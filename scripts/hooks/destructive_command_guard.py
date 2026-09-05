@@ -83,6 +83,173 @@ _SEPARATOR_SPACING = re.compile(r"(\|\||&&|[|;]|(?<![<>])&(?!>))")
 # wrong is a guard bypass, not a cosmetic issue — see _rm_violations.
 _CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
 
+# Unquoted characters after which the shell starts a new word, and therefore
+# after which a `#` opens a comment. This is the shell's metacharacter set plus
+# whitespace — ENUMERATED against bash (each member checked by whether the text
+# after `<char>#note` is executed or swallowed as comment), not inferred from the
+# parser's shape. An earlier revision inferred it and was wrong in BOTH
+# directions at once.
+_COMMENT_OPENERS = frozenset(" \t\n|&;<>()")
+
+# The character immediately before a `(` decides whether that parenthesis is
+# WORD-FORM — part of the surrounding word, so its matching `)` leaves the word
+# open and a `#` glued to it is NOT a comment — or COMMAND-FORM, where the `)`
+# ends a command and a glued `#` does open a comment.
+#
+#   word-form   $( … )  $(( … ))   command/arithmetic substitution
+#               <( … )  >( … )     process substitution
+#               =( … )             array assignment (`a=(x)`, `a+=(x)`)
+#               ?( *( @(           extglob patterns
+#   command     ( … )              subshell
+#               (( … ))            arithmetic command
+#               x)                 case pattern, function definition `f()`
+#               !( … )             see below — NOT an extglob pattern here
+#
+# `!(` is the member that cannot be settled from a static set, so the runtime
+# decides it. It is an extglob pattern only when `shopt -s extglob` is set; this
+# hook sees non-interactive `bash -c`, where extglob is OFF, and there `!(true)`
+# is a `!` negation applied to a subshell — a COMMAND-form paren whose `)` really
+# does let a following `#` open a comment. MEASURED both ways with
+# `!(true)#note; touch MARKER`: extglob off, no marker (a comment opened);
+# extglob on, marker present (no comment). The two answers are incompatible, so
+# the default that this hook actually runs under wins, and `!` stays out.
+#
+# ENUMERATED against bash 5.2, one member at a time, with `<prefix>#note; touch
+# MARKER`: the marker appears iff `#` did NOT open a comment, so the `; touch`
+# ran. That spelling is used deliberately instead of a trailing continuation —
+# with `<prefix>#note \`⏎`touch MARKER`, folding leaves `<prefix>#note touch
+# MARKER`, whose first word is an assignment prefix for the `a=(x)` case, so
+# `touch` runs as the command word and the marker appears in BOTH directions.
+# That confound reported array assignment as command-form, which it is not.
+#
+# Deliberately no worked example here. Naming a construct beside a statement
+# that a gate stopped working is a recipe, and this repository is public; the
+# repo's own prose tripwire forbids the pairing but cannot see every construct
+# name, so its silence is not permission. The shapes live as fixture rows in the
+# guard's tests, where they are data rather than instruction.
+#
+# Getting a member wrong is a bypass in one direction or the other: calling a
+# word-form `)` a boundary lets a glued `#` fake a comment and hide the next
+# line, and calling a command-form `)` mid-word folds a continuation the shell
+# does not fold, gluing the next command onto the comment text so no `rm` token
+# survives. Both directions are covered by fixture rows in the guard's tests.
+_WORD_PAREN_PREFIXES = frozenset("$<>=?*+@")
+
+
+def _fold_continuations(cmd: str) -> str:
+    """Delete the line continuations the shell deletes — and only those.
+
+    A whole-string regex cannot decide this, because whether a backslash-newline
+    is a continuation depends on the CONTEXT it sits in. A ``#`` comment ends at
+    the newline and the shell does not continue it, so folding there deletes a
+    real command separator and glues the following command into the comment
+    text: no ``rm`` token survives, and because tokenizing then SUCCEEDS the
+    legacy-regex fallback (which fires only when tokenizing FAILS) never runs.
+
+    Both error directions are bypasses in this guard, which is why this tracks
+    state instead of approximating either one. Failing to fold a genuine
+    continuation splits a word the shell joins and can hide the recursive-force
+    flags — the bypass recorded in ``_rm_violations``. Folding one the shell
+    does not join hides the command itself. Contrast ``shell_parse``, where the
+    consumers only ever over-read, so an approximation is safe there and is not
+    safe here.
+
+    Quotes keep their previous treatment deliberately: a ``#`` inside them opens
+    nothing, and the continuation is still folded, because the shell keeps the
+    sequence literally inside single quotes and folding it changes one operand's
+    spelling, never its depth or its flags.
+
+    Odd/even parity falls out with no counting: an escaped PAIR is consumed
+    here, so a newline following an even-length run is seen fresh and stays a
+    real separator. ``_CONTINUATION`` is retained as the parity reference this
+    is checked against.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    in_comment = False
+    # The shell opens a comment at a WORD START only, so track that directly
+    # rather than inferring it from the last emitted character. Inferring it was
+    # wrong in both directions: the separators `;` `|` `&` reach the output as
+    # themselves here (the spacing pass runs downstream, on this function's
+    # result), so they were missed and the fold still ran inside a real comment;
+    # and a `)` closing a word-form parenthesis (see _WORD_PAREN_PREFIXES) is
+    # mid-word, so it was treated as a boundary and a real continuation was
+    # refused — which splits a word the shell joins and can hide the
+    # recursive-force flags.
+    at_word_start = True
+    # One entry per OPEN parenthesis, each classified from its OWN preceding
+    # character: True = word-form (see _WORD_PAREN_PREFIXES), so its `)` closes an
+    # expansion and the word continues; False = command-form, so its `)` is a
+    # boundary and a `#` after it opens a comment.
+    #
+    # A stack rather than a depth counter, and each entry classified independently
+    # rather than inheriting from the one below it. A counter cannot express either
+    # property and was wrong twice over: nesting inherited, so a genuine subshell
+    # inside `$( … )` was read as word-form and a real comment was missed; and the
+    # count leaked whenever a partially-modelled context swallowed an opener or a
+    # closer — a `)` inside a comment never decremented it, so every later `)` in
+    # the command read as mid-word. Independent classification also keeps `$((`
+    # right without a special case: the inner entry may be command-form, but the
+    # outer word-form `)` is the one that decides where the word ends.
+    paren_forms: list[bool] = []
+    # The previous UNQUOTED, UNESCAPED character — what decides a `(`'s form.
+    # A quoted or backslash-escaped character resets it to None: `\$(` is a
+    # literal `$` followed by a subshell, not a command substitution.
+    prev: str | None = None
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if quote:
+            if c == "\\" and i + 1 < n and cmd[i + 1] == "\n":
+                i += 2  # fold inside quotes, as before
+                continue
+            out.append(c)
+            if quote == '"' and c == "\\" and i + 1 < n:
+                out.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+                prev = None
+            i += 1
+            continue
+        if not in_comment and c in ("'", '"'):
+            quote = c
+            out.append(c)
+            at_word_start = False
+            prev = None
+            i += 1
+            continue
+        if c == "#" and not in_comment and at_word_start:
+            in_comment = True
+        if c == "\\" and i + 1 < n and not in_comment:
+            if cmd[i + 1] == "\n":
+                i += 2
+                continue
+            out.append(c)
+            out.append(cmd[i + 1])
+            at_word_start = False  # `a\ #x` is one word — the escaped space does not end it
+            prev = None
+            i += 2
+            continue
+        if not in_comment:
+            if c == "(":
+                paren_forms.append(prev in _WORD_PAREN_PREFIXES)
+            elif c == ")" and paren_forms and paren_forms.pop():
+                out.append(c)
+                at_word_start = False  # closes an expansion, so still inside a word
+                prev = c
+                i += 1
+                continue
+        if c == "\n":
+            in_comment = False  # a comment ends at the newline, never past it
+        out.append(c)
+        if not in_comment:
+            at_word_start = c in _COMMENT_OPENERS
+        prev = c
+        i += 1
+    return "".join(out)
+
 
 def _check_target(target: str) -> str | None:
     """Reason string if *target* is too broad to rm recursively."""
@@ -138,7 +305,7 @@ def _rm_violations(cmd: str) -> list[str] | None:
     # Redirections are NOT stripped here — they are recognized at the token
     # level after shlex (see _REDIR_TOKEN), so shlex stays the sole authority on
     # quoting/escaping.
-    cmd = _CONTINUATION.sub(r"\1", cmd).replace("\n", " ; ")
+    cmd = _fold_continuations(cmd).replace("\n", " ; ")
     # Space glued command separators (`x;y`, `a&&b`) into standalone tokens so
     # the operand loop stops at them; a redirection `&` is preserved.
     spaced = _SEPARATOR_SPACING.sub(r" \1 ", cmd)
