@@ -3705,6 +3705,48 @@ class TestFenceClosingFollowsCommonMark:
         assert len(segs) == 2, segs
         assert guard_module._cr_severity(segs[1])[0] == "critical"
 
+    def test_an_over_indented_fence_line_is_content_not_a_closer(self, guard_module):
+        """CommonMark gives fence DELIMITERS at most three leading spaces — a
+        4+-space-indented backtick run is code CONTENT (Codex P2, #1677 round 5).
+        Stripping before matching let it close the outer suggestion fence."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "````suggestion\n"
+            "    ````\n"
+            "---\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n"
+            "````\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1, (
+            "an indented backtick run inside the suggestion closed the outer fence"
+        )
+
+    def test_an_indented_rule_inside_quoted_code_does_not_split(self, guard_module):
+        """A 4+-space-indented `---` is CODE under CommonMark, not a thematic
+        break — CodeRabbit quotes markdown as indented code blocks, and an
+        indented rule there must not manufacture a second, blocking finding
+        (Codex P2, #1677 round 5)."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "    ---\n"
+            "    _🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1, (
+            "an indented rule inside quoted code split a phantom Critical out"
+        )
+
+    def test_a_rule_with_up_to_three_leading_spaces_still_splits(self, guard_module):
+        """CONTROL: CommonMark allows a thematic break up to three leading
+        spaces — tightening past that would hide real bundled findings."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "   ---\n\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n**Real one.**\n"
+        )
+        segs = guard_module._cr_findings(body)
+        assert len(segs) == 2, segs
+        assert guard_module._cr_severity(segs[1])[0] == "critical"
+
     def test_an_unclosed_fence_does_not_hide_the_rest_of_the_body(self, guard_module):
         """A deliberate DEVIATION from CommonMark, in the safe direction.
 

@@ -1005,7 +1005,10 @@ _CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
 # CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
 # markdown rule, when they land near each other in the diff. Each segment is
 # its own finding with its own severity.
-_CR_FINDING_SPLIT_RE = re.compile(r"^\s*-{3,}\s*$", re.M)
+# At most THREE leading spaces: CommonMark reads a 4+-space-indented rule as
+# CODE, and CodeRabbit quotes markdown as indented code blocks — an indented
+# `---` inside quoted code must not become a finding boundary (Codex P2, #1677).
+_CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
 # 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
 # the SAME weighted machinery as the Codex findings rather than a second blocking
@@ -1303,7 +1306,12 @@ def _cr_markup_mask(body: str) -> list[bool]:
     details_opened_at: int | None = None
     for idx, line in enumerate(lines):
         stripped = line.strip()
-        fence = _CR_FENCE_RE.match(stripped)
+        # CommonMark gives fence DELIMITERS at most three leading spaces; a
+        # 4+-space-indented backtick run is code CONTENT. Stripping first and
+        # matching meant an indented ```` line inside a four-backtick
+        # suggestion closed the outer fence (Codex P2, #1677).
+        indent = len(line) - len(line.lstrip(" \t"))
+        fence = _CR_FENCE_RE.match(stripped) if indent <= 3 else None
         if fence:
             run, info = fence.group(1), fence.group(2).strip()
             if fence_char is None:
