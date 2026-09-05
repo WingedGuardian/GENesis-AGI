@@ -297,9 +297,13 @@ Three rules when a bound really is needed:
   cut is honest. A silent permitted cut is still a defect; a loud forbidden cut
   is still forbidden.
   **When the total is not already known, say that instead of computing it.**
-  Bounding a stream is the case: learning the exact discarded length means
-  reading the whole source, which is the cost the bound existed to avoid. State
-  the quantity you KNOW — the cap — and mark the tail unknown:
+  Bounding a stream is the case — but first ask which KIND of bounded reader
+  you have, because the bound is on RETENTION, not necessarily on reading. A
+  drain-and-discard reader consumes to EOF anyway (a subprocess pipe must be
+  drained or the child blocks) and can count what it discards in constant
+  space, so it KNOWS the exact total and should say it. Only a stop-at-limit
+  reader, which truly stops consuming, cannot know. There, state the quantity
+  you KNOW — the cap — and mark the tail unknown:
   `<kept first 40,000 chars; rest of stream omitted>`. Do not write
   `<omitted: ≥40,000 chars>`: under this rule's own grammar that number
   describes the OMITTED content, and one character over the cap makes it a
