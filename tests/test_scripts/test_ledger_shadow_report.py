@@ -458,3 +458,76 @@ def test_headline_renders_the_version_denominator():
     assert f"prompt **{PROMPT_VERSION}** only" in md
     assert "1 other-version run(s) excluded" in md
     assert "v1" in md
+
+
+def test_attribution_runs_stay_out_of_the_metric_populations():
+    """Attribution runs exist for MODE JUDGMENT, not health statistics.
+
+    Merged into `runs`, an event-less old run (loaded only because its
+    promotion is retention-exempt) entered the status histogram and extended
+    the FN horizon past the loaded events — so an old-only session accrued
+    false negatives and the headline counted runs its event population never
+    covered. Passed separately, the leak verdict still judges write-time mode
+    while every metric population ignores them.
+    """
+    old_run = _run("r_old", started="2026-01-01T00:00:00+00:00", mode="live")
+    promo_ev = _event(
+        "e_old", "ship the thing", run_id="r_old", promoted_item_id="led-1",
+    )
+    led = _extractor_row("led-1", "ship the thing", source_quote="q")
+    # A foreground row that predates nothing in the loaded window: with the
+    # old run merged in, the FN horizon covered it and charged a miss.
+    fg = _fg_row("fg-1", "totally unrelated commitment")
+
+    rep = _rep.build_report(
+        [],  # windowed runs: none loaded
+        [],
+        [led, fg],
+        mode="live",
+        attribution_events=[promo_ev],
+        attribution_runs=[old_run],
+    )
+    assert rep["n_runs"] == 0, "an attribution-only run entered the headline"
+    assert rep["status_histogram"] == {}
+    assert rep["fn"] == [], (
+        "an attribution-only run extended the FN horizon past the loaded events"
+    )
+    # ...while the verdict still judged the old promotion by its run's mode.
+    assert rep["leak_invariant_ok"] is True
+    assert rep["n_attributed_run_missing"] == 0
+
+
+def test_dangling_duplicates_group_by_their_missing_root():
+    """Descendants of one unloaded root are ONE agreement, not several.
+
+    The worker's dedup pool points repeated proposals at the same oldest
+    root; once that root falls outside the loaded run window, counting each
+    descendant as its own root inflates the TP/FP denominator with copies.
+    """
+    runs = [_run("r1", started=T1)]
+    events = [
+        _event("e1", "ship the thing", run_id="r1", duplicate_of="e_gone"),
+        _event("e2", "ship the thing", run_id="r1", duplicate_of="e_gone"),
+        _event("e3", "a different thing", run_id="r1"),
+    ]
+    rep = _rep.build_report(runs, events, [])
+    assert rep["n_unique_agreements"] == 2, (
+        "two descendants of one missing root were counted separately"
+    )
+
+
+def test_incomplete_ledger_refuses_the_leak_verdict():
+    """The invariant convicts on absence, so a partial ledger read cannot
+    hold it — an empty list from a failed read used to render HELD, the
+    exact vacuous all-clear the verdict exists to prevent."""
+    runs = [_run("r1", started=T1, mode="live")]
+    rep = _rep.build_report(runs, [], [], mode="live", ledger_complete=False)
+    assert rep["leak_invariant_ok"] is None
+    md = _rep.render_md(rep, generated_at=T1)
+    assert "NOT ISSUED" in md
+    assert "VIOLATED" not in md.split("NOT ISSUED")[0], (
+        "a refused verdict must not render as a violation"
+    )
+    # And the complete default still yields a real verdict.
+    held = _rep.build_report(runs, [], [], mode="live")
+    assert held["leak_invariant_ok"] is True

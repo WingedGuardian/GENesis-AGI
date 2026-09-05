@@ -78,6 +78,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A schema rebuild no longer destroys columns a private fork added.** The
+  ledger table rebuild (widening a constraint means rebuilding the table on
+  SQLite) copied a hardcoded upstream column list and then dropped the old
+  table — so on an install whose supported private fork had added its own
+  column, that column and all of its data were silently, irreversibly gone.
+  The rebuild now reads the live table first, re-creates any column it does
+  not recognize from that column's own declaration, and copies its data; the
+  one shape it cannot re-create (NOT NULL with no default) stops the
+  migration with a clear message before anything is dropped.
 - **The pre-merge check now reads the second review bot it was already fetching.**
   Two automated reviewers comment on every pull request, and the gate that decides
   whether a change is ready to merge only understood the format of one of them. The

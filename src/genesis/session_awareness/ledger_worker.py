@@ -279,6 +279,7 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
     written = 0
     disqualified = 0
     failed = 0
+    vanished = 0
     n_qualifying = 0
     mode_stopped = False
     sweep_error = False
@@ -328,7 +329,7 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                             "ledger promotion stopped mid-sweep for %s — mode "
                             "left 'live' with %d candidate(s) unprocessed",
                             session_id,
-                            len(candidates) - written - disqualified - failed,
+                            len(candidates) - written - disqualified - failed - vanished,
                         )
                         break
                     # OPEN rows only. A CLOSED row is a finished agreement,
@@ -339,6 +340,51 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                     # from every future sweep. Permanently: the closed row never
                     # goes away, so the renewal could never be promoted.
                     #
+                    # A duplicate group is ONE agreement, and the open-rows
+                    # recheck below cannot see a promotion whose ledger row
+                    # has since CLOSED: a member deferred by the cap or a
+                    # transient failure was then inserted as a SECOND open
+                    # row for a commitment observed before the closure. The
+                    # group's promotion state is the durable fact, so ask it
+                    # directly — but time-discriminate, because the deduper
+                    # stamps duplicate_of on RENEWALS too (its pool is all
+                    # prior events), and a blanket group-disqualify would
+                    # suppress every renewal forever, the module's canonical
+                    # failure mode. Observed BEFORE the promoted row closed =
+                    # the same commitment, deferred → disqualify. Observed
+                    # AFTER = a renewal → fall through to the open-rows
+                    # recheck, which promotes it. A promoted row that is
+                    # still OPEN disqualifies regardless (that is a live
+                    # duplicate, whatever the timestamps say). One hop covers
+                    # the graph — chain nesting is MEASURED 0.
+                    dup_root = ev.get("duplicate_of") or ev["id"]
+                    cur = await db.execute(
+                        "SELECT e.promoted_item_id, l.status, l.updated_at "
+                        "FROM session_ledger_shadow_events e "
+                        "LEFT JOIN session_ledger l ON l.id = e.promoted_item_id "
+                        "WHERE (e.id = ? OR e.duplicate_of = ?) "
+                        "  AND e.promoted_item_id IS NOT NULL "
+                        "LIMIT 1",
+                        (dup_root, dup_root),
+                    )
+                    prior = await cur.fetchone()
+                    if prior is not None and prior["status"] is not None:
+                        row_open = prior["status"] in ("open", "in_progress")
+                        observed = ev.get("observed_at") or ""
+                        closed_after_observation = (
+                            observed <= (prior["updated_at"] or "")
+                        )
+                        if row_open or closed_after_observation:
+                            await db.execute(
+                                "UPDATE session_ledger_shadow_events "
+                                "SET match_kind = 'exact', matched_item_id = ?, "
+                                "    match_score = 1.0 "
+                                "WHERE id = ?",
+                                (prior["promoted_item_id"], ev["id"]),
+                            )
+                            await db.commit()
+                            disqualified += 1
+                            continue
                     # `in_progress` counts as open — that IS a live duplicate.
                     cur = await db.execute(
                         "SELECT id, text FROM session_ledger "
@@ -396,11 +442,30 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                         # instead of narrowing it.
                         commit=False,
                     )
-                    await db.execute(
+                    cur = await db.execute(
                         "UPDATE session_ledger_shadow_events "
-                        "SET promoted_item_id = ? WHERE id = ?",
+                        "SET promoted_item_id = ? "
+                        "WHERE id = ? AND promoted_item_id IS NULL",
                         (item_id, ev["id"]),
                     )
+                    if cur.rowcount != 1:
+                        # The candidate vanished (or was claimed) between the
+                        # sweep query and this write — retention prunes old
+                        # UNPROMOTED events, and candidates are selected
+                        # before their per-row transaction. Committing anyway
+                        # would mint a ledger row no event claims — exactly
+                        # the unattributed-leak shape the report convicts.
+                        # Roll the whole promotion back; nothing to retry,
+                        # the event is gone.
+                        await db.rollback()
+                        vanished += 1
+                        logger.warning(
+                            "ledger promotion: candidate event %s vanished "
+                            "mid-sweep for %s (pruned or concurrently "
+                            "claimed); promotion rolled back",
+                            ev["id"], session_id,
+                        )
+                        continue
                     await db.commit()
                     written += 1
                 except Exception:
@@ -444,8 +509,59 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
         "qualifying": n_qualifying,
         "disqualified_at_write": disqualified,
         "failed_rows": failed,
+        # Candidates whose shadow event was pruned (or claimed) between the
+        # sweep query and the link write. Not failures — the rollback is the
+        # design working — but never silent either.
+        "vanished_rows": vanished,
         "sweep_error": sweep_error,
         "mode_stopped": mode_stopped,
+    }
+
+
+async def _settle_empty_delta(
+    db_path: Path | str,
+    run_id: str,
+    session_id: str,
+    *,
+    trigger: str,
+    mode: str,
+    recorded: bool,
+    reason: str,
+) -> dict:
+    """Empty-delta epilogue: pending-promotion sweep, then telemetry.
+
+    ``_promote_live`` is otherwise reached only after a successfully parsed
+    NONEMPTY delta — but a failed promotion leaves its candidate in the shadow
+    store, and a session that then goes quiet presents the same ``end_byte``
+    forever, so the empty-delta early return was exactly where a pending
+    candidate could wait indefinitely. Live mode sweeps here too; the sweep
+    reads its own candidates from the store, so a quiet session costs one
+    query when nothing is pending.
+
+    A sweep failure re-marks the (already committed, ``empty_delta``) run row
+    failed for the same reason the ok path does: the report's health surface
+    reads run rows, and a live promotion failure must not look healthy there.
+    """
+    promotion: dict = {"promoted": 0}
+    if mode == "live" and trigger != "backfill" and effective_mode() == "live":
+        promotion = await _promote_live(db_path, session_id, trigger=trigger)
+    failed = bool(promotion.get("failed_rows", 0)) or bool(promotion.get("sweep_error"))
+    if recorded and failed:
+        await _mark_run_failed(
+            db_path,
+            run_id,
+            f"promotion_failed={promotion.get('failed_rows', 0)}"
+            f"|sweep_error={int(bool(promotion.get('sweep_error')))}",
+        )
+    await _record_telemetry(
+        db_path,
+        "failed" if failed else "empty_delta",
+        f"{reason}|promoted={promotion.get('promoted', 0)}"
+        f"|qualifying={promotion.get('qualifying', 0)}",
+    )
+    return {
+        "status": "failed" if failed else "empty_delta",
+        "promoted": promotion.get("promoted", 0),
     }
 
 
@@ -717,8 +833,10 @@ async def _run_locked(
         recorded = await _record_run(db_path, **_base_row(status="empty_delta"))
         if recorded:
             _advance_cursor(session_dir, end_byte, cursor)
-        await _record_telemetry(db_path, "empty_delta", "no_new_bytes")
-        return {"status": "empty_delta"}
+        return await _settle_empty_delta(
+            db_path, run_id, session_id,
+            trigger=trigger, mode=mode, recorded=recorded, reason="no_new_bytes",
+        )
 
     # The extractor owns these budgets; parse_delta truncates FIRST, so its
     # defaults silently win unless they are passed. That is not hypothetical:
@@ -734,8 +852,10 @@ async def _run_locked(
         recorded = await _record_run(db_path, **_base_row(status="empty_delta"))
         if recorded:
             _advance_cursor(session_dir, end_byte, cursor)
-        await _record_telemetry(db_path, "empty_delta", "no_typed_turns")
-        return {"status": "empty_delta"}
+        return await _settle_empty_delta(
+            db_path, run_id, session_id,
+            trigger=trigger, mode=mode, recorded=recorded, reason="no_typed_turns",
+        )
 
     prompt, included, truncated = build_prompt(turns)
     result = await run_headless_json(

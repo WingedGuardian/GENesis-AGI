@@ -1423,7 +1423,12 @@ verified: 29a382e7 2026-09-03
   `shadow` takes effect. INTERIM cap of 5 rows/run, logged when it bites;
   qualifying / promoted / disqualified / failed counts all reach the run's
   telemetry line, so a sweep that failed on every row is distinguishable
-  from one that found nothing.
+  from one that found nothing. The sweep also runs on live-mode EMPTY-DELTA
+  invocations (a quiet session must not strand a failed promotion), asks the
+  duplicate GROUP's own promotion state before writing — observed-before-
+  closure disqualifies, observed-after is a renewal and promotes — and
+  requires the event-link UPDATE to touch exactly one row, rolling the whole
+  promotion back if the candidate was pruned mid-sweep.
   Levers: settings domain `session_ledger_shadow` (off|shadow|live) read
   live per call — **`live` requires BOTH `mode: live` and
   `live_opt_in: true`**, a renewed opt-in that legacy overlays (which could

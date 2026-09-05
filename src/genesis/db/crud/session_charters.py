@@ -343,21 +343,56 @@ async def ledger_list(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+# One fetch of the ledger_all keyset walk. A module constant so tests can
+# shrink it and genuinely cross page boundaries with a small corpus.
+_LEDGER_ALL_PAGE = 10_000
+
+
 async def ledger_all(
     db: aiosqlite.Connection,
     *,
-    limit: int = 10000,
+    hard_cap: int = 200_000,
 ) -> list[dict]:
-    """All ledger rows across sessions, oldest first (incl. added_by).
+    """All ledger rows across sessions, oldest first (incl. added_by) — COMPLETE.
 
-    Read seam for the shadow precision report (leak-invariant check needs
-    the added_by column across every session). Assumes a Row factory.
+    Read seam for the shadow precision report and repo-pulse matching, both of
+    which state facts about the WHOLE ledger — the leak invariant convicts on
+    absence, so a silently truncated read turns "row not seen" into "row not
+    written". Keyset-paginated internally (created_at, id) so no single fetch
+    is unbounded; *hard_cap* is a resource tripwire that RAISES rather than
+    truncates — a caller that needs a verdict refuses it instead of computing
+    over a partial corpus. Sized from capacity, not history: 200k rows of this
+    table is ~100MB in memory, far past any plausible real ledger (the live
+    table holds thousands). Assumes a Row factory.
     """
-    lim = max(1, min(int(limit), 100000))
-    cursor = await db.execute(
-        "SELECT * FROM session_ledger ORDER BY created_at ASC LIMIT ?", (lim,)
-    )
-    return [dict(r) for r in await cursor.fetchall()]
+    rows: list[dict] = []
+    last: tuple[str, str] | None = None
+    page = _LEDGER_ALL_PAGE
+    while True:
+        if last is None:
+            cursor = await db.execute(
+                "SELECT * FROM session_ledger ORDER BY created_at ASC, id ASC "
+                "LIMIT ?",
+                (page,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM session_ledger "
+                "WHERE (created_at, id) > (?, ?) "
+                "ORDER BY created_at ASC, id ASC LIMIT ?",
+                (*last, page),
+            )
+        batch = [dict(r) for r in await cursor.fetchall()]
+        rows.extend(batch)
+        if len(rows) > hard_cap:
+            raise RuntimeError(
+                f"ledger_all: session_ledger exceeds the {hard_cap}-row "
+                "tripwire — refusing a partial read; raise hard_cap "
+                "deliberately if the table is legitimately this large"
+            )
+        if len(batch) < page:
+            return rows
+        last = (batch[-1]["created_at"], batch[-1]["id"])
 
 
 async def ledger_counts(db: aiosqlite.Connection, session_id: str) -> dict[str, int]:

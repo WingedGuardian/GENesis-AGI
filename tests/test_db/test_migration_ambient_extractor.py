@@ -310,3 +310,65 @@ class TestThePromotionStateColumn:
         """The drift this whole file exists to prevent, for the new column:
         migrated and fresh-install schemas must not disagree."""
         assert "promoted_item_id" in TABLES["session_ledger_shadow_events"]
+
+
+class TestForkColumnPreservation:
+    """The rebuild must not destroy what it does not know.
+
+    The migration runner intentionally executes fork migrations too, so a live
+    table can carry columns this rebuild's hardcoded copy list never heard of —
+    and the DROP TABLE at the end is irreversible. Unknown columns are re-added
+    from their own PRAGMA declaration and their data copied; the one shape ADD
+    COLUMN cannot recreate (NOT NULL, no default) aborts loudly BEFORE anything
+    is dropped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fork_added_column_and_its_data_survive_the_rebuild(self, db):
+        await _seed_old(db)
+        await db.execute(
+            "ALTER TABLE session_ledger ADD COLUMN fork_notes TEXT DEFAULT 'x'"
+        )
+        await db.execute("UPDATE session_ledger SET fork_notes = 'kept' WHERE id = 'row0'")
+        await db.commit()
+
+        await M90.up(db)
+        await db.commit()
+
+        cur = await db.execute("PRAGMA table_info(session_ledger)")
+        cols = {row[1] for row in await cur.fetchall()}
+        assert "fork_notes" in cols, "the rebuild dropped a fork-added column"
+        cur = await db.execute("SELECT fork_notes FROM session_ledger WHERE id = 'row0'")
+        assert (await cur.fetchone())[0] == "kept", "the column survived but its data did not"
+        # And the rebuild still did its own job.
+        assert EXTRACTOR in _allowed_from_ddl(await _ddl(db))
+
+    @pytest.mark.asyncio
+    async def test_not_null_no_default_fork_column_aborts_before_any_drop(self, db):
+        """ADD COLUMN cannot recreate NOT NULL without a default — refusing
+        loudly beats silently destroying the column. Nothing may have been
+        dropped by the time it raises."""
+        await _seed_old(db)
+        # SQLite only forbids ADD COLUMN NOT NULL without default; a rebuild
+        # can create such a column directly, which is exactly what a fork
+        # migration doing its own rebuild would produce.
+        cur = await db.execute("SELECT sql FROM sqlite_master WHERE name='session_ledger'")
+        old = (await cur.fetchone())[0]
+        hardened = old.replace(
+            "updated_at  TEXT", "updated_at  TEXT, fork_req TEXT NOT NULL"
+        )
+        await db.execute("ALTER TABLE session_ledger RENAME TO _tmp_fork")
+        await db.execute(hardened)
+        await db.execute(
+            "INSERT INTO session_ledger SELECT *, 'v' FROM _tmp_fork"
+        )
+        await db.execute("DROP TABLE _tmp_fork")
+        await db.commit()
+
+        with pytest.raises(RuntimeError, match="fork_req"):
+            await M90.up(db)
+        # The live table must be untouched — the raise happened before DROP.
+        cur = await db.execute("SELECT COUNT(*) FROM session_ledger")
+        assert (await cur.fetchone())[0] == 3
+        cur = await db.execute("PRAGMA table_info(session_ledger)")
+        assert "fork_req" in {row[1] for row in await cur.fetchall()}

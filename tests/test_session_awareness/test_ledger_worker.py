@@ -1229,3 +1229,161 @@ async def test_promotion_failure_re_marks_the_durable_run_row(
         "the durable run row still says ok — the report's histogram reads rows"
     )
     assert "promotion_failed=1" in (run["detail"] or "")
+
+
+async def test_a_deferred_duplicate_is_not_repromoted_after_its_row_closed(
+    tmp_path, sessions_root, live_mode, live_db_path
+):
+    """One agreement, one row — even across a closure.
+
+    A duplicate group member deferred by the cap or a transient failure, whose
+    promoted sibling's ledger row then CLOSES before the next sweep, was
+    invisible to the open-rows recheck and minted a second open row for a
+    commitment observed before the closure. The group's own promotion state is
+    the durable fact: observed-before-closure disqualifies, permanently and
+    with the promoted row recorded as the match.
+    """
+    import genesis.db.crud.session_charters as charters_crud
+
+    text = "close out the retention sweep follow-up"
+    await _fabricate_run(live_db_path, [_fab_event(text)])
+    out1 = await lw._promote_live(live_db_path, SID, trigger="manual")
+    assert out1["promoted"] == 1
+    (row,) = await _ledger(live_db_path)
+
+    async with aiosqlite.connect(str(live_db_path)) as db:
+        await charters_crud.ledger_update(db, item_id=row["id"], status="done")
+
+    deferred = {
+        **_fab_event(text, ev_id="fab-ev-2"),
+        "duplicate_of": "fab-ev-1",
+        "observed_at": "2026-09-01T00:00:02+00:00",  # before the closure above
+    }
+    await _fabricate_run(live_db_path, [deferred], run_id="fab-run-2")
+    out2 = await lw._promote_live(live_db_path, SID, trigger="manual")
+
+    assert out2["promoted"] == 0, (
+        "a deferred member of an already-promoted group minted a second row"
+    )
+    assert out2["disqualified_at_write"] == 1
+    rows = await _ledger(live_db_path)
+    assert [r["status"] for r in rows] == ["done"], rows
+    ev2 = next(e for e in await _shadow_event_rows(live_db_path) if e["id"] == "fab-ev-2")
+    assert ev2["match_kind"] == "exact"
+    assert ev2["matched_item_id"] == row["id"], (
+        "the disqualification must record WHICH row already carries the agreement"
+    )
+
+
+async def test_a_renewal_observed_after_closure_still_promotes(
+    tmp_path, sessions_root, live_mode, live_db_path
+):
+    """The other side of the discriminator — the CONTROL for the test above.
+
+    The deduper stamps duplicate_of on renewals too (its pool is all prior
+    events), so a blanket group-disqualify would suppress every renewed
+    commitment forever — the module's canonical failure mode. Observed AFTER
+    the promoted row closed = a new commitment; it must reach the ledger.
+    """
+    import genesis.db.crud.session_charters as charters_crud
+
+    text = "close out the retention sweep follow-up"
+    await _fabricate_run(live_db_path, [_fab_event(text)])
+    out1 = await lw._promote_live(live_db_path, SID, trigger="manual")
+    assert out1["promoted"] == 1
+    (row,) = await _ledger(live_db_path)
+
+    async with aiosqlite.connect(str(live_db_path)) as db:
+        await charters_crud.ledger_update(db, item_id=row["id"], status="done")
+
+    renewal = {
+        **_fab_event(text, ev_id="fab-ev-2"),
+        "duplicate_of": "fab-ev-1",
+        "observed_at": "2027-01-01T00:00:00+00:00",  # after the closure above
+    }
+    await _fabricate_run(live_db_path, [renewal], run_id="fab-run-2")
+    out2 = await lw._promote_live(live_db_path, SID, trigger="manual")
+
+    assert out2["promoted"] == 1, (
+        "a renewal observed after its predecessor closed was suppressed by the "
+        "duplicate-group check"
+    )
+    rows = await _ledger(live_db_path)
+    assert sorted(r["status"] for r in rows) == ["done", "open"]
+
+
+async def test_an_empty_delta_run_still_sweeps_pending_promotions(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript, monkeypatch
+):
+    """A quiet session must not strand a failed promotion forever.
+
+    Run 1's live write fails after the shadow write; the cursor advances (the
+    shadow guarantee held). The session then goes QUIET: run 2 sees the same
+    end_byte and takes the empty-delta early return — which used to skip the
+    sweep entirely, so a session with no later nonempty extraction never
+    retried its pending candidate. The empty-delta path sweeps now.
+    """
+    import genesis.db.crud.session_charters as charters_crud
+
+    real_ledger_add = charters_crud.ledger_add
+
+    async def _always_fails(*a, **kw):
+        raise RuntimeError("simulated live-write failure")
+
+    monkeypatch.setattr(charters_crud, "ledger_add", _always_fails)
+    first = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert first["status"] == "failed"
+    assert first["promoted"] == 0
+    assert await _ledger(live_db_path) == []
+
+    # Run 2: healthy again, cursor NOT rewound — same end_byte, empty delta.
+    monkeypatch.setattr(charters_crud, "ledger_add", real_ledger_add)
+    second = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert second["status"] == "empty_delta", second
+    assert second["promoted"] == 1, (
+        "the empty-delta early return bypassed the pending-promotion sweep"
+    )
+    (row,) = await _ledger(live_db_path)
+    assert row["text"] == AGREEMENT["text"]
+
+
+async def test_a_vanished_candidate_rolls_the_whole_promotion_back(
+    tmp_path, sessions_root, live_mode, live_db_path, monkeypatch
+):
+    """Retention can prune an unpromoted event between the sweep query and the
+    link write. Committing anyway mints a ledger row no event claims — the
+    unattributed-leak shape. The link UPDATE's rowcount is the tripwire: 0
+    rows affected rolls the ledger insert back with it.
+
+    Simulated by deleting the event INSIDE the promotion transaction (a
+    separate connection would block on the held write lock); the rollback then
+    restores the event too, which is itself evidence the rollback was atomic.
+    """
+    import genesis.db.crud.session_charters as charters_crud
+
+    real_ledger_add = charters_crud.ledger_add
+
+    async def _add_then_vanish(db, **kw):
+        item_id = await real_ledger_add(db, **kw)
+        await db.execute(
+            "DELETE FROM session_ledger_shadow_events "
+            "WHERE session_id = ? AND promoted_item_id IS NULL",
+            (kw["session_id"],),
+        )
+        return item_id
+
+    monkeypatch.setattr(charters_crud, "ledger_add", _add_then_vanish)
+    text = "wire the vanish tripwire"
+    await _fabricate_run(live_db_path, [_fab_event(text)])
+    out = await lw._promote_live(live_db_path, SID, trigger="manual")
+
+    assert out["promoted"] == 0
+    assert out["vanished_rows"] == 1
+    assert out["failed_rows"] == 0, "a vanish is a rollback, not a failure"
+    assert await _ledger(live_db_path) == [], (
+        "the ledger insert survived its candidate's disappearance"
+    )
+    (ev,) = await _shadow_event_rows(live_db_path)
+    assert ev["promoted_item_id"] is None, (
+        "the rollback must revert the whole transaction, link included"
+    )

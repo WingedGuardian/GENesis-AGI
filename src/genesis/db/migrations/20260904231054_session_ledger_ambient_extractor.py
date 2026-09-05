@@ -35,9 +35,35 @@ thing this migration actually changes is the only check that cannot lie.
 
 from __future__ import annotations
 
+import logging
+
 import aiosqlite
 
+logger = logging.getLogger(__name__)
+
 _NEW_VALUE = "ambient_ledger_extractor"
+
+# The columns this rebuild KNOWS. Anything else on the live table is a
+# fork-added column (the migration runner intentionally executes fork
+# migrations too), and a hardcoded copy list would silently destroy it —
+# the DROP TABLE below is irreversible. Unknown columns are re-added to the
+# new table from their PRAGMA declaration and their data copied.
+_KNOWN_COLUMNS = (
+    "id",
+    "session_id",
+    "text",
+    "status",
+    "source_ref",
+    "added_by",
+    "evidence",
+    "source_quote",
+    "created_at",
+    "updated_at",
+)
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 async def _add_promoted_item_id(db: aiosqlite.Connection) -> None:
@@ -96,6 +122,33 @@ async def up(db: aiosqlite.Connection) -> None:
         await _add_source_quote(db)
         return
 
+    # FORK-COLUMN PRESERVATION. Read the LIVE table's columns before the
+    # rebuild: a supported private fork may have added columns here, and the
+    # DROP TABLE below destroys anything the copy list omits — irreversibly.
+    # Each unknown column is re-added to the new table from its own PRAGMA
+    # declaration (name/type/notnull/default) and its data copied. The one
+    # shape ADD COLUMN cannot carry — NOT NULL with no default — aborts the
+    # migration loudly instead of silently dropping the data: the fork
+    # reconciles first, nothing is lost.
+    cursor = await db.execute("PRAGMA table_info(session_ledger)")
+    live_info = await cursor.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
+    live_names = {row[1] for row in live_info}
+    extras = [row for row in live_info if row[1] not in _KNOWN_COLUMNS]
+    for row in extras:
+        if row[3] and row[4] is None:
+            raise RuntimeError(
+                "session_ledger rebuild: fork-added column "
+                f"{row[1]!r} is NOT NULL without a default, which ADD COLUMN "
+                "cannot recreate — reconcile the fork migration (add a "
+                "default or drop the constraint) before this rebuild runs"
+            )
+    if extras:
+        logger.info(
+            "session_ledger rebuild: preserving %d fork-added column(s): %s",
+            len(extras),
+            ", ".join(row[1] for row in extras),
+        )
+
     # A prior attempt may have died between CREATE and RENAME.
     await db.execute("DROP TABLE IF EXISTS session_ledger_new")
 
@@ -118,17 +171,40 @@ async def up(db: aiosqlite.Connection) -> None:
         )
         """
     )
+    for row in extras:
+        decl = _quote_ident(row[1])
+        if row[2]:
+            decl += f" {row[2]}"
+        if row[3]:
+            decl += f" NOT NULL DEFAULT {row[4]}"
+        elif row[4] is not None:
+            decl += f" DEFAULT {row[4]}"
+        await db.execute(f"ALTER TABLE session_ledger_new ADD COLUMN {decl}")
 
+    base = [
+        "id",
+        "session_id",
+        "text",
+        "status",
+        "source_ref",
+        "added_by",
+        "evidence",
+        "created_at",
+        "updated_at",
+    ]
+    extra_names = [row[1] for row in extras]
+    target_cols = [*base, "source_quote", *extra_names]
+    select_cols = [
+        *base,
+        # A partial prior attempt (or a fork) may already carry the column —
+        # copy it rather than resetting provenance to NULL.
+        "source_quote" if "source_quote" in live_names else "NULL",
+        *extra_names,
+    ]
     await db.execute(
-        """
-        INSERT INTO session_ledger_new
-            (id, session_id, text, status, source_ref, added_by,
-             evidence, source_quote, created_at, updated_at)
-        SELECT
-            id, session_id, text, status, source_ref, added_by,
-            evidence, NULL, created_at, updated_at
-        FROM session_ledger
-        """
+        f"INSERT INTO session_ledger_new ({', '.join(_quote_ident(c) for c in target_cols)}) "  # noqa: S608 — identifiers from PRAGMA, values never interpolated
+        f"SELECT {', '.join(c if c == 'NULL' else _quote_ident(c) for c in select_cols)} "
+        "FROM session_ledger"
     )
 
     await db.execute("DROP TABLE session_ledger")

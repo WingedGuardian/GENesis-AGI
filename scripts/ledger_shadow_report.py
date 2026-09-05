@@ -44,8 +44,13 @@ def _collapse_duplicates(events: list[dict]) -> list[dict]:
     """Unique proposals: fold duplicate_of chains onto their root event.
 
     Crash-recovery re-covers windows, so the same agreement can appear in
-    several runs — precision must count it once. A dangling duplicate_of
-    (root pruned) keeps the event as its own root.
+    several runs — precision must count it once. A DANGLING duplicate_of
+    (the root fell outside the loaded run window, or was pruned) still
+    groups: every descendant of one missing root shares its target id, and
+    the deduper points repeated proposals at the same oldest root — so
+    counting each descendant as its own root inflated the TP/FP denominator
+    with copies of one agreement. The first-seen descendant represents the
+    group; its text is the matcher's input either way.
     """
     by_id = {e["id"]: e for e in events}
     roots: dict[str, dict] = {}
@@ -58,7 +63,8 @@ def _collapse_duplicates(events: list[dict]) -> list[dict]:
                 break
             seen.add(nxt["id"])
             cur = nxt
-        roots.setdefault(cur["id"], cur)
+        dangling = cur.get("duplicate_of") and cur["duplicate_of"] not in by_id
+        roots.setdefault(cur["duplicate_of"] if dangling else cur["id"], cur)
     return list(roots.values())
 
 
@@ -70,6 +76,8 @@ def build_report(
     include_backfill: bool = False,
     mode: str | None = None,
     attribution_events: list[dict] | None = None,
+    attribution_runs: list[dict] | None = None,
+    ledger_complete: bool = True,
 ) -> dict:
     """Pure comparator — everything the markdown renders, as data.
 
@@ -79,8 +87,21 @@ def build_report(
     over "the newest N events" silently narrows to recent-rows-only as the
     retention-exempt attribution corpus outgrows the cap. ``None`` falls back
     to the windowed list — acceptable only for small/complete corpora (tests,
-    fresh installs); the CLI loader always passes the real set. The *runs*
-    param must include the attribution events' runs (the loader merges them).
+    fresh installs); the CLI loader always passes the real set.
+
+    *attribution_runs* are those events' run rows, passed SEPARATELY from
+    *runs* on purpose: they exist so the leak verdict can judge write-time
+    mode however old the promotion is, and folding them into *runs* put
+    event-less old runs inside the health statistics — an old-only session
+    extended the FN horizon past its loaded events and accrued false
+    negatives, and the headline described more runs than its event
+    population covers. They feed mode judgment and event classification
+    only, never the metric populations.
+
+    *ledger_complete* is the loader's word that *ledger_rows* is the WHOLE
+    table. The leak invariant convicts on absence, so over a partial or
+    failed ledger read the verdict is NOT ISSUED (``leak_invariant_ok`` is
+    ``None``) rather than vacuously HELD.
 
     *mode* selects how the leak invariant is judged; ``None`` reads the live
     config. It is a parameter because a hardcoded read is unredirectable, which
@@ -118,7 +139,11 @@ def build_report(
     #   - its run has another prompt version -> legacy corpus
     #   - its run was not loaded at all      -> outside the query window; a
     #     fact about OUR read (caps, retention), not about the event.
-    all_runs_by_id = {r["run_id"]: r for r in runs}
+    # Attribution runs join the LOOKUP (mode judgment, event classification)
+    # but never the populations above — live_runs/legacy_runs were filtered
+    # from *runs* alone, which is what keeps event-less old runs out of the
+    # histogram, the latency percentiles, and the FN horizon.
+    all_runs_by_id = {r["run_id"]: r for r in [*runs, *(attribution_runs or [])]}
     backfill_events = []
     legacy_events = []
     window_orphan_events = []
@@ -233,7 +258,10 @@ def build_report(
     extractor_rows = [
         r for r in ledger_rows if r.get("added_by") == "ambient_ledger_extractor"
     ]
-    run_mode = {r["run_id"]: (r.get("mode") or "shadow") for r in runs}
+    run_mode = {
+        r["run_id"]: (r.get("mode") or "shadow")
+        for r in [*runs, *(attribution_runs or [])]
+    }
     # ATTRIBUTION IS NEVER READ THROUGH THE WINDOWED SCAN. The precision
     # populations above are windowed by design; the leak invariant is not a
     # population metric — it is a verdict, and a verdict computed over "the
@@ -319,6 +347,14 @@ def build_report(
         "extractor rows are legitimate only if promoted by a run in live mode "
         "AND carrying their source quote"
     )
+    # The invariant convicts on ABSENCE (a row no event claims), so it can
+    # only be judged over the complete ledger. A failed or partial ledger
+    # read yields an empty/short extractor_rows list, which reads as HELD —
+    # the exact vacuous all-clear this verdict exists to prevent. Tri-state:
+    # True held, False violated, None not issued.
+    leak_ok: bool | None = (len(leaks) == 0) if ledger_complete else None
+    if not ledger_complete:
+        leak_label += " — VERDICT NOT ISSUED: ledger read failed or incomplete"
 
     return {
         "n_runs": n_runs,
@@ -353,7 +389,7 @@ def build_report(
         "legacy_events": legacy_events,
         "window_orphan_events": window_orphan_events,
         "n_attributed_run_missing": len(attributed_run_missing),
-        "leak_invariant_ok": len(leaks) == 0,
+        "leak_invariant_ok": leak_ok,
         "leak_invariant_label": leak_label,
         "leak_mode": mode,
         "ambient_leaks": leaks,
@@ -364,6 +400,13 @@ def build_report(
 
 def _fmt_rate(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
+
+
+def _leak_verdict(ok: bool | None) -> str:
+    """Tri-state: a verdict the data cannot support is stated as such."""
+    if ok is None:
+        return "NOT ISSUED — ledger read failed or incomplete"
+    return "HELD" if ok else "VIOLATED — INVESTIGATE"
 
 
 def render_md(report: dict, *, generated_at: str) -> str:
@@ -393,7 +436,7 @@ def render_md(report: dict, *, generated_at: str) -> str:
         f" failure rate {_fmt_rate(report['failure_rate'])};"
         f" latency p50/p90 {report['latency_p50_ms']}/{report['latency_p90_ms']} ms",
         f"- **Leak invariant** ({report['leak_invariant_label']}):"
-        f" {'HELD' if report['leak_invariant_ok'] else 'VIOLATED — INVESTIGATE'}"
+        f" {_leak_verdict(report['leak_invariant_ok'])}"
         f"  ·  extractor rows: {report['n_extractor_rows']}"
         + (
             f"  ·  attributed, run row missing "
@@ -465,7 +508,7 @@ def render_md(report: dict, *, generated_at: str) -> str:
         # sibling sections do.
         for ev in report["window_orphan_events"][:100]:
             lines.append(f"- `{ev['session_id'][:8]}` [{ev['kind']}] {ev['text']}")
-    if not report["leak_invariant_ok"]:
+    if report["leak_invariant_ok"] is False:
         lines += ["", "## LEAK INVARIANT VIOLATION", ""]
         for row in report["ambient_leaks"]:
             lines.append(f"- `{row['session_id'][:8]}` row {row['id']}: {row['text']}")
@@ -473,11 +516,16 @@ def render_md(report: dict, *, generated_at: str) -> str:
     return "\n".join(lines)
 
 
-async def _load(db_path: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+async def _load(
+    db_path: str,
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], bool]:
     """Read runs/events/ledger via the CRUD layer (RO connection).
 
     Failures are LOUD (stderr): a silently-empty table would make the
-    leak-invariant check vacuously HELD and the metrics meaningless.
+    leak-invariant check vacuously HELD and the metrics meaningless — and the
+    ledger read carries an explicit completeness flag for exactly that
+    reason, so build_report refuses the verdict instead of holding it
+    vacuously.
     """
     import aiosqlite
 
@@ -511,20 +559,33 @@ async def _load(db_path: str) -> tuple[list[dict], list[dict], list[dict], list[
                 f"ledger_shadow_report: joined event read failed: {exc}",
                 file=sys.stderr,
             )
-        ledger = await _all(ledger_all, "session_ledger", limit=10000)
+        # ledger_all is COMPLETE (keyset-paginated; raises past its tripwire
+        # rather than truncating). The flag says whether the read actually
+        # delivered the whole table — the leak verdict convicts on absence,
+        # so it is issued only over a complete corpus.
+        ledger: list[dict] = []
+        ledger_complete = False
+        try:
+            ledger = await ledger_all(db)
+            ledger_complete = True
+        except Exception as exc:
+            print(
+                f"ledger_shadow_report: session_ledger read failed: {exc}",
+                file=sys.stderr,
+            )
         # The ATTRIBUTION set is loaded by its key, never through the windows
-        # above: the leak verdict must see every promoted event however old,
-        # and its run rows are merged in so mode judgment never depends on the
-        # capped run window either.
+        # above: the leak verdict must see every promoted event however old.
+        # Its run rows travel SEPARATELY — build_report uses them for mode
+        # judgment only; merging them into `runs` put event-less old runs
+        # inside the health statistics and the FN horizon.
         attribution: list[dict] = []
+        attr_runs: list[dict] = []
         try:
             from genesis.db.crud.session_ledger_shadow import (
                 list_promoted_events_with_runs,
             )
 
             attribution, attr_runs = await list_promoted_events_with_runs(db)
-            known = {r["run_id"] for r in runs}
-            runs.extend(r for r in attr_runs if r["run_id"] not in known)
         except Exception as exc:
             # LOUD, and fail toward the windowed fallback (which convicts
             # MORE, never less) rather than a silent all-clear.
@@ -533,10 +594,11 @@ async def _load(db_path: str) -> tuple[list[dict], list[dict], list[dict], list[
                 file=sys.stderr,
             )
             attribution = []
+            attr_runs = []
         # the comparator wants both oldest-first
         runs.sort(key=lambda r: r.get("started_at") or "")
         events.sort(key=lambda e: e.get("observed_at") or "")
-        return runs, events, ledger, attribution
+        return runs, events, ledger, attribution, attr_runs, ledger_complete
 
 
 def main() -> None:
@@ -549,13 +611,17 @@ def main() -> None:
     from genesis.env import genesis_db_path
 
     db_path = args.db or str(genesis_db_path())
-    runs, events, ledger, attribution = asyncio.run(_load(db_path))
+    runs, events, ledger, attribution, attr_runs, ledger_complete = asyncio.run(
+        _load(db_path)
+    )
     report = build_report(
         runs,
         events,
         ledger,
         include_backfill=args.include_backfill,
         attribution_events=attribution or None,
+        attribution_runs=attr_runs or None,
+        ledger_complete=ledger_complete,
     )
     now = datetime.now(UTC)
     md = render_md(report, generated_at=now.isoformat())
@@ -570,7 +636,8 @@ def main() -> None:
         f"unique={report['n_unique_agreements']} runs={report['n_runs']} "
         f"prompt={report['prompt_version']} "
         f"excluded_other_version={report['n_runs_excluded_other_version']} "
-        f"leak_invariant={'HELD' if report['leak_invariant_ok'] else 'VIOLATED'}"
+        f"leak_invariant="
+        f"{ {True: 'HELD', False: 'VIOLATED', None: 'NOT_ISSUED'}[report['leak_invariant_ok']] }"
     )
     print(f"report: {out}")
 
