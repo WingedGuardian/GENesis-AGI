@@ -555,6 +555,22 @@ def _probe_root(root: Path, reads: _Reads, health: InjectionHealth) -> bool:
     return True
 
 
+def _genesis_saw_recent_session(reads: _Reads, cutoff: float) -> bool:
+    """Did THIS install's own session store record a live CC session in-window?
+
+    ``last_prompt_time`` is rewritten on every prompt of every foreground
+    session, so a fresh mtime here is Genesis's own evidence that CC ran —
+    independent of CC's directory layout, which is the whole point: it is the
+    half of the freshness comparison that a CC update cannot move.
+    """
+    with reads.unreported():  # absent files are the norm (dispatched sessions)
+        for d in reads.listdir(_genesis_sessions_dir()):
+            st = reads.stat(d / "last_prompt_time")
+            if st is not None and st.st_mtime >= cutoff:
+                return True
+    return False
+
+
 def _note_blind_scan(
     projects_dirs: tuple[Path, ...], reads: _Reads, health: InjectionHealth, *, what: str
 ) -> None:
@@ -692,6 +708,7 @@ def _collect_sync(
     roots_usable = 0
     in_scope_projects = 0
     tool_results_seen = 0
+    fresh_in_scope_entries = 0
     for root in projects_dirs:
         if not _probe_root(root, reads, health):
             continue
@@ -705,6 +722,18 @@ def _collect_sync(
                 if not in_scope:
                     scope.enter_context(reads.unreported())
                 for session in reads.listdir(project):
+                    if in_scope:
+                        # Freshness evidence for the FOURTH blindness granularity
+                        # below. A session entry is a transcript file or a session
+                        # directory; a live session appends to its transcript, so
+                        # its mtime moves. Unreported: the stat only feeds the
+                        # coverage discriminator, and any real read failure on
+                        # this same entry is reported by the listdir/stat a few
+                        # lines down.
+                        with reads.unreported():
+                            st_e = reads.stat(session)
+                        if st_e is not None and st_e.st_mtime >= cutoff:
+                            fresh_in_scope_entries += 1
                     tool_results = session / "tool-results"
                     if in_scope:
                         # UNREPORTED: this probe only feeds the blindness counter
@@ -759,6 +788,25 @@ def _collect_sync(
             reads,
             health,
             what="held no tool-results directory under any session of this install",
+        )
+    elif not fresh_in_scope_entries and _genesis_saw_recent_session(reads, cutoff):
+        # The three checks above are EXISTENCE checks, and CC's projects tree is
+        # retained indefinitely — so after a CC update moves new sessions to a
+        # different slug or layout, the fossil directories keep all three
+        # satisfied forever while every current session runs outside the scan.
+        # The discriminator that catches it without paging a quiet install:
+        # Genesis's own store says a session was live inside the lookback, yet
+        # NOTHING under any in-scope project moved in that window. Both fresh →
+        # healthy; both stale → idle install, healthy; Genesis fresh + CC view
+        # fossil → the scan is looking at the past, and must not resolve.
+        _note_blind_scan(
+            projects_dirs,
+            reads,
+            health,
+            what=(
+                "showed no session activity inside the lookback under any in-scope "
+                "project, while this install's own session store recorded a live session"
+            ),
         )
 
     fresh.sort(key=lambda t: t[0], reverse=True)  # newest first

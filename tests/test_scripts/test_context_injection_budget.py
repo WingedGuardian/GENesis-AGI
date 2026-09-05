@@ -151,8 +151,15 @@ def _run_raw(tmp_path: Path, *args: str, sid: str = "11111111-2222-3333-4444-555
 
 
 def test_explicit_all_emits_every_part_for_tests_and_manual_runs(tmp_path):
-    """`all` is reachable ONLY by explicit request — never as a fallback."""
-    r = _run_raw(tmp_path, "--part", "all")
+    """`all` is reachable ONLY by explicit request — never as a fallback.
+
+    Run WITHOUT a session id: that is the manual/test shape. A live session
+    payload plus `all` is now a mis-wire (see
+    test_all_with_a_live_session_payload_degrades_to_charter_and_screams) —
+    a hook invocation always carries a session_id, a person at a terminal
+    need not.
+    """
+    r = _run_raw(tmp_path, "--part", "all", sid="")
     assert "_[ctx all:" in r.stdout
 
 
@@ -738,3 +745,53 @@ def test_a_long_session_id_does_not_clip_the_audit_line(tmp_path, monkeypatch, c
     assert audit.endswith("]_"), f"audit line clipped: …{audit[-80:]!r}"
     assert str(mirror) in audit, "the mirror pointer is the part that must survive"
     assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
+
+
+def test_all_with_a_live_session_payload_degrades_to_charter_and_screams(tmp_path):
+    """`--part all` is a manual/test path — a REAL session must never get it.
+
+    `all` grants ONE hook entry the four-part sum (39,200 units), so a wiring
+    edit that passes `--part all` recreates the original whole-payload filing —
+    and the old code accepted it silently, with `miswired` empty, so neither the
+    in-band alert nor the miswire log said anything. The discriminator is the
+    payload: a hook invocation always carries a session_id; the manual/test path
+    does not have to. With a live id, `all` now degrades exactly like any other
+    mis-wire: charter only, loud, in-band.
+    """
+    sid = "11111111-2222-3333-4444-555555555555"
+    r = _run_raw(tmp_path, "--part", "all", sid=sid)
+    assert "_[ctx charter:" in r.stdout
+    for other in ("identity-core", "identity-user", "knowledge"):
+        assert f"_[ctx {other}:" not in r.stdout, f"{other} leaked into a mis-wired all"
+    assert len(r.stdout) <= _ctx._PART_BUDGET
+    assert "MIS-WIRED" in r.stderr
+
+
+def test_a_malformed_probe_value_does_not_silence_the_injection(tmp_path):
+    """A typo in GENESIS_CTX_PROBE_BYTES must not erase the whole window.
+
+    The env var is inherited by all four SessionStart entries, so the old
+    `except ValueError: return` turned one stale exported value into four empty
+    parts — charter, identity and knowledge all gone, with no audit line and no
+    miswire record: the silent-loss class this whole branch exists to kill,
+    reachable by a shell typo. A malformed value now warns on stderr and falls
+    through to NORMAL injection; probe mode engages only on a valid integer.
+    """
+    (tmp_path / ".genesis").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".genesis" / "cc_context_enabled").touch()
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPTS_DIR / "genesis_session_context.py"), "--part", "charter"],
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(tmp_path),
+            "PATH": "/usr/bin:/bin",
+            "GENESIS_CTX_PROBE_BYTES": "10k",  # a human wrote this, not a probe
+        },
+        input="{}",
+        timeout=60,
+    )
+    assert r.returncode == 0, r.stderr[-400:]
+    assert "_[ctx charter:" in r.stdout, "a malformed probe value silenced the whole part"
+    assert "PROBE" in r.stderr, "the malformed value must be reported, not ignored"
+    assert "PROBE-START" not in r.stdout, "probe mode must not engage on garbage"

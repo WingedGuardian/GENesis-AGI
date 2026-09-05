@@ -14,6 +14,7 @@ filing it cannot attribute.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1445,3 +1446,63 @@ def test_real_probe_shapes_are_still_excluded(tmp_path):
     h = _collect(tmp_path)
     assert h.probe_filings == 3, (h.probe_filings, [f for f in h.fresh_filings])
     assert not h.fresh_filings
+
+
+def _aged(path: Path, hours: float) -> None:
+    ts = time.time() - hours * 3600
+    os.utime(path, (ts, ts))
+
+
+def test_lifetime_directories_do_not_satisfy_the_coverage_check(tmp_path, monkeypatch):
+    """The fourth granularity: coverage needs FRESH evidence, not fossils.
+
+    CC's projects tree is retained indefinitely, so after a CC update moves new
+    sessions to a different slug or results layout, the OLD directories keep
+    every existence-based counter satisfied forever: roots usable, in-scope
+    projects present, tool-results present — and the watcher resolves its alert
+    as healthy while every CURRENT session runs outside the scan. The
+    discriminator that catches this without paging a quiet-but-healthy install:
+    Genesis's own session store says a CC session was live inside the lookback
+    (a fresh last_prompt_time), while NOTHING under any in-scope project moved
+    in that window. Both halves fresh -> healthy; both stale -> idle install,
+    healthy; Genesis fresh + CC view fossil -> blind.
+    """
+    home = tmp_path / "inuse"
+    sess = home / ".genesis" / "sessions" / "sess-live"
+    sess.mkdir(parents=True)
+    (sess / "last_prompt_time").write_text("2026-09-05T00:00:00+00:00")  # FRESH mtime
+    monkeypatch.setenv("HOME", str(home))
+
+    projects = tmp_path / "projects"
+    old = _file(projects, name="hook-old-stdout.txt", age_h=200.0)  # fossil filing
+    # Age the whole in-scope tree: nothing under the project moved in the window.
+    for p in (old.parent, old.parent.parent, old.parent.parent.parent):
+        _aged(p, 200.0)
+
+    h = _collect(projects)
+    assert h.errors, "a fossil tree read as live coverage — the blind resolve is back"
+    assert any("CANNOT BE TREATED AS ALL-CLEAR" in f for f in ci.derive_findings(h))
+
+
+def test_an_idle_install_with_a_fossil_tree_stays_quiet(tmp_path, monkeypatch):
+    """Control: no fresh Genesis session -> a stale CC view is NOT blindness.
+
+    Without this cell the fourth granularity is 'alert whenever quiet', which
+    gets the watcher muted — the failure that buried the original incident.
+    """
+    home = tmp_path / "inuse"
+    sess = home / ".genesis" / "sessions" / "sess-idle"
+    sess.mkdir(parents=True)
+    lpt = sess / "last_prompt_time"
+    lpt.write_text("2026-08-01T00:00:00+00:00")
+    _aged(lpt, 200.0)  # Genesis saw nothing recent either
+    monkeypatch.setenv("HOME", str(home))
+
+    projects = tmp_path / "projects"
+    old = _file(projects, name="hook-old-stdout.txt", age_h=200.0)
+    for p in (old.parent, old.parent.parent, old.parent.parent.parent):
+        _aged(p, 200.0)
+
+    h = _collect(projects)
+    assert not h.errors, h.errors
+    assert not ci.derive_findings(h)

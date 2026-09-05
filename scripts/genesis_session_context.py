@@ -621,11 +621,22 @@ def _emit_body() -> tuple[str, str, str] | None:
             # any real probe (the cap being measured is ~10k).
             _n = max(0, min(int(_probe), _PROBE_MAX_CHARS))
         except ValueError:
+            # A malformed value must not SILENCE the injection: this env var is
+            # inherited by all four SessionStart entries, so `return` here
+            # turned one shell typo into four empty parts — no charter, no
+            # identity, no audit line, no miswire record. Warn and fall through
+            # to normal injection; probe mode engages only on a valid integer.
+            print(
+                f"genesis_session_context: ignoring malformed GENESIS_CTX_PROBE_BYTES={_probe!r} "
+                "(not an integer) — emitting the normal injection instead of a probe",
+                file=sys.stderr,
+            )
+            _probe = None
+        if _probe is not None:
+            _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
+            sys.stdout.write("PROBE-START " + _ch * _n + " PROBE-END")
+            sys.stdout.flush()
             return
-        _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
-        sys.stdout.write("PROBE-START " + _ch * _n + " PROBE-END")
-        sys.stdout.flush()
-        return
 
     # Eject lever: flag file absent → no Genesis context
     if not _FLAG.exists():
@@ -683,7 +694,16 @@ def _emit_body() -> tuple[str, str, str] | None:
             requested = sys.argv[sys.argv.index("--part") + 1]
         except IndexError:
             requested = ""
-        if requested in (*_PARTS, "all"):
+        if requested == "all" and _hook_session_id:
+            # `all` is a MANUAL/TEST path and is never wired: it grants one hook
+            # entry the four-part sum, so wiring drifting to `--part all` on a
+            # real session recreates the original whole-payload filing — with
+            # `miswired` empty, i.e. the original bug with its alarm disabled.
+            # A hook invocation always carries a session_id; that is the
+            # discriminator. Degrade exactly like any other mis-wire: loud,
+            # charter only, in budget.
+            miswired = "--part all with a live session payload (all is manual/test only)"
+        elif requested in (*_PARTS, "all"):
             part = requested
         else:
             miswired = f"--part {requested!r} is not one of {(*_PARTS, 'all')}"
