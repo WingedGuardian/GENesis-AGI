@@ -240,6 +240,17 @@ the procedure (step 5).
    Run `scripts/check_cc_running_versions.sh` here too: after `update.sh` replaces the binary,
    every session open across the deploy is still mapped to the previous one, so post-deploy
    validation done in an un-relaunched session re-checks the version you just moved away from.
+   **Confirm the pin can still hold.** `update.sh` re-asserts auto-updater suppression
+   automatically (via `cc_ensure_local` → `cc_ensure_updater_suppressed`), so watch its output for
+   a `! CC auto-updater suppression was MISSING` line — that means something on this machine
+   rewrote `~/.claude/settings.json`, and a repeat is worth investigating rather than letting it
+   be silently re-repaired every run. To check by hand on either machine:
+   ```bash
+   python3 -c "import json,os;p=os.path.expanduser('~/.claude/settings.json');e=(json.load(open(p)) if os.path.exists(p) else {}).get('env',{});print({k:e.get(k) for k in ('DISABLE_AUTOUPDATER','DISABLE_UPDATES')})"
+   ```
+   Both must read `1`. A missing file, or either key `None`, means **not suppressed** — and a pin
+   with an un-suppressed auto-updater is not a pin. See §Auto-Updater Suppression Requires
+   User-Level Settings.
 10. **Leverage + capture.** For each newly-available capability Genesis would want, file the
     detection→behavior follow-up. Store what was learned to memory + this doc + the KB so the next
     update executes rather than rediscovers.
@@ -845,14 +856,102 @@ project directory. The auto-updater runs in contexts where repo settings don't a
 **user-level** `~/.claude/settings.json` on every machine running Genesis (container
 + host VM). This is the file with authority for global CC behavior.
 
-**Automated:** `scripts/install.sh` and `scripts/host-setup.sh` now create or merge
-these env vars into `~/.claude/settings.json` during setup (preserving any existing
-keys). Fresh installs no longer need manual intervention.
+**Automated — and re-asserted on every align, not just at setup.** Both keys are owned
+by one shared function, **`cc_ensure_updater_suppressed`** (`scripts/lib/cc_version.sh`):
 
-This file is per-machine and NOT tracked in the repo. Without the install-script
-automation, CC silently bumps versions out from under us — we discovered this when
-the host VM was running 2.1.119 despite the 2.1.87 script pin, and again mid-session
-when the container auto-updated from 2.1.159 to 2.1.160.
+- `scripts/install.sh` (container) and `scripts/host-setup.sh` (host) call it at setup —
+  it creates `~/.claude/settings.json` when absent and merges into an existing one,
+  preserving every other key.
+- **`cc_ensure_local` calls it FIRST on every align** — i.e. on every `install.sh`,
+  `bootstrap.sh`, and `update.sh` run. Deliberately ahead of the pin/npm checks, because
+  the common path is "already at pin", which returns early, and that steady state is
+  exactly when settings drift would otherwise go unnoticed.
+- **A dedicated daily timer makes it RECURRING** — `genesis-cc-settings-align.timer`
+  (`scripts/cc_settings_align.sh`). Container-side, its own unit, deliberately NOT folded
+  into `genesis-cc-align.timer`: that one is **host-only by contract** and its unit is
+  hardened on that basis, so a container-side filesystem write there would invalidate both
+  the contract and the sandbox rationale. A dedicated unit also means its status carries
+  exactly one meaning — "suppression verified or not" — with no other work to conflate it
+  with, so it can fail loudly without muddying an unrelated outcome.
+  This matters because the align path only helps a box that RUNS an align: measured on a
+  live install, `update.sh` had not run for **14 days**, which is precisely the window in
+  which a drifted settings file stays silently unprotected.
+- **A non-ok outcome reaches health, not just the log** — the function sets
+  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed` / `contended` / `unverified`),
+  `update.sh` folds anything other than `ok` into `HOST_CC_DEGRADED` → `update_history` →
+  deploy health (the same channel a *version* sync failure uses), and the **service**
+  (`genesis-cc-settings-align.service`, driven by the timer of the same name) exits
+  non-zero so the unit enters `failed` — visible in
+  `systemctl --user status genesis-cc-settings-align.service`. `ok` and `repaired` are EARNED, never defaulted: the state starts `unverified` at
+  function entry and is promoted only where a post-operation READ confirms both keys
+  (the reconciler's re-read; the python3-less create's grep-back of its own literals;
+  the read-only check the align timer runs even when another run holds the write
+  lock). A path added later that sets nothing therefore reports `unverified`, which
+  every consumer treats as not-ok — fail closed by construction, not by review.
+  Every path that did not
+  positively verify suppression exits non-zero, including the structural ones (no lock,
+  library missing, function renamed away): a run that checked nothing must never report
+  success, or the unit becomes a green light for an unguarded updater.
+- **The write is a compare-and-swap, not a blind replace.** `settings.json` is rewritten by
+  OTHER processes — CC itself persists it on a `/config` change or a permission grant
+  (MEASURED: modified mid-session while several CC sessions were live). `os.replace` is
+  atomic for *readers* but is not a CAS, so a stale in-memory copy would silently revert a
+  concurrent writer. The helper re-checks file identity immediately before the rename and
+  retries the whole read-modify instead of clobbering, with a short randomized backoff so
+  the three attempts do not all land inside one contended window. Ownership, mode and
+  xattrs are carried across (a fresh inode would otherwise widen a credential-bearing
+  file), and the write is `fsync`ed before the rename.
+
+  **POSIX ACLs are carried, not refused.** `shutil.copystat` reproduces
+  `system.posix_acl_access` on the replacement inode for the file's owner (MEASURED on
+  ext4/CPython 3.12; setting that xattr does not require privilege). An earlier revision
+  refused to write at all when an ACL was present, assuming a rename could not preserve
+  one — a false premise with a severe cost: a *default* ACL on `$HOME` or `~/.claude`
+  (routine on NFS and corporate images) gives every file created inside one, so the
+  reconciler would never write, suppression would never be established, and the timer would
+  fail daily forever with no self-heal. The carry is now VERIFIED after the copy and the
+  write abandoned only if it genuinely did not survive.
+
+  The replacement also gets a fresh mtime (`os.utime`) rather than the source's. `copystat`
+  carries times too, which would restore the pre-write timestamp and hide the repair from
+  every mtime+size change detector — measured: a same-length value correction left size and
+  mtime byte-identical. A file this thing rewrote must look rewritten, not least because
+  the remediation advice below starts with comparing timestamps.
+  **Residual, stated honestly:** the few syscalls between the final check and the rename are
+  irreducible without a lock the other writers do not take. A single run therefore cannot
+  prove persistence — a **repeat `repaired` across timer ticks** is the real "something on
+  this machine keeps rewriting settings.json" signal, and the timer gives that signal a
+  receiver: it remembers the previous outcome and **fails the unit on the second
+  consecutive repair**. Without that the signal existed only as identical journal lines in
+  a unit that stayed green, precisely during the long gaps between deploys when
+  `update.sh` (the other consumer of the state) is not running at all.
+
+It is idempotent and silent when correct, and **loud when it repairs drift**
+(`! CC auto-updater suppression was MISSING in … — restored: …` on stderr, so it shows
+up in update/bootstrap output). It never overwrites a settings file it cannot parse —
+a corrupt or foreign file is reported and left alone, since destroying operator settings
+is worse than the drift.
+
+**Why the re-assert exists (2026-08-26):** setup-time-only was not enough. This install
+was found with `DISABLE_AUTOUPDATER=1` present but **`DISABLE_UPDATES` missing** from the
+user-level file, and nothing in the recurring paths (`update.sh`, `genesis-cc-align.timer`,
+`cc_version.sh`) re-checked it — so a drifted install stayed silently unprotected and the
+pin could be violated with no signal. The npm pin only governs what a *deliberate* install
+writes; these two keys are what stop CC moving on its own.
+
+This file is per-machine and NOT tracked in the repo. Without this automation CC silently
+bumps versions out from under us — discovered when the host VM was running 2.1.119 despite
+the 2.1.87 script pin, and again mid-session when the container auto-updated from 2.1.159
+to 2.1.160.
+
+**Known coverage gap (the HOST's `settings.json` only):** the container is reconciled on
+every align *and* daily via `genesis-cc-settings-align.timer` (above). The host's
+user-level file is written by `host-setup.sh` at setup, and `genesis-cc-align.timer`
+re-aligns the host's CC *version* through the guardian gateway but cannot reach the host's
+`settings.json` — there is no gateway op for it. So
+host *version* drift self-heals nightly, host *settings* drift does not: re-run
+`host-setup.sh`, or check the file by hand, if the host is ever suspected of
+self-updating.
 
 ### Cache Inflation (since ~2.1.100, accepted)
 
