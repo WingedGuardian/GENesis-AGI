@@ -43,10 +43,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   own working directory, so their transcripts accumulated under the interactive
   project and surfaced in Claude Code's `--resume` list — previewing as
   injected hook text, since they contain no human prompt. The runner now uses
-  the same out-of-repo working directory as dispatched background sessions,
-  which both keeps the resume picker clean and stops the project's
-  session-start hooks from injecting kilobytes of context into calls that
-  cannot use it.
+  a dedicated out-of-repo working directory of its own — deliberately not the
+  one dispatched background sessions share, since those retain write tools
+  and a compromised one could otherwise plant project instructions where
+  every later judge would load them. This keeps the resume picker clean,
+  stops the project's session-start hooks from injecting kilobytes of context
+  into calls that cannot use it, and denies the judges every built-in tool
+  outright.
 
 - **Two branches that each add a changelog entry no longer collide over it.**
   This file is an append-only list of independent bullets, so two branches

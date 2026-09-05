@@ -32,6 +32,14 @@ def seed_theme(
     save_state(session_id, s, base=sessions_root)
 
 
+@pytest.fixture()
+def production_dirs():
+    """The UNPATCHED module constants, for invariant tests. Captured from
+    the modules before the autouse hermetic fixture below re-points them
+    (fixture ordering: this one reads the originals at import scope)."""
+    return dict(_PRODUCTION_DIRS)
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_background_session_dir(tmp_path, monkeypatch):
     """Keep every headless spawn's cwd out of the real HOME.
@@ -41,7 +49,20 @@ def _hermetic_background_session_dir(tmp_path, monkeypatch):
     keeps the whole suite hermetic instead of provisioning a real
     ``~/.genesis/background-sessions`` on every test machine."""
     import genesis.cc.types as _cc_types
+    import genesis.session_awareness.headless as _headless
 
     monkeypatch.setattr(
         _cc_types, "_BACKGROUND_SESSION_DIR", tmp_path / "bg-sessions"
     )
+    monkeypatch.setattr(_headless, "_AMBIENT_JUDGE_DIR", tmp_path / "ambient-judges")
+
+
+# Captured at import time — before any fixture patches the modules — so the
+# production_dirs fixture hands tests the REAL constants, not tmp paths.
+import genesis.cc.types as _cc_types_orig  # noqa: E402
+import genesis.session_awareness.headless as _headless_orig  # noqa: E402
+
+_PRODUCTION_DIRS = {
+    "background": _cc_types_orig._BACKGROUND_SESSION_DIR,
+    "judge": _headless_orig._AMBIENT_JUDGE_DIR,
+}
