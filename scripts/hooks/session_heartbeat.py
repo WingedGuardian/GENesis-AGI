@@ -494,3 +494,140 @@ def throttle_ok(
                 fcntl.flock(fh, fcntl.LOCK_UN)
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Roster identity helpers -- stdlib-only, called ONLY where a heartbeat write
+# already happens (behind throttle_ok / per prompt), so their cost rides a
+# path that is already paying for a sqlite connect.
+# ---------------------------------------------------------------------------
+
+
+def claude_ancestor_pid(
+    start_pid: int | None = None, proc_root: str = "/proc"
+) -> int | None:
+    """The owning ``claude`` session pid for this hook process, or None.
+
+    Hooks run as ``claude -> launcher shell -> python`` (the launcher execs, but
+    CC's own hook command runs through a shell), so ``claude`` is an ANCESTOR,
+    not necessarily the parent -- walk the ppid chain to the first
+    ``comm == "claude"``. Deliberately duplicated from
+    ``scripts/genesis_urgent_alerts.py::_claude_ancestor_pid`` rather than
+    imported: that module has module-scope side effects, and this one must stay
+    a dependency-free leaf. ``/proc/<pid>/{comm,stat}`` are world-readable (no
+    ptrace gate). Bounded walk (never loops on a cycle); fail-open None on any
+    read/parse failure. The stat parse splits after the LAST ``')'`` because
+    comm is parenthesised and may itself contain spaces or ``')'``.
+    """
+    try:
+        pid = start_pid if start_pid is not None else os.getppid()
+        for _ in range(16):
+            if not isinstance(pid, int) or pid <= 1:
+                return None
+            base = Path(proc_root) / str(pid)
+            comm = (base / "comm").read_text().strip()
+            if comm == "claude":
+                return pid
+            stat = (base / "stat").read_text()
+            after = stat.rsplit(")", 1)[1].split()
+            ppid = int(after[1])
+            if ppid == pid:
+                return None
+            pid = ppid
+        return None
+    except Exception:
+        return None
+
+
+def proc_start_iso(pid: int, proc_root: str = "/proc") -> str | None:
+    """Wall-clock start time of a pid as ISO-8601 UTC, or None.
+
+    starttime is field 22 of ``/proc/<pid>/stat`` (in clock ticks after the
+    comm field), anchored to btime from ``/proc/stat``. Same math as
+    ``genesis.observability.cc_slots.read_proc_start_iso`` -- duplicated here
+    because this module must not import genesis (stdlib-only hook leaf).
+    Written as a PAIR with pid so a reader can reject a recycled pid.
+    """
+    try:
+        stat = (Path(proc_root) / str(pid) / "stat").read_text()
+        fields = stat.rsplit(")", 1)[1].split()
+        ticks = int(fields[19])  # starttime = stat field 22; 20th after comm
+        btime = None
+        for line in (Path(proc_root) / "stat").read_text().splitlines():
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+        if btime is None:
+            return None
+        hz = os.sysconf("SC_CLK_TCK")
+        epoch = btime + ticks / hz
+        from datetime import UTC, datetime
+
+        return datetime.fromtimestamp(epoch, tz=UTC).isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+def resolve_git_branch(cwd: str) -> str | None:
+    """The branch of ``cwd``'s repository, by pure file reads -- no subprocess.
+
+    Walks UP from cwd (bounded) to the first ``.git`` entry; a ``.git`` FILE is
+    a linked worktree's ``gitdir:`` indirection (resolved relative to the dir
+    holding it); reads HEAD there. Returns the branch name (only the
+    ``refs/heads/`` prefix stripped -- branch names contain ``/``), ``""`` for
+    KNOWN-no-branch (detached HEAD, or not a repo at all), and None when
+    resolution FAILED (unreadable, malformed) -- the table's three-valued
+    contract depends on that distinction.
+    """
+    try:
+        if not cwd:
+            return None
+        p = Path(cwd)
+        if not p.is_dir():
+            return None
+        for _ in range(30):
+            entry = p / ".git"
+            if entry.is_dir():
+                gitdir = entry
+                break
+            if entry.is_file():
+                # BOUNDED read: both this file and HEAD below are inside a
+                # directory the session cd'd into — a cloned third-party repo
+                # is a normal workflow, so their content is attacker-
+                # influenced, and an unbounded read_text() of a crafted
+                # multi-GB file is an allocation this zero-swap box cannot
+                # absorb (security review). 512B covers any legitimate
+                # gitdir line with room to spare.
+                with open(entry, "rb") as fh:
+                    first = fh.read(512).decode("utf-8", "replace")
+                first = first.splitlines()[0].strip() if first else ""
+                if not first.startswith("gitdir:"):
+                    return None
+                target = first[len("gitdir:"):].strip()
+                if not target or len(target) >= 480:
+                    return None  # truncated-by-bound or empty: unknown
+                gitdir = (entry.parent / target).resolve()
+                break
+            if p.parent == p:
+                return ""  # walked to filesystem root: known not-a-repo
+            p = p.parent
+        else:
+            # Depth bound exhausted before reaching a .git OR the root: we
+            # gave up, we did not learn anything — per the three-valued
+            # contract that is a failed resolution, not a known no-branch.
+            return None
+        with open(gitdir / "HEAD", "rb") as fh:
+            head = fh.read(512).decode("utf-8", "replace")
+        head = head.splitlines()[0].strip() if head else ""
+        if head.startswith("ref: "):
+            ref = head[len("ref: "):]
+            if ref.startswith("refs/heads/"):
+                branch = ref[len("refs/heads/"):]
+                # A branch name this long is not a value we accept — the
+                # store gets None (unknown), never a silent truncation
+                # (select-don't-amputate; render caps at 40 anyway).
+                return branch if 0 < len(branch) <= 200 else None
+            return ""  # a ref outside heads (bisect etc.): no branch
+        return ""  # detached HEAD
+    except Exception:
+        return None

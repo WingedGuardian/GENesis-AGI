@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Concurrent-session awareness now tells live from gone — and idle from
+  dead.** Each session's heartbeat now records which OS process it belongs to,
+  its working directory and git branch; every reader derives liveness fresh
+  from the process table instead of trusting row age. The per-prompt
+  concurrent-sessions line shows it: `live` / `live-no-sock` / `gone`, the
+  branch and directory a peer is working in, and how long it has been idle —
+  an idle session in an open terminal now stays visible instead of vanishing
+  after ten minutes, and a crashed one is marked instead of lingering. The
+  line is also bounded (eight peers plus an overflow count) so a busy machine
+  cannot flood a session's context. Rows written before the upgrade render
+  honestly as identity-unknown.
+
 - **A review comment on documentation no longer blocks a merge.** The pre-merge
   check already declined to count findings on prose, but its idea of prose was
   narrow: markdown counted only underneath `docs/`, so a comment on a top-level

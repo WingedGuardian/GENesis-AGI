@@ -174,20 +174,21 @@ def main() -> None:
         # session that spends five minutes in a skipped tool must not read as
         # dead to its peers. In its own guard, because a refresh failure must
         # never cost the observation append above.
-        _maybe_refresh_heartbeat(data.get("session_id", ""))
+        _maybe_refresh_heartbeat(data.get("session_id", ""), data.get("cwd", ""))
 
 
-def _maybe_refresh_heartbeat(session_id: str) -> None:
+def _maybe_refresh_heartbeat(session_id: str, hook_cwd: str = "") -> None:
     """Bump this session's heartbeat ``updated_at``, at most once per window.
 
     WHY: ``get_active_sync`` hides any row older than 10 minutes, and the only
     other writer is UserPromptSubmit -- so a session working heads-down for
     twenty minutes DISAPPEARS from every peer's awareness while it is busiest.
 
-    ``updated_at`` ONLY. Passing no other field is a pure liveness touch because
-    the upsert's conflict clause COALESCEs every content column; that property is
-    what makes this safe, and it is pinned by
-    tests/test_db/test_session_heartbeats_upsert.py.
+    ``updated_at`` plus the roster IDENTITY fields (pid pair, cwd, branch,
+    slot) — each resolves fail-open to None, and the upsert's conflict clause
+    COALESCEs every content column, so an unknown never clears a stored value;
+    pinned by tests/test_db/test_session_heartbeats_upsert.py. Content columns
+    (topic, summaries) are still never touched here.
 
     Everything expensive sits behind ``throttle_ok`` -- including the crud import
     (order of 100 ms; measured 102/168/218 across samples), which is therefore
@@ -210,7 +211,31 @@ def _maybe_refresh_heartbeat(session_id: str) -> None:
         db_path = genesis_db_path()
         if not Path(db_path).exists():
             return
-        upsert_sync(str(db_path), cc_session_id=session_id)
+        # Identity ride-along (roster): all four resolve behind the SAME 1/60s
+        # throttle that already pays for the crud import and sqlite connect —
+        # the 99% path is still one stat(). Each fails open to None, which the
+        # upsert COALESCEs (pid+started_at move as a pair; see the crud
+        # contract comment). cwd comes from the hook payload via the caller.
+        from session_heartbeat import (
+            claude_ancestor_pid,
+            proc_start_iso,
+            resolve_git_branch,
+        )
+
+        pid = claude_ancestor_pid()
+        pid_started_at = proc_start_iso(pid) if pid else None
+        cwd = hook_cwd or None
+        git_branch = resolve_git_branch(cwd) if cwd else None
+        slot = os.environ.get("GENESIS_SLOT") or None
+        upsert_sync(
+            str(db_path),
+            cc_session_id=session_id,
+            pid=pid,
+            pid_started_at=pid_started_at,
+            cwd=cwd,
+            git_branch=git_branch,
+            slot=slot,
+        )
     except Exception:
         return  # never block the session for an awareness nicety
 
