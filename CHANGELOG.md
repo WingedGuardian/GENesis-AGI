@@ -69,6 +69,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A broken critical call site no longer falls silent after a day.** The
+  dashboard's `callsite:down` view only counted failures from the last 24
+  hours, so a slow-cadence critical site (like the weekly strategic
+  reflection) that failed its last run went quiet after a day and stayed
+  broken-and-invisible until its next attempt — the longer something was
+  broken, the quieter Genesis got. Critical sites now stay red for up to 35
+  days after a failed last run (matching the job-health floor), while
+  non-critical sites keep the tight 24h window so long-abandoned one-off
+  sites still don't nag.
 - **The pre-merge check now reads the second review bot it was already fetching.**
   Two automated reviewers comment on every pull request, and the gate that decides
   whether a change is ready to merge only understood the format of one of them. The
