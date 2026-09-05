@@ -920,6 +920,27 @@ For "does Genesis already have X", consult the subsystem map
 
 ## Adaptive Review Protocol
 
+**Review early and often DURING the build, not only at the end.** After each
+meaningful chunk of CODE — a function wired, a guard changed, a test file
+written — run the built-in `/code-review` at **low** effort. It is cheap, it
+is not a gate, and it clears nothing; its value is catching drift while the
+fix is one edit instead of a review round. (Chunks the table below rates
+"None" — docs, mechanical renames — need no in-build pass either.) Every
+defect that survives to the end-of-build review costs an adversarial cycle
+there, and every one that survives THAT costs an external Codex round against
+the escalation cap.
+
+**For a SUBSTANTIAL change, the end-of-build review is canonical, not the
+builder's choice: run `/deep-review`.** Substantial is the commit gate's own
+definition — ≥50 reviewable lines, more than one code file, or any auth /
+API / migration / prompt / agent / skill surface. `/deep-review` dispatches
+the adversarial pass in the required shape (genesis-architect, plus
+genesis-security-reviewer when the diff touches a security surface) and
+writes the evidence marker the gate reads. Below substantial, the table
+governs: a small focused fix ends with code-reviewer inline. `/audit-changes`
+stays what it is — a light self-check that writes no marker — and is a
+terminus for nothing beyond the table's "None" rows.
+
 Choose the review level proportional to the change:
 
 | Change type | Review level | Examples |
