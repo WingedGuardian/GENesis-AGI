@@ -78,7 +78,21 @@ _CC_SUPP_OUTCOME_FILE="${HOME:-}/.genesis/cc_suppression_outcome"
 
 _cc_supp_persist_outcome() {
     [ "${CC_SUPPRESSION_STATE:-unverified}" = "ok" ] && return 0
-    mkdir -p "$(dirname "$_CC_SUPP_OUTCOME_FILE")" 2>/dev/null || return 0
+    # A failed mkdir loses the channel exactly as a failed WRITE does — the
+    # breadcrumb can never land in a directory that does not exist. This used
+    # to be `|| return 0`: with ~/.genesis present-as-a-FILE (or uncreatable),
+    # bootstrap could repair the keys and report `repaired lost=0`, and the
+    # later update check saw `ok` and recorded a clean deploy — the exact
+    # silence the breadcrumb exists to remove, reintroduced one syscall
+    # earlier. Same surfacing as the write arm below, for the same reason.
+    if ! mkdir -p "$(dirname "$_CC_SUPP_OUTCOME_FILE")" 2>/dev/null; then
+        CC_SUPPRESSION_BREADCRUMB_LOST=1
+        echo "  WARNING: cc_ensure_updater_suppressed: could not create the directory" \
+             "for $_CC_SUPP_OUTCOME_FILE — a repair made in a subprocess" \
+             "will not reach update_history (suppression state:" \
+             "${CC_SUPPRESSION_STATE:-unverified})" >&2
+        return 1
+    fi
     # EPOCHSECONDS first: it is a bash builtin, so the stamp does not depend on
     # `date` being on PATH. A zero stamp is not harmless — the reader compares
     # it against a watermark, so `0` makes a real repair invisible rather than
@@ -224,21 +238,41 @@ _cc_ensure_updater_suppressed_inner() {
             # also write through the link, but it gives up the atomic swap this
             # branch deliberately has; renaming into the resolved path keeps both
             # the atomicity and the operator's symlink.
+            # Resolve the FULL chain, not one level. Nested dotfiles wiring is
+            # real (settings.json -> dots/second -> target): resolving one hop
+            # and renaming lands ON `dots/second`, replacing the operator's
+            # INNER link with a regular file while the true target stays
+            # missing — and the function reports `repaired`. The walk is manual
+            # because `readlink -f` cannot be assumed on the minimal hosts this
+            # branch exists for, and would refuse a target whose directory does
+            # not exist yet (a case the mkdir below handles deliberately). The
+            # bound matches the kernel's own symlink-resolution limit; hitting
+            # it means a cycle, which is operator wiring to decline, not break.
             local _write_to="$settings_file"
             if [ -L "$settings_file" ]; then
-                local _link
-                _link="$(readlink "$settings_file" 2>/dev/null || true)"
-                if [ -z "$_link" ]; then
-                    umask "$_umask_prev"
-                    CC_SUPPRESSION_STATE=failed
-                    echo "  WARNING: cc_ensure_updater_suppressed: $settings_file is a" \
-                         "symlink whose target could not be read — leaving it alone" >&2
-                    return 1
-                fi
-                case "$_link" in
-                    /*) _write_to="$_link" ;;                             # absolute
-                    *)  _write_to="$(dirname "$settings_file")/$_link" ;; # relative to the LINK
-                esac
+                local _link _hops=0
+                while [ -L "$_write_to" ]; do
+                    if [ "$_hops" -ge 40 ]; then
+                        umask "$_umask_prev"
+                        CC_SUPPRESSION_STATE=failed
+                        echo "  WARNING: cc_ensure_updater_suppressed: $settings_file resolves" \
+                             "through more than 40 symlinks (a cycle?) — leaving it alone" >&2
+                        return 1
+                    fi
+                    _link="$(readlink "$_write_to" 2>/dev/null || true)"
+                    if [ -z "$_link" ]; then
+                        umask "$_umask_prev"
+                        CC_SUPPRESSION_STATE=failed
+                        echo "  WARNING: cc_ensure_updater_suppressed: $settings_file is a" \
+                             "symlink whose target could not be read — leaving it alone" >&2
+                        return 1
+                    fi
+                    case "$_link" in
+                        /*) _write_to="$_link" ;;                          # absolute
+                        *)  _write_to="$(dirname "$_write_to")/$_link" ;;  # relative to THIS link
+                    esac
+                    _hops=$((_hops + 1))
+                done
                 if ! mkdir -p "$(dirname "$_write_to")" 2>/dev/null; then
                     umask "$_umask_prev"
                     CC_SUPPRESSION_STATE=failed
@@ -509,7 +543,23 @@ for _attempt in range(ATTEMPTS):
             try:
                 os.chown(tmp, st_before.st_uid, st_before.st_gid)
             except OSError:
-                pass
+                pass   # judged on EFFECT below — the resulting ids are what ship
+            # Ownership is part of the write contract, not decoration. A
+            # settings.json owned nobody:daemon whose group this process cannot
+            # set would otherwise be PUBLISHED carrying the temp's default
+            # group — silently changing group-based access to a
+            # credential-adjacent file, while the function reports `repaired`.
+            # Judge the outcome, not the syscall: compare the ids the
+            # replacement actually carries against the original's, and decline
+            # the swap when they differ. The common cases sail through — an
+            # unprivileged run on the operator's own file matches trivially,
+            # and the sudo host leg is allowed the chown.
+            st_tmp = os.stat(tmp)
+            if (st_tmp.st_uid, st_tmp.st_gid) != (st_before.st_uid, st_before.st_gid):
+                os.unlink(tmp)
+                fail("cannot give the replacement settings.json its current "
+                     "ownership (uid %d gid %d) — left untouched; set the two "
+                     "keys by hand" % (st_before.st_uid, st_before.st_gid))
         else:
             os.chmod(tmp, 0o600)     # brand-new file: secrets-adjacent, start private
 

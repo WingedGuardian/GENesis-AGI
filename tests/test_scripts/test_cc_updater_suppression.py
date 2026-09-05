@@ -116,6 +116,52 @@ sys.exit(subprocess.run(
 ).returncode)
 """
 
+# A stand-in `python3` for the OWNERSHIP arm: makes the original settings.json
+# appear to carry a gid this process cannot set (stat lies by +1, for the
+# SETTINGS path only), and makes os.chown raise EPERM — the unprivileged-user
+# reality on a nobody:daemon file, forced deterministically without root and
+# without a test-only branch in production code. The temp's stat stays
+# truthful, so the reconciler's effect-comparison sees exactly the mismatch the
+# real machine state produces. The lie is CONSISTENT across identity() reads
+# (before and after both go through it), so the compare-and-swap is unaffected;
+# st_mtime_ns is carried into the forged stat_result explicitly because
+# identity() keys on it and a bare 10-tuple would not preserve it. Used by
+# TestVerifiedByConstruction.
+_CHOWN_SHIM_TEMPLATE = """#!%(python)s
+import subprocess, sys
+
+ANCHOR = "import json, os, random, shutil, signal, sys, tempfile, time"
+INJECT = (
+    "import errno as _te, os as _to\\n"
+    "_t_real_stat = _to.stat\\n"
+    "def _t_lying_stat(p, *a, **k):\\n"
+    "    st = _t_real_stat(p, *a, **k)\\n"
+    "    if isinstance(p, (str, bytes)) and "
+    "_to.path.basename(_to.fsdecode(p)) == 'settings.json':\\n"
+    "        vals = list(st)\\n"
+    "        vals[5] = st.st_gid + 1\\n"
+    "        return _to.stat_result(tuple(vals), "
+    "{'st_mtime_ns': st.st_mtime_ns, 'st_atime_ns': st.st_atime_ns, "
+    "'st_ctime_ns': st.st_ctime_ns})\\n"
+    "    return st\\n"
+    "_to.stat = _t_lying_stat\\n"
+    "def _t_chown(*_a, **_k):\\n"
+    "    raise OSError(_te.EPERM, 'Operation not permitted')\\n"
+    "_to.chown = _t_chown\\n"
+)
+
+script = sys.stdin.read()
+if ANCHOR not in script:
+    sys.stderr.write("CHOWN SHIM: anchor line not found in the lib\\n")
+    sys.exit(97)
+script = script.replace(ANCHOR, ANCHOR + "\\n" + INJECT, 1)
+
+rest = sys.argv[2:] if sys.argv[1:2] == ["-"] else sys.argv[1:]
+sys.exit(subprocess.run(
+    ["%(python)s", "-"] + rest, input=script, text=True
+).returncode)
+"""
+
 
 class TestSuppressionReconcile:
     """cc_ensure_updater_suppressed owns both keys, idempotently."""
@@ -1377,6 +1423,175 @@ class TestVerifiedByConstruction:
         assert "S=repaired" in r.stdout, (r.stdout, r.stderr)
         assert "L=1" in r.stdout, "the lost breadcrumb was silently discarded"
         assert "could not persist the outcome" in r.stderr
+
+    def test_an_uncreatable_breadcrumb_dir_is_reported_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """mkdir failure loses the channel exactly as a failed WRITE does.
+
+        The reviewer's reproduction, replayed: ~/.genesis present as a regular
+        FILE. `mkdir -p` cannot create the directory — and the old
+        `|| return 0` swallowed that, so bootstrap repaired the keys, reported
+        `repaired lost=0`, and the later update check recorded a clean deploy.
+        The breadcrumb can never land in a directory that does not exist, so
+        this is the same channel loss as the write-failure case above, one
+        syscall earlier, and carries the same two opposite-pulling properties:
+        surfaced loudly, never aborting a `set -e` caller.
+        """
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".genesis").write_text("not a directory")
+        r = subprocess.run(
+            ["bash", "-c",
+             f'set -euo pipefail; source "{_LIB}"; '
+             'cc_ensure_updater_suppressed || true; '
+             'echo "S=$CC_SUPPRESSION_STATE L=$CC_SUPPRESSION_BREADCRUMB_LOST"'],
+            capture_output=True, text=True, timeout=60,
+            env={"HOME": str(home), "PATH": str(_minimal_bin(tmp_path)),
+                 "CC_VERSION": "9.9.9"},
+        )
+        assert r.returncode == 0, (
+            "an uncreatable breadcrumb dir aborted a `set -e` caller; the "
+            f"suppression had already succeeded. stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+        assert "S=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "L=1" in r.stdout, (
+            "an uncreatable breadcrumb directory was silently swallowed — a "
+            "subprocess repair reads as a clean deploy"
+        )
+        assert "could not create the directory" in r.stderr
+        assert (home / ".genesis").read_text() == "not a directory", (
+            "the reporting path must not replace whatever is sitting at ~/.genesis"
+        )
+
+    def test_an_ownership_it_cannot_reproduce_declines_the_write(
+        self, tmp_path: Path
+    ) -> None:
+        """A replacement that cannot carry the original's owner must not ship.
+
+        The reviewer's reproduction, forced without root: a settings.json owned
+        nobody:daemon whose group this process cannot set was PUBLISHED
+        carrying the temp's default group — nobody:nogroup — silently changing
+        group-based access to a credential-adjacent file, under a `repaired`.
+        The shim makes stat report a gid one off for the settings path and
+        chown raise EPERM, which is that machine state exactly; the write must
+        be DECLINED on the effect comparison, the file left byte-identical, and
+        no temp left behind.
+        """
+        real_python = shutil.which("python3")
+        assert real_python, "python3 required"
+        bindir = _minimal_bin(tmp_path)
+        (bindir / "python3").unlink(missing_ok=True)
+        shim = bindir / "python3"
+        shim.write_text(_CHOWN_SHIM_TEMPLATE % {"python": real_python})
+        shim.chmod(0o755)
+
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        # One key missing, so a write IS attempted — an already-correct file
+        # would exit before the ownership arm and pass vacuously.
+        original = json.dumps({"env": {"DISABLE_AUTOUPDATER": "1"}})
+        settings.write_text(original)
+
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+
+        assert "STATE=failed" in r.stdout, (r.stdout, r.stderr)
+        assert "ownership" in r.stderr, (r.stdout, r.stderr)
+        assert settings.read_text() == original, (
+            "the replacement shipped with ownership the process could not "
+            "reproduce — group-based access to a credential-adjacent file changed"
+        )
+        strays = [p for p in settings.parent.iterdir() if ".settings." in p.name]
+        assert not strays, f"stray temp left behind: {strays}"
+
+    def test_a_nested_symlink_chain_is_resolved_to_its_end(self, tmp_path: Path) -> None:
+        """settings.json -> dots/second -> target: BOTH links must survive.
+
+        The reviewer's reproduction: one-level resolution renames onto
+        `dots/second`, so the operator's INNER link becomes a regular file
+        while the true target stays missing — nested dotfiles wiring broken by
+        a repair that reports `repaired`. The chain must be walked to its end
+        and the FINAL target written.
+        """
+        bindir = self._bin_sans_python(tmp_path)
+        for tool in ("readlink", "ln"):
+            src = shutil.which(tool)
+            assert src, f"{tool} missing — this test would not exercise its branch"
+            if not (bindir / tool).exists():
+                (bindir / tool).symlink_to(src)
+
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        dots = tmp_path / "home" / "dots"
+        dots.mkdir(parents=True)
+        second = dots / "second"
+        target = dots / "claude-settings.json"
+        second.symlink_to(target)        # inner link — DANGLING
+        settings.symlink_to(second)      # outer link
+        assert settings.is_symlink() and second.is_symlink() and not target.exists()
+
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert second.is_symlink(), (
+            "the INTERMEDIATE link was replaced by a regular file — the "
+            "operator's nested dotfiles wiring is broken and the true target "
+            "was never created"
+        )
+        assert settings.is_symlink(), "the outer link was replaced"
+        assert target.exists() and not target.is_symlink(), (
+            "the chain's final target was never written"
+        )
+        # Reading back THROUGH the whole chain is what proves it still resolves.
+        env = json.loads(settings.read_text())["env"]
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["DISABLE_UPDATES"] == "1"
+
+    def test_a_symlink_cycle_is_declined_not_broken(self, tmp_path: Path) -> None:
+        """A cycle of links is operator wiring to DECLINE, not to rename over.
+
+        `[ -e ]` on a cycle is false (ELOOP), so the create branch is reached;
+        an unbounded walk would spin, and a one-level resolver would rename
+        onto the first link in the loop. The walk must give up at its bound,
+        report failure, and leave every link exactly as it found it.
+        """
+        bindir = self._bin_sans_python(tmp_path)
+        for tool in ("readlink", "ln"):
+            src = shutil.which(tool)
+            assert src, f"{tool} missing — this test would not exercise its branch"
+            if not (bindir / tool).exists():
+                (bindir / tool).symlink_to(src)
+
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        loop_a = tmp_path / "home" / "loop-a"
+        loop_b = tmp_path / "home" / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        settings.symlink_to(loop_a)
+
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+
+        assert "STATE=failed" in r.stdout, (r.stdout, r.stderr)
+        assert "symlink" in r.stderr, (r.stdout, r.stderr)
+        assert settings.is_symlink() and loop_a.is_symlink() and loop_b.is_symlink(), (
+            "a link in the cycle was replaced — declining means touching nothing"
+        )
 
     def test_sigterm_removes_the_temporary_settings_file(self, tmp_path: Path) -> None:
         """SIGTERM must RAISE, or the cleanup arm around the write is decorative.
