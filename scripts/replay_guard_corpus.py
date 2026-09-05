@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Replay this install's real shell commands through a Bash guard and report the
-benign-block rate.
+rate at which it blocks them.
+
+Deliberately NOT "the benign-block rate", which is what this line used to say.
+The corpus is every command anyone typed here, DANGEROUS ONES INCLUDED, so
+nothing in it has been classified as benign — which is why every rate this tool
+prints is stamped UNCLASSIFIED. This docstring is also the CLI's --help text, so
+the old wording was recreating the exact misreading the rest of the file exists
+to prevent, on the most-read surface it has.
 
 The dev skill's "Acceptance Bar + Measured Rate" asks a change to a Bash guard's
 PREDICATE to carry a measured `blocked k/N` figure. That is a CONVENTION, not an
@@ -92,6 +99,11 @@ def _extract_commands() -> list[tuple[str, str]]:
                     rec = json.loads(line)
                 except (ValueError, TypeError):
                     continue
+                if not isinstance(rec, dict):
+                    # A JSON line containing "Bash" but shaped as, say, ['Bash'].
+                    # Every other malformed record here is skipped; this one
+                    # raised AttributeError and killed a ~1.4 GB walk outright.
+                    continue
                 msg = rec.get("message")
                 if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
                     continue
@@ -100,7 +112,10 @@ def _extract_commands() -> list[tuple[str, str]]:
                         continue
                     if block.get("name") != "Bash":
                         continue
-                    cmd = (block.get("input") or {}).get("command")
+                    inp = block.get("input")
+                    if not isinstance(inp, dict):
+                        continue  # a schema change could make this a str or list
+                    cmd = inp.get("command")
                     if isinstance(cmd, str) and cmd.strip():
                         # The cwd the command was actually typed in. Guards that
                         # ask "am I in a worktree?" answer differently here than
@@ -137,6 +152,19 @@ def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
             print(
                 "cache predates the cwd field (v1) — rebuilding, because "
                 "replaying it would measure the wrong directory",
+                file=sys.stderr,
+            )
+        elif not all(
+            isinstance(r, list) and len(r) == 2 and all(isinstance(x, str) for x in r) for r in rows
+        ):
+            # A row that is valid JSON but the wrong SHAPE. `42` or `["one"]`
+            # crashed the loader; worse, a `{"command": …, "cwd": …}` object
+            # unpacked to the literal pair ("command", "cwd") and produced a
+            # confident measurement of two words nobody typed. Rebuild, which is
+            # the same answer the v1 branch above already gives.
+            print(
+                "cache rows are not (command, cwd) string pairs — rebuilding "
+                f"{_CACHE} rather than measuring a shape nobody wrote",
                 file=sys.stderr,
             )
         else:
@@ -313,10 +341,17 @@ class ReplaySafety:
 
 
 def replay_safe(why: str, *, caveat: str = "") -> ReplaySafety:
+    """Declare a guard replayable. `why` is the EVIDENCE, not an assurance — it
+    is printed verbatim by --list, so a claim in it that turns out to be false
+    (as "no environment reads" was for protected_paths) is worse than saying
+    nothing. `caveat` qualifies the resulting number and prints beside it."""
     return ReplaySafety(safe=True, why=why, caveat=caveat)
 
 
 def not_replay_safe(why: str) -> ReplaySafety:
+    """Refuse a guard, with the evidence for the refusal. Refused guards stay in
+    the table and still appear in --list: absence teaches nothing, and
+    exclusion-by-absence is the pattern this replaced."""
     return ReplaySafety(safe=False, why=why)
 
 
@@ -403,7 +438,20 @@ GUARDS: dict[str, Guard] = {
         run=lambda c, w: _run_python_guard("protected_paths_guard", c, w),
         safety=replay_safe(
             "a pure argv/string classifier — no filesystem writes, no subprocess, "
-            "no network, no environment reads."
+            "no network. It DOES read the environment, which an earlier version "
+            "of this line wrongly denied: protected_paths_guard.py:90 runs "
+            "os.path.expanduser(os.path.expandvars(token)) on each operand, :225 "
+            "expands again to spot a surviving `$`, and :145/:154/:159 resolve "
+            "~ for the home-directory rules. Reads only, so replay is still "
+            "safe.",
+            caveat=(
+                "resolves ~ and $VARS while classifying, so a verdict depends on "
+                "HOME and on whatever variables the command references. The "
+                "recorded rows carry no environment, so the replay uses this "
+                "session's — which is the honest choice for measuring THIS "
+                "install, but it means an operand like $SOME_PATH is classified "
+                "against today's value rather than the one it had when typed."
+            ),
         ),
     ),
     "worktree_cwd": Guard(
@@ -491,6 +539,15 @@ GUARDS: dict[str, Guard] = {
 _INLINE_BLOB = _inline_blob()
 
 
+class Result(NamedTuple):
+    """One guard's replay. `valid` is False when anything crashed or timed out —
+    the rate is still printed, because seeing it is how you diagnose the cause,
+    but the process must not exit 0 on it."""
+
+    blocked: int
+    valid: bool
+
+
 class Outcome(NamedTuple):
     """One command's result. A NamedTuple because it crosses the mp.Pool
     boundary and pickles as a plain tuple, and because four positional bools
@@ -564,7 +621,7 @@ def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> i
                 crashed += outcome.crashed
                 timed_out += outcome.timed_out
                 if outcome.blocked:
-                    blocked.append(corpus[i - 1][0])
+                    blocked.append(corpus[i - 1])
     else:
         for i, (cmd, cwd) in enumerate(corpus, 1):
             if i % 5000 == 0:
@@ -574,7 +631,7 @@ def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> i
             crashed += outcome.crashed
             timed_out += outcome.timed_out
             if outcome.blocked:
-                blocked.append(cmd)
+                blocked.append((cmd, cwd))
     n = len(corpus)
     pct = (100.0 * len(blocked) / n) if n else 0.0
     # "blocked", not "benign". Nothing here classifies a command as benign or
@@ -588,9 +645,13 @@ def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> i
         # With the rate, not in --list only. The number is what gets pasted into
         # a PR body, so anything qualifying it has to travel alongside it.
         print(f"    caveat: {safety.caveat}")
-    for cmd in blocked[:show]:
+    for cmd, cwd in blocked[:show]:
+        # WITH the directory. For protected_paths and worktree_cwd the cwd is
+        # what DECIDES the verdict — two identical-looking commands can be
+        # classified differently — so a sample without it cannot be reproduced
+        # or argued with.
         flat = " ".join(cmd.split())
-        print(f"    {flat[:150]}")
+        print(f"    [{cwd or '<unrecorded>'}] {flat[:150]}")
     if show and len(blocked) > show:
         print(f"    … and {len(blocked) - show} more")
     if substituted:
@@ -613,7 +674,12 @@ def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> i
             "block too, but a hung guard is not the same measurement as a "
             "deliberate one"
         )
-    return len(blocked)
+    # The COUNT is not the whole result. A guard that crashed or hung on every
+    # row still produces a number, and main() used to discard this value and
+    # return 0 — so a wrapper saw success while the output said, in words, that
+    # the figure is not a measurement. Refusals already exit 2 for exactly that
+    # reason; this closes the same hole one level in.
+    return Result(blocked=len(blocked), valid=not crashed and not timed_out)
 
 
 def main() -> int:
@@ -642,6 +708,18 @@ def main() -> int:
         "(leaves 2 cores for the live services on this box)",
     )
     args = ap.parse_args()
+
+    if args.show < 0:
+        # blocked[:-1] prints every blocked command except the last. These are
+        # verbatim command lines that demonstrably contain secrets passed in
+        # argv, so a slipped minus sign is a corpus dump to a terminal or a
+        # captured log, not a formatting quirk.
+        ap.error(
+            "--show must be >= 0; a negative count would print nearly every "
+            "blocked command, and those are real command lines"
+        )
+    if args.limit < 0:
+        ap.error("--limit must be >= 0")
 
     if args.list:
         # Every guard, INCLUDING the refused ones. A refused guard vanishing from
@@ -697,8 +775,10 @@ def main() -> int:
             "these numbers are the interactive-session rates.",
         )
 
+    invalid: list[str] = []
     for name in names:
-        replay(name, corpus, args.show, args.jobs)
+        if not replay(name, corpus, args.show, args.jobs).valid:
+            invalid.append(name)
 
     if refused:
         # Named, not omitted. A sweep that silently skipped guards reads as a
@@ -711,6 +791,14 @@ def main() -> int:
         "and an inert one. Pair every number with a positive control.",
         file=sys.stderr,
     )
+    if invalid:
+        print(
+            f"\nEXIT 2: {', '.join(invalid)} produced no valid measurement — see "
+            "the RAISED/TIMED OUT lines above. The rates are printed because they "
+            "help diagnose the cause, not because they can be quoted.",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

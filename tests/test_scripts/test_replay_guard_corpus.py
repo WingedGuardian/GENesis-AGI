@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -603,3 +604,130 @@ def test_all_with_nothing_safe_exits_2(rgc, monkeypatch):
     )
 
     assert rgc.main() == 2
+
+
+# ── review round 1 on this PR ────────────────────────────────────────────────
+
+
+def test_the_protected_paths_declaration_does_not_deny_reading_the_environment(
+    rgc, monkeypatch, capsys
+):
+    """The sharpest finding on this PR, whatever severity it was filed at.
+
+    The declaration read "no environment reads". That is FALSE:
+    protected_paths_guard.py:90 runs expanduser(expandvars(token)) on each
+    operand, :225 expands again, and :145/:154/:159 resolve ~. The mechanism's
+    entire value is that each entry carries VERIFIED evidence — a declaration
+    with a false claim in it is worse than no declaration, because it reads as
+    protection while being wrong. That is the failure this design replaced,
+    committed inside the replacement.
+    """
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
+    rgc.main()
+
+    out = capsys.readouterr().out
+    protected = out.split("protected_paths")[1].split("worktree_cwd")[0]
+    assert "no environment reads" not in protected
+    assert "expandvars" in protected or "environment" in protected
+
+
+def test_the_module_docstring_does_not_call_the_rate_benign(rgc):
+    """This docstring is the CLI's --help text (ArgumentParser(description=__doc__)),
+    so it is the most-read surface the tool has. Calling the result a
+    "benign-block rate" recreated the exact misreading every printed rate is
+    stamped UNCLASSIFIED to prevent — the corpus is every command anyone typed,
+    dangerous ones included, and nothing in it has been classified."""
+    assert "benign-block rate" not in rgc.__doc__.split("Deliberately NOT")[0]
+
+
+def test_a_cache_row_of_the_wrong_shape_is_rebuilt_not_measured(cache, rgc, capsys):
+    """A JSON OBJECT row is the dangerous one: `{"command": …, "cwd": …}`
+    unpacked to the literal pair ("command", "cwd"), so the tool measured two
+    words nobody typed and reported it as a rate. `42` and `["one"]` merely
+    crashed the loader, which at least fails loudly."""
+    cache.write_text('{"command": "rm -rf /", "cwd": "/tmp"}\n')
+
+    rows = rgc.load_corpus()
+
+    assert rows == _ROWS, "a structurally wrong cache row was replayed"
+    assert ("command", "cwd") not in rows
+    assert "rebuilding" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("row", ["42", '["only-one"]'])
+def test_other_wrong_cache_shapes_rebuild_rather_than_crash(cache, rgc, row):
+    cache.write_text(row + "\n")
+
+    assert rgc.load_corpus() == _ROWS
+
+
+def test_one_malformed_transcript_record_does_not_abort_the_whole_walk(rgc, monkeypatch, tmp_path):
+    """The walk covers ~1.4 GB. Every other malformed record here is skipped; a
+    JSON line containing "Bash" but shaped as a LIST raised AttributeError from
+    .get() and killed the entire rebuild — losing minutes of work to one bad
+    line, at whatever point in the tree it happened to sit."""
+    t = tmp_path / "projects"
+    t.mkdir()
+    good = {
+        "cwd": "/tmp",
+        "message": {
+            "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "echo ok"}}]
+        },
+    }
+    bad_record = '["Bash"]'
+    bad_input = {
+        "cwd": "/tmp",
+        "message": {"content": [{"type": "tool_use", "name": "Bash", "input": "Bash"}]},
+    }
+    (t / "s.jsonl").write_text(f"{bad_record}\n{json.dumps(bad_input)}\n{json.dumps(good)}\n")
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", t)
+
+    assert rgc._extract_commands() == [("echo ok", "/tmp")]
+
+
+def test_a_blocked_sample_carries_the_directory_that_decided_it(rgc, capsys):
+    """For both in-process guards the cwd DECIDES the verdict, so two
+    identical-looking commands can be classified differently. A sample printed
+    without it cannot be reproduced or argued with."""
+    with fake_guard(rgc, "always", lambda c, w: True, safety=rgc.replay_safe("a test double")):
+        rgc.replay("always", [("echo hi", "/some/recorded/dir")], show=5, jobs=1)
+
+    out = capsys.readouterr().out
+    assert "/some/recorded/dir" in out, "the sample dropped the cwd that decided it"
+
+
+def test_a_run_with_no_valid_measurement_exits_2(rgc, monkeypatch, capsys):
+    """A guard that crashed on every row still prints a number, and main()
+    discarded replay()'s result and returned 0 — so a wrapper saw success while
+    the output said in words that the figure is not a measurement. Refusals
+    already exit 2 for exactly this reason."""
+
+    def boom(cmd, cwd):
+        raise FileNotFoundError("guard is not installed")
+
+    monkeypatch.setattr(
+        rgc,
+        "GUARDS",
+        {"boom": rgc.Guard(run=boom, safety=rgc.replay_safe("a test double"))},
+    )
+    monkeypatch.setattr(rgc, "load_corpus", lambda **kw: [("echo hi", "/tmp")])
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
+
+    assert rgc.main() == 2
+
+    err = capsys.readouterr().err
+    assert "no valid measurement" in err
+
+
+def test_a_negative_show_count_is_refused(rgc, monkeypatch):
+    """`blocked[:-1]` prints every blocked command except the last. These are
+    verbatim command lines that demonstrably contain secrets passed in argv, so
+    a slipped minus sign is a corpus dump to a terminal or a captured log."""
+    monkeypatch.setattr(
+        sys, "argv", ["replay_guard_corpus.py", "--guard", "protected_paths", "--show", "-1"]
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        rgc.main()
+
+    assert excinfo.value.code == 2
