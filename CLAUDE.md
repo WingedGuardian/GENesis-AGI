@@ -62,7 +62,11 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+`scripts/cc_align_host.sh` — host-only by contract, no container leg),
+`genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
+auto-updater suppression in `~/.claude/settings.json`, because the align path
+only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to

@@ -20,6 +20,30 @@ def _skip_api_key_check():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_local_config():
+    """Keep routing-config tests off the DEVELOPER'S real ~/.genesis/config/genesis.yaml.
+
+    `_expand_env_vars` resolves the placeholders that have a `genesis.env` accessor
+    through that accessor, so routing now honours the local yaml — which is the
+    point of that change, and which also means an unisolated test reads whatever
+    this particular machine is configured with. Without this,
+    `test_env_placeholder_default_used_when_unset` passes or fails depending on
+    whether the developer's install points Ollama at localhost: a verdict that
+    changes with no change to the checkout, which is not a test result at all.
+
+    Patches the module globals rather than GENESIS_HOME, because `_local_config`
+    resolves against `Path.home()` and would ignore that override.
+    """
+    import genesis.env as env_mod
+
+    with (
+        patch.object(env_mod, "_LOCAL_CONFIG_LOADED", True),
+        patch.object(env_mod, "_LOCAL_CONFIG", {}),
+    ):
+        yield
+
+
 class MockDelegate:
     """Mock LLM delegate for testing the router."""
 

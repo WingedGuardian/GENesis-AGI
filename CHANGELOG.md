@@ -32,6 +32,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **A `tmux kill-server` with no socket binding now draws an advisory.** tmux
+  resolves its target server from the inherited `$TMUX` variable before
+  `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address
+  the main server instead and take down every live session on it — including
+  the one issuing the command. Clearing `$TMUX` does not help: that only
+  re-targets the default socket, which is usually the main server too. A new
+  advisory-tier guard flags a `kill-server` carrying no explicit `-S`/`-L`
+  binding and points at the one safe form — binding the kill to its own
+  socket. Session-scoped kills (`kill-session`) are deliberately not flagged,
+  and the advisory never blocks anything.
+
 - **The review-round limit now has an end, not just a speed bump.** The existing
   limit pauses after three rounds in which an independent reviewer keeps finding new
   problems, and asks for a conscious decision to continue — but acknowledging it
@@ -58,6 +69,121 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Marketing campaign updates now post to their own Telegram topic.** The marketing
+  campaign's tick updates previously routed to the shared Morning Reports topic; they
+  now go to a dedicated "Marketing" forum topic via a new `marketing` outreach
+  category, keeping them separate from the morning report and other digests. Existing
+  installs pick up the category automatically on restart (an additive schema
+  migration); the morning report and all other topics are unaffected.
+- **Proactive memory recall could time out completely.** The embedding provider
+  queues standard-rate requests when a model is busy, and that wait can run past
+  recall's four-and-a-half-second budget — measured at eight to thirteen seconds
+  against a budget of four and a half — so every lookup fails and sessions run with
+  no recalled memory at all. Recall now asks for the provider's priority lane, which
+  answers in about 650 milliseconds regardless of how long the prompt is.
+
+  **This costs a little more, and the amount is worth knowing: one and a half times
+  the standard embedding rate, on recall only.** At one person's usage that is a
+  fraction of a cent a month, and declining it means keeping a feature that does not
+  work. Storing memories stays on the standard rate — that runs in the background
+  with nothing waiting on it. Set `GENESIS_EMBED_PRIORITY_TIER=false` to decline the
+  faster lane; recall then falls back to keyword-only search whenever the queue is
+  longer than the deadline.
+
+  Scope: this covers the proactive-recall path served by genesis-server. An explicit
+  `memory_recall` tool call through a standalone MCP process still uses the standard
+  lane, so it can be slow without failing.
+
+  The setting is a yaml lever as well as an environment one, and the template no
+  longer overrides it: a fresh install copies `secrets.env.example` to `secrets.env`
+  and the environment is read first, so an uncommented assignment in the template
+  would have quietly outranked `memory.embed_priority_tier: false` and left the
+  documented opt-out doing nothing.
+
+- **The setup script's questions about local inference servers had no effect.** The
+  same shadowing applied to the Ollama and LM Studio addresses: the template assigned
+  them, a fresh install copied that to its environment, and the environment outranks
+  the config file — so the address the interactive setup script asks for was written
+  to the config and then ignored, and every call went to localhost regardless. Those
+  assignments are now commented out; the values they held were already the defaults.
+  The Ollama on/off switch deliberately stays assigned, because unlike the addresses
+  its default differs from the template value, and removing it would switch Ollama on
+  everywhere.
+
+- **A malformed config section could quietly weaken the private-data scan.** The
+  fingerprint harvester, which collects this install's private values so they can be
+  blocked from ever reaching a public push, read config sections the same unguarded
+  way — and its error handling covers the whole harvest, so one bad section dropped
+  not just the addresses it was reading but the timezone and private-repository
+  patterns queued behind them, with nothing logged. Sections are now read defensively
+  there too. Separately, ignoring a malformed section is no longer silent anywhere: it
+  logs which section was discarded and that defaults are in force, because two of
+  those settings fail toward spending money and toward running an autonomous job the
+  operator had switched off.
+
+- **Model routing ignored the install config, so half the system talked to the
+  wrong machine.** Settings like the local inference server's address are resolved
+  in one documented order — environment, then the install config file, then a
+  built-in default — but the routing layer expanded its placeholders from the
+  environment alone. That was invisible while the template forced the same values
+  into the environment anyway; removing those assignments so the config file could
+  work is what exposed it. An install pointing at a remote inference server ended
+  up with its dashboard, health check and embeddings reaching that server while
+  routed model calls still went to localhost. Routing now resolves those settings
+  the same way everything else does, which also means the setup script's questions
+  about local inference finally take effect. An environment variable still wins
+  where one is set, and any placeholder without a matching setting behaves exactly
+  as before.
+
+- **A quoted "false" in the install config meant true.** Settings written in
+  `genesis.yaml` are read as booleans, but a value in quotes arrives as text, and
+  any non-empty text counted as on — so `embed_priority_tier: "false"` kept the
+  paid lane running, while the same word unquoted, or written in `secrets.env`,
+  correctly turned it off. One intention, three places to write it, two answers.
+  The same spellings now mean the same thing everywhere, for every on/off setting
+  in that file.
+
+- **An override set from the dashboard could never be unset again.** Some settings
+  can be given a value in the config file or overridden in the environment, and the
+  environment always wins. The settings editor could set those overrides but had no
+  way to clear one, so the first time you typed a value there it took over
+  permanently — later edits to the config file appeared to do nothing, with no way
+  back short of hand-editing the file the editor exists to avoid. Clearing the field
+  now removes the override and hands the setting back to the config file. Required
+  credentials still cannot be blanked.
+
+- **A config file that was unreadable as settings was ignored in silence.** A
+  malformed section already said so; a malformed file did not, even though it still
+  contained everything the operator had written — including the switch that keeps
+  memory lookups off the paid lane. It now says plainly that the whole file is being
+  ignored and where it is.
+
+- **The timezone control could delete the config it exists to repair.** If the
+  file was malformed in a way that left its contents unreadable as settings, the
+  dropdown rewrote it with the timezone alone — discarding whatever else was in
+  there, silently, on the one control documented as the way to recover. It now
+  copies the original alongside first, writes the timezone, and says plainly what
+  it did and where the copy went.
+
+- **Settings the template ships commented out disappeared from the dashboard.**
+  Some defaults are deliberately left commented so the equivalent setting in
+  `genesis.yaml` keeps working. The dashboard's editor only recognised
+  uncommented lines, so those keys vanished from it and updates were rejected as
+  unknown — including several that had been invisible this way for some time.
+  They are listed again, simply with no value set.
+
+- **A one-line typo in the install config could silently disable vector memory.**
+  Accessors that read a nested setting out of `~/.genesis/config/genesis.yaml`
+  assumed the section around it was a mapping. Two shapes an ordinary edit produces
+  are not: a section whose only child is commented out (which yaml reads as empty
+  rather than absent), and a section given a plain value instead of a block. Either
+  one raised on the next read, and because the memory subsystem catches everything
+  around its own startup, the install would come up reporting a degradation and then
+  run with no vector memory at all — from a config file the operator is invited to
+  edit by hand. Every such setting — the local inference URLs, the Ollama switch, the
+  recall priority lane, the build lane, the models-file synthesis job, and the GitHub
+  identity — now falls back to its documented default instead, as does a config file
+  whose top level is malformed outright.
 - **Two branches that each add a changelog entry no longer collide over it.**
   This file is an append-only list of independent bullets, so two branches
   adding an entry under the same heading are not disagreeing about anything —
@@ -182,6 +308,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Claude Code's auto-updater suppression now re-asserts itself, and "verified"
+  means verified.** The two kill switches (`DISABLE_AUTOUPDATER`/`DISABLE_UPDATES`
+  in the user-level `~/.claude/settings.json`) were written only at install time,
+  so a machine whose settings drifted stayed silently unprotected until someone
+  re-ran setup — twice CC self-updated past the pin that way. One shared owner now
+  re-asserts them on every install/bootstrap/update and on a daily container timer
+  (`genesis-cc-settings-align.timer`), whose unit goes red rather than staying
+  green when it cannot verify. The outcome channel is fail-closed by
+  construction: the state starts `unverified` and is promoted to `ok`/`repaired`
+  only where a post-operation read confirms both keys are on disk — an audit
+  found nine paths that previously reported success without checking (a
+  busy lock, a missing library, a write never read back, and callers that
+  discarded the outcome entirely), and each now either verifies or says plainly
+  that it could not.
+
+  Three follow-ons keep that honesty intact where it was still leaking. A repair
+  performed during the early part of a deploy is now recorded even though the
+  later check finds nothing left to fix — previously that repair vanished
+  entirely, because it happened in a separate process whose result could not
+  travel back. A verified-clean run that happens to overlap another run now
+  counts as clean, so the next unrelated repair is no longer misreported as "the
+  second in a row" and does not raise a false alarm about something repeatedly
+  rewriting the settings file. And `uninstall.sh --dry-run` no longer clears the
+  saved timer schedules for real: that was the one step in the uninstall that
+  ignored dry-run, and it can change whether a missed scheduled run replays
+  after a later reinstall.
 - **Telegram ping when someone replies to a marketing pitch.** When a real person
   replies to one of Genesis's cold marketing emails, you now get one brief
   Telegram notification — the sender and the first line of their reply.

@@ -2303,9 +2303,21 @@
             if (resp && resp.ok) {
               const d = await resp.json();
               this.systemTimezone = d.timezone || tz;
-              this.settingsRestartMessage =
-                "Timezone set to " + this.systemTimezone +
-                " — display updates now; most scheduled jobs re-time after a Genesis restart.";
+              // A `warning` means the config file was malformed and has been REPLACED
+              // with a timezone-only file, with the original copied aside. Say so
+              // instead of the routine success line: the operator's network, GitHub
+              // and custom settings are no longer active, and the backup path is the
+              // only way back. Surfacing it in the restart banner is not enough on its
+              // own — an alert makes it impossible to miss, because the cost of
+              // missing it is silently running without the settings you configured.
+              if (d.warning) {
+                this.settingsRestartMessage = "\u26a0 " + d.warning;
+                alert(d.warning);
+              } else {
+                this.settingsRestartMessage =
+                  "Timezone set to " + this.systemTimezone +
+                  " — display updates now; most scheduled jobs re-time after a Genesis restart.";
+              }
             } else {
               const err = resp ? await resp.json().catch(() => ({})) : {};
               alert("Timezone update failed: " + (err.error || "Unknown error"));
@@ -2381,12 +2393,41 @@
           } catch (e) { console.warn("Secrets fetch failed:", e); }
         },
         toggleSecretEdit(keyName) {
-          this.secretsEditing = {...this.secretsEditing, [keyName]: !this.secretsEditing[keyName]};
-          if (!this.secretsEditing[keyName]) { delete this.secretsValues[keyName]; }
+          const opening = !this.secretsEditing[keyName];
+          this.secretsEditing = {...this.secretsEditing, [keyName]: opening};
+          if (!opening) { delete this.secretsValues[keyName]; return; }
+          // SEED the buffer from the current value. Without this it stays undefined
+          // until an `input` event, so opening a configured override and pressing
+          // Save WITHOUT TYPING reads as empty — and since empty now means "unset",
+          // that silently deleted the override. An untouched field must mean "no
+          // change", never "delete".
+          const def = (this.secretsGroups || []).flatMap(g => g.keys || [])
+            .find(k => k.key === keyName);
+          this.secretsValues = {...this.secretsValues, [keyName]: (def && def.value) || ''};
         },
         async saveSecret(keyName) {
           const val = (this.secretsValues[keyName] || '').trim();
-          if (!val) { this.secretsMessage = {type: 'error', text: 'Value cannot be empty'}; return; }
+          // An OPTIONAL OVERRIDE may be cleared — empty means "unset", which removes
+          // the assignment and hands the setting back to genesis.yaml or its default.
+          // Without this the editor is a one-way door: once set, the environment
+          // shadows the yaml permanently and later config edits appear to do nothing.
+          // A required credential still cannot be blanked.
+          const def = (this.secretsGroups || [])
+            .flatMap(g => g.keys || [])
+            .find(k => k.key === keyName);
+          const clearable = !!(def && def.is_optional_override);
+          if (!val && !clearable) {
+            this.secretsMessage = {type: 'error', text: 'Value cannot be empty'};
+            return;
+          }
+          // Clearing is destructive and easy to do by accident, and seeding the
+          // buffer cannot cover every case — a masked value is not readable, so it
+          // seeds empty. Make the deletion an explicit act.
+          if (!val && clearable && !confirm(
+                'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
+                'genesis.yaml or its built-in default.')) {
+            return;
+          }
           this.secretsSaving = true;
           try {
             const resp = await fetchApi("/api/genesis/secrets", {

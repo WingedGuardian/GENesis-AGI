@@ -243,9 +243,55 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 225f9e3b 2026-09-04
+verified: 51f9a358 2026-09-05
 ```
 
+- **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
+  recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
+  admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
+  standby is indistinguishable from a healthy one in every self-report. This module
+  records what the last real attempt showed, and the failover path still tries every
+  peer in order regardless: a stale "unavailable" that suppressed a peer would drop a
+  WORKING backup exactly when the home model is down. Two invariants worth keeping:
+  only a PROVIDER REFUSAL (rate-limit/quota) is evidence about a peer — a local fault
+  (offline, our timeout, an MCP crash, a stale session) is a `CCError` on the same
+  branch but never reaches the provider, and `note_failure` declines it; and records
+  refresh ONLY while the home model is down, so they are last-observed facts carrying
+  `observed_at`/`age_seconds`, never current state. A third, learned across four review
+  rounds: a self-report is an EXPOSURE surface, so the record stores NO FREE TEXT
+  at all — every field is a closed set, and a row read from disk is either exactly
+  what the module writes or it is DROPPED, never repaired. The state file is read
+  into every health snapshot, reaches an LLM context via the health MCP tool, and
+  is JSON-dumped whole into `sentinel/monitor.py`'s prompt with no sanitisation,
+  so a text field here is a text field in an LLM prompt; the provider's prose goes
+  to the log at the point of failure instead. That is a deletion rather than a
+  guard, and it was the answer to two generators that no amount of patching
+  closed: per-field REPAIR of a foreign document (seven findings), and inferring
+  whether credential discovery had succeeded from a config loader that degrades
+  silently by design (two P1s).
+- **Failover records availability only when a peer DEMONSTRABLY served** — a
+  usable output, or answer text already streamed to the user. The degenerate
+  empty non-error output (a silent cap) keeps its long-standing behaviour and is
+  simply NOT recorded, so it cannot clear a real block with a turn that showed
+  nothing. What to DO about that empty reply — advance to the next peer, or stop
+  because this attempt may already have executed tools whose effects a re-run
+  would repeat — is retry policy, and it lives on the `feat/peer-effects-guard`
+  branch as its own change with its own review, together with the effects
+  tracking it needs and the provider-refusal classification redesign (a closed
+  allowlist rather than per-case exclusions).
+- **`StreamEvent.from_raw` is lossless on the live stream surface** — CC's
+  `stream-json` emits ONE content block per `assistant` line, so the
+  first-recognized-block parse drops nothing. MEASURED 2026-09-04 against CC
+  2.1.246, 8/8 lines across two probes, 0 multi-block — including a
+  thinking→text→tool_use turn and three PARALLEL tool calls, which the API packs
+  into a single message and the CLI splits across three lines. The version is
+  part of the claim: this is a property of a CLI build, and eight lines is a thin
+  denominator for a negative property across versions and modes. The assumption
+  is RECORDED by a canary in `invoker.run_streaming` (counting via
+  `StreamEvent.recognized_blocks`, which lives beside the loop it mirrors so the
+  two cannot drift) — a log line nothing polls: it makes a future batching CC
+  diagnosable in one grep, it does not alert. If it ever fires, `invoker`'s
+  `collected_text` recovery and every `event_type` consumer need revisiting.
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.

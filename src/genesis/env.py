@@ -52,7 +52,10 @@ def _local_config() -> dict:
     """
     global _LOCAL_CONFIG, _LOCAL_CONFIG_LOADED
     if _LOCAL_CONFIG_LOADED:
-        return _LOCAL_CONFIG or {}
+        # Normalized on the CACHED path too, not just after a load: this function
+        # has two returns, and guarding only the loader would leave the one that
+        # serves every call after the first unprotected.
+        return _LOCAL_CONFIG if isinstance(_LOCAL_CONFIG, dict) else {}
     _LOCAL_CONFIG_LOADED = True
     cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
     if not cfg_path.is_file():
@@ -62,11 +65,103 @@ def _local_config() -> dict:
         import yaml  # noqa: PLC0415 — lazy import, yaml is always available
 
         with cfg_path.open() as fh:
-            _LOCAL_CONFIG = yaml.safe_load(fh) or {}
+            loaded = yaml.safe_load(fh)
+        # `or {}` alone covers a null/empty file but KEEPS a truthy non-mapping
+        # root (a yaml list, or a bare scalar from a stray edit), and every caller
+        # below then calls `.get` on it. Hand-edited file, documented graceful
+        # contract: anything that is not a mapping is treated as absent.
+        #
+        # AND IT SAYS SO. Discarding the whole file silently is the same defect the
+        # section guard was fixed for, one level up: an accidental top-level list
+        # still CONTAINS the operator's settings, so `{}` throws away a declared
+        # policy — including the opt-out that stops recall using the paid lane —
+        # and `_local_section` never gets the chance to warn, because there is no
+        # section left to be malformed. Before this normalization the resulting
+        # exception at least surfaced a memory-bootstrap degradation; a quiet
+        # fallback is worse than the crash it replaced unless it is announced.
+        if loaded is not None and not isinstance(loaded, dict):
+            logger.warning(
+                "genesis.yaml root is %s, not a mapping — the ENTIRE file is being "
+                "ignored and every setting falls back to its default. Nothing in it "
+                "is in force. Fix the file (its top level must be a mapping) to "
+                "restore your declared policy. Path: %s",
+                type(loaded).__name__,
+                cfg_path,
+            )
+        _LOCAL_CONFIG = loaded if isinstance(loaded, dict) else {}
     except Exception:
         logger.warning("Failed to load local config from %s", cfg_path, exc_info=True)
         _LOCAL_CONFIG = {}
     return _LOCAL_CONFIG
+
+
+#: The spellings every env-var branch in this module already treats as FALSE.
+#: Kept as one set so the yaml branch cannot drift from the environment branch.
+_FALSEY_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _yaml_bool(value: object) -> bool:
+    """Interpret a yaml scalar as a boolean the SAME way the env branch does.
+
+    ``bool()`` alone is wrong here and the failure is silent: PyYAML returns a
+    plain string for a QUOTED scalar, so ``embed_priority_tier: "false"`` is a
+    non-empty string and ``bool()`` reads it as TRUE — the opposite of what the
+    operator wrote, and in that particular case it keeps the PAID lane running.
+    The same yaml written unquoted parses to a real ``False``, so the meaning of
+    an identical setting would depend on quoting alone; written in secrets.env
+    instead, the env branch already reads it correctly. Three spellings of one
+    intention must not disagree.
+
+    Strings are matched case-insensitively against the same token set the env
+    branches use; every other type falls back to ``bool()`` (a real yaml
+    ``false``, ``0``, an empty list — all already correct under it).
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        # EMPTY IS FALSE, and this branch has to say so explicitly. The token set
+        # below answers "is this one of the words meaning no", and an empty string
+        # is in none of them — so without this line `ollama_enabled: ""` would read
+        # as TRUE, where the `bool()` it replaced correctly read it as False. That
+        # is a regression this helper would have introduced while fixing its
+        # sibling: `embed_priority_tier: ""` would silently select the PAID lane.
+        # An empty value is an absent value, not an affirmation.
+        if not stripped:
+            return False
+        return stripped.lower() not in _FALSEY_TOKENS
+    return bool(value)
+
+
+def _local_section(name: str) -> dict:
+    """Return the named local-config section, or ``{}`` if it is not a mapping.
+
+    Every accessor that reads a nested key MUST go through this rather than
+    ``_local_config().get(name, {})``. That spelling supplies its default only
+    for a MISSING key, so both shapes a hand-edited yaml actually produces —
+    ``memory:`` with the child commented out (loads as ``None``) and
+    ``memory: enabled`` (loads as ``str``) — survive it and raise AttributeError
+    on the next ``.get``.
+
+    That raise is not contained. ``runtime/init/memory.py`` catches ``Exception``
+    around the memory bootstrap and records an init degradation, so a one-line
+    typo in the user-editable config silently runs the whole install with no
+    vector memory — while ``_local_config``'s docstring promises callers fall
+    through to their defaults gracefully.
+    """
+    section = _local_config().get(name)
+    if section is not None and not isinstance(section, dict):
+        # Never discard a declared policy SILENTLY. Two of the settings under here
+        # fail toward spending money (the paid embedding lane) and toward running an
+        # autonomous job the operator switched off, so "your config was ignored" has
+        # to be visible. Matches the existing precedent for an unreadable-but-present
+        # setting elsewhere in the tree: enforce the default, and say so.
+        logger.warning(
+            "genesis.yaml section %r is %s, not a mapping — ignoring it and using the "
+            "default for every setting under it. Fix the config to restore your "
+            "declared policy.",
+            name,
+            type(section).__name__,
+        )
+    return section if isinstance(section, dict) else {}
 
 
 def repo_root() -> Path:
@@ -457,7 +552,7 @@ def ollama_url() -> str:
     env_val = os.environ.get("OLLAMA_URL")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("network", {}).get("ollama_url")
+    local_val = _local_section("network").get("ollama_url")
     if local_val:
         return str(local_val).strip()
     return _DEFAULT_OLLAMA_URL
@@ -475,7 +570,7 @@ def lm_studio_url() -> str:
     env_val = os.environ.get("LM_STUDIO_URL")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("network", {}).get("lm_studio_url")
+    local_val = _local_section("network").get("lm_studio_url")
     if local_val:
         return str(local_val).strip()
     return _DEFAULT_LM_STUDIO_URL
@@ -494,10 +589,48 @@ def ollama_enabled() -> bool:
     env_val = os.environ.get("GENESIS_ENABLE_OLLAMA")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    local_val = _local_config().get("network", {}).get("ollama_enabled")
+    local_val = _local_section("network").get("ollama_enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return False
+
+
+def embed_priority_tier() -> bool:
+    """Whether RECALL embeddings request DeepInfra's paid priority tier.
+
+    Defaults to TRUE, and that default is a deliberate cost/quality call worth
+    stating rather than burying.
+
+    DeepInfra queues default-tier requests when a model is under load (their
+    Priority Service Tier announcement, 2026-06-29). MEASURED 2026-09-04 on
+    Qwen3-Embedding-0.6B: default 8.6-13.3s, priority ~650ms flat across input
+    sizes. The proactive-recall route has a 4.5s deadline, so on the default
+    tier recall failed 100% of the time — 20 of 20 through the live endpoint.
+
+    The premium is 1.5x: $0.010 -> $0.015 per 1M tokens. MEASURED volume on this
+    install is 217 recall requests in 24h at ~120 tokens each, so the difference
+    is roughly HALF A CENT PER MONTH. Defaulting to False would ship a feature
+    that does not work, to save an amount too small to measure — which the
+    project's stated "quality over cost, always" principle rules out.
+
+    Only the deadline-bound RECALL chain uses this. Storage embedding is a
+    background write with no deadline and stays on the normal rate.
+
+    Set GENESIS_EMBED_PRIORITY_TIER=false in secrets.env, or
+    memory.embed_priority_tier: false in ~/.genesis/config/genesis.yaml, to opt
+    out — recall then degrades to the keyword-only path whenever the queue runs
+    deeper than the deadline.
+    """
+    env_val = os.environ.get("GENESIS_EMBED_PRIORITY_TIER")
+    if env_val is not None:
+        return env_val.strip().lower() not in {"0", "false", "no", "off"}
+    # Via `_local_section`, which tolerates every shape a hand-edited yaml can
+    # produce: the documented opt-out must not be able to break the thing it opts
+    # out of. See that helper for what an unguarded read costs here specifically.
+    local_val = _local_section("memory").get("embed_priority_tier")
+    if local_val is not None:
+        return _yaml_bool(local_val)
+    return True
 
 
 def build_lane_enabled() -> bool:
@@ -514,9 +647,9 @@ def build_lane_enabled() -> bool:
     env_val = os.environ.get("GENESIS_BUILD_LANE_ENABLED")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    local_val = _local_config().get("build_lane", {}).get("enabled")
+    local_val = _local_section("build_lane").get("enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return False
 
 
@@ -541,9 +674,9 @@ def models_md_synthesis_enabled() -> bool:
     if env_val is not None:
         # The env var names the OFF state: a truthy value DISABLES the job.
         return env_val.strip().lower() not in {"1", "true", "yes", "on"}
-    local_val = _local_config().get("models_md_synthesis", {}).get("enabled")
+    local_val = _local_section("models_md_synthesis").get("enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return True
 
 
@@ -607,7 +740,7 @@ def github_user() -> str:
     env_val = os.environ.get("GENESIS_GITHUB_USER")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("github", {}).get("user")
+    local_val = _local_section("github").get("user")
     if local_val:
         return str(local_val).strip()
     return ""
@@ -621,7 +754,7 @@ def github_public_repo() -> str:
     env_val = os.environ.get("GENESIS_GITHUB_PUBLIC_REPO")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("github", {}).get("public_repo")
+    local_val = _local_section("github").get("public_repo")
     if local_val:
         return str(local_val).strip()
     return "GENesis-AGI"
