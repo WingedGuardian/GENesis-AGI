@@ -1557,6 +1557,63 @@ class TestCheckInlineReviewFindings:
         assert not block
         assert "unknown-severity" in capsys.readouterr().err
 
+    def test_two_severity_looking_fields_are_ambiguous_not_first_wins(
+        self, guard_module, capsys
+    ):
+        """A header field that merely ENDS in a severity word must not outrank
+        the real severity field (Codex P2, PR #1677 round at d18db012).
+
+        `_Business Critical_ | _🟡 Minor_` read as Critical because the first
+        matching field won. Two severity-looking fields is a format this code
+        cannot adjudicate — so it is a canary, never a guess in either
+        direction: guessing high falsely blocks, guessing low hides a Major
+        behind a decorative field.
+        """
+        body = "_Business Critical_ | _🟡 Minor_ | _⚡ Quick win_\n\n**Something.**"
+        severity, header_seen = guard_module._cr_severity(body)
+        assert (severity, header_seen) == (None, True)
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "unknown-severity" in capsys.readouterr().err
+
+    def test_unanimous_duplicate_severity_words_still_resolve(self, guard_module):
+        """`_Business Critical_ | _🔴 Critical_` names ONE level twice — demoting
+        a real Critical to the non-blocking canary over a decorative category
+        would be the worse read. Only genuine disagreement is ambiguous."""
+        body = "_Business Critical_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n**X.**"
+        assert guard_module._cr_severity(body)[0] == "critical"
+
+    def test_single_severity_field_still_wins_regardless_of_position(self, guard_module):
+        """CONTROL for the ambiguity rule: exactly one severity-looking field —
+        in any position — must keep resolving, or the fix above is just
+        blindness with better manners."""
+        body = "_🎯 Functional Correctness_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n**X.**"
+        assert guard_module._cr_severity(body)[0] == "major"
+
+    def test_headerless_coderabbit_original_is_a_canary_not_advisory(
+        self, guard_module, capsys
+    ):
+        """A CodeRabbit ORIGINAL with no recognisable header is FORMAT DRIFT,
+        not an advisory (Codex P2, PR #1677 round at d18db012).
+
+        Every observed CodeRabbit finding leads with the italic pipe header; its
+        absence means the bot changed its markup — exactly the drift the canary
+        exists for. Classifying it "below Major" is a confident claim about a
+        level that was never read, and a drifted MAJOR would ride through under
+        that label.
+        """
+        body = "<!-- rabbit-meta -->\n\n**A finding in a format this gate has never seen.**"
+        severity, header_seen = guard_module._cr_severity(body)
+        assert (severity, header_seen) == (None, False)
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        err = capsys.readouterr().err
+        assert "unknown-severity" in err, (
+            "a headerless CodeRabbit original was filed as an ordinary advisory"
+        )
+
     def test_coderabbit_major_replied_by_maintainer_does_not_block(self, guard_module):
         """The line that turns a BLOCK into a PASS, which had no test.
 
@@ -3646,3 +3703,70 @@ class TestFenceClosingFollowsCommonMark:
         segs = guard_module._cr_findings(body)
         assert len(segs) == 2, f"an unclosed fence swallowed a Critical: {segs}"
         assert guard_module._cr_severity(segs[1])[0] == "critical"
+
+
+class TestDetailsNestingFollowsHtml:
+    """``<details>`` masking parallels the fence rules, and got the same two
+    things wrong one construct over (Codex P2s, PR #1677 round at d18db012):
+    nesting is a DEPTH, not a boolean — an inner ``</details>`` was unmasking
+    the rest of an outer collapsed section; and an unclosed section masked to
+    end-of-body, which is the fail-OPEN direction — a real Major behind a stray
+    ``<details>`` went unreported while the merge proceeded.
+    """
+
+    def test_nested_details_stay_masked_until_the_outer_closes(self, guard_module):
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "<details>\n<summary>outer</summary>\n\n"
+            "<details>\n<summary>inner</summary>\ninner content\n</details>\n\n"
+            "---\n\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n"
+            "</details>\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1, (
+            "content between an inner close and the outer close was read as real"
+        )
+
+    def test_an_unclosed_details_does_not_hide_the_rest_of_the_body(self, guard_module):
+        """Mirror of the unclosed-fence recovery, same rationale: a phantom
+        finding blocks loudly and gets looked at; a hidden Critical merges."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "<details>\n<summary>collapsed analysis</summary>\n"
+            "\n---\n\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n**Real one.**\n"
+        )
+        segs = guard_module._cr_findings(body)
+        assert len(segs) == 2, f"an unclosed <details> swallowed a Critical: {segs}"
+        assert guard_module._cr_severity(segs[1])[0] == "critical"
+
+    def test_a_closed_details_still_masks(self, guard_module):
+        """CONTROL: a properly closed section quoting a rule and a Critical
+        header must stay ONE finding — without this, never masking details at
+        all would pass both tests above."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "<details>\n<summary>quoted</summary>\n\n"
+            "---\n\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n"
+            "</details>\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1
+
+    def test_a_fence_inside_an_unclosed_details_stays_masked(self, guard_module):
+        """The recovery must clear only the DETAILS contribution to the mask.
+
+        Unmasking everything after the unclosed tag would re-open the fence bug
+        this file already closed: quoted fenced content — here a rule and a
+        Critical-shaped header — would be read as real findings again.
+        """
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "<details>\n<summary>collapsed</summary>\n"
+            "```md\n---\n_Quoted thing_ | _🔴 Critical_\n```\n"
+            "\n---\n\n"
+            "_🗄️ Data Integrity_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n**Real one.**\n"
+        )
+        segs = guard_module._cr_findings(body)
+        assert len(segs) == 2, segs
+        assert guard_module._cr_severity(segs[1])[0] == "major"

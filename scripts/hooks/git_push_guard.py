@@ -1242,10 +1242,24 @@ def _cr_severity(body: str) -> tuple[str | None, bool]:
         if not all(fields):
             # Header-SHAPED but unparseable is a canary, not a clean miss.
             return None, bool(_CR_HEADER_SHAPE_RE.match(stripped))
+        hits = []
         for fld in fields:
             words = fld.group(1).split()  # type: ignore[union-attr]
             if words and words[-1].casefold() in _CR_SEVERITIES:
-                return words[-1].casefold(), True
+                hits.append(words[-1].casefold())
+        if len(set(hits)) == 1 and hits:
+            # Exactly one DISTINCT level — including the unanimous-duplicate
+            # case (`_Business Critical_ | _🔴 Critical_`), where demoting a
+            # real Critical to the non-blocking canary would be the worse read.
+            return hits[0], True
+        if len(hits) > 1:
+            # Two severity-looking fields (`_Business Critical_ | _🟡 Minor_`)
+            # is a format this code cannot adjudicate. First-match-wins read
+            # that example as Critical — a false block; last-match-wins would
+            # hide a real Major behind a decorative trailing field. Neither
+            # guess is safe, so it is reported as unknown, the canary path
+            # (Codex P2, PR #1677).
+            return None, True
         return None, True  # a header, but no field names a level we know
     return None, False
 
@@ -1275,11 +1289,18 @@ def _cr_markup_mask(body: str) -> list[bool]:
     how a markdown renderer reads it.
     """
     lines = body.split("\n")
-    mask: list[bool] = []
+    # Fence and <details> contributions are tracked as SEPARATE masks and OR'd
+    # at the end, because each has an unclosed-construct recovery that clears
+    # its own contribution — and clearing a single combined mask would also
+    # unmask the OTHER construct's quoted content, silently re-opening the
+    # fence bug whenever a fence sits inside an unclosed <details>.
+    fence_mask = [False] * len(lines)
+    details_mask = [False] * len(lines)
     fence_char: str | None = None
     fence_len = 0
     fence_opened_at: int | None = None
-    in_details = False
+    details_depth = 0
+    details_opened_at: int | None = None
     for idx, line in enumerate(lines):
         stripped = line.strip()
         fence = _CR_FENCE_RE.match(stripped)
@@ -1298,21 +1319,29 @@ def _cr_markup_mask(body: str) -> list[bool]:
                 # findings, blocking a merge on the strength of quoted content
                 # (Codex P2, PR #1677).
                 fence_char, fence_len, fence_opened_at = None, 0, None
-            mask.append(True)
+            fence_mask[idx] = True
             continue
         if fence_char is not None:
-            mask.append(True)
+            fence_mask[idx] = True
             continue
         low = stripped.casefold()
         if low.startswith("<details"):
-            in_details = True
-            mask.append(True)
+            # Nesting is a DEPTH, not a boolean: valid nested <details> meant
+            # the INNER close unmasked the rest of the outer collapsed section,
+            # so a quoted rule + severity header there manufactured a blocking
+            # finding out of collapsed content (Codex P2, PR #1677).
+            if details_depth == 0:
+                details_opened_at = idx
+            details_depth += 1
+            details_mask[idx] = True
             continue
         if low.startswith("</details"):
-            in_details = False
-            mask.append(True)
+            details_depth = max(0, details_depth - 1)
+            if details_depth == 0:
+                details_opened_at = None
+            details_mask[idx] = True
             continue
-        mask.append(in_details)
+        details_mask[idx] = details_depth > 0
     if fence_opened_at is not None:
         # An UNCLOSED fence. CommonMark says it runs to the end of the document,
         # and masking to the end is therefore "correct" — but this mask decides
@@ -1321,9 +1350,19 @@ def _cr_markup_mask(body: str) -> list[bool]:
         # unreported and the merge proceeds. A phantom finding, the other error,
         # blocks loudly and gets looked at. So a fence that never closes is
         # treated as ordinary content from the line it opened on.
-        for i in range(fence_opened_at, len(mask)):
-            mask[i] = False
-    return mask
+        for i in range(fence_opened_at, len(lines)):
+            fence_mask[i] = False
+    if details_opened_at is not None:
+        # An UNCLOSED <details> gets the same recovery for the same reason: a
+        # stray tag must not hide a later genuine Major from the gate. Only the
+        # details CONTRIBUTION is cleared — quoted fenced content inside the
+        # section stays masked via fence_mask. A complete inner section between
+        # the unclosed opener and end-of-body is unmasked too; that is the
+        # phantom-finding direction, which blocks loudly, and is accepted for
+        # the same reason the fence recovery accepts it (Codex P2, PR #1677).
+        for i in range(details_opened_at, len(lines)):
+            details_mask[i] = False
+    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
 
 
 def _cr_findings(body: str) -> list[str]:
@@ -1616,10 +1655,18 @@ def _check_inline_review_findings(
                 # below — otherwise the two reviewers are inconsistent for no
                 # stated reason, and a maintainer-accepted finding from one
                 # would still block.
-                severity, header_seen = _cr_severity(seg)
+                severity, _header_seen = _cr_severity(seg)
                 if severity not in _CR_BLOCKING_SEVERITIES:
                     title = _coderabbit_title(seg)
-                    if header_seen and severity is None:
+                    if severity is None:
+                        # No recognised severity — whether the header names a
+                        # level this gate does not know, is ambiguous, or is
+                        # missing entirely. Every observed CodeRabbit finding
+                        # leads with the italic pipe header, so a headerless
+                        # original is FORMAT DRIFT: filing it as an ordinary
+                        # advisory printed "below Major" about a level that was
+                        # never read, and a drifted Major would ride through
+                        # under that label (Codex P2, PR #1677).
                         cr_unknown.append(title)
                     else:
                         cr_advisory.append(title)
@@ -1681,8 +1728,9 @@ def _check_inline_review_findings(
             print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
     if cr_unknown:
         print(
-            f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) carry a "
-            f"severity this gate does not know (the ladder may have changed). "
+            f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
+            f"severity this gate could not read (unknown level, ambiguous header, "
+            f"or no recognisable header — the format may have changed). "
             f"NOT scored — verify the level by hand before merging:",
             file=sys.stderr,
         )
