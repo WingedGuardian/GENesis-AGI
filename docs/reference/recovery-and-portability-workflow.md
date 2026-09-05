@@ -50,17 +50,24 @@ gets its own branch like any other change:
    disappear in a change whose `CHANGELOG.md` diff actually contains its entry.
 
    **Merge this last, and if anything else landed while it was open: merge the
-   latest `main` into the release branch FIRST, then re-run step 2.** The order
-   matters — re-running the assembler on a stale release branch reassembles the
-   same old tree, because the newly merged fragment only exists on `main`, and
-   its arrival there does not conflict with this branch's deletions, so nothing
-   forces the sync. Other PRs keep merging while the release PR sits in review;
-   git carries their fragments forward without touching the version section you
-   already generated. Nothing is lost — those fragments survive and appear in
-   the *next* release — but they are filed under the wrong version, and neither
-   CI nor the assembler can see it, because the fragment still exists and still
-   validates. Sync, reassemble, then merge is what makes the section match the
-   tag.
+   latest `main` into the release branch, re-run step 2, then MOVE the newly
+   folded entries out of `[Unreleased]` into the existing `[vX.Y]` section.**
+   All three, in that order — each alone is insufficient. Re-running the
+   assembler on a stale release branch reassembles the same old tree, because
+   the newly merged fragment only exists on `main`, and its arrival there does
+   not conflict with this branch's deletions, so nothing forces the sync. And
+   re-running step 2 alone is not enough either: the assembler always targets
+   `## [Unreleased]`, which step 3 re-created empty above the version section —
+   so the late entry folds under the NEXT release while `[vX.Y]` stays
+   incomplete, and CI cannot see it because the entry did arrive in the
+   changelog, just under the wrong heading. Do NOT run step 3's rename a second
+   time — a `[vX.Y]` heading already exists, and renaming the repopulated
+   `[Unreleased]` would create a duplicate; moving the entries is the whole
+   fix. Other PRs keep merging while the release PR sits in review; git
+   carries their fragments forward without touching the version section you
+   already generated. Nothing is lost — but misfiled is invisible to every
+   check, so: sync, reassemble, move, then merge is what makes the section
+   match the tag.
 5. **Tag** `vX.Y` on `main` once that PR has merged.
 6. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
 

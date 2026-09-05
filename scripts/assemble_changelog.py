@@ -53,6 +53,47 @@ FRAGMENT_PATTERN = re.compile(
 NON_FRAGMENTS = frozenset({"README.md"})
 
 UNRELEASED_HEADING = "## [Unreleased]"
+# A GENUINE heading, not any line whose stripped text matches: CommonMark
+# treats up to three spaces of indent as a heading and four or more as an
+# indented code block, so `    ## [Unreleased]` is code — matching it via
+# .strip() would fold entries after a code line, outside any real section.
+# The same 0-3 rule the body validators above already encode.
+_UNRELEASED_HEADING_RE = re.compile(r"^ {0,3}## \[Unreleased\]\s*$")
+
+
+def _unreleased_line_index(lines: list[str]) -> int | None:
+    """Index of the first GENUINE ``## [Unreleased]`` heading, or None.
+
+    Genuine means what a CommonMark reader would render as a heading: at most
+    three spaces of indent (four or more is an indented code block — the regex
+    handles that) AND outside any fenced code block — the case the regex alone
+    cannot see, because a fence puts an unindented copy of the heading line
+    into code context. Folding after a code line lands every generated entry
+    inside the fence, rendered as literal code above the real section.
+
+    Fence tracking follows CommonMark's shape without a full parser: any
+    ``_CODE_FENCE`` line opens a fence (its info string is irrelevant here); it
+    closes only on a line that is nothing but the SAME character repeated at
+    least as many times — an info-string line like `````python``
+    inside an open fence is content, not a closer.
+    """
+    fence_char: str | None = None
+    fence_len = 0
+    for i, ln in enumerate(lines):
+        if fence_char is not None:
+            stripped = ln.strip()
+            if stripped and set(stripped) == {fence_char} and len(stripped) >= fence_len:
+                fence_char = None
+            continue
+        m = _CODE_FENCE.match(ln)
+        if m:
+            run = m.group().lstrip()
+            fence_char, fence_len = run[0], len(run)
+            continue
+        if _UNRELEASED_HEADING_RE.match(ln):
+            return i
+    return None
+
 
 # Block constructs that stay block constructs when spliced in. CommonMark allows
 # up to THREE spaces of indent before each of these, and a list item's content
@@ -165,8 +206,13 @@ def _validate_body(name: str, body: str) -> None:
             )
 
 
-def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Path]]:
-    """Every fragment in the directory as (timestamp, Category, path).
+def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Path, str]]:
+    """Every fragment in the directory as (timestamp, Category, path, raw text).
+
+    The raw text is captured HERE, once: rendering, the pre-delete comparison
+    and the rollback all use this capture, so the bytes validated, the bytes
+    folded and the bytes removed are one artifact — a file that changes after
+    this read is detected rather than silently overwritten or deleted.
 
     Classifies EVERY entry: a file that is neither a fragment nor an explicitly
     known non-fragment raises. A directory raises for the same reason — the
@@ -181,7 +227,7 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
     directory = FRAGMENT_DIR if directory is None else directory
     if not directory.is_dir():
         return []
-    out: list[tuple[str, str, Path]] = []
+    out: list[tuple[str, str, Path, str]] = []
     for path in sorted(directory.iterdir()):
         # The flat-directory rule is checked FIRST, before any name-based
         # exemption. Exempting by name first would let a DIRECTORY named
@@ -192,6 +238,26 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
             raise FragmentError(
                 f"{path.name}/: changelog.d is flat; a nested directory would be "
                 "skipped by the assembler and its entries would never ship"
+            )
+        # A fragment must be a REGULAR file. A symlink with a valid fragment
+        # name publishes another file's body under this name (a `security`
+        # link to a `fixed` fragment ships one body under two categories), and
+        # the file deleted at fold time is not the artifact whose content was
+        # validated. Checked before the name exemption so a symlinked
+        # README.md errors too instead of being exempted.
+        if path.is_symlink():
+            raise FragmentError(
+                f"{path.name}: is a symlink; a fragment must be a regular file "
+                "so the validated body and the file removed at fold time are "
+                "one artifact"
+            )
+        # And a regular file it must actually BE — is_symlink alone under-
+        # enforces the invariant: a FIFO with a valid fragment name would hang
+        # the read forever, a socket corrupts it. Classified before any read.
+        if not path.is_file():
+            raise FragmentError(
+                f"{path.name}: not a regular file; a fragment must be a plain "
+                "file so it can be read, folded and removed as one artifact"
             )
         if path.name in NON_FRAGMENTS:
             continue
@@ -209,16 +275,17 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
             continue
         ts, category, _slug = parse_fragment_name(path.name)
         try:
-            body = path.read_text(encoding="utf-8").strip()
+            raw = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             # The contract is a single 'changelog.d: <message>' line and exit 2.
-            # An unreadable, unreadably-encoded or dangling-symlink fragment must
-            # not surface as a traceback that a CI job cannot classify.
+            # An unreadable or unreadably-encoded fragment must not surface as
+            # a traceback that a CI job cannot classify.
             raise FragmentError(f"{path.name}: cannot read fragment: {exc}") from exc
+        body = raw.strip()
         if not body:
             raise FragmentError(f"{path.name}: fragment is empty")
         _validate_body(path.name, body)
-        out.append((ts, category, path))
+        out.append((ts, category, path, raw))
     # No duplicate-name check here on purpose: a directory cannot hold two files
     # with one name, so such a check could never fire. Two branches choosing the
     # same name collide as a git add/add conflict, which git reports on its own —
@@ -227,11 +294,15 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
     return sorted(out, key=lambda r: (CATEGORIES.index(r[1]), r[0]))
 
 
-def render_sections(fragments: list[tuple[str, str, Path]]) -> dict[str, list[str]]:
-    """Category -> the fragment bodies belonging to it, in timestamp order."""
+def render_sections(fragments: list[tuple[str, str, Path, str]]) -> dict[str, list[str]]:
+    """Category -> the fragment bodies belonging to it, in timestamp order.
+
+    Rendered from the text captured at validation time, never a re-read: what
+    was validated is what is folded, whatever happens to the file in between.
+    """
     sections: dict[str, list[str]] = {}
-    for _ts, category, path in fragments:
-        sections.setdefault(category, []).append(path.read_text(encoding="utf-8").strip())
+    for _ts, category, _path, raw in fragments:
+        sections.setdefault(category, []).append(raw.strip())
     return sections
 
 
@@ -254,12 +325,9 @@ def splice(changelog_text: str, sections: dict[str, list[str]]) -> str:
     the same way every time. Existing content is never moved or reordered.
     """
     lines = changelog_text.splitlines()
-    try:
-        start = next(i for i, ln in enumerate(lines) if ln.strip() == UNRELEASED_HEADING)
-    except StopIteration:
-        raise FragmentError(
-            f"CHANGELOG.md has no '{UNRELEASED_HEADING}' heading to fold into"
-        ) from None
+    start = _unreleased_line_index(lines)
+    if start is None:
+        raise FragmentError(f"CHANGELOG.md has no '{UNRELEASED_HEADING}' heading to fold into")
 
     rendered: list[str] = []
     for category in CATEGORIES:
@@ -297,7 +365,7 @@ def _check_target() -> None:
         text = CHANGELOG.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise FragmentError(f"cannot read {CHANGELOG.name}: {exc}") from exc
-    if not any(ln.strip() == UNRELEASED_HEADING for ln in text.splitlines()):
+    if _unreleased_line_index(text.splitlines()) is None:
         raise FragmentError(
             f"{CHANGELOG.name} has no '{UNRELEASED_HEADING}' heading — fragments "
             "would have nowhere to be folded into at release"
@@ -494,11 +562,22 @@ def main(argv: list[str] | None = None) -> int:
     # correct.
     removed: list[tuple[Path, str]] = []
     try:
-        for _ts, _category, path in fragments:
+        for _ts, _category, path, raw in fragments:
+            # The bytes about to be deleted must be the bytes that were folded.
+            # An editor save landing between the assembly read and this loop
+            # would otherwise be destroyed silently: CHANGELOG.md carries the
+            # older text, the newer bytes exist nowhere afterwards, and git
+            # never saw them. Refuse and roll back; the changed file itself is
+            # left untouched, still carrying the newer content.
+            if path.read_text(encoding="utf-8") != raw:
+                raise FragmentError(
+                    f"{path.name}: changed on disk after it was read for "
+                    "assembly; refusing to delete the newer content"
+                )
             # Capture BEFORE unlink, so there is no instant at which a file is
             # gone but unrecorded. The rollback rewriting a file that was never
             # actually unlinked is harmless — same content, idempotent.
-            removed.append((path, path.read_text(encoding="utf-8")))
+            removed.append((path, raw))
             path.unlink()
     except BaseException as exc:
         # Put back everything already destroyed, not just the changelog. Rolling
@@ -525,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
             "fragments and CHANGELOG.md are tracked files.)",
             file=sys.stderr,
         )
-        if not isinstance(exc, OSError):
+        if not isinstance(exc, (OSError, FragmentError)):
             raise  # Ctrl-C etc. must still terminate as what they are
         return 2
     print(

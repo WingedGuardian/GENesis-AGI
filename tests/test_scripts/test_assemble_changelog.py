@@ -160,7 +160,7 @@ def test_fragments_sort_by_category_then_timestamp(tmp_path: Path) -> None:
     _fragment(d, "20260904220000-fixed-later.md")
     _fragment(d, "20260904210000-fixed-earlier.md")
     _fragment(d, "20260904230000-added-newest.md")
-    got = [(c, p.name) for _ts, c, p in ac.collect_fragments(d)]
+    got = [(c, p.name) for _ts, c, p, _raw in ac.collect_fragments(d)]
     assert got == [
         ("Added", "20260904230000-added-newest.md"),
         ("Fixed", "20260904210000-fixed-earlier.md"),
@@ -969,3 +969,146 @@ def test_ctrl_c_mid_cleanup_restores_everything_and_propagates(
         ac.main([])
     assert {p.name for p in d.iterdir()} == before
     assert cl.read_text() == CHANGELOG_SKELETON
+
+
+# ── round-4 findings: heading authenticity, symlinks, mid-assembly edits ──────
+
+
+def test_an_indented_unreleased_heading_is_not_a_fold_target() -> None:
+    """Four spaces of indent make '## [Unreleased]' a code line, not a heading.
+
+    CommonMark renders the four-space form as an indented code block, so folding
+    after it puts every generated entry outside any real section. When it is the
+    only match, the splice must refuse rather than target it.
+    """
+    code_only = "# Changelog\n\n    ## [Unreleased]\n\n## [v1] - 2026-01-01\n"
+    with pytest.raises(ac.FragmentError):
+        ac.splice(code_only, {"Fixed": ["- x"]})
+
+
+def test_check_target_rejects_an_indented_unreleased_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text("# Changelog\n\n    ## [Unreleased]\n")
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+    with pytest.raises(ac.FragmentError):
+        ac._check_target()
+
+
+def test_a_real_heading_below_an_indented_copy_is_the_target() -> None:
+    """splice picks the genuine heading, not a code-block occurrence above it."""
+    text = (
+        "# Changelog\n\n    ## [Unreleased]\n\n## [Unreleased]\n\n"
+        "### Fixed\n\n- old\n"
+    )
+    out = ac.splice(text, {"Added": ["- new entry"]})
+    lines = out.splitlines()
+    assert lines.index("- new entry") > lines.index("## [Unreleased]")
+    # nothing was inserted right after the indented (code) copy
+    assert lines[lines.index("    ## [Unreleased]") + 1] == ""
+
+
+def test_a_three_space_indented_heading_is_still_a_heading() -> None:
+    """CommonMark allows up to three spaces of indent before a heading."""
+    out = ac.splice("# Changelog\n\n   ## [Unreleased]\n", {"Fixed": ["- y"]})
+    assert "- y" in out
+
+
+def test_a_symlinked_fragment_is_rejected(tmp_path: Path) -> None:
+    """A fragment must be a regular file.
+
+    A symlink with a valid fragment name publishes ANOTHER file's body under
+    this name (a 'security' link to a 'fixed' fragment ships one body under two
+    categories), and the file deleted at fold time is not the artifact whose
+    content was validated.
+    """
+    d = tmp_path / "changelog.d"
+    real = _fragment(d, "20260904210000-fixed-real.md")
+    link = d / "20260904210001-security-alias.md"
+    link.symlink_to(real)
+    with pytest.raises(ac.FragmentError, match="symlink"):
+        ac.collect_fragments(d)
+
+
+def test_an_edit_landing_mid_assembly_is_never_silently_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save between the assembly read and cleanup must not vanish.
+
+    The fold deletes fragments after splicing their text into CHANGELOG.md. If
+    a fragment changed in between, deleting it destroys the newer bytes while
+    the changelog carries the older ones — an uncommitted edit lost with
+    nothing in git to recover it. The fold must refuse and roll back instead,
+    leaving the newer bytes on disk.
+    """
+    d = tmp_path / "changelog.d"
+    frag = _fragment(d, "20260904210000-fixed-thing.md", body="- **Original.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+    orig_render = ac.render_sections
+
+    def render_then_edit(fragments):  # type: ignore[no-untyped-def]
+        out = orig_render(fragments)
+        frag.write_text(
+            "- **Original.** body\n- **Late edit.** saved during assembly\n"
+        )
+        return out
+
+    monkeypatch.setattr(ac, "render_sections", render_then_edit)
+    rc = ac.main([])
+    surviving = frag.read_text() if frag.exists() else ""
+    # The late edit must survive somewhere; silently gone is the failure mode.
+    assert "Late edit." in surviving or "Late edit." in cl.read_text()
+    assert rc == 2
+    assert cl.read_text() == CHANGELOG_SKELETON  # rolled back, rerun correct
+
+
+def test_a_fenced_unreleased_heading_is_not_a_fold_target() -> None:
+    """A '## [Unreleased]' inside a fenced code block is content, not a heading.
+
+    The indent rule alone does not close the class: a fence puts an unindented
+    copy of the heading line into code context, and folding after it lands the
+    entries inside the fence — rendered as literal code, above the real
+    section.
+    """
+    text = (
+        "# Changelog\n\n```md\n## [Unreleased]\n```\n\n## [Unreleased]\n\n"
+        "### Fixed\n\n- old\n"
+    )
+    out = ac.splice(text, {"Added": ["- new entry"]})
+    lines = out.splitlines()
+    real = max(i for i, ln in enumerate(lines) if ln == "## [Unreleased]")
+    assert lines.index("- new entry") > lines.index("```", 1)  # after fence
+    assert lines.index("- new entry") > real  # after the real heading
+
+
+def test_check_target_rejects_a_fenced_only_unreleased_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text("# Changelog\n\n```md\n## [Unreleased]\n```\n")
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+    with pytest.raises(ac.FragmentError):
+        ac._check_target()
+
+
+def test_a_non_regular_file_is_rejected_before_it_is_read(tmp_path: Path) -> None:
+    """The invariant is a REGULAR file, not merely a non-symlink.
+
+    A FIFO with a valid fragment name would hang the read forever; a socket
+    corrupts it. Both must be classified before any read is attempted.
+    """
+    import socket as _socket
+
+    d = tmp_path / "changelog.d"
+    d.mkdir()
+    sock = _socket.socket(_socket.AF_UNIX)
+    try:
+        sock.bind(str(d / "20260904210000-fixed-sock.md"))
+        with pytest.raises(ac.FragmentError, match="regular file"):
+            ac.collect_fragments(d)
+    finally:
+        sock.close()
