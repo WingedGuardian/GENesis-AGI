@@ -14,21 +14,24 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import field, read_payload  # noqa: E402
+from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
     git_subcommand,
     has_trailing_override,
     split_segments,
+    untokenizable,
 )
 
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
@@ -593,6 +596,48 @@ def _worktree_root(cwd: str) -> str:
     return os.path.realpath(cwd)
 
 
+def _merge_note(cwd: str | None) -> str:
+    """A hint appended to a cap/mode-switch denial when a merge is mid-flight.
+
+    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict or the round
+    counter: those sentinels are unauthenticated files that any actor with shell
+    access can create (``echo x > .git/MERGE_HEAD``), and `git merge --no-commit`
+    leaves one indefinitely without any forgery at all. Keying an EXEMPTION off
+    them would let the actor this gate exists to constrain silence it
+    permanently with one write — measured: a forged sentinel froze the counter
+    across three further distinct defect rounds. Telling the author what the
+    gate can see is safe; letting that state decide the verdict is not.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return ""
+        raw = out.stdout.strip()
+        git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
+        merging = (
+            any((git_dir / n).exists() for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"))
+            or (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return ""
+    if not merging:
+        return ""
+    return (
+        "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "
+        "keys on the staged diff, so pulling upstream in to resolve a conflict "
+        "reads as another round even though it adds no authored code. If this "
+        "commit IS only that merge, say so in the ack rather than treating it "
+        "as a real round."
+    )
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -609,6 +654,71 @@ def main() -> None:
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
+        # ── Blind-spot net: unverifiable → ASK the human ────────────────────
+        # "No commit segment" is a trustworthy verdict only when the command was
+        # PARSEABLE. The parser can mis-segment a command and DROP the real
+        # commit segment, so this very early-out is what lets a commit-to-main
+        # / --no-verify / unreviewed commit through. Reproduced against a
+        # shimmed binary, so the proof was execution rather than a parse
+        # reading. When the word "commit" appears (guaranteed past the
+        # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
+        # empty parse is not evidence of absence.
+        #
+        # The outcome is an approval PROMPT, not a refusal. A hard block here has
+        # to be surgically precise about which un-parseable commands are real
+        # commits — and precision is exactly what an unreliable parse cannot
+        # deliver: every narrowing conjunct became a new way to starve the trigger,
+        # while over-blocking broke benign shapes (`git status # don't commit yet`).
+        # Asking inverts those costs: a false positive is one confirmation, a miss
+        # is the pre-existing status quo.
+        #
+        # The probe reads the command RAW — the normalizer that used to
+        # pre-process it is deleted, so an ordinary contraction inside quoted
+        # multi-line input DOES reach this branch. It still does not prompt, but
+        # for a different reason than this comment used to give: analyze()
+        # resolves the segment, and the net only fires where it found none.
+        try:
+            if untokenizable(command):
+                # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
+                # "1" and every other consumer compares to it exactly
+                # (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
+                # outcome_verification_hook). A truthiness test also treats
+                # GENESIS_CC_SESSION=0 — an operator explicitly turning it OFF — as
+                # dispatched, and would then HARD-BLOCK a benign unparseable
+                # mention such as `echo $'don\\'t commit this'` that the interactive
+                # path is meant to merely ask about. Over-blocking is the failure
+                # direction this whole design was chosen to avoid.
+                if os.environ.get("GENESIS_CC_SESSION") == "1":
+                    # No human present to answer a prompt in a dispatched session.
+                    _deny(
+                        "BLOCKED: this command cannot be parsed safely (e.g. "
+                        "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
+                        "sessions cannot proceed on an unverifiable command.\n"
+                        "To proceed: if you are WRITING TEXT (a commit message, "
+                        "a plan, review notes) whose content merely mentions a "
+                        "commit, use the Write tool instead of a here-doc — an "
+                        "apostrophe in ordinary prose is what makes this "
+                        "unparseable, and re-quoting the here-doc cannot fix "
+                        "that. If you are RUNNING a git command, rewrite it in "
+                        "a directly-parseable form (plain quotes, or "
+                        "`git commit -F <file>`)."
+                        # The way OUT belongs here more than on the ask below:
+                        # an interactive session can ask a human what it did
+                        # wrong, an unattended one cannot. A refusal it cannot
+                        # act on is a wall; with the rewrite named it is a cost.
+                    )
+                _ask(
+                    "This command could not be parsed safely (e.g. ANSI-C $'...' "
+                    "quoting) and mentions a commit, so review enforcement cannot "
+                    "verify what it would actually run. Approve only if you are "
+                    "sure. To avoid the prompt, rewrite it in a directly-parseable "
+                    "form (plain quotes, or `git commit -F <file>`)."
+                )
+        except Exception:  # noqa: BLE001 — never crash into a silent allow
+            _ask(
+                "The commit-guard parseability probe failed, so this command could "
+                "not be verified. Approve only if you are sure."
+            )
         sys.exit(0)
 
     # Rule 0: Block --no-verify / -n on ANY executed commit segment — it
@@ -621,7 +731,9 @@ def main() -> None:
         _deny(
             "BLOCKED: --no-verify / -n bypasses review enforcement AND the "
             "native pre-commit guards (secrets, large files, direct-to-main). "
-            "Remove it and establish a review first via /review."
+            "Remove it and establish a review first (`/review` where the optional "
+            "`superpowers` plugin is installed, else `/deep-review`, or review and "
+            "then `python3 scripts/review_state.py mark --agent-output <file>`)."
         )
         return
 
@@ -641,7 +753,11 @@ def main() -> None:
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
+            FINAL_ROUND_CAP,
+            consume_final_accept,
             get_current_branch,
+            get_final_accept_consumed,
+            get_review_lifetime,
             get_review_round,
             has_code_changes,
             has_valid_review_marker,
@@ -649,8 +765,34 @@ def main() -> None:
             marker_content_current,
             reset_review_round,
         )
-    except ImportError:
-        # If review_state.py is missing, fail open — don't block
+    except Exception:  # noqa: BLE001 — ANY load failure, not just absence.
+        # If review_state cannot be loaded, fail open — don't block.
+        #
+        # WIDENED from `except ImportError` deliberately, and the wrapper below is
+        # exactly why. A SyntaxError (or any top-level runtime error) in
+        # review_state is NOT an ImportError, so it used to escape this handler
+        # and exit 1 — non-blocking, so the commit proceeded. Now that main() runs
+        # under run_guard, that same escape converts to a hard BLOCK instead, and
+        # MEASURED it blocks EVERY commit on the box: the trailing
+        # `# review-override` cannot rescue it either, because the override is
+        # parsed after this import. That includes the commit that would repair
+        # review_state, so the gate would wall off its own fix.
+        #
+        # The sibling (scripts/hooks/git_push_guard.py, the ESCALATION_ROUND_CAP
+        # import) widened the same handler for the same reason, but its degrade
+        # is NOT the same and the difference matters: it falls back to a default
+        # constant and keeps every gate armed, whereas this one abandons the
+        # whole gate — the direct-to-main rule, the review-marker requirement and
+        # the round rules all stop applying. That is a big loss, chosen over a
+        # bigger one, and it is the pre-existing behaviour for the absent case
+        # rather than something new. (The narrower handler was not "no guard": it
+        # caught absence and missed everything else.)
+        print(
+            "WARNING (review_enforcement_commit): review_state failed to load — "
+            "the review gate is DISABLED for this commit (fail-open). Fix "
+            "scripts/review_state.py; commits are unguarded until you do.",
+            file=sys.stderr,
+        )
         sys.exit(0)
 
     # Rule 1: Block commits on main. Fail closed when the cwd is ambiguous — we
@@ -789,12 +931,18 @@ def main() -> None:
             return
 
     # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
-    # defect-bearing review→fix→re-review rounds on this change (a clean review
-    # resets the streak — see review_state.bump_review_round), block the commit
+    # defect-bearing review→fix→re-review rounds on this change, block the commit
     # until an explicit '# escalation-ack' trailing comment — a machine-enforced
-    # STOP so a genuine review→fix loop can't silently run long on a standing
-    # "proceed" (see genesis-development SKILL.md), while honestly-clean
-    # multi-commit development never trips. Checked BEFORE
+    # STOP. The streak is CROSS-MODEL ONLY: only an EXTERNAL, non-Anthropic reviewer
+    # (Codex/Kimi/…) marked `--source external` advances or resets it (see
+    # review_state.bump_review_round). Internal same-model self/subagent reviews
+    # (genesis-architect/genesis-security/any spawned agent) NEVER count — they are
+    # free and share the author's blind spots, so penalizing them just punishes
+    # self-review. This is why the mode-switch audit below (an internal subagent) does
+    # NOT trip the cap: only a repeat EXTERNAL non-convergence does. The machine-
+    # enforced STOP keeps a genuine cross-model review→fix loop from silently running
+    # long on a standing "proceed" (see genesis-development SKILL.md), while
+    # honestly-clean multi-commit development never trips. Checked BEFORE
     # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
     # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
     # cap would otherwise sneak past via the docs skip), nor by '# review-override'
@@ -807,21 +955,116 @@ def main() -> None:
     # documented `git commit … # escalation-ack` form is a plain segment.
     round_n = get_review_round(cwd=cwd)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+
+    # Set when Rule 3a honours a '# final-round-accept', SPENT only at an actual
+    # allow. The two must not be the same moment: Rule 3a is checked FIRST, but
+    # four later rules (the escalation cap, the mode-switch tier, the depth gate,
+    # Rule 2) can still deny the very same command — and consuming inside the tier
+    # burned the one-shot token on a commit that never ran. Because the consuming
+    # tier is then checked first on the retry, the branch became permanently
+    # uncommittable. MEASURED before this fix, at streak 7 / lifetime 7 (a state
+    # this file's own comment calls reachable): all four sigil combinations
+    # returned exit 2, including the one the block message itself prints.
+    spend_final_accept = False
+
+    def _allow() -> None:
+        """Exit 0, spending the acceptance only if one was actually honoured."""
+        if spend_final_accept:
+            consume_final_accept(cwd=cwd)
+        sys.exit(0)
+
+    # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
+    # and that ordering is the entire point — at the terminal the round counter has
+    # typically just been reset by an earlier '# escalation-ack', so the cap would
+    # not fire and an escalation-ack must not be able to clear this.
+    #
+    # The cap below is REPEATABLE by construction: its ack calls
+    # reset_review_round, so a change can cycle 1-2-3-ack, 4-5-6-ack, without end.
+    # This tier is the terminal that cycle never reaches. It is deliberately NOT
+    # resettable by its own ack: '# final-round-accept' clears exactly ONE commit
+    # and the block returns on the next one. A sigil that kept working would just
+    # be a fourth repeatable sigil, which is the defect being closed.
+    #
+    # Counted the same way as the streak — EXTERNAL cross-model rounds only
+    # (see review_state.bump_review_round). Internal self/subagent audits stay
+    # free, including the one the mode-switch tier itself mandates; counting those
+    # would make the machine penalise the remedy it demands.
+    lifetime_n = get_review_lifetime(cwd=cwd)
+    if lifetime_n >= FINAL_ROUND_CAP:
+        final_acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
+        )
+        # "Clears exactly ONE commit" has to be RECORDED to be true. Re-requiring the
+        # sigil on every commit is not a terminal — a session under a mandate to make
+        # progress just appends it again, which is the fourth repeatable escape hatch
+        # this tier exists to remove. The acceptance is spent on first use and the
+        # branch cannot buy another.
+        if final_acked and get_final_accept_consumed(cwd=cwd):
+            _deny(
+                f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
+                f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
+                "commit, once — re-applying the sigil does not buy another round, or it "
+                "would be the repeatable escape hatch this terminal replaced.\n\n"
+                "You accepted the outstanding findings and committed. If that commit "
+                "still needs work, the loop did not end, and continuing is no longer a "
+                "call this session makes:\n"
+                "  (a) TAKE IT TO THE USER — say what is still open and that the branch "
+                "is past its terminal. Only they can authorise more work here.\n"
+                "  (b) ABANDON the branch and restart from a design that does not need "
+                "seven rounds.\n\n"
+                "A dispatched session with nobody reading cannot choose either alone — "
+                "surface it and stop." + _merge_note(cwd)
+            )
+            return
+        if not final_acked:
+            # The terminal deliberately does NOT reset the streak, so streak>=3 and
+            # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
+            # required — the escalation cap below is still live once this one clears.
+            # Printing only one would send a session round a loop of alternating
+            # blocks, so name the co-required form when it applies.
+            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
+            _deny(
+                f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
+                f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
+                "audits are not counted). Two full escalation cycles have already run and "
+                "each already asked for a fresh decision; a change still surfacing new "
+                "defects from an independent reviewer after that is not converging, and "
+                "another round is not the answer.\n\n"
+                "This is a judgement call, and there are exactly two ways out:\n"
+                "  (a) ACCEPT the outstanding findings and merge — document each one and "
+                "why it is acceptable in the PR body, then:\n"
+                f'        git commit -m "your message"  # final-round-accept{escalation_hint}\n'
+                "      That clears ONE commit; the block returns on the next, so the "
+                "decision has to actually end the loop.\n"
+                "  (b) ABANDON the branch and restart from a design that does not need "
+                "seven rounds. No sigil — just stop committing here.\n\n"
+                "Take this to the user before choosing; neither option is yours to make "
+                "alone." + _merge_note(cwd)
+            )
+            return
+        # Acked = the accept decision was made. Deliberately NO reset: the counter
+        # stays at/above the terminal so the next commit blocks again. The spend is
+        # DEFERRED to the allow (see `_allow` above) — the later rules can still
+        # deny this command, and a token spent on a denied command bricks the branch.
+        spend_final_accept = True
+
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
         )
         if not acked:
             _deny(
-                f"BLOCKED: review escalation cap reached — {round_n} consecutive review "
-                f"rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). The "
-                "review→fix loop has run long — the round-2 mode-switch audit did NOT "
-                "converge, which means the DESIGN or the problem statement is likely "
-                "wrong, not just this fix. STOP and get a FRESH user decision on how to "
-                "proceed (robust-by-construction redesign / narrow scope / shelve), then "
+                f"BLOCKED: review escalation cap reached — {round_n} consecutive "
+                f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
+                f"{ESCALATION_ROUND_CAP}; internal same-model self/subagent audits are "
+                "not counted). The cross-model review→fix loop has run long — the "
+                "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
+                "the problem statement is likely wrong, not just this fix. STOP and get "
+                "a FRESH user decision on how to proceed (robust-by-construction "
+                "redesign / narrow scope / shelve), then "
                 "acknowledge that decision with a trailing shell comment (outside any "
                 "quotes):\n"
-                '  git commit -m "your message"  # escalation-ack'
+                '  git commit -m "your message"  # escalation-ack' + _merge_note(cwd)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -848,15 +1091,18 @@ def main() -> None:
         )
         if not acked:
             _deny(
-                f"BLOCKED (mode-switch): {round_n} consecutive review rounds each "
-                f"surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). You are fixing the "
-                "INSTANCE the reviewer named, not the CLASS — a third round is how the "
-                "loop runs away. Do NOT commit another one-line patch. STOP and switch "
-                "approach:\n"
+                f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
+                f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
+                "internal self/subagent audits are not counted). You are fixing the "
+                "INSTANCE the reviewer named, not the CLASS — a third external round is "
+                "how the loop runs away. Do NOT commit another one-line patch. STOP and "
+                "switch approach:\n"
                 "  1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
                 "clean context) over the ENTIRE diff — tell it to exhaustively "
                 "enumerate every edge/boundary/sentinel/hierarchy/error case, "
-                "independent of what the bot flagged.\n"
+                "independent of what the bot flagged. (This audit is INTERNAL — mark it "
+                "`--source internal` or plainly; it does NOT advance the cap, so it can "
+                "never be the round that blocks you — that was the bug this fixes.)\n"
                 "  2. For any domain semantics in play (cgroup, systemd, SQLite, async, "
                 "timezones, …), READ the authoritative docs/source — do not reason from "
                 "assumption; assumption is what produced the serial defects.\n"
@@ -864,7 +1110,7 @@ def main() -> None:
                 "case.\n"
                 "Then acknowledge you did the audit (not another blind patch) with a "
                 "trailing shell comment (outside any quotes):\n"
-                '  git commit -m "your message"  # audit-ack'
+                '  git commit -m "your message"  # audit-ack' + _merge_note(cwd)
             )
             return
 
@@ -891,7 +1137,7 @@ def main() -> None:
     if not commit_may_add_content:
         staged = _staged_files(cwd)
         if staged and all(_is_docs_or_config(p) for p in staged):
-            sys.exit(0)
+            _allow()
 
     # Rule 2.5: review DEPTH. A SUBSTANTIAL change needs an ADVERSARIAL audit, not a
     # precision-filtered inline pass — a "no findings" from a confidence-≥80 reviewer
@@ -959,7 +1205,9 @@ def main() -> None:
                 "hierarchy class, READ authoritative semantics for any domain code), save it "
                 "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
                 "(concurrent sessions don't clobber it), then re-mark:\n"
-                "  python3 scripts/review_state.py mark\n"
+                "  python3 scripts/review_state.py mark   # a genesis-architect audit is "
+                "INTERNAL — it satisfies this depth gate and never counts toward the "
+                "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
             )
@@ -985,7 +1233,7 @@ def main() -> None:
                 "Findings acknowledged by session.",
                 file=sys.stderr,
             )
-            sys.exit(0)
+            _allow()
         if override == "in_quote":
             _deny(
                 "BLOCKED: '# review-override' is not a clean trailing shell "
@@ -998,16 +1246,21 @@ def main() -> None:
             return
         _deny(
             "BLOCKED: Code changes exist without review. "
-            "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
-            "save it to `python3 scripts/review_state.py evidence-path`, "
-            "then run: python3 scripts/review_state.py mark\n"
+            "Run an adversarial audit first — `/review` where the optional `superpowers` "
+            "plugin is installed, else `/deep-review`, or dispatch the genesis-architect "
+            "agent — save it to `python3 scripts/review_state.py evidence-path`, then "
+            "re-mark: `python3 scripts/review_state.py mark --agent-output <that file>` "
+            "(a genesis-architect audit is INTERNAL and satisfies this gate; it never "
+            "counts toward the escalation cap — no outcome flag needed). Only a "
+            "non-Anthropic cross-model review (Codex/Kimi) is marked `--source external "
+            "--defects|--clean`.\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )
         return
 
     # All checks passed — allow
-    sys.exit(0)
+    _allow()
 
 
 def _deny(message: str) -> None:
@@ -1016,5 +1269,35 @@ def _deny(message: str) -> None:
     sys.exit(2)
 
 
+def _ask(reason: str) -> None:
+    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
+
+    For the UNVERIFIABLE path only: a command the parser cannot resolve is not
+    evidence of wrongdoing, so it earns a human decision rather than a refusal.
+    Claude Code runs the tool only on explicit approval, which the agent cannot
+    self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
+    stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
+    """
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    sys.exit(0)
+
+
 if __name__ == "__main__":
-    main()
+    # Fail CLOSED on an unexpected crash. CC's PreToolUse contract is "exit 2 =
+    # block; ANY other code = non-blocking error → the tool RUNS", so a bare
+    # main() let every uncaught exception in this gate (Rule 0, the branch/review
+    # rules, git_root_for, …) exit 1 = silent FAIL-OPEN on a commit. run_guard
+    # converts that to exit 2 and logs loudly; SystemExit (every deliberate
+    # _deny/allow path here) propagates untouched, so allow/block decisions are
+    # unchanged. Mirrors git_push_guard.py's wiring.
+    run_guard(main, "review_enforcement_commit")

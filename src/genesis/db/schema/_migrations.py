@@ -215,6 +215,13 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)"
         )
 
+    # B2b dispatch follow-through: who created an intention — 'ego' (LLM,
+    # counts against MAX_ACTIVE_PER_SOURCE) or 'system' (mechanical dispatch
+    # follow-through, bypasses the cap). Mirrored in migration 0086.
+    await _try_alter(db,
+        "ALTER TABLE ego_intentions ADD COLUMN origin TEXT NOT NULL DEFAULT 'ego'",
+        "ego_intentions.origin")
+
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN thread_id TEXT",
@@ -898,6 +905,108 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             exc_info=True,
         )
 
+    # Add 'marketing' category so the marketing campaign's tick digest routes to
+    # its own "Marketing" supergroup topic (never the shared Morning Reports
+    # topic that 'digest' lands in).  Rebuild #5, appended AFTER the enforcing
+    # engagement rebuild (#4) so this becomes the FINAL DDL — it therefore
+    # carries the ENFORCING engagement CHECK ('engaged' + IS NULL OR ...) and
+    # preserves every earlier category-probe fragment VERBATIM, or an older
+    # rebuild re-fires next boot (see test_final_ddl_preserves_all_chain_probe_
+    # fragments).  Probe on the exact trailing pair 'notification', 'marketing'.
+    # By the time this runs the engagement rebuild has already normalized
+    # engagement_outcome, so a straight column copy is safe.
+    _MARKETING_FRAGMENT = "'notification', 'marketing'"
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='outreach_history'"
+        )
+        row = await cursor.fetchone()
+        if row and _MARKETING_FRAGMENT not in (row[0] or ""):
+            # Clean up an orphaned temp table from any prior failed rebuild
+            await db.execute("DROP TABLE IF EXISTS outreach_history_new")
+            await db.execute("""
+                CREATE TABLE outreach_history_new (
+                    id                  TEXT PRIMARY KEY,
+                    person_id           TEXT,
+                    signal_type         TEXT NOT NULL,
+                    topic               TEXT NOT NULL,
+                    category            TEXT NOT NULL CHECK (category IN (
+                        'blocker', 'alert', 'finding', 'insight', 'opportunity',
+                        'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
+                    )),
+                    salience_score      REAL NOT NULL,
+                    channel             TEXT NOT NULL,
+                    message_content     TEXT NOT NULL,
+                    drive_alignment     TEXT,
+                    labeled_surplus     INTEGER DEFAULT 0,
+                    content_hash        TEXT,
+                    delivery_id         TEXT,
+                    delivered_at        TEXT,
+                    opened_at           TEXT,
+                    user_response       TEXT,
+                    action_taken        TEXT,
+                    engagement_outcome  TEXT CHECK (
+                        engagement_outcome IS NULL OR engagement_outcome IN (
+                        'useful', 'engaged', 'acted_on', 'acknowledged',
+                        'not_useful', 'ambivalent', 'ignored'
+                    )),
+                    engagement_signal   TEXT,
+                    prediction_error    REAL,
+                    created_at          TEXT NOT NULL
+                )
+            """)
+            # Copy over the live↔rebuild column INTERSECTION (drift-safe). If the
+            # live table carries a column this rebuild target lacks — e.g. a
+            # concurrent schema-bearing branch added one — _intersection_copy
+            # RAISES instead of silently dropping it; the enclosing try/except then
+            # keeps the ORIGINAL table intact (recoverable) and the rebuild
+            # self-heals once this CREATE is corrected to match the canonical
+            # _tables.py DDL. By the time this block runs, rebuild #4 has already
+            # normalized engagement_outcome under the enforcing CHECK, so the
+            # straight column copy is clean.
+            await _intersection_copy(
+                db, src="outreach_history", dst="outreach_history_new"
+            )
+            await db.execute("DROP TABLE outreach_history")
+            await db.execute(
+                "ALTER TABLE outreach_history_new RENAME TO outreach_history"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_channel "
+                "ON outreach_history(channel)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_category "
+                "ON outreach_history(category)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_delivered "
+                "ON outreach_history(delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_outcome "
+                "ON outreach_history(engagement_outcome)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_dedup "
+                "ON outreach_history(signal_type, topic, category, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_content_hash "
+                "ON outreach_history(signal_type, category, content_hash, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_person "
+                "ON outreach_history(person_id)"
+            )
+            await db.commit()
+            logger.info("outreach_history table rebuilt with 'marketing' category")
+    except Exception:
+        logger.error(
+            "outreach_history CHECK constraint migration (marketing) failed",
+            exc_info=True,
+        )
+
     # Memory photographic: extraction watermark tracking on cc_sessions
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_at TEXT",
@@ -1100,6 +1209,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         # the actionable drift message; the savepoint above already restored
         # the pre-rebuild table, so nothing is lost or half-rebuilt.
         raise
+
+    # Entity human-approval gate (0090): approved_at/approved_by on
+    # entity_adjudications. Mirrored here because create_all_tables runs
+    # _migrate_add_columns but NOT the numbered runner (schema_both_build_paths),
+    # and — critically — the INDEXES pass that follows this function creates
+    # idx_entity_adjud_approved ON entity_adjudications(verdict, approved_at). On a
+    # legacy DB the table pre-exists WITHOUT these columns (CREATE TABLE IF NOT
+    # EXISTS is a no-op), so without these ALTERs the index build crashes bootstrap
+    # with 'no such column: approved_at' before the numbered runner ever runs (the
+    # #1123/#1127 class). NULL = unreviewed; the apply path filters on approved_at
+    # IS NOT NULL so no merge is ever auto-applied.
+    await _try_alter(db,
+        "ALTER TABLE entity_adjudications ADD COLUMN approved_at TEXT",
+        "entity_adjudications.approved_at")
+    await _try_alter(db,
+        "ALTER TABLE entity_adjudications ADD COLUMN approved_by TEXT",
+        "entity_adjudications.approved_by")
 
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,
@@ -2046,6 +2172,25 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         db,
         "ALTER TABLE memory_metadata ADD COLUMN capture_clarity REAL",
         "memory_metadata.capture_clarity",
+    )
+
+    # The two stamps the peer-line topic recency comparison needs. Neither
+    # table had a timestamp meaning what the comparison requires:
+    # session_charters.updated_at is a ROW timestamp (set_pointers and the
+    # upsert bump it too), and cc_sessions.last_extracted_at is a PASS
+    # watermark the extraction job advances even when it writes no topic
+    # (measured: 219/899 live rows carry a watermark with no topic). Mirrored
+    # in migration 0091 for the standalone runner; added here so an existing DB
+    # gets them on the base create_all_tables path (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT",
+        "session_charters.mission_updated_at",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN topic_updated_at TEXT",
+        "cc_sessions.topic_updated_at",
     )
 
 

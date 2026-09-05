@@ -109,9 +109,15 @@ def test_h5_guardian_state_uses_operator_home():
 
 
 def test_h5_claude_dir_chowned_to_operator():
+    """Owner ONLY — no trailing colon. MEASURED: `chown user:` resets the group
+    to the user's LOGIN group (a file at ubuntu:sudo became ubuntu:ubuntu), so
+    the colon form silently destroyed a deliberate group on a pre-existing
+    ~/.claude. The operator-owner bit is what the guard is about; the group is
+    not ours to reset."""
     code = _code(HOST_SETUP)
     seg = code.split('mkdir -p "$_host_home/.claude"', 1)[1].split("if [ ! -f", 1)[0]
-    assert 'chown "$_host_user:" "$_host_home/.claude"' in seg
+    assert 'chown "$_host_user" "$_host_home/.claude"' in seg
+    assert 'chown "$_host_user:"' not in seg, "trailing colon resets the group"
 
 
 # ── I2: set -e-safe mount add + retrofit-removal warning ────────────

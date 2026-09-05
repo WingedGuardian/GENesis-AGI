@@ -20,6 +20,7 @@ async def enqueue(
     deliver_after: str | None = None,
     thread_id: str | None = None,
     validated_recipient: str | None = None,
+    labeled_surplus: bool = False,
 ) -> str:
     """Queue a message for bridge delivery. Returns the pending ID.
 
@@ -27,6 +28,11 @@ async def enqueue(
     recipient through the queue so the genesis-server drain can rebuild a
     properly-routed request — without them a queued email defaulted to the
     agent's own address (a self-send loop).
+
+    ``labeled_surplus`` carries the BULK/campaign flag through the queue so a
+    QUEUED cold-marketing send (the MCP subprocess enqueue path) is rebuilt with
+    ``labeled_surplus=True`` and classifies BULK at the autonomy gate — without it
+    a queued cold send mis-classifies as IDENTITY.
     """
     from datetime import UTC, datetime
 
@@ -35,8 +41,8 @@ async def enqueue(
     await db.execute(
         """INSERT INTO pending_outreach
            (id, message, category, channel, urgency, deliver_after, created_at,
-            thread_id, validated_recipient)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            thread_id, validated_recipient, labeled_surplus)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             pending_id,
             message,
@@ -47,6 +53,7 @@ async def enqueue(
             now,
             thread_id,
             validated_recipient,
+            1 if labeled_surplus else 0,
         ),
     )
     await db.commit()
@@ -130,7 +137,20 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             delivered           INTEGER NOT NULL DEFAULT 0,
             delivered_at        TEXT,
             thread_id           TEXT,
-            validated_recipient TEXT
+            validated_recipient TEXT,
+            labeled_surplus     INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # Legacy DBs whose pending_outreach predates labeled_surplus: add it here too
+    # (this standalone-fallback path runs before the numbered migration on a
+    # subprocess-only boot). Guarded so a re-run / fresh DB never errors.
+    import contextlib
+
+    with contextlib.suppress(Exception):
+        cursor = await db.execute("PRAGMA table_info(pending_outreach)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "labeled_surplus" not in cols:
+            await db.execute(
+                "ALTER TABLE pending_outreach ADD COLUMN labeled_surplus INTEGER NOT NULL DEFAULT 0"
+            )
     await db.commit()

@@ -345,3 +345,64 @@ class TestRecentProviderFallbackCounts:
             db, since="2026-01-01T00:00:00",
         )
         assert out == {}
+
+
+class TestWorstSeverityRanking:
+    """`worst_severity` must rank by SEVERITY, not alphabetically.
+
+    The vocabulary is lowercase (`Severity` StrEnum: debug/info/warning/error/
+    critical), so a lexicographic MAX() returns "warning" > "info" > "error" >
+    "debug" > "critical" — critical sorts LOWEST. Any group mixing a CRITICAL
+    with a WARNING therefore reported "warning" and rendered amber, silently
+    downgrading the most severe events in the group.
+    """
+
+    @pytest.mark.asyncio
+    async def test_critical_outranks_warning_in_a_mixed_group(self, db):
+        # Same subsystem/type/message-prefix => one group.
+        await crud.insert(
+            db, subsystem="routing", severity="warning",
+            event_type="provider.fallback", message="Provider trouble",
+            timestamp="2026-03-14T10:00:00",
+        )
+        await crud.insert(
+            db, subsystem="routing", severity="critical",
+            event_type="provider.fallback", message="Provider trouble",
+            timestamp="2026-03-14T10:01:00",
+        )
+        groups = await crud.query_grouped_errors(db, since="2026-03-14T00:00:00")
+        assert len(groups) == 1, f"expected one group, got {groups}"
+        assert groups[0]["worst_severity"] == "critical", (
+            "a group containing a CRITICAL reported "
+            f"{groups[0]['worst_severity']!r} — alphabetical MAX() puts "
+            "'warning' above 'critical', so criticals render amber"
+        )
+
+    @pytest.mark.asyncio
+    async def test_error_outranks_warning_in_a_mixed_group(self, db):
+        await crud.insert(
+            db, subsystem="memory", severity="warning",
+            event_type="embedding.failed", message="Embed trouble",
+            timestamp="2026-03-14T11:00:00",
+        )
+        await crud.insert(
+            db, subsystem="memory", severity="error",
+            event_type="embedding.failed", message="Embed trouble",
+            timestamp="2026-03-14T11:01:00",
+        )
+        groups = await crud.query_grouped_errors(db, since="2026-03-14T00:00:00")
+        assert len(groups) == 1
+        assert groups[0]["worst_severity"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_warning_only_group_still_reports_warning(self, db):
+        """Control — the ranking must not over-escalate a homogeneous group."""
+        for i in range(2):
+            await crud.insert(
+                db, subsystem="routing", severity="warning",
+                event_type="breaker.tripped", message="Just warnings",
+                timestamp=f"2026-03-14T12:0{i}:00",
+            )
+        groups = await crud.query_grouped_errors(db, since="2026-03-14T00:00:00")
+        assert len(groups) == 1
+        assert groups[0]["worst_severity"] == "warning"

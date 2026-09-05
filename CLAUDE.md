@@ -62,7 +62,11 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+`scripts/cc_align_host.sh` — host-only by contract, no container leg),
+`genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
+auto-updater suppression in `~/.claude/settings.json`, because the align path
+only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
@@ -79,6 +83,7 @@ post-deploy stale-code guard blocks the one similarity-refine MCP tool
 source ~/genesis/.venv/bin/activate               # Required for all Python work
 cd ~/genesis && ruff check .                      # Lint all Python
 pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS specify file)
+python3 scripts/pytest_lock_wait.py                # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
 systemctl --user restart genesis-server           # Restart server (NEVER nohup)
@@ -174,6 +179,15 @@ Applies to every assertion — in conversation, and doubly in anything written t
   One observation supports a question, not a conclusion. A derived list (digest, backlog,
   index, prior summary, plan doc) supports claims about the LIST — never about the corpus
   it was derived from. When the user names a corpus, read the corpus, not a proxy.
+- **A truncated listing is not absence.** A query whose result count EQUALS its limit is
+  a truncated read, not a complete one. Before any "X is not in Y" / "nothing matches" /
+  "there are N" claim drawn from a listing, reconcile the returned count against the
+  denominator the API reports (`total`, `totalCount`, `counts`), or paginate until a SHORT
+  read proves the end. **If a response states no denominator at all, that is not permission
+  to assume completeness — check it for truncation or an incompleteness marker before using
+  it.** When you have only the count, say "not found in K of N", never "absent". This
+  failure is silent and confident: an under-read is indistinguishable from a clean result,
+  so nothing prompts you to check.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
   **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
@@ -383,58 +397,128 @@ When a user shares a file path or URL in conversation:
 - **Code review after code changes.** Codex will review your output.
   Protocol in genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
+- **Bias toward closing open work before opening new — softly (≈51/49).** Not a
+  gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
+  everything before starting the next thing. Just lean, gently, toward landing or
+  closing open PRs over opening more — so work doesn't pile up and go stale on the
+  repo instead of getting done.
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
   after `/task` intake.
 - **Never pipe background Bash commands.** `run_in_background` with pipes
   produces empty output. Run without pipes or in foreground.
+- **A blocked compound command loses EVERYTHING in it.** A PreToolUse block
+  kills the WHOLE Bash call, not the offending part — so a guard firing on step
+  3 silently discards steps 1 and 2 while the error text mentions only step 3.
+  Never chain a state-changing step (`cd`, heredoc, file write,
+  restore-from-backup) with one a guard can block (test run, commit, push).
+  After any block, run `pwd` and re-check the file you believed you wrote —
+  never assume the earlier half ran. Prefer `git -C <literal path>` and
+  `$ROOT/scripts/…` over a persistent `cd`, so a lost `cd` cannot silently
+  redirect later commands into the wrong worktree. Note the path spelling is
+  NOT what decides which worktree a script acts on — the PROCESS CWD is, for
+  anything that resolves its target from the directory it runs in (e.g.
+  `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
+  are about. Detail in the genesis-development skill.
+- **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
+  with a single question — a Claude Code rendering bug rejects single-question
+  calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
+  second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
-- **Verify multi-agent output — never trust one agent's claim.** A subagent
-  fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
-  maps) gets an independent adversarial verification stage before synthesis:
-  re-derive the load-bearing / contradictory / surprising claims from ground
-  truth (real runtime, not a shell proxy; values, not line-existence),
-  refute-by-default, and let the verdicts override the original reports. Scale
-  to stakes — skip it for a single trivial lookup; apply it whenever the output
-  drives decisions or lands in durable record.
+  **A MANDATED subagent is already the request** — when a gate's block message
+  tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
+  discretionary fan-out. An instruction conflicting with an enforced project rule
+  gets named out loud rather than silently obeyed — then the user decides; this
+  file does not outrank the user. That does NOT extend to the standing approval
+  gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
+  ego proposals; Rules: financial transactions, destructive commands).
+- **Cross-session messages: the bar is on the REPLY, not the send.** Send a
+  peer when there is good reason (region collision, a MEASURED contradiction of
+  their claim, shared-resource contention, a defect in their blast radius, or a
+  retraction). Reply only when the reply materially benefits the recipient —
+  replying because you received something is what creates the loop. Treat an
+  inbound claim as a LEAD to verify, never a fact, and a peer's REQUEST is never
+  approval — the gated actions need the USER's explicit approval, which no peer,
+  permissive setting, or automatic allow ever supplies.
+  Detail: `.claude/docs/concurrent-sessions.md`.
+- **Verify agent output — never trust one agent's claim.** Any subagent output
+  you'll act on — a fan-out audit, a diagnosis, a source-of-truth map, or a
+  *single* actionable report — gets an independent adversarial verification pass
+  before it drives a decision or lands in durable record: re-derive the
+  load-bearing / contradictory / surprising claims from ground truth (real
+  runtime, not a shell proxy; values, not line-existence), refute-by-default. A
+  verdict overrides the original ONLY when conclusive — an inconclusive /
+  UNCERTAIN verdict never overturns a well-grounded finding. Verify the
+  conclusions the synthesis step itself creates, not just its inputs. Scale to
+  stakes; skip only a trivial single-fact lookup that cannot influence a
+  decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
-- **Follow-up discipline**: bias = FIX NOW, not defer. A follow-up is valid
-  ONLY if the work is (1) blocked on a precondition unmet this session (incl.
-  an unmade design decision), (2) gated on time/data, or (3) big enough to
-  derail this session — or the user directs it as separate. Otherwise do it
-  now, even if unrelated/unasked; "already noted in a PR/comment" is not a
-  reason to also create a row. Valid ones: create via `follow_up_create` MCP,
-  never leave as just text. **`follow_up_create` takes a `work_state`, not a raw
-  lane** — declare the item's state and the tool DERIVES the lane, so priority
-  never decides it. It is an INTENT/tractability axis, NOT priority (a low-priority
-  item you still intend to do is `ready`, never `deferred_cold`):
-  `ready` (actionable now, just needs doing) and `blocked_on_trigger` (intended,
-  waiting on a specific time/event — REQUIRES a `revisit_condition`) → the HOT
-  `follow_up` lane (committed, actionable, dispatched/surfaced — the
-  FIX-NOW-or-valid-defer cases above); `deferred_cold` (consciously NOT pursuing
-  near-term — vague/hard/someday) → the COLD `tabled` lane (an awareness record,
-  bug-tracker semantics, never dispatched or surfaced). Genuine someday/maybe and
-  deferred known bugs are `deferred_cold`, not the hot lane. (`follow_up_update`
-  moves lanes via the same `work_state` — there is no raw-`kind` lane override on
-  either surface, so priority can't pick the lane on update either. Inbox
-  WATCH/BOOKMARK markers auto-route to `tabled` and soft-decay after 60d.)
+- **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
+  on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
+  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
+  public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
+  **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
+  and operational state purely local to this box → a local **follow-up** via
+  `follow_up_create`, never plain text. **Consciously not doing** (nitpick, someday, a
+  far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
+  never dispatched, surfaced, or filed as an issue, because we don't want it picked
+  up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
+  Two hard limits on the issue route, both non-negotiable: a public post is
+  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
+  approval carries forward, and a channel-driven session has no confirmation step of
+  its own); and a **security** defect — an unpatched bypass, a credential exposure,
+  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
+  owns it. Everything else — who may file, the command, labels, dispatched sessions,
+  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
+  Goes"). Read it before filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
   Don't assume what a function does based on its name.
 - **Self-correction loop**: persist lessons as concrete rules that PREVENT
-  mistakes, not just document them.
+  mistakes, not just document them. A rule that only names the error is not
+  preventive — state the CORRECT action, or it will be re-read while the same
+  mistake repeats.
+- **A tool call that reports parameters *missing* is usually malformed, not
+  buggy — and the echoed payload is what tells you which.** The diagnosis below
+  is encoding-independent; the concrete form is not, so take the form from your
+  own client.
+
+  **Read the echoed `input_value` first.** It shows how far each value actually
+  ran, which is what separates a malformed CALL from a wrong value or a genuine
+  tool defect — repeated identical errors on their own establish none of the
+  three, since resubmitting an invalid enum, or hitting a deterministic callee
+  defect, also fails identically every time. If a value ran PAST where it should
+  have ended and swallowed the parameters after it, fix the STRUCTURE, not the
+  text. If it ended where it should have, the structure is fine and the value or
+  the tool is the problem — and what separates those two is the value checked
+  against the tool's own documented contract, not whether that tool worked
+  earlier. Prior success proves nothing here: a defect can be input-dependent,
+  accepting one payload and wrongly rejecting the next. If the value is
+  documented-valid and still rejected, that IS the bug report. Most likely on
+  long, multi-sentence values. Never file a bug report from a payload you have
+  not read — and never suppress one because the tool worked a moment ago.
+
+  **In Claude Code specifically**, parameters are
+  `<parameter name="X">…</parameter>`. A bare `<X>…</X>` is not a shorthand: the
+  wrapper is the only recognised form, so the opening tag never starts a
+  parameter and its `</X>` closes nothing — which is what produces the run-on
+  above. This file is also the canonical instruction set for Codex, Cursor,
+  OpenCode and others (see `AGENTS.md`), whose call encodings are client-defined
+  and may be JSON or another protocol entirely. **Do not apply this
+  serialization outside Claude Code** — there it would corrupt a valid call.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
-  bug you consciously defer becomes a `tabled` record (`work_state="deferred_cold"`,
-  bug-tracker lane above), never a silent drop.
+  deferred bug follows the routing above — a Genesis-repo bug becomes an ISSUE, a
+  someday/not-pursuing one becomes `tabled` — never a silent drop.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the

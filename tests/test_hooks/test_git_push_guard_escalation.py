@@ -452,3 +452,88 @@ class TestMainWiring:
     def test_main_allows_with_ack(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
         assert self._run_main(monkeypatch, TRIGGER + "  # escalation-ack") == 0
+
+
+class TestCodexRoundTerminal:
+    """The terminal has to live HERE too, not only in the commit gate.
+
+    The commit-side terminal reads `review_state`'s local lifetime counter. This
+    gate's own docstring records why that counter is not enough: it "stays asleep
+    when every local review is clean while the loop churns through CODEX rounds on
+    the PR — the exact blind spot of the 2026-08-12 MW-3 #1372 whack-a-mole (5
+    Codex rounds, local counter at 0)". A terminal built on the sleeping counter
+    inherits the blind spot, so the normal review/fix loop could run past seven
+    rounds without ever reaching it. This tier counts the PR's REAL review history.
+    """
+
+    def _at(self, monkeypatch, n: int):
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(n)))
+
+    def test_escalation_ack_does_not_clear_the_terminal(self, monkeypatch):
+        """The load-bearing case: the repeatable sigil must stop working here."""
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        blocked, msg = _check(f"{TRIGGER}  # escalation-ack")
+        assert blocked, "an escalation-ack past the terminal must NOT dispatch"
+        assert "terminal" in msg.lower()
+
+    def test_escalation_ack_still_works_below_the_terminal(self, monkeypatch):
+        """The control. Without this, a terminal that blocked everything would pass."""
+        self._at(monkeypatch, _mod.ESCALATION_ROUND_CAP)
+        assert _check(f"{TRIGGER}  # escalation-ack")[0] is False
+        assert _check(TRIGGER)[0] is True, "control: unacked at the cap must block"
+
+    def test_final_round_accept_clears_the_terminal(self, monkeypatch):
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        assert _check(TRIGGER)[0] is True, "control: the terminal must be live here"
+        assert _check(f"{TRIGGER}  # final-round-accept")[0] is False
+
+    def test_below_the_terminal_is_untouched(self, monkeypatch):
+        self._at(monkeypatch, _mod.ESCALATION_ROUND_CAP - 1)
+        assert _check(TRIGGER)[0] is False
+
+    def test_terminal_message_names_the_sigil_that_works(self, monkeypatch):
+        """A block printing only the sigil that does NOT work teaches a dead loop."""
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        msg = _check(TRIGGER)[1]
+        assert "final-round-accept" in msg
+        assert "user" in msg.lower()
+
+    def test_one_acceptance_licenses_only_one_dispatch(self, monkeypatch):
+        """`request && request  # final-round-accept` must not chain rounds.
+
+        The sigil is matched command-wide on purpose — a nested
+        `bash -c '…' # final-round-accept` carries it on the OUTER segment, so
+        per-segment binding would break the documented nested form. That same
+        command-wide truth let one decision authorise every trigger in a compound,
+        while the advisory promises the user directed "ONE more round".
+        """
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        one = f"{TRIGGER}  # final-round-accept"
+        assert _check(one)[0] is False, "control: a single licensed dispatch allows"
+        blocked, msg = _check(f"{TRIGGER} && {TRIGGER}  # final-round-accept")
+        assert blocked, "a second terminal-stage dispatch rode the same acceptance"
+        assert "one dispatch" in msg.lower() or "second terminal-stage" in msg.lower()
+
+    def test_the_nested_form_still_works_at_the_terminal(self, monkeypatch):
+        """Guard the guard: the fix must not break the sigil-on-the-outer-segment form."""
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        nested = f"bash -c '{TRIGGER}'  # final-round-accept"
+        assert _check(nested)[0] is False, "nested single dispatch must still be licensed"
+
+    def test_an_unreadable_count_fails_open(self, monkeypatch):
+        """Advisory posture unchanged: an unreadable count never hard-blocks.
+
+        Named for what it proves. It cannot be terminal-specific — with the count
+        unreadable there is no count of any size, so `reviews is None` short-circuits
+        before either tier. The terminal's own fail-open is covered by the pairing
+        below, which establishes a real terminal count and THEN breaks the read.
+        """
+        monkeypatch.setattr(_mod, "_codex_reviews", lambda pr, repo=None: None)
+        assert _check(TRIGGER)[0] is False
+
+    def test_a_read_error_at_a_real_terminal_count_still_fails_open(self, monkeypatch):
+        """Control: the terminal blocks on a readable count, and only on one."""
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        assert _check(TRIGGER)[0] is True, "control: a readable terminal count blocks"
+        monkeypatch.setattr(_mod, "_codex_reviews", lambda pr, repo=None: None)
+        assert _check(TRIGGER)[0] is False, "an unreadable count must not hard-block"

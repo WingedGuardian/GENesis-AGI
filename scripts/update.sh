@@ -65,6 +65,28 @@ VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
 STATE_FILE="$HOME/.genesis/update_state.json"
 
+# Guardian pause across the deploy's server restart (PR-2). We pause the host
+# Guardian's gateway before the stop and resume on EXIT, so a deploy doesn't trip
+# it to confirmed_dead and fire false down/recovered alerts. Coords are resolved
+# lazily inside _guardian_pause and stashed here for resume (kept SEPARATE from the
+# HOST_IP/SSH_KEY globals _sync_deploy_targets owns).
+_GUARDIAN_PAUSED=""
+_GUARDIAN_HOST=""
+_GUARDIAN_KEY=""
+_GUARDIAN_RENEW_PID=""   # PID of the background lease-renewer (P2 #4), if running
+# Generous TTL: the EXIT-trap resume ends the pause early on success, so this only
+# matters if the deploy is SIGKILLed (the host's expires_at then self-heals after
+# this long). The bound is the server-DOWN window (~3-15 min), not the total pause
+# (the long host-sync runs server-up); capped at the guardian's 3600.
+GUARDIAN_PAUSE_TTL=1800
+# Bounded lease-renew (P2 #4): the stop→restart window has NO upper bound (the
+# bootstrap does unbounded network work — installer downloads, npm), so a fixed
+# TTL can expire mid-deploy and re-fire the very alerts the pause suppresses. A
+# background renewer re-issues `pause` every TTL/2 while the server is down. CAPPED
+# so an orphaned renewer (parent died before cleanup) self-terminates in
+# ~ RENEW_MAX * TTL/2 (here ~1h) instead of pausing the guardian forever.
+GUARDIAN_PAUSE_RENEW_MAX=4
+
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
 _write_state() {
@@ -133,6 +155,33 @@ _on_signal_prestop() {
     _clear_deploy_state
     exit 1
 }
+
+# ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
+# deploy can repair the keys.
+#
+# bootstrap.sh runs as a SUBPROCESS later in this script and calls
+# cc_ensure_local, which may repair CC's auto-updater suppression. That repair
+# sets CC_SUPPRESSION_STATE in the SUBPROCESS, where it dies; the in-process
+# call in _sync_deploy_targets then finds an already-correct file and reports
+# `ok`, so a real repair reaches neither update_history nor the deploy output —
+# and bootstrap's own message is usually cut by its `tail -10`.
+#
+# cc_ensure_updater_suppressed leaves a durable breadcrumb on any non-ok
+# outcome. CLEARING the file here is what lets the consumer tell "repaired
+# during THIS deploy" from a breadcrumb left weeks ago: anything present after
+# the subprocess was written by this deploy, BY CONSTRUCTION. This replaced an
+# epoch watermark compared with `-gt` — an ordering that rode on the wall
+# clock, so a clock rollback, a snapshot restore carrying a future-dated
+# breadcrumb, or a same-second overwrite each made a GENUINE repair read as a
+# clean deploy. Existence cannot be reordered. The epoch inside the file is
+# display data only, and no reader may compare it again.
+rm -f "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true
+if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
+    # The clear is load-bearing for attribution; a file that survives it would
+    # quietly restore the old weeks-ago-breadcrumb misattribution for one run.
+    echo "  WARNING: could not clear $HOME/.genesis/cc_suppression_outcome —" \
+         "a suppression outcome reported later in this deploy may predate it"
+fi
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
@@ -267,7 +316,10 @@ _sync_deploy_targets() {
         # into a function; test_update_host_sync.py guards the class.
         HOST_IP=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_ip', ''))" 2>/dev/null || true)
         HOST_USER=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_user', 'ubuntu'))" 2>/dev/null || echo "ubuntu")
-        SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
+        # Honor the configured ssh_key (single-line parse per the note above; expand
+        # a leading ~), falling back to the historical default when absent/empty.
+        SSH_KEY=$("$VENV_DIR/bin/python" -c "import yaml, pathlib, os; print(os.path.expanduser(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('ssh_key', '') or ''))" 2>/dev/null || true)
+        [ -n "$SSH_KEY" ] || SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 
         if [ -n "$HOST_IP" ] && [ -f "$SSH_KEY" ]; then
             # Check if Guardian-relevant paths changed in this update. Includes
@@ -481,13 +533,57 @@ _sync_deploy_targets() {
         # swallowing it — symmetric with the host-side pin failures accumulated
         # above, so a container left on a stale CC pin is surfaced in
         # update_history, not silently dropped.
+        # Clear any inherited value first: the `+set` probe below catches a
+        # LIBRARY that predates the state variable only if nothing else already
+        # put the name in scope — an exported CC_SUPPRESSION_STATE=ok from the
+        # parent environment, or an earlier in-process call, would defeat it.
+        # cc_settings_align.sh does the same, for the same reason.
+        unset CC_SUPPRESSION_STATE
         if ! cc_ensure_local; then
             echo "  WARNING: container Claude Code sync failed"
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
         fi
+        # cc_ensure_local also re-asserts auto-updater suppression (it sets
+        # CC_SUPPRESSION_STATE). Surface a non-ok outcome the same way as a version
+        # sync failure: an unsuppressed auto-updater makes the pin advisory, and a
+        # REPEATED repair means something on this box keeps rewriting settings.json
+        # — neither should live only as a line in a long deploy log.
+        # UNSET is not ok. `cc_ensure_local` sourced from a revision that predates
+        # the state variable — version skew across a partial deploy — would sail
+        # through a `${VAR:-ok}` default as a clean deploy that verified nothing.
+        # scripts/cc_settings_align.sh already refuses that read for the same
+        # reason; this is the sibling consumer of the same channel, so it refuses
+        # it too. The `+set` test distinguishes unset from empty; `:-` cannot.
+        if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
+        elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
+        else
+            # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier
+            # in this same deploy, as a subprocess, and may already have repaired
+            # the keys — leaving this call nothing to do and nothing to report.
+            # The breadcrumb is the only surviving evidence, and the file was
+            # CLEARED at the top of this script — so its mere existence now
+            # means "written during this deploy". No epoch comparison: that is
+            # the wall-clock ordering this channel used to ride on, and a clock
+            # rollback or restored snapshot made a genuine repair read as clean.
+            _supp_line="$(cat "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
+            _supp_state="${_supp_line%% *}"
+            if [ -n "$_supp_state" ]; then
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${_supp_state}"
+                echo "  NOTE: auto-updater suppression was '${_supp_state}' earlier in this" \
+                     "deploy (bootstrap) — recording it, since this later check found the" \
+                     "file already correct and would otherwise have reported a clean run"
+            fi
+        fi
         cc_shadow_scan || true
     else
+        # Without the marker, a deploy that never ran the container CC sync OR
+        # the suppression check recorded "success" with an empty degraded list —
+        # the whole block above is behind this file check, so its absence must
+        # be a first-class degraded cause, same as any failure inside it.
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
+        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_env_missing"
     fi
     echo ""
 }
@@ -697,6 +793,106 @@ _start_genesis_server() {
     echo "nohup" > "$HOME/.genesis/server-start-mode"
 }
 
+# ── Guardian pause / resume across the server restart (PR-2) ─────────────────
+# Pause the host Guardian's gateway before we stop genesis-server, so the deploy
+# restart doesn't trip it to confirmed_dead / fire false down+recovered alerts.
+# BEST-EFFORT ONLY: at the pause site `set -e` is live and the ERR trap is not yet
+# armed, so a bare SSH failure would ABORT the deploy — every SSH is
+# `timeout … || true` (version-verb style, NOT fetch style, which exit 1s). Host
+# coords are resolved lazily here (no hoisted resolver → nothing enters the
+# phase-order chain) into separate globals. The `pause` verb only stands the
+# Guardian down once PR-1's gateway is on the host; against an old gateway it
+# errors and we proceed unpaused (safe, dark). No-op when no host is configured.
+_guardian_pause() {
+    local cfg="$HOME/.genesis/guardian_remote.yaml"
+    [ -f "$cfg" ] || return 0
+    local hip hus key
+    hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
+    hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
+    # Honor the configured ssh_key (guardian_remote.yaml), expanding a leading ~,
+    # and fall back to the historical default when the field is absent/empty.
+    key=$("$VENV_DIR/bin/python" -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
+    [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
+    [ -n "$hip" ] && [ -f "$key" ] || return 0
+    _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
+    _GUARDIAN_KEY="$key"
+    # Don't clobber a pause we did not create (P2 #1): if the gateway already has an
+    # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
+    # proceed WITHOUT pausing and WITHOUT arming resume, so our EXIT never removes
+    # their pause (a pre-existing pause already covers our restart window). Against
+    # an OLD gateway with no `paused` verb the query errors/returns non-JSON → no
+    # match → we fall through and pause as before (backward-compatible). The pipe is
+    # in an `if` condition, so a failing ssh can't abort the deploy.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" paused 2>/dev/null | grep -q '"paused": true'; then
+        echo "  Guardian already paused (operator/other) — leaving it intact; not arming our resume"
+        return 0
+    fi
+    # Only mark paused (and arm the resume) if the gateway ACCEPTED the verb.
+    # Against an OLD gateway (no `pause <ttl>` grammar — needs PR-1 deployed) or an
+    # unreachable host this fails; we then proceed unpaused with a VISIBLE warning
+    # instead of a misleading "paused" + silence. The `if` is set -e-safe (a failing
+    # condition never aborts), so a denied/unreachable pause can't abort the deploy.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1; then
+        _GUARDIAN_PAUSED=1
+        echo "  Guardian paused across the restart (ttl ${GUARDIAN_PAUSE_TTL}s)"
+        # Resume on ANY exit, COMPOSED with the temp-copy self-delete (never
+        # replace it — a resume-only re-arm would leak the mktemp copy each deploy).
+        trap '_guardian_resume; rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
+        # Start the bounded lease renewer so an over-TTL downtime can't expire the
+        # pause mid-deploy (P2 #4). _guardian_resume (and the EXIT trap) kills it.
+        # Redirect its fds so it (and its `sleep` child) don't hold the deploy's
+        # stdout/stderr — otherwise a lingering sleep would keep the pipe open.
+        _guardian_renew_loop >/dev/null 2>&1 &
+        _GUARDIAN_RENEW_PID=$!
+    else
+        echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
+    fi
+}
+
+_guardian_resume() {
+    [ "${_GUARDIAN_PAUSED:-}" = 1 ] || return 0
+    # Stop the lease renewer FIRST so it cannot re-pause after we resume (P2 #4).
+    # We never `wait` the renewer before this point, so its PID stays held (running,
+    # or a zombie once the bounded loop self-exits) and CANNOT be reused — so kill -0
+    # reliably identifies our own process (no PID-reuse hazard, no fragile identity
+    # check). `wait` reaps the renewer bash, stopping further renewals. RESIDUAL: a
+    # `pause` ssh already in flight when the kill lands (~15s window, only if the
+    # kill hits mid-renew) is orphaned and may complete AFTER the resume below,
+    # re-asserting the pause — bounded + self-healing via the host-side TTL (≤ the
+    # pause TTL, ≤30min). All steps non-aborting under set -e.
+    if [ -n "${_GUARDIAN_RENEW_PID:-}" ]; then
+        if kill -0 "$_GUARDIAN_RENEW_PID" 2>/dev/null; then
+            kill "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
+        fi
+        wait "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
+        _GUARDIAN_RENEW_PID=""
+    fi
+    # Clear the flag ONLY after the gateway accepts `resume`. On a transient SSH
+    # failure the flag stays set so the EXIT-trap retries; if every retry fails the
+    # host-side TTL (expires_at) self-heals. Clearing first would no-op the retry.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" resume >/dev/null 2>&1; then
+        _GUARDIAN_PAUSED=""
+    fi
+    return 0
+}
+
+_guardian_renew_loop() {
+    # Re-issue `pause $TTL` every TTL/2 while the server is down, BOUNDED to
+    # GUARDIAN_PAUSE_RENEW_MAX iterations. Runs in the background (started by
+    # _guardian_pause); _guardian_resume — and thus the EXIT trap — kills it. A
+    # failed renew is swallowed (best-effort, like the pause itself).
+    local i=0
+    while [ "$i" -lt "$GUARDIAN_PAUSE_RENEW_MAX" ]; do
+        sleep "$((GUARDIAN_PAUSE_TTL / 2))"
+        timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
+        i=$((i + 1))
+    done
+}
+
 # ── Pre-update DB snapshot ────────────────────────────────
 # Flush the WAL and create a clean backup before stopping services.
 # If the server is killed mid-write during the update, this backup
@@ -748,6 +944,9 @@ done
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+    # Pause the host Guardian BEFORE the stop so it never sees the restart as an
+    # outage. Best-effort; on success it arms the EXIT-trap resume.
+    _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -1286,6 +1485,11 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         rm -f "$USER_MD_BAK"
         echo "  (restored live $USER_MD from pre-merge backup)"
     fi
+    # Resume the Guardian now the server is back up — BEFORE the multi-minute
+    # host-sync below — mirroring the success path (else this no-change path leaves
+    # it stood-down through the whole drift-heal, only resuming on EXIT). The
+    # EXIT-trap resume stays the backstop; idempotent (flag cleared on first resume).
+    _guardian_resume
     # Even with no repo delta, heal deploy-target drift (host/container CC + Node
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
@@ -1647,6 +1851,12 @@ fi
 
 # ── Success: disarm trap ──────────────────────────────────
 trap - ERR INT TERM
+
+# Resume the Guardian now — BEFORE the multi-minute host-sync below — not just on
+# EXIT, else it stays stood-down through the whole guardian/CC/Node sync (server
+# up + health-verified). The EXIT-trap resume stays the backstop; this is
+# idempotent (the flag is cleared on first resume).
+_guardian_resume
 
 _sync_deploy_targets
 
