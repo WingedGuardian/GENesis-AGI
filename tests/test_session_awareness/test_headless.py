@@ -31,8 +31,27 @@ def test_build_argv_pinned_shape():
     assert argv[argv.index("--max-turns") + 1] == "1"
     assert "--strict-mcp-config" in argv
     assert "--dangerously-skip-permissions" in argv
+    # Pure-completion judge over text that includes EXTERNAL content, running
+    # outside project-guard scope: every built-in tool is denied wholesale.
+    # Execution-proof measured 2026-09-04: a name list reopens with every new
+    # built-in; the wildcard closed the set (touch-via-Bash probe, both
+    # directions). Default-deny without the flag was REFUTED on a live
+    # install — user settings made the tool run.
+    assert argv[argv.index("--disallowedTools") + 1] == "*"
     assert "--effort" not in argv
     assert "--output-format" in argv
+    assert argv.index("claude") == 0  # bare command stays bare (PATH lookup)
+
+
+def test_build_argv_anchors_relative_paths():
+    """The child runs from the background dir — relative path arguments must
+    be resolved against the PARENT's cwd before the spawn, or every ambient
+    call breaks under a relative override (incl. GENESIS_REPO_ROOT=.)."""
+    argv = build_argv(MODEL, "./bin/claude", "config/no_mcp.json")
+    import os
+
+    assert os.path.isabs(argv[0])
+    assert os.path.isabs(argv[argv.index("--mcp-config") + 1])
 
 
 @pytest.mark.asyncio
@@ -234,3 +253,80 @@ async def test_cancel_group_kills_and_reraises(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert killpg_calls and killpg_calls[0][0] == 424243
+
+
+def test_production_dirs_disjoint_and_unnested(production_dirs):
+    """The isolation invariant on the REAL constants — the spawn test above
+    patches both dirs to tmp paths it chose disjoint, so only this test
+    fails if someone nests the judge dir back under the shared one."""
+    bg = production_dirs["background"]
+    judge = production_dirs["judge"]
+    assert judge != bg
+    assert bg not in judge.parents
+    assert judge not in bg.parents
+
+
+def test_judge_dir_sweeps_foreign_context(tmp_path, monkeypatch):
+    """The emptiness invariant is ENFORCED: planted context-bearing files
+    (and a .claude/ project dir, whose hooks would EXECUTE) are removed
+    before the spawn."""
+    import genesis.session_awareness.headless as headless_mod
+
+    d = tmp_path / "judges"
+    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_DIR", d)
+    d.mkdir()
+    (d / "CLAUDE.md").write_text("planted instructions")
+    (d / ".mcp.json").write_text("{}")
+    (d / ".claude").mkdir()
+    (d / ".claude" / "settings.json").write_text("{}")
+
+    out = headless_mod._ambient_judge_dir()
+    assert out == str(d)
+    assert not (d / "CLAUDE.md").exists()
+    assert not (d / ".mcp.json").exists()
+    assert not (d / ".claude").exists()
+
+
+@pytest.mark.asyncio
+async def test_spawns_from_isolated_judge_dir(tmp_path, monkeypatch):
+    """The child runs from the judges' OWN out-of-repo dir — not the
+    inherited server cwd (else transcripts pollute the interactive
+    /resume list, measured 2026-09-04), and not the shared
+    background-sessions dir: tool-enabled dispatched sessions run there
+    with Write retained, so a poisoned one could plant a CLAUDE.md that
+    CC auto-discovers from the judge's cwd (external round-2 P1)."""
+    import genesis.cc.types as cc_types
+    import genesis.session_awareness.headless as headless_mod
+
+    bg = tmp_path / "judge-dir"
+    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_DIR", bg)
+    shared = tmp_path / "bg-sessions"
+    monkeypatch.setattr(cc_types, "_BACKGROUND_SESSION_DIR", shared)
+    captured: dict = {}
+
+    async def fake_exec(*argv, **kwargs):
+        captured.update(kwargs)
+
+        class _P:
+            returncode = 0
+            pid = 12345
+
+            async def communicate(self, _in):
+                return b"{}", b""
+
+        return _P()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    res = await run_headless_json(
+        "p", model=MODEL, claude_path="claude", no_mcp_config="/dev/null", timeout_s=5
+    )
+    assert res["status"] == "ok"
+    assert captured.get("cwd") == str(bg)
+    assert bg.is_dir()  # accessor provisions it (empty-state: fresh install)
+    from genesis.cc.types import background_session_dir
+
+    judge = Path(captured["cwd"])
+    shared_resolved = Path(background_session_dir())
+    assert judge != shared_resolved
+    # Not nested: the shared dir must never be an ancestor CLAUDE.md source.
+    assert shared_resolved not in judge.parents
