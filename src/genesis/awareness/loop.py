@@ -1936,8 +1936,14 @@ async def _publish_repo_bundle_if_due() -> None:
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
 # suppress the first alert for a slot.
-_last_slot_alert_at: dict[str, float] = {}
-_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour
+# pid-key -> (last alert monotonic time, priority it was sent at). The priority
+# rides along because the cooldown must NOT swallow an ESCALATION: a WARN
+# ("high") at minute 0 used to silence the CRIT that crossed ten minutes later
+# for the rest of the hour — and CRIT is the tier that actually reaches
+# Telegram. With the tree denominator this is a live shape, not a theoretical
+# one: a session that starts a heavy job can cross WARN->CRIT within one window.
+_last_slot_alert_at: dict[str, tuple[float, str]] = {}
+_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour (per severity step)
 
 
 async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
@@ -1968,10 +1974,18 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
     # lifetime); an entry older than the cooldown no longer suppresses anything,
     # so dropping it is behaviour-neutral and prevents slow growth on a
     # long-running server.
-    for k in [k for k, t in _last_slot_alert_at.items() if now - t >= _SLOT_ALERT_COOLDOWN_S]:
+    for k in [k for k, v in _last_slot_alert_at.items() if now - v[0] >= _SLOT_ALERT_COOLDOWN_S]:
         del _last_slot_alert_at[k]
     for slot in slots:
+        # `rss_mb` is the slot's WHOLE TREE (claude + Serena + the MCP fleet).
+        # Comparing the threshold against the root process alone — which is what
+        # this did before — meant the alert could not fire in the regime it
+        # exists for: the root stays ~0.8 GB while the tree balloons.
         rss = slot.get("rss_mb", 0.0)
+        # `or rss`, not a .get default: the dashboard detail path emits the key
+        # with value None, and a present-None would survive a default and then
+        # TypeError inside the try — swallowing the alert at DEBUG.
+        proc_rss = slot.get("proc_rss_mb") or rss
         if rss < SLOT_RSS_WARN_MB:
             continue
         # Key the cooldown by PID (unique per process), never the slot label: rows
@@ -1983,15 +1997,22 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         pid = slot.get("pid")
         key = f"pid:{pid}"
         label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
+        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         last = _last_slot_alert_at.get(key)
-        if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
+        # Within the window a repeat at the SAME (or lower) severity stays
+        # suppressed; an escalation high -> critical always re-alerts, since
+        # critical is the tier that reaches Telegram.
+        if (
+            last is not None
+            and (now - last[0]) < _SLOT_ALERT_COOLDOWN_S
+            and not (priority == "critical" and last[1] == "high")
+        ):
             continue
         if db is None:
             continue  # can't write the observation now; retry next tick
-        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         # Consumed only once we can actually write (after the db-None guard), and
         # set before the await so a failed create still suppresses per-tick retries.
-        _last_slot_alert_at[key] = now
+        _last_slot_alert_at[key] = (now, priority)
         try:
             await observations.create(
                 db,
@@ -2000,9 +2021,14 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 type="infrastructure_alert",
                 content=(
                     f"CC {label} (pid {pid}) is using "
-                    f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
-                    f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting {label}."
+                    f"{rss / 1024:.1f} GB RAM across its whole process tree "
+                    f"({proc_rss / 1024:.1f} GB in the claude process itself, the rest "
+                    f"in its Serena and MCP children) — warn "
+                    f"{SLOT_RSS_WARN_MB // 1024} GB, crit {SLOT_RSS_CRIT_MB // 1024} GB. "
+                    f"A single Claude Code session may be leaking — or may be "
+                    f"running a legitimately memory-heavy job (the tree counts "
+                    f"anything the session started). Check {label}'s process "
+                    f"tree before restarting it."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),

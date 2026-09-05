@@ -115,11 +115,16 @@ def _slot(
     rss_mb: float = 512.0,
     status: str = "healthy",
     started_at: str | None = None,
+    proc_rss_mb: float = 200.0,
 ) -> dict:
+    # rss_mb is the slot's whole process tree; proc_rss_mb is the root claude
+    # process. They are deliberately DIFFERENT here so a route that dropped or
+    # transposed one of them cannot pass by coincidence.
     return {
         "slot": slot,
         "pid": pid,
         "rss_mb": rss_mb,
+        "proc_rss_mb": proc_rss_mb,
         "status": status,
         "started_at": started_at,
     }
@@ -215,6 +220,7 @@ async def test_slot_merge_by_pid(db, monkeypatch):
         "slot": "1",
         "pid": 100,
         "rss_mb": 512.0,
+        "proc_rss_mb": 200.0,
         "slot_status": "healthy",
         "started_at": None,
         "stale_code": False,

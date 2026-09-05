@@ -268,7 +268,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51f9a358 2026-09-05
+verified: 9730efe90 2026-09-05
 ```
 
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
@@ -322,7 +322,13 @@ verified: 51f9a358 2026-09-05
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.
   enumerate_cc_slots`) is what the DASHBOARD renders; `session_heartbeats` is
   what SESSIONS tell each other. They share no source and neither substitutes
-  for the other. `session_heartbeats` has exactly ONE reader in the tree —
+  for the other. The trap in READING the slot rows: `rss_mb` is the slot's
+  WHOLE PROCESS TREE (the `claude` process plus its Serena LSP and MCP-server
+  children — most of a session's real cost), while `proc_rss_mb` is the root
+  process alone. It used to report only the root, which understated a slot
+  roughly threefold and kept the slot-memory thresholds from ever firing; the
+  measurements and the threshold basis live in the constants' own comment in
+  `observability/cc_slots.py`, not here. `session_heartbeats` has exactly ONE reader in the tree —
   `scripts/proactive_memory_hook.py`, which prints a `[Concurrent | …]` tag into
   each peer session's context on UserPromptSubmit — so it is an AGENT-ONLY
   channel with no human surface. Written by that same hook and refreshed
@@ -1756,7 +1762,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 50b79ffb 2026-09-01
+verified: 9730efe90 2026-09-05
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this

@@ -80,7 +80,8 @@
                         :title="'idle'"
                         x-text="s.idle_s != null ? $store.genesisDashboard.formatAgeSeconds(s.idle_s) + ' idle' : '-'"></span>
                   <span style="min-width: 108px;" :style="`color: ${s.live ? '#3b82f6' : 'var(--color-text-secondary)'}`"
-                        x-text="s.live ? ((s.live.slot ? '#' + s.live.slot + ' ' : '') + 'pid ' + s.live.pid + ' ' + (s.live.rss_mb / 1024).toFixed(1) + 'G') : '—'"></span>
+                        :title="s.live && s.live.proc_rss_mb != null ? ((s.live.rss_mb / 1024).toFixed(1) + ' GB whole session tree, ' + (s.live.proc_rss_mb / 1024).toFixed(1) + ' GB in the claude process itself') : 'session memory (whole process tree)'"
+                        x-text="s.live ? ((s.live.slot ? '#' + s.live.slot + ' ' : '') + 'pid ' + s.live.pid + ' ' + (s.live.rss_mb / 1024).toFixed(1) + 'G' + (s.live.proc_rss_mb != null ? ' (' + (s.live.proc_rss_mb / 1024).toFixed(1) + 'G proc)' : '')) : '—'"></span>
                   <template x-if="$store.genesisDashboard.ccSessionsModal.data.charters_available">
                     <span style="min-width: 130px; flex: 1; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;"
                           :title="s.charter ? ((s.charter.mission || 'no mission') + ' · ' + s.charter.compaction_count + ' compactions · ' + s.charter.ledger_open + ' open of ' + s.charter.ledger_total) : 'no charter'"
