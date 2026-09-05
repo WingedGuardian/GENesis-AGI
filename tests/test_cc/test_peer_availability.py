@@ -222,12 +222,12 @@ def test_a_corrupt_row_does_not_permanently_kill_recording(tmp_path):
 # ── the snapshot surface (what an operator/LLM actually reads) ───────────────
 
 
-def test_snapshot_reports_blocked_first_with_age_and_no_current_state_claim():
+async def test_snapshot_reports_blocked_first_with_age_and_no_current_state_claim():
     from genesis.observability.snapshots.cc_sessions import _peer_availability_snapshot
 
     PA.note_success("healthy-peer")
     PA.note_failure("blocked-peer", CCRateLimitError("429 limit reached"))
-    rows = _peer_availability_snapshot()
+    rows = await _peer_availability_snapshot()
 
     assert [r["peer"] for r in rows] == ["blocked-peer", "healthy-peer"]  # blocked first
     blocked = rows[0]
@@ -240,10 +240,10 @@ def test_snapshot_reports_blocked_first_with_age_and_no_current_state_claim():
     }
 
 
-def test_snapshot_is_empty_and_silent_with_no_records():
+async def test_snapshot_is_empty_and_silent_with_no_records():
     from genesis.observability.snapshots.cc_sessions import _peer_availability_snapshot
 
-    assert _peer_availability_snapshot() == []
+    assert await _peer_availability_snapshot() == []
 
 
 # ── review round 3 (PR #1646) ────────────────────────────────────────────────
@@ -1141,3 +1141,58 @@ def test_an_older_observation_never_overwrites_a_newer_one(tmp_path):
         "peer-x", _status(False, newer + timedelta(seconds=5))
     ) is True
     assert PA.read_peer("peer-x").available is False
+
+
+def test_a_future_stamp_cannot_pin_the_record_forever(tmp_path):
+    """The newer-wins merge compares blindly, so a single future-stamped row —
+    a foreign file, or a clock corrected backward after a write — would out-rank
+    every genuine observation FOREVER while _merge_and_write kept returning
+    True. Recording would look healthy and write nothing.
+
+    The decoder now rejects a stamp beyond a small skew horizon, so the poisoned
+    row drops on read and the next real observation lands.
+    """
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "peer-x": {
+            "available": False, "reason": "quota",
+            "observed_at": "9999-12-31T23:59:59+00:00",
+            "reset_at": "", "limit_kind": "unknown",
+        },
+    }}))
+    assert PA.read() == {}, "a future-stamped row must be rejected, not trusted"
+    assert PA.note_success("peer-x") is True
+    st = PA.read_peer("peer-x")
+    assert st is not None and st.available is True, "the poisoned row pinned the record"
+
+
+def test_a_small_clock_skew_does_not_reject_an_honest_row():
+    """The other direction: five minutes of tolerance means an NTP step cannot
+    silently discard real observations."""
+    from datetime import timedelta
+
+    near_future = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+    (PA._state_path()).write_text(json.dumps({"peers": {
+        "peer-x": {
+            "available": True, "reason": "",
+            "observed_at": near_future, "reset_at": "", "limit_kind": "",
+        },
+    }}))
+    assert set(PA.read()) == {"peer-x"}, "a 60s skew must not reject the row"
+
+
+def test_fdopen_failure_does_not_leak_the_descriptor(monkeypatch):
+    """Round-8's fix cleared `fd` BEFORE os.fdopen returned, so an fdopen raise
+    left the descriptor open with the failure path seeing None — the exact
+    one-leak-per-write the fix claimed to close. Ownership now transfers only
+    after fdopen succeeds."""
+    import os as _os
+
+    def _boom(*a, **k):
+        raise MemoryError("allocation pressure")
+
+    monkeypatch.setattr(PA.os, "fdopen", _boom)
+    before = len(_os.listdir("/proc/self/fd"))
+    for _ in range(25):
+        assert PA.note_success("peer-x") is False
+    after = len(_os.listdir("/proc/self/fd"))
+    assert after - before < 5, f"leaked ~{after - before} descriptors over 25 writes"

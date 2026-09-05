@@ -90,7 +90,7 @@ import os
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from genesis.env import genesis_home
@@ -120,6 +120,13 @@ _MAX_STATE_BYTES = 1_000_000
 #: truncation: a longer value is not a stamp we wrote, so its row is dropped.
 #: It exists so a pathological value is refused before `fromisoformat` parses it.
 _MAX_STAMP = 64
+
+#: How far into the future an ``observed_at`` may sit before the row is rejected.
+#: SAFETY bound, derived from the threat it blocks (a future-stamped row would
+#: out-rank every later genuine observation in the newer-wins merge, forever),
+#: not from any corpus: we only write ``now``, so the only honest future skew is
+#: a clock step, and five minutes covers real NTP corrections with room over.
+_MAX_STAMP_SKEW = timedelta(minutes=5)
 
 #: Hard cap on tracked peers. A roster holds a handful; this only bounds a
 #: pathological case (a renamed/rotating peer id) so the file cannot grow without
@@ -255,7 +262,7 @@ def _read_raw() -> dict:
     return peers if isinstance(peers, dict) else {}
 
 
-def _decode_stamp(value: object) -> str | None:
+def _decode_stamp(value: object, *, allow_future: bool = False) -> str | None:
     """The stamp we EMIT, or None to reject the row. ``""`` is a valid absent stamp.
 
     Round-tripping is the whole check, and it is what makes this closed-set:
@@ -283,6 +290,19 @@ def _decode_stamp(value: object) -> str | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     if parsed.isoformat() != value:
+        return None
+    # Reject an OBSERVATION stamp from the FUTURE (beyond a small skew
+    # tolerance). We only ever write `now` there, so a future observed_at is not
+    # something this module emits — and it is not harmless garbage: the
+    # newer-wins merge compares against it, so a single "9999-…" row (foreign
+    # file, or a clock corrected backward after a write) would out-rank every
+    # genuine observation FOREVER while _merge_and_write kept returning True.
+    # Recording would look healthy and write nothing. Five minutes of tolerance
+    # covers real clock steps. reset_at opts OUT via allow_future: a provider's
+    # reset time is legitimately hours ahead — the first version of this check
+    # applied it to both fields and silently rejected every row that carried a
+    # parsed reset hint, which its own suite caught.
+    if not allow_future and parsed > datetime.now(UTC) + _MAX_STAMP_SKEW:
         return None
     return value
 
@@ -327,7 +347,7 @@ def _decode_row(peer: object, raw: object) -> tuple[str, dict] | None:
         return None
 
     observed_at = _decode_stamp(raw.get("observed_at", ""))
-    reset_at = _decode_stamp(raw.get("reset_at", ""))
+    reset_at = _decode_stamp(raw.get("reset_at", ""), allow_future=True)
     if observed_at is None or reset_at is None:
         return None
     # We ALWAYS write an observation time, and a record without one is
@@ -870,15 +890,18 @@ def _write(payload: dict) -> bool:
         # preserves it, but this file can hold provider prose, so the mode is
         # load-bearing and should not depend on a default staying put.
         os.fchmod(fd, 0o600)
-        # Ownership of the descriptor passes to the file object HERE, and only
-        # here — the `with` closes it from this point on. Anything that raises
-        # between mkstemp and this line (fchmod on a filesystem that refuses
-        # mode changes, fdopen itself) leaves the descriptor ours to close, and
-        # the failure path below does it. This module writes on every failover
-        # during an outage, so a leak per attempt walks a long-running server
-        # into its descriptor limit.
-        fd_owned, fd = fd, None
-        with os.fdopen(fd_owned, "wb") as fh:
+        # Ownership passes to the file object only when os.fdopen RETURNS — so
+        # `fd` is cleared AFTER that call succeeds, never before. An earlier
+        # revision did `fd_owned, fd = fd, None` first, which meant an fdopen
+        # raise (allocation pressure) left the descriptor open with the failure
+        # path seeing None: exactly the one-leak-per-write this exists to stop.
+        # Anything that raises up to and INCLUDING fdopen leaves the descriptor
+        # ours, and the failure path below closes it. This module writes on
+        # every failover during an outage, so a leak per attempt walks a
+        # long-running server into its descriptor limit.
+        fh = os.fdopen(fd, "wb")
+        fd = None  # the file object now owns the descriptor
+        with fh:
             fh.write(json.dumps(payload, indent=2).encode())
             fh.flush()
             os.fsync(fh.fileno())

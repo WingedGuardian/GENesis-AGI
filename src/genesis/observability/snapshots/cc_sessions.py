@@ -40,7 +40,7 @@ def _fallback_snapshot() -> dict:
         return {"is_fallback": False, "original": "", "fallback": "", "reason": "", "since": ""}
 
 
-def _peer_availability_snapshot() -> list[dict]:
+async def _peer_availability_snapshot() -> list[dict]:
     """LAST-OBSERVED availability of each failover peer. Never raises.
 
     Answers a question no other field in this snapshot can: is the STANDBY
@@ -64,11 +64,20 @@ def _peer_availability_snapshot() -> list[dict]:
     be a field that holds provider prose in a prompt.
     """
     try:
+        import asyncio
+
         from genesis.cc.peer_availability import read as read_peers
+
+        # OFF the event loop: read() stats, reads and json-parses a file that
+        # may legitimately be near its 1MB cap, and this snapshot runs inside
+        # health_data's gather precisely so independent probes overlap — a
+        # synchronous read here stalls every gathered coroutine, not just this
+        # section. Same pattern as the neighbouring file-backed snapshots.
+        peers = await asyncio.to_thread(read_peers)
 
         now = datetime.now(UTC)
         rows: list[dict] = []
-        for st in read_peers().values():
+        for st in peers.values():
             age: int | None = None
             # Unparseable/missing stamp → age stays None (unknown), never 0,
             # which would read as "just observed".
@@ -100,7 +109,7 @@ async def cc_sessions(
             "foreground": {"status": "unknown"},
             "background": {"status": "unknown"},
             "fallback": _fallback_snapshot(),
-            "peer_availability": _peer_availability_snapshot(),
+            "peer_availability": await _peer_availability_snapshot(),
         }
 
     try:
@@ -256,5 +265,5 @@ async def cc_sessions(
         "rate_limited_24h": rate_limited_24h,
         "realtime_status": cc_realtime_status,
         "fallback": _fallback_snapshot(),
-        "peer_availability": _peer_availability_snapshot(),
+        "peer_availability": await _peer_availability_snapshot(),
     }
