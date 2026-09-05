@@ -457,6 +457,25 @@ When a user shares a file path or URL in conversation:
   decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
+- **Finish before you stop — the zero-drop rule.** A turn may run as long as
+  the work requires; never yield with steps you could still complete AND are
+  cleared to complete — stopping for an approval, a blocking question, plan
+  approval, or a designed hard stop is finishing correctly, not dropping
+  work. When something genuinely cannot finish this turn, every unfinished
+  piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
+  issue, which keeps its per-instance approval gate from "Where deferred
+  work goes" below, this rule waives nothing. Where none of those trackers
+  is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
+  ledger or follow-up tool — the fallback is a structured handoff that NAMES
+  every unfinished piece in your final message; a named remainder is tracked,
+  an unnamed one is dropped. An untracked remainder is a
+  drop, not a deferral, and a plan-file bullet is not a row. On the next
+  prompt, reconcile your own stranded artifacts early — ordered behind
+  anything the user's prompt makes urgent — before taking on discretionary
+  new work. The answer to "what has fallen through the cracks?" is MADE
+  zero: enumerate, then fix or file what the enumeration finds. (Origin
+  2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
+  days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
