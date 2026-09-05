@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass
 
 import aiosqlite
@@ -125,13 +124,11 @@ def _bfs_with_strength(
         return []
 
     visited: set[str] = {root_id}
-    queue: deque[tuple[str, int]] = deque([(root_id, 0)])
+    frontier: list[str] = [root_id]
     results: list[GraphNode] = []
+    depth = 0
 
-    while queue:
-        node, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
+    while frontier and depth < max_depth:
 
         # A pair may carry several typed edges (MultiDiGraph), so out_edges
         # yields one tuple per parallel edge. Consider them all and keep the
@@ -162,43 +159,84 @@ def _bfs_with_strength(
         # not a semantic ranking; it happens to demote `contradicts` (which sorts
         # early), the safe direction. 0 of the 106 tied pairs carries one.
         #
-        # This makes the choice WITHIN one (source, target) pair well-defined. It
-        # does NOT make the traversal's reported labels row-order independent, and
-        # nothing here claims that: the `visited` check below means a node
-        # reachable from several parents is claimed by whichever parent the queue
-        # reaches first, and queue order follows row order. MEASURED 2026-09-02 on
-        # the live graph: ~15.8% of reported labels flip under a reversed row
-        # order. Attribution at 500 roots traced every flip to multi-parent claim
-        # order and none to ties — but that zero is a SUBSAMPLE BOUND, not an
-        # absolute: at 3000 roots the tie-break itself removes 16 of 21,486 flips
-        # (~0.07%). Ties are a rounding error on this surface, not nil.
+        # `best` is scoped to the whole LEVEL, not to one expanding parent, and
+        # that is the point. Per-parent, a node reachable from several parents was
+        # claimed by whichever one the queue happened to reach first — so the
+        # reported edge followed the loader's row order (its SELECT has no ORDER
+        # BY) and could be the WEAKER of the two. That is not cosmetic: `strength`
+        # is put in front of the model AND is what the consumers sort on before
+        # taking the top five, so a node credited to a weaker parent sinks in that
+        # order and can leave the slice entirely.
         #
-        # Pre-existing (~15.8% before the multigraph change too) and tracked as
-        # follow-up ab0d0c28 rather than changed here, since best-parent-wins is a
-        # traversal-semantics change needing its own blast-radius measurement.
-        # "Reach-set-neutral (0 delta)" holds for THIS function's full output, but
-        # not for what the model sees: core.py:437,:709 slice nodes[:5] after a
-        # stable sort on (depth, -strength), so on 3.5% of roots a different SET
-        # of five memories reaches the context depending on row order. Same root
-        # cause, same follow-up — stated here so the bound is not read as wider
-        # than it is.
+        # MEASURED against this module on the live graph, old vs new, over the FULL
+        # population (256,063 links; all 66,856 roots that have neighbours; the real
+        # call parameters max_depth=2, min_strength=0.3):
+        #   68,330 of 1,066,912 reported nodes (6.40%) gained a higher, truer
+        #     strength, across 50.4% of roots; 0 were ever lowered.
+        #   top-five SET churn between a forward and a reversed row order: 3.09%
+        #     before, 0 after; the full output is likewise identical under both.
+        #   reach-set unchanged (0 roots) and no reported depth changed (0 nodes).
+        # Draining the level is what allows the cross-parent comparison.
+        #
+        # State the DENOMINATOR when quoting any of this. 6.40% is over every node
+        # the walk computes (~16 per root); restricted to the five that actually
+        # reach the model it is 0.16% of surfaced nodes and 0.7% of lookups. The
+        # blast radius at that slice is separate again: the surfaced SET changes on
+        # 1.94% of roots and its ORDER on 8.15%. An earlier revision of this comment
+        # quoted a 1,000-root sample and read an order of magnitude high on the
+        # surfaced surface — which is why every figure here is a population count.
+        #
+        # Sample-drawn figures also drift between runs on an unchanged table: the
+        # loader's SELECT has no ORDER BY, so node insertion order — and any sample
+        # drawn from it — varies per rebuild. Prefer the population numbers above.
+        #
+        # The commit below is ordered by a TOTAL key, and that alone is what makes
+        # the whole output deterministic: it fixes the append sequence, and the
+        # final sort is stable, so equal `(depth, -strength)` keys keep that
+        # sequence rather than the row order they used to keep. Note `drift.py`
+        # consumes that sequence as a RANKED list for RRF (its `local_ids`,
+        # drift.py:202) even though it reads no labels, so the ordering here is
+        # load-bearing for a second consumer, not just for the sliced view.
+        #
+        # A total key on the FINAL sort as well was tried and dropped. It is
+        # redundant by construction — a stable sort of an already-deterministic
+        # list cannot reintroduce nondeterminism — and measured redundant too
+        # (0 differences either way across 1,447 live roots). Keeping it would only
+        # have reordered ties gratuitously and widened the divergence from the CTE
+        # fallback's documented `(depth, strength DESC)`.
         best: dict[str, tuple[float, str]] = {}
-        for _, neighbor, data in G.out_edges(node, data=True):
-            if neighbor in visited:
-                continue
-            strength = data.get("strength", 0.0)
-            edge_type = data.get("link_type", "")
+        for node in frontier:
+            for _, neighbor, data in G.out_edges(node, data=True):
+                if neighbor in visited:
+                    continue
+                strength = data.get("strength", 0.0)
+                edge_type = data.get("link_type", "")
 
-            if strength < min_strength:
-                continue
-            if link_type_filter and edge_type != link_type_filter:
-                continue
+                if strength < min_strength:
+                    continue
+                if link_type_filter and edge_type != link_type_filter:
+                    continue
 
-            current = best.get(neighbor)
-            if current is None or (strength, edge_type) > current:
-                best[neighbor] = (strength, edge_type)
+                current = best.get(neighbor)
+                if current is None or (strength, edge_type) > current:
+                    best[neighbor] = (strength, edge_type)
 
-        for neighbor, (strength, edge_type) in best.items():
+        next_frontier: list[str] = []
+        # Key is (-strength, neighbour_id) and DELIBERATELY excludes link_type,
+        # unlike the within-pair comparison above. The id alone already makes the
+        # key total, so link_type buys no determinism here — and it is not neutral:
+        # sorting equal-strength neighbours alphabetically by TYPE front-loads
+        # early-sorting relationships in the order the model reads. MEASURED over
+        # all 66,856 roots, 13.8% of which carry a (depth, strength) tie group:
+        # including link_type moved the reported top-1 type by +32.8%
+        # (categorized_as), +31.8% (action_item_for), -23.8% (preceded_by) and
+        # -39.6% (succeeded_by) against the id-only key. Memory ids are UUIDs, so
+        # they carry no such correlation. The within-pair key above is a different
+        # case: there the two candidates are the SAME pair and a type must be
+        # picked, so a stated rule beats an arbitrary one.
+        for neighbor, (strength, edge_type) in sorted(
+            best.items(), key=lambda kv: (-kv[1][0], kv[0])
+        ):
             visited.add(neighbor)
             results.append(GraphNode(
                 memory_id=neighbor,
@@ -206,9 +244,13 @@ def _bfs_with_strength(
                 depth=depth + 1,
                 strength=strength,
             ))
-            queue.append((neighbor, depth + 1))
+            next_frontier.append(neighbor)
+        frontier = next_frontier
+        depth += 1
 
-    # Match CTE output order: depth ascending, strength descending
+    # Match CTE output order: depth ascending, strength descending. Deliberately
+    # left as a partial key — ties now resolve to the deterministic commit order
+    # established above, so no further tiebreak is needed to make this stable.
     results.sort(key=lambda n: (n.depth, -n.strength))
     return results
 

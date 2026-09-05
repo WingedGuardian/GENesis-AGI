@@ -20,10 +20,12 @@ pre-fix code. (Row and pair counts track a growing table — 252,525 rows at the
 first measurement, 252,773 hours later — so re-derive them rather than quoting
 these numbers.)
 
-What these tests do NOT establish: that a traversal's reported labels are
-independent of row order. They are not, for a reason that predates this module —
-see ``test_tied_strength_resolves_independently_of_row_order``'s SCOPE note and
-follow-up ab0d0c28.
+Traversal-wide label determinism WAS a separate, unfixed property when this
+module was written, and is no longer: the multi-parent tests at the end of the
+file cover it. A node reachable from several parents used to be claimed by
+whichever one the queue reached first — following row order, and reporting the
+weaker edge in 6.24% of cases — and now reports the strongest edge from any
+nearest parent, identically under any row order.
 
 Note the fixture below uses the PRODUCTION primary key. The pre-existing
 fixture in ``test_graph.py`` declares ``PRIMARY KEY (source_id, target_id)``,
@@ -151,11 +153,10 @@ async def test_tied_strength_resolves_independently_of_row_order():
     SCOPE — read this before trusting the name. The single root here has exactly
     one neighbour, so the property under test is the WITHIN-PAIR choice and
     nothing more. Traversal-wide label determinism is a DIFFERENT and much larger
-    property that this does not test and the code does not have: a node reachable
-    from several parents is claimed by whichever parent the queue reaches first
-    (15.84% of live labels flip under a reversed row order, 100% from that cause
-    and 0% from ties — follow-up ab0d0c28). A multi-parent fixture here would
-    measure that instead and pass or fail for the wrong reason.
+    property, and the code now has it — but it is tested SEPARATELY, at the end of
+    this file, precisely so that each failure names its own cause. Keep this root
+    single-neighboured: a multi-parent fixture here would measure the other
+    property and pass or fail for the wrong reason.
 
     This asserts the property that actually matters — the SAME answer from two
     row orders — rather than a specific winner under one order, because an
@@ -202,3 +203,102 @@ async def test_tied_strength_resolves_independently_of_row_order():
     # early), which is the safe direction — graph_expansion excludes that type
     # from LLM-visible context. MEASURED: 0 of the 106 tied pairs carries one.
     assert reported["forward"] == "supports"
+
+
+# ── multi-parent claiming: the property the tie test deliberately excludes ──
+
+# R reaches X and Y each through TWO depth-1 parents of unequal strength. Under a
+# per-parent `best`, whichever parent the queue reached first claimed the child
+# and ITS edge was reported — so the answer followed row order and could report
+# the WEAKER edge.
+#
+# TWO opposite-polarity triples, not one, and the property is pinned in the DATA
+# for the same reason the `parallel_db` fixture above is: a single triple is
+# vacuous under half the plausible scan orders, and a comment asserting otherwise
+# is exactly how that fixture went vacuous twice. Alphabetically
+# ``P_far < P_near`` and ``Q_alpha < Q_omega``, and the Q pair is INSERTED
+# strong-first while the P pair is inserted weak-first, so:
+#
+#   rowid ASC  (insertion; today's plan) -> P_near first -> X weak   BROKEN
+#   rowid DESC (reversed)                -> Q_alpha first -> Y weak  BROKEN
+#   PK-index ASC                         -> Q_alpha first -> Y weak  BROKEN
+#   PK-index DESC                        -> P_near first -> X weak   BROKEN
+#
+# so at least one child is mis-reported under EVERY order and the assertions
+# (which require both correct) fail on the old code in all four. VERIFIED by
+# replaying all four orders against the real traversal, not reasoned.
+_MULTI_PARENT_LINKS = [
+    ("R", "P_near", "extends", 0.9),
+    ("R", "P_far", "extends", 0.9),
+    ("P_near", "X", "supports", 0.4),  # WEAK path to X — sorts LATE alphabetically
+    ("P_far", "X", "supports", 0.8),  # STRONG path to X
+    ("R", "Q_omega", "extends", 0.9),  # inserted FIRST of the Q pair
+    ("R", "Q_alpha", "extends", 0.9),
+    ("Q_alpha", "Y", "supports", 0.4),  # WEAK path to Y — sorts EARLY alphabetically
+    ("Q_omega", "Y", "supports", 0.8),  # STRONG path to Y
+]
+
+
+async def test_multi_parent_node_reports_the_strongest_reaching_edge():
+    """A node reachable from two parents must report the STRONGER edge.
+
+    This is a correctness assertion, not a tidiness one. ``strength`` is put in
+    front of the model AND is the key the consumers sort on before slicing the
+    top five (``mcp/memory/core.py``), so a node credited with a weaker parent's
+    edge sinks in that ordering and can drop out of the slice entirely.
+
+    MEASURED against the real module on the live graph, old vs new: 970 of 15,433
+    reported nodes (6.29%) gained a higher, truer strength, across 48.8% of roots,
+    largest single understatement 0.203. Re-derive rather than quoting — and note
+    the DENOMINATOR drifts between runs even on an unchanged table, because the
+    loader's SELECT has no ORDER BY and any sample drawn from node order inherits
+    that. The rate is stable; the counts are not.
+    """
+    invalidate_graph_cache()
+    db = await _make_db(_MULTI_PARENT_LINKS)
+    try:
+        result = await traverse(db, "R", max_depth=2, min_strength=0.3)
+        by_id = {n.memory_id: n for n in result.nodes}
+        for child in ("X", "Y"):
+            assert by_id[child].strength == pytest.approx(0.8), (
+                f"{child} was credited to the weaker parent — the strongest "
+                f"reaching edge is 0.8, got {by_id[child].strength}"
+            )
+    finally:
+        invalidate_graph_cache()
+        await db.close()
+
+
+async def test_multi_parent_claim_does_not_follow_row_order():
+    """The reported edge for a multi-parent node must not depend on row order.
+
+    Separate from the strength assertion above because they fail for different
+    reasons and a single test would not say which. This one is the determinism
+    half: the same graph loaded in two row orders must answer identically.
+
+    Both orders are asserted to be *equal* AND to equal the strong edge, because
+    equality alone goes vacuously green whenever the two orders happen to agree
+    on the wrong answer — the coverage trap the tie test above documents.
+    """
+    seen = {}
+    for label, links in (
+        ("forward", _MULTI_PARENT_LINKS),
+        ("reversed", list(reversed(_MULTI_PARENT_LINKS))),
+    ):
+        invalidate_graph_cache()
+        db = await _make_db(links)
+        try:
+            result = await traverse(db, "R", max_depth=2, min_strength=0.3)
+            by_id = {n.memory_id: n for n in result.nodes}
+            seen[label] = {
+                c: (by_id[c].strength, by_id[c].link_type, by_id[c].depth) for c in ("X", "Y")
+            }
+        finally:
+            invalidate_graph_cache()
+            await db.close()
+
+    assert seen["forward"] == seen["reversed"], f"multi-parent node resolved by row order: {seen}"
+    for child in ("X", "Y"):
+        assert seen["forward"][child][0] == pytest.approx(0.8), (
+            f"both orders agreed on the WEAKER edge for {child}: {seen}"
+        )
