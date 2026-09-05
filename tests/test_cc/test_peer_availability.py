@@ -1263,3 +1263,67 @@ def test_an_unopenable_lock_file_fails_closed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(PA.Path, "open", _fail_lock_open)
     assert PA.note_success("peer-x") is False
+
+
+def test_eintr_on_every_attempt_fails_closed_not_unserialized(monkeypatch):
+    """EINTR's `continue` on the final attempt exhausts the loop with nothing
+    decided, and the old epilogue returned may_write=True — an unserialized
+    write while another process may hold the lock. Only an acquired lock or a
+    provably nonexistent one may write."""
+    import errno as _errno
+
+    def _always_eintr(fd, op):
+        raise OSError(_errno.EINTR, "interrupted")
+
+    # A scoped context, NOT monkeypatch.undo(): undo() also reverts the autouse
+    # fixture's GENESIS_HOME on the same monkeypatch instance, so later reads
+    # silently hit the REAL install's state file — a test reading production
+    # data and passing by luck.
+    with monkeypatch.context() as m:
+        m.setattr(PA.fcntl, "flock", _always_eintr)
+        m.setattr(PA, "_LOCK_ATTEMPTS", 3)
+        assert PA.note_success("peer-x") is False, "exhausted EINTR must not write"
+    assert PA.read_peer("peer-x") is None
+
+
+def test_a_transient_read_failure_cannot_erase_the_other_peers(tmp_path, monkeypatch):
+    """The killer case: the state file holds rows, read_text hits a transient
+    EIO DURING A WRITE's merge, the merge sees "empty", and the atomic replace
+    erases every other peer's observation because of a read blip.
+
+    Unreadable-but-present is now UNAVAILABLE (fail closed on write), distinct
+    from missing/corrupt (self-heal by overwrite)."""
+    assert PA.note_failure("peer-a", CCRateLimitError("429")) is True
+    assert PA.note_success("peer-b") is True
+
+    real_read_bytes = PA.Path.read_bytes
+
+    def _eio(self):
+        if self.name == PA._STATE_FILE:
+            raise OSError(5, "Input/output error")
+        return real_read_bytes(self)
+
+    with monkeypatch.context() as m:  # scoped: undo() would revert GENESIS_HOME too
+        m.setattr(PA.Path, "read_bytes", _eio)
+        assert PA.note_success("peer-c") is False, "a blind merge must not report success"
+
+    peers = PA.read()
+    assert set(peers) == {"peer-a", "peer-b"}, (
+        f"a transient read error erased rows: {set(peers)}"
+    )
+
+
+def test_invalid_utf8_is_corrupt_state_never_a_repaired_identity(tmp_path):
+    """errors='replace' would repair invalid bytes inside a peer KEY into
+    U+FFFD — a fabricated identity that passes the decoder, shows in health,
+    and gets re-persisted as valid JSON. Reject-by-default applies to the
+    ENCODING too: undecodable bytes are corrupt (self-heal), never material to
+    repair."""
+    f = tmp_path / "cc_peer_availability.json"
+    good_row = json.dumps(_valid_row()).encode()
+    f.write_bytes(b'{"peers": {"peer-\xff\xfe": ' + good_row + b"}}")
+
+    assert PA.read() == {}, "invalid UTF-8 must read as corrupt, not as a � peer"
+    # Self-heal: the next record OVERWRITES the poisoned file.
+    assert PA.note_success("peer-x") is True
+    assert set(PA.read()) == {"peer-x"}

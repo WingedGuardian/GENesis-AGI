@@ -180,8 +180,22 @@ class PeerStatus:
     limit_kind: str = ""  # session / weekly / unknown, per rate_limit_reset
 
 
-def _read_raw() -> dict:
-    """Raw peer map from disk. Never raises — any unreadable file reads empty."""
+def _read_raw() -> dict | None:
+    """Raw peer map from disk, or ``None`` when the file EXISTS but cannot be read.
+
+    Never raises. The None/{} split is load-bearing for the WRITE path:
+
+    * ``{}`` means "there is nothing here, or nothing interpretable here" — a
+      missing file, corrupt JSON, invalid UTF-8, an oversize blob. Writing over
+      those is the SELF-HEAL property (a poisoned file must always be
+      recoverable by writing over it).
+    * ``None`` means "there may be perfectly good rows here that I cannot see
+      right now" — a transient EIO, a permission failure. Merging onto None as
+      if it were empty and then atomically REPLACING the file would erase every
+      other peer's observation because of a read blip; the write path must fail
+      closed instead. ``read()`` maps None to {} for its callers, where an
+      empty answer is merely uninformative rather than destructive.
+    """
     path = _state_path()
     try:
         # Bound the INPUT, not just the parsed result: this runs synchronously on
@@ -203,7 +217,14 @@ def _read_raw() -> dict:
             )
             return {}
         _complaint_resolved("oversize")
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        # STRICT decode, no errors="replace": replacement would repair invalid
+        # bytes inside a peer KEY into U+FFFD — a fabricated identity that
+        # passes _decode_row, shows up in health, gets re-persisted as valid
+        # JSON by the next merge, and can merge two distinct corrupted byte
+        # sequences onto one displayed peer. Reject-by-default applies to the
+        # ENCODING too: undecodable bytes are corrupt state (self-heal by
+        # overwrite), never material to repair.
+        raw = path.read_bytes().decode("utf-8")
         # The read SUCCEEDED, so the unreadable condition is over. Without this
         # the warning below fires exactly once in the life of the process and
         # never again: its identity is the constant file name, so a recurrence
@@ -212,6 +233,16 @@ def _read_raw() -> dict:
         # line while every health snapshot keeps losing its peers. A suppressor
         # whose condition is never cleared is a suppressor that reports once.
         _complaint_resolved("unreadable")
+    except UnicodeDecodeError:
+        # Undecodable bytes are CORRUPT state, not an unavailable file: the
+        # bytes were delivered fine, they are just not ours to interpret.
+        # {} (not None) so the self-heal property holds — the next record
+        # overwrites the poisoned file.
+        _complain_on_change(
+            "corrupt", "Corrupt %s — treating as empty", _STATE_FILE,
+            identity=(_STATE_FILE, "utf8"), exc_info=True,
+        )
+        return {}
     except FileNotFoundError:
         # The ONLY silent case: no file yet is the normal state before any
         # failover has ever run. It also ENDS an unreadable condition — the file
@@ -228,16 +259,16 @@ def _read_raw() -> dict:
         # the `except Exception` below unreachable for the failure it was
         # written for.
         _complain_on_change(
-            "unreadable", "Unreadable %s — treating as empty", _STATE_FILE,
+            "unreadable", "Unreadable %s — treating as UNAVAILABLE", _STATE_FILE,
             identity=(_STATE_FILE,), exc_info=True,
         )
-        return {}
+        return None
     except Exception:  # pragma: no cover — defence in depth on a hot path
         _complain_on_change(
-            "unreadable", "Unreadable %s — treating as empty", _STATE_FILE,
+            "unreadable", "Unreadable %s — treating as UNAVAILABLE", _STATE_FILE,
             identity=(_STATE_FILE,), exc_info=True,
         )
-        return {}
+        return None
     try:
         data = json.loads(raw)
     # RecursionError is NOT a ValueError, so it used to escape this handler
@@ -443,7 +474,10 @@ def read() -> dict[str, PeerStatus]:
     out: dict[str, PeerStatus] = {}
     rejected: list[str] = []
     try:
-        for name, raw in _read_raw().items():
+        # None = the file exists but cannot be read right now. For a READER an
+        # empty answer is merely uninformative, so map it to {}; the write path
+        # treats the same None as fail-closed (see _merge_and_write).
+        for name, raw in (_read_raw() or {}).items():
             pair = _decode_row(name, raw)
             if pair is None:
                 # Kept for the de-dup IDENTITY only — never logged, so an
@@ -760,6 +794,7 @@ def _acquire_record_lock():
     path = _state_path().parent / _LOCK_FILE
     fh = None
     acquired = False
+    unsupported = False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = path.open("a+")
@@ -776,6 +811,7 @@ def _acquire_record_lock():
                     # unserialized is safe and refusing would disable recording
                     # on that platform entirely. Degrade open.
                     logger.debug("flock unsupported — proceeding unserialized", exc_info=True)
+                    unsupported = True
                     with contextlib.suppress(Exception):
                         fh.close()
                     fh = None
@@ -813,6 +849,21 @@ def _acquire_record_lock():
             "peer availability lock file unavailable — not recording this "
             "observation rather than risking an unserialized write",
             exc_info=True,
+        )
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fh.close()
+        return None, False, False
+    if not acquired and not unsupported:
+        # The loop can exhaust WITHOUT reaching the contended-final-attempt
+        # return: EINTR's `continue` on the last attempt falls out of the loop
+        # with nothing decided. may_write=True here would write unserialized
+        # while another process may hold the lock — the clobber this whole
+        # mechanism exists to prevent. Only an acquired lock or a provably
+        # nonexistent one may write.
+        logger.warning(
+            "peer availability lock not acquired after %d attempts — not "
+            "recording this observation", _LOCK_ATTEMPTS,
         )
         if fh is not None:
             with contextlib.suppress(Exception):
@@ -860,8 +911,20 @@ def _merge_and_write(peer: str, status: PeerStatus) -> bool:
     ``read()`` cannot survive by being merged forward either. Reader and writer
     share one decoder precisely so they cannot disagree about what a row is.
     """
+    current = _read_raw()
+    if current is None:
+        # The file EXISTS but cannot be read right now (transient EIO, a
+        # permission blip). Merging onto "nothing" and atomically REPLACING the
+        # file would erase every other peer's observation because of a read
+        # error. Fail closed: losing THIS observation beats destroying all the
+        # others — the same asymmetry as the lock.
+        logger.warning(
+            "%s unreadable at merge time — not recording this observation "
+            "rather than overwriting rows that may still be there", _STATE_FILE,
+        )
+        return False
     peers = {}
-    for k, v in _read_raw().items():
+    for k, v in current.items():
         pair = _decode_row(k, v)
         if pair is not None:
             peers[pair[0]] = pair[1]
