@@ -926,6 +926,22 @@ fi
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
+
+# Baseline for the post-restart subsystem delta (consumed in the health block far
+# below). Captured HERE, while the old server is still ALIVE, and NOT next to the
+# code that uses it: `systemctl show -p MainPID` returns "0" for a stopped unit, so
+# reading the pid any time after the stop below can never match the pid recorded in
+# the manifest on disk — the baseline would be silently rejected on every deploy and
+# the delta would degrade to a no-op that still looks healthy.
+#
+# Why a delta at all: a subsystem's own status is ambiguous. "degraded" means BOTH
+# "an optional dependency is absent" (normal, and permanent on many installs) and
+# "the initializer crashed and swallowed its own exception" — and 30 of the 33
+# modules under runtime/init/ do exactly that, so "failed:" almost never appears.
+# "Was working before this restart, is not working after it" is unambiguous.
+MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
+SERVER_PID_BEFORE="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+
 # Detect what is running BEFORE stopping anything, so the pre-stop signal handler
 # can restart exactly what was running if an interrupt lands mid-stop (the stop
 # polls up to ~10s) — otherwise a Ctrl-C / shutdown during the stop would leave
@@ -1775,16 +1791,6 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     # Reload systemd in case templates changed during bootstrap
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # Freshness anchor for the post-restart subsystem check below. Deliberately
-    # NOT $STARTED_AT: that is stamped at the top of the script, and a deploy runs
-    # for many minutes before reaching here, so it would accept a bootstrap
-    # manifest written at any point in that window. GenesisRuntime.bootstrap()
-    # writes that file, and the server is not its only caller — the bridge and the
-    # interactive terminal (cc/terminal.py, which takes bootstrap()'s default
-    # mode="full") write it too. Anchoring on the restart narrows the window to
-    # the seconds that actually belong to the process now serving health.
-    RESTART_AT="$(date -Iseconds)"
-
     for svc in "${WERE_RUNNING[@]}"; do
         if [ "$svc" = "genesis-server" ]; then
             if ! _start_genesis_server; then
@@ -1827,66 +1833,141 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
         # The bootstrap manifest is the authoritative record, written as the last
         # statement of GenesisRuntime.bootstrap(). Statuses are exactly
         # "ok" | "degraded" | "failed: <exc>" (runtime/_core.py _run_init_step).
-        # Only "failed:" counts: "degraded" means an optional dependency is
-        # absent, which is a NORMAL steady state on installs without Ollama or a
-        # given API key, and counting it would cry wolf on exactly the installs
-        # least able to act on it.
+        #
+        # Two properties of that vocabulary drive the design, and testing a status
+        # in isolation gets BOTH of them wrong:
+        #
+        #   1. "failed:" is almost unreachable. _run_init_step only records it when
+        #      an exception ESCAPES the init function — and 30 of the 33 modules
+        #      under runtime/init/ catch their own (perception.py is the worked
+        #      example: `except Exception: logger.exception(...)`). A subsystem that
+        #      CRASHED therefore lands in the manifest as "degraded".
+        #   2. "degraded" is ambiguous. It is also the normal, PERMANENT state of an
+        #      optional dependency that is simply absent — no Ollama, no optional
+        #      API key — so reporting it outright cries wolf on every deploy of the
+        #      installs least able to act on it.
+        #
+        # So the check compares against a BASELINE taken before the restart instead.
+        # A delta is unambiguous where a status is not: a subsystem that was ok
+        # before this restart and is not ok after it regressed, whichever flavour of
+        # not-ok it is, while one that was already degraded stays quiet. Hard
+        # failures are reported regardless of baseline.
         #
         # ADVISORY, deliberately — it records, it does not revert. A CRITICAL
-        # subsystem (db/observability/router) already fails the health wait
-        # above: the runtime refuses to report bootstrapped without all three,
-        # and the health route 503s while not bootstrapped. So what reaches here
-        # is the non-critical remainder, where reverting an otherwise-good deploy
-        # over one subsystem is the wrong trade. Surfaced the same way as
-        # HOST_CC_DEGRADED below, via the degraded_subsystems column.
+        # subsystem (db/observability/router) never reaches here: the runtime
+        # refuses to report bootstrapped without all three, hosting/standalone.py
+        # then leaves no app and serve() exits, so the health wait above exhausts
+        # and rolls back on its own. What is left is the non-critical remainder,
+        # where reverting an otherwise-good deploy over one subsystem is the wrong
+        # trade. Surfaced like HOST_CC_DEGRADED below, via degraded_subsystems.
         #
         # python3, not "$VENV_DIR/bin/python": this needs stdlib only, and the
         # venv may be mid-reinstall at this point in a deploy.
-        # Every read below fails CLOSED — an absent, undated, empty or unusable
-        # value reports `check:*` (unknown), never an empty string. Empty means
-        # "checked, nothing wrong", and handing that back for a check that did not
-        # happen is precisely the defect being fixed here: the old code trusted a
-        # key that was not there and therefore always said "clean". The new source
-        # gets no more benefit of the doubt than the old one earned.
-        if ! DEGRADED=$(RESTART_AT="$RESTART_AT" python3 -c '
+        #
+        # Every read below fails CLOSED — an unowned, empty or unusable value
+        # reports `check:*` (unknown), never an empty string. Empty means "checked,
+        # nothing wrong", and handing that back for a check that did not happen is
+        # precisely the defect being fixed here: the old code trusted a key that was
+        # not there and therefore always said "clean".
+        SERVER_PID="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+        # Quoted heredoc, NOT `python3 -c '...'`: inside a single-quoted -c body an
+        # apostrophe in a comment silently terminates the shell string and breaks the
+        # script. Same form already used elsewhere in this file.
+        if ! DEGRADED=$(SERVER_PID="$SERVER_PID" SERVER_PID_BEFORE="$SERVER_PID_BEFORE" \
+                        MANIFEST_BEFORE="$MANIFEST_BEFORE" python3 - <<'PYEOF'
 import json, os, sys
-from datetime import datetime
 
-def _dt(value):
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+def rank(value):
+    """ok > degraded > everything else. Ordering only — never a pass/fail test."""
+    s = str(value)
+    return 2 if s == "ok" else 1 if s == "degraded" else 0
+
+def owner_ok(doc, pid_want):
+    """True IFF this document was written by pid_want.
+
+    Identity, not recency. The file is user-global and the server is not its only
+    writer (bridge, interactive terminal), so "written recently" cannot establish
+    whose it is — any writer can land at any moment. "Written by the process
+    systemd is running as genesis-server" is a yes/no fact.
+    """
+    return isinstance(doc, dict) and str(doc.get("pid")) == pid_want
+
+def payload(doc):
+    """The non-empty manifest mapping, or None. Kept SEPARATE from ownership so the
+    two failures get distinct sentinels — "someone else wrote this" and "this is
+    ours but says nothing" send a reader to completely different places."""
+    m = doc.get("manifest") if isinstance(doc, dict) else None
+    return m if isinstance(m, dict) and m else None
 
 try:
+    pid_want = (os.environ.get("SERVER_PID") or "").strip()
+    if not pid_want or pid_want == "0":
+        print("check:no-server-pid")
+        sys.exit(0)
     with open(os.path.expanduser("~/.genesis/bootstrap_manifest.json")) as fh:
         doc = json.load(fh)
-    anchor = os.environ.get("RESTART_AT", "")
-    # Checked on its own line, NOT folded into the comparison below as
-    # `anchor and ...`: a falsy anchor in that form deletes the freshness gate
-    # instead of failing it, which is the same shape of silent pass this whole
-    # change exists to remove.
-    if not anchor:
-        print("check:no-restart-anchor")
+    if not owner_ok(doc, pid_want):
+        # Written by the bridge, a terminal, or a previous boot. Unknown — and
+        # unknown is reported, never treated as a clean bill of health.
+        print("check:manifest-not-this-server")
         sys.exit(0)
-    persisted = doc.get("persisted_at")
-    if not persisted:
-        print("check:manifest-undated")
-        sys.exit(0)
-    if _dt(persisted) < _dt(anchor):
-        print("check:manifest-stale")
-        sys.exit(0)
-    manifest = doc.get("manifest")
-    if not isinstance(manifest, dict) or not manifest:
+    after = payload(doc)
+    if after is None:
         print("check:manifest-empty")
         sys.exit(0)
-    # Less permissive than a "failed:" prefix test, and deliberately matching
-    # runtime/_capabilities.py, which treats anything that is not ok/degraded as
-    # failed. A gate must be the stricter of two readers of the same data, so a
-    # status value added later cannot quietly pass it.
-    print(",".join(sorted(k for k, v in manifest.items() if str(v) not in ("ok", "degraded"))))
+
+    before, baseline_known = {}, False
+    raw = (os.environ.get("MANIFEST_BEFORE") or "").strip()
+    pid_before = (os.environ.get("SERVER_PID_BEFORE") or "").strip()
+    # `!= "0"` is load-bearing: "0" is what systemd reports for a STOPPED unit, and
+    # it is a TRUTHY string, so `raw and pid_before` alone would accept it and then
+    # fail the comparison silently — reporting "no baseline" (which reads like a
+    # first deploy) instead of "I read a stopped unit". Same falsy-check family that
+    # review already caught here once.
+    if raw and pid_before and pid_before != "0":
+        try:
+            d = json.loads(raw)
+            if owner_ok(d, pid_before):
+                b = payload(d)
+                if b is not None:
+                    before, baseline_known = b, True
+        except Exception:
+            pass
+
+    bad = []
+    if not baseline_known:
+        # First deploy on this install, or the pre-restart manifest was not the old
+        # server's. The check still runs, but it can only see hard failures — say so
+        # rather than emitting a confident-looking empty result.
+        bad.append("check:no-baseline")
+    for name, status in sorted(after.items()):
+        if rank(status) == 0:
+            bad.append(name)                          # hard failure, baseline or not
+        elif not baseline_known:
+            continue
+        elif name not in before:
+            # Arrived on THIS deploy already not-ok. The likeliest real regression:
+            # a newly added init step whose module swallows its own exception and
+            # so records "degraded" rather than "failed:".
+            if rank(status) < 2:
+                bad.append(name)
+        elif rank(status) < rank(before[name]):
+            bad.append(name)                          # regressed across the restart
+    if baseline_known:
+        # Present before, absent after. A manifest key is written on BOTH branches of
+        # _run_init_step, so an absent key means the step never ran at all — a
+        # deleted or newly-skipped subsystem. A legitimate rename costs one false
+        # positive, once; a silent drop costs the signal entirely.
+        for name in sorted(set(before) - set(after)):
+            if rank(before[name]) == 2:
+                bad.append(name + ":gone")
+    print(",".join(bad))
 except Exception as exc:
     # Name the cause: this token is the only artefact the check leaves behind, and
     # a bare "unreadable" makes the one signal it exists to emit undiagnosable.
     print("check:manifest-unreadable(" + type(exc).__name__ + ")")
-'); then
+PYEOF
+); then
             # The interpreter itself failed (absent python3, OOM). Unknown, not clean.
             DEGRADED="check:manifest-interpreter-failed"
         fi

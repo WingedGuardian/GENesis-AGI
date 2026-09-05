@@ -1,31 +1,39 @@
 """The post-update degraded-subsystem check must actually observe subsystems.
 
 Regression cover for a SILENT FAIL-OPEN in the deploy gate: the check parsed a
-``subsystems`` key off ``/api/genesis/health``, but that response has no such
-key (verified against a running server: 24 top-level keys, ``subsystems``
-absent — the only endpoint using that name returns a LIST, not a mapping). So
-the computed ``DEGRADED`` was ALWAYS empty and the branch guarded by it had
-never fired on any install.
+``subsystems`` key off ``/api/genesis/health``, but that response has no such key
+(verified against a running server: 24 top-level keys, ``subsystems`` absent —
+the only endpoint using that name returns a LIST). ``DEGRADED`` was therefore
+ALWAYS empty and the branch guarded by it had never fired on any install.
 
-Scope of what this gate can and cannot catch, which is why it is ADVISORY:
-``GenesisRuntime._CRITICAL_SUBSYSTEMS`` is ``{db, observability, router}`` and
-``_bootstrapped`` is false unless all three are ok. A critical failure does not
-merely 503 — ``hosting/standalone.py`` returns early leaving ``_app`` None and
-``serve()`` then exits, so the process does not come up at all, the health wait
-exhausts, and the deploy rolls back on its own. What reaches this check is the
-OTHER ~31 subsystems, whose failure leaves the server bootstrapped, answering
-200, and shipping silently. Reverting a whole deploy over one non-critical
-subsystem is too blunt for that, so the finding is recorded, never rolled back.
+Two properties of the manifest vocabulary shape the replacement, and testing a
+status in isolation gets both wrong:
 
-EVERY negative outcome is a ``check:`` sentinel rather than an empty string.
-Empty means "checked, nothing wrong"; returning that for a check that did not
-happen is the exact defect being fixed, so the replacement source gets no
-benefit of the doubt either. The ``check:`` prefix also keeps these tokens
-distinguishable from real subsystem names once they reach the update-failure
-alert, which interpolates the column verbatim.
+1. ``failed:`` is almost unreachable — ``_run_init_step`` records it only when an
+   exception ESCAPES, and 30 of 33 modules under ``runtime/init/`` catch their own
+   (``perception.py``: ``except Exception: logger.exception(...)``). A subsystem
+   that CRASHED lands in the manifest as ``degraded``.
+2. ``degraded`` is ambiguous — it is also the normal, PERMANENT state of an absent
+   optional dependency, so reporting it outright cries wolf on every deploy.
 
-These drive the SHIPPED block extracted from update.sh, with ``curl`` shimmed on
-PATH so the test can never reach a real server on :5000.
+Hence a DELTA against a pre-restart baseline: ``ok -> degraded`` is a regression
+this deploy introduced whichever flavour it is, while an already-degraded
+subsystem stays quiet.
+
+Ownership is decided by IDENTITY, not recency. The manifest path is user-global
+and the server is not its only writer (bridge, interactive terminal), so the
+runtime stamps the writing ``pid`` and this check compares it against the unit's
+``MainPID``. "Written recently" cannot establish whose a file is; "written by the
+process systemd is running as genesis-server" is a yes/no fact.
+
+Every negative outcome is a ``check:`` sentinel, never an empty string. Empty
+means "checked, nothing wrong"; returning that for a check that did not happen is
+the exact defect being fixed. The prefix also keeps these tokens distinguishable
+from real subsystem names once they reach the update-failure alert, which
+interpolates the column verbatim.
+
+These drive the SHIPPED block extracted from update.sh, with ``curl`` and
+``systemctl`` shimmed on PATH so the test can never reach the real server.
 """
 
 from __future__ import annotations
@@ -38,24 +46,12 @@ from pathlib import Path
 
 import pytest
 
-UPDATE_SH = Path(__file__).resolve().parents[2] / "scripts" / "update.sh"
+REPO = Path(__file__).resolve().parents[2]
+UPDATE_SH = REPO / "scripts" / "update.sh"
 
-# A realistic health payload: the shape the endpoint ACTUALLY returns. The
-# absence of a "subsystems" key is the whole point — a fixture that invented one
-# would test a server that does not exist.
-_HEALTH_JSON = json.dumps(
-    {
-        "status": "healthy",
-        "timestamp": "2026-01-01T00:00:00Z",
-        "infrastructure": {"genesis.db": {"status": "healthy"}},
-        "services": {},
-        "queues": {},
-    }
-)
-
-_ANCHOR = "2026-01-01T00:00:00+00:00"
-_AFTER_ANCHOR = "2026-01-01T00:00:10+00:00"
-_BEFORE_ANCHOR = "2025-01-01T00:00:00+00:00"
+_HEALTH_JSON = json.dumps({"status": "healthy", "infrastructure": {}, "services": {}})
+_PID = "4242"
+_OLD_PID = "1111"
 
 
 @pytest.fixture
@@ -76,31 +72,57 @@ def _extract_degraded_block(text: str) -> str:
     return text[start:end].replace('"$VENV_DIR/bin/python"', "python3")
 
 
-def _run_degraded(
+def _doc(manifest: dict, pid: str = _PID) -> dict:
+    return {
+        "bootstrapped": True,
+        "manifest": manifest,
+        "persisted_at": "2026-01-01T00:00:00+00:00",
+        "pid": int(pid),
+    }
+
+
+def _run(
     tmp_path: Path,
     text: str,
     *,
-    doc: dict | None,
-    restart_at: str = _ANCHOR,
+    after: dict | None,
+    before: dict | None = None,
+    main_pid: str = _PID,
+    pid_before: str | None = None,
+    no_python: bool = False,
     label: str = "case",
 ) -> tuple[str, str, int]:
-    """Drive the shipped block. Returns (DEGRADED value, combined output, rc)."""
+    """Drive the shipped block. Returns (DEGRADED value, combined output, rc).
+
+    ``after``/``before`` are whole manifest DOCUMENTS (or None to omit).
+    ``pid_before`` defaults to _OLD_PID when a baseline is given; pass "0"
+    explicitly to reproduce a pid read from a STOPPED unit.
+    """
     home = tmp_path / f"home_{label}"
     (home / ".genesis").mkdir(parents=True)
-    if doc is not None:
-        (home / ".genesis" / "bootstrap_manifest.json").write_text(json.dumps(doc))
+    if after is not None:
+        (home / ".genesis" / "bootstrap_manifest.json").write_text(json.dumps(after))
 
-    # Shim curl so the block cannot reach the real server on this box.
     bindir = tmp_path / f"bin_{label}"
     bindir.mkdir()
-    curl = bindir / "curl"
-    curl.write_text(f"#!/bin/bash\ncat <<'EOF'\n{_HEALTH_JSON}\nEOF\n")
-    curl.chmod(0o755)
+    (bindir / "curl").write_text(f"#!/bin/bash\ncat <<'EOF'\n{_HEALTH_JSON}\nEOF\n")
+    (bindir / "curl").chmod(0o755)
+    # systemctl shim: only `show ... -p MainPID --value` is consulted here.
+    (bindir / "systemctl").write_text(f"#!/bin/bash\necho '{main_pid}'\n")
+    (bindir / "systemctl").chmod(0o755)
+    if no_python:
+        # Shadow python3 so the interpreter leg fails (127), exercising the bash
+        # fallback that no other test in this file reaches.
+        (bindir / "python3").write_text("#!/bin/bash\nexit 127\n")
+        (bindir / "python3").chmod(0o755)
 
+    before_json = json.dumps(before) if before is not None else ""
+    pid_b = pid_before if pid_before is not None else (_OLD_PID if before is not None else "")
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 HEALTH_OK=true
-RESTART_AT="{restart_at}"
+MANIFEST_BEFORE={json.dumps(before_json)}
+SERVER_PID_BEFORE="{pid_b}"
 _do_rollback() {{ echo "ROLLBACK-CALLED: $*"; exit 9; }}
 {_extract_degraded_block(text)}
 echo "DEGRADED=[${{DEGRADED:-}}]"
@@ -114,164 +136,296 @@ echo "DEGRADED=[${{DEGRADED:-}}]"
         text=True,
         timeout=30,
     )
-    combined = out.stdout + out.stderr
     value = ""
     for line in out.stdout.splitlines():
         if line.startswith("DEGRADED=["):
             value = line[len("DEGRADED=[") : -1]
-    return value, combined, out.returncode
+    return value, out.stdout + out.stderr, out.returncode
 
 
-def _fresh(manifest: dict) -> dict:
-    return {"bootstrapped": True, "manifest": manifest, "persisted_at": _AFTER_ANCHOR}
+# ── the regression this exists to catch ────────────────────────────────────
 
 
-# ── detection ──────────────────────────────────────────────────────────────
+def test_ok_to_degraded_regression_is_detected(tmp_path: Path, text: str) -> None:
+    """THE REPRO — the case both reviewers surfaced.
 
-
-def test_failed_subsystem_is_detected(tmp_path: Path, text: str) -> None:
-    """THE REPRO. A non-critical subsystem that failed to init must be named.
-
-    Fails on the pre-fix code: it parsed a `subsystems` key the health response
-    does not have, so DEGRADED came back empty and the deploy shipped silently.
+    perception (and 29 other init modules) swallow their own exceptions, so a
+    CRASH is recorded as "degraded", not "failed:". Testing the status alone
+    misses it; the delta against the pre-restart baseline catches it.
     """
-    value, combined, rc = _run_degraded(
+    value, out, rc = _run(
         tmp_path,
         text,
-        doc=_fresh({"db": "ok", "router": "ok", "outreach": "failed: boom"}),
-        label="failed",
+        before=_doc({"db": "ok", "perception": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "perception": "degraded"}),
+        label="regress",
     )
-    assert rc == 0, combined
-    assert value == "outreach", f"failed subsystem not surfaced; DEGRADED={value!r}"
+    assert rc == 0, out
+    assert value == "perception", f"ok->degraded regression not surfaced; got {value!r}"
 
 
-def test_unknown_status_counts_as_failed(tmp_path: Path, text: str) -> None:
-    """The gate must be the STRICTER of the two readers of this manifest.
-    runtime/_capabilities.py treats anything not ok/degraded as failed; matching
-    that means a status value added later cannot quietly pass the gate."""
-    value, combined, rc = _run_degraded(
-        tmp_path, text, doc=_fresh({"db": "ok", "inbox": "wedged"}), label="unknown"
+def test_persistently_degraded_stays_quiet(tmp_path: Path, text: str) -> None:
+    """An absent optional dependency (no Ollama, no optional key) is degraded
+    before AND after. Reporting it would cry wolf on every deploy of exactly the
+    installs least able to act on it."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "voice": "degraded"}, _OLD_PID),
+        after=_doc({"db": "ok", "voice": "degraded"}),
+        label="persist",
     )
-    assert rc == 0, combined
-    assert value == "inbox", f"unrecognised status must count as failed; got {value!r}"
+    assert rc == 0, out
+    assert value == "", f"pre-existing degradation must stay quiet, got {value!r}"
+
+
+def test_hard_failure_reported_regardless_of_baseline(tmp_path: Path, text: str) -> None:
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "router": "failed: boom"}, _OLD_PID),
+        after=_doc({"db": "ok", "router": "failed: boom"}),
+        label="hard",
+    )
+    assert rc == 0, out
+    assert value == "router", f"a hard failure must report every time; got {value!r}"
 
 
 def test_all_ok_reports_nothing(tmp_path: Path, text: str) -> None:
-    value, combined, rc = _run_degraded(
-        tmp_path, text, doc=_fresh({"db": "ok", "router": "ok"}), label="allok"
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "router": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "router": "ok"}),
+        label="allok",
     )
-    assert rc == 0, combined
-    assert value == "", f"clean manifest must report nothing, got {value!r}"
+    assert rc == 0, out
+    assert value == "", f"clean deploy must report nothing, got {value!r}"
 
 
-def test_degraded_status_is_not_a_failure(tmp_path: Path, text: str) -> None:
-    """`degraded` means an optional dependency is absent — normal on many
-    installs (no Ollama, no optional API key). Counting it would make the gate
-    cry wolf on exactly the installs least able to act on it."""
-    value, combined, rc = _run_degraded(
-        tmp_path, text, doc=_fresh({"db": "ok", "voice": "degraded"}), label="degr"
+def test_improvement_is_not_reported(tmp_path: Path, text: str) -> None:
+    """degraded -> ok is a fix, not a regression."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "voice": "degraded"}, _OLD_PID),
+        after=_doc({"db": "ok", "voice": "ok"}),
+        label="improve",
     )
-    assert rc == 0, combined
-    assert value == "", f"'degraded' must not count as failed, got {value!r}"
+    assert rc == 0, out
+    assert value == "", f"an improvement must not be reported, got {value!r}"
 
 
-# ── fail-closed paths: each reports a sentinel, never an empty "all clear" ──
+# ── ownership: identity, not recency ───────────────────────────────────────
 
 
-def test_stale_manifest_is_not_reported_clean(tmp_path: Path, text: str) -> None:
-    """A manifest predating this RESTART describes an earlier boot — the bridge
-    and the interactive terminal write this same file."""
-    doc = {"bootstrapped": True, "manifest": {"db": "ok"}, "persisted_at": _BEFORE_ANCHOR}
-    value, combined, rc = _run_degraded(tmp_path, text, doc=doc, label="stale")
-    assert rc == 0, combined
-    assert value == "check:manifest-stale", f"got {value!r}"
-
-
-def test_undated_manifest_is_not_reported_clean(tmp_path: Path, text: str) -> None:
-    value, combined, rc = _run_degraded(
-        tmp_path, text, doc={"bootstrapped": True, "manifest": {"db": "ok"}}, label="undated"
+def test_manifest_written_by_another_process_is_rejected(tmp_path: Path, text: str) -> None:
+    """The bridge and the interactive terminal write this same user-global file.
+    A manifest whose pid is not the serving unit's MainPID says nothing about
+    this deploy — and must not read as a clean bill of health."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "perception": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "perception": "ok"}, "9999"),  # someone else's
+        label="notours",
     )
-    assert rc == 0, combined
-    assert value == "check:manifest-undated", f"got {value!r}"
+    assert rc == 0, out
+    assert value == "check:manifest-not-this-server", f"got {value!r}"
 
 
-def test_missing_manifest_key_is_not_reported_clean(tmp_path: Path, text: str) -> None:
-    """The bug being fixed was trusting a key that was not there. The
-    REPLACEMENT source must not repeat it: a fresh document with no usable
-    payload is unknown, not a clean bill of health."""
-    doc = {"bootstrapped": True, "persisted_at": _AFTER_ANCHOR}
-    value, combined, rc = _run_degraded(tmp_path, text, doc=doc, label="nokey")
-    assert rc == 0, combined
-    assert value == "check:manifest-empty", f"got {value!r}"
+def test_no_server_pid_is_not_reported_clean(tmp_path: Path, text: str) -> None:
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok"}),
+        main_pid="0",  # systemd reports 0 for an inactive unit
+        label="nopid",
+    )
+    assert rc == 0, out
+    assert value == "check:no-server-pid", f"got {value!r}"
 
 
-def test_empty_manifest_is_not_reported_clean(tmp_path: Path, text: str) -> None:
-    value, combined, rc = _run_degraded(tmp_path, text, doc=_fresh({}), label="emptyman")
-    assert rc == 0, combined
-    assert value == "check:manifest-empty", f"got {value!r}"
-
-
-def test_empty_anchor_does_not_disable_the_freshness_gate(tmp_path: Path, text: str) -> None:
-    """An empty anchor must FAIL the gate, not delete it. Folded into the
-    comparison as `anchor and ...`, a falsy anchor silently skips the staleness
-    test and an ancient manifest reads as this deploy's."""
-    doc = {"bootstrapped": True, "manifest": {"db": "ok"}, "persisted_at": _BEFORE_ANCHOR}
-    value, combined, rc = _run_degraded(tmp_path, text, doc=doc, restart_at="", label="noanchor")
-    assert rc == 0, combined
-    assert value == "check:no-restart-anchor", f"got {value!r}"
-
-
-def test_missing_manifest_file_is_not_reported_clean(tmp_path: Path, text: str) -> None:
-    value, combined, rc = _run_degraded(tmp_path, text, doc=None, label="missing")
-    assert rc == 0, combined
+def test_missing_manifest_names_its_cause(tmp_path: Path, text: str) -> None:
+    value, out, rc = _run(tmp_path, text, before=None, after=None, label="missing")
+    assert rc == 0, out
     assert value.startswith("check:manifest-unreadable("), f"got {value!r}"
     assert "FileNotFoundError" in value, f"cause must be named for diagnosis; got {value!r}"
+
+
+def test_absent_baseline_is_declared_not_hidden(tmp_path: Path, text: str) -> None:
+    """First deploy on an install: the check still runs but can only see hard
+    failures. It says so rather than emitting a confident-looking empty result."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=None,
+        after=_doc({"db": "ok", "voice": "degraded"}),
+        label="nobase",
+    )
+    assert rc == 0, out
+    assert "check:no-baseline" in value, f"reduced capability must be declared; got {value!r}"
+    assert "voice" not in value, "without a baseline a degraded subsystem is not a regression"
+
+
+def test_baseline_from_another_process_is_not_trusted(tmp_path: Path, text: str) -> None:
+    """A baseline is only a baseline if it belonged to the server it precedes."""
+    stale = {"bootstrapped": True, "manifest": {"db": "ok"}, "pid": 777}  # not SERVER_PID_BEFORE
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=stale,
+        after=_doc({"db": "ok"}),
+        label="badbase",
+    )
+    assert rc == 0, out
+    assert "check:no-baseline" in value, f"got {value!r}"
+
+
+def test_stopped_unit_baseline_pid_is_rejected(tmp_path: Path, text: str) -> None:
+    """THE CONTROL FOR THE CAPTURE-POINT BUG. systemd reports MainPID "0" for a
+    stopped unit, and "0" is a TRUTHY string — so a guard of the form
+    `if raw and pid_before:` accepts it and then fails the comparison silently,
+    emitting check:no-baseline, which is indistinguishable from a legitimate first
+    deploy. An earlier revision captured the baseline pid AFTER the stop and was
+    therefore a permanent no-op with a fully green suite."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "perception": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "perception": "degraded"}),
+        pid_before="0",
+        label="stoppedpid",
+    )
+    assert rc == 0, out
+    assert "check:no-baseline" in value, f"a stopped-unit pid must not be trusted; got {value!r}"
+
+
+def test_new_subsystem_arriving_broken_is_detected(tmp_path: Path, text: str) -> None:
+    """A deploy that ADDS an init step whose module swallows its own exception
+    records it as `degraded` with no baseline entry. Gating the regression arm on
+    `name in before` would make the likeliest real regression invisible."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "newthing": "degraded"}),
+        label="newbroken",
+    )
+    assert rc == 0, out
+    assert value == "newthing", f"a subsystem arriving broken must be named; got {value!r}"
+
+
+def test_new_subsystem_arriving_healthy_is_quiet(tmp_path: Path, text: str) -> None:
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "newthing": "ok"}),
+        label="newok",
+    )
+    assert rc == 0, out
+    assert value == "", f"a healthy new subsystem is not a regression; got {value!r}"
+
+
+def test_disappeared_subsystem_is_detected(tmp_path: Path, text: str) -> None:
+    """A manifest key is written on BOTH branches of _run_init_step, so an absent
+    key means the step never ran — a deleted or newly-skipped subsystem, which is
+    exactly a 'this deploy broke something' event."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok", "reflex": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok"}),
+        label="gone",
+    )
+    assert rc == 0, out
+    assert value == "reflex:gone", f"a vanished subsystem must be named; got {value!r}"
+
+
+def test_empty_manifest_gets_its_own_sentinel(tmp_path: Path, text: str) -> None:
+    """ "Ours but says nothing" and "someone else wrote it" send a reader to
+    completely different places, so they must not share a sentinel."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok"}, _OLD_PID),
+        after={"bootstrapped": True, "pid": int(_PID), "manifest": {}},
+        label="emptyman",
+    )
+    assert rc == 0, out
+    assert value == "check:manifest-empty", f"got {value!r}"
+
+
+def test_interpreter_failure_is_not_reported_clean(tmp_path: Path, text: str) -> None:
+    """The bash fallback leg. Nothing else in this file reaches it."""
+    value, out, rc = _run(
+        tmp_path,
+        text,
+        before=_doc({"db": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok"}),
+        no_python=True,
+        label="nopy",
+    )
+    assert rc == 0, out
+    assert value == "check:manifest-interpreter-failed", f"got {value!r}"
 
 
 # ── contract ───────────────────────────────────────────────────────────────
 
 
 def test_failure_is_advisory_never_a_rollback(tmp_path: Path, text: str) -> None:
-    """The check surfaces; it does not revert. A critical failure already
-    prevents the server coming up at all, and one non-critical subsystem must
-    not destroy an otherwise-good deploy."""
-    _, combined, rc = _run_degraded(
+    _, out, rc = _run(
         tmp_path,
         text,
-        doc=_fresh({"db": "ok", "outreach": "failed: boom", "inbox": "failed: boom"}),
+        before=_doc({"db": "ok", "inbox": "ok", "outreach": "ok"}, _OLD_PID),
+        after=_doc({"db": "ok", "inbox": "failed: x", "outreach": "degraded"}),
         label="advisory",
     )
-    assert "ROLLBACK-CALLED" not in combined, f"degraded check must not roll back:\n{combined}"
-    assert rc == 0, combined
+    assert "ROLLBACK-CALLED" not in out, f"degraded check must not roll back:\n{out}"
+    assert rc == 0, out
 
 
 def test_finding_is_folded_into_the_recorded_degraded_column(text: str) -> None:
     """SOURCE PIN, mirroring test_cc_updater_suppression's fold test: the value
     must reach update_history, or "surfaced, not silent" is true only of one
-    run's console output. The fold sits outside the extractor's span, so no
-    behavioural test above covers it.
-    """
+    run's console output. The fold sits outside the extractor's span."""
     fold = re.search(
-        r'if \[ -n "\$\{DEGRADED:-\}" \]; then\s*\n\s*_p6_degraded="\$\{_p6_degraded:\+\$_p6_degraded,\}\$DEGRADED"',
+        r'if \[ -n "\$\{DEGRADED:-\}" \]; then\s*\n\s*'
+        r'_p6_degraded="\$\{_p6_degraded:\+\$_p6_degraded,\}\$DEGRADED"',
         text,
     )
     assert fold is not None, "DEGRADED must be folded into _p6_degraded before it is recorded"
-    # Anchor on the UNIQUE success call that carries the column. Plain
-    # `_record_update_history "success"` also matches the two no-op-path calls
-    # earlier in the file, which is a different code path and orders the wrong way.
     record = '_record_update_history "success" "" "$_p6_degraded"'
     assert text.count(record) == 1, "success-with-degraded call is no longer unique — re-anchor"
-    assert fold.start() < text.index(record), (
-        "the fold must happen before the success row is written"
+    assert fold.start() < text.index(record), "fold must precede the success row"
+
+
+def test_baseline_is_captured_before_the_restart(text: str) -> None:
+    """The delta needs a PRE-restart snapshot; capturing it after would compare
+    the new manifest against itself and report nothing, ever."""
+    assert 'MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json"' in text
+    # THE invariant that actually broke: the pid must be read while the old server
+    # is still ALIVE. `systemctl show -p MainPID` returns "0" for a stopped unit, so
+    # capturing anywhere after the stop can never match the manifest's real pid —
+    # the baseline is silently rejected on every deploy and the delta becomes a
+    # no-op that still emits a healthy-looking sentinel. An earlier revision of this
+    # change did exactly that and the whole suite stayed green.
+    capture = text.index('MANIFEST_BEFORE="$(cat')
+    first_stop = text.index("    _stop_genesis_server\n")
+    assert capture < first_stop, (
+        "baseline must be captured BEFORE the server is stopped — a stopped unit "
+        "reports MainPID 0 and the baseline can never be matched"
+    )
+    assert text.index("SERVER_PID_BEFORE=") < first_stop, (
+        "the baseline pid must be read while the old server is still running"
     )
 
 
-def test_restart_anchor_is_stamped_at_the_restart_not_script_start(text: str) -> None:
-    """The freshness anchor must be RESTART_AT, stamped next to the restart. Using
-    $STARTED_AT (top of script) would accept any manifest written during the whole
-    multi-minute deploy, including one from a concurrently-booting runtime."""
-    assert 'RESTART_AT="$(date -Iseconds)"' in text
-    assert text.index('RESTART_AT="$(date -Iseconds)"') < text.index(
-        'if [ "$HEALTH_OK" = "true" ]; then'
-    ), "anchor must be stamped before the health/degraded check reads it"
-    assert 'RESTART_AT="$RESTART_AT" python3' in text, "the check must consume the restart anchor"
+def test_runtime_stamps_the_writing_pid(text: str) -> None:
+    """The identity bind is only possible because the runtime records who wrote
+    the manifest. Pin it here: this check is the consumer, and a silent removal
+    upstream would turn the bind into a permanent check:manifest-not-this-server."""
+    cap = (REPO / "src" / "genesis" / "runtime" / "_capabilities.py").read_text()
+    assert '"pid": os.getpid(),' in cap, "bootstrap manifest must record its writer's pid"
