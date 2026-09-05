@@ -726,3 +726,145 @@ async def test_should_reset_uses_local_midnight_not_utc(loop, monkeypatch):
     assert loop._should_reset({"started_at": "2026-08-24T02:00:00+00:00"}, now=now) is True
     # Started 06:00 UTC — after local midnight → not stale yet today.
     assert loop._should_reset({"started_at": "2026-08-24T06:00:00+00:00"}, now=now) is False
+
+
+# --- Session self-knowledge on RESUMED turns (measured 2026-09-02) ----------
+# A Telegram DM session refused "switch to Opus, medium effort", claiming it
+# could not change its own model. session_config existed and GENESIS_SESSION_ID
+# was in its env. The gap was self-knowledge, and it had to survive RESUME:
+# a resumed turn sends no system prompt, so anything stated only at session
+# start is absent from every later turn — including the turn that failed.
+
+
+@pytest.mark.asyncio
+async def test_streaming_carries_session_control_on_a_FRESH_turn(loop):
+    sp = await _capture_streaming_system_prompt(
+        loop, channel=ChannelType.TELEGRAM, user_id="tg-ctl-1"
+    )
+    assert sp is not None
+    assert "session_config" in sp
+    # The id is interpolated, not read from the (stale-prone) env var.
+    assert "GENESIS_SESSION_ID" not in sp
+
+
+@pytest.mark.asyncio
+async def test_streaming_carries_session_control_on_a_RESUMED_turn(loop, db):
+    """THE case that matters. On resume the system prompt is None, so the block
+    must arrive via --append-system-prompt or it is absent exactly when needed."""
+    captured = {}
+
+    async def _fake_try(invocation, *, session, **kw):
+        captured["sp"] = invocation.system_prompt
+        captured["resume"] = invocation.resume_session_id
+        return _make_output(), session
+
+    loop._try_invoke_streaming = _fake_try
+    # First turn establishes the session and its cc_session_id.
+    await loop.handle_message_streaming(
+        "hello", user_id="tg-ctl-2", channel=ChannelType.TELEGRAM, thread_id=None,
+    )
+    # Second turn resumes it.
+    await loop.handle_message_streaming(
+        "switch to opus", user_id="tg-ctl-2", channel=ChannelType.TELEGRAM,
+        thread_id=None,
+    )
+    sp = captured["sp"]
+    # PIN the resume branch. Without this the test passes even if the second
+    # turn silently took the fresh path, since that path gets the block too.
+    assert captured["resume"] == "cc-sess-1", captured["resume"]
+    assert "You are Genesis." not in (sp or ""), "took the fresh path, not resume"
+    assert sp is not None, "resumed turn carried NO system prompt at all"
+    assert "session_config" in sp, sp[:400]
+
+
+@pytest.mark.asyncio
+async def test_session_control_reports_the_CURRENT_model_not_the_original(loop, db):
+    """After a /model switch the session's own description must follow. Values
+    stated only in the fresh-session prompt go stale for the conversation's life."""
+    captured = {}
+
+    async def _fake_try(invocation, *, session, **kw):
+        captured["sp"] = invocation.system_prompt
+        return _make_output(), session
+
+    loop._try_invoke_streaming = _fake_try
+    await loop.handle_message_streaming(
+        "hi", user_id="tg-ctl-3", channel=ChannelType.TELEGRAM, thread_id=None,
+    )
+    session = await cc_sessions.get_active_foreground(
+        db, user_id="tg-ctl-3", channel=str(ChannelType.TELEGRAM), thread_id=None,
+    )
+    await cc_sessions.update_model_effort(db, session["id"], model="opus", effort="low")
+    await loop.handle_message_streaming(
+        "and now?", user_id="tg-ctl-3", channel=ChannelType.TELEGRAM, thread_id=None,
+    )
+    assert "model=opus" in captured["sp"], captured["sp"][:400]
+    assert "effort=low" in captured["sp"], captured["sp"][:400]
+
+
+@pytest.mark.asyncio
+async def test_session_control_withheld_on_terminal(loop, mock_invoker, db):
+    """TERMINAL has Claude Code's own /model and /effort, and its resumed turns
+    deliberately carry NO system prompt (test_second_message_resumes pins that)."""
+    await loop.handle_message("hello", user_id="u-term", channel=ChannelType.TERMINAL)
+    first = mock_invoker.run.call_args[0][0]
+    assert "session_config" not in (first.system_prompt or "")
+
+    await loop.handle_message("again", user_id="u-term", channel=ChannelType.TERMINAL)
+    second = mock_invoker.run.call_args[0][0]
+    assert second.resume_session_id is not None
+    assert second.system_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_handle_message_carries_session_control_for_telegram(loop, mock_invoker):
+    """The non-streaming path had NO positive coverage: deleting its injection
+    left every test green. It is also the OpenClaw production path."""
+    await loop.handle_message("hi", user_id="tg-ctl-4", channel=ChannelType.TELEGRAM)
+    sp = mock_invoker.run.call_args[0][0].system_prompt
+    assert "session_config" in (sp or ""), (sp or "")[:300]
+
+
+@pytest.mark.asyncio
+async def test_session_control_withheld_on_web(loop, mock_invoker):
+    """WEB is OpenClaw's /v1/chat/completions — registered with NO auth gate and
+    stamped supervised=False / origin=external_untrusted. Telling THAT session it
+    can switch its own model, and never to refuse, hands an anonymous caller a
+    lever the user is supposed to own."""
+    await loop.handle_message("hi", user_id="web-ctl-1", channel=ChannelType.WEB)
+    sp = mock_invoker.run.call_args[0][0].system_prompt
+    assert "session_config" not in (sp or ""), (sp or "")[:300]
+
+
+@pytest.mark.asyncio
+async def test_contingency_reassembles_identity_on_a_RESUMED_turn(
+    loop_with_contingency, mock_invoker
+):
+    """`system_prompt is None` was a RESUME SENTINEL, not a null guard.
+
+    Two degraded paths used it to decide whether to re-assemble Genesis identity
+    for a fresh peer. A resumed turn's prompt is NOT None once anything is
+    appended to it — the research-routing nudge already does this on Telegram —
+    so the sentinel silently failed and the contingency shipped that fragment
+    alone to a tool-less router LLM: an assistant answering as Genesis with no
+    SOUL.md, no persona, during the outage contingency exists to survive.
+
+    The guard is now keyed on the resume FACT, so an appended fragment cannot
+    disable it.
+    """
+    from genesis.cc.exceptions import CCQuotaExhaustedError
+
+    loop, contingency = loop_with_contingency
+    # Turn 1 establishes the session so that turn 2 RESUMES it.
+    await loop.handle_message("hello", user_id="tg-cx", channel=ChannelType.TELEGRAM)
+    mock_invoker.run.side_effect = CCQuotaExhaustedError("usage limit reached")
+
+    await loop.handle_message("follow up", user_id="tg-cx", channel=ChannelType.TELEGRAM)
+
+    contingency.dispatch_conversation.assert_awaited()
+    kwargs = contingency.dispatch_conversation.await_args.kwargs
+    args = contingency.dispatch_conversation.await_args.args
+    system_prompt = kwargs.get("system_prompt") or (args[1] if len(args) > 1 else "")
+    # The distinguishing fact: FULL identity, not just the appended fragment
+    # that a resumed turn's prompt had been reduced to.
+    assert "You are Genesis." in (system_prompt or ""), (system_prompt or "")[:300]
