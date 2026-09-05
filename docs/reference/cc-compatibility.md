@@ -517,6 +517,45 @@ Genesis hooks read input through `scripts/hooks/hook_input.py`
 stdin, extracts the `tool_input`-nested fields, and warns on a malformed payload
 so a broken contract can't silently fail open again.
 
+#### Hook OUTPUT: a decision channel and a context channel, capped differently
+
+These are separate, and conflating them produces a plausible-but-wrong safety
+worry. CC **files** a hook's stdout above a per-hook-entry size cap (10,000
+characters on 2.1.246 — version-volatile; it sat near the high-20s K on 2.1.218)
+and shows the model a ~2 KB preview. That cap governs stdout as **model-visible
+context**.
+
+It does **not** gate the control-plane parse of `hookSpecificOutput`. A
+PreToolUse `deny` is parsed and honoured however long its
+`permissionDecisionReason` is — so an oversized reason does **not** cause the
+gate to fail open.
+
+MEASURED 2026-09-03 on CC 2.1.246, via `claude -p --settings <probe>` with a
+PreToolUse hook emitting a `deny` whose reason length was varied, discriminating
+on a **disk side effect** (the denied command writes a marker file) rather than
+on wording:
+
+| reason chars | hook stdout bytes | marker written | verdict |
+|---|---|---|---|
+| 500 | 617 | no | BLOCKED (control) |
+| 15,000 | 15,117 | no | BLOCKED |
+| 200,000 | 200,117 | no | BLOCKED |
+
+The small-reason control arm is load-bearing: without it, "not blocked" at the
+large size is indistinguishable from a probe that never worked. In all three
+arms the reason also reached the model, so it is not silently discarded.
+
+Two cautions. **Re-measure both numbers after a CC pin bump** — the stdout cap
+has already moved once across a version bump, and this one could too. And do not
+transfer either result to the other channel, or to a tool result: per-tool
+`maxResultSizeChars` is a third budget again.
+
+Genesis's own gates are unaffected either way: every blocking hook uses **exit
+code 2 with the reason on stderr**, whose verdict comes from the exit status and
+therefore cannot be weakened by a long reason. `permissionDecision` appears in
+the tree only as `allow` and `ask`. The measurement matters for any future hook
+that denies via JSON.
+
 `session_id` is a special case: a dozen hooks interpolate it into a filesystem
 path (`~/.genesis/sessions/<id>/`), and several `mkdir(parents=True)` — so an id
 carrying `/` or `..` would not merely read the wrong file, it would CREATE
