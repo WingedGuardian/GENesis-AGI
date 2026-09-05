@@ -121,7 +121,24 @@ if [[ "$MODE_ARG" == "manual" ]]; then
             # is ordinary — the tmux server shuts down the moment the last slot's
             # claude exits, and `list-panes` on a missing session exits 1 — and on
             # the manual door that would drop the operator at a bare prompt.
-            _map_pids=$(tmux list-panes -s -t "=${name}" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+            # BOUNDED, and charged to the SAME whole-map deadline as the probe
+            # below. A budget that covers only the probe is not a budget: this
+            # `list-panes` is a blocking round-trip to the tmux server, runs once
+            # per listed slot on the interactive login path, and a wedged server
+            # would hang the login here — before the launch — in a feature this
+            # code calls COSMETIC. `-k` because `timeout` sends SIGTERM and then
+            # waits, which a process stuck in uninterruptible I/O outlives.
+            _map_t="$_MAP_PROBE_BUDGET"
+            if [ "$_MAP_DEADLINE" -gt 0 ]; then
+                _map_rem=$(( _MAP_DEADLINE - SECONDS ))
+                if [ "$_map_rem" -le 0 ]; then
+                    _MAP_PROBE_GAVE_UP=1
+                    _map_rem=1
+                fi
+                [ "$_map_rem" -lt "$_map_t" ] && _map_t="$_map_rem"
+            fi
+            _map_pids=$(timeout -k 2 "$_map_t" tmux list-panes -s -t "=${name}" \
+                -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
             _map_v=""
             [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
             # Set in the LOOP's shell, not inside the substitution above.
@@ -445,15 +462,41 @@ fi
 # the gate/fallback message above carries the cap itself.
 echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, live: ${existing})" >&2
 
-# Redirect CC temp to dedicated directory (keeps /tmp clean)
-export TMPDIR="$HOME/.genesis/cc-tmp"
-mkdir -p "$TMPDIR"
-chmod 700 "$TMPDIR"
+# Redirect CC temp to a dedicated directory (keeps /tmp clean).
+#
+# CREATING a directory does not make it USABLE: `mkdir -p` returns SUCCESS for
+# one that already exists, including a root-owned one left by an earlier sudo
+# run. The old form also ran `mkdir`/`chmod` UNGUARDED under `set -euo pipefail`,
+# so a failing chmod killed the whole door — and since this value is now pinned
+# into the session with `-e TMPDIR=` below, an unusable path would be propagated
+# to every slot rather than staying local to this script. So each candidate must
+# be created AND writable before it is accepted, in a loop no future candidate
+# can be added without. ~/tmp is a DEGRADED fallback (disk_hygiene.sh prunes it
+# at 7 days), never an equal one.
+TMPDIR=""
+for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
+    mkdir -p "$_cand" 2>/dev/null || continue
+    [ -w "$_cand" ] || continue
+    chmod 700 "$_cand" 2>/dev/null || true
+    TMPDIR="$_cand"
+    break
+done
+unset _cand
+if [ -n "$TMPDIR" ]; then
+    export TMPDIR
+    [ "$TMPDIR" = "$HOME/.genesis/cc-tmp" ] \
+        || echo "cc-slot: ${HOME}/.genesis/cc-tmp is unusable — using ${TMPDIR} instead." >&2
+else
+    echo "cc-slot: no usable temp dir (${HOME}/.genesis/cc-tmp or ${HOME}/tmp) —" >&2
+    echo "cc-slot: leaving CC on the system default (check disk space/permissions)." >&2
+fi
 
 # Move CC's Bash sandbox off volatile /tmp onto persistent disk.
 # CC uses CLAUDE_CODE_TMPDIR for its sandbox root (/claude-<uid>/<cwd>/).
 # Without this, intermittent ENOENT failures on /tmp break the Bash tool.
-export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
+# Same resolved directory as TMPDIR above — never a second, unchecked path.
+CLAUDE_CODE_TMPDIR="$TMPDIR"
+[ -n "$CLAUDE_CODE_TMPDIR" ] && export CLAUDE_CODE_TMPDIR
 
 # Permission mode for this interactive dev console. Default: auto — auto-approves
 # common ops but still prompts on deny/ask rules, which the operator answers in
@@ -568,11 +611,19 @@ fi
 #                             Do not "helpfully" add it — measured unnecessary.)
 # CLAUDE_CODE_TMPDIR was already pinned for the same server-env reason.
 # LANG stays LAST — a doors test parses the create line from its final -e.
+#
+# The temp pins are built as an ARRAY because they are conditional: when no
+# usable temp dir was found above, pinning `TMPDIR=` would push an EMPTY value
+# into the session, which is worse than not pinning it (CC would resolve an
+# empty TMPDIR rather than fall back to the system default).
+_TMPDIR_PIN=()
+if [ -n "$TMPDIR" ]; then
+    _TMPDIR_PIN=(-e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" -e "TMPDIR=$TMPDIR")
+fi
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
-    -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
-    -e "TMPDIR=$TMPDIR" \
+    "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
     "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

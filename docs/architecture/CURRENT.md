@@ -304,7 +304,7 @@ verified: 225f9e3b 2026-09-04
   in this slot?" by walking `/proc` for a `claude` under any of the slot's pane pids —
   reading only world-readable `comm`/`cmdline` (never the ptrace-gated `environ`), and
   biased toward reporting ALIVE (a false ALIVE costs a plain attach; a false POISONED
-  would clobber a live TUI). The manual/dashboard slot map uses it to ANNOTATE a
+  would clobber a live TUI). The MANUAL-mode slot map uses it to ANNOTATE a
   claude-less slot (`no claude running — attach, then run 'claude' to relaunch it in
   place`, the move the in-tmux wrapper below makes first-class; NOTHING here
   relaunches a poisoned slot, since `new-session -A` attaches and discards the

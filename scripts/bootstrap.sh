@@ -916,29 +916,44 @@ claude() {
         # A FAILED mkdir must not be shrugged past: exporting TMPDIR to a
         # directory that does not exist is worse than not exporting it at all —
         # every temp write then fails inside CC rather than here, where the
-        # cause is visible. And "just use the ambient TMPDIR" is NOT a fallback
-        # in this branch: it only runs INSIDE a slot pane, where the launcher
-        # has already exported TMPDIR to the very directory whose creation just
-        # failed. The fallback has to name a different directory explicitly, or
-        # clear the variables so the system default applies.
+        # cause is visible. And "just use the ambient TMPDIR" is NOT a reliable
+        # fallback: in a cc-N slot pane the launcher has ALREADY exported TMPDIR
+        # to the very directory that just proved unusable, so deferring to it
+        # would hand CC the failing path straight back. (This branch fires in ANY
+        # interactive tmux, not only a slot — see the gate above — but the slot
+        # case is the one the ambient value cannot rescue.) The fallback
+        # therefore names a different directory explicitly, or clears the
+        # variables so the system default applies.
         # Deliberately NOT fatal: refusing to start Claude because a mkdir
         # failed strands the operator.
-        _ctmp="$HOME/.genesis/cc-tmp"
-        if mkdir -p "$_ctmp" 2>/dev/null; then
-            chmod 700 "$_ctmp" 2>/dev/null || true
-        elif mkdir -p "$HOME/tmp" 2>/dev/null; then
-            # Same 0700 as the primary path: this holds CC session state, and
-            # at the ambient umask it would land world-readable. NOTE for
-            # whoever reads this next: ~/tmp is swept by disk_hygiene.sh's
-            # 7-day prune, so this is a degraded fallback, not an equal one.
-            chmod 700 "$HOME/tmp" 2>/dev/null || true
-            echo "genesis: could not create $_ctmp — using $HOME/tmp instead." >&2
-            _ctmp="$HOME/tmp"
-        else
-            echo "genesis: could not create $_ctmp or $HOME/tmp; starting Claude with" >&2
-            echo "genesis: the system default temp dir (check disk space/permissions)." >&2
-            _ctmp=""
+        # CREATING a directory does not make it USABLE, and `mkdir -p` returns
+        # SUCCESS for one that already exists — including a root-owned one left
+        # by an earlier sudo run, where the following chmod is best-effort and
+        # its failure is swallowed. Accepting on mkdir's exit status alone would
+        # export TMPDIR to a directory Claude cannot write, which is the same
+        # defect as exporting a missing one: the failure surfaces later, inside
+        # CC, instead of here. So each candidate must be created AND writable
+        # before it is accepted, and the check lives in a loop so a future
+        # candidate cannot be added without it. Order matters: ~/tmp is swept by
+        # disk_hygiene.sh's 7-day prune, so it is a degraded fallback, not an
+        # equal one. 0700 because this holds CC session state and the ambient
+        # umask would leave it world-readable.
+        _ctmp=""
+        for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
+            mkdir -p "$_cand" 2>/dev/null || continue
+            [ -w "$_cand" ] || continue
+            chmod 700 "$_cand" 2>/dev/null || true
+            _ctmp="$_cand"
+            break
+        done
+        if [ -z "$_ctmp" ]; then
+            echo "genesis: no usable temp dir ($HOME/.genesis/cc-tmp or $HOME/tmp);" >&2
+            echo "genesis: starting Claude with the system default temp dir" >&2
+            echo "genesis: (check disk space/permissions)." >&2
+        elif [ "$_ctmp" != "$HOME/.genesis/cc-tmp" ]; then
+            echo "genesis: $HOME/.genesis/cc-tmp is unusable — using $_ctmp instead." >&2
         fi
+        unset _cand
         # A SUBSHELL, so the fallback token below is scoped to this launch and
         # never lingers in the operator's interactive shell.
         (
@@ -970,7 +985,12 @@ claude() {
                 # terminal.
                 if _notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_mode" \
                         "$_lg" -m genesis.cc.login_gate); then
-                    _tok=$("$_lg" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)
+                    # BOUNDED like the gate one line above. This spawns a second
+                    # interpreter whose import graph reaches config/DB code, so a
+                    # wedged ~/.genesis mount would hang the operator's `claude`
+                    # forever — in an interactive shell, with stderr already
+                    # suppressed, so there is no clue why.
+                    _tok=$(timeout -k 2 15 "$_lg" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null) || _tok=""
                     # Export ONLY when non-empty: a failed read must never
                     # export a blank credential over a working login.
                     if [ -n "$_tok" ]; then
@@ -992,6 +1012,10 @@ claude() {
         )
         _ec=$?
         unset _ctmp
+        # Runs in ANY interactive tmux, not only a cc-N slot, so a pane with no
+        # GENESIS_SLOT captures under the label "manual" (deliberate — a crash
+        # outside a slot is exactly as undiagnosable without it, and the log is
+        # 0600 and scrubbed). Pinned by test_missing_slot_env_falls_back_to_a_label.
         [ -x "$HOME/genesis/scripts/cc_exit_capture.sh" ] \
             && "$HOME/genesis/scripts/cc_exit_capture.sh" "$_slot" "$_ec" >/dev/null 2>&1
         return $_ec

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pty
+import select
 import stat
 import subprocess
 import time
@@ -534,12 +535,30 @@ echo "RC=$?" >> {str(rec)!r}
             # wrapper sees a real tty on fd 0/1. Test-only, fixed argv.
             os.execvp("bash", ["bash", "-c", script])  # noqa: S606
         seen: list[bytes] = []
+        # A deadline is only real if EVERY wait under it is bounded. Both waits
+        # here would otherwise block forever on a child that produces no output
+        # and never exits (an auth regression waiting on input is the realistic
+        # shape): a bare `os.read` blocks before the loop can re-check the
+        # clock, and the reap in `finally` blocks on a live child — so the test
+        # would hang the suite instead of failing in 30s. `select` bounds the
+        # read by the SAME deadline, and the child is killed before the reap.
+        deadline = time.monotonic() + 30
         try:
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
+            while True:
                 done, _ = os.waitpid(pid, os.WNOHANG)
                 if done:
                     break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:  # pragma: no cover - only on a hang
+                    # pty.fork() returns the child's real pid in the parent, so
+                    # this is never a pgid-0/1 broadcast.
+                    os.kill(pid, 9)
+                    break
+                # Short slices so an exit with no further output is noticed
+                # promptly by the WNOHANG check above rather than at the ceiling.
+                ready, _, _ = select.select([fd], [], [], min(remaining, 0.5))
+                if not ready:
+                    continue
                 try:
                     chunk = os.read(fd, 4096)
                 except OSError:
@@ -547,12 +566,11 @@ echo "RC=$?" >> {str(rec)!r}
                 if not chunk:
                     break
                 seen.append(chunk)
-            else:  # pragma: no cover - only on a hang
-                os.kill(pid, 9)
-                os.waitpid(pid, 0)
         finally:
             os.close(fd)
             # Reap unconditionally: the read loop can exit before the child does.
+            # Safe to block here — either the child already exited, or the
+            # deadline branch above SIGKILLed it, so this returns either way.
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
         return (b"".join(seen).decode(errors="replace"),
@@ -625,8 +643,9 @@ echo "RC=$?" >> {str(rec)!r}
     def test_temp_dir_falls_back_when_the_slot_dir_cannot_be_made(self, tmp_path):
         """The fallback has to NAME a different directory, not "the ambient one".
 
-        This branch runs only inside a slot pane, where the launcher has
-        ALREADY exported TMPDIR to the directory whose creation is now failing.
+        In a slot pane the launcher has ALREADY exported TMPDIR to the very
+        directory whose creation is now failing (the branch itself fires in any
+        interactive tmux, but that is the case the ambient value cannot rescue).
         So "start Claude with the ambient TMPDIR" would hand it exactly the
         missing path — the failure it was trying to avoid, moved somewhere less
         visible. The env_extra below reproduces that precondition deliberately;
@@ -649,6 +668,37 @@ echo "RC=$?" >> {str(rec)!r}
         )
         assert str(bad) not in rec, (
             f"started Claude pointed at the directory that could not be created:\n{rec}"
+        )
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bit")
+    def test_an_existing_unwritable_slot_dir_is_rejected_not_used(self, tmp_path):
+        """`mkdir -p` SUCCEEDS on a directory that already exists — including one
+        we cannot write (a root-owned leftover from an earlier sudo run). Creation
+        is not usability; only the writability check separates them, and without
+        it Claude launches pointed at a temp dir whose every write fails INSIDE
+        CC instead of here.
+
+        The existing fallback test cannot cover this: it makes `mkdir -p` itself
+        fail, so it passes with the writability check deleted.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        home = tmp_path / "home"
+        bad = home / ".genesis" / "cc-tmp"
+        bad.mkdir(parents=True)
+        bad.chmod(0o500)  # exists; mkdir -p returns 0; not writable
+        try:
+            _unused, rec = self._harness(
+                tmp_path,
+                "export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7",
+                bootstrap_text=text,
+            )
+        finally:
+            bad.chmod(0o700)  # so tmp_path teardown can remove it
+        assert f"TMPDIR={home}/tmp" in rec, (
+            f"did not fall back off an unwritable slot dir:\n{rec}"
+        )
+        assert f"TMPDIR={bad}" not in rec, (
+            f"launched Claude on a temp dir it cannot write:\n{rec}"
         )
 
     def test_injects_permission_flag_tmpdirs_and_capture(self, tmp_path):
