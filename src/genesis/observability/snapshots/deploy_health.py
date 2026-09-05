@@ -29,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,12 +76,18 @@ GUARDIAN_HOST_PATHS = (
 )
 
 # Resident daemons whose ExecStart is a repo script — keep in LOCKSTEP with
-# update.sh RESIDENT_UNIT_SCRIPTS (the restart heal). Timer-fired oneshots
-# re-exec their script every tick and are immune; genesis-server/bridge have
-# their own restart handling in update.sh. Values are repo-relative script
-# paths resolved against repo_root() at collection time.
+# update.sh RESIDENT_UNIT_SCRIPTS (the restart heal; test-enforced). Values
+# are EVERY startup-loaded repo-relative file (ExecStart script + libraries
+# it sources at start), resolved against repo_root() at collection time.
+# Timer-fired oneshots re-exec their script every tick and are immune;
+# genesis-server/bridge have their own restart handling in update.sh;
+# genesis-code-intel-freeze is deliberately excluded (operator-armed kill
+# switch — auto-bouncing it would drop the very locks it exists to hold).
 RESIDENT_UNIT_SCRIPTS = {
-    "genesis-tmp-watchgod.service": "scripts/tmp_watchgod.sh",
+    "genesis-tmp-watchgod.service": (
+        "scripts/tmp_watchgod.sh",
+        "scripts/lib/alert_queue.sh",
+    ),
 }
 
 _HOST_STATE_FILE = "host_gateway_state.json"
@@ -151,20 +156,29 @@ def _probe_unit(unit: str) -> tuple[bool, float | None]:
     (no network — the module contract), budgeted like the git probes. Any
     unreadable fact degrades to (False, None) / (True, None) rather than
     raising; the caller treats None as "cannot judge"."""
-    # TZ=UTC pins systemctl's CLIENT-SIDE timestamp render to one zone, so
-    # the strptime below can attach UTC explicitly — the same trick (and the
-    # same reason) as update.sh's _unit_restart_reason loop: ambiguous zone
-    # abbreviations and DST fold hours parse differently per install, and
-    # the two halves must reach the same verdict on the same facts.
-    utc_env = {**os.environ, "TZ": "UTC"}
+    # systemctl_env() first: under the genesis-server systemd sandbox,
+    # XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS may be absent and a raw
+    # environ copy cannot reach the user manager — every probe would then
+    # read "inactive" and RESOLVE a real drift alert. Then TZ=UTC pins the
+    # client-side timestamp render so the strptime below can attach UTC
+    # explicitly — same trick, same reason as update.sh's loop (ambiguous
+    # zone abbreviations and DST folds parse differently per install; the
+    # two halves must reach one verdict on the same facts).
+    from genesis.util.systemd import systemctl_env
+
+    utc_env = {**systemctl_env(), "TZ": "UTC"}
     rc = subprocess.run(
         ["systemctl", "--user", "is-active", "--quiet", unit],
         capture_output=True,
         timeout=_CHEAP_TIMEOUT_S,
         env=utc_env,
     ).returncode
+    if rc == 3:
+        return False, None  # cleanly inactive — nothing to judge
     if rc != 0:
-        return False, None
+        # Cannot contact the user manager / unit in an error state: UNKNOWN,
+        # never "inactive" — a probe outage must not read as health.
+        raise RuntimeError(f"systemctl is-active rc={rc} for {unit}")
     out = subprocess.run(
         ["systemctl", "--user", "show", unit, "-p", "ExecMainStartTimestamp", "--value"],
         capture_output=True,
@@ -187,32 +201,37 @@ def _probe_unit(unit: str) -> tuple[bool, float | None]:
 
 
 def collect_stale_units(
-    unit_scripts: dict[str, Path],
+    unit_scripts: dict[str, tuple[Path, ...] | Path],
     *,
     probe: object = None,
 ) -> list[str] | None:
-    """Resident daemons running code older than their backing script.
+    """Resident daemons running code older than any startup-loaded file.
 
     Verdict mirrors update.sh's ``_unit_restart_reason``: a unit is stale iff
-    it is ACTIVE and its ExecMainStart epoch predates the script's file mtime
-    (mtime = when the code arrived on THIS install; a commit timestamp is
-    authored upstream and misses the started-between-commit-and-pull window).
-    Every unreadable fact fails open per unit (skip, never flag); a broken
+    it is ACTIVE and its ExecMainStart epoch predates the NEWEST mtime among
+    its listed files (mtime = when the code arrived on THIS install; a commit
+    timestamp is authored upstream and misses the started-between-commit-and-
+    pull window; multiple files because a daemon sources libraries once at
+    start). Unreadable facts fail open per unit (skip, never flag); a broken
     probe returns ``None`` — "could not determine", never a clean empty
     (fail-closed data-access doctrine: an outage must not masquerade as
     health)."""
     probe_fn = probe or _probe_unit
     try:
         stale: list[str] = []
-        for unit, script in unit_scripts.items():
+        for unit, scripts in unit_scripts.items():
             active, start_epoch = probe_fn(unit)
             if not active or start_epoch is None:
                 continue
-            try:
-                script_epoch = Path(script).stat().st_mtime
-            except OSError:
-                continue
-            if start_epoch < script_epoch:
+            paths = (scripts,) if isinstance(scripts, (str, Path)) else scripts
+            newest = None
+            for script in paths:
+                try:
+                    m = Path(script).stat().st_mtime
+                except OSError:
+                    continue
+                newest = m if newest is None else max(newest, m)
+            if newest is not None and start_epoch < newest:
                 stale.append(unit)
         return sorted(stale)
     except Exception:
@@ -404,7 +423,10 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
     )
     host_gateway = collect_host_gateway(repo, genesis_home_dir / _HOST_STATE_FILE)
     stale_units = collect_stale_units(
-        {unit: repo / script for unit, script in RESIDENT_UNIT_SCRIPTS.items()}
+        {
+            unit: tuple(repo / script for script in scripts)
+            for unit, scripts in RESIDENT_UNIT_SCRIPTS.items()
+        }
     )
     return {
         "git": git_facts,

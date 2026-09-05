@@ -264,14 +264,22 @@ _guardian_redeploy_reason() {
     return 0
 }
 
-# Resident daemons whose ExecStart is a repo script, as unit:script pairs.
-# Timer-fired oneshots re-exec their script every tick and are immune;
-# genesis-server and genesis-bridge have their own restart handling. A unit
-# listed here is restarted by _sync_deploy_targets when it is RUNNING code
-# older than its on-disk script (verified instance: tmp_watchgod ran a
-# 7-week-old copy for two weeks after its OOM-capture feature merged,
-# leaving the one instrument built to explain silent session deaths inert).
-RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh"
+# Resident daemons whose ExecStart is a repo script, as unit:script[,script…]
+# pairs — EVERY startup-loaded file, not just ExecStart: tmp_watchgod sources
+# lib/alert_queue.sh once at start, so a lib-only pull would otherwise leave
+# the daemon paging with old code while reading as fresh. Timer-fired
+# oneshots re-exec their script every tick and are immune; genesis-server
+# and genesis-bridge have their own restart handling. A unit listed here is
+# restarted by _sync_deploy_targets when it is RUNNING code older than any
+# of its listed files (verified instance: tmp_watchgod ran a 7-week-old copy
+# for two weeks after its OOM-capture feature merged, leaving the one
+# instrument built to explain silent session deaths inert).
+# DELIBERATELY EXCLUDED: genesis-code-intel-freeze — an operator-armed
+# kill switch whose whole guarantee is continuously HOLDING the index
+# locks; an auto-bounce would release them mid-freeze. Its code freshness
+# is the operator's re-arm. Keep in LOCKSTEP with deploy_health's
+# RESIDENT_UNIT_SCRIPTS (test-enforced).
+RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh"
 
 _unit_restart_reason() {
     # Pure verdict: facts in → reason out (mirrors _guardian_redeploy_reason,
@@ -572,13 +580,27 @@ _sync_deploy_targets() {
         if [ -n "$_ru_start_ts" ] && [ "$_ru_start_ts" != "n/a" ]; then
             _ru_start_epoch=$(TZ=UTC date -d "$_ru_start_ts" +%s 2>/dev/null) || _ru_start_epoch=""
         fi
+        # Newest change across ALL the unit's startup-loaded files.
         _ru_script_epoch=""
-        _ru_script_epoch=$(stat -c %Y "$GENESIS_ROOT/$_ru_script" 2>/dev/null) || _ru_script_epoch=""
+        for _ru_one in ${_ru_script//,/ }; do
+            _ru_e=""
+            _ru_e=$(stat -c %Y "$GENESIS_ROOT/$_ru_one" 2>/dev/null) || _ru_e=""
+            case "$_ru_e" in '' | *[!0-9]*) continue ;; esac
+            if [ -z "$_ru_script_epoch" ] || [ "$_ru_e" -gt "$_ru_script_epoch" ]; then
+                _ru_script_epoch="$_ru_e"
+            fi
+        done
         _ru_reason=""
         _ru_reason=$(_unit_restart_reason "$_ru_active" "$_ru_start_epoch" "$_ru_script_epoch" "$_ru_unit") || _ru_reason=""
         if [ -n "$_ru_reason" ]; then
             echo "  $_ru_reason"
-            systemctl --user restart "$_ru_unit" 2>/dev/null || echo "  WARNING: restart of $_ru_unit failed"
+            if ! systemctl --user restart "$_ru_unit" 2>/dev/null; then
+                echo "  WARNING: restart of $_ru_unit failed"
+                # Deploy-target alignment failure — accumulate like every
+                # other miss in this function, so update_history records a
+                # degraded deployment instead of a clean one.
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}unit_restart_${_ru_unit%%.service}"
+            fi
         fi
     done
     # END unit-restart-check

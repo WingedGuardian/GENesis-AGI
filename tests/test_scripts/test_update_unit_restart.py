@@ -69,6 +69,8 @@ def test_table_covers_tmp_watchgod(text: str) -> None:
     m = re.search(r'^RESIDENT_UNIT_SCRIPTS="([^"]*)"', text, re.MULTILINE)
     assert m, "RESIDENT_UNIT_SCRIPTS table not found"
     assert "genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh" in m.group(1)
+    # Every startup-loaded file, not just ExecStart (sourced-lib finding):
+    assert "scripts/lib/alert_queue.sh" in m.group(1)
 
 
 def test_tables_in_lockstep_with_deploy_health(text: str) -> None:
@@ -80,8 +82,11 @@ def test_tables_in_lockstep_with_deploy_health(text: str) -> None:
 
     m = re.search(r'^RESIDENT_UNIT_SCRIPTS="([^"]*)"', text, re.MULTILINE)
     assert m
-    bash_pairs = dict(pair.split(":", 1) for pair in m.group(1).split())
-    assert bash_pairs == dict(RESIDENT_UNIT_SCRIPTS)
+    bash_pairs = {
+        pair.split(":", 1)[0]: tuple(pair.split(":", 1)[1].split(","))
+        for pair in m.group(1).split()
+    }
+    assert bash_pairs == {k: tuple(v) for k, v in RESIDENT_UNIT_SCRIPTS.items()}
 
 
 def test_block_is_nonfatal_throughout(text: str) -> None:
@@ -146,16 +151,21 @@ def _run_block(
     script_mtime: int,
     show_fails: bool = False,
     script_exists: bool = True,
+    lib_mtime: int | None = None,
+    restart_fails: bool = False,
 ) -> tuple[str, list[str]]:
     """Run the extracted block against a stub systemctl + a real tmp script."""
     root = tmp_path / "root"
-    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "lib").mkdir(parents=True)
     script = root / "scripts" / "tmp_watchgod.sh"
+    lib = root / "scripts" / "lib" / "alert_queue.sh"
+    import os
+
     if script_exists:
         script.write_text("#!/bin/bash\n")
-        import os
-
         os.utime(script, (script_mtime, script_mtime))
+    lib.write_text("#!/bin/bash\n")
+    os.utime(lib, (lib_mtime if lib_mtime is not None else script_mtime,) * 2)
 
     calls = tmp_path / "systemctl.calls"
     calls.write_text("")
@@ -168,12 +178,14 @@ def _run_block(
         if show_fails
         else f'  *ExecMainStartTimestamp*) echo "$(date -d @{start_epoch} "+%a %F %T %Z")" ;;\n'
     )
+    restart_line = '  *" restart "*) exit 1 ;;\n' if restart_fails else ""
     stub.write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{calls}"\n'
         'case "$*" in\n'
         f'  *is-active*) exit {is_active_rc} ;;\n'
         + show_line
+        + restart_line
         + "esac\n"
         "exit 0\n"
     )
@@ -184,11 +196,12 @@ def _run_block(
         "set -euo pipefail\n"
         f'PATH="{stub_dir}:$PATH"\n'
         f'GENESIS_ROOT="{root}"\n'
-        'RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh"\n'
+        'RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh,scripts/lib/alert_queue.sh"\n'
         + _extract_func(text, "_unit_restart_reason")
         + "\n"
+        + "HOST_CC_DEGRADED=\"\"\n"
         + block
-        + '\necho "RC=$?"\n'
+        + '\necho "RC=$?"\necho "DEGRADED=$HOST_CC_DEGRADED"\n'
     )
     r = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=20)
     assert r.returncode == 0, f"block must not fail under set -e: {r.stderr}"
@@ -210,7 +223,7 @@ class TestRestartLoop:
     def test_missing_script_is_survived_and_restarts_nothing(self, text: str, tmp_path: Path) -> None:
         out, calls = _run_block(
             text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
-            script_exists=False,
+            script_exists=False, lib_mtime=500,
         )
         assert "RC=0" in out
         assert not any("restart" in c for c in calls), calls
@@ -224,6 +237,24 @@ class TestRestartLoop:
     def test_fresh_daemon_not_restarted(self, text: str, tmp_path: Path) -> None:
         _out, calls = _run_block(text, tmp_path, active=True, start_epoch=3000, script_mtime=2000)
         assert not any("restart" in c for c in calls), calls
+
+    def test_sourced_lib_change_alone_triggers_restart(self, text: str, tmp_path: Path) -> None:
+        """A pull touching only the sourced library must restart the daemon —
+        it loaded that code once at startup (external finding)."""
+        _out, calls = _run_block(
+            text, tmp_path, active=True, start_epoch=1500,
+            script_mtime=1000, lib_mtime=2000,
+        )
+        assert any("restart genesis-tmp-watchgod.service" in c for c in calls), calls
+
+    def test_restart_failure_marks_degraded(self, text: str, tmp_path: Path) -> None:
+        """A failed heal is a degraded deployment, never a silent clean
+        (external finding: the accumulator contract at the function head)."""
+        out, _calls = _run_block(
+            text, tmp_path, active=True, start_epoch=1000, script_mtime=2000,
+            restart_fails=True,
+        )
+        assert "unit_restart_genesis-tmp-watchgod" in out
 
     def test_inactive_unit_not_started(self, text: str, tmp_path: Path) -> None:
         _out, calls = _run_block(text, tmp_path, active=False, start_epoch=1000, script_mtime=2000)
