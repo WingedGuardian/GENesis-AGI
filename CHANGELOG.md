@@ -69,6 +69,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A slow boot is no longer mistaken for a failed deploy.** The post-update
+  health gate gave the server a fixed three minutes to answer, but a busy
+  machine can take five just to finish starting — and the gate then rolled a
+  perfectly good deploy back to the old code. The gate now watches the server
+  process itself: while it is alive and starting, it gets up to ten minutes
+  (adjustable via `GENESIS_DEPLOY_HEALTH_WINDOW_SECS`, never less than the old
+  three); the moment the process dies, the wait stops early instead of
+  padding out the clock. The rollback message now states how long it waited
+  and what state the service was in.
+
 - **Marketing campaign updates now post to their own Telegram topic.** The marketing
   campaign's tick updates previously routed to the shared Morning Reports topic; they
   now go to a dedicated "Marketing" forum topic via a new `marketing` outreach
