@@ -257,7 +257,12 @@ Three rules when a bound really is needed:
   over-large batch or an implausibly large file is simply not a value we accept,
   and refusing it is a resource guard, not an amputation. What is forbidden is
   silently CUTTING them to fit. Only free text gets a bound it is expected to sit
-  under; everything else gets one it must not cross.
+  under; every other INBOUND value gets one it must not cross. Scope that to
+  inbound on purpose: a READ that pages a large collection — the first n WHOLE
+  elements plus a total and a truncation flag — is a selection with a
+  denominator, this section's own preferred shape, and the source collection is
+  valid precisely because it exceeds the page. Reject the oversized value you
+  are asked to ACCEPT; paginate the oversized collection you are asked to LIST.
 - **Derive the number from the right thing, and record how.** A SAFETY bound —
   memory exhaustion, an abuse ceiling, untrusted input — does not come from the
   corpus at all: historical traffic says nothing about adversarial input,
