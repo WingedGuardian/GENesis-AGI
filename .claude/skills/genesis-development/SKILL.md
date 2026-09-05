@@ -190,6 +190,229 @@ string ends in `\n`). The acceptance replay is what exposed it. A matcher that
 finds nothing is indistinguishable from a matcher that looks at nothing —
 only replaying a known-positive tells them apart.
 
+### Select, don't amputate — truncation is the absence of a decision
+
+**Scope first, because bounding is often correct.** What makes something an
+amputation is LOSS — the value cut here was the only copy. Nothing else. A
+bounded PREVIEW of something stored intact elsewhere is a selection, and stays
+one even if its handle is useless. Bounding against a hard external budget is
+likewise correct: a hook's stdout cap, a context window, a column whose limit is
+actually ENFORCED. That last qualifier is load-bearing here — this repo's SQLite
+`TEXT` columns enforce no length at all, so "the database column" does not
+excuse a cut; a self-imposed storage assumption is a decision to justify, not a
+budget to obey. So is refusing an oversized value outright.
+
+**And a SAFETY cap may be lossy — that is the one place cutting the only copy is
+right.** Streaming is a TRANSPORT property and only-copy is a DURABILITY one;
+check them separately, because a chunked read is often backed by a retained
+source you could go back to. The case that earns the lossy cap is the source
+that genuinely has no retained copy — a live subprocess pipe — where reading to
+the end to avoid "truncating" is how a runaway command exhausts memory; this
+repo bounds exactly that at a few MiB (`autonomy/executor/deterministic.py`
+`_read_limited`, whose own comment names the `yes`-command threat; verified
+2026-09-04). Losing the tail of a log beats losing the process. The obligation
+there is not to keep the bytes, it is to be LOUD about the cut — say the output
+was bounded and roughly by how much, so nobody reads a clipped log as a
+complete one. That cited cap does NOT yet meet this bar: `_read_limited`
+returns only the retained bytes with no truncation flag, and its caller reports
+the retained length as the total — a 3 MiB stream reads as "2097152 bytes
+total". The cap is right; its silence is the improvable half, cited here as a
+counterexample to "never cut", not as a model of declaring. A silent lossy cap
+is still the defect; a declared one is a resource guard doing its job. This
+section is about the remaining case.
+
+**A handle that does not resolve is a separate defect, and do not conflate the
+two** — that conflation is the mistake this section made about itself, twice.
+Check the pointer, because a preview advertising a retrieval path that does not
+exist teaches a lie; but when the full value survives somewhere, the fix is to
+mend or drop the handle — removing the cap TO PREVENT DATA LOSS is fixing a
+loss that never happened, and that misdiagnosis is how this rule causes the
+damage it exists to stop. Whether the cap should exist at all is the separate
+question the "what breaks if it is unbounded" test answers: a cap with no
+external, safety, or measured compatibility justification may be removed once
+that is established — for being unjustified, never for being an amputation.
+
+**There, do not truncate.** Not strings, not lists, not context, not output.
+Reaching for a character cap is a signal that a question was skipped, not
+answered. Omitting is legitimate — it is a judgement about relevance. Truncating
+is not: it is what happens when that judgement was never made, so the value gets
+cut at a point that has nothing to do with meaning. A truncated value is
+frequently worse than either alternative, because it still LOOKS complete, so
+nobody checks it — at which point you may as well not have passed it at all.
+
+Before bounding anything, answer: what is this value FOR, who reads it, why does
+it need budgeting at all, and what actually breaks if it is unbounded? Solve
+THAT. Usually the answer is "select less, whole" rather than "cut", and often the
+bound turns out not to be load-bearing.
+
+Three rules when a bound really is needed:
+
+- **Bound by MEANING, not by one blanket number.** A closed set is validated
+  against that set — a value outside it is INVALID, not "too long". A timestamp
+  is a shape; half a timestamp is not a shorter timestamp. A blanket cap turns
+  100,000 characters of foreign data into 300 characters of foreign data and
+  calls it bounded.
+  **This governs HOW you bound, never WHETHER you may.** Rejecting a structured
+  value or a collection by size is correct and stays correct: an over-long id, an
+  over-large batch or an implausibly large file is simply not a value we accept,
+  and refusing it is a resource guard, not an amputation. What is forbidden is
+  silently CUTTING them to fit. Only free text gets a bound it is expected to sit
+  under; every other INBOUND value gets one it must not cross. Scope that to
+  inbound on purpose: a READ that pages a large collection — the first n WHOLE
+  elements plus a total and a truncation flag — is a selection with a
+  denominator, this section's own preferred shape, and the source collection is
+  valid precisely because it exceeds the page. Reject the oversized value you
+  are asked to ACCEPT; paginate the oversized collection you are asked to LIST.
+- **Derive the number from the right thing, and record how.** A SAFETY bound —
+  memory exhaustion, an abuse ceiling, untrusted input — does not come from the
+  corpus at all: historical traffic says nothing about adversarial input,
+  concurrency, or the memory you actually have, and a cap chosen from observed
+  values will be exactly the wrong size when it matters. Derive those from the
+  protocol, the capacity and the threat model FIRST, then use `k/N` only to price
+  what the bound rejects. It is the COMPATIBILITY bounds — how long is this field
+  in practice, what does this cap cost real readers — that a corpus answers, and
+  for those: measure the real population and report `k/N` per the Acceptance Bar,
+  then name the corpus, the query and the date. Naming them is necessary and not
+  sufficient: the query is only re-derivable if the rows are still there when the
+  next reader runs it, so a table with a retention window yields an EPHEMERAL
+  observation. Say which one you have. And what the bound COSTS is a SECOND claim
+  needing its own denominator — "the cap discards the part worth keeping" is
+  exactly the sentence that sounds measured because it followed a measurement.
+- **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
+  chars>`) in preference to a mid-value cut. An honest gap beats a
+  plausible-looking fragment. The bound-plus-loud-flag half of this is already
+  the house pattern; the character-count marker is a proposal, so do not go
+  looking for a precedent that is not there.
+  **Declaration is a requirement on top of the loss rules, never a substitute
+  for them.** Stating the rule as "never cut" overshoots: this repo cuts
+  mid-value in several places on purpose and is right to — a resource guard on
+  an unbounded stream, a preview rendered next to the full record, a display
+  string trimmed before escaping so the cut cannot land mid-entity. Each of
+  those is a cut the loss rules PERMIT (a safety cap, a pointer-backed
+  selection, third-party display text) — which does not certify how each is
+  reported today: the safety cap above still cuts silently, and PERMITTED is
+  not DECLARED. The order matters: first the loss rules decide whether a cut may
+  happen at all — announcing a sliced KEY does not un-merge the two identities
+  it collapsed — and only then does declaration decide whether the permitted
+  cut is honest. A silent permitted cut is still a defect; a loud forbidden cut
+  is still forbidden.
+  **When the total is not already known, say that instead of computing it.**
+  Bounding a stream is the case — but first ask which KIND of bounded reader
+  you have, because the bound is on RETENTION, not necessarily on reading. A
+  drain-and-discard reader consumes to EOF anyway (a subprocess pipe must be
+  drained or the child blocks) and can count what it discards in constant
+  space, so it KNOWS the exact total and should say it. Only a stop-at-limit
+  reader, which truly stops consuming, cannot know. There, state the quantity
+  you KNOW — the cap — and mark the tail unknown:
+  `<kept first 40,000 chars; rest of stream omitted>`. Do not write
+  `<omitted: ≥40,000 chars>`: under this rule's own grammar that number
+  describes the OMITTED content, and one character over the cap makes it a
+  fabricated tail length — an invented number wearing the honest marker's
+  clothes, which is the exact thing the marker exists to prevent.
+
+One trap deserves naming, because it is what produced this rule: **a cap can
+manufacture a correctness bug in the very data it was added to protect.**
+Truncating an identifier used as a KEY merges two distinct identities into one,
+and downstream code then attributes one subject's state to another. That is not
+hypothetical — it shipped here. Two roster peers whose names shared a prefix
+collapsed onto a single key, so one peer's success cleared the other peer's
+recorded failure. A short DISPLAY handle is a different thing and is fine; the
+rule is about the stored key, not the rendered one.
+
+**A real need to truncate is a CONVERSATION to have, not a magic number to pick
+alone.** If you catch yourself choosing 300 or 200 or 1000, stop and raise it.
+
+**When there is nobody to raise it with** — an unattended background session —
+the rule is NOT "never pick a number". It is **never pick one silently.** Bound
+if you must, and put the reasoning beside the number, where a reader of the value
+will see it. That includes the question that comes BEFORE the number — whether
+this value needed bounding at all — because "is this big enough to matter?" is
+the same judgement drawing on the same missing information, and skipping it is
+precisely how the number gets invented. State both. A number with its reasoning
+next to it can be argued with and corrected, which is all anyone needed from you.
+What made the original defect dangerous was never that 300 existed — it was that
+300 arrived silent, looking deliberate, and was then defended.
+
+That default is about SIZE, never about secrecy, and the two must not be
+confused. If a value may carry a credential, token, or personal data, the
+unbounded default does NOT apply — for UNAUTHORIZED egress and for storage you
+cannot vouch for: there, fail closed, omit wholesale with a marker as the "omit
+explicitly" rule says, and keep only non-sensitive metadata. Losing diagnostic
+prose is recoverable; leaking a token is not. The scope qualifier is
+load-bearing and an earlier revision dropped it while restructuring — read
+unconditionally, "omit wholesale" would delete values existing features exist
+to hold: the References store deliberately RETAINS credentials, and its own
+dashboard tab masks the value behind an explicit reveal
+(`dashboard/routes/references.py`; verified 2026-09-04). That is a statement
+about ONE surface, not a security guarantee — other readers of the same store
+return raw bodies (`reference_lookup`, the knowledge routes), which is worth
+knowing precisely because a rule reader might otherwise lean on the reveal
+gate as if it covered them. An authorized, gated store holding a secret is the
+feature working, not a leak.
+
+**Then ask WHO WROTE IT as well as where it is going — two independent axes,
+and each governs a different decision.** Destination governs DISCLOSURE: what
+may cross a trust boundary is decided by where it lands, whoever wrote it — a
+user-authored secret bound for an external channel still gets scanned — and
+quarantined when a SUPPORTED pattern matches. Say that precisely, because the
+scanner is a high-confidence pattern gate by its own declaration, not a general
+secret filter: content carrying a secret outside its pattern set passes as
+safe, so nothing downstream may lean on that gate as proof of cleanliness
+(`security/output_scanner.py`; verified 2026-09-05). Authorship is a RISK INPUT to sanitization, and the treatment
+itself is chosen by the CONSUMING SINK: the same stranger-authored email
+fields are HTML-escaped and truncated where the sink renders raw HTML
+(`outreach/engagement.py` `_sanitize_ping_field`, whose docstring names both
+the threat and the destination; verified 2026-09-04) and stored UNESCAPED
+where the sink is a parameterised database column (`db/crud/email_threads.py`
+`record_reply`; verified 2026-09-04). Unescaped is not unbounded, and an
+earlier draft conflated them: what reaches that column is `body_preview`,
+already cut to 500 characters upstream (`mail/reply_poller.py`,
+`parsed.body[:500]`) — a silent mid-value cut of exactly the kind this section
+exists to surface, sitting inside the example chosen to demonstrate the
+opposite. The escaping point stands; the "canonical, unbounded" flourish did
+not survive following its own pointer. Escaping at
+ingestion would corrupt the stored copy; passing raw markup to a live
+renderer hands a stranger the user's most trusted channel. Maximally
+authorized destination, maximally defensive treatment AT THE RENDERER — any
+rule that reads "it's going somewhere trusted, so pass it whole" deletes that
+defence, and any rule that reads "a stranger wrote it, so escape it
+everywhere" corrupts the stored original.
+
+**And an authorized destination does not mean untreated.** The rule is narrow:
+do not strip the USER'S OWN content on its way to the user. It is not a licence
+to stop scrubbing on owner-facing surfaces, and this repo does not (each
+verified 2026-09-04): it rewrites username-bearing paths out of what the owner's
+own dashboard renders (`dashboard/routes/backup.py` `_scrub_reason`), gates
+credential values behind an explicit reveal rather than showing them (the
+References tab — that one surface, per the caveat above), applies the safe
+mechanical rewrite to the draft the user reviews (`content/egress.py`
+`should_gate`, `category == "content"` — non-fixable tells are FLAGGED, not
+removed, so the copy they approve has been treated, not certified clean), and
+in at least one subsystem deliberately keeps captured text out of its own
+private store entirely (`attention/types.py`: "never stored";
+`db/crud/attention.py`: "value-free … NO text"). "Into a private store" is
+emphatically not a blanket exemption; some stores are built specifically to
+never receive the value.
+
+**One last thing, learned the hard way from this section itself.** Four review
+rounds found defects in it, and every single one had the same shape: the cited
+FACT was true, and the CONCLUSION drawn from it was false. A retrieval tool
+really did lack an id lookup — and "therefore this is an amputation" was wrong,
+because the value was stored whole elsewhere. A field really was written
+unsliced — and "therefore it is a cheap place to record something" was wrong,
+because reaching it aborted the whole run. Verifying that each cited fact is true
+is the easy half, and it is not the half that fails. **State the inference as its
+own claim, and check THAT.**
+
+The sharpest instance is this section committing that error in the sentence next
+to the one warning against it. A draft of the paragraph above cited a real file
+that says, correctly, that a particular scrub applies to external audiences and
+not to replies going to the user — and generalised it into "this repo leaves
+owner-facing content untouched", which four other paths contradict. True fact,
+false inference, two paragraphs from the rule forbidding exactly that. The
+generalisation is the step to distrust, and it is seductive precisely when the
+evidence under it is solid.
+
 ### A blocked compound command loses EVERYTHING in it
 
 A PreToolUse block kills the **whole** Bash call, not the offending part — so a
