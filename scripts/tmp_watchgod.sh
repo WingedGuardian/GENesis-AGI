@@ -114,6 +114,19 @@ fs_total_mb() {
     echo "${result:-0}"
 }
 
+reap_dir_sparing_sockets() {
+    # Object-level deletion that NEVER removes unix sockets. CC binds one
+    # socket per live session under cc-tmp (cross-session messaging); they are
+    # 0 bytes, so deleting them reclaims nothing and silently severs the local
+    # coordination plane — sessions keep listening on bound-but-unlinked
+    # sockets and inbound connects fail ENOENT (measured, 2026-09-05 RED
+    # incident). Deletes everything else depth-first; a socket's ancestor dirs
+    # stay non-empty so they survive; a dir holding no sockets is removed
+    # entirely, exactly like rm -rf. -delete failures on non-empty dirs are
+    # expected and suppressed; GNU find continues past them.
+    find "$1" -depth -not -type s -delete 2>/dev/null || true
+}
+
 write_state() {
     local cc_tier="$1" cc_used="$2" sys_tier="$3" sys_pct="$4"
     local is_tmpfs="false"
@@ -238,14 +251,18 @@ clean_cc_red() {
     newest_session=$(find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*" \
         -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}') || true
 
-    # Delete ALL session dirs EXCEPT the newest one and files modified in last 60s
+    # Reap every depth-1 dir except the newest session's ancestor —
+    # object-level and socket-sparing (see reap_dir_sparing_sockets); loose
+    # depth-1 files are the separate sweep below. `|| true` matches the
+    # file's find idiom: a transient find error must not abort the daemon
+    # mid-RED under set -euo pipefail.
     find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do
         # Skip if this contains the active session
         if [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
             continue
         fi
-        rm -rf "$dir" 2>/dev/null || true
-    done
+        reap_dir_sparing_sockets "$dir"
+    done || true
 
     # Delete all reclaimable files except those modified in last 60s
     find "$CC_TMP_DIR" -type f -not -newermt '60 seconds ago' \
@@ -254,6 +271,17 @@ clean_cc_red() {
     # Delete caches unconditionally
     find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         -exec rm -rf {} + 2>/dev/null || true
+
+    # Report the surviving control plane — counted AFTER every sweep above,
+    # so the line is true by construction whatever any sweep did. Sockets
+    # are 0 bytes: deleting them reclaims nothing and silently severs
+    # cross-session messaging (measured, 2026-09-05 incident — this line's
+    # absence is what made that invisible).
+    local sock_count
+    sock_count=$(find "$CC_TMP_DIR" -type s 2>/dev/null | wc -l) || sock_count=0
+    if (( sock_count > 0 )); then
+        log INFO "RED preserved ${sock_count} unix socket(s) under cc-tmp — control plane, 0 bytes reclaimable"
+    fi
 
     # Kill ALL idle CC sessions (log each — so it's clear which terminals were reaped)
     while IFS= read -r sname; do

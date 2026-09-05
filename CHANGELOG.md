@@ -69,6 +69,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The temp-space watchdog no longer severs cross-session messaging when it
+  goes nuclear.** At its most aggressive cleanup tier the watchdog deleted every
+  top-level directory of Claude Code's working temp — including the directory
+  holding each live session's messaging socket. The sockets are zero bytes, so
+  deleting them reclaimed nothing, while every running session silently became
+  unreachable to its peers until restarted. The nuclear sweep now spares unix
+  sockets (and only them — all reclaimable bytes are still deleted) and logs
+  how many it preserved.
+
 - **The pre-merge check now reads the second review bot it was already fetching.**
   Two automated reviewers comment on every pull request, and the gate that decides
   whether a change is ready to merge only understood the format of one of them. The
