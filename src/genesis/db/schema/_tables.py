@@ -1390,7 +1390,13 @@ TABLES = {
             file_path        TEXT,
             success          INTEGER NOT NULL DEFAULT 1,
             error_snippet    TEXT,
-            timestamp        TEXT NOT NULL
+            timestamp        TEXT NOT NULL,
+            -- LAST on purpose: ALTER TABLE ADD COLUMN appends, so declaring it
+            -- last keeps fresh-CREATE and legacy-ALTER column order identical.
+            -- Dedup key for the Stop-hook outcome scanner (#1597). Every row the
+            -- scanner writes carries a value; the pre-#1597 rows carry NULL
+            -- (SQLite allows multiple NULLs in a UNIQUE index).
+            tool_use_id      TEXT
         )
     """,
     "direct_session_queue": """
@@ -2541,6 +2547,12 @@ INDEXES = [
     # tool call outcomes (edit failure sensor)
     "CREATE INDEX IF NOT EXISTS idx_tco_tool_ts ON tool_call_outcomes(tool_name, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_tco_success ON tool_call_outcomes(success, timestamp)",
+    # UNIQUE dedup key for the Stop-hook transcript outcome scanner (INSERT OR
+    # IGNORE). tool_use_id is globally unique per CC; the pre-#1597 rows carry
+    # NULL, and SQLite treats each NULL as distinct so they never collide. #1597.
+    # (Column mirrored into _migrate_add_columns so this index is safe to build
+    # on a legacy DB before the numbered migration runs — #1123/#1127 class.)
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tco_tool_use_id ON tool_call_outcomes(tool_use_id)",
     # cognitive self-modification ledger (rollback)
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_target ON cognitive_file_modifications(target_path)",
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_actor ON cognitive_file_modifications(actor)",
