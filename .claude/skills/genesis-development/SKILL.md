@@ -1611,6 +1611,36 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   engage each on merits: verify it, then fix or consciously accept with a
   stated reason. Merging past unread findings on a "skip review" is a trust
   breach, not obedience. (Origin: #1439 merged past 3 correct Codex P2s.)
+- **"Not blocking" describes the GATE, not the finding — and fixing is usually
+  FREE, so there is no tradeoff to weigh.** The subtler sibling of the rule
+  above: there, a waiver was granted; here the gate legitimately passes the
+  finding on its own rules, and the pass gets read as "handled".
+  MEASURED 2026-09-03 — two correct non-blocking findings merged UNFIXED because
+  nobody read them: #1620's P2 (an invalid `wing` raises `ValueError`, and
+  `tool_api.py:200-202` maps every exception to HTTP 500, so a caller input error
+  reads as a retryable server failure) and #1606's doc-path P1 above.
+  **Neither cost anything to fix.** A docs-only follow-up commit is
+  review-TRIVIAL: `classify_compare_substantiality` returns `inline` for doc
+  paths at ANY size, and `_classify_post_review_delta` tests the DELTA's files
+  rather than the PR's — so a CHANGELOG-only fix stays trivial even on a
+  hook-surface PR (verified: CHANGELOG-only → `inline`; a 1-line guard change →
+  `substantial`). So it costs zero CODEX rounds — but not zero blocks, and the
+  difference matters when you are budgeting the follow-up. On the canonical
+  public repo the SCHEDULED-review gate is head-pinned per kind, and only
+  `leaks` has ancestor relief (`_MECHANICAL_RESCAN_BY_KIND`); `code-review` has
+  none. So the push moves the head, the earlier `code-review` marker stops
+  counting, and that gate blocks until a fresh scheduled review lands at the new
+  head. Budget the follow-up as: one commit, no Codex round, one scheduled
+  `code-review` at the new head.
+  So: read every finding the report prints, fix the cheap ones, then merge.
+  The read is what the standing merge-when-green policy is buying — a gate
+  verdict of `ok` is not a report that there is nothing there.
+  And the inverse failure is as costly: do NOT escalate a cheap finding into a
+  mechanism change. The same session diagnosed its own inattention as a gate
+  defect and proposed weighting that would have taxed every PR — *"we'll never
+  get anything shipped if that's the standard"* (owner). Before proposing any
+  gate change, ask whether the mechanism is broken or you simply did not do the
+  work it assumed you would.
 
 ## The Gate Machinery — the sequence, and why it bites
 
@@ -2072,9 +2102,36 @@ The review-findings gate specifically:
 2. If review present with **blocking findings** → merge is **BLOCKED**
    by the hook (exit code 2). Fix the findings first.
 3. Inline findings are SCORED — P1 = 1.0, P2 = 0.5 — and the gate blocks at
-   score >= 1.0 (any P1, OR >= 2 P2s). A lone P2 is advisory (0.5, allowed); a
-   P2 is excluded from the score if a MAINTAINER reply engages it or it is on a
-   documentation path. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
+   score >= 1.0 (a P1 on a code path, OR >= 2 P2s). A lone P2 is advisory (0.5,
+   allowed). A finding is excluded from the score when a MAINTAINER reply engages
+   it, or when it is on a DOCUMENTATION path — and the doc-path exclusion covers
+   **P1s as well as P2s** (`_is_doc_path`: CHANGELOG/README/LICENSE/NOTICE, any
+   `*.rst`, and `*.md` under a top-level `docs/`). Codex is a CODE reviewer by
+   standing user directive (2026-08-10, PR #1362), and that exclusion is how the
+   directive is enforced — but it is an ALLOWLIST OF PATHS, not a judgement about
+   prose, so "its prose findings never block" is broader than the gate. Prose
+   OUTSIDE the list still blocks, and the near misses are the files this repo
+   edits constantly: `AGENTS.md`, `.claude/skills/**/SKILL.md`, `.claude/**/*.md`
+   and any `*.md` outside a top-level `docs/` all return False from
+   `_is_doc_path`, so a P1 anchored on one contributes its full 1.0. Read the
+   PATH, not the file type — the paragraph below exists because a broader claim
+   than the code cost a session, and this sentence was the same mistake one
+   clause over. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
+
+   **This paragraph used to say "any P1" blocks, which was FALSE, and the
+   divergence cost a whole session.** A P1 anchored on `CHANGELOG.md` merged
+   (#1606, 2026-09-03) with no override; a session read this text, saw the merge,
+   concluded the gate had a hole, and built a reversal of the owner's directive
+   before checking whether one existed. Docs describe intent, code describes
+   reality — and when they disagree, suspect the doc. Verify against
+   `git_push_guard.py` before concluding the gate misbehaved.
+
+   **A doc-path P1 is still usually a CODE finding.** A changelog is where a PR
+   states its own blast radius, so a P1 there typically means *"your stated blast
+   radius is wrong"* — the anchor is prose, the defect is not. #1606's was
+   anchored on the sentence "the quiet path is a hand-edited overlay", which was
+   false: the settings writer persisted `default: glm-5.2` alone, so settings-UI
+   users hit the quiet path too. Correctly non-blocking; still needed fixing.
 4. If no review comments at all (quota exhausted) → merge allowed
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
@@ -2098,7 +2155,10 @@ The review-findings gate specifically:
    weighted inline SCORE (P1=1.0, P2=0.5; block at >= 1.0), so a lone P2 is
    advisory but TWO unresolved P2s block — unread P2s no longer slip through in
    pairs (2026-07-10: 8 real P2s on the entity-layer PRs merged past the OLD
-   P1-only gate, the exact gap this score closes). And the two
+   P1-only gate, the exact gap this score closes). Note what it does NOT close,
+   and do not read it as more than it is: a LONE P2 still passes unread, which is
+   how #1620's HTTP-500 finding merged (2026-09-03). The score bounds what the
+   gate stops; only reading the report stops the rest. And the two
    channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
    ISSUE comment while a later `@codex review` trigger delivers real inline
    findings anyway — a quota message is evidence about that channel at that
