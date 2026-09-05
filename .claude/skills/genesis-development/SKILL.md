@@ -298,10 +298,13 @@ Three rules when a bound really is needed:
   is still forbidden.
   **When the total is not already known, say that instead of computing it.**
   Bounding a stream is the case: learning the exact discarded length means
-  reading the whole source, which is the cost the bound existed to avoid. So
-  `<omitted: ≥40,000 chars>` or `<omitted: rest of stream>` is the correct
-  marker there, and demanding an exact figure would force either an unbounded
-  read or an invented number — the two things this whole section is against.
+  reading the whole source, which is the cost the bound existed to avoid. State
+  the quantity you KNOW — the cap — and mark the tail unknown:
+  `<kept first 40,000 chars; rest of stream omitted>`. Do not write
+  `<omitted: ≥40,000 chars>`: under this rule's own grammar that number
+  describes the OMITTED content, and one character over the cap makes it a
+  fabricated tail length — an invented number wearing the honest marker's
+  clothes, which is the exact thing the marker exists to prevent.
 
 One trap deserves naming, because it is what produced this rule: **a cap can
 manufacture a correctness bug in the very data it was added to protect.**
@@ -346,8 +349,12 @@ feature working, not a leak.
 **Then ask WHO WROTE IT as well as where it is going — two independent axes,
 and each governs a different decision.** Destination governs DISCLOSURE: what
 may cross a trust boundary is decided by where it lands, whoever wrote it — a
-user-authored secret bound for an external channel still gets scanned and
-quarantined. Authorship is a RISK INPUT to sanitization, and the treatment
+user-authored secret bound for an external channel still gets scanned — and
+quarantined when a SUPPORTED pattern matches. Say that precisely, because the
+scanner is a high-confidence pattern gate by its own declaration, not a general
+secret filter: content carrying a secret outside its pattern set passes as
+safe, so nothing downstream may lean on that gate as proof of cleanliness
+(`security/output_scanner.py`; verified 2026-09-05). Authorship is a RISK INPUT to sanitization, and the treatment
 itself is chosen by the CONSUMING SINK: the same stranger-authored email
 fields are HTML-escaped and truncated where the sink renders raw HTML
 (`outreach/engagement.py` `_sanitize_ping_field`, whose docstring names both
