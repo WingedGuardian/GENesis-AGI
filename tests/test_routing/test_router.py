@@ -632,3 +632,90 @@ async def test_aggregate_deadline_stops_inner_retries(cost_tracker, degradation)
     # attempt0(0.0→0.1) attempt1(0.1→0.2) attempt2(0.2→0.3); attempt3 sees
     # 0.3 >= 0.25 and stops — 3 calls, NOT the full 6 (max_retries+1).
     assert len(delegate.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_entitlement_403_fails_fast_and_chain_reaches_a_working_provider(
+    sample_config, breakers, cost_tracker, degradation
+):
+    """ACCEPTANCE BAR — replay of the live outage this change exists for.
+
+    `free-1` returns the verbatim 403 body measured from Mistral on
+    2026-09-05. Before this change that message matched `_QUOTA_KEYWORDS`
+    ("subscription") and classified QUOTA_EXHAUSTED, which is NOT in the
+    router's fail-fast set — so the dead provider was retried with backoff,
+    spending the chain's aggregate `max_total_s` budget before the walk could
+    reach a provider that works.
+
+    The load-bearing assertion is the ATTEMPT COUNT against the dead provider:
+    exactly one. A chain that merely succeeds proves nothing, because the walk
+    reaches `free-2` either way when the budget happens to be generous.
+    """
+    live_403 = CallResult(
+        success=False,
+        status_code=403,
+        error=(
+            '{"object":"error","message":"This model is not available in your '
+            'subscription tier","type":"tier_not_allowed","code":"1910"}'
+        ),
+    )
+    delegate = MockDelegate(responses={"free-1": live_403})
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    dead_attempts = [c for c in delegate.calls if c["provider"] == "free-1"]
+    assert len(dead_attempts) == 1, (
+        f"entitlement 403 must not be retried against the same provider; "
+        f"got {len(dead_attempts)} attempts"
+    )
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    assert result.fallback_used is True
+    # The breaker recorded it (unlike RATE_LIMITED/BAD_REQUEST) and holds the
+    # long cap, so the next call skips the dead provider outright.
+    cb = breakers.get("free-1")
+    assert cb.last_failure_category == ErrorCategory.NOT_ENTITLED
+
+
+@pytest.mark.asyncio
+async def test_exhausted_quota_403_also_fails_fast(
+    sample_config, breakers, cost_tracker, degradation
+):
+    """The other member of the same class, found by review rather than by the alert.
+
+    A spent allowance is a BILLING state: it cannot clear inside a backoff
+    window, so retrying it is the same defect as retrying an entitlement
+    denial. It matters more than the single-provider case suggests, because
+    the limit is usually account-global — OpenRouter's "Key limit exceeded
+    (total limit)" applies to every openrouter entry in a chain at once, so a
+    single walk could pay the wait repeatedly.
+
+    MEASURED on this install 2026-09-05, before the fix: 4.1-6.8s average per
+    exposure across 22 rows (openrouter-deepseek-v4 / -flash / -nemo).
+    """
+    live_quota_403 = CallResult(
+        success=False,
+        status_code=403,
+        error=(
+            "litellm.APIError: APIError: OpenrouterException - "
+            '{"error":{"message":"Key limit exceeded (total limit)."}}'
+        ),
+    )
+    delegate = MockDelegate(responses={"free-1": live_quota_403})
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    assert len([c for c in delegate.calls if c["provider"] == "free-1"]) == 1
+    assert result.success is True
+    # Still classified QUOTA, not swept into the new category — the two keep
+    # distinct meanings on every surface that reports them; only the retry
+    # behaviour is now shared.
+    assert breakers.get("free-1").last_failure_category == ErrorCategory.QUOTA_EXHAUSTED

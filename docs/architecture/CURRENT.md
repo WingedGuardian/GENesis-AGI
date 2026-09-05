@@ -1649,21 +1649,37 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: b8232425 2026-09-02
+verified: df6605eda 2026-09-05
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
-  capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
-  failure; state persisted cross-process to
+  capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
+  NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
   a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
   HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
   opened by a real call failure (`_opened_by_call`) is closed only by a real
   `record_success`. A models-listing 200 evidences *reachable*, never *working* —
   it is what a 403-on-use, an exhausted quota or a truncated completion looks
-  like from outside. The probe heal deliberately does NOT fire `on_recovery`
+  like from outside. The 403-on-use half of that is now classified in its own
+  right: `NOT_ENTITLED` (`retry.py` `_ENTITLEMENT_MARKERS`, checked BEFORE
+  `_QUOTA_KEYWORDS` because an entitlement message names the plan/tier/
+  subscription it lacks and three of those words are quota keywords). It takes
+  one behaviour from each neighbour — fail-fast like PERMANENT, so a dead
+  provider cannot spend the chain's aggregate `max_total_s` before the walk
+  reaches a working one; the 4h cap like QUOTA_EXHAUSTED, since an entitlement
+  does not change in 30 minutes. Either neighbour alone gives up the other half.
+  The same review pass closed the CLASS: QUOTA_EXHAUSTED now fails fast too. The
+  old split was inverted — RATE_LIMITED, the one 4xx that genuinely might clear
+  inside a backoff, already failed fast, while a spent allowance (a billing
+  state, and usually account-global: one OpenRouter key limit covers all 13
+  openrouter chain entries) was retried. MEASURED 2026-09-05 before the fix:
+  ~11.9s avg per entitlement exposure (n=15), 4.1-6.8s per quota exposure
+  (n=22), against a 180-600s aggregate `max_total_s`. The two categories stay
+  DISTINCT on every reporting surface; only the retry behaviour is shared.
+  The probe heal deliberately does NOT fire `on_recovery`
   (which resolves the `provider_failure` observation and clears `first_trip_at`),
   so a listing can no longer erase an outage clock. This does not hold a provider
   out of rotation: OPEN auto-transitions to HALF_OPEN on backoff, HALF_OPEN is

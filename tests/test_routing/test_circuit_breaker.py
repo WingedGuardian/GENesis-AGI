@@ -6,7 +6,9 @@ import json
 import logging
 
 from genesis.routing.circuit_breaker import (
+    _LONG_OPEN_CATEGORIES,
     _MAX_OPEN_S,
+    _MAX_QUOTA_OPEN_S,
     CircuitBreaker,
     CircuitBreakerRegistry,
 )
@@ -1155,3 +1157,51 @@ def test_a_restart_keeps_the_failure_reason_for_a_half_open_row(tmp_path):
         "the failure reason was blanked on restart; the dashboard and the API-key "
         "snapshot lose why this provider is not closed"
     )
+
+
+# --- open-duration cap by failure category ---
+
+class TestOpenDurationCapByCategory:
+    """Which categories hold the breaker open on the LONG (4h) cap.
+
+    Previously untested. Partitioning the enum is NOT enough on its own —
+    see `test_every_member_has_an_explicit_cap_decision` for why, and for
+    the guard that actually catches an undecided new member.
+    """
+
+    def _tripped_cap(self, category: ErrorCategory) -> float:
+        # Trip well past the threshold so escalating backoff saturates and the
+        # cap — not the doubling — is what the duration reports.
+        cb = CircuitBreaker(_provider(), failure_threshold=1, open_duration_s=120)
+        for _ in range(12):
+            cb.record_failure(category)
+        return cb._effective_open_duration()
+
+    def test_every_member_has_an_explicit_cap_decision(self):
+        # The guard the other two tests CANNOT provide: they partition the enum
+        # into the long-cap set and "everything else", so a new member added to
+        # neither set lands in the short-cap branch and SATISFIES the assertion
+        # — the skip branch is the default branch. Only pinning the whole enum
+        # turns "nobody decided" into a failure.
+        assert {c.value for c in ErrorCategory} == {
+            "transient", "degraded", "permanent", "quota_exhausted",
+            "timeout", "rate_limited", "bad_request", "not_entitled",
+        }, "new ErrorCategory member — decide whether it belongs in _LONG_OPEN_CATEGORIES"
+
+    def test_long_cap_categories(self):
+        # Read from the production set, not a hardcoded pair, so the literal
+        # and the frozenset cannot drift apart.
+        for category in _LONG_OPEN_CATEGORIES:
+            assert self._tripped_cap(category) == _MAX_QUOTA_OPEN_S, category
+
+    def test_every_other_category_gets_the_short_cap(self):
+        for category in set(ErrorCategory) - _LONG_OPEN_CATEGORIES:
+            assert self._tripped_cap(category) == _MAX_OPEN_S, category
+
+    def test_entitlement_is_not_merely_permanent(self):
+        # The distinction that motivates the category: PERMANENT would have
+        # given an entitlement denial the 30-minute cap, re-probing a dead
+        # provider 8x more often than the fix does.
+        assert self._tripped_cap(ErrorCategory.NOT_ENTITLED) > self._tripped_cap(
+            ErrorCategory.PERMANENT
+        )

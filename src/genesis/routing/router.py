@@ -500,9 +500,23 @@ class Router:
             #    burning more of this provider's rate quota.
             #  - BAD_REQUEST: a 400/422 is deterministic (our payload) — the
             #    same provider with the same payload fails identically.
+            #  - NOT_ENTITLED: a 403 on account tier is deterministic — the
+            #    same credential and model fail identically on every retry.
+            #  - QUOTA_EXHAUSTED: an exhausted allowance is a BILLING state, not
+            #    a timing one. Unlike a 429 it cannot clear inside a backoff
+            #    window, and the limit is usually account-global rather than
+            #    per-model — one OpenRouter key limit covers every openrouter
+            #    entry in the chain — so retrying pays the same toll repeatedly
+            #    within a single walk. MEASURED 2026-09-05 on this install:
+            #    4.1-6.8s average per exposure (n=22) spent sleeping on a
+            #    provider whose answer could not change.
+            # Both were previously retried, which is the inversion this fixes:
+            # RATE_LIMITED — the one 4xx that genuinely might clear — already
+            # fails fast, while the two that certainly will not did not.
             if category in (
                 ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT,
                 ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+                ErrorCategory.NOT_ENTITLED, ErrorCategory.QUOTA_EXHAUSTED,
             ):
                 return result
 

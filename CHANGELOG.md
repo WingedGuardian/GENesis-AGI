@@ -9,6 +9,29 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **A model your account tier cannot use no longer stalls the fallback chain.**
+  When a provider refuses a call because the plan does not include that model,
+  the refusal arrives as an HTTP 403 whose message names the plan or subscription
+  you would need. Those are the same words a genuine "you have used up your
+  allowance" message uses, so the router read the refusal as an exhausted quota
+  and did what that calls for: waited, and tried the same provider again. Since
+  the answer can never change, that wait was spent against the chain's overall
+  time budget for nothing — measured at several seconds on each attempt.
+
+  Entitlement refusals are now recognised on their own terms. The router gives up
+  on that provider immediately and moves to the next one in the chain, and the
+  provider is held out of rotation on the long window rather than being re-tried
+  every half hour.
+
+  The same correction is applied to an exhausted allowance, which had the same
+  problem for the same reason: a spent quota is a billing state, so waiting a
+  few seconds cannot change it either, and the limit usually applies to the
+  whole account rather than one model — so a single walk could pay that wait
+  once per provider it tried. Both now behave the way a rate-limit already did,
+  which is to stop asking and move on.
+
 ### Changed
 
 - **A review comment on documentation no longer blocks a merge.** The pre-merge

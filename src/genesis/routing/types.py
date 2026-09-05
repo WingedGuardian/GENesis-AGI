@@ -33,6 +33,22 @@ class ErrorCategory(StrEnum):
     # and the breaker does NOT trip — it's our payload's fault, not the
     # provider's health, so tripping would wrongly take a healthy provider down.
     BAD_REQUEST = "bad_request"
+    # An entitlement 403: the credential authenticates fine, but THIS account
+    # tier may not use this model. Distinct from both neighbours on purpose,
+    # because it needs one behaviour from each and neither alone is right:
+    #   - like PERMANENT, it must fail FAST (no same-provider retry). MEASURED
+    #     2026-09-05: the retry stack cost ~11.9s avg / 19.2s max per exposure
+    #     (n=15) sleeping on a provider whose answer could not change, against
+    #     a 180-600s aggregate `max_total_s` — i.e. a few percent of the walk's
+    #     budget each time it is reached, not the whole of it.
+    #   - like QUOTA_EXHAUSTED, it must hold the breaker open on the LONG cap —
+    #     an entitlement does not change in 30 minutes, and re-probing on the
+    #     short cap costs a doomed attempt 8x more often.
+    # Classifying it as either one alone gives up the other half. MEASURED:
+    # `mistral-large-latest` returned this continuously from 2026-08-27 while
+    # its "not available in your subscription tier" message matched
+    # `_QUOTA_KEYWORDS` and bought it the retry-with-backoff path.
+    NOT_ENTITLED = "not_entitled"
 
 
 class DegradationLevel(StrEnum):

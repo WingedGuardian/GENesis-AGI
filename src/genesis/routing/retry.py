@@ -17,6 +17,40 @@ _QUOTA_KEYWORDS = frozenset({
     "quota", "exceeded", "billing", "limit", "exhausted",
     "usage", "credits", "subscription", "plan",
 })
+# A 403 that means "your tier may not use this model" — checked BEFORE
+# _QUOTA_KEYWORDS, because the two vocabularies overlap and quota would
+# otherwise win: an entitlement message naturally names the thing you do not
+# have ("subscription", "plan", "tier"), and three of those words are quota
+# keywords. Order is the whole fix; see ErrorCategory.NOT_ENTITLED for why the
+# distinction has to exist at all.
+#
+# Provenance, because these are matched against live vendor prose. The first
+# two are MEASURED verbatim from Mistral (2026-09-05, and the same shape in the
+# outage from 2026-08-27); zero false positives over 1,093 real error messages
+# in `activity_log` that day, with OpenRouter's genuine "Key limit exceeded"
+# quota 403 correctly NOT captured. The remaining four are INFERRED, and are of
+# two different kinds rather than one:
+#   - negation beside an access noun ("does not have access", "not authorized")
+#     — consumption language ("exceeded your usage") cannot reach these.
+#   - a vendor status TOKEN ("permission_denied"). Broader than entitlement
+#     proper: Google returns it at 403 for project-level states too (API not
+#     enabled, suspended consumer). Those want the same fail-fast and tolerate
+#     the same long cap, so the over-capture is acceptable — but it is
+#     over-capture, not a precise match, and is recorded as such.
+# KNOWN GAP, measured not assumed: the OpenAI-family phrasing that carries the
+# "access" wording ("The model X does not exist or you do not have access to
+# it") arrives as 404, which `litellm_delegate` maps to `status_code=404` and
+# `_PERMANENT_CODES` sends straight to PERMANENT — so those two markers are
+# UNCONFIRMED at 403 and may never fire here. Widening this branch to 404 on
+# inference alone was rejected; add a marker when a real one is measured.
+_ENTITLEMENT_MARKERS = (
+    "tier_not_allowed",
+    "not available in your",
+    "does not have access",
+    "do not have access",
+    "not authorized",
+    "permission_denied",
+)
 
 
 def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
@@ -25,7 +59,10 @@ def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
         if status_code in _QUOTA_CODES:
             return ErrorCategory.QUOTA_EXHAUSTED
         if status_code in _MAYBE_QUOTA_CODES:
-            if any(kw in error_msg.lower() for kw in _QUOTA_KEYWORDS):
+            msg_lower = error_msg.lower()
+            if any(m in msg_lower for m in _ENTITLEMENT_MARKERS):
+                return ErrorCategory.NOT_ENTITLED
+            if any(kw in msg_lower for kw in _QUOTA_KEYWORDS):
                 return ErrorCategory.QUOTA_EXHAUSTED
             return ErrorCategory.PERMANENT
         if status_code in _PERMANENT_CODES:
