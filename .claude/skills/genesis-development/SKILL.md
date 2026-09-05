@@ -2244,10 +2244,30 @@ Standard open-source workflow: PRs go directly to the public repo.
   is how coverage disappears.
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
+- **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`
+  fragment.** (The one exception is the release-fold PR, where the
+  `CHANGELOG.md` diff is produced by `scripts/assemble_changelog.py` and the
+  section rename rather than written by hand — see the release procedure in
+  `docs/reference/recovery-and-portability-workflow.md`.)
+  One file per change, named `<YYYYMMDDHHMMSS>-<category>-<slug>.md`
+  (timestamp from `date -u +%Y%m%d%H%M%S`; category is one of `added`,
+  `changed`, `deprecated`, `removed`, `fixed`, `security`). The file holds
+  the entry exactly as it should appear — a Markdown bullet, spliced in
+  verbatim. `scripts/assemble_changelog.py` folds them into `[Unreleased]`
+  at RELEASE time, not per PR.
+
+  This is not bookkeeping preference: two branches editing one shared
+  changelog insert at the same position, which git calls a conflict.
+  Measured 2026-09-04 — of 49 open PRs, 21 could not merge and **18 of
+  those conflicted on `CHANGELOG.md` and nothing else**. Two branches
+  writing two different filenames have nothing to merge. A merge driver
+  cannot substitute: GitHub ignores repository `.gitattributes`
+  server-side, measured against its own merge engine.
 - **CHANGELOG audience is users** — only include entries a user updating
   their install would care about. No internal refactors, README changes,
   CI tweaks, or process artifacts. Lead with the user-visible effect, not
-  the implementation technique.
+  the implementation technique. Same bar for a fragment: it becomes a
+  changelog entry verbatim.
 - **No sensitive data in commits** — voice data, research profiles, IPs,
   and secrets must never enter the repo. User data lives in overlays
   outside the repo (e.g., `~/.claude/skills/*/`, `~/.genesis/`).

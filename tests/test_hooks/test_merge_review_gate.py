@@ -2032,6 +2032,30 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
 
+    def test_inline_p1_on_a_changelog_fragment_does_not_block(self, guard_module):
+        # changelog.d/ holds one changelog entry per file — the same prose that
+        # would otherwise be a bullet in CHANGELOG.md. Covered by the general
+        # Markdown rule rather than by a rule of its own; pinned here because a
+        # PR carrying a fragment must never be blocked by a wording nit.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/20260904210000-fixed-thing.md")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_a_non_markdown_file_in_changelog_d_still_blocks(
+        self, guard_module
+    ):
+        # The allowlist is extension-based, so a script that lands in that
+        # directory is not prose and must not inherit the exemption.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/generate.py")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
     def test_inline_p1_on_code_path_still_blocks(self, guard_module):
         with self._mock(
             guard_module, [self._codex(1, _P1_BODY, path="src/genesis/foo.py")]
