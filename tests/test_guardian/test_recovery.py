@@ -12,7 +12,7 @@ from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 from genesis.guardian.health_signals import HealthSnapshot, PauseState, SignalResult
 from genesis.guardian.recovery import RecoveryEngine
 from genesis.guardian.snapshots import SnapshotManager
-from genesis.guardian.state_machine import ConfirmationStateMachine
+from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 
 
 @pytest.fixture
@@ -231,83 +231,41 @@ class TestRecoveryIOTriage:
         assert engine._sm.state.recovery_attempts == 1
 
 
-_SHA_A = "a" * 40
-_SHA_B = "b" * 40
-_SHA_OTHER = "c" * 40
-
-
 def _revert_mock(
-    *, head: tuple[int, str] = (0, _SHA_A), in_flight: str = "",
-    left_behind: str | None = None, stash: tuple[int, str] = (0, ""),
-    revert: tuple[int, str] = (0, ""), abort: tuple[int, str] = (0, ""),
-    calls: list[str] | None = None,
+    *, stash: tuple[int, str] = (0, ""),
+    calls: list[str] | None = None, kwargs_seen: list[dict] | None = None,
 ):
     """Mock `_run_subprocess` for the revert path, dispatching on the shell command.
 
-    ``head``        (rc, stdout) of the `git rev-parse HEAD` probe. stdout may
-                    carry a login-shell banner ahead of the sha.
-    ``in_flight``   REVERT_HEAD BEFORE we start ("" = no revert in progress).
-    ``left_behind`` REVERT_HEAD AFTER our revert ran; defaults to the sha we
-                    pinned when the revert failed, "" when it succeeded.
-    ``stash`` / ``revert`` / ``abort``  (rc, stderr) of those calls.
+    ``stash`` is the (rc, stderr) the `git stash` call returns; everything else
+    succeeds. ``kwargs_seen`` captures per-call kwargs so a test can assert the
+    timeout, which the dispatch itself ignores.
 
-    Dispatch order matters: REVERT_HEAD is matched before the bare `rev-parse
-    HEAD`, and `revert --abort` before the bare `git revert` — each pair shares
-    a substring.
+    The dispatch keys on ``args[-1]`` being the shell-command string. That holds
+    for every call reachable from `_revert_code` today, but NOT for
+    `_restart_container`, whose last arg is a number — so a future routing change
+    would need this revisited.
     """
-    state = {"revert_ran": False}
-
     async def mock(*args, **kwargs):
         cmd = args[-1]
         if calls is not None:
             calls.append(cmd)
-        if "REVERT_HEAD" in cmd:
-            if not state["revert_ran"]:
-                return (0, in_flight, "")
-            if left_behind is not None:
-                return (0, left_behind, "")
-            return (0, (head[1] if revert[0] != 0 else ""), "")
-        if "rev-parse HEAD" in cmd:
-            return (head[0], head[1], "")
+        if kwargs_seen is not None:
+            kwargs_seen.append({"cmd": cmd, **kwargs})
         if "git stash" in cmd:
             return (stash[0], "", stash[1])
-        if "revert --abort" in cmd:
-            return (abort[0], "", abort[1])
-        if "git revert" in cmd:
-            state["revert_ran"] = True
-            return (revert[0], "", revert[1])
         return (0, "", "")
     return mock
 
 
-class TestRecoveryRevertCode:
-
-    @pytest.mark.asyncio
-    async def test_revert_code(self, engine: RecoveryEngine) -> None:
-        with (
-            patch("genesis.guardian.recovery._run_subprocess", _revert_mock()),
-            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
-            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
-            patch("asyncio.sleep", new_callable=AsyncMock),
-        ):
-            result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
-        assert result.success is True
-        assert "reverted" in result.detail.lower()
-
-
-class TestRevertCodeGuards:
+class TestRevertCodeStashGuard:
     """REVERT_CODE runs `git stash` then `git revert` against the container's
-    LIVE dev checkout. Ways that destroyed work it should not touch:
+    LIVE development checkout — the tree sessions hold uncommitted work in.
 
-    1. The stash's exit code was DISCARDED, so a failed stash still reverted on
-       top of uncommitted work that was never saved.
-    2. HEAD was resolved implicitly by the revert itself, so a commit landing
-       during the stash round-trip redirected the revert onto a commit nothing
-       had inspected.
-    3. A failed revert left the tree mid-revert; `git stash` refuses an unmerged
-       index, so the new stash guard would then decline this rung forever.
-    4. Cleaning that up unconditionally would reset a revert ANOTHER session
-       started, destroying a conflict resolution our stash never captured.
+    The stash's exit code was DISCARDED (`rc, _, _ = ...`), so a FAILED stash
+    still went on to revert, on top of changes that were never saved. `git stash`
+    exits 0 with "No local changes to save" on a clean tree, so rc is the success
+    test — not whether anything was actually stashed.
     """
 
     @pytest.mark.asyncio
@@ -330,7 +288,8 @@ class TestRevertCodeGuards:
     async def test_stash_timeout_aborts_before_reverting(
         self, engine: RecoveryEngine,
     ) -> None:
-        # _run_subprocess returns (-1, "", "timeout") on timeout — rc != 0.
+        # _run_subprocess never raises: it returns (-1, "", "timeout") on timeout
+        # and (-1, "", str(exc)) on exec failure, so rc != 0 is the correct test.
         calls: list[str] = []
         with patch(
             "genesis.guardian.recovery._run_subprocess",
@@ -341,183 +300,108 @@ class TestRevertCodeGuards:
         assert not any("git revert" in c for c in calls)
 
     @pytest.mark.asyncio
-    async def test_reverts_the_pinned_sha_not_symbolic_head(
+    async def test_stash_runs_plain_with_a_budget_matching_its_siblings(
         self, engine: RecoveryEngine,
     ) -> None:
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(0, _SHA_B), calls=calls),
-        ):
-            ok, _ = await engine._revert_code("genesis")
-        assert ok is True
-        revert_cmds = [c for c in calls if "git revert" in c and "--abort" not in c]
-        assert len(revert_cmds) == 1
-        assert _SHA_B in revert_cmds[0], "the resolved sha must be what gets reverted"
-        assert "HEAD" not in revert_cmds[0], (
-            "reverting symbolic HEAD re-resolves it — a commit landing after the "
-            "probe would then revert something that was never vetted"
-        )
+        """Two unlocked constants the guard's behaviour depends on.
 
-    @pytest.mark.asyncio
-    async def test_login_shell_banner_does_not_disable_the_rung(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        # `su -` runs a LOGIN shell: its startup files write to the same stdout
-        # BEFORE the -c command runs, so a pipe inside that command cannot filter
-        # them — the banner was never its input. Parsing the last line in Python
-        # is what stops a supported shell config failing this rung closed on
-        # every attempt.
-        banner = "Found '.nvmrc' with version <22>\ndirenv: loading ~/.envrc\n"
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(0, banner + _SHA_B), calls=calls),
-        ):
-            ok, _ = await engine._revert_code("genesis")
-        assert ok is True, "a login-shell banner must not be read as a bad sha"
-        revert_cmds = [c for c in calls if "git revert" in c and "--abort" not in c]
-        assert _SHA_B in revert_cmds[0]
+        The COMMAND: `"git stash" in cmd` would equally match `git stash -u` or
+        `git stash push --keep-index`, which save different things — `-u` also
+        REMOVES untracked files from a running checkout. Assert what actually runs.
 
-    @pytest.mark.asyncio
-    async def test_probe_does_not_pipe_away_its_exit_status(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        # The mock cannot execute a shell, so assert on the command TEXT. A pipe
-        # makes the probe report the filter's status instead of git's, and
-        # `git rev-parse HEAD` exits 128 while printing the literal "HEAD".
-        calls: list[str] = []
-        with patch("genesis.guardian.recovery._run_subprocess", _revert_mock(calls=calls)):
+        The TIMEOUT: it decides how often this guard aborts the rung spuriously.
+        `su -` starts a login shell before git runs, in a container that is by
+        definition unhealthy, and a spurious abort now also burns one of
+        max_escalations. It must not be tighter than the revert it gates.
+        """
+        seen: list[dict] = []
+        with patch(
+            "genesis.guardian.recovery._run_subprocess", _revert_mock(kwargs_seen=seen),
+        ):
             await engine._revert_code("genesis")
-        probe = next(c for c in calls if "rev-parse HEAD" in c)
-        assert "|" not in probe, (
-            "piping the probe replaces git's exit status with the filter's; the "
-            "last-line parse belongs in Python, where rc stays meaningful"
+        stash = next(c for c in seen if "git stash" in c["cmd"])
+        revert = next(c for c in seen if "git revert" in c["cmd"])
+        assert stash["cmd"] == "cd ~/genesis && git stash", (
+            "plain stash only — `-u` would delete untracked files from a live checkout"
+        )
+        assert stash["timeout"] >= revert["timeout"], (
+            "the cheapest precondition must not have a tighter budget than the "
+            "destructive step it guards"
         )
 
     @pytest.mark.asyncio
-    async def test_nonzero_probe_rc_refuses_even_when_stdout_looks_valid(
+    async def test_timeout_is_reported_as_unknown_not_as_failure(
         self, engine: RecoveryEngine,
     ) -> None:
-        # Isolates the `rc != 0` half of the probe guard: a test that ALSO passed
-        # empty stdout would pass on the regex alone and leave this clause dead.
-        calls: list[str] = []
+        # _run_subprocess returns rc=-1/"timeout" when it does not KNOW whether
+        # the stash ran. Refusing is still right, but the alert must not assert a
+        # failure it cannot establish.
         with patch(
             "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(128, _SHA_A), calls=calls),
-        ):
-            ok, _ = await engine._revert_code("genesis")
-        assert ok is False
-        assert not any("git stash" in c for c in calls)
-
-    @pytest.mark.parametrize("contaminated", ["$(id)", "`id`", _SHA_A + "; echo INJECTED", "HEAD", "", "a" * 7, "a" * 39, "a" * 41])
-    @pytest.mark.asyncio
-    async def test_refuses_any_head_value_that_is_not_a_bare_sha(
-        self, engine: RecoveryEngine, contaminated: str,
-    ) -> None:
-        # The sha is interpolated into a shell command inside the container, so
-        # the shape check is a boundary, not a formality. The length cases pin
-        # the exact-40 requirement: an abbreviated sha is still hex.
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(0, contaminated), calls=calls),
-        ):
-            ok, _ = await engine._revert_code("genesis")
-        assert ok is False
-        assert not any("git revert" in c for c in calls)
-
-    @pytest.mark.asyncio
-    async def test_refuses_when_another_revert_is_already_in_progress(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(in_flight=_SHA_OTHER, calls=calls),
+            _revert_mock(stash=(-1, "timeout")),
         ):
             ok, detail = await engine._revert_code("genesis")
         assert ok is False
-        assert "already in progress" in detail.lower()
-        assert not any("git stash" in c for c in calls), (
-            "refuse BEFORE stashing — our own revert would fail against another "
-            "session's sequencer state, and cleanup would then abort THEIRS"
-        )
+        assert "unknown" in detail.lower()
 
     @pytest.mark.asyncio
-    async def test_failed_revert_aborts_only_our_own(
+    async def test_failed_stash_surfaces_through_execute_as_a_critical_alert(
         self, engine: RecoveryEngine,
     ) -> None:
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(revert=(1, "conflict"), calls=calls),
+        """The guard makes a NEW False path reachable from execute(). Its blast
+        radius — the attempt is recorded, the machine goes confirmed-dead, and
+        the operator gets the reason — is what the direct-call tests cannot see."""
+        with (
+            patch(
+                "genesis.guardian.recovery._run_subprocess",
+                _revert_mock(stash=(1, "fatal: unable to write new index file")),
+            ),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("asyncio.sleep", new_callable=AsyncMock),
         ):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is False
-        assert "revert failed" in detail.lower()
-        assert any("revert --abort" in c for c in calls), (
-            "our own failed revert must be aborted, or the conflicted tree "
-            "disables this rung permanently"
-        )
+            result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
+        assert result.success is False
+        assert "stash" in result.detail.lower()
+        assert engine._sm.state.current_state is GuardianState.CONFIRMED_DEAD
+        assert engine._sm.state.recovery_attempts == 1
 
     @pytest.mark.asyncio
-    async def test_does_not_abort_a_revert_this_did_not_start(
+    async def test_success_detail_says_where_the_displaced_work_went(
         self, engine: RecoveryEngine,
     ) -> None:
-        # Race window: another session began a revert between our pre-check and
-        # our own revert. Aborting it would reset their state and destroy a
-        # staged conflict resolution our stash never captured.
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(revert=(1, "conflict"), left_behind=_SHA_OTHER, calls=calls),
-        ):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is False
-        assert not any("revert --abort" in c for c in calls)
-        assert "did not start" in detail.lower()
-
-    @pytest.mark.asyncio
-    async def test_no_abort_when_the_failed_revert_left_nothing_behind(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(revert=(1, "bad object"), left_behind="", calls=calls),
-        ):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is False
-        assert not any("revert --abort" in c for c in calls)
-        assert "revert failed" in detail.lower()
-
-    @pytest.mark.asyncio
-    async def test_abort_failure_is_surfaced_in_the_result_not_only_logged(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        # The recovery ALERT is built from this string. If cleanup failed, the
-        # checkout is left with an unmerged index that makes every later stash
-        # fail — reporting only the original revert error hides that.
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(revert=(1, "conflict"), abort=(1, "no revert in progress")),
-        ):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is False
-        assert "revert failed" in detail.lower(), "the original cause must survive"
-        assert "manual repair" in detail.lower(), "the poisoned checkout must be named"
-
-    @pytest.mark.asyncio
-    async def test_success_detail_says_where_uncommitted_work_went(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        # The stash is never popped, so the outcome string is the only place the
-        # recovery alert can tell the owner their work is recoverable.
+        # The stash is never popped and the next rung (SNAPSHOT_ROLLBACK) would
+        # destroy it, so this string is the owner's only notice.
         with patch("genesis.guardian.recovery._run_subprocess", _revert_mock()):
             ok, detail = await engine._revert_code("genesis")
         assert ok is True
         assert "stash" in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_clean_tree_still_reverts(self, engine: RecoveryEngine) -> None:
+        # "No local changes to save" exits 0 — a clean tree is not a failure, and
+        # the rung must still do its job.
+        calls: list[str] = []
+        with patch(
+            "genesis.guardian.recovery._run_subprocess", _revert_mock(calls=calls),
+        ):
+            ok, _ = await engine._revert_code("genesis")
+        assert ok is True
+        assert any("git revert" in c for c in calls)
+
+
+class TestRecoveryRevertCode:
+
+    @pytest.mark.asyncio
+    async def test_revert_code(self, engine: RecoveryEngine) -> None:
+        with (
+            patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(0, "")),
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
+        assert result.success is True
+        assert "reverted" in result.detail.lower()
 
 
 class TestRestartContainerStopped:
