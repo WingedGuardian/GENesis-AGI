@@ -317,10 +317,14 @@ explicitly" rule says, and keep only non-sensitive metadata. Losing diagnostic
 prose is recoverable; leaking a token is not. The scope qualifier is
 load-bearing and an earlier revision dropped it while restructuring — read
 unconditionally, "omit wholesale" would delete values existing features exist
-to hold: the References store deliberately RETAINS credentials and exposes
-plaintext only through its explicit reveal flow
-(`dashboard/routes/references.py`; verified 2026-09-04). An authorized, gated
-store holding a secret is the feature working, not a leak.
+to hold: the References store deliberately RETAINS credentials, and its own
+dashboard tab masks the value behind an explicit reveal
+(`dashboard/routes/references.py`; verified 2026-09-04). That is a statement
+about ONE surface, not a security guarantee — other readers of the same store
+return raw bodies (`reference_lookup`, the knowledge routes), which is worth
+knowing precisely because a rule reader might otherwise lean on the reveal
+gate as if it covered them. An authorized, gated store holding a secret is the
+feature working, not a leak.
 
 **Then ask WHO WROTE IT as well as where it is going — two independent axes,
 and each governs a different decision.** Destination governs DISCLOSURE: what
@@ -330,10 +334,16 @@ quarantined. Authorship is a RISK INPUT to sanitization, and the treatment
 itself is chosen by the CONSUMING SINK: the same stranger-authored email
 fields are HTML-escaped and truncated where the sink renders raw HTML
 (`outreach/engagement.py` `_sanitize_ping_field`, whose docstring names both
-the threat and the destination; verified 2026-09-04) and stored CANONICAL —
-unescaped, unbounded — where the sink is a parameterised database column
-(`db/crud/email_threads.py` `record_reply`; verified 2026-09-04). Escaping at
-ingestion would corrupt the canonical copy; passing raw markup to a live
+the threat and the destination; verified 2026-09-04) and stored UNESCAPED
+where the sink is a parameterised database column (`db/crud/email_threads.py`
+`record_reply`; verified 2026-09-04). Unescaped is not unbounded, and an
+earlier draft conflated them: what reaches that column is `body_preview`,
+already cut to 500 characters upstream (`mail/reply_poller.py`,
+`parsed.body[:500]`) — a silent mid-value cut of exactly the kind this section
+exists to surface, sitting inside the example chosen to demonstrate the
+opposite. The escaping point stands; the "canonical, unbounded" flourish did
+not survive following its own pointer. Escaping at
+ingestion would corrupt the stored copy; passing raw markup to a live
 renderer hands a stranger the user's most trusted channel. Maximally
 authorized destination, maximally defensive treatment AT THE RENDERER — any
 rule that reads "it's going somewhere trusted, so pass it whole" deletes that
@@ -346,8 +356,10 @@ to stop scrubbing on owner-facing surfaces, and this repo does not (each
 verified 2026-09-04): it rewrites username-bearing paths out of what the owner's
 own dashboard renders (`dashboard/routes/backup.py` `_scrub_reason`), gates
 credential values behind an explicit reveal rather than showing them (the
-References tab), scrubs the draft the user reviews so the copy they approve is
-already clean (`content/egress.py` `should_gate`, `category == "content"`), and
+References tab — that one surface, per the caveat above), applies the safe
+mechanical rewrite to the draft the user reviews (`content/egress.py`
+`should_gate`, `category == "content"` — non-fixable tells are FLAGGED, not
+removed, so the copy they approve has been treated, not certified clean), and
 in at least one subsystem deliberately keeps captured text out of its own
 private store entirely (`attention/types.py`: "never stored";
 `db/crud/attention.py`: "value-free … NO text"). "Into a private store" is
