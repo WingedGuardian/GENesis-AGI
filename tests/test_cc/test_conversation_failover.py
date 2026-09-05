@@ -787,3 +787,32 @@ async def test_a_genuine_refusal_after_streaming_still_blocks(
     assert st is not None and st.available is False, (
         "a genuine refusal after streaming was laundered into availability"
     )
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_streaming_is_not_evidence_of_service(
+    loop, invoker, monkeypatch,
+):
+    """A whitespace-only text block is truthy but shows the user nothing. It set
+    streamed["text"], and that flag is EVIDENCE — it records the peer as having
+    served and clears stale blocks — so a silent-cap attempt emitting one blank
+    could erase a genuine quota block."""
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("429 earlier"))
+
+    async def _blank_stream(inv, on_event=None):
+        calls = getattr(_blank_stream, "n", 0)
+        _blank_stream.n = calls + 1
+        if calls == 0:
+            raise CCRateLimitError("limit")  # home
+        if on_event:
+            await on_event(StreamEvent(event_type="text", text="   \n  "))
+        return _output(text="   ", session_id="glm-9")
+
+    invoker.run_streaming = AsyncMock(side_effect=_blank_stream)
+    await loop.handle_message_streaming(
+        "hi", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    st = peer_availability.read_peer("glm-5.2")
+    assert st is not None and st.available is False, (
+        "a whitespace-only attempt cleared a genuine quota block"
+    )

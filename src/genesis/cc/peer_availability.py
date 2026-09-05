@@ -552,7 +552,19 @@ def _mentions_mcp(exc: BaseException) -> bool:
     adding this never turns a previously-recorded refusal into a raise.
     """
     try:
-        return "mcp" in str(exc).lower()
+        parts = [str(exc)]
+        # The classifier MATCHES on the combined stderr+stdout but CONSTRUCTS
+        # the typed exception from stderr alone, keeping the combined text in
+        # raw_text (and the stream event in raw_event). So an MCP marker on
+        # stdout with the limit text on stderr is invisible to str(exc) — the
+        # split-stream case. Inspect everything the classifier saw.
+        raw_text = getattr(exc, "raw_text", None)
+        if isinstance(raw_text, str):
+            parts.append(raw_text)
+        raw_event = getattr(exc, "raw_event", None)
+        if raw_event is not None:
+            parts.append(str(raw_event))
+        return any("mcp" in part.lower() for part in parts)
     except Exception:
         return False
 
@@ -686,6 +698,16 @@ _LOCK_SLEEP_S = 0.025
 #: contention must fail CLOSED (see below), a missing implementation may not.
 _LOCK_CONTENDED = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK})
 
+#: Errnos that mean flock genuinely DOES NOT EXIST on this filesystem — the only
+#: case where writing unserialized is safe, because there is no lock anyone else
+#: could be holding. Everything outside this set and _LOCK_CONTENDED (EINTR
+#: excepted — that is retried) is a TRANSIENT or unknown failure: ENOLCK, EIO, …
+#: — where another process may hold the lock right now, so an unserialized write
+#: could clobber its freshly written map. Those fail CLOSED.
+_LOCK_UNSUPPORTED = frozenset(
+    {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS}
+)
+
 
 @contextlib.contextmanager
 def _record_lock():
@@ -747,13 +769,30 @@ def _acquire_record_lock():
                 acquired = True
                 break
             except OSError as exc:
-                if exc.errno not in _LOCK_CONTENDED:
-                    # Not contention — flock is unavailable here. Degrade open.
+                if exc.errno == errno.EINTR:
+                    continue  # interrupted, not answered — ask again
+                if exc.errno in _LOCK_UNSUPPORTED:
+                    # flock does not exist HERE, so no one can hold it: writing
+                    # unserialized is safe and refusing would disable recording
+                    # on that platform entirely. Degrade open.
                     logger.debug("flock unsupported — proceeding unserialized", exc_info=True)
                     with contextlib.suppress(Exception):
                         fh.close()
                     fh = None
                     break
+                if exc.errno not in _LOCK_CONTENDED:
+                    # Transient/unknown (ENOLCK, EIO, …): flock EXISTS but this
+                    # attempt failed, so another process may hold it right now —
+                    # an unserialized write here can clobber a holder's freshly
+                    # written map, the measured data-loss shape. Fail CLOSED.
+                    logger.warning(
+                        "peer availability lock errno %s — not recording this "
+                        "observation rather than risking an unserialized write",
+                        exc.errno,
+                    )
+                    with contextlib.suppress(Exception):
+                        fh.close()
+                    return None, False, False
                 if attempt == _LOCK_ATTEMPTS - 1:
                     logger.warning(
                         "peer availability lock held for %.1fs — not recording this "
@@ -766,12 +805,19 @@ def _acquire_record_lock():
                     return None, False, False
                 time.sleep(_LOCK_SLEEP_S)
     except Exception:
-        # Could not even open the lock file. Same reasoning as "no flock".
-        logger.debug("peer availability lock unavailable — proceeding unserialized", exc_info=True)
+        # Could not even OPEN the lock file (permissions, read-only fs, EIO).
+        # This is NOT the "no flock" case: the lock may exist and be held by a
+        # process that could open it, so an unserialized write can clobber a
+        # holder. Fail CLOSED — losing this observation beats destroying one.
+        logger.warning(
+            "peer availability lock file unavailable — not recording this "
+            "observation rather than risking an unserialized write",
+            exc_info=True,
+        )
         if fh is not None:
             with contextlib.suppress(Exception):
                 fh.close()
-            fh = None
+        return None, False, False
     return fh, acquired, True
 
 

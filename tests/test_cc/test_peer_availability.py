@@ -1196,3 +1196,70 @@ def test_fdopen_failure_does_not_leak_the_descriptor(monkeypatch):
         assert PA.note_success("peer-x") is False
     after = len(_os.listdir("/proc/self/fd"))
     assert after - before < 5, f"leaked ~{after - before} descriptors over 25 writes"
+
+
+def test_mcp_evidence_is_seen_even_when_split_across_streams():
+    """The classifier MATCHES on combined stderr+stdout but constructs the typed
+    exception from stderr alone, keeping the combined text in raw_text. So an
+    MCP marker on stdout with the limit text on stderr was invisible to a
+    predicate reading str(exc) — and the peer was wrongly marked quota-blocked.
+    Built through the REAL classifier (supply, not just the predicate)."""
+    from genesis.cc.invoker import CCInvoker
+
+    exc = CCInvoker._classify_error(
+        "API error: 429 rate limit",                       # stderr → str(exc)
+        "MCP server 'web-search' request log",             # stdout → raw_text only
+    )
+    assert "mcp" not in str(exc).lower(), "premise: the marker is NOT in str(exc)"
+    assert PA.is_provider_refusal(exc) is False, (
+        "split-stream MCP evidence was missed and the peer blamed"
+    )
+
+
+def test_transient_lock_errors_fail_closed_not_open(tmp_path, monkeypatch):
+    """EINTR is retried; a genuinely-unsupported flock degrades open; everything
+    else (ENOLCK, EIO, …) fails CLOSED — flock EXISTS there, so another process
+    may hold it and an unserialized write can clobber its freshly written map,
+    which is the measured data-loss shape this lock was built against."""
+    import errno as _errno
+
+    calls = {"n": 0}
+    real_flock = PA.fcntl.flock
+
+    def _eintr_then_ok(fd, op):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(_errno.EINTR, "interrupted")
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(PA.fcntl, "flock", _eintr_then_ok)
+    assert PA.note_success("peer-x") is True, "EINTR must be retried, not fatal"
+
+    def _enolck(fd, op):
+        raise OSError(_errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(PA.fcntl, "flock", _enolck)
+    assert PA.note_success("peer-y") is False, "ENOLCK must fail closed"
+    assert PA.read_peer("peer-y") is None, "a closed failure must not have written"
+
+    def _enotsup(fd, op):
+        raise OSError(_errno.ENOTSUP, "not supported")
+
+    monkeypatch.setattr(PA.fcntl, "flock", _enotsup)
+    assert PA.note_success("peer-z") is True, "unsupported flock degrades open"
+    assert PA.read_peer("peer-z") is not None
+
+
+def test_an_unopenable_lock_file_fails_closed(tmp_path, monkeypatch):
+    """Failing to OPEN the lock file is not proof no lock exists — another
+    process with permissions may hold it right now. The old branch degraded
+    open and could clobber that holder's map."""
+    real_open = PA.Path.open
+
+    def _fail_lock_open(self, *a, **k):
+        if self.name == PA._LOCK_FILE:
+            raise PermissionError("lock file unreadable")
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(PA.Path, "open", _fail_lock_open)
+    assert PA.note_success("peer-x") is False

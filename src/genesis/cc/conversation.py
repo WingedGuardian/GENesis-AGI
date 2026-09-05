@@ -677,7 +677,12 @@ class ConversationLoop:
             streamed = {"text": False, "tools": False}
 
             async def _failover_tracked(ev: StreamEvent) -> None:
-                if ev.event_type == "text" and ev.text:
+                # strip(): this flag is EVIDENCE — it gates the double-output
+                # guard and, in the failover loop, records the peer as having
+                # SERVED and clears stale blocks. A whitespace-only text block
+                # is truthy but shows the user nothing, so counting it let a
+                # silent-cap attempt erase a genuine quota block.
+                if ev.event_type == "text" and ev.text and ev.text.strip():
                     streamed["text"] = True
                 if on_event:
                     await on_event(ev)
