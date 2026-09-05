@@ -79,7 +79,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   failed print under `failed:`, providers passed over before any call print
   under `skipped:` with the reason (no API key, breaker open, budget exceeded),
   because a never-called provider labelled "failed" reads as an outage where
-  there may be none.
+  there may be none. One-time cost of reshaping the message: the Errors
+  dashboard keys manual resolutions on the message prefix, so an exhaustion
+  group resolved before this change reappears once under its new key — resolve
+  it again and it stays resolved.
 - **The temp-space watchdog no longer severs cross-session messaging when it
   goes nuclear.** At its most aggressive cleanup tier the watchdog deleted every
   top-level directory of Claude Code's working temp — including the directory
