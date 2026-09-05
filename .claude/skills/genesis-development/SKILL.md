@@ -203,23 +203,34 @@ excuse a cut; a self-imposed storage assumption is a decision to justify, not a
 budget to obey. So is refusing an oversized value outright.
 
 **And a SAFETY cap may be lossy — that is the one place cutting the only copy is
-right.** An unbounded stream has no other copy by definition, and reading it to
-the end to avoid "truncating" is how a runaway command exhausts memory; this repo
-bounds subprocess output at a few MiB for exactly that reason
-(`autonomy/executor/deterministic.py` `_read_limited`, whose own comment names
-the `yes`-command threat; verified 2026-09-04). Losing the tail of
-a log beats losing the process. The obligation there is not to keep the bytes, it
-is to be LOUD about the cut — say the output was bounded and roughly by how much,
-so nobody reads a clipped log as a complete one. A silent lossy cap is still the
-defect; a declared one is a resource guard doing its job. This section is about
-the remaining case.
+right.** Streaming is a TRANSPORT property and only-copy is a DURABILITY one;
+check them separately, because a chunked read is often backed by a retained
+source you could go back to. The case that earns the lossy cap is the source
+that genuinely has no retained copy — a live subprocess pipe — where reading to
+the end to avoid "truncating" is how a runaway command exhausts memory; this
+repo bounds exactly that at a few MiB (`autonomy/executor/deterministic.py`
+`_read_limited`, whose own comment names the `yes`-command threat; verified
+2026-09-04). Losing the tail of a log beats losing the process. The obligation
+there is not to keep the bytes, it is to be LOUD about the cut — say the output
+was bounded and roughly by how much, so nobody reads a clipped log as a
+complete one. That cited cap does NOT yet meet this bar: `_read_limited`
+returns only the retained bytes with no truncation flag, and its caller reports
+the retained length as the total — a 3 MiB stream reads as "2097152 bytes
+total". The cap is right; its silence is the improvable half, cited here as a
+counterexample to "never cut", not as a model of declaring. A silent lossy cap
+is still the defect; a declared one is a resource guard doing its job. This
+section is about the remaining case.
 
 **A handle that does not resolve is a separate defect, and do not conflate the
 two** — that conflation is the mistake this section made about itself, twice.
 Check the pointer, because a preview advertising a retrieval path that does not
 exist teaches a lie; but when the full value survives somewhere, the fix is to
-mend or drop the handle, never to remove the cap. Removing a cap to prevent a
-loss that never happened is how this rule causes the damage it exists to stop.
+mend or drop the handle — removing the cap TO PREVENT DATA LOSS is fixing a
+loss that never happened, and that misdiagnosis is how this rule causes the
+damage it exists to stop. Whether the cap should exist at all is the separate
+question the "what breaks if it is unbounded" test answers: a cap with no
+external, safety, or measured compatibility justification may be removed once
+that is established — for being unjustified, never for being an amputation.
 
 **There, do not truncate.** Not strings, not lists, not context, not output.
 Reaching for a character cap is a signal that a question was skipped, not
@@ -273,8 +284,9 @@ Three rules when a bound really is needed:
   an unbounded stream, a preview rendered next to the full record, a display
   string trimmed before escaping so the cut cannot land mid-entity. Each of
   those is a cut the loss rules PERMIT (a safety cap, a pointer-backed
-  selection, third-party display text), and each is declared or bounded where
-  it is read. The order matters: first the loss rules decide whether a cut may
+  selection, third-party display text) — which does not certify how each is
+  reported today: the safety cap above still cuts silently, and PERMITTED is
+  not DECLARED. The order matters: first the loss rules decide whether a cut may
   happen at all — announcing a sliced KEY does not un-merge the two identities
   it collapsed — and only then does declaration decide whether the permitted
   cut is honest. A silent permitted cut is still a defect; a loud forbidden cut
