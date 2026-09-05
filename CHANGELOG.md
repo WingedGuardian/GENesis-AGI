@@ -69,6 +69,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **An update that leaves part of the system broken now says so.** After every
+  update Genesis checked which subsystems had come up — except it asked the health
+  endpoint for a list that endpoint has never returned, so the answer was always
+  "nothing wrong" and the check had never once reported anything on any install.
+  It now reads the record the server writes when it finishes starting. The three
+  subsystems the server cannot run without were already covered, because it refuses
+  to report itself healthy without them and the update then rolls back on its own;
+  what was invisible was any of the *other* thirty-odd failing while the update
+  reported a clean success. Those are now named in the update history and in the
+  update's own output. They are recorded rather than treated as a failure: one
+  optional subsystem not starting is not a reason to undo an otherwise good update,
+  and an absent optional dependency is a normal state on many installs.
+
 - **The pre-merge check now reads the second review bot it was already fetching.**
   Two automated reviewers comment on every pull request, and the gate that decides
   whether a change is ready to merge only understood the format of one of them. The

@@ -1775,6 +1775,16 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     # Reload systemd in case templates changed during bootstrap
     systemctl --user daemon-reload 2>/dev/null || true
 
+    # Freshness anchor for the post-restart subsystem check below. Deliberately
+    # NOT $STARTED_AT: that is stamped at the top of the script, and a deploy runs
+    # for many minutes before reaching here, so it would accept a bootstrap
+    # manifest written at any point in that window. GenesisRuntime.bootstrap()
+    # writes that file, and the server is not its only caller — the bridge and the
+    # interactive terminal (cc/terminal.py, which takes bootstrap()'s default
+    # mode="full") write it too. Anchoring on the restart narrows the window to
+    # the seconds that actually belong to the process now serving health.
+    RESTART_AT="$(date -Iseconds)"
+
     for svc in "${WERE_RUNNING[@]}"; do
         if [ "$svc" = "genesis-server" ]; then
             if ! _start_genesis_server; then
@@ -1808,21 +1818,80 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     done
 
     if [ "$HEALTH_OK" = "true" ]; then
-        # Check for failed subsystems
-        DEGRADED=$(curl -sf --max-time 20 http://localhost:5000/api/genesis/health 2>/dev/null | \
-            "$VENV_DIR/bin/python" -c "
-import sys, json
+        # Which subsystems actually came up? The health ENDPOINT cannot answer
+        # that: its response carries no per-subsystem mapping. This check used to
+        # parse a `subsystems` key off it that has never existed, so DEGRADED was
+        # always empty and the branch below it had never fired on any install —
+        # a silent fail-open in a deploy gate.
+        #
+        # The bootstrap manifest is the authoritative record, written as the last
+        # statement of GenesisRuntime.bootstrap(). Statuses are exactly
+        # "ok" | "degraded" | "failed: <exc>" (runtime/_core.py _run_init_step).
+        # Only "failed:" counts: "degraded" means an optional dependency is
+        # absent, which is a NORMAL steady state on installs without Ollama or a
+        # given API key, and counting it would cry wolf on exactly the installs
+        # least able to act on it.
+        #
+        # ADVISORY, deliberately — it records, it does not revert. A CRITICAL
+        # subsystem (db/observability/router) already fails the health wait
+        # above: the runtime refuses to report bootstrapped without all three,
+        # and the health route 503s while not bootstrapped. So what reaches here
+        # is the non-critical remainder, where reverting an otherwise-good deploy
+        # over one subsystem is the wrong trade. Surfaced the same way as
+        # HOST_CC_DEGRADED below, via the degraded_subsystems column.
+        #
+        # python3, not "$VENV_DIR/bin/python": this needs stdlib only, and the
+        # venv may be mid-reinstall at this point in a deploy.
+        # Every read below fails CLOSED — an absent, undated, empty or unusable
+        # value reports `check:*` (unknown), never an empty string. Empty means
+        # "checked, nothing wrong", and handing that back for a check that did not
+        # happen is precisely the defect being fixed here: the old code trusted a
+        # key that was not there and therefore always said "clean". The new source
+        # gets no more benefit of the doubt than the old one earned.
+        if ! DEGRADED=$(RESTART_AT="$RESTART_AT" python3 -c '
+import json, os, sys
+from datetime import datetime
+
+def _dt(value):
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
 try:
-    d = json.load(sys.stdin)
-    failed = [k for k,v in d.get('subsystems',{}).items() if v.get('status') == 'failed']
-    print(' '.join(failed))
-except Exception:
-    pass
-" 2>/dev/null || true)
+    with open(os.path.expanduser("~/.genesis/bootstrap_manifest.json")) as fh:
+        doc = json.load(fh)
+    anchor = os.environ.get("RESTART_AT", "")
+    # Checked on its own line, NOT folded into the comparison below as
+    # `anchor and ...`: a falsy anchor in that form deletes the freshness gate
+    # instead of failing it, which is the same shape of silent pass this whole
+    # change exists to remove.
+    if not anchor:
+        print("check:no-restart-anchor")
+        sys.exit(0)
+    persisted = doc.get("persisted_at")
+    if not persisted:
+        print("check:manifest-undated")
+        sys.exit(0)
+    if _dt(persisted) < _dt(anchor):
+        print("check:manifest-stale")
+        sys.exit(0)
+    manifest = doc.get("manifest")
+    if not isinstance(manifest, dict) or not manifest:
+        print("check:manifest-empty")
+        sys.exit(0)
+    # Less permissive than a "failed:" prefix test, and deliberately matching
+    # runtime/_capabilities.py, which treats anything that is not ok/degraded as
+    # failed. A gate must be the stricter of two readers of the same data, so a
+    # status value added later cannot quietly pass it.
+    print(",".join(sorted(k for k, v in manifest.items() if str(v) not in ("ok", "degraded"))))
+except Exception as exc:
+    # Name the cause: this token is the only artefact the check leaves behind, and
+    # a bare "unreadable" makes the one signal it exists to emit undiagnosable.
+    print("check:manifest-unreadable(" + type(exc).__name__ + ")")
+'); then
+            # The interpreter itself failed (absent python3, OOM). Unknown, not clean.
+            DEGRADED="check:manifest-interpreter-failed"
+        fi
         if [ -n "$DEGRADED" ]; then
-            echo "  Degraded subsystems: $DEGRADED"
-            _do_rollback "subsystems failed after update: $DEGRADED" "$DEGRADED"
-            exit 1
+            echo "  NOTE: recording degraded subsystems after update: $DEGRADED"
         fi
     fi
 
@@ -1933,6 +2002,12 @@ _p6_degraded="$HOST_CC_DEGRADED"
 if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
     echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
     _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
+fi
+# Subsystems that failed to initialise (or an unreadable/stale manifest). Advisory
+# by design — see the health-verification block — but it must reach the record,
+# or "surfaced, not silent" is only true of the console output of one run.
+if [ -n "${DEGRADED:-}" ]; then
+    _p6_degraded="${_p6_degraded:+$_p6_degraded,}$DEGRADED"
 fi
 _record_update_history "success" "" "$_p6_degraded"
 
