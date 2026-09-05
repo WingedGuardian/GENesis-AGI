@@ -139,17 +139,37 @@ def _audit_line(
     )
 
 
+def _audit_line_minimal(part: str, where: str) -> str:
+    """The counters-dropped fallback for :func:`_audit_line`'s cut form.
+
+    Emitted by ``emit_final`` only when the full cut line will not fit its
+    reserve. It keeps the two load-bearing parts — the part id and the mirror
+    pointer (``where``) — and drops the unbounded counters, which is the
+    'select, don't amputate' answer to a line that must shrink: omit the
+    volatile field explicitly rather than let a right-clip eat the pointer.
+    The widened reserve below makes this path unreachable for any real part;
+    it is the STRUCTURAL guarantee behind that arithmetic, not a substitute.
+    """
+    return f"\n_[ctx {part}: audit counts omitted for size{where}]_"
+
+
 # Room reserved for the trailing `_[ctx <part>: …]_` self-audit line — DERIVED
 # from the renderer above at its realistic worst case, not a round number.
 # Pinned by test_the_audit_reserve_fits_the_line_it_reserves_for, which rebuilds
 # this same worst case, so the two cannot drift.
+# 12-digit worst-case counters (999_999_999_999 ≈ 1 TB): `intended`/`dropped`
+# are unbounded, and the earlier 5-digit 99_999 under-reserved for any part that
+# renders a 6+-digit count — a right-clip would then eat the trailing mirror
+# pointer. 12 digits covers any real payload with room to spare; the fallback in
+# `_finish_part` is the structural backstop past even that.
+_AUDIT_WORST_COUNTER = 999_999_999_999
 _AUDIT_LINE_RESERVE = (
     len(
         _audit_line(
             "identity-user",
-            99_999,
-            99_999,
-            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999),
+            _AUDIT_WORST_COUNTER,
+            _AUDIT_WORST_COUNTER,
+            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, _AUDIT_WORST_COUNTER),
             where=(
                 f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
             ),
@@ -179,7 +199,11 @@ def _audit_reserve(part: str, mirror: Path | None) -> int:
     """
     where = f" — full text: {mirror}" if mirror is not None else " — MIRROR UNAVAILABLE"
     worst = _audit_line(
-        part, 99_999, 99_999, cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999), where=where
+        part,
+        _AUDIT_WORST_COUNTER,
+        _AUDIT_WORST_COUNTER,
+        cut=("x" * _AUDIT_BLOCK_LABEL_MAX, _AUDIT_WORST_COUNTER),
+        where=where,
     )
     return max(_AUDIT_LINE_RESERVE, emit_cost(worst))
 
@@ -1406,7 +1430,8 @@ def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
         block, dropped = cut
         where = f" — full text: {mirror}" if wrote_mirror else " — MIRROR UNAVAILABLE"
         out.emit_final(
-            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where)
+            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where),
+            fallback=_audit_line_minimal(part, where),
         )
     else:
         out.emit_final(_audit_line(part, out.emitted_chars, out.emitted_chars))

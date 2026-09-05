@@ -225,6 +225,22 @@ _MAX_FRESH = 2_000
 #: How many distinct read failures to name in the findings before summarising.
 _MAX_LISTED_ERRORS = 3
 
+#: How many affected session ids the restart remedy names before summarising.
+#: SEPARATE from the filings' ``max_listed`` (5) on purpose: the session list is
+#: an INVENTORY the operator acts on ("restart THESE"), not a sample, so it must
+#: name every session in the ordinary case — 8 sessions filing at once was the
+#: live 2026-09-05 shape, and inheriting the filings' 5 would leave 3 unnamed
+#: under a "restart the affected sessions" remedy. 20 sits well above that while
+#: bounding a pathological fan-out. Past it, the EXACT total is stated alongside
+#: the first 20 names — a selection with a denominator, not a silent cut. It does
+#: NOT claim the "filing paths above" cover the rest: that list caps at
+#: ``max_listed`` (5), so beyond 20 sessions the overflow is genuinely
+#: un-enumerated, and the honest thing is to say the count, not point at a list
+#: that does not hold them. 20 named + an exact total is enough for the operator
+#: to grasp the scale; a >20-session fan-out is itself the "cap MOVED" escalation
+#: the remedy already names.
+_MAX_SESSIONS_NAMED = 20
+
 #: Hard bound on the recorded errors themselves (the display bound above is a
 #: separate, smaller one). One entry per unreadable path, and the whole list is
 #: hashed into the alert identity, so an unbounded list is unbounded work on a
@@ -319,6 +335,17 @@ class InjectionHealth:
         """``{path, size, age_h, producer}`` per filing, paths already escaped."""
         return self._filings
 
+    @property
+    def filing_session_ids(self) -> list[str]:
+        """Distinct sessions that filed, first-seen order, ids already escaped.
+
+        Over ALL producers — this is the "across N session(s)" population.
+        Derived from the per-filing ``session`` fact rather than stored, so it
+        cannot drift from ``_filings``. The restart remedy scopes a NARROWER
+        list (session-context producers only); see :func:`_session_context_sessions`.
+        """
+        return list(dict.fromkeys(d["session"] for d in self._filings))
+
     def add_error(self, subject: object, what: str, exc: BaseException | None = None) -> None:
         """Record a read that failed. Escapes at the boundary, every time.
 
@@ -330,13 +357,24 @@ class InjectionHealth:
         self._errors.append(f"{_safe_path(subject)} {what}{detail}")
 
     def note_filing(self, path: Path, *, size: int, age_h: float, producer: str) -> None:
-        """Record a filing. The path is escaped here so no renderer has to."""
+        """Record a filing. The path is escaped here so no renderer has to.
+
+        The session id (``<projects>/<slug>/<SESSION>/tool-results/<file>`` — the
+        grandparent's name) rides in the row too, escaped at this same boundary:
+        it is CC-authored filesystem metadata, POSIX permits a newline in it, and
+        it now reaches a first_party observation via the restart remedy. Kept as
+        a FACT on each filing rather than a pre-derived list, so each consumer
+        scopes it correctly — the distinct-session COUNT is over all producers,
+        but the restart remedy names only the session-context subset (a session
+        that filed only an other-hook output has a different remedy, not restart).
+        """
         self._filings.append(
             {
                 "path": _safe_path(path),
                 "size": size,
                 "age_h": age_h,
                 "producer": producer,
+                "session": _safe_path(path.parent.parent.name),
             }
         )
 
@@ -562,12 +600,22 @@ def _genesis_saw_recent_session(reads: _Reads, cutoff: float) -> bool:
     session, so a fresh mtime here is Genesis's own evidence that CC ran —
     independent of CC's directory layout, which is the whole point: it is the
     half of the freshness comparison that a CC update cannot move.
+
+    Reads are REPORTED, deliberately NOT wrapped in ``unreported()``. Absent
+    files — dispatched sessions with no ``last_prompt_time`` — are already
+    silent: ``_Reads.stat`` maps FileNotFoundError to None. What is left to
+    report is a genuine I/O failure on THIS install's own store (a permission
+    fault, an unreadable subtree), which must not read as "no fresh prompt":
+    that answer is indistinguishable from an idle install and would let a
+    fossil CC tree resolve a live alert (the fourth-granularity blind resolve
+    this probe exists to catch). Suppressing here traded that failure for
+    silence; the primitives already give absence for free, so the wrapper only
+    hid the case worth reporting.
     """
-    with reads.unreported():  # absent files are the norm (dispatched sessions)
-        for d in reads.listdir(_genesis_sessions_dir()):
-            st = reads.stat(d / "last_prompt_time")
-            if st is not None and st.st_mtime >= cutoff:
-                return True
+    for d in reads.listdir(_genesis_sessions_dir()):
+        st = reads.stat(d / "last_prompt_time")
+        if st is not None and st.st_mtime >= cutoff:
+            return True
     return False
 
 
@@ -814,15 +862,15 @@ def _collect_sync(
         health.scan_truncated = True
         fresh = fresh[:_MAX_FRESH]
 
-    sessions: set[str] = set()
     for mtime, f, size in fresh:
         producer, is_probe = _attribute(f, reads)
         if is_probe:
             health.probe_filings += 1
             continue
         health.note_filing(f, size=size, age_h=round((now - mtime) / 3600, 1), producer=producer)
-        sessions.add(f.parent.parent.name)
-    health.filing_sessions = len(sessions)
+    # note_filing tracks the distinct affected sessions (escaped, deduped); the
+    # count is just its length — no second, unescaped set to drift from it.
+    health.filing_sessions = len(health.filing_session_ids)
 
     # Applied LAST, after attribution has had its chance to record failures.
     health.bound_errors(_MAX_ERRORS)
@@ -843,6 +891,18 @@ _IDENTITY_EXEMPT_FIELDS: dict[str, str] = {
     # and the producer set carry the condition; the count is reported in the
     # finding text, where it informs without re-paging.
     "filing_sessions": "a rolling-window count — reported, never keyed",
+    # The session ids the restart remedy names now ride inside `_filings` (a
+    # per-filing `session` fact), covered by `_filings`'s exemption above — so
+    # they need no separate entry here. Their re-page behaviour is a DELIBERATE
+    # tradeoff, documented at the remedy: keying the session SET into the alert
+    # identity would re-page on every session change (the churn this exemption
+    # avoids), while exempting it means a sustained-churn window can show a
+    # stale "restart THESE" list until the alert resolves. Post-deploy the
+    # session-context population only SHRINKS (a restarted session stops filing;
+    # new sessions carry the fixed wiring and never file), so the list ages to
+    # empty and the alert resolves — the frozen-list case needs NEW sessions to
+    # start filing, which only happens if the cap MOVED, and the remedy already
+    # escalates to that. Accepted with that reasoning rather than re-paging.
     # Not rendered by derive_findings, and both move for reasons unrelated to
     # any loss: probes appear while measuring the cap, foreign filings whenever
     # the operator opens another repo.
@@ -942,12 +1002,30 @@ def derive_findings(health: InjectionHealth, *, max_listed: int = 5) -> list[str
         f"session(s) — those windows ran WITHOUT the filed content: {listed}{more}."
     )
     if any(p.startswith("session-context") for p in by_producer):
+        # SCOPED to session-context filings: a session that filed only an
+        # other-hook output has a different remedy (bound that hook), so naming
+        # it here under "restart" would be wrong and would inflate the count.
+        ids = list(
+            dict.fromkeys(
+                d["session"]
+                for d in health.fresh_filings
+                if d["producer"].startswith("session-context")
+            )
+        )
+        named = ", ".join(ids[:_MAX_SESSIONS_NAMED])
+        overflow = (
+            f" …and {len(ids) - _MAX_SESSIONS_NAMED} more of {len(ids)} (the count is "
+            "exact; only the first names are listed)"
+            if len(ids) > _MAX_SESSIONS_NAMED
+            else ""
+        )
         findings.append(
             "session-context filings mean the injection crossed the harness cap: "
-            "RESTART the affected sessions (a session started before a fix keeps the "
-            "old wiring until it does), and if filings continue after a restart the "
-            "cap itself has MOVED — re-measure it with the probe seam in "
-            "scripts/genesis_session_context.py and re-fit the part budgets."
+            f"RESTART the affected sessions ({len(ids)} total) [{named}{overflow}] "
+            "(a session started before a fix keeps the old wiring until it does), "
+            "and if filings continue after a restart the cap itself has MOVED — "
+            "re-measure it with the probe seam in scripts/genesis_session_context.py "
+            "and re-fit the part budgets."
         )
     if any(not p.startswith(("session-context", "cap-measurement")) for p in by_producer):
         findings.append(
