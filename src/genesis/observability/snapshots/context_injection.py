@@ -1013,15 +1013,24 @@ def derive_findings(health: InjectionHealth, *, max_listed: int = 5) -> list[str
             )
         )
         named = ", ".join(ids[:_MAX_SESSIONS_NAMED])
+        # When the scan itself truncated (>_MAX_FRESH fresh filings), the loop
+        # that built these ids saw only the newest _MAX_FRESH — so this count is
+        # a LOWER BOUND, not exact, and saying "exact" would be the false
+        # completeness claim the whole watcher exists to avoid.
+        total_desc = (
+            f"at least {len(ids)}; the scan hit its {_MAX_FRESH}-filing cap, so more "
+            "may be affected"
+            if health.scan_truncated
+            else f"{len(ids)} total"
+        )
         overflow = (
-            f" …and {len(ids) - _MAX_SESSIONS_NAMED} more of {len(ids)} (the count is "
-            "exact; only the first names are listed)"
+            f" …and {len(ids) - _MAX_SESSIONS_NAMED} more not listed"
             if len(ids) > _MAX_SESSIONS_NAMED
             else ""
         )
         findings.append(
             "session-context filings mean the injection crossed the harness cap: "
-            f"RESTART the affected sessions ({len(ids)} total) [{named}{overflow}] "
+            f"RESTART the affected sessions ({total_desc}) [{named}{overflow}] "
             "(a session started before a fix keeps the old wiring until it does), "
             "and if filings continue after a restart the cap itself has MOVED — "
             "re-measure it with the probe seam in scripts/genesis_session_context.py "

@@ -367,9 +367,10 @@ def test_session_context_remedy_names_the_sessions_to_restart(tmp_path):
 
     Replays the live shape (2026-09-05): 8 sessions filing, the remedy naming
     none, and listing 5 FILINGS covers only 4 of the 8 sessions. An operator
-    cannot act on "restart the affected sessions" without the ids.
+    cannot act on "restart the affected sessions" without the ids. (Synthetic
+    ids — never a real session's, per the privacy gate.)
     """
-    ids = [f"1c93a6da-sess{i}" for i in range(8)]
+    ids = [f"sess-{i:02d}" for i in range(8)]
     for i, sid in enumerate(ids):
         _file(
             tmp_path,
@@ -402,6 +403,29 @@ def test_session_list_bounds_and_says_so(tmp_path, monkeypatch):
     remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
     assert "6" in remedy, f"true session total not stated: {remedy}"
     assert "more" in remedy, f"bounded list did not announce the overflow: {remedy}"
+
+
+def test_a_truncated_scan_does_not_claim_an_exact_session_count(tmp_path, monkeypatch):
+    """When the scan hit `_MAX_FRESH` the session inventory is a LOWER BOUND.
+
+    `_collect_sync` truncates the filing list to `_MAX_FRESH` BEFORE the session
+    ids are derived, so the count covers only the sampled filings. Labelling it
+    "exact" (or a bare "N total") would be the false completeness claim the
+    watcher exists to avoid — the remedy must say the count is a floor.
+    """
+    monkeypatch.setattr(ci, "_MAX_FRESH", 3)
+    for i in range(6):
+        _file(
+            tmp_path,
+            session=f"sess-{i:02d}",
+            name=f"hook-{i}-stdout.txt",
+            body=b"## Session Configuration\n\npayload",
+        )
+    h = _collect(tmp_path)
+    assert h.scan_truncated, "fixture did not trip the scan cap"
+    remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
+    assert "at least" in remedy, f"truncated scan claimed a complete count: {remedy}"
+    assert "-filing cap" in remedy, remedy
 
 
 def test_filing_session_ids_are_escaped(tmp_path):

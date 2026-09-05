@@ -155,8 +155,11 @@ def _audit_line_minimal(part: str, where: str) -> str:
 
 # Room reserved for the trailing `_[ctx <part>: …]_` self-audit line — DERIVED
 # from the renderer above at its realistic worst case, not a round number.
-# Pinned by test_the_audit_reserve_fits_the_line_it_reserves_for, which rebuilds
-# this same worst case, so the two cannot drift.
+# The load-bearing invariant is that `_AUDIT_WORST_COUNTER` exceeds any counter a
+# real part can render (checked by test_the_audit_worst_counter_exceeds_any_real_part,
+# which asserts that margin directly — not by rebuilding the line, which would be
+# tautological against a reserve derived from the same figure); the pointer-safe
+# fallback in `_finish_part` is the structural backstop past even that.
 # 12-digit worst-case counters (999_999_999_999 ≈ 1 TB): `intended`/`dropped`
 # are unbounded, and the earlier 5-digit 99_999 under-reserved for any part that
 # renders a 6+-digit count — a right-clip would then eat the trailing mirror
