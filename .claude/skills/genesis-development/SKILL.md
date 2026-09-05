@@ -929,22 +929,36 @@ interactive one does). What this paragraph adds is the named DEFAULT below the
 substantial line: for an ordinary code commit, run the built-in `/code-review`
 at **low** effort and let its findings feed the evidence you mark. Cheap,
 catches drift while the fix is one edit instead of a review round, and it is
-NOT a clearance — the marker flow is unchanged. (Commits the table below rates
-"None" — docs, mechanical renames — stay exempt as ever.) Every defect that
+NOT a clearance — the marker flow is unchanged. (The gate auto-allows a
+docs/config-only commit; any code change goes through the marker flow, and the
+gate itself sets the depth — an ordinary edit takes a plain marker, a
+substantial or prompt-surface one takes the adversarial pass.)
+Every defect that
 survives to the end-of-build review costs an adversarial cycle there, and
 every one that survives THAT costs an external Codex round against the
 escalation cap.
 
-**For a SUBSTANTIAL change, the end-of-build review is canonical, not the
-builder's choice: run `/deep-review`.** Substantial is the commit gate's own
-definition — ≥50 reviewable lines, more than one code file, or any auth /
-API / migration / prompt / agent / skill surface. `/deep-review` dispatches
-the adversarial pass in the required shape (genesis-architect, plus
-genesis-security-reviewer when the diff touches a security surface) and
-writes the evidence marker the gate reads. Below substantial, the table
-governs: a small focused fix ends with code-reviewer inline. `/audit-changes`
-stays what it is — a light self-check that writes no marker — and is a
-terminus for nothing beyond the table's "None" rows.
+**For a SUBSTANTIAL change, the end-of-build adversarial review is canonical,
+not the builder's choice: run `/deep-review`.** Judge substantial at end of
+build over the WHOLE branch — the `merge-base(HEAD, origin/main)..working-tree`
+range `/deep-review` and the CI check examine — not the last staged commit: the
+commit gate classifies each commit's own staged diff, so continuous commits
+leave the index empty and a branch split into individually-small commits would
+otherwise slip the bar it clears in aggregate. The threshold VALUES are the
+commit gate's — ≥50 reviewable lines, more than one code file, or any auth /
+API / migration / prompt / agent / skill surface (the prompt-surface trigger
+excludes the user-sovereign top-level CAPS docs, CLAUDE.md / SOUL.md / USER.md)
+— applied here to the branch range rather than one staged commit. `/deep-review`
+dispatches the adversarial pass in the required shape (genesis-architect, plus
+genesis-security-reviewer when the diff touches a security surface) and writes
+the evidence marker the gate reads; it is the end-of-build terminus, riding on
+TOP of the during-build `/code-review` inline passes — which is exactly the
+table's "Code-reviewer inline + `/deep-review`" for a substantial row, the two
+playing different positions rather than a choice between them. Below
+substantial, the table governs: a small focused fix ends with code-reviewer
+inline. `/audit-changes` stays what it is — a light self-check that writes no
+marker — and is a terminus only where the gate needs no marker at all: a
+docs/config-only commit it auto-allows.
 
 Choose the review level proportional to the change:
 

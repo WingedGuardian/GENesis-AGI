@@ -460,7 +460,11 @@ When a user shares a file path or URL in conversation:
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
   issue, which keeps its per-instance approval gate from "Where deferred
-  work goes" below, this rule waives nothing. An untracked remainder is a
+  work goes" below, this rule waives nothing. Where none of those trackers
+  is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
+  ledger or follow-up tool — the fallback is a structured handoff that NAMES
+  every unfinished piece in your final message; a named remainder is tracked,
+  an unnamed one is dropped. An untracked remainder is a
   drop, not a deferral, and a plan-file bullet is not a row. On the next
   prompt, reconcile your own stranded artifacts early — ordered behind
   anything the user's prompt makes urgent — before taking on discretionary
