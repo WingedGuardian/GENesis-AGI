@@ -36,6 +36,31 @@ logger = logging.getLogger(__name__)
 # dead_letter.redispatch() and the matching test.
 UNKNOWN_CALL_SITE_ERROR_PREFIX = "Unknown call site:"
 
+# How many provider names an exhaustion line names before it summarises. A
+# chain is single digits today, so this never trims in practice — it is here so
+# that a future long chain cannot turn one ERROR line into a paragraph in
+# `journalctl`, which is where this message is read.
+_FAILED_NAMES_IN_MESSAGE = 8
+
+
+def _failed_clause(failed_providers: list[str]) -> str:
+    """The `; failed: a, b, c` tail of an exhaustion message, or '' when empty.
+
+    EMPTY IS A REAL STATE AND IT SAYS SOMETHING: every chain member was skipped
+    before it was tried (an open breaker, a missing key, an exceeded budget) or
+    the aggregate deadline abandoned the walk. Emitting `failed: ` with nothing
+    after it would read as a formatting bug, so the clause is dropped and the
+    `N attempted of M walkable` counts carry that case on their own — 0 of 7 is
+    the whole story there.
+    """
+    if not failed_providers:
+        return ""
+    shown = failed_providers[:_FAILED_NAMES_IN_MESSAGE]
+    listed = ", ".join(shown)
+    if len(failed_providers) > len(shown):
+        listed += f", +{len(failed_providers) - len(shown)} more"
+    return f"; failed: {listed}"
+
 
 class Router:
     """Routes LLM calls through provider fallback chains with resilience."""
@@ -417,12 +442,38 @@ class Router:
 
         # All exhausted
         if self._event_bus:
+            # `attempts` alone is not readable. A provider skipped for an open
+            # breaker, a missing key or an exceeded budget costs no attempt, so
+            # "attempts: 2" on a seven-provider chain looks exactly like a
+            # two-provider chain that was fully tried. Carrying the names AND
+            # the chain length lets a reader reconcile the two — and makes the
+            # aggregate-deadline `break` above legible, which is the one exit
+            # that abandons the walk while recording nothing at all.
+            #
+            # THE NAMES GO IN THE MESSAGE, not only in the details. `emit()`
+            # logs `subsystem=… event=… msg=…` and nothing else
+            # (observability/events.py), so details reach the persisted event
+            # and the dashboard but never `journalctl` — and the runbook for
+            # this failure sends the reader to the systemd log. Details-only
+            # would have left that surface byte-identical to the behaviour this
+            # change exists to fix. The sibling `provider.fallback` event above
+            # already names its providers in the message; this one now matches.
             await self._event_bus.emit(
                 Subsystem.ROUTING, Severity.ERROR,
                 "all_exhausted",
-                f"All providers exhausted for {call_site_id}",
+                f"All providers exhausted for {call_site_id} "
+                f"({attempts} attempted of {len(chain)} walkable"
+                f"{_failed_clause(failed_providers)})",
                 call_site=call_site_id,
                 attempts=attempts,
+                failed_providers=tuple(failed_providers),
+                # The WALKABLE chain: post-`_filter_chain`, so a `never_pays`
+                # site does not count paid entries it was never going to try.
+                # That is the only length `attempts` can be reconciled against
+                # — but it is NOT the length a reader counts in
+                # `model_routing.yaml`, and the two currently differ on three
+                # of this install's nine `never_pays` sites.
+                chain_size=len(chain),
             )
 
         # Record failure for neural monitor visibility
@@ -456,6 +507,11 @@ class Router:
             success=False,
             call_site_id=call_site_id,
             attempts=attempts,
+            # The success path has always returned this (see above); the
+            # exhaustion path accumulated the same list and then dropped it, so
+            # the one result whose reader most needs to know which providers
+            # were involved was the only one that said nothing.
+            failed_providers=tuple(failed_providers),
             error="All providers exhausted",
             dead_lettered=dead_lettered,
         )
