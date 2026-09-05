@@ -524,6 +524,42 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The worktree-removal guard no longer refuses a command for *mentioning* a
+  removal, and no longer misses one that is really happening.** It matched raw
+  command text, so the phrase inside a quoted grep pattern, a heredoc body, a
+  docstring or a commit message read as the operation itself. That is not only
+  friction: a blocked command is discarded *whole*, so a false match on the last
+  step silently threw away the file writes in the earlier ones while the error
+  mentioned only the rule that fired. The check now keys on the parsed command —
+  the executable, its subcommand and its real arguments. Replayed over 51,052
+  unique (command, directory) pairs from one install's own session history, each
+  from the directory it was typed in: 154 commands blocked before and 154 after,
+  but it is a different set — 6 refusals of commands that merely *mention* a
+  removal are released, and 6 real removals that were previously allowed are
+  caught. The unchanged total is why the composition is quoted rather than the
+  count. That corpus is built from real transcripts and cannot be published, so
+  these totals are the scale at which the change was observed rather than a
+  result anyone else can reproduce; the composition is the claim.
+- **A worktree removal hidden behind a global git flag is now caught.** The
+  check required `git` to be followed immediately by the subcommand, so
+  `git -C <path> worktree remove <target>` slipped past it entirely. Two shapes
+  did: a global flag before the subcommand, and — found by cross-model review —
+  a global flag whose *operand* happened to equal the subcommand's own name,
+  which made the operand extraction anchor one token early and skip the segment.
+  The parser now reports the subcommand's index from the same scan that finds
+  it, so no caller has to re-derive it.
+- **The global Bash safety hook is now syntax-checked by the test suite.** It is
+  loaded for every session on the machine, and a shell syntax error there exits 2
+  — which Claude Code reads as "block" — so a typo would have refused every
+  subsequent command, including the one needed to repair it. Nothing checked for
+  that before.
+- **The equivalent shell-side checks were deliberately left over-matching.** They
+  run in the global hook with no access to the command parser, so keying them on
+  command position means modelling shell grammar with a regex — an open set. An
+  attempt to do so fell open on a leading redirection and on the `command` /
+  `env` wrappers, all of which the broader form catches. They keep refusing some
+  commands that merely mention an operation; that friction is the deliberate
+  price of not leaving a hole in a check that exists because of a real crash.
 - **Campaign names stored before the control-character fix are now cleaned at
   startup.** Names have been sanitized at the write boundary since the previous
   release, so nothing new lands malformed, but rows written earlier were never

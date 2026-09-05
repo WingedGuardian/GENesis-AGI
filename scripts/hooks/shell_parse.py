@@ -934,9 +934,21 @@ def _nested_script(argv: list[str]) -> str:
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand(argv: list[str]) -> str | None:
-    """The git subcommand for an argv whose executable is git, skipping git
-    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+def git_subcommand_index(argv: list[str]) -> int | None:
+    """Index of the git subcommand token in ``argv``, or None.
+
+    Exposed alongside :func:`git_subcommand` because a caller that needs the
+    OPERANDS after the subcommand cannot recover this index on its own.
+    ``argv.index(name)`` returns the FIRST token equal to the name, and a global
+    option's operand may equal the subcommand's own name — ``git -C worktree worktree
+    remove /tmp/x`` selects the ``-C`` operand, so the operand list starts one
+    token early, the removal is not recognised, and the guard falls OPEN. Found
+    by cross-model review, 2026-09-03.
+
+    The alternative was for the caller to repeat the option-skipping loop below.
+    That is replica drift: two copies of one rule, diverging silently the next
+    time the option table grows. One scan, one source of truth.
+    """
     if not argv or _basename(argv[0]) != "git":
         return None
     i = 1
@@ -948,8 +960,15 @@ def git_subcommand(argv: list[str]) -> str | None:
         if t.startswith("-"):
             i += 1
             continue
-        return t
+        return i
     return None
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git
+    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+    i = git_subcommand_index(argv)
+    return None if i is None else argv[i]
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:
