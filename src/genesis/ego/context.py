@@ -134,16 +134,12 @@ class EgoContextBuilder:
         queues = snap.get("queues", {})
         if queues:
             lines.append("\n### Queues")
-            deferred = queues.get("deferred_work_queue", {})
-            dead_letter = queues.get("dead_letter_queue", {})
-            if isinstance(deferred, dict):
-                lines.append(
-                    f"- Deferred work: {deferred.get('pending', 0)} pending"
-                )
-            if isinstance(dead_letter, dict):
-                lines.append(
-                    f"- Dead letter: {dead_letter.get('count', 0)} items"
-                )
+            lines.append(
+                f"- Deferred work: {queues.get('deferred_work', 0)} pending"
+            )
+            lines.append(
+                f"- Dead letter: {queues.get('dead_letters', 0)} items"
+            )
 
         # Surplus
         surplus = snap.get("surplus", {})
