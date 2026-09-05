@@ -853,6 +853,58 @@ async def test_the_exhaustion_message_carries_both_counts(
     assert "failed: free-2, paid-1" in message, message
 
 
+@pytest.mark.asyncio
+async def test_exhaustion_grouping_prefix_is_stable_across_states(
+    sample_config, breakers, cost_tracker, degradation
+):
+    """The Errors dashboard groups events by the first MSG_GROUP_PREFIX_LEN
+    characters of the message and keys MANUAL RESOLUTIONS off that prefix
+    (db/crud/events.py SUBSTR + dashboard/routes/errors.py). If the prefix
+    varies with breaker/key/budget state, one recurring outage splits into a
+    group per permutation and a resolved group resurrects under a new key.
+    So: same call site, two different exhaustion states → identical prefix;
+    the per-occurrence diagnostics live entirely beyond it.
+    """
+    from unittest.mock import AsyncMock
+
+    from genesis.db.crud.events import MSG_GROUP_PREFIX_LEN
+
+    def exhausted_message(bus):
+        return [
+            c for c in bus.emit.call_args_list if c.args[2] == "all_exhausted"
+        ][0].args[3]
+
+    bus_a = AsyncMock()
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, error="down", status_code=503),
+        "free-2": CallResult(success=False, error="down", status_code=503),
+        "paid-1": CallResult(success=False, error="down", status_code=503),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate, event_bus=bus_a,
+    )
+    await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    # Second exhaustion of the SAME site under a different state: a breaker
+    # now skips free-1, changing attempts and the failed/skipped clauses.
+    cb = breakers.get("free-1")
+    for _ in range(3):
+        cb.record_failure(ErrorCategory.TRANSIENT)
+    bus_b = AsyncMock()
+    router._event_bus = bus_b
+    await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+
+    msg_a, msg_b = exhausted_message(bus_a), exhausted_message(bus_b)
+    assert msg_a != msg_b, "the states must actually differ for this to lock anything"
+    assert msg_a[:MSG_GROUP_PREFIX_LEN] == msg_b[:MSG_GROUP_PREFIX_LEN], (
+        f"grouping prefix varies with exhaustion state:\n{msg_a!r}\n{msg_b!r}"
+    )
+    assert "test_mixed" in msg_a[:MSG_GROUP_PREFIX_LEN], (
+        "the call site is the group's identity and must sit inside the prefix"
+    )
+
+
 def test_nothing_recorded_prints_no_dangling_clause():
     """EMPTY IS A REAL STATE. Only the aggregate deadline abandons the walk while
     recording nothing — `failed: ` or `skipped: ` with nothing after it reads as

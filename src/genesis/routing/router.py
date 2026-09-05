@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 
+from genesis.db.crud.events import MSG_GROUP_PREFIX_LEN
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import ProviderActivityTracker
@@ -488,11 +489,20 @@ class Router:
             # would have left that surface byte-identical to the behaviour this
             # change exists to fix. The sibling `provider.fallback` event above
             # already names its providers in the message; this one now matches.
+            # The Errors dashboard groups events by the first
+            # MSG_GROUP_PREFIX_LEN characters of the message and keys manual
+            # resolutions off that prefix — so the head (stable per call site)
+            # is padded past the grouping window before the per-occurrence
+            # diagnostics start. Without the pad, every breaker/key/budget
+            # permutation of ONE recurring outage becomes its own group, and
+            # a resolved group resurrects under a new key.
             await self._event_bus.emit(
                 Subsystem.ROUTING, Severity.ERROR,
                 "all_exhausted",
-                f"All providers exhausted for {call_site_id} "
-                f"({attempts} attempted of {len(chain)} walkable"
+                f"All providers exhausted for {call_site_id} ".ljust(
+                    MSG_GROUP_PREFIX_LEN
+                )
+                + f"({attempts} attempted of {len(chain)} walkable"
                 f"{_exhaustion_clause(called_failed, skipped)})",
                 call_site=call_site_id,
                 attempts=attempts,
