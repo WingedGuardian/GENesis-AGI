@@ -394,8 +394,9 @@ def test_a_failed_write_leaves_every_fragment_on_disk(
         raise OSError("disk full")
 
     monkeypatch.setattr(Path, "write_text", boom)
-    with pytest.raises(OSError):
-        ac.main([])
+    # The failure exits as the documented single-line + status 2, not a
+    # traceback — and above all deletes nothing.
+    assert ac.main([]) == 2
     assert len(list(d.iterdir())) == 1, "fragments were deleted despite a failed write"
     assert cl.read_text() == CHANGELOG_SKELETON
 
@@ -421,8 +422,9 @@ def test_the_changelog_is_replaced_atomically_never_written_in_place(
         raise OSError("rename failed")
 
     monkeypatch.setattr(Path, "replace", boom)
-    with pytest.raises(OSError):
-        ac.main([])
+    # Exits as the documented single-line + status 2; the original is intact
+    # either way, which is what distinguishes atomic from in-place.
+    assert ac.main([]) == 2
     assert cl.read_text() == CHANGELOG_SKELETON, (
         "CHANGELOG.md was modified despite the replace failing — the write is "
         "not atomic, so a kill mid-write can leave it truncated"
@@ -1112,3 +1114,38 @@ def test_a_non_regular_file_is_rejected_before_it_is_read(tmp_path: Path) -> Non
             ac.collect_fragments(d)
     finally:
         sock.close()
+
+
+def test_a_concurrent_changelog_edit_is_never_silently_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An edit to CHANGELOG.md landing mid-assembly must not vanish.
+
+    The fold reads CHANGELOG.md, splices, and atomically replaces it. If the
+    file changed between that read and the replace, the replace overwrites the
+    concurrent edit with a result computed from stale text — silently, on the
+    success path. The fold must refuse instead, leaving the newer edit in
+    place and every fragment on disk, so a rerun is correct. (The fragment
+    files got this guarantee one round earlier; this is the same invariant on
+    the target side.)
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md", body="- **Landed.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+    orig_splice = ac.splice
+
+    def splice_then_edit(text, sections):  # type: ignore[no-untyped-def]
+        out = orig_splice(text, sections)
+        cl.write_text(cl.read_text() + "\n- **Concurrent.** saved mid-assembly\n")
+        return out
+
+    monkeypatch.setattr(ac, "splice", splice_then_edit)
+    rc = ac.main([])
+    assert "Concurrent." in cl.read_text()  # the newer edit must survive
+    assert rc == 2
+    assert list(d.iterdir())  # nothing was deleted; a rerun is correct
+    # The refusal contract includes cleanup: no half-finished twin left behind.
+    assert not (tmp_path / "CHANGELOG.md.tmp").exists()

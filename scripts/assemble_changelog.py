@@ -20,11 +20,36 @@ USAGE
 
 Run the assembly at RELEASE time, not per pull request — folding early
 re-creates the shared file everyone edits, which is the thing this avoids.
+
+DECLARED BOUNDARY. The validators and scanners in this file approximate
+CommonMark's BLOCK STARTS with line scanners; they are a hardening gate over
+repo-controlled, PR-reviewed text, not a Markdown parser, and full CommonMark
+fidelity is explicitly not the goal — the divergence list has no fixed point.
+Consciously accepted, with reasons:
+
+- Lines are split with ``str.splitlines()``, which also treats NEL (U+0085),
+  U+2028/U+2029, and the other C0/C1 line controls (``\v``, ``\f``,
+  U+001C-001E) as boundaries and normalizes them to ``\n`` on assembly.
+  Measured 2026-09-05: zero bytes of ANY of these exist in this repository's
+  CHANGELOG.md, and content that exotic is visible in any fragment's diff.
+- The setext/thematic-break scanner misses some valid CommonMark forms: a lone
+  ``-`` underline (a setext H2 when it follows paragraph text) and spaced
+  breaks like ``- - -`` both pass validation. Both are review-visible in a
+  fragment's own diff.
+- The genuine-heading scanner tracks fenced-code state but not HTML-block
+  context. The real ``[Unreleased]`` is the first ``##`` heading, ten reviewed
+  lines into a preamble that contains no HTML — an HTML-wrapped decoy above it
+  cannot occur without a reviewed edit putting it there, and assembly itself
+  only ever inserts BELOW the heading it finds.
+
+Widening any single rule is welcome when a real case appears; enumerating
+every remaining CommonMark construct is not.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import os
 import re
@@ -514,7 +539,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        result = splice(CHANGELOG.read_text(encoding="utf-8"), render_sections(fragments))
+        # ONE capture, like the fragments one round earlier: the text spliced,
+        # the rollback copy, and the pre-replace comparison all use this read.
+        # A second read anywhere re-opens the window this closes.
+        original = CHANGELOG.read_text(encoding="utf-8")
+        result = splice(original, render_sections(fragments))
     except FragmentError as exc:
         print(f"changelog.d: {exc}", file=sys.stderr)
         return 2
@@ -545,23 +574,47 @@ def main(argv: list[str] | None = None) -> int:
     # entries, so a write that fails half-way must not be followed by deleting
     # them. `replace` is atomic on the same filesystem, so CHANGELOG.md is
     # either the old file or the complete new one, never a truncated middle.
-    original = CHANGELOG.read_text(encoding="utf-8")
+    #
+    # ONE protected region covers everything from the tmp write through the
+    # last unlink. A rollback handler protects only what its try encloses —
+    # a try that began after the replace would leave an interrupt landing in
+    # the seam with a folded changelog, every fragment still on disk, and no
+    # handler: exactly the duplicate-entry re-run state described below.
+    # `replaced` is set BEFORE the replace so the seam does not exist; rolling
+    # back a replace that never ran rewrites the file with its own bytes.
     tmp = CHANGELOG.with_name(CHANGELOG.name + ".tmp")
-    tmp.write_text(result, encoding="utf-8")
-    try:
-        tmp.replace(CHANGELOG)
-    except OSError:
-        tmp.unlink(missing_ok=True)  # never leave a half-finished twin behind
-        raise
-    # Cleanup is part of the same operation, not a tidy-up after it. If a
-    # fragment cannot be removed — an unwritable directory, a partial loop —
-    # the changelog is rolled back to what it was, because the alternative is a
-    # half-done state whose obvious remedy makes it worse: re-running the
-    # documented command would fold the surviving fragments in a SECOND time and
-    # duplicate those entries in the release notes. All-or-nothing keeps a rerun
-    # correct.
     removed: list[tuple[Path, str]] = []
+    replaced = False
     try:
+        tmp.write_text(result, encoding="utf-8")
+        # The file about to be overwritten must be the file that was spliced.
+        # An editor save landing between the capture and here would otherwise
+        # be discarded silently on the SUCCESS path — `result` is computed
+        # from stale text, and the atomic replace makes the loss clean and
+        # invisible. Same invariant, target side, as the fragments'
+        # pre-delete comparison below. Check-then-act NARROWS this window to
+        # the microseconds between this read and the replace — it cannot
+        # close it; full closure would need a file lock, which a human-run
+        # release script does not earn.
+        if CHANGELOG.read_text(encoding="utf-8") != original:
+            tmp.unlink(missing_ok=True)
+            print(
+                "changelog.d: CHANGELOG.md changed on disk after it was read "
+                "for assembly; refusing to overwrite the newer content. "
+                "Nothing was modified and no fragment was removed — a rerun "
+                "is correct.",
+                file=sys.stderr,
+            )
+            return 2
+        replaced = True
+        tmp.replace(CHANGELOG)
+        # Cleanup is part of the same operation, not a tidy-up after it. If a
+        # fragment cannot be removed — an unwritable directory, a partial
+        # loop — the changelog is rolled back to what it was, because the
+        # alternative is a half-done state whose obvious remedy makes it
+        # worse: re-running the documented command would fold the surviving
+        # fragments in a SECOND time and duplicate those entries in the
+        # release notes. All-or-nothing keeps a rerun correct.
         for _ts, _category, path, raw in fragments:
             # The bytes about to be deleted must be the bytes that were folded.
             # An editor save landing between the assembly read and this loop
@@ -594,17 +647,32 @@ def main(argv: list[str] | None = None) -> int:
         # and `git restore` returns to the pre-fold tree. That, not a staging
         # scheme, is the recovery of record; building a second one beside git
         # would be a store nobody reconciles.
+        # DATA first, cosmetics last: the restores must never be prevented by
+        # the tmp cleanup failing — when unlink itself is what is broken, a
+        # cleanup-first handler dies before restoring anything.
         for done, text in removed:
             done.write_text(text, encoding="utf-8")
-        CHANGELOG.write_text(original, encoding="utf-8")
+        # Restore the changelog only if the replace ran (or was armed): a
+        # failure BEFORE it must not rewrite the target at all — the file is
+        # still the pre-fold original, and blindly rewriting it here would be
+        # the one place this handler could itself clobber a concurrent edit.
+        if replaced:
+            CHANGELOG.write_text(original, encoding="utf-8")
+        with contextlib.suppress(OSError):
+            # A stranded .tmp is cosmetic; the data above is already restored.
+            tmp.unlink(missing_ok=True)
         print(
-            f"changelog.d: interrupted while removing fragments ({exc!r}); every "
-            "fragment and CHANGELOG.md have been restored, so nothing was lost "
-            "and a rerun is correct. (After a hard kill, recover with git: the "
-            "fragments and CHANGELOG.md are tracked files.)",
+            f"changelog.d: interrupted mid-fold ({exc!r}); every "
+            "already-removed fragment and CHANGELOG.md have been restored, so "
+            "nothing was lost and a rerun is correct. (After a hard kill, "
+            "recover with git: the fragments and CHANGELOG.md are tracked "
+            "files.)",
             file=sys.stderr,
         )
-        if not isinstance(exc, (OSError, FragmentError)):
+        # UnicodeDecodeError included: a fragment rewritten as non-UTF-8
+        # mid-run must exit as the documented single-line + status 2, not a
+        # traceback the CI job cannot classify.
+        if not isinstance(exc, (OSError, FragmentError, UnicodeDecodeError)):
             raise  # Ctrl-C etc. must still terminate as what they are
         return 2
     print(

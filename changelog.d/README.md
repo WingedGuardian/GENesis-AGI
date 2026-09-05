@@ -25,8 +25,12 @@ with and without a `merge=union` attribute present.
     changelog.d/<YYYYMMDDHHMMSS>-<category>-<slug>.md
 
 - **Timestamp** — UTC, from `date -u +%Y%m%d%H%M%S`. It is the sort key within a
-  category, and it is why two branches never pick the same name. Same convention
-  as migration ids, for the same reason.
+  category, and it is what makes two branches picking the same name unlikely —
+  not impossible: one-second resolution means two branches writing the same
+  category and slug in the same second collide. That collision is an ordinary
+  git add/add conflict, which git itself reports and a human resolves by
+  renaming one file; nothing is lost silently. Same convention as migration
+  ids, for the same reason.
 - **Category** — one of `added`, `changed`, `deprecated`, `removed`, `fixed`,
   `security` (Keep a Changelog).
 - **Slug** — lowercase, dash-separated. For humans scanning the directory.
