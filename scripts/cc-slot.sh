@@ -560,8 +560,23 @@ fi
 # into the session, which is worse than not pinning it (CC would resolve an
 # empty TMPDIR rather than fall back to the system default).
 _TMPDIR_PIN=()
+_TMPDIR_UNSET=""
 if [ -n "${TMPDIR:-}" ]; then
     _TMPDIR_PIN=(-e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" -e "TMPDIR=$TMPDIR")
+else
+    # OMITTING the pins is not the same as having no value. A new session takes
+    # its environment from the tmux SERVER (the inheritance measured above), so
+    # with no pin the pane silently gets whatever that server holds — including a
+    # stale `~/.genesis/cc-tmp` that we just rejected as unusable. The only way
+    # to actually leave CC on the system default is to unset both names INSIDE
+    # the pane. Joined with `&&`, not `;`, so a failed `cd` still skips claude
+    # (test_cd_guard_skips_claude_on_bad_cd); `unset` cannot fail, so it never
+    # blocks the launch. With these two branches the pane's temp environment is
+    # explicitly determined in BOTH directions — there is no third case.
+    # (Referenced as ${_TMPDIR_UNSET:-} below: the launch line is extracted
+    # and evaluated under `set -u` by the oauth tests, where a bare
+    # ${_TMPDIR_UNSET} would be unbound.)
+    _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
 fi
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
@@ -569,4 +584,4 @@ exec tmux -u new-session -A -s "$SESSION_NAME" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

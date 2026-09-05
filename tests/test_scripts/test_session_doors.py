@@ -197,6 +197,14 @@ class TestManualMode:
                 cand.chmod(0o700)  # so tmp_path teardown can clean up
         assert proc.returncode == 0, proc.stderr
         body = log.read_text()
+        # Omission is not absence: with no `-e` pin the pane would take the tmux
+        # SERVER's value, which may be the very directory just rejected. The pane
+        # command must unset both names explicitly, joined with `&&` so a failed
+        # `cd` still skips claude.
+        assert "unset TMPDIR CLAUDE_CODE_TMPDIR &&" in body, (
+            f"no -e pin AND no unset: the pane inherits the server's stale temp "
+            f"dir, so 'system default' is false:\n{body}"
+        )
         assert "INHERITED_TMPDIR=[<unset>]" in body, (
             "the door handed tmux an exported TMPDIR when none was usable; an "
             f"empty one poisons the server it starts:\n{body}\n{proc.stderr}"
