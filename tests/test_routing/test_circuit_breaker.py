@@ -1195,10 +1195,10 @@ class TestOpenDurationCapByCategory:
         # partition passes: moving TIMEOUT into the long set would leave this
         # test and test_every_other_category_gets_the_short_cap both green
         # while a transient error held the 4h cap.
-        assert _LONG_OPEN_CATEGORIES == {
+        assert {
             ErrorCategory.QUOTA_EXHAUSTED,
             ErrorCategory.NOT_ENTITLED,
-        }, "membership changed — a category gained or lost the 4h cap"
+        } == _LONG_OPEN_CATEGORIES, "membership changed — a category gained or lost the 4h cap"
         for category in _LONG_OPEN_CATEGORIES:
             assert self._tripped_cap(category) == _MAX_QUOTA_OPEN_S, category
 
