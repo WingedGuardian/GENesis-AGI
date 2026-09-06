@@ -108,6 +108,7 @@ import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -1034,6 +1035,10 @@ _INLINE_REVIEW_BOTS = {
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+# A finding title is a one-line PREVIEW in a list of them; the full body is on
+# the PR, so this bounds a pointer-backed value rather than cutting the only
+# copy. `_inline_title` states the cut when it makes one.
+_INLINE_TITLE_MAX_CHARS = 120
 
 # ── Documentation-path allowlist for review findings (ledger 54eb3752) ───────
 # A P1 inline finding on a DOCUMENTATION file is not a code defect and must not
@@ -1201,11 +1206,55 @@ def _is_sqlite_write(cmd: str) -> bool:
 
 
 def _inline_title(body: str) -> str:
-    """First readable line of an inline finding body."""
+    """First readable line of an inline finding body, SAFE to print.
+
+    Sanitising happens HERE, at the producer, rather than at each consumer.
+    Every title that reaches a terminal comes through this function —
+    ``_coderabbit_title`` delegates to it, the blocking message is built from
+    it, and so are the eight advisory ``print(..., file=sys.stderr)`` sites in
+    ``_check_inline_review_findings``. A fix applied per-consumer is a
+    CONVENTION each future call site has to remember, and this file already
+    has eight places that would have had to remember it.
+
+    MEASURED before the sanitising moved here: a LONE P2 — which scores 0.5,
+    does NOT block, and so renders on a run whose verdict the operator reads as
+    passing — printed its title raw. A title carrying CR + ``ESC[2K`` redrew the
+    line as a counterfeit ``merge-with :`` command with ``--match-head-commit``
+    absent, stripping the TOCTOU binding from a command the operator is told to
+    copy verbatim. The non-blocking path was the dangerous one.
+    """
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
-    return (first[0].strip() if first else "")[:120]
+    return _safe_title(first[0].strip() if first else "")
+
+
+def _safe_title(raw: str) -> str:
+    """Defang and bound one finding title. BOTH producers end here.
+
+    This exists because "sanitise at the producer" was implemented once and was
+    still wrong: `_inline_title` was treated as the single producer on the
+    strength of `_coderabbit_title` ENDING with `return _inline_title(body)`.
+    It has an EARLIER return for the bold-title line, which is the path a
+    CodeRabbit finding actually takes — so the common case never reached the
+    sanitiser. MEASURED: a hostile bold title came back through
+    `_coderabbit_title` with CR, ESC, RLO and ZWSP intact while the same body
+    through `_inline_title` came back clean (CodeRabbit Major, PR #1638, round 3
+    — on the fix for round 2's finding).
+
+    The lesson is in the shape, not the instance: a function ending in a
+    delegation does not delegate on every path, and "there is one producer" is a
+    claim about EVERY return statement. Both producers now converge here, and
+    `test_no_title_producer_returns_unsanitised_text` walks the AST to keep it
+    that way rather than trusting the next reader to notice.
+    """
+    safe = "".join(" " if _gate_text_unsafe(ch) else ch for ch in raw)
+    if len(safe) <= _INLINE_TITLE_MAX_CHARS:
+        return safe
+    # A title is a PREVIEW whose full text is one click away on the PR, so
+    # bounding it is a selection rather than an amputation — but say that a cut
+    # happened, so a clipped title is never read as the whole finding.
+    return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _cr_severity(body: str) -> tuple[str | None, bool]:
@@ -1438,7 +1487,11 @@ def _coderabbit_title(body: str) -> str:
             continue
         stripped = line.strip()
         if stripped.startswith("**") and stripped.rstrip("*").strip():
-            return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
+            # Through _safe_title, NOT a bare slice: this is the branch a real
+            # CodeRabbit finding takes, so it is the one that matters most.
+            return _safe_title(
+                _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()
+            )
     return _inline_title(body)
 
 
@@ -6449,7 +6502,7 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — base branch is not the repo default.",
                         file=sys.stderr,
                     )
-                    print(base_msg, file=sys.stderr)
+                    print(_defang_gate_text(base_msg), file=sys.stderr)
                     return 2
 
                 # Pin receipts. This is the AUTHORITY for the two release gates
@@ -6475,7 +6528,7 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — CC pin gate refused this merge.",
                         file=sys.stderr,
                     )
-                    print(receipts_msg, file=sys.stderr)
+                    print(_defang_gate_text(receipts_msg), file=sys.stderr)
                     return 2
                 elif receipts_msg.startswith("NOTE:"):
                     # A NOTE means the gate did NOT verify the receipts and is allowing the
@@ -6484,7 +6537,7 @@ def main() -> int:
                     # prints its note, and this one silently discarded seven of them, which
                     # made "the residue is narrow and named" false at the only surface a
                     # human reads.
-                    print(receipts_msg, file=sys.stderr)
+                    print(_defang_gate_text(receipts_msg), file=sys.stderr)
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6505,7 +6558,7 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — Codex has not reviewed the current head.",
                         file=sys.stderr,
                     )
-                    print(fresh_msg, file=sys.stderr)
+                    print(_defang_gate_text(fresh_msg), file=sys.stderr)
                     return 2
 
                 # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
@@ -6544,7 +6597,12 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — review-body gate did not pass.",
                         file=sys.stderr,
                     )
-                    print(review_msg, file=sys.stderr)
+                    # Sanitised for the same reason the report path is: this stderr is
+                    # what a human reads when a merge is blocked, and it is the other
+                    # consumer of the same gate messages. (review_msg's tail is
+                    # hardcoded pattern strings today, not attacker text — routed
+                    # anyway so the two arms cannot drift apart again.)
+                    print(_sanitize_gate_text(review_msg), file=sys.stderr)
                     return 2
 
                 # Inline review comments (Codex P1/P2 badges) — separate
@@ -6560,7 +6618,12 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} — inline review gate did not pass.",
                         file=sys.stderr,
                     )
-                    print(inline_msg, file=sys.stderr)
+                    # inline_msg carries `_inline_title` output — attacker-influencable
+                    # PR-comment text — so it gets the same treatment as the report
+                    # path. `_inline_title` already guarantees no embedded \n, so this
+                    # arm could not forge a LINE; \r and ESC could still overwrite or
+                    # recolour the BLOCKED: line a human is reading to decide.
+                    print(_sanitize_gate_text(inline_msg), file=sys.stderr)
                     return 2
 
                 # Scheduled Claude review at HEAD — its OWN fail-closed gate with its OWN
@@ -6597,7 +6660,7 @@ def main() -> int:
                         f"missing at the current head.",
                         file=sys.stderr,
                     )
-                    print(sched_msg, file=sys.stderr)
+                    print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
@@ -6710,6 +6773,164 @@ def _parse_check_pr_repo(argv: list[str]):
     return None
 
 
+# Bounds and sanitisation for every surface that renders a gate message. A gate
+# message can carry text lifted from PR review comments (`_inline_title`), so it is
+# untrusted wherever it is printed — the REPORT's stdout and the merge-enforcement
+# arm's stderr alike. One sanitiser serves both: a fix applied to only one of two
+# consumers of the same untrusted data is the shape of bug this whole change exists
+# to remove.
+_GATE_TEXT_MAX_LINES = 40
+_GATE_TEXT_MAX_CHARS = 200
+# How many lines are kept from the END when the cap bites. A gate's recovery
+# instruction is the last thing it prints, so the tail is the half that must
+# survive; 8 covers the longest such trailer measured (the scheduled-review
+# marker explanation, 6 lines).
+_GATE_TEXT_TAIL_LINES = 8
+# Same reasoning one dimension down. A gate line puts its remediation at the END
+# ("… or append '# stale-review-override' to merge anyway."), so when a single
+# line runs past the cap the tail is the half worth keeping. 80 covers the
+# longest such trailer measured on a real message (the codex-at-head override
+# sentence, 62 characters).
+_GATE_TEXT_TAIL_CHARS = 80
+# Everything a terminal would ACT on rather than display, plus everything
+# CLASSIFIED, not enumerated. The previous version listed the ranges it knew
+# about, and an enumeration of a Unicode property is a list that is wrong the
+# moment the property has a member nobody listed: U+061C ARABIC LETTER MARK is a
+# bidi-formatting character and sat outside every range here, so a finding title
+# carrying it reached the operator's terminal able to reorder the line around it
+# (Codex P2, PR #1638). Widening the list by one range would have fixed that
+# character and left the class.
+#
+# What must be stripped, stated as the property rather than as codepoints:
+#   Cc  C0/C1 controls + DEL — includes \t (fake column alignment), \x1b (ESC:
+#       strips the lead byte of ANSI CSI/OSC sequences, leaving them inert text),
+#       \x0b/\x1c-\x1e and \u0085 NEL (all `splitlines()` breaks)
+#   Cf  every format character — the bidi embeddings/overrides/isolates that
+#       visually REORDER a line without changing its bytes, the zero-width
+#       family, LRM/RLM, ALM, the BOM, and the Unicode tag block
+#   Zl  U+2028 LINE SEPARATOR
+#   Zp  U+2029 PARAGRAPH SEPARATOR
+# `unicodedata` is the canonical answer to "which characters are these", and it
+# tracks the standard without anyone re-reading it.
+_GATE_TEXT_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _gate_text_unsafe(char: str) -> bool:
+    return unicodedata.category(char) in _GATE_TEXT_UNSAFE_CATEGORIES
+
+
+def _defang_gate_text(text: str) -> str:
+    """Neutralise terminal-acting characters WITHOUT bounding the length.
+
+    Two different risks travel in gate output and they want different answers.
+    FORGERY — a control character that makes a terminal redraw, reorder or hide
+    a line — is a property of any embedded untrusted value, so it is stripped
+    unconditionally, here and in ``_sanitize_gate_text`` alike. FLOODING — a
+    message so long it pushes the verdict off the screen — is a property of a
+    message an attacker CONTROLS END TO END, which a gate's own message is not.
+
+    So the enforcement arm gets this and the report gets the bounded variant.
+    A gate message is repo-authored prose whose LAST clause is the operator's
+    remediation route ("… or append '# stale-review-override' …"); bounding it
+    would cost something real to defend against nothing. What it does carry is
+    embedded untrusted VALUES — a scheduled-review marker's field quoted back
+    verbatim, a branch name from the API — and those can still act on a
+    terminal, which is exactly what this strips.
+
+    Splits on ``\\n`` first for the same reason ``_sanitize_gate_text`` does:
+    ``\\n`` is category Cc, so cleaning the raw string would flatten every
+    multi-line gate message into one line.
+    """
+    return "\n".join(
+        "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
+        for line in text.split("\n")
+    )
+
+
+def _sanitize_gate_text(text: str) -> str:
+    """Make an untrusted gate message safe to print, bounded in both dimensions.
+
+    Splits on ``\\n`` and NOT ``splitlines()``, deliberately, to match the producer:
+    ``_inline_title`` takes ``body.split("\\n")[0]`` precisely so that a NEL inside a
+    comment body cannot shift which line is treated as the title. Sanitising with the
+    wider ``splitlines()`` model would disagree with it, and that disagreement is
+    exploitable \u2014 a single finding title could forge an extra output line, and a
+    counterfeit ``merge-with :`` line WITHOUT ``--match-head-commit`` would strip the
+    TOCTOU binding from a command the operator is told to copy verbatim.
+
+    Returns the text with unsafe characters replaced by spaces, and BOTH dimensions
+    bounded the same way — head, a stated omission, tail — so a hostile message can
+    neither forge structure nor flood the verdict off the screen, and no bound ever
+    removes an operator's recovery instruction without saying it did.
+    """
+    def _clean(line: str) -> str:
+        cleaned = "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
+        if len(cleaned) <= _GATE_TEXT_MAX_CHARS:
+            return cleaned
+        # SELECT, do not amputate — the same rule the LINE dimension below already
+        # follows, applied to characters. A plain head-slice was silent and cut
+        # mid-word: MEASURED on the real codex-at-head message, a 532-char line
+        # arrived as 200 characters ending "…to merge without a", losing the
+        # '# stale-review-override' route it exists to hand the operator, with no
+        # marker to say anything had been dropped. A gate that tells someone they
+        # are blocked and not how to proceed has failed at the only job the detail
+        # line has.
+        kept = _GATE_TEXT_MAX_CHARS - _GATE_TEXT_TAIL_CHARS
+        omitted = len(cleaned) - kept - _GATE_TEXT_TAIL_CHARS
+        return (
+            f"{cleaned[:kept]} … {omitted} char(s) omitted … "
+            f"{cleaned[-_GATE_TEXT_TAIL_CHARS:]}"
+        )
+
+    lines = [_clean(ln) for ln in text.split("\n")]
+    if len(lines) <= _GATE_TEXT_MAX_LINES:
+        return "\n".join(lines)
+    # SELECT, do not amputate. A plain head-slice drops the TAIL, and the tail is
+    # where every gate puts its recovery instruction — the one line the operator
+    # needs. MEASURED shape: a PR with many stale/refused/malformed scheduled-review
+    # markers produces enough detail rows to push "Or append '# scheduled-review-
+    # override' to merge without the missing review(s)" past the cap, so the reader
+    # is told they are blocked and not how to proceed. Keeping both ends preserves
+    # the flood protection the cap exists for while losing nothing actionable, and
+    # the omission is STATED rather than silent.
+    head = _GATE_TEXT_MAX_LINES - _GATE_TEXT_TAIL_LINES - 1
+    omitted = len(lines) - head - _GATE_TEXT_TAIL_LINES
+    return "\n".join(
+        [
+            *lines[:head],
+            f"  … {omitted} more line(s) omitted here to bound this output …",
+            *lines[-_GATE_TEXT_TAIL_LINES:],
+        ]
+    )
+
+
+def _print_gate_detail(msg: str) -> None:
+    """Render lines 1+ of a gate message underneath its one-line report line.
+
+    Every blocking gate message follows the same shape: line 0 SUMMARIZES and the
+    lines below carry the actual diagnosis — which findings, which patterns, which
+    cause. `check_pr_report` prints only line 0, so a gate whose summary ends in a
+    colon reads as a sentence with its object cut off.
+
+    MEASURED 2026-09-02 on PR #1611: `inline-findings: BLOCK — review score 1.0 >=
+    1.0 blocks (...): 1 unresolved [P1] + 0 unresolved [P2] finding(s), none
+    maintainer-replied:` and then nothing. The P1's title is in `msg` line 1 and was
+    discarded. An operator is told a P1 blocks and never told WHICH — on the surface
+    that exists precisely to tell them what to act on.
+
+    Two gates already open-coded this loop (pin-receipts, scheduled-claude) and three
+    did not (review-body, inline-findings, codex-at-head) — which is the whole bug.
+    Every message-bearing gate goes through here so a new one inherits the behaviour
+    instead of re-deciding it; `TestReportRendersGateDetail` locks that in BOTH
+    directions (nobody re-implements the loop; nobody forgets to call it).
+
+    The message is untrusted — it can carry inline review-comment titles — so it goes
+    through `_sanitize_gate_text` first; see that function for what and why.
+    """
+    for line in _sanitize_gate_text(msg).split("\n")[1:]:
+        print("  " + line)
+
+
 def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     """CANONICAL pre-merge report: run the SAME checks the merge gate enforces.
 
@@ -6758,6 +6979,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    if blocked:
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
     # a check run completes, so only a merge-time read describes the body that
@@ -6767,8 +6990,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
     )
     if blocked:
-        for line in msg.splitlines()[1:]:
-            print(f"  {line}")
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
@@ -6802,6 +7024,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         else:
             label = "ok (current)"
     print(f"codex-at-head  : {label}")
+    if blocked:
+        # The tail is the ONLY remediation text this gate gives: "@codex review then
+        # wait", the `# stale-review-override` route, and the `git log <reviewed>..<head>`
+        # command for inspecting the unreviewed commits. The merge-enforcement arm
+        # already prints the whole message, so dropping it here made the report and the
+        # gate disagree on exactly one gate.
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
@@ -6843,18 +7072,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # cause it was live on lines 1+. Printing only line 0 means every improvement to
         # them is invisible here, which is where the mistake was actually made.
         if sched_msg:
-            for line in sched_msg.splitlines()[1:]:
-                print(f"  {line}")
+            _print_gate_detail(sched_msg)
         failures += 1 if sched_msg else 0
     # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
     # shows as a failure here, never as "ok" — the report must not issue a false all-clear.
     blocked, msg = _check_pr_review_findings(pr_num, repo=repo)
     print(f"review-body    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok'}")
+    if blocked:
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
     print(
         f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
     )
+    if blocked:
+        _print_gate_detail(msg)
     failures += 1 if blocked else 0
     # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding

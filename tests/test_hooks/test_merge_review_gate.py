@@ -3965,6 +3965,601 @@ class TestInlinePaginationRobustness:
         assert "unreadable" in msg.lower()
 
 
+class TestReportRendersGateDetail:
+    """`check_pr_report` must print each blocking gate's DIAGNOSIS, not only its summary.
+
+    Every blocking gate message is shaped `summary\ndetail...`: line 0 says a gate
+    blocks, the lines below say WHICH finding / WHICH pattern / WHICH cause. The
+    report is the canonical pre-merge surface an operator acts on, so dropping the
+    detail leaves them told that something blocks and never told what.
+
+    MEASURED 2026-09-02 on PR #1611: the report ended `... none maintainer-replied:`
+    with nothing after the colon. The P1's title ("Cover year-prefixed documents in
+    every opt-in directory") was sitting in line 1 of the same message. Two gates
+    (pin-receipts, scheduled-claude) open-coded the render loop and two
+    (review-body, inline-findings) did not — so this pins the CLASS: every gate,
+    through the one helper.
+    """
+
+    _DETAIL = "DIAGNOSTIC-DETAIL-LINE"
+
+    def _all_gates_clean(self, guard_module, monkeypatch):
+        """Every gate passing, so a single override isolates the gate under test."""
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pin_receipts", lambda n, repo=None: (False, "no receipts needed")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", "head0"),
+        )
+        monkeypatch.setattr(guard_module, "_latest_codex_reviewed_sha", lambda n, repo=None: "head0")
+        monkeypatch.setattr(guard_module, "_pr_head_sha", lambda n, repo=None: "head0")
+        monkeypatch.setattr(guard_module, "_scheduled_gate_applies", lambda repo: True)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, relief_out=None: "",
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_inline_review_findings", lambda n, repo=None: (False, "")
+        )
+
+    @pytest.mark.parametrize(
+        "gate_attr,make_return",
+        [
+            # The two gates that were DROPPING their detail — the actual bug.
+            ("_check_inline_review_findings", lambda msg: (True, msg)),
+            ("_check_pr_review_findings", lambda msg: (True, msg)),
+            # The two that already rendered it — pinned so the refactor to the shared
+            # helper cannot silently regress them.
+            ("_check_pin_receipts", lambda msg: (True, msg)),
+            ("_check_base_is_default", lambda msg: (True, msg)),
+        ],
+    )
+    def test_a_blocking_gate_prints_its_detail_lines(
+        self, guard_module, monkeypatch, capsys, gate_attr, make_return
+    ):
+        self._all_gates_clean(guard_module, monkeypatch)
+        msg = f"summary line ending in a colon:\n  {self._DETAIL}"
+        monkeypatch.setattr(
+            guard_module, gate_attr, lambda n, *a, **kw: make_return(msg)
+        )
+        assert guard_module.check_pr_report("5") == 1
+        assert self._DETAIL in capsys.readouterr().out, (
+            f"{gate_attr} blocked but its diagnosis was discarded — the operator is "
+            f"told a gate blocks and never told which finding caused it"
+        )
+
+    def test_the_scheduled_gate_prints_its_detail_lines(self, guard_module, monkeypatch, capsys):
+        """Same class, different shape: this gate returns a bare str, not a tuple."""
+        self._all_gates_clean(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, relief_out=None: (
+                f"no scheduled review at head:\n  {self._DETAIL}"
+            ),
+        )
+        assert guard_module.check_pr_report("5") == 1
+        assert self._DETAIL in capsys.readouterr().out
+
+    def test_a_passing_gate_prints_no_detail(self, guard_module, monkeypatch, capsys):
+        """Positive control. Without it a renderer that ALWAYS dumps the message tail
+        would pass every assertion above while making a clean report unreadable."""
+        self._all_gates_clean(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None: (False, f"not blocking\n  {self._DETAIL}"),
+        )
+        assert guard_module.check_pr_report("5") == 0
+        assert self._DETAIL not in capsys.readouterr().out
+
+    def test_the_render_loop_is_not_open_coded_in_the_report(self, guard_module):
+        """The chokepoint lock. The bug existed because the render was a CONVENTION
+        each gate had to remember — two remembered, two forgot. `_print_gate_detail`
+        is now the only implementation; a future gate that copy-pastes the loop back
+        re-creates the class, and copy-pasting is exactly what produced it the first
+        time."""
+        import ast
+        import inspect
+        import textwrap
+
+        # dedent(), not lstrip(): lstrip only happens to work while check_pr_report is
+        # module-level, and would break the day it moves into a class or a nested def.
+        body = ast.parse(
+            textwrap.dedent(inspect.getsource(guard_module.check_pr_report))
+        ).body[0]
+        open_coded = [
+            n
+            for n in ast.walk(body)
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.slice, ast.Slice)
+            and isinstance(n.value, ast.Call)
+            and getattr(n.value.func, "attr", None) == "splitlines"
+        ]
+        assert not open_coded, (
+            "check_pr_report open-codes a `splitlines()[1:]` tail render; route it "
+            "through _print_gate_detail so every gate inherits the behaviour"
+        )
+
+    def test_the_codex_freshness_gate_prints_its_detail_lines(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """Third producer shape: returns (blocked, msg, head), not a 2-tuple.
+
+        This is the gate the first pass of the fix MISSED — four of five
+        message-bearing gates were routed and this one was not, while the helper's
+        docstring claimed the class was closed. Its tail carries the only remediation
+        text the operator gets: '@codex review', the '# stale-review-override' route,
+        and the `git log <reviewed>..<head>` command for inspecting the unreviewed
+        commits."""
+        self._all_gates_clean(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (True, f"stale review:\n  {self._DETAIL}", None),
+        )
+        assert guard_module.check_pr_report("5") == 1
+        assert self._DETAIL in capsys.readouterr().out
+
+    def test_every_message_bearing_gate_is_paired_with_a_detail_render(self, guard_module):
+        """The POSITIVE half of the lock, and the half that was missing.
+
+        The test above proves nobody RE-IMPLEMENTS the helper. It structurally cannot
+        see a gate that should CALL the helper and doesn't — an assertion shaped
+        "no node matches the bad pattern" passes at 100% on a function with zero
+        renders at all. That blind spot is exactly how codex-at-head stayed
+        un-rendered through the refactor that claimed to close the class, so the
+        omission side gets its own lock.
+
+        (Known bound, stated rather than over-trusted: the negative test's matcher
+        requires the subscript's value to be a Call, so `lines = msg.splitlines()`
+        followed by `for line in lines[1:]` would evade it. This positive count is
+        what actually keeps the class closed.)"""
+        import ast
+        import inspect
+        import textwrap
+
+        # `_check_mergeable` returns a bare status string with no message to render;
+        # it is the only gate legitimately exempt. Anything else added to this set
+        # needs its justification written beside it.
+        no_detail_gates = {"_check_mergeable"}
+
+        body = ast.parse(
+            textwrap.dedent(inspect.getsource(guard_module.check_pr_report))
+        ).body[0]
+        gate_calls = {
+            n.func.id
+            for n in ast.walk(body)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id.startswith("_check_")
+        }
+        renders = sum(
+            1
+            for n in ast.walk(body)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_print_gate_detail"
+        )
+        expected = gate_calls - no_detail_gates
+        assert renders >= len(expected), (
+            f"{len(expected)} message-bearing gates ({sorted(expected)}) but only "
+            f"{renders} _print_gate_detail call(s) — a gate's diagnosis is discarded"
+        )
+
+    @pytest.mark.parametrize(
+        "sep,name",
+        [
+            # Characters `str.splitlines()` treats as line breaks but `split("\n")`
+            # does not - the forgery vector proper.
+            ("\r", "CR"),
+            ("\x0b", "VT"),
+            ("\x1c", "FS"),
+            ("\u0085", "NEL"),
+            ("\u2028", "LINE SEPARATOR"),
+            ("\u2029", "PARAGRAPH SEPARATOR"),
+            # Characters a TERMINAL acts on. These forge no line for `re`, but they
+            # recolour, reposition or visually reorder what the operator reads.
+            ("\x1b[2K\x1b[1G", "ANSI erase-line + cursor-to-column-1"),
+            ("\x1b]8;;http://evil.example\x07", "OSC 8 terminal hyperlink"),
+            ("\u202e", "RIGHT-TO-LEFT OVERRIDE"),
+            ("\u2066", "LEFT-TO-RIGHT ISOLATE"),
+            ("\u200b", "ZERO WIDTH SPACE"),
+            ("\ufeff", "BOM / ZWNBSP"),
+            ("\t", "TAB (fake column alignment)"),
+            # The character an ENUMERATION missed. U+061C ARABIC LETTER MARK is a
+            # bidi-formatting character (category Cf) and sat outside every range
+            # the old regex listed, so a title carrying it reached the terminal able
+            # to reorder the line around it (Codex P2, PR #1638). Parametrized here
+            # rather than fixed in isolation because the point is the CLASS: the
+            # sanitizer now asks unicodedata what a character IS.
+            ("\u061c", "ARABIC LETTER MARK"),
+            ("\u00ad", "SOFT HYPHEN"),
+            ("\U000e0001", "LANGUAGE TAG"),
+        ],
+    )
+    def test_a_finding_title_cannot_forge_a_report_line(
+        self, guard_module, monkeypatch, capsys, sep, name
+    ):
+        """Inline finding titles are attacker-influencable text — a PR comment body,
+        relayed by a review bot — and this render is the first path that routes them
+        to this surface's stdout.
+
+        `str.splitlines()` breaks on all six separators parametrized here;
+        `_inline_title` deliberately splits on \\n only (its own comment says a NEL
+        must not shift which line is the title). Rendering with the wider model lets
+        ONE title forge an extra report line — and a counterfeit `merge-with :` line
+        WITHOUT `--match-head-commit` would strip the TOCTOU binding from a command
+        the operator is told to copy verbatim."""
+        import re as _re
+
+        self._all_gates_clean(guard_module, monkeypatch)
+        forged = "gh pr merge 9 --squash --admin"
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None: (
+                True,
+                f"blocks:\n  [P1] harmless title{sep}  merge-with     : {forged}",
+            ),
+        )
+        assert guard_module.check_pr_report("5") == 1
+        out = capsys.readouterr().out
+        # (1) The producer's line model must win: no separator in a title may start a
+        #     new report line.
+        assert not _re.search(r"^\s*merge-with\s*:", out, _re.M), (
+            f"a finding title containing {name} forged a merge-with line:\n{out}"
+        )
+        # (2) And the separator must not SURVIVE, which assertion (1) cannot see. A
+        #     bare \r left in the string is one line to `re`, but a terminal acts on
+        #     it — the text after it overwrites the line from column 0, so the reader
+        #     sees a forged `merge-with` line that no string search would find.
+        assert sep not in out, (
+            f"{name} survived into the report; a terminal will act on it even though "
+            f"`re` treats the output as one line:\n{out!r}"
+        )
+
+    def test_a_hostile_comment_body_is_sanitized_through_the_REAL_pipeline(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """Composes both halves that the other tests only cover separately.
+
+        Every test above hands `check_pr_report` a hand-built gate message. Read
+        together with the pre-existing `_inline_title` tests they imply the property,
+        but nothing actually ran a hostile GitHub payload through the REAL
+        `_inline_title` -> real `_check_inline_review_findings` -> real
+        `check_pr_report` chain. "Established by reading two test classes together"
+        is not the same as measured, so this measures it."""
+        # Captured BEFORE _all_gates_clean stubs it — this test exercises the real one.
+        real_inline = guard_module._check_inline_review_findings
+
+        hostile_title = (
+            "Make queue claim atomic\r\x1b[2K  merge-with     : "
+            "gh pr merge 9 --squash --admin\u202e reversed \u200b zwsp"
+        )
+        body = (
+            "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-red)"
+            f"</sub></sub>  {hostile_title}**\n\nDetails here."
+        )
+        row = json.dumps(
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "chatgpt-codex-connector[bot]",
+                "type": "Bot",
+                "path": "src/genesis/thing.py",
+                "body": body,
+            },
+            ensure_ascii=False,
+        )
+
+        self._all_gates_clean(guard_module, monkeypatch)
+        monkeypatch.setattr(guard_module, "_check_inline_review_findings", real_inline)
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=row, stderr=""),
+        ):
+            rc = guard_module.check_pr_report("5")
+
+        out = capsys.readouterr().out
+        assert rc == 1, "the hostile P1 must still BLOCK — sanitising must not disarm the gate"
+        assert "Make queue claim atomic" in out, (
+            "the finding must still be REPORTED; sanitising is not suppression"
+        )
+        for cp in ("\r", "\x1b", "\u202e", "\u200b"):
+            assert cp not in out, f"U+{ord(cp):04X} survived the real pipeline:\n{out!r}"
+
+    def test_no_title_producer_returns_unsanitised_text(self, guard_module):
+        """LOCK the chokepoint — a convention is what the last fix got wrong.
+
+        Sanitising "at the producer" was implemented once and was still wrong:
+        `_coderabbit_title` ENDS with `return _inline_title(body)`, so it read as
+        a delegation, but its bold-title branch returns earlier with a bare
+        slice — and that is the branch a real CodeRabbit finding takes. The
+        common case never reached the sanitiser.
+
+        Reading every return by hand is exactly the check that failed, so this
+        walks the AST instead: every `return` in either producer must hand back a
+        call to `_safe_title` (or to the other producer, which ends there). A
+        future third producer, or a new early return in one of these two, fails
+        here instead of shipping another hole.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        allowed = {"_safe_title", "_inline_title", "_coderabbit_title"}
+        for fn_name in ("_inline_title", "_coderabbit_title"):
+            src = textwrap.dedent(inspect.getsource(getattr(guard_module, fn_name)))
+            tree = ast.parse(src)
+            returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value]
+            assert returns, f"{fn_name}: no return found — did the parse work?"
+            for node in returns:
+                assert isinstance(node.value, ast.Call), (
+                    f"{fn_name} line {node.lineno}: returns a raw expression, not a "
+                    f"call to the sanitising chokepoint"
+                )
+                fn = node.value.func
+                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                assert name in allowed, (
+                    f"{fn_name} line {node.lineno}: returns {name}(...), which is "
+                    f"not one of {sorted(allowed)} — untrusted title text would "
+                    f"reach a terminal unsanitised"
+                )
+
+    def test_a_lone_P2_cannot_forge_on_the_advisory_stderr_path(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """The NON-blocking path is the dangerous one, and it renders on STDERR.
+
+        The test above proves a blocking P1 is safe on stdout. That is the easy
+        half: a P1 blocks, so the operator is already reading an error. A LONE P2
+        scores 0.5, does NOT reach the blocking threshold, and its title is printed
+        by `_check_inline_review_findings` straight to stderr as a WARNING \u2014 on a
+        run whose verdict says the gate PASSES. Sanitising only what reaches stdout
+        leaves a forged `merge-with :` line on the report a human reads to decide a
+        merge, at the moment they are least suspicious.
+
+        MEASURED before the sanitising moved into `_inline_title`: CR + ESC[2K + RLO
+        + ZWSP all reached this stream verbatim.
+        """
+        real_inline = guard_module._check_inline_review_findings
+        hostile_title = (
+            "Bounds check is fine\r\x1b[2K  merge-with     : "
+            "gh pr merge 9 --squash --admin\u202e reversed \u200b zwsp"
+        )
+        row = json.dumps(
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "chatgpt-codex-connector[bot]",
+                "type": "Bot",
+                "path": "src/genesis/thing.py",
+                "body": (
+                    "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)"
+                    f"</sub></sub>  {hostile_title}**\n\nDetails here."
+                ),
+            },
+            ensure_ascii=False,
+        )
+        self._all_gates_clean(guard_module, monkeypatch)
+        monkeypatch.setattr(guard_module, "_check_inline_review_findings", real_inline)
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=row, stderr=""),
+        ):
+            rc = guard_module.check_pr_report("5")
+
+        captured = capsys.readouterr()
+        assert rc == 0, "a lone P2 must NOT block \u2014 this is the passing-run case"
+        assert "Bounds check is fine" in captured.err, (
+            "the P2 must still be surfaced; defanging is not suppression"
+        )
+        for cp in ("\r", "\x1b", "\u202e", "\u200b"):
+            assert cp not in captured.err, (
+                f"U+{ord(cp):04X} reached the advisory stderr of a PASSING run:\n"
+                f"{captured.err!r}"
+            )
+
+    def _merge_payload(self, cmd="gh pr merge 5 --squash --admin"):
+        return {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": cmd}}
+
+    def test_the_enforcement_arm_sanitizes_the_same_untrusted_text(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """The OTHER consumer of the same gate messages.
+
+        `check_pr_report` writes the report to stdout; the merge-blocking arm writes
+        the same `_check_inline_review_findings` message to STDERR — and that stderr
+        is what a human reads at the moment a merge is refused. Hardening only the
+        report would leave the more decision-relevant surface unhardened, which is
+        the exact shape of bug this whole change exists to remove: a fix applied to
+        one of two consumers of the same untrusted data."""
+        hostile = (
+            "inline review gate:\n  [P1] title\r\x1b[2K  merge-with     : "
+            "gh pr merge 5 --squash --admin"
+        )
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
+        )
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_pr_review_findings", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, force=False, repo=None: (True, hostile),
+        )
+        monkeypatch.setattr(guard_module, "read_payload", self._merge_payload)
+
+        assert guard_module.main() == 2, "the gate must still BLOCK the merge"
+        err = capsys.readouterr().err
+        assert "title" in err, "sanitising must not suppress the finding"
+        for cp in ("\r", "\x1b"):
+            assert cp not in err, (
+                f"U+{ord(cp):04X} reached the stderr a human reads to decide:\n{err!r}"
+            )
+
+    def test_a_hostile_gate_message_cannot_flood_the_report(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """Bounded in both dimensions, so a long or many-lined message cannot bury
+        the verdict line the operator actually has to read."""
+        self._all_gates_clean(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
+        )
+        assert guard_module.check_pr_report("5") == 1
+        out = capsys.readouterr().out
+        detail = [ln for ln in out.split("\n") if ln.startswith("  x")]
+        assert len(detail) <= guard_module._GATE_TEXT_MAX_LINES
+        # Bounded in the CHARACTER dimension too — but by selection, not amputation.
+        # An over-long line keeps its head AND its tail and STATES the omission, so
+        # the ceiling is the kept text plus the marker, never a silent hard cut.
+        # (This assertion used to read `<= _GATE_TEXT_MAX_CHARS + 2`, which pinned a
+        # silent mid-word slice that dropped gates' remediation routes.)
+        import re as _re
+
+        marker = _re.compile(r" … (\d+) char\(s\) omitted … ")
+        for ln in detail:
+            body = ln[2:]  # strip the "  " detail indent
+            m = marker.search(body)
+            if m is None:
+                assert len(body) <= guard_module._GATE_TEXT_MAX_CHARS, (
+                    f"an unmarked detail line ran past the cap: {len(body)}"
+                )
+                continue
+            kept = len(body) - len(m.group(0))
+            assert kept == guard_module._GATE_TEXT_MAX_CHARS, (
+                f"kept {kept} chars, expected {guard_module._GATE_TEXT_MAX_CHARS}"
+            )
+            assert body.endswith("x"), "the TAIL must survive — it carries remediation"
+        assert "verdict" in out
+
+
+class TestGateDetailSelectsRatherThanAmputates:
+    """The line cap bounds a hostile message; it must not eat the recovery line.
+
+    Every gate puts its remedy LAST — "Or append '# scheduled-review-override' to
+    merge without the missing review(s)" — so a plain head-slice tells the
+    operator they are blocked and not how to proceed. That is the failure mode
+    of truncation generally: it is the ABSENCE of a decision about what matters
+    (Codex P2, PR #1638).
+    """
+
+    def test_a_long_message_keeps_its_head_its_tail_and_says_what_it_dropped(
+        self, guard_module
+    ):
+        cap = guard_module._GATE_TEXT_MAX_LINES
+        tail = guard_module._GATE_TEXT_TAIL_LINES
+        body = [f"detail row {i}" for i in range(cap * 3)]
+        remedy = "Or append '# scheduled-review-override' to merge."
+        msg = "\n".join(["summary:", *body, remedy])
+
+        out = guard_module._sanitize_gate_text(msg)
+        lines = out.split("\n")
+
+        assert len(lines) <= cap, f"the cap stopped bounding the output: {len(lines)}"
+        assert lines[0] == "summary:"
+        assert lines[-1] == remedy, (
+            "the recovery instruction was truncated away — the one line the "
+            f"operator needs. Tail was: {lines[-3:]}"
+        )
+        assert any("omitted here to bound this output" in ln for ln in lines), (
+            "lines vanished with no statement that anything was dropped"
+        )
+        # The rows immediately BEFORE the remedy — the diagnosis it refers to —
+        # must survive with it. `tail` covers the remedy plus tail-1 body rows.
+        for i in range(len(body) - (tail - 1), len(body)):
+            assert f"detail row {i}" in out, f"tail row {i} was dropped"
+        assert "detail row 0" in out, "the head rows were not kept"
+
+    def test_a_short_message_is_untouched(self, guard_module):
+        """CONTROL: the selection path must not disturb the ordinary case, which
+        is every message the gate actually emits."""
+        msg = "summary:\n  [P1] a finding\nOr append '# review-override'."
+        assert guard_module._sanitize_gate_text(msg) == msg
+
+    def test_the_omission_count_is_honest(self, guard_module):
+        """The stated number must equal what was actually dropped — a count that
+        drifts is worse than none, because it reads as measured."""
+        import re as _re
+
+        cap = guard_module._GATE_TEXT_MAX_LINES
+        msg = "\n".join(f"row {i}" for i in range(cap * 2))
+        out = guard_module._sanitize_gate_text(msg)
+        stated = int(_re.search(r"… (\d+) more line\(s\) omitted", out).group(1))
+        kept = len([ln for ln in out.split("\n") if _re.fullmatch(r"row \d+", ln)])
+        assert stated + kept == cap * 2, f"stated {stated} + kept {kept} != {cap * 2}"
+
+    def test_one_over_long_line_keeps_its_remediation_tail(self, guard_module):
+        """The CHARACTER dimension has to obey the same rule as the LINE dimension.
+
+        A single gate line routinely runs past the cap on its own — the
+        codex-at-head message is 532 characters — and its remediation route is the
+        LAST clause in it. A head-only character slice therefore reproduces exactly
+        the defect this class exists to prevent, one dimension down, and it did:
+        MEASURED, the real message arrived cut mid-word at "…to merge without a",
+        losing the '# stale-review-override' route with nothing to say a cut had
+        happened.
+        """
+        import re as _re
+
+        remedy = "or append '# stale-review-override' to merge without a current review."
+        msg = "summary line\n  " + ("PADDING word. " * 60) + remedy
+        out = guard_module._sanitize_gate_text(msg)
+        line = out.split("\n")[1]
+
+        assert remedy in line, "the remediation tail must survive the character bound"
+        m = _re.search(r" … (\d+) char\(s\) omitted … ", line)
+        assert m, f"a character cut must DECLARE itself, got: {line!r}"
+        kept = len(line) - len(m.group(0))
+        assert kept == guard_module._GATE_TEXT_MAX_CHARS, (
+            f"kept {kept}, expected {guard_module._GATE_TEXT_MAX_CHARS} "
+            f"(head + tail); the marker must not be counted as kept text"
+        )
+        assert kept + int(m.group(1)) == len("  " + ("PADDING word. " * 60) + remedy), (
+            "stated omission + kept must reconcile to the original length"
+        )
+
+    def test_a_line_at_the_cap_is_not_marked(self, guard_module):
+        """Control: the marker appears only when something was actually dropped."""
+        exact = "z" * guard_module._GATE_TEXT_MAX_CHARS
+        out = guard_module._sanitize_gate_text(f"summary\n{exact}")
+        assert out.split("\n")[1] == exact
+        assert "omitted" not in out
+
+
 class TestFenceClosingFollowsCommonMark:
     """The mask decides what the merge gate is allowed to SEE, and a hand-rolled
     toggle got CommonMark's closing rule wrong in a shape CodeRabbit emits by
