@@ -102,8 +102,11 @@ isolation is still load-bearing for you — it is:
   health probes and dashboard polling keep working. Anything readable through
   the API is readable by anyone who can reach the port.
 - It is **inert when no dashboard password is set**, which is the default.
-- It exempts the `/api/genesis/auth/*` login endpoints, and it can be disabled
-  outright with `GENESIS_DASHBOARD_API_AUTH=off`.
+- It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
+  not a fixed list, so any route added there in future is exempt by default.
+  Today that prefix holds only login, logout and an auth-status probe, none of
+  which mutate a credential.
+- It can be disabled outright with `GENESIS_DASHBOARD_API_AUTH=off`.
 - The built-in web terminal and the noVNC console are **not** covered by it.
 
 This is safe **only under the assumed deployment model: the host is not
@@ -234,10 +237,12 @@ applied merge can be reconstructed.
 
 **Session identifiers are validated before use as path components.** Session ids
 arrive from outside the process and several hooks interpolate them into
-filesystem paths. A single shared validator (`is_safe_session_id` in
+filesystem paths. A shared validator (`is_safe_session_id` in
 `scripts/hooks/hook_input.py`) rejects traversal shapes, separators, null bytes,
-the empty string, and over-long values, and is used in place of the hand-copied
-per-hook checks that previously disagreed with each other.
+the empty string, and over-long values. It exists because hooks had each
+hand-rolled their own check and disagreed about what was unsafe; adoption is
+widespread but not yet complete, so a hook that has not moved over still carries
+a narrower check of its own.
 
 ### External Egress
 
