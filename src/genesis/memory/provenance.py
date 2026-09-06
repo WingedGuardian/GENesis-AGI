@@ -494,6 +494,18 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # reflection and perception. If a future change puts hook content back
         # in this observation, this source must LOSE its place in this list.
         "context_injection_monitor",
+        # Code-intel index health (awareness/loop.py _check_code_intel_health) —
+        # Genesis observing its OWN indexer. The evidence is file existence and
+        # the contents of markers GENESIS ITSELF writes (scripts/lib/
+        # index_marker.py): a repo path, an attempt count, and whether an index
+        # database exists or carries a .corrupt suffix. No byte of any indexed
+        # SOURCE FILE, and no output from the third-party indexer binary, enters
+        # the observation — the finding text is authored here from a closed set
+        # of states (ok / absent / corrupt). Paths are escaped at ingestion in
+        # code_intel_health.collect. If a future change quotes indexer output or
+        # file content into this observation, this source must LOSE its place in
+        # this list.
+        "code_intel_health_monitor",
     }
 )
 
