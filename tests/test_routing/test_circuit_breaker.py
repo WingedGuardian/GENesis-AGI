@@ -1189,8 +1189,16 @@ class TestOpenDurationCapByCategory:
         }, "new ErrorCategory member — decide whether it belongs in _LONG_OPEN_CATEGORIES"
 
     def test_long_cap_categories(self):
-        # Read from the production set, not a hardcoded pair, so the literal
-        # and the frozenset cannot drift apart.
+        # Pin MEMBERSHIP first. The loop below reads the production set so the
+        # literal and the frozenset cannot drift apart — but that alone makes
+        # the pair of cap tests a PARTITION of set(ErrorCategory), and every
+        # partition passes: moving TIMEOUT into the long set would leave this
+        # test and test_every_other_category_gets_the_short_cap both green
+        # while a transient error held the 4h cap.
+        assert _LONG_OPEN_CATEGORIES == {
+            ErrorCategory.QUOTA_EXHAUSTED,
+            ErrorCategory.NOT_ENTITLED,
+        }, "membership changed — a category gained or lost the 4h cap"
         for category in _LONG_OPEN_CATEGORIES:
             assert self._tripped_cap(category) == _MAX_QUOTA_OPEN_S, category
 
