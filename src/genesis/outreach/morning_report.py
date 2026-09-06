@@ -13,6 +13,9 @@ from genesis.content.drafter import ContentDrafter
 from genesis.content.types import DraftRequest, FormatTarget
 from genesis.db.crud.observations import INTERNAL_OBS_TYPES as _INTERNAL_OBS_TYPES_SET
 from genesis.outreach.types import OutreachCategory, OutreachRequest
+from genesis.session_awareness.ledger_escalation_link import (
+    ESCALATION_SOURCE as _LEDGER_ESCALATION_SOURCE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -849,6 +852,19 @@ class MorningReportGenerator:
         user_items = await follow_ups.get_pending(
             self._db, strategy="user_input_needed", domain="user_world",
         )
+        # Ledger escalations never reach this report, whatever their domain.
+        # Their content reproduces `session_ledger` row text VERBATIM, and real
+        # rows have carried credentials a session pasted into the ledger; this
+        # report renders content[:200] into a Telegram message. They ship
+        # domain=None, which the exact-match filter above already excludes — but
+        # the follow-up's own body asks the reader to classify it, and choosing
+        # `user_world` would otherwise put unredacted ledger text on the wire.
+        # A documented privacy guarantee that holds only until someone answers a
+        # question the feature itself poses is not a guarantee. Enforce it here,
+        # where the egress is, rather than relying on the domain default.
+        user_items = [
+            fu for fu in user_items if fu.get("source") != _LEDGER_ESCALATION_SOURCE
+        ]
         if user_items:
             shown = (
                 f" (showing 5 of {len(user_items)})" if len(user_items) > 5 else ""

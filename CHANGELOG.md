@@ -9,6 +9,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Work you agreed to in a session that has since ended no longer goes quiet.**
+  A session's ledger is its list of agreements, and it was only ever visible to
+  that session — so when a session ended with items still open, they stopped
+  being visible to anything. On the install this was built against, 15 items had
+  been sitting undisposed, the oldest for 52 days, and not all of them were
+  internal development work — some were user-facing requests, which is the class
+  most likely to be missed everywhere else.
+
+  An hourly sweep now turns such an item into a follow-up asking what should
+  happen to it — done, absorbed into other work, or no longer needed. It only
+  fires when BOTH the item has gone untouched for five days AND its session has
+  been quiet for five days, so an item you are still working on is never taken
+  out of your hands. Disposing of the item closes the follow-up automatically at
+  the next sweep. Escalations arrive up to five per hour rather than all at once,
+  and they appear in `follow_up_list` and the dashboard follow-ups tab under the
+  source `ledger_escalation` — deliberately not in the morning report, since
+  ledger text is free-form and has contained credentials.
+
+  They arrive unclassified rather than guessed at: the sweep genuinely cannot
+  tell one of your errands from an internal development item, so it asks.
+
+  Tune or disable it with the `ledger_escalation` settings domain (`stale_days`,
+  `quiet_days`, `max_per_run`, `priority`), or turn it off entirely with
+  `GENESIS_LEDGER_ESCALATION_DISABLED=1`.
+
 ### Changed
 
 - **The session charter now lists every open ledger item, not just the oldest

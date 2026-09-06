@@ -324,6 +324,27 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
     ),
+    "ledger_escalation": SettingsDomain(
+        name="ledger_escalation",
+        description=(
+            "Undisposed-ledger escalation sweep (learning scheduler, hourly) — "
+            "master `enabled` + `stale_days` / `quiet_days` / `max_per_run` / "
+            "`priority` / `escalate_added_by`. A session_ledger row untouched >= "
+            "stale_days whose owning session has been quiet >= quiet_days becomes "
+            "a `user_input_needed` follow-up asking for a disposition; disposing "
+            "the row auto-completes that follow-up. BOTH thresholds must pass — a "
+            "stale row in a LIVE session is that session's to dispose. WRITES "
+            "(creates follow-ups), never to session_ledger. `escalate_added_by` "
+            "is a provenance allow-list, foreground-only by default so the "
+            "ambient extractor's proposals cannot ask the owner to dispose of "
+            "something nobody committed to. off (or env "
+            "GENESIS_LEDGER_ESCALATION_DISABLED=1) silences it. Read live each "
+            "tick — no restart."
+        ),
+        config_filename="ledger_escalation.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
     "context_injection_watch": SettingsDomain(
         name="context_injection_watch",
         description=(
@@ -1732,6 +1753,43 @@ def _validate_follow_up_watchdog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_ledger_escalation(changes: dict) -> list[str]:
+    """Validate ledger-escalation lever changes (see
+    genesis.session_awareness.ledger_escalation_config)."""
+    from genesis.db.crud.session_charters import VALID_ADDED_BY
+    from genesis.session_awareness.ledger_escalation_config import (
+        _VALID_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "priority", "escalate_added_by", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "priority":
+            if value not in _VALID_PRIORITY:
+                errors.append(
+                    f"'priority' must be one of {', '.join(_VALID_PRIORITY)}; got {value!r}"
+                )
+        elif key == "escalate_added_by":
+            if not isinstance(value, list) or not value:
+                errors.append("'escalate_added_by' must be a non-empty list")
+            else:
+                unknown = [v for v in value if v not in VALID_ADDED_BY]
+                if unknown:
+                    errors.append(
+                        f"'escalate_added_by' has unknown provenance {unknown}; "
+                        f"valid: {', '.join(sorted(VALID_ADDED_BY))}"
+                    )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_context_injection_watch(changes: dict) -> list[str]:
     """Validate context-injection watcher lever changes (see
     genesis.awareness.context_injection_watch_config)."""
@@ -1780,6 +1838,7 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
+    "ledger_escalation": _validate_ledger_escalation,
     "context_injection_watch": _validate_context_injection_watch,
     "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
