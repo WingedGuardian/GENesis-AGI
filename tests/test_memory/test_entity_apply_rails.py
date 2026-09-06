@@ -299,6 +299,39 @@ async def test_query_resolves_both_the_active_and_the_merged_same_norm_entity(db
 
 
 @pytest.mark.asyncio
+async def test_one_norm_carries_every_survivor_it_was_merged_into(db):
+    """The producer's LIST-valuedness, which its docstring argues and nothing
+    pinned.
+
+    ``UNIQUE(norm_name, entity_type)`` lets the same norm exist on two merged
+    rows of different types, each with its OWN survivor. Returning a single id
+    would make the result depend on scan order — nondeterministic, and silently
+    dropping one survivor. A `dict[str, str]` shape passes every other test in
+    this file, so without this the docstring is the only thing holding it.
+    """
+    concept = await _mk(db, "Atlas", "atlas", etype="concept")
+    person = await _mk(db, "Atlas", "atlas", etype="person")
+    device = await _mk(db, "Atlas device", "atlas device", etype="device")
+    org = await _mk(db, "Atlas Corp", "atlas corp", etype="org")
+    await _tombstone(db, concept, device)
+    await _tombstone(db, person, org)
+
+    redirects = await entities_crud.merged_norm_redirects(db)
+
+    assert sorted(redirects["atlas"]) == sorted([device, org])
+
+
+# The consumer's `survivor_id not in ids` dedup is deliberately NOT pinned, and
+# that is a finding rather than an omission. `resolve_query_entities` returns a
+# dict keyed by entity_id, so a duplicated id collapses on assignment and the
+# check has NO observable effect through the public API: removing it leaves the
+# whole file green (measured). A test asserting it would pass with or without
+# the code it names — the shape this suite spent the round removing. The dedup
+# is defensive only, and the producer's docstring should not lean on it as the
+# reason list-valuedness is safe; the dict is that reason.
+
+
+@pytest.mark.asyncio
 async def test_enqueue_adjudication_reports_whether_it_inserted(db, monkeypatch):
     """The enqueue helper must tell callers whether a row actually landed:
     both silent no-op paths (pending-row dedup, kill switch) previously

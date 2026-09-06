@@ -694,11 +694,13 @@ async def merged_norm_redirects(db: aiosqlite.Connection) -> dict[str, list[str]
     owned by an active row (legal across types under UNIQUE(norm_name,
     entity_type)) still gets its redirect — the survivor rides ALONGSIDE the
     live row, because suppressing it makes the merged entity unfindable by
-    its old surface form; the consumer's map is list-valued and dedups.
+    its old surface form. A duplicate is harmless because the consumer keys its
+    result by entity_id — NOT because of its `not in` check, which is defensive
+    only: removing it changes no observable output (measured).
     LIST-valued because UNIQUE(norm_name, entity_type) allows one norm on two
     merged rows of different types with different survivors — a single pick
-    from an unordered scan would be nondeterministic; both are carried and the
-    consumer's map is already list-valued."""
+    from an unordered scan would be nondeterministic, and would silently drop
+    one survivor. That one IS pinned."""
     rows = await db.execute_fetchall(
         "SELECT entity_id, norm_name, status, merged_into FROM entities"
     )
