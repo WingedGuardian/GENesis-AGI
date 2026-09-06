@@ -100,18 +100,33 @@ _WHITESPACE_RUN = re.compile(r"\s+")
 _RENDER_LIMIT = 160
 
 
-def _render_identity(value: str) -> str:
-    """One untrusted identity, safe to splice into the alert's prose.
+def _neutralise(value: str) -> str:
+    """Flatten untrusted text and defuse the alert's row grammar. NO bound.
 
-    Branch names and worktree paths reach a MODEL through the observation this
-    builds. Flattening newlines and neutralising the row grammar stops a chosen
-    name from forging an extra row (or an extra field inside one) that a reader
-    would attribute to the detector itself.
+    Branch names, worktree paths and the diagnostic blobs built from them reach
+    a MODEL through the observations this module writes. Flattening newlines and
+    substituting the grammar characters stops chosen text from forging an extra
+    row — or an extra field inside one — that a reader would attribute to the
+    detector itself.
+
+    Deliberately separate from the bound: the two renderers here budget
+    differently (one identity vs a diagnostic blob), and folding the bound in
+    meant the second caller either reused a limit written for something else or
+    skipped the sanitising entirely. It skipped it.
     """
-    flattened = _WHITESPACE_RUN.sub(" ", (value or "").translate(_ALERT_GRAMMAR_CHARS)).strip()
-    if len(flattened) <= _RENDER_LIMIT:
-        return flattened
-    return f"{flattened[:_RENDER_LIMIT]}<+{len(flattened) - _RENDER_LIMIT} chars omitted>"
+    return _WHITESPACE_RUN.sub(" ", (value or "").translate(_ALERT_GRAMMAR_CHARS)).strip()
+
+
+def _bounded(text: str, limit: int) -> str:
+    """Bound a DISPLAY string, announcing the omission rather than cutting mute."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}<+{len(text) - limit} chars omitted>"
+
+
+def _render_identity(value: str) -> str:
+    """One untrusted identity, safe to splice into the alert's prose."""
+    return _bounded(_neutralise(value), _RENDER_LIMIT)
 
 logger = logging.getLogger(__name__)
 
@@ -512,7 +527,15 @@ async def _maintain_blind_alert(db, *, degraded: dict) -> str:
             f"The zero-drop detector is BLIND on: {legs}. Findings in those classes are "
             f"FROZEN — nothing new is detected there and nothing already found is "
             f"resolved, so the board is not a measurement until this clears. "
-            f"Cause: {json.dumps(degraded, default=str)[:400]}"
+            # The cause text embeds WORKTREE PATHS (a failed status call names
+            # The cause text embeds WORKTREE PATHS (a failed status call names
+            # the path it failed on), which this process did not author — the
+            # same untrusted content the findings alert neutralises. Sanitising
+            # one renderer and not its sibling is how that class survives: the
+            # findings alert got this treatment and this one, written in the
+            # same change, did not. 400 is the diagnostic budget, not the
+            # 160-char identity budget — a cause blob is worth more room.
+            f"Cause: {_bounded(_neutralise(json.dumps(degraded, default=str)), 400)}"
         )
         created = await observations.create(
             db,
@@ -736,14 +759,27 @@ async def _run_locked(
         if dirty_findings is not None:
             await _apply(db, CLASS_DIRTY, dirty_findings, dirty_held)
 
-        counts = await zd_crud.counts_by_status(db)
-        open_rows = await zd_crud.list_findings(db, statuses=("open",))
+        # These are REPORTING reads, and they run after the sweep has already
+        # committed. Letting one raise would throw away the run record, the
+        # heartbeat and the blindness alarm for a failure that changed nothing
+        # in the store — losing the report of a sweep that actually happened,
+        # and losing it hardest in the degraded case where the report matters
+        # most. Degrade the numbers instead, and say the numbers are missing.
+        counts: dict[str, int] = {}
+        open_rows: list[dict] = []
+        try:
+            counts = await zd_crud.counts_by_status(db)
+            open_rows = await zd_crud.list_findings(db, statuses=("open",))
+        except Exception as exc:  # noqa: BLE001 — the sweep already landed
+            logger.warning("zero_drop store read failed after the sweep", exc_info=True)
+            degraded["store_read"] = f"{type(exc).__name__}: {exc}"[:200]
+
         # The counts come from the WHOLE store, so a run that froze a class is
         # reporting rows it did not measure this time. Every surface that shows
         # the number shows what the number covers.
         frozen = [c for c in ALL_CLASSES if c not in applied]
         coverage = "all classes swept" if not frozen else f"FROZEN: {','.join(frozen)}"
-        if mode == "alert":
+        if mode == "alert" and "store_read" not in degraded:
             alert_state = await _maintain_alert(
                 db,
                 cfg=cfg,

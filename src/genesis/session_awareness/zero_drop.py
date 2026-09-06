@@ -31,7 +31,7 @@ the judgement instead of a rule nobody can see.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 CLASS_UNPUSHED = "unpushed_branch"
 CLASS_PUSHED_NO_PR = "pushed_no_pr"
@@ -44,12 +44,24 @@ DETACHED_KEY_PREFIX = "@detached:"
 
 
 def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
+    """Parse a timestamp to an AWARE datetime, or None.
+
+    Aware is not a nicety here. `now` and the age cutoffs are timezone-aware,
+    and comparing an aware datetime with a naive one raises TypeError rather
+    than returning a wrong answer — which would escape `classify_branches`,
+    escape the branch leg, and be caught only by the worker's outer handler as
+    a failed sweep. git's `%(committerdate:iso-strict)` always carries an
+    offset, but `mergedAt` comes from gh and `tip_date` can be replayed from a
+    recorded fixture, so the input is not ours to assume. A naive value is
+    read as UTC, which is what every producer here means.
+    """
+    if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def index_prs_by_head(prs: list[dict]) -> dict[str, list[dict]]:
@@ -124,9 +136,11 @@ def classify_branches(
     audit.
 
     A branch whose ahead-count is UNKNOWN (an old git, a broken base ref) is
-    counted as ``ahead_unknown`` and is NOT a finding: reporting stranded work
-    on evidence we failed to collect is the false-positive direction that
-    would teach everyone to ignore the board.
+    counted as ``ahead_unknown``, is NOT a finding, and IS held: reporting
+    stranded work on evidence we failed to collect would teach everyone to
+    ignore the board, and RESOLVING an existing finding on that same missing
+    evidence would quietly clear it. Both directions are wrong, and only the
+    first is obvious.
     """
     index = index_prs_by_head(prs)
     cutoff = now - timedelta(hours=min_age_hours)
@@ -149,15 +163,29 @@ def classify_branches(
     )
     stages["refs_total"] = len(branches)
 
+    # Every `continue` below is one of two KINDS, and conflating them is the
+    # bug this classifier keeps almost making:
+    #   "the condition genuinely ended"  -> absent from `present`, so the
+    #       reconciler resolves the finding. Correct for not_ahead and for the
+    #       PR-coverage verdicts.
+    #   "we could not determine"         -> HELD. Never resolve a finding on
+    #       evidence we failed to collect.
     for row in branches:
+        branch = row["branch"]
         ahead = row.get("ahead")
         if ahead is None:
+            # An old git expands %(ahead-behind:) empty, and a broken base ref
+            # yields nothing. We do NOT know this branch is clean — we failed to
+            # measure it — so it is held, not resolved. (Missed on the first
+            # pass, which held age-gated branches and let this one through: the
+            # identical mistake one branch over.)
             stages["ahead_unknown"] += 1
+            held.add(branch)
             continue
         if ahead <= 0:
+            # Genuinely no longer ahead of the base: the condition ended.
             stages["not_ahead"] += 1
             continue
-        branch = row["branch"]
         tip_date = _parse_iso(row.get("tip_date"))
         if tip_date is not None and tip_date > cutoff:
             # Work in flight right now is not stranded work. An UNDATED tip
@@ -203,6 +231,30 @@ def classify_branches(
         )
 
     return {"findings": findings, "stages": stages, "held": held}
+
+
+def dirty_state_key(entries: list[tuple[str, str]], newest: datetime | None) -> str:
+    """The EXPIRY key for a dirty-worktree finding — its branch-tip analogue.
+
+    An acknowledgement is keyed to the state it was granted against and expires
+    the moment that state changes. A branch has a tip SHA for this; a dirty
+    worktree has nothing equivalent, and leaving the key empty does not fail
+    loudly — it makes the ack PERMANENT, because the expiry test compares
+    ``acked_tip_sha != tip_sha`` and ``None != None`` is False. So an
+    acknowledged worktree would stay suppressed through every later edit, which
+    is precisely the "mute this forever" the ack design refuses to offer.
+
+    Digest of what "the work changed" means for a worktree: which paths are
+    dirty, how each is dirty, and when it last changed. Add, remove, or touch a
+    file and the key moves. The full digest is stored — a key is the one thing
+    that must never be shortened, since two states colliding on a prefix would
+    silently transfer one worktree's acknowledgement to another's work.
+    """
+    import hashlib
+
+    payload = "\n".join(sorted(f"{xy}\t{path}" for xy, path in entries))
+    payload += f"\n@{newest.isoformat() if newest else 'undated'}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def worktree_identity(observation: dict) -> str:
@@ -259,6 +311,7 @@ def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours
         findings.append(
             {
                 "branch": worktree_identity(obs),
+                "tip_sha": dirty_state_key(entries, newest),
                 "worktree_path": obs["path"],
                 "details": {
                     "tracked_changes": tracked,

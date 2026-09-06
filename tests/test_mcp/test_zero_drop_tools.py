@@ -154,11 +154,49 @@ async def test_the_read_tool_is_in_the_reflection_allowlist():
     assert "zero_drop_ack" not in _REFLECTION_READ_MCP, "a write tool is not a read tool"
 
 
-def test_both_tools_are_registered_on_the_health_server():
-    """Built != wired: an _impl with no @mcp.tool wrapper reaches nobody."""
+async def test_both_tools_are_registered_on_the_health_server():
+    """Built != wired: an _impl with no @mcp.tool wrapper reaches nobody.
+
+    Ask the SERVER what it has registered. Counting `@mcp.tool()` occurrences in
+    the source proved only that the file contains that text — it would pass with
+    the decorator applied to the wrong function, with the module never imported
+    by `genesis.mcp.health`, or with both tools registered under names no caller
+    uses.
+    """
     import genesis.mcp.health as health
+    from genesis.mcp.health import mcp
 
     assert hasattr(health, "_impl_zero_drop_status")
     assert hasattr(health, "_impl_zero_drop_ack")
-    source = __import__("pathlib").Path(health._zero_drop_tools.__file__).read_text()
-    assert source.count("@mcp.tool()") == 2
+
+    registered = await mcp.get_tools()
+    assert {"zero_drop_status", "zero_drop_ack"} <= set(registered)
+
+
+@pytest.mark.parametrize(
+    "bad", [12345, {"t": 1}, ["x"], "not-a-timestamp", "2026-13-45T99:99:99"]
+)
+async def test_a_malformed_computed_at_reports_unverified_rather_than_raising(db, last_run, bad):
+    """read_last_run parses UNVALIDATED json, so computed_at may be any type
+    (TypeError) or a naive timestamp (also TypeError, subtracting from an aware
+    now). A read-only status tool must report that it cannot date the board,
+    never raise out of it."""
+    from datetime import UTC, datetime
+
+    last_run({"computed_at": bad})
+    out = await _impl_zero_drop_status(db, now=datetime.now(UTC))
+
+    assert out["status"] == "ok"
+    assert out["detector"]["stale"] is True
+    assert out["detector"]["age_seconds"] is None
+
+
+async def test_a_naive_computed_at_is_read_as_utc_not_a_crash(db, last_run):
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    last_run({"computed_at": (now - timedelta(hours=1)).replace(tzinfo=None).isoformat()})
+    out = await _impl_zero_drop_status(db, now=now)
+
+    assert out["detector"]["stale"] is False
+    assert 3000 < out["detector"]["age_seconds"] < 4200

@@ -54,13 +54,17 @@ def test_spawn_skipped_on_clear_and_by_the_kill_switch(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_spawn_failure_never_raises(monkeypatch):
+def test_spawn_failure_never_raises(tmp_path, monkeypatch):
     """Fail-open end to end. A detector is advisory; session start is not."""
 
     def boom(*a, **kw):
         raise OSError("no fds left")
 
     monkeypatch.setattr("subprocess.Popen", boom)
+    # Redirect home: the spawn mkdir()s ~/.genesis/session_awareness for its
+    # error log before it ever reaches Popen, and a test has no business
+    # creating directories in the developer's real home.
+    monkeypatch.setattr(_ctx.Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.delenv("GENESIS_ZERO_DROP_DISABLED", raising=False)
     _ctx._spawn_zero_drop_worker("startup")
 

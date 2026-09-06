@@ -115,8 +115,17 @@ def load_config() -> dict[str, Any]:
 def effective_mode() -> str:
     """The mode the worker must run under — read live."""
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    enabled = cfg.get("enabled", True)
+    # ONLY an explicit boolean False disables. A bare `enabled:` with no value
+    # parses as None, and `not None` would have silently returned "off" — the
+    # exact silent-off this module's docstring says must never happen, reachable
+    # by a one-character typo. Anything that is not literally False (None, a
+    # stray string, a number) is not a decision to disable; it degrades to
+    # ENABLED and lets the mode lever below do the validating.
+    if enabled is False:
         return "off"
+    if not isinstance(enabled, bool):
+        logger.warning("zero_drop `enabled` is %r, not a boolean — treating as enabled", enabled)
     mode = cfg.get("mode")
     if mode is False:
         # A hand-edited unquoted `mode: off` parses as YAML-1.1 False.

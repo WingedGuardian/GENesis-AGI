@@ -44,8 +44,16 @@ def _freshness(last_run: dict, *, now: datetime) -> dict:
             "verdict": "NEVER RUN — a zero here is unverified, not clean",
         }
     try:
-        age = (now - datetime.fromisoformat(computed_at)).total_seconds()
-    except ValueError:
+        # read_last_run() parses UNVALIDATED json, so computed_at may be any
+        # type (TypeError) or a naive timestamp (also TypeError, on the
+        # subtraction against an aware `now`). Both mean the same thing here —
+        # we cannot date the board — and both must report that rather than
+        # raise out of a read-only status tool.
+        parsed = datetime.fromisoformat(computed_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        age = (now - parsed).total_seconds()
+    except (ValueError, TypeError):
         return {
             "computed_at": computed_at,
             "age_seconds": None,

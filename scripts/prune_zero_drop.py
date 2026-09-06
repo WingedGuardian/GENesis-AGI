@@ -47,6 +47,11 @@ def main() -> None:
         help="retention window in days (RESOLVED rows older than this are deleted)",
     )
     args = ap.parse_args()
+    if args.days < 1:
+        # `--days 0` prunes everything resolved today; a negative window prunes
+        # into the future. Both are silent data loss dressed as retention, and
+        # argparse accepts them happily. Refuse rather than interpret.
+        ap.error(f"--days must be >= 1 (got {args.days}); a window that small deletes live rows")
     try:
         deleted = asyncio.run(_prune(args.days))
         print(f"zero_drop prune: deleted {deleted} resolved row(s) older than {args.days}d")

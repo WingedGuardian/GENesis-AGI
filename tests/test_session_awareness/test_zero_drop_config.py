@@ -98,3 +98,19 @@ def test_settings_validator_rejects_what_the_loader_would_reject():
     assert _validate_zero_drop({"enabled": "yes"})
     assert _validate_zero_drop({"alert_priority": "urgent"})
     assert _validate_zero_drop({"not_a_knob": 1})
+
+
+@pytest.mark.parametrize("value", ["", "null", "~", "yes", "0", "[]"])
+def test_only_an_explicit_false_disables(cfg_root, value):
+    """A bare `enabled:` parses as None, and `not None` would have returned
+    "off" — the silent-off this module exists to refuse, reachable by a
+    one-character typo. Anything that is not literally False is not a decision
+    to disable."""
+    cfg_root.write_text(f"enabled: {value}\n")
+    assert cfg_mod.effective_mode() != "off"
+
+
+def test_an_explicit_false_still_disables(cfg_root):
+    """The lever must keep working, or the fix above has just broken it."""
+    cfg_root.write_text("enabled: false\n")
+    assert cfg_mod.effective_mode() == "off"

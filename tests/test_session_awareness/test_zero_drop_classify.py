@@ -250,3 +250,60 @@ def test_dirty_worktrees_report_held_identities_that_MATCH_the_finding_key():
     assert [f["branch"] for f in out["findings"]] == ["feat/old"]
     assert worktree_identity(old) == "feat/old"
     assert worktree_identity(detached_young) == f"{DETACHED_KEY_PREFIX}/w/dy"
+
+
+def test_an_unknown_ahead_count_is_HELD_not_resolved():
+    """The class miss the first pass made: age-gated branches were held and
+    unmeasurable ones were not, so a branch whose ahead-count we FAILED to read
+    had its finding resolved — clearing it on exactly the evidence we could not
+    collect. Both skips mean 'we could not determine'; both must hold."""
+    out = _run([_branch("unmeasurable", ahead=None), _branch("gone", ahead=0)])
+
+    assert out["held"] == {"unmeasurable"}, "an unreadable ahead-count must be held"
+    assert "gone" not in out["held"], (
+        "a branch genuinely no longer ahead has ENDED — resolving it is correct"
+    )
+
+
+def test_a_naive_timestamp_does_not_crash_the_classifier():
+    """`now` and the cutoffs are aware; comparing an aware datetime with a naive
+    one raises TypeError, which would escape the classifier, escape the branch
+    leg, and surface only as a failed sweep. git's committerdate always carries
+    an offset — `mergedAt` and replayed fixtures are not ours to assume."""
+    naive_tip = (NOW - timedelta(days=10)).replace(tzinfo=None).isoformat()
+    naive_merge = (NOW - timedelta(days=30)).replace(tzinfo=None).isoformat()
+
+    out = _run(
+        [_branch(date=naive_tip)],
+        remote=("feat/x",),
+        prs=[_pr("MERGED", merged=naive_merge)],
+    )
+
+    assert out["stages"]["flagged_merge_predates_tip"] == 1
+    assert [f["branch"] for f in out["findings"][CLASS_PUSHED_NO_PR]] == ["feat/x"]
+
+
+def test_a_dirty_worktree_finding_carries_an_EXPIRY_key():
+    """Without one, `acked_tip_sha` is None, the expiry test compares None to
+    None, and an acknowledged worktree stays suppressed through every later
+    edit — a permanent mute the ack design refuses to offer."""
+    out = classify_worktrees([_wt(entries=[("M ", "a.py")])], now=NOW, min_age_hours=6)
+    key = out["findings"][0]["tip_sha"]
+    assert key and len(key) == 64, f"expected a full sha256 expiry key, got {key!r}"
+
+
+def test_the_expiry_key_MOVES_when_the_work_changes_and_not_otherwise():
+    """That is the whole contract: an ack survives an unchanged worktree and
+    dies the moment anything about the dirty set changes."""
+    base = _wt(entries=[("M ", "a.py")], mtime=NOW - timedelta(days=2))
+    same = classify_worktrees([base], now=NOW, min_age_hours=6)["findings"][0]["tip_sha"]
+    again = classify_worktrees([base], now=NOW, min_age_hours=6)["findings"][0]["tip_sha"]
+    assert same == again, "an unchanged worktree must keep its key, or every ack expires"
+
+    for changed in (
+        _wt(entries=[("M ", "a.py"), ("??", "b.py")], mtime=NOW - timedelta(days=2)),  # added
+        _wt(entries=[("A ", "a.py")], mtime=NOW - timedelta(days=2)),  # status changed
+        _wt(entries=[("M ", "a.py")], mtime=NOW - timedelta(days=1)),  # touched
+    ):
+        key = classify_worktrees([changed], now=NOW, min_age_hours=6)["findings"][0]["tip_sha"]
+        assert key != same, f"the key survived a real change: {changed['entries']}"
