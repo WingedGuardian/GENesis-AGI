@@ -1210,6 +1210,27 @@ verified: 29a382e7 2026-09-03
   `next_fire_at` proxies that stay green through a deadlock) raises one
   self-superseding `high` `ego_alert` per ego, auto-resolving when a cycle lands;
   `gated`/`paused`/fresh-install are never stalls.
+  Also (hourly) **code-intel index health** (`_check_code_intel_health`,
+  `observability/snapshots/code_intel_health.py`): the code indexer can give up
+  permanently and say nothing — MEASURED 2026-09-05, the main repo's index
+  request was euthanized to a `<hash>.failed.json` marker (a state
+  `scripts/lib/index_marker.py` calls "never retried") and its database sat as a
+  164 MB `.db.corrupt` for two weeks while the runner logged `index failed` 35
+  times and no check covered it. Reads the INDEXER'S OWN artifacts (euthanized
+  markers + the index db for the configured target), never the tool's
+  self-report: a crashed indexer cannot report its own health. **Do-not-touch
+  edge:** `config/code_intel_health.yaml:indexed_path` steers ONLY the check —
+  every index-request writer (post-commit hook, `disk_reclaim`, the gitnexus
+  surplus job) hardcodes the repo root, and nothing in the indexing path reads
+  that config. Narrowing what is indexed therefore means re-pointing those
+  writers AND setting `indexed_path` to match; setting it alone makes the check
+  watch an index nothing builds and report ABSENT forever. Equally: a
+  `<slug>.db.corrupt` file is the indexer's RETAINED BACKUP (it rebuilds the db
+  in place and never unlinks the backup), so it means "currently broken" only
+  when NEWER than the live db. Scoped to that one target
+  (worktree indexes churn constantly; alerting on them is how an alarm gets
+  muted). `high`, not `critical` — a dead index degrades tool quality, it does
+  not lose user data or session context.
   Also per-tick (WS-2 M10) the SINGLE designated `alert_events` writer:
   `_persist_health_alerts` recomputes the firing set via the pure
   `mcp/health/errors.py::_compute_alerts()` and reconciles a durable open-set

@@ -344,6 +344,32 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
     ),
+    "code_intel_health": SettingsDomain(
+        name="code_intel_health",
+        description=(
+            "Code-intel index health (awareness hourly band) — master `enabled` + "
+            "`indexed_path` / `alert_priority`. Reads the INDEXER'S OWN artifacts: a "
+            "`<hash>.failed.json` marker means the runner permanently gave up on a "
+            "repo (never retried), and the index database for `indexed_path` may be "
+            "absent or carry a `.corrupt` suffix. Never asks the code-intel tool how "
+            "it is doing — a crashed indexer cannot report its own health. "
+            "`indexed_path` (empty = repo root) steers ONLY this check — every "
+            "index-request writer hardcodes the repo root and nothing in the indexing "
+            "path reads this config, so leave it empty unless you have also re-pointed "
+            "those writers; setting it alone makes the check watch an index nothing "
+            "builds and report 'no index' forever. "
+            "Scoped to that one target — worktree indexes churn constantly and "
+            "alerting on them is how an alarm gets muted. One deduped, "
+            "self-resolving infrastructure_alert; default priority high (morning "
+            "report, not the Telegram path — a dead index degrades tool quality, it "
+            "does not lose user data). Read-and-alert only. off (or env "
+            "GENESIS_CODE_INTEL_HEALTH_DISABLED=1) silences it AND resolves any open "
+            "alert. Read live each hourly tick — no restart."
+        ),
+        config_filename="code_intel_health.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
     "provider_outage_notify": SettingsDomain(
         name="provider_outage_notify",
         description=(
@@ -1732,6 +1758,34 @@ def _validate_follow_up_watchdog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_code_intel_health(changes: dict) -> list[str]:
+    """Validate code-intel health lever changes (see
+    genesis.awareness.code_intel_health_config)."""
+    from genesis.awareness.code_intel_health_config import _VALID_ALERT_PRIORITY
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", "indexed_path")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        # Empty string is meaningful (= repo root), so only the TYPE is
+        # constrained. Whether the path EXISTS is deliberately not validated: it
+        # may legitimately not exist yet at config time, and the check itself
+        # reports an absent index as a finding rather than a config error.
+        elif key == "indexed_path" and not isinstance(value, str):
+            errors.append("'indexed_path' must be a string ('' = repo root)")
+    return errors
+
+
 def _validate_context_injection_watch(changes: dict) -> list[str]:
     """Validate context-injection watcher lever changes (see
     genesis.awareness.context_injection_watch_config)."""
@@ -1781,6 +1835,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
     "context_injection_watch": _validate_context_injection_watch,
+    "code_intel_health": _validate_code_intel_health,
     "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,
