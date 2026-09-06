@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **The session charter now lists every open ledger item, not just the oldest
+  six.** The ledger is a curated list of one-line to-dos, and the old window
+  meant a session with more than six open items never saw a newly added one in
+  its own prompt — it existed only in the aggregate count. The list is now
+  effectively unbounded (a 200-row ceiling with an explicit "more than 200 —
+  the rest are not listed" note), and an oversized charter block degrades by
+  dropping whole sections with a marker rather than cutting mid-bullet, with
+  the open/closed count preserved.
+
 - **A review comment on documentation no longer blocks a merge.** The pre-merge
   check already declined to count findings on prose, but its idea of prose was
   narrow: markdown counted only underneath `docs/`, so a comment on a top-level
@@ -80,6 +89,37 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   graph stale: superseding a memory now tells the graph about the new
   succession edge, and the integrity sweep that purges a dead memory's edges
   now invalidates the cache it just made wrong.
+- **A schema rebuild no longer destroys columns a private fork added.** The
+  ledger table rebuild (widening a constraint means rebuilding the table on
+  SQLite) copied a hardcoded upstream column list and then dropped the old
+  table — so on an install whose supported private fork had added its own
+  column, that column and all of its data were silently, irreversibly gone.
+  The rebuild now reads the live table first, re-creates any column it does
+  not recognize from that column's own declaration, and copies its data; the
+  one shape it cannot re-create (NOT NULL with no default) stops the
+  migration with a clear message before anything is dropped.
+- **When every provider fails, the log now says which ones.** A routing failure
+  recorded only how many attempts were made — but a provider skipped because its
+  circuit breaker is open, its API key is missing, or the budget is spent costs
+  no attempt at all, so "2 attempts" on a seven-provider chain looked exactly
+  like a two-provider chain that was fully tried. The exhaustion event and result
+  now name every provider involved, alongside how many the chain had to offer —
+  and the log line keeps the two kinds apart: providers whose call actually
+  failed print under `failed:`, providers passed over before any call print
+  under `skipped:` with the reason (no API key, breaker open, budget exceeded),
+  because a never-called provider labelled "failed" reads as an outage where
+  there may be none. One-time cost of reshaping the message: the Errors
+  dashboard keys manual resolutions on the message prefix, so an exhaustion
+  group resolved before this change reappears once under its new key — resolve
+  it again and it stays resolved.
+- **The temp-space watchdog no longer severs cross-session messaging when it
+  goes nuclear.** At its most aggressive cleanup tier the watchdog deleted every
+  top-level directory of Claude Code's working temp — including the directory
+  holding each live session's messaging socket. The sockets are zero bytes, so
+  deleting them reclaimed nothing, while every running session silently became
+  unreachable to its peers until restarted. The nuclear sweep now spares unix
+  sockets (and only them — all reclaimable bytes are still deleted) and logs
+  how many it preserved.
 
 - **The pre-merge check now reads the second review bot it was already fetching.**
   Two automated reviewers comment on every pull request, and the gate that decides
@@ -274,6 +314,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a non-zero exit, so a caller checking exit status still notices; and the
   guardian's automated `git revert HEAD` on a clean tree is unaffected, because
   there both sides equal the base and the driver never runs.
+- **A session slot started after another tmux server no longer gets the wrong
+  temp directory.** A new slot created while a tmux server started in some other
+  context is already running used to inherit that server's temp directory
+  (often the small system `/tmp` Genesis keeps Claude off of). The temp
+  directory and the OAuth-durability setting are now pinned to the slot
+  explicitly (when a usable temp directory exists at all — if none does, the
+  session is left on the system default rather than pointed at a bad path).
 
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the

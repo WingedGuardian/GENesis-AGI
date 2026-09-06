@@ -268,7 +268,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 29a382e7 2026-09-03
+verified: 51f9a358 2026-09-05
 ```
 
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
@@ -366,6 +366,23 @@ verified: 29a382e7 2026-09-03
   COALESCEs content columns; a writer distinguishes "read fine, nothing to
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
+
+- **Slot environment pinning + usable temp directories.**
+  LIVE. `tmux new-session` builds a new session's environment from the tmux
+  SERVER's, updated by the client only for `update-environment` vars — so a slot
+  created on a server someone else started inherited that server's values.
+  MEASURED on tmux 3.4: `TMPDIR` and `GENESIS_CC_SLOT_OAUTH` resolve to the
+  SERVER's value (both now pinned via `-e`), while `PATH` resolves to the
+  CLIENT's (no gap, so deliberately NOT pinned). Both temp-dir candidates must be
+  created AND writable AND accept `chmod 700` — creation is not usability, since
+  `mkdir -p` succeeds on a directory that already exists, and one this user
+  cannot make private would put session temp state where others can read it. When
+  no candidate is usable both names are left genuinely UNSET rather than exported
+  empty, and the pane command unsets them itself: this script ends in
+  `exec tmux`, which STARTS the server every later slot inherits from, and
+  omitting a pin is not the same as having no value.
+  Recovering a slot that is alive but running no claude — detecting it, and
+  rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
@@ -1378,22 +1395,63 @@ verified: 29a382e7 2026-09-03
   prompt, fail-closed parse, verbatim-quote verification), matches against
   the live ledger (exact hash + SequenceMatcher ≥0.85 — the precision
   signal) and prior shadow events (`duplicate_of`), and records rows to
-  `session_ledger_shadow_runs`/`_events` (migration 0059) — **the live
-  `session_ledger` is NEVER written until the data-gated flip PR**. Shared
-  subprocess core with the arbiter: `session_awareness/headless.py`;
+  `session_ledger_shadow_runs`/`_events` (migration 0059). **The live write
+  path is BUILT and SHIPPED OFF: the shipped config is `mode: shadow`, so
+  the live `session_ledger` is never written until an operator flips it.**
+  Shared subprocess core with the arbiter: `session_awareness/headless.py`;
   canonical typed-prompt filter `session_awareness/transcript.py` (the
   PreCompact hook keeps a parity-tested stdlib duplicate; honors
   `promptSource` typed/queued, excludes bare slash-commands + markers).
-  Levers: settings domain `session_ledger_shadow` (off|shadow; `live`
-  reserved, coerced+warn) read at worker startup;
-  `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level kill. Per-session flock;
-  `--backfill` replays historical transcripts in typed-turn windows
-  (`trigger='backfill'`, cursor untouched). Measurement:
-  `scripts/ledger_shadow_report.py` (recomputed precision, FP adjudication,
-  FN windowing, leak invariant); retention 45d via
-  `scripts/prune_ledger_shadow.py` (disk-hygiene step 8). Telemetry:
-  `call_site_last_run` row `ambient_ledger_extractor` (deliberately not a
-  critical site).
+  In `live`, qualifying proposals promote into the real ledger stamped
+  `added_by='ambient_ledger_extractor'` (migration 0090 widens the CHECK;
+  distinct from `ambient`, which any dispatched CC session already uses, so
+  the leak invariant can still tell them apart). Promotion is a SWEEP over
+  the shadow store, not over one run's in-memory events — the shadow row is
+  the retry state, so a failed live write costs only time and the cursor is
+  never coupled to promotion outcome (`promoted_item_id` marks a completed
+  one). **Idempotency is the novelty recheck inside a `BEGIN IMMEDIATE`
+  transaction and only that** — a foreground `session_ledger_add` landing
+  mid-flight is detected and the proposal disqualified rather than
+  duplicated; every SQL clause in the sweep is an efficiency filter, not a
+  safety property (mutation-verified), which is why `duplicate_of` is
+  deliberately NOT among them: it suppressed re-proposals whose chain root
+  was ineligible, permanently and silently. The sweep is scoped to
+  `mode='live'` (the flip is not retroactive — proposals gathered under the
+  shadow promise are never drained on it) and to the CURRENT
+  `prompt_version` (a bump never ships the old generation's backlog). The
+  gate is re-read immediately before the write, so a mid-run rollback to
+  `shadow` takes effect. INTERIM cap of 5 rows/run, logged when it bites;
+  qualifying / promoted / disqualified / failed counts all reach the run's
+  telemetry line, so a sweep that failed on every row is distinguishable
+  from one that found nothing. The sweep also runs on live-mode EMPTY-DELTA
+  invocations (a quiet session must not strand a failed promotion), asks the
+  duplicate GROUP's own promotion state before writing — observed-before-
+  closure disqualifies, observed-after is a renewal and promotes — and
+  requires the event-link UPDATE to touch exactly one row, rolling the whole
+  promotion back if the candidate was pruned mid-sweep.
+  Levers: settings domain `session_ledger_shadow` (off|shadow|live) read
+  live per call — **`live` requires BOTH `mode: live` and
+  `live_opt_in: true`**, a renewed opt-in that legacy overlays (which could
+  persist `live` while it was reserved) cannot satisfy; a non-boolean
+  `enabled` reads as off, and every other malformed value degrades to
+  shadow, never to live. `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level
+  kill. Per-session flock; `--backfill` replays historical transcripts in
+  typed-turn windows (`trigger='backfill'`, cursor untouched, never
+  promotes). Measurement: `scripts/ledger_shadow_report.py` (recomputed
+  precision, FP adjudication, FN windowing, leak invariant) — note its
+  automated precision CANNOT gate the flip: promotion requires
+  `match_kind='none'` and the report classifies exactly that set as its
+  false positives, so the metric measures the complement of what would
+  ship. The flip gate is hand adjudication of what would have been written
+  (v1: 17/40 wanted = 43%, 2026-08-29 — the reason prompt v2 exists).
+  Retention 45d via `scripts/prune_ledger_shadow.py` (disk-hygiene step 8) —
+  EXCEPT promoted events + their runs, which are the leak invariant's
+  attribution record and survive retention unbounded (owner decision
+  2026-09-05; bounded in practice by live-mode-only promotion at
+  PROMOTION_CAP per compaction). Promotion inserts the ledger row and stamps
+  the claiming event in ONE transaction, so a crash leaves both or neither.
+  Telemetry: `call_site_last_run` row `ambient_ledger_extractor`
+  (deliberately not a critical site).
 - **Repo-pulse annotator** (session-manager stage 4) — **LIVE (exact tier)**.
   At SessionStart boundaries (startup/resume/compact, never clear; foreground
   only) `genesis_session_context.py` fire-and-forgets
@@ -1632,7 +1690,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: b8232425 2026-09-02
+verified: 29a382e7 2026-09-03
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1693,6 +1751,30 @@ verified: b8232425 2026-09-02
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **Exhaustion is now readable.** `attempts` alone never was: a provider skipped
+  for an open breaker, a missing API key or an exceeded budget costs no attempt,
+  so "attempts: 2" on a seven-provider chain is indistinguishable from a
+  two-provider chain fully tried. The `all_exhausted` event carries
+  `failed_providers` and `chain_size` alongside `attempts`; the log MESSAGE
+  additionally keeps called-and-failed providers (`failed:`) apart from
+  never-called ones (`skipped:` with the reason), while the payload's
+  `failed_providers` keeps the combined meaning its consumers predate. The exhaustion
+  `RoutingResult` returns `failed_providers` — which the SUCCESS path had always
+  returned while the failure path accumulated the same list and dropped it.
+  `chain_size` is the WALKABLE chain (post-`_filter_chain`), not the one written
+  in `model_routing.yaml`: a `never_pays` site never walks its paid entries, so
+  counting them would make every such exhaustion look like it stopped early. The
+  two genuinely differ — MEASURED 2026-09-03, three of this install's nine
+  `never_pays` sites (`4_light_reflection`, `12_surplus_brainstorm`,
+  `45_intelligence_intake`) drop one provider apiece since Mistral Large moved
+  off the free tier. One
+  exit stays deliberately silent and the chain size is what exposes it: the
+  aggregate-deadline `break` abandons the walk without recording anything, so a
+  short `failed_providers` against a longer `chain_size` reads as "walked 3 of 7",
+  not as "the chain was 3 long". NOTE the payload is deliberately NOT wired into
+  `recent_provider_fallback_counts`, whose SQL filters `event_type =
+  'provider.fallback'`; widening that filter would silently change what an
+  existing metric counts.
 - **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
   observation at 5 trips (~10 min), carrying `first_trip_at` — the only
   per-provider "failing since" timestamp. Once the outage passes
@@ -1739,7 +1821,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 50b79ffb 2026-09-01
+verified: 3de52202 2026-09-02
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
