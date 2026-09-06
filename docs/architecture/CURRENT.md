@@ -1501,8 +1501,65 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 50b79ffb 2026-09-01
+verified: 788dd9a9 2026-09-06
 ```
+
+- **The graders are TOLD the response status; they must never infer it.** The
+  triage/outcome/delta graders each judge an `InteractionSummary`, and the
+  summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.
+  If it hands over a bare prefix, a response that stops mid-word is
+  indistinguishable from one the model abandoned — and the resulting verdict is
+  written to permanent record via `observation_writer` (tagged
+  `source_subsystem=reflection`, alongside the other self-observation sources).
+  So: `_MAX_RESPONSE_TEXT` is a SAFETY VALVE sized above real traffic, not a
+  working limit; anything elided is elided from the MIDDLE with an explicit
+  marker and the ENDING preserved, because the ending is what "did generation
+  finish" is judged from.
+- **A note about the response is emitted only on a POSITIVE signal.** The first
+  fix here asserted the opposite of `CCOutput.bg_truncated` as fact
+  ("COMPLETE — the model finished normally") and told the grader not to disagree.
+  That flag is one stderr substring match (`cc/invoker.py` `_stderr_bg_truncated`) whose producer
+  documents the match as version-drift tolerant, and a hand-built `CCOutput`
+  (e.g. `mail/monitor.py`) simply defaults it — so its `False` means "that
+  substring was absent", never "the model finished normally". Restating it as a
+  fact was the original defect with its sign flipped. `learning/response_context.py`
+  is now the single place that decides what the graders are told: silence by
+  default, a narrow note when the runtime really did kill background work, and a
+  note about elision driven by the character count the summarizer REPORTS. Both
+  signals travel out-of-band, on `InteractionSummary`. Deriving either one by
+  searching `response_text` puts the response in charge of the prompt's factual
+  claims about it — a debrief that describes this mechanism, or an inbox item
+  echoing a prompt back, would manufacture a pipeline-status claim that is
+  simply false. For the same reason the elision marker states only how many
+  characters were removed and makes no claim about whether the model stopped
+  early; that is the question the grader is there to answer. The same rule now
+  covers `tool_calls`: names come from the runtime's own `tool_use` events
+  (`CCOutput.tools_used`) when the invocation streamed, and the prompt says so.
+  `conversation.py` also uses the NON-streaming `run()`, where no such events
+  exist, so the text-scraping fallback stays — but a scraped list is presented
+  as "tool names found in the response text", never as tools that ran, because
+  the regex cannot tell a tool that ran from one the reply merely discussed.
+  KNOWN AND ACCEPTED, with both consumers named: `prefilter.should_skip` still
+  counts a scraped name, so a reply that only mentions tools can buy itself a
+  grading pass; and `pipeline.py`'s `session_tools_count` carries that count
+  into a stored procedure's `extraction_context`. Neither is a decision gate the
+  wrong way — `should_skip` can only cause MORE grading, never less, and
+  tightening it would skip real tool use on every non-streaming path. It also fences `response_text`, which is
+  unbounded untrusted content sitting next to authoritative lines — though the
+  fence delimiters are fixed literals, so a response containing them can still
+  break out; closing that is tracked separately. The three-state
+  `CCOutput.tools_used` (None = nothing watched, () = watched and saw none) is
+  what keeps "no report" from rendering as the finding "none".
+- **The REQUEST is sized the same way as the reply, by the same function.**
+  `_MAX_USER_TEXT` was 500 and was a working limit, not a valve: MEASURED on
+  this install, 222 of 1481 inbound messages (15.0%) exceeded it, the longest
+  5,924 characters, and `inbox`/`mail` pass whole-file and joined-subject
+  content that no messaging limit bounds. Each one reached `DeltaAssessor` —
+  the grader comparing what was asked against what was delivered — as a bare
+  prefix with nothing saying so, which reads as an underspecified request.
+  `summarizer._fit` is now one mechanism serving both texts, and
+  `user_text_elided_chars` carries the request's count out-of-band exactly as
+  the response's does.
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
   ~20+ jobs well beyond learning (recovery orchestrator, reapers, email-gate

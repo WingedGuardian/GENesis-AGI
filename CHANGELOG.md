@@ -11,6 +11,75 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis's self-review now reads your whole reply before judging it.** After
+  each interaction a background pipeline grades what happened — whether the
+  request was met, what to learn from it — and writes the verdict to long-term
+  memory. It was shown only the first 1,000 characters of a response, with no
+  indication that anything had been left out — so an ordinary answer could arrive
+  looking like one that stopped mid-sentence. Measured over a month of production
+  traffic on this install, about two in five graded responses were being shortened
+  that way. The limit is now a safety valve set above real traffic; if a very long
+  response does have to be shortened, the middle is removed rather than the end and
+  the gap is labelled. The graders are also given the response inside explicit
+  markers, and told about a shortened or interrupted run only when there is an
+  actual signal to report — and the "shortened" signal now comes from the
+  pipeline's own record of what it did, rather than from searching the reply for
+  a phrase. A reply that
+  happens to discuss this mechanism (or an incoming message that quotes it back)
+  can no longer make the grader believe the reply was shortened when it was not,
+  and the label on a genuinely shortened reply no longer claims anything about
+  whether the model stopped early.
+- **The tools a session used are now read from the session, not from its own
+  reply.** The same self-review pipeline told its graders which tools an
+  interaction used by pattern-matching the reply's text — so a reply that merely
+  *discussed* running a tool was reported as having run it. Genesis now records
+  tool use as it happens and reports that instead. Where it cannot — some
+  invocations do not stream — the graders are told plainly that any names were
+  extracted from the reply and may be tools it only mentioned, and where there
+  is no evidence either way they are told that too, rather than being handed a
+  bare "none" that reads like a finding. One visible consequence: short
+  interactions that genuinely used a tool are now reviewed where some were
+  previously filtered out, so review volume rises slightly.
+- **A reply cannot forge the notes written beside it.** The reviewed text is
+  wrapped in markers so a grader can tell the interaction apart from the
+  system's own remarks about it — but the markers were a fixed pair, which a
+  reply could simply write, ending the quoted region early and placing its own
+  lines where the system's go. The markers are now derived per message and
+  checked against it, so no message can contain the one that ends its own
+  region. The user's message is wrapped the same way; it had not been wrapped at
+  all, which is the same gap on the input an outside sender writes.
+- **Tools are reported as requested, not as run.** The runtime records the
+  moment the model asks for a tool, which is before anything happens — a call a
+  safety hook then denies looks identical. The line shown to the reviewer says
+  so instead of asserting the tool ran.
+- **The size limit on reviewed text now bounds what it claims to.** It counted
+  characters, so text in a non-Latin script or heavy in emoji could be several
+  times larger than the limit implied, with no combined bound across the message
+  and the reply together. Counting bytes bounds it for any script. Ordinary
+  English text is unaffected — for it the two counts are the same number.
+- **A long request is no longer cut off before Genesis reviews it.** The same
+  pipeline shortened the user's own message to its first 500 characters with
+  nothing marking the cut, and then asked a grader to judge whether the reply
+  matched the request. On this install 15% of incoming messages were over that
+  limit. Requests now reach the reviewer whole; a genuinely enormous one is
+  shortened from the middle, keeps its ending, and says how much was removed.
+- **One malformed character no longer stops Genesis reviewing an interaction at
+  all.** Some text encodings allow a stray half-character that is technically
+  invalid on its own. JSON accepts it, so it can arrive in an incoming message or
+  in a reply, and the self-review pipeline measures text in bytes — so it stopped
+  with an error before grading began, and every lesson from that interaction was
+  lost. Text is now checked as it enters review, and anything unencodable is
+  shown in a visible escaped form rather than crashing the pass or being silently
+  dropped.
+- **A message can no longer plant a procedure Genesis will follow later.** One
+  older path that turns a finished interaction into a reusable, stored procedure
+  was handing the request and the reply to the model as plain text, with nothing
+  marking where they ended. Text written by whoever sent the message could
+  therefore pose as the pipeline's own instructions — and because the result of
+  that step is SAVED and recalled by later sessions, a single crafted message
+  could leave behind a procedure Genesis would go on following. Both pieces of
+  text now sit inside markers the text itself cannot forge, the same protection
+  the review prompts already use.
 - **SECURITY.md described a posture the code left behind two months ago.** The
   security policy told operators to treat the dashboard API as
   "unauthenticated administrative access" and said the dashboard password
