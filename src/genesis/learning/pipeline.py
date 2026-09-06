@@ -38,12 +38,43 @@ _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
 # in the room. The gate only OBSERVES (shadow) -- a deny-list escape that
 # writes a steering rule now produces a would-block row instead of being
 # invisible.
+# WARNING to the next editor: this map now has a SECOND, ENFORCING consumer --
+# _PROCEDURE_EXTRACTION_CHANNELS below derives its owner half from here. Adding
+# a `"x": "owner"` entry for the shadow classifier also grants `x` procedure-
+# extraction eligibility, so the test pins that set literally; expect it to fail.
 _CHANNEL_ORIGIN = {
     "terminal": "owner",
     "telegram": "owner",
     "whatsapp": "owner",
     "web": "owner",
 }
+
+# Channels whose text may feed PROCEDURE EXTRACTION. The extractor's output
+# becomes a stored procedure that later sessions recall and follow, so its input
+# is restricted to the owner-map channels plus Genesis's own cognition:
+#   - the owner half is DERIVED from _CHANNEL_ORIGIN (never retyped) so the two
+#     cannot drift apart;
+#   - reflection/surplus are Genesis's own cognition: the "user_text" there is
+#     Genesis's own output, not anyone's input.
+# Everything else is excluded, including `inbox` and `mail` (whose user_text is
+# externally writable -- raw email subjects, raw inbox item content) and `voice`
+# (excluded for the reason _CHANNEL_ORIGIN states above). ALLOW-list, not a
+# deny-list, for that same stated reason: a deny-list fails OPEN for every
+# channel nobody remembered to add.
+#
+# Scope, stated honestly rather than overclaimed: `_CHANNEL_ORIGIN`'s owner map
+# is BROADER than `cc.types.is_owner_attended_channel`, which counts only
+# terminal + telegram as owner-authenticated and names web/OpenClaw, WhatsApp
+# and voice as gateway channels. So this set still admits `web` (live -- every
+# OpenClaw HTTP completion arrives on it) and `whatsapp` (no caller constructs
+# it today). Both reached the extractor before this gate existed, so neither is
+# a regression, but neither is owner-AUTHENTICATED either. Narrowing to
+# is_owner_attended_channel is a deliberate open question, not an oversight.
+_SELF_COGNITION_CHANNELS = frozenset({"reflection", "surplus"})
+_PROCEDURE_EXTRACTION_CHANNELS = frozenset(
+    {channel for channel, origin in _CHANNEL_ORIGIN.items() if origin == "owner"}
+    | _SELF_COGNITION_CHANNELS
+)
 
 
 # A STEERING.md rule must READ as a terse imperative directive addressed to
@@ -233,9 +264,17 @@ def build_triage_pipeline(
         # This legacy path (500-char summary extractor) remains as a fallback
         # during the transition. Remove after 2026-07-09.
         is_autonomous = summary.channel in _AUTONOMOUS_CHANNELS
-        if router is not None and (
-            outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS)
-            or (outcome == OutcomeClass.SUCCESS and is_autonomous)
+        if (
+            router is not None
+            # Fail-closed allow-list, checked BEFORE the outcome clauses: the
+            # failure-class clauses below are channel-agnostic, so without this
+            # an externally-writable user_text (inbox/mail) or a non-owner
+            # speaker (voice) reached the extractor on any failure outcome.
+            and summary.channel in _PROCEDURE_EXTRACTION_CHANNELS
+            and (
+                outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS)
+                or (outcome == OutcomeClass.SUCCESS and is_autonomous)
+            )
         ):
             try:
                 logger.debug("Running deprecated procedure extraction (legacy 500-char path)")
