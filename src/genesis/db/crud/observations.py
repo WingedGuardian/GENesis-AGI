@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -168,6 +170,13 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "sentinel_escalated": timedelta(days=7),
     "guardian_diagnosis": timedelta(days=7),
     "infrastructure_drift": timedelta(days=7),
+    # A dispatched session blocked against a user-gated wall (scripts/hooks/
+    # needs_user.py). By construction there is no legitimate instance — the
+    # session cannot pass it and will not recover — so it is an operator action
+    # item, not ephemeral noise: 7d, not the 3d alert tier. Listed explicitly
+    # because an unlisted type takes the 14d default AND logs an unknown-type
+    # warning on every single write.
+    "background_session_blocked_needs_user": timedelta(days=7),
     # entity-resolution adjudication run summaries — a per-run diagnostic
     # observation (memory/entity_adjudication.py), same class as guardian_diagnosis.
     "entity_adjudication": timedelta(days=7),
@@ -404,6 +413,95 @@ async def create(
     )
     await db.commit()
     return id
+
+
+# ---------------------------------------------------------------------------
+# Sync version (for hook use — must be fast, no async overhead)
+# ---------------------------------------------------------------------------
+
+
+def create_sync(
+    db_path: str,
+    *,
+    source: str,
+    type: str,
+    content: str,
+    priority: str,
+    category: str | None = None,
+    content_hash: str | None = None,
+    origin_class: str | None = None,
+    skip_if_duplicate: bool = True,
+    timeout: float = 1.0,
+) -> bool:
+    """Record an observation from a PreToolUse/PostToolUse hook. Never raises.
+
+    Hooks run on a tight budget and cannot await, so they cannot use ``create``.
+    They must not hand-roll the write either: a raw INSERT skips ``_compute_ttl``
+    and ``_resolve_origin``, and a SELECT-then-INSERT dedupe is the cross-process
+    race ``create`` documents against. This shares all three with the async path.
+
+    Returns True when a row was written, False when it was deduped away or the
+    write failed. Callers that need the block to hold regardless MUST NOT treat
+    False as a reason to stop — recording is observability, never authorization.
+    """
+    try:
+        import sqlite3
+
+        created_at = datetime.now(UTC).isoformat()
+        origin = _resolve_origin(origin_class, source)
+        if content_hash is None and content and content.strip():
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        expires_at = None
+        ttl = _compute_ttl(type)
+        if ttl:
+            with contextlib.suppress(ValueError, TypeError):
+                expires_at = (datetime.fromisoformat(created_at) + ttl).isoformat()
+
+        params = (
+            str(uuid.uuid4()),
+            None,
+            source,
+            type,
+            category,
+            content,
+            priority,
+            0,
+            created_at,
+            expires_at,
+            content_hash,
+            origin,
+        )
+
+        conn = sqlite3.connect(db_path, timeout=timeout)
+        try:
+            if skip_if_duplicate and content_hash is not None:
+                cur = conn.execute(
+                    """INSERT INTO observations
+                       (id, person_id, source, type, category, content, priority,
+                        speculative, created_at, expires_at, content_hash, origin_class)
+                       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM observations
+                           WHERE source = ? AND content_hash = ? AND resolved = 0
+                             AND origin_class IS ?
+                       )""",
+                    (*params, source, content_hash, origin),
+                )
+            else:
+                cur = conn.execute(
+                    """INSERT INTO observations
+                       (id, person_id, source, type, category, content, priority,
+                        speculative, created_at, expires_at, content_hash, origin_class)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    params,
+                )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - observability must never break its caller
+        return False
 
 
 async def upsert(
