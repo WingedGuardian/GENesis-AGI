@@ -106,10 +106,11 @@ fi
 # the whole Bash call. The same blindness ran the other way: `-qe` / `-ve` are
 # real editable installs carrying no literal `-e`, so the arm never saw them.
 #
-# The token form below is what pip actually accepts, VERIFIED 2026-09-06 against
-# pip's own parser: `-e X`, `-qe X`, `-ve X`, `-eX` (glued value) and
-# `--editable=X` all reach the editable code path. The optional quote lets
-# `pip install '-e' .` keep matching, which the substring form covered.
+# Every spelling below was VERIFIED 2026-09-06 by running pip's own parser, not
+# read off its --help: `-e X`, `-qe X`, `-ve X`, `-eX` (glued value),
+# `--editable=X` and the abbreviations in the next paragraph all reach the
+# editable code path. The optional quote lets `pip install '-e' .` keep matching,
+# which the substring form covered.
 #
 # The LONG form is matched by the prefix `--ed`, not by the full spelling,
 # because optparse accepts any UNAMBIGUOUS abbreviation and pip therefore really
@@ -195,13 +196,14 @@ fi
 
 # git worktree remove --force / -f
 #
-# DELIBERATELY OVER-MATCHING — do not "fix" this into an anchored predicate.
-# An earlier revision of this PR keyed it on command position so the phrase could
-# not match inside a heredoc, a grep pattern or a commit message. Cross-model
-# review found three fail-OPEN bypasses in that version, and replaying the same
-# shapes against the sibling arm found five more: a leading redirection
-# (`2>/dev/null <cmd>`), a bundled short flag (`-qe`), and the `command` / `env`
-# wrappers all slipped past the anchor while the substring form caught each one.
+# DELIBERATELY OVER-MATCHING ON COMMAND POSITION — do not "fix" that. An earlier
+# revision of this PR keyed it on command position so the phrase could not match
+# inside a heredoc, a grep pattern or a commit message. Cross-model review found
+# three fail-OPEN bypasses in that version, and replaying the same shapes against
+# the sibling arm found more: a leading redirection (`2>/dev/null <cmd>`) and the
+# `command` / `env` wrappers all slipped past the anchor while the substring form
+# caught each one. (The bundled short flag reported alongside them belongs to the
+# FLAG axis below, not this one, and is now closed on both arms.)
 #
 # The reason is structural, not a bug to patch. This arm runs SHELL-side in the
 # global user-level hook, with no access to the canonical tokenizer
