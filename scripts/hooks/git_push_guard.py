@@ -1584,10 +1584,21 @@ def _check_inline_review_findings(
     Returns (should_block, message). Each unresolved finding contributes to a review
     score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
     >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
-    reply (engagement = consciously accepted) or its path is documentation
-    (``_is_doc_path``). The two exclusions differ in VISIBILITY by design: a doc-path
-    finding was auto-excluded by PATH (not engaged), so it is still SURFACED as a NOTE —
-    scored P2s print as a WARNING, doc-path P1s/P2s as a NOTE — nothing unaddressed is
+    reply (engagement = consciously accepted), its path is documentation
+    (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
+    merge of main stamps base-branch findings onto the PR; scoring them makes
+    the gate demand base-branch fixes as this PR's price — reconciliation must
+    stay gate-neutral). Off-diff findings are surfaced with their paths so real
+    ones can be routed to the base branch's tracker; a MISSING/null path always
+    scores (never silently discount a finding this check cannot place), and an
+    unreadable changed-file set scores everything (status quo) with a loud
+    NOTE. Scoping leans on the Codex FRESHNESS gate as its backstop: code moved
+    away from a reverted file re-enters the diff at the new head, where a current
+    review is separately required — weakening that gate widens this one.
+    The exclusions differ in VISIBILITY by design: doc-path and off-diff findings
+    were auto-excluded by PATH (not engaged), so both are still SURFACED as NOTEs —
+    scored P2s print as a WARNING, doc-path P1s/P2s and off-diff findings as NOTEs —
+    nothing unaddressed is
     dropped. A maintainer-replied finding was CONSCIOUSLY ENGAGED (the reply IS the
     acknowledgement), so it is excluded from the report too: the pre-merge report shows
     what still needs attention, not what a maintainer already handled (re-listing every
@@ -1633,6 +1644,40 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
+    cr_off_diff: list[tuple[str, str]] = []
+    off_diff_p1: list[tuple[str, str]] = []
+    off_diff_p2: list[tuple[str, str]] = []
+    # The PR's changed-file set, resolved LAZILY and at most once: only a PR
+    # that actually carries a candidate blocking finding pays for the read
+    # (one paginated `gh api pulls/N/files` under _gh_timeout(8), which clamps
+    # to the remaining merge deadline). [] = unresolved; [set] = resolved;
+    # [None] = resolution failed → every check answers "in diff" (scored),
+    # which re-creates the pre-scoping behavior, announced by a NOTE below.
+    _scope_cache: list[set[str] | None] = []
+
+    def _off_diff(path: str | None) -> bool:
+        """True only when the finding names a path PROVABLY outside the diff.
+
+        An EMPTY changed-file set is treated like an UNREADABLE one (score
+        everything + the loud NOTE), not like a resolved answer: over the API,
+        200-with-zero-rows cannot be told apart from a transiently-degraded
+        response, and "discount every finding on the whole PR" is the one
+        outcome this gate must never reach through an ambiguity (security
+        review HIGH, 2026-09-06). The cost is only that a genuinely empty PR
+        (head == base) scores its findings — the stricter direction, and such
+        a PR has no content to merge anyway. NOTE: `_hook_surface_override_check`
+        deliberately keeps the opposite reading of `[]` ("no hook files") —
+        that consumer fails CLOSED on `None` and an empty PR truly has no hook
+        files, so its contract is untouched.
+        """
+        if not path:
+            return False  # pathless/outdated comment — never silently discounted
+        if not _scope_cache:
+            files = _pr_changed_files(pr_num, repo=repo)
+            _scope_cache.append(set(files) if files else None)
+        changed = _scope_cache[0]
+        return changed is not None and path not in changed
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1679,6 +1724,14 @@ def _check_inline_review_findings(
                     else:
                         cr_advisory.append(title)
                     continue
+                if _off_diff(c.get("path")):
+                    # Checked BEFORE the doc-path lever: off-diff is the broader
+                    # exclusion (a base-branch finding is not this PR's to
+                    # answer whatever the file type), and unlike doc-skipping it
+                    # is not mode-gated — it enforces ratified policy (#1728),
+                    # not a per-install preference.
+                    cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
+                    continue
                 if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                     # Its OWN list, not the Codex `doc_skipped` one — landing a
                     # CodeRabbit finding there printed it as "[doc P1]" under a
@@ -1695,6 +1748,13 @@ def _check_inline_review_findings(
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
+            if _off_diff(c.get("path")):
+                # Same scoping the CodeRabbit branch gets above — the stale-
+                # anchor mechanism (#1728) is reviewer-agnostic, and enforcing
+                # it for one reviewer only would be an asymmetry with no
+                # stated reason (the #1677 class).
+                off_diff_p1.append((_inline_title(body), c.get("path") or ""))
+                continue
             if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
@@ -1706,6 +1766,9 @@ def _check_inline_review_findings(
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
+            if _off_diff(c.get("path")):
+                off_diff_p2.append((_inline_title(body), c.get("path") or ""))
+                continue
             if _is_doc_path(c.get("path") or "") and _doc_findings_mode() in ("skip", "p1_only"):
                 # A P2 on a doc path is not a code defect — excluded from the SCORE, but
                 # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
@@ -1738,6 +1801,38 @@ def _check_inline_review_findings(
         )
         for bot_login, title in unmatched_bot[:5]:
             print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+    if _scope_cache and _scope_cache[0] is None:
+        # Resolution was ATTEMPTED (a candidate finding consulted it) and
+        # failed — say so loudly, because from here the scan behaves exactly
+        # as it did before scoping existed: everything scores.
+        print(
+            f"NOTE: PR #{pr_num} — diff scoping unavailable (changed-file set "
+            f"unreadable or empty: gh error, a >3000-file PR, or a no-content "
+            f"PR). ALL findings scored, including any on base-branch content.",
+            file=sys.stderr,
+        )
+    if cr_off_diff:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_off_diff)} CodeRabbit Critical/Major "
+            f"finding(s) on files outside this PR's diff (base-branch content, "
+            f"typically stamped by a merge of main) — NOT scored. A real one "
+            f"belongs to the base branch's tracker, not this PR's gate:",
+            file=sys.stderr,
+        )
+        for title, fpath in cr_off_diff[:8]:
+            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+    if off_diff_p1 or off_diff_p2:
+        print(
+            f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
+            f"[P2] inline finding(s) on files outside this PR's diff — NOT "
+            f"scored (base-branch content; route real ones to the base "
+            f"branch's tracker):",
+            file=sys.stderr,
+        )
+        for title, fpath in off_diff_p1[:5]:
+            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+        for title, fpath in off_diff_p2[:5]:
+            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
     if cr_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
@@ -2615,9 +2710,14 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
                 ],
                 capture_output=True,
                 text=True,
-                # Merge-path timeout budget (see main()): this runs ONLY on the
-                # rare `# stale-review-override` path, so one paginated read
-                # stays inside the hook's wall-clock.
+                # Merge-path timeout budget (see main()): THREE consumers —
+                # the hook-surface override check (rare override path),
+                # _pin_blob_unchanged (rare pin path), and the inline-findings
+                # diff scoping (#1728), which is on the hot merge path but
+                # LAZY: it reads only when a candidate blocking finding exists,
+                # at most once per scan. _gh_timeout clamps this call to the
+                # remaining merge deadline, and a timeout degrades to None →
+                # the scoping caller scores everything (status quo) + a NOTE.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
