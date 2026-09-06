@@ -60,8 +60,8 @@ def _safe_path(value: object) -> str:
 def index_slug(path: Path) -> str:
     """CBM's on-disk name for a project: the FULL path with ``/`` -> ``-``.
 
-    Verified against a live cache entry rather than assumed:
-    ``/home/ubuntu/tmp/kimi_review`` -> ``home-ubuntu-tmp-kimi_review``.
+    Verified against a real cache entry rather than assumed:
+    ``/home/<user>/tmp/scratch`` -> ``home-<user>-tmp-scratch``.
 
     That the slug carries the WHOLE path is load-bearing here, not a detail: it
     means indexing ``<repo>/src`` produces a DIFFERENT slug from indexing

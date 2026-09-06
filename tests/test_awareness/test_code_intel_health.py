@@ -54,8 +54,8 @@ def _euthanized(markers: Path, repo: str, attempts: int = 5) -> Path:
 def _index(cache: Path, target: Path, *, suffix: str = ".db") -> Path:
     """Write a fake index db for `target`, using CBM's real slug shape.
 
-    Slug is the FULL path with '/' -> '-', verified against a live cache entry
-    (/home/ubuntu/tmp/kimi_review -> home-ubuntu-tmp-kimi_review).
+    Slug is the FULL path with '/' -> '-', verified against a real cache entry
+    (/home/<user>/tmp/scratch -> home-<user>-tmp-scratch).
     """
     p = cache / (ci.index_slug(target) + suffix)
     p.write_bytes(b"x" * 64)
