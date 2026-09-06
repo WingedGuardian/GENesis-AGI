@@ -478,6 +478,22 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # (It embeds a truncated follow-up snippet; that snippet's own hygiene is
         # a content concern, not an origin one — the OBSERVATION is Genesis's.)
         "follow_up_watchdog",
+        # Context-injection watcher (awareness/loop.py _check_context_injection_health)
+        # — Genesis observing its OWN runtime: whether the harness filed a
+        # SessionStart hook's output instead of delivering it. The evidence is
+        # file sizes, mtimes and PATHS of the harness's own persisted files
+        # under ~/.claude/projects — filesystem metadata Genesis observed. No
+        # byte of a filed hook's CONTENT reaches the observation: the collector
+        # attributes each filing from a closed set of labels it authors itself
+        # (context_injection._attribute). That is what makes first_party true
+        # here rather than merely convenient. An earlier version quoted the
+        # first 80 characters of an unrecognised hook's output — sanitised and
+        # framed "unverified", which changes neither where the text came from
+        # nor the origin stamped on the row, so it would have carried external
+        # text past the trusted-only SAFE_SURFACING_ORIGINS filters used by
+        # reflection and perception. If a future change puts hook content back
+        # in this observation, this source must LOSE its place in this list.
+        "context_injection_monitor",
     }
 )
 
@@ -494,7 +510,13 @@ _EGO_REDIRECT_SOURCE_PREFIX = "ego_domain_redirect:"
 #: currently UNWIRED (no caller) and stays fail-closed NULL until a wiring commit
 #: stamps it channel-aware. Listed here so the source-coverage guardrail treats
 #: them as consciously-classified, not accidentally-omitted.
-_USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset({"conversation_intent", "user_reply"})
+#: ``ego_question`` (ego/session.py questions channel) stamps per-row:
+#: ``user_reply`` rows are ``owner`` (the waiter resolves only the owner's
+#: Telegram reply in the delivered chat's own thread), ``no_reply``/
+#: ``not_delivered`` rows are ``first_party`` (pure ego-authored content).
+_USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset(
+    {"conversation_intent", "user_reply", "ego_question"}
+)
 
 #: Genesis-ANALYSIS sources whose trust follows the ANALYZED session's channel,
 #: NOT the source string: the learning triage pipeline writes these ABOUT a

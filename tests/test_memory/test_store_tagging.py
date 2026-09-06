@@ -162,3 +162,67 @@ def test_extraction_kwargs_include_source_pipeline():
     )
     kwargs = extractions_to_store_kwargs(extraction)
     assert kwargs["source_pipeline"] == "harvest"
+
+
+# --- Controlled-vocabulary enforcement for `wing` ---------------------------
+# Before this, the wing branch only tested falsiness, so ANY explicit string
+# reached the FTS5 `wing:` tag, the Qdrant payload and memory_metadata.wing —
+# and classify_life_domain() returns "personal" for an unknown wing, so one bad
+# value corrupted the life domain too. essential_knowledge.py filtered junk
+# wings on READ, which hid the problem rather than preventing it.
+
+
+@pytest.mark.asyncio()
+async def test_store_drops_unknown_wing_and_auto_classifies(store, caplog):
+    """An out-of-vocabulary wing must never be persisted. The store COERCES
+    (rather than raising) because internal callers pass LLM-derived values."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        with caplog.at_level("WARNING"):
+            await store.store("test content", "src", wing="portfolio")
+
+    from genesis.memory.taxonomy import WINGS
+
+    payload = mock_upsert.call_args.kwargs["payload"]
+    assert payload["wing"] != "portfolio"
+    assert payload["wing"] in WINGS, payload["wing"]
+    assert "wing:portfolio" not in payload["tags"], payload["tags"]
+    # The companion metadata write must not carry it either.
+    assert mock_mem.create_metadata.call_args.kwargs["wing"] != "portfolio"
+    assert mock_mem.create_metadata.call_args.kwargs["wing"] in WINGS
+    # The second half of the defect: classify_life_domain() returns "personal"
+    # for an unknown wing, so a bad value corrupts a DERIVED field too. There is
+    # no life_domain column on memory_metadata — the payload is the only place
+    # this is observable.
+    from genesis.memory.taxonomy import LIFE_DOMAINS
+
+    assert payload["life_domain"] in LIFE_DOMAINS, payload["life_domain"]
+    # Silent coercion would be its own trap — the drop is logged, by THIS
+    # logger at WARNING (any WARNING anywhere mentioning the value would
+    # otherwise satisfy this).
+    assert any(
+        r.name == "genesis.memory.store"
+        and r.levelname == "WARNING"
+        and "portfolio" in r.getMessage()
+        for r in caplog.records
+    ), caplog.text
+
+
+@pytest.mark.asyncio()
+async def test_store_preserves_a_valid_explicit_wing(store):
+    """The guard must not disturb the supported case — an explicit, valid wing
+    still wins outright over auto-classification."""
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        await store.store("test content", "src", wing="career", room="applications")
+
+    payload = mock_upsert.call_args.kwargs["payload"]
+    assert payload["wing"] == "career"
+    assert "wing:career" in payload["tags"]
+    assert mock_mem.create_metadata.call_args.kwargs["wing"] == "career"

@@ -24,6 +24,14 @@ class OutreachCategory(StrEnum):
     # Routed through the outreach pipeline with governance (dedup, rate limit,
     # quiet hours) but no approval gate. Added in PR #530.
     NOTIFICATION = "notification"
+    # Marketing campaign updates — the campaign's tick digest / reply pings.
+    # Routed to a dedicated "Marketing" supergroup topic (never the shared
+    # Morning Reports topic that 'digest' lands in). Must match the DB CHECK
+    # constraint on outreach_history (see db/schema/_migrations.py — the
+    # 'marketing' table-rebuild block) AND carry a delivery threshold (see
+    # config/outreach.yaml thresholds.marketing) so an owner-facing digest is
+    # never dropped by the default salience gate.
+    MARKETING = "marketing"
 
 
 class OutreachStatus(StrEnum):

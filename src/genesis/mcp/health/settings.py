@@ -95,8 +95,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "Ambient session-ledger extractor (session-manager PR-3) — "
             "master `enabled` + `mode` off/shadow/live. Shadow logs "
-            "proposals only (live session_ledger never written); `live` is "
-            "reserved and coerced to shadow until the data-gated flip PR. "
+            "proposals only; `live` also promotes the qualifying ones "
+            "into the real ledger as added_by='ambient_ledger_extractor'. "
+            "Live requires BOTH mode=live and live_opt_in=true (renewed "
+            "opt-in — legacy overlays persisted `live` while it was "
+            "reserved). An invalid mode degrades to shadow, never to live. "
             "Read at worker startup — takes effect next compaction."
         ),
         config_filename="session_ledger_shadow.yaml",
@@ -151,6 +154,22 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         # and 422 the entire save. Disabling this approval gate must be a deliberate
         # overlay-file edit, never a UI round-trip.
         hidden_fields=frozenset({"require_approval"}),
+    ),
+    "marketing_outreach": SettingsDomain(
+        name="marketing_outreach",
+        description=(
+            "Autonomous COLD marketing-outreach substrate — master `enabled` + "
+            "`mode` off/observe/live. Gates the `marketing_send` tool, which "
+            "stages a cold email to a recipient resolved IN CODE from the "
+            "owner-curated marketing_prospects store (never the LLM). off "
+            "(default, shipped) refuses to stage any send; every staged send "
+            "still holds at the WS-8 email autonomy gate (BULK cell at ASK). "
+            "Invalid mode degrades to off (least authority). Read live per tool "
+            "call — no restart. Kill switch: GENESIS_MARKETING_OUTREACH_DISABLED=1."
+        ),
+        config_filename="marketing_outreach.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by marketing_config
     ),
     "memory_integrity": SettingsDomain(
         name="memory_integrity",
@@ -304,6 +323,44 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="follow_up_watchdog.yaml",
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
+    ),
+    "context_injection_watch": SettingsDomain(
+        name="context_injection_watch",
+        description=(
+            "Context-injection watcher (awareness hourly band) — master `enabled` + "
+            "`lookback_hours` / `max_listed` / `alert_priority`. Watches the GROUND "
+            "TRUTH of the silent-context-loss class: a hook-stdout file the Claude "
+            "Code harness persisted instead of injecting (the session then ran "
+            "without that hook's content, invisibly). Scoped to this install's "
+            "checkouts and attributed per producer, so another hook's filing is "
+            "reported too, with its own remedy. One deduped, self-resolving "
+            "infrastructure_alert; "
+            "default priority critical (~5-min Telegram path — this class ran "
+            "unnoticed for a month). Read-and-alert only. off (or env "
+            "GENESIS_CONTEXT_INJECTION_WATCH_DISABLED=1) silences it. Read live each "
+            "hourly tick — no restart."
+        ),
+        config_filename="context_injection_watch.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "provider_outage_notify": SettingsDomain(
+        name="provider_outage_notify",
+        description=(
+            "Dead-provider notification sweep (awareness 5-min band) — master "
+            "`enabled` + `mode` off/propose_only/live. Once an unresolved "
+            "provider outage passes 1h: live (default) writes the ONE critical "
+            "observation that becomes a Telegram; propose_only writes it at "
+            "high (no immediate page; dashboard, ego and the next morning "
+            "report); off disables the sweep "
+            "AND resolves open notification rows — so off→on re-notifies a "
+            "still-dead provider, deliberately. Invalid mode degrades to "
+            "propose_only. Env kill switch GENESIS_PROVIDER_NOTIFY_DISABLED=1. "
+            "Read live each tick — no restart."
+        ),
+        config_filename="provider_outage_notify.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every 5-min tick
     ),
     "voice_act": SettingsDomain(
         name="voice_act",
@@ -1194,11 +1251,11 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
 
     errors: list[str] = []
     for key, value in changes.items():
-        if key not in ("enabled", "mode"):
-            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
-        elif key == "enabled":
+        if key not in ("enabled", "mode", "live_opt_in"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode, live_opt_in")
+        elif key in ("enabled", "live_opt_in"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif value not in MODES:
             errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
@@ -1337,6 +1394,46 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_marketing_outreach(changes: dict) -> list[str]:
+    """Validate marketing-outreach lever changes (see
+    genesis.outreach.marketing_config).
+
+    ``mode`` accepts ``off``/``observe`` here, but ``live`` is REJECTED — arming
+    autonomous cold sending is deliberately overlay-file-only. A settings_update
+    (MCP tool or dashboard PUT) is reachable by a foreground/injected model, so
+    letting it flip ``mode`` to ``live`` would let the model self-elevate past the
+    observe gate. The owner arms live by editing
+    ``config/marketing_outreach.local.yaml`` directly (filesystem access, not
+    model-reachable); ``marketing_config.load_config`` still merges that overlay so
+    an owner-set ``live`` takes effect. Mirrors ``_validate_memory_recall``'s
+    reservation of ``entity_lane.mode: live``. (Rejecting the value unconditionally
+    is safe because ``marketing_outreach`` is not a dashboard FORM domain — there is
+    no whole-config PUT that would re-echo an already-set ``live`` and 422 the save;
+    if it is ever added to ``_FORM_DOMAINS``, make this transition-aware or hide
+    ``mode`` first.)
+    """
+    from genesis.outreach.marketing_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value == "live":
+                errors.append(
+                    "'mode' cannot be set to 'live' via settings — the live gate is "
+                    "overlay-file-only. Edit config/marketing_outreach.local.yaml "
+                    "directly to arm autonomous cold sending. 'off' and 'observe' "
+                    "are settable here."
+                )
+            elif value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
 
 
@@ -1635,9 +1732,56 @@ def _validate_follow_up_watchdog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_context_injection_watch(changes: dict) -> list[str]:
+    """Validate context-injection watcher lever changes (see
+    genesis.awareness.context_injection_watch_config)."""
+    from genesis.awareness.context_injection_watch_config import (
+        _VALID_ALERT_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_provider_outage_notify(changes: dict) -> list[str]:
+    """Validate dead-provider notify lever changes (see
+    genesis.awareness.provider_notify_config)."""
+    from genesis.awareness.provider_notify_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
+    "context_injection_watch": _validate_context_injection_watch,
+    "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,
     "entity_adjudication": _validate_entity_adjudication,
@@ -1653,6 +1797,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
     "contributor_worklog": _validate_contributor_worklog,
+    "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,

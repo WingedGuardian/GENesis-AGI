@@ -425,6 +425,12 @@ Use MCP tools first, then output valid JSON:
       "urgency": "low|normal|high"
     }
   ],
+  "questions": [
+    {
+      "content": "A direct question when you need the user's input or a decision — sent WITHOUT approval; the reply returns to you as a signal (and a durable observation), or you'll see an observation if delivery/reply fails. The user must quote-reply to answer.",
+      "urgency": "low|normal|high"
+    }
+  ],
   "execution_briefs": [
     {
       "proposal_id": "approved_proposal_id",

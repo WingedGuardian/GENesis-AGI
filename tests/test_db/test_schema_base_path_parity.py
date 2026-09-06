@@ -41,6 +41,7 @@ import textwrap
 from pathlib import Path
 
 from genesis.db import migrations as _migrations_pkg
+from genesis.db.migrations import runner as _migrations_runner
 from genesis.db.schema import INDEXES, TABLES
 from genesis.db.schema import _migrations as _schema_migrations
 
@@ -152,8 +153,14 @@ def _migration_added() -> set[tuple[str, str]]:
     """(table, column) pairs any numbered migration adds via ALTER ... ADD COLUMN."""
     mig_dir = Path(_migrations_pkg.__file__).parent
     pairs: set[tuple[str, str]] = set()
-    for path in sorted(mig_dir.glob("[0-9][0-9][0-9][0-9]_*.py")):
-        pairs |= _alter_pairs_in_source(path.read_text())
+    # Match on the RUNNER's own pattern, not a hand-written glob. The previous
+    # `[0-9][0-9][0-9][0-9]_*.py` glob silently excluded timestamp-id
+    # migrations, so this guard would have stopped seeing every NEW migration
+    # while still reporting green — a fail-open on the bootstrap-crash class
+    # (#1123/#1127) it exists to catch.
+    for path in sorted(mig_dir.iterdir()):
+        if _migrations_runner._MIGRATION_PATTERN.match(path.name):
+            pairs |= _alter_pairs_in_source(path.read_text())
     return pairs
 
 
@@ -256,3 +263,19 @@ def test_ego_directives_kind_seen_as_migration_added():
     idx_ego_directives_kind_status) must register as migration-added so the
     crash-class guard actually protects it."""
     assert ("ego_directives", "kind") in _migration_added()
+
+
+def test_marketing_prospects_email_index_ddl_parity():
+    """The UNIQUE email index DDL must be byte-identical across BOTH build paths
+    (_tables.py INDEXES and migration 0089_marketing_prospects) — opt-out
+    suppression relies on canonical (COLLATE NOCASE) uniqueness on the
+    fresh-install AND the upgrade path, so a future collation/uniqueness edit
+    can't silently drift one path (marketing cold-send PR1)."""
+    tables_ddl = next((s for s in INDEXES if "idx_marketing_prospects_email" in s), None)
+    assert tables_ddl is not None, "email index missing from _tables INDEXES"
+    mig_src = (Path(_migrations_pkg.__path__[0]) / "0089_marketing_prospects.py").read_text()
+    m = re.search(r'"(CREATE UNIQUE INDEX[^"]*idx_marketing_prospects_email[^"]*)"', mig_src)
+    assert m is not None, "email index DDL missing from migration 0089"
+    assert m.group(1) == tables_ddl, (
+        f"DDL drift between build paths: _tables={tables_ddl!r} migration={m.group(1)!r}"
+    )

@@ -88,6 +88,15 @@ _REDIR_TOKEN = re.compile(r"\d*[<>]|&>")
 # (`2>&1`, `>&2`) or followed by `>` (`&>`). (`&&` is matched as a unit first.)
 _SEPARATOR_SPACING = re.compile(r"(\|\||&&|[|;]|(?<![<>])&(?!>))")
 
+# A line continuation: a backslash-newline whose backslash is NOT itself escaped.
+# `(?<!\\)` anchors the match at the START of a backslash run; `((?:\\\\)*)`
+# consumes the escaped PAIRS (kept via the backreference); the trailing `\\\n` is
+# the odd one out — the real continuation — and is dropped with its newline.
+# An even-length run therefore matches nothing: its last backslash is a literal
+# character and the newline after it stays a command separator. Getting this
+# wrong is a guard bypass, not a cosmetic issue — see _rm_violations.
+_CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+
 
 def _check_target(target: str) -> str | None:
     """Reason string if *target* is too broad to rm recursively."""
@@ -126,12 +135,24 @@ def _rm_violations(cmd: str) -> list[str] | None:
     # the shell keeps the sequence literally; folding it there only changes the
     # spelling of one operand, never its depth or its flags.)
     #
+    # ONLY AN ODD-LENGTH BACKSLASH RUN IS A CONTINUATION. In an even-length run
+    # every backslash is escaped by its neighbour, so the last one is a literal
+    # character and the newline after it is a REAL command separator. Folding it
+    # anyway deleted that separator and glued the next command's first word onto
+    # the previous token (`printf x` + `rm` -> `xrm`), so no `rm` token existed
+    # and the guard allowed a destructive command the shell then ran. It returned
+    # "no violations" rather than "unparseable", so main()'s legacy-regex fallback
+    # — which only fires when tokenizing FAILED — never fired either.
+    # `_CONTINUATION` therefore matches a backslash-newline only when the run
+    # length is odd: the captured even pairs are kept, the final backslash and its
+    # newline are dropped.
+    #
     # These replacements delete a continuation or insert whitespace/`;`, never
     # quote or escape characters, so they cannot corrupt shlex's quote balance.
     # Redirections are NOT stripped here — they are recognized at the token
     # level after shlex (see _REDIR_TOKEN), so shlex stays the sole authority on
     # quoting/escaping.
-    cmd = cmd.replace("\\\n", "").replace("\n", " ; ")
+    cmd = _CONTINUATION.sub(r"\1", cmd).replace("\n", " ; ")
     # Space glued command separators (`x;y`, `a&&b`) into standalone tokens so
     # the operand loop stops at them; a redirection `&` is preserved.
     spaced = _SEPARATOR_SPACING.sub(r" \1 ", cmd)

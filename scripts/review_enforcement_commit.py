@@ -633,16 +633,20 @@ def _merge_note(cwd: str | None) -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--git-dir"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if out.returncode != 0 or not out.stdout.strip():
             return ""
         raw = out.stdout.strip()
         git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
-        merging = any(
-            (git_dir / n).exists()
-            for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
-        ) or (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+        merging = (
+            any((git_dir / n).exists() for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"))
+            or (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+        )
     except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     if not merging:
@@ -772,7 +776,11 @@ def main() -> None:
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
+            FINAL_ROUND_CAP,
+            consume_final_accept,
             get_current_branch,
+            get_final_accept_consumed,
+            get_review_lifetime,
             get_review_round,
             has_code_changes,
             has_valid_review_marker,
@@ -946,12 +954,18 @@ def main() -> None:
             return
 
     # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
-    # defect-bearing review→fix→re-review rounds on this change (a clean review
-    # resets the streak — see review_state.bump_review_round), block the commit
+    # defect-bearing review→fix→re-review rounds on this change, block the commit
     # until an explicit '# escalation-ack' trailing comment — a machine-enforced
-    # STOP so a genuine review→fix loop can't silently run long on a standing
-    # "proceed" (see genesis-development SKILL.md), while honestly-clean
-    # multi-commit development never trips. Checked BEFORE
+    # STOP. The streak is CROSS-MODEL ONLY: only an EXTERNAL, non-Anthropic reviewer
+    # (Codex/Kimi/…) marked `--source external` advances or resets it (see
+    # review_state.bump_review_round). Internal same-model self/subagent reviews
+    # (genesis-architect/genesis-security/any spawned agent) NEVER count — they are
+    # free and share the author's blind spots, so penalizing them just punishes
+    # self-review. This is why the mode-switch audit below (an internal subagent) does
+    # NOT trip the cap: only a repeat EXTERNAL non-convergence does. The machine-
+    # enforced STOP keeps a genuine cross-model review→fix loop from silently running
+    # long on a standing "proceed" (see genesis-development SKILL.md), while
+    # honestly-clean multi-commit development never trips. Checked BEFORE
     # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
     # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
     # cap would otherwise sneak past via the docs skip), nor by '# review-override'
@@ -964,22 +978,116 @@ def main() -> None:
     # documented `git commit … # escalation-ack` form is a plain segment.
     round_n = get_review_round(cwd=cwd)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+
+    # Set when Rule 3a honours a '# final-round-accept', SPENT only at an actual
+    # allow. The two must not be the same moment: Rule 3a is checked FIRST, but
+    # four later rules (the escalation cap, the mode-switch tier, the depth gate,
+    # Rule 2) can still deny the very same command — and consuming inside the tier
+    # burned the one-shot token on a commit that never ran. Because the consuming
+    # tier is then checked first on the retry, the branch became permanently
+    # uncommittable. MEASURED before this fix, at streak 7 / lifetime 7 (a state
+    # this file's own comment calls reachable): all four sigil combinations
+    # returned exit 2, including the one the block message itself prints.
+    spend_final_accept = False
+
+    def _allow() -> None:
+        """Exit 0, spending the acceptance only if one was actually honoured."""
+        if spend_final_accept:
+            consume_final_accept(cwd=cwd)
+        sys.exit(0)
+
+    # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
+    # and that ordering is the entire point — at the terminal the round counter has
+    # typically just been reset by an earlier '# escalation-ack', so the cap would
+    # not fire and an escalation-ack must not be able to clear this.
+    #
+    # The cap below is REPEATABLE by construction: its ack calls
+    # reset_review_round, so a change can cycle 1-2-3-ack, 4-5-6-ack, without end.
+    # This tier is the terminal that cycle never reaches. It is deliberately NOT
+    # resettable by its own ack: '# final-round-accept' clears exactly ONE commit
+    # and the block returns on the next one. A sigil that kept working would just
+    # be a fourth repeatable sigil, which is the defect being closed.
+    #
+    # Counted the same way as the streak — EXTERNAL cross-model rounds only
+    # (see review_state.bump_review_round). Internal self/subagent audits stay
+    # free, including the one the mode-switch tier itself mandates; counting those
+    # would make the machine penalise the remedy it demands.
+    lifetime_n = get_review_lifetime(cwd=cwd)
+    if lifetime_n >= FINAL_ROUND_CAP:
+        final_acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
+        )
+        # "Clears exactly ONE commit" has to be RECORDED to be true. Re-requiring the
+        # sigil on every commit is not a terminal — a session under a mandate to make
+        # progress just appends it again, which is the fourth repeatable escape hatch
+        # this tier exists to remove. The acceptance is spent on first use and the
+        # branch cannot buy another.
+        if final_acked and get_final_accept_consumed(cwd=cwd):
+            _deny(
+                f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
+                f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
+                "commit, once — re-applying the sigil does not buy another round, or it "
+                "would be the repeatable escape hatch this terminal replaced.\n\n"
+                "You accepted the outstanding findings and committed. If that commit "
+                "still needs work, the loop did not end, and continuing is no longer a "
+                "call this session makes:\n"
+                "  (a) TAKE IT TO THE USER — say what is still open and that the branch "
+                "is past its terminal. Only they can authorise more work here.\n"
+                "  (b) ABANDON the branch and restart from a design that does not need "
+                "seven rounds.\n\n"
+                "A dispatched session with nobody reading cannot choose either alone — "
+                "surface it and stop." + _merge_note(cwd)
+            )
+            return
+        if not final_acked:
+            # The terminal deliberately does NOT reset the streak, so streak>=3 and
+            # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
+            # required — the escalation cap below is still live once this one clears.
+            # Printing only one would send a session round a loop of alternating
+            # blocks, so name the co-required form when it applies.
+            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
+            _deny(
+                f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
+                f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
+                "audits are not counted). Two full escalation cycles have already run and "
+                "each already asked for a fresh decision; a change still surfacing new "
+                "defects from an independent reviewer after that is not converging, and "
+                "another round is not the answer.\n\n"
+                "This is a judgement call, and there are exactly two ways out:\n"
+                "  (a) ACCEPT the outstanding findings and merge — document each one and "
+                "why it is acceptable in the PR body, then:\n"
+                f'        git commit -m "your message"  # final-round-accept{escalation_hint}\n'
+                "      That clears ONE commit; the block returns on the next, so the "
+                "decision has to actually end the loop.\n"
+                "  (b) ABANDON the branch and restart from a design that does not need "
+                "seven rounds. No sigil — just stop committing here.\n\n"
+                "Take this to the user before choosing; neither option is yours to make "
+                "alone." + _merge_note(cwd)
+            )
+            return
+        # Acked = the accept decision was made. Deliberately NO reset: the counter
+        # stays at/above the terminal so the next commit blocks again. The spend is
+        # DEFERRED to the allow (see `_allow` above) — the later rules can still
+        # deny this command, and a token spent on a denied command bricks the branch.
+        spend_final_accept = True
+
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
         )
         if not acked:
             _deny(
-                f"BLOCKED: review escalation cap reached — {round_n} consecutive review "
-                f"rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). The "
-                "review→fix loop has run long — the round-2 mode-switch audit did NOT "
-                "converge, which means the DESIGN or the problem statement is likely "
-                "wrong, not just this fix. STOP and get a FRESH user decision on how to "
-                "proceed (robust-by-construction redesign / narrow scope / shelve), then "
+                f"BLOCKED: review escalation cap reached — {round_n} consecutive "
+                f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
+                f"{ESCALATION_ROUND_CAP}; internal same-model self/subagent audits are "
+                "not counted). The cross-model review→fix loop has run long — the "
+                "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
+                "the problem statement is likely wrong, not just this fix. STOP and get "
+                "a FRESH user decision on how to proceed (robust-by-construction "
+                "redesign / narrow scope / shelve), then "
                 "acknowledge that decision with a trailing shell comment (outside any "
                 "quotes):\n"
-                '  git commit -m "your message"  # escalation-ack'
-                + _merge_note(cwd)
+                '  git commit -m "your message"  # escalation-ack' + _merge_note(cwd)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -1006,15 +1114,18 @@ def main() -> None:
         )
         if not acked:
             _deny(
-                f"BLOCKED (mode-switch): {round_n} consecutive review rounds each "
-                f"surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). You are fixing the "
-                "INSTANCE the reviewer named, not the CLASS — a third round is how the "
-                "loop runs away. Do NOT commit another one-line patch. STOP and switch "
-                "approach:\n"
+                f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
+                f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
+                "internal self/subagent audits are not counted). You are fixing the "
+                "INSTANCE the reviewer named, not the CLASS — a third external round is "
+                "how the loop runs away. Do NOT commit another one-line patch. STOP and "
+                "switch approach:\n"
                 "  1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
                 "clean context) over the ENTIRE diff — tell it to exhaustively "
                 "enumerate every edge/boundary/sentinel/hierarchy/error case, "
-                "independent of what the bot flagged.\n"
+                "independent of what the bot flagged. (This audit is INTERNAL — mark it "
+                "`--source internal` or plainly; it does NOT advance the cap, so it can "
+                "never be the round that blocks you — that was the bug this fixes.)\n"
                 "  2. For any domain semantics in play (cgroup, systemd, SQLite, async, "
                 "timezones, …), READ the authoritative docs/source — do not reason from "
                 "assumption; assumption is what produced the serial defects.\n"
@@ -1022,8 +1133,7 @@ def main() -> None:
                 "case.\n"
                 "Then acknowledge you did the audit (not another blind patch) with a "
                 "trailing shell comment (outside any quotes):\n"
-                '  git commit -m "your message"  # audit-ack'
-                + _merge_note(cwd)
+                '  git commit -m "your message"  # audit-ack' + _merge_note(cwd)
             )
             return
 
@@ -1050,7 +1160,7 @@ def main() -> None:
     if not commit_may_add_content:
         staged = _staged_files(cwd)
         if staged and all(_is_docs_or_config(p) for p in staged):
-            sys.exit(0)
+            _allow()
 
     # Rule 2.5: review DEPTH. A SUBSTANTIAL change needs an ADVERSARIAL audit, not a
     # precision-filtered inline pass — a "no findings" from a confidence-≥80 reviewer
@@ -1118,7 +1228,9 @@ def main() -> None:
                 "hierarchy class, READ authoritative semantics for any domain code), save it "
                 "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
                 "(concurrent sessions don't clobber it), then re-mark:\n"
-                "  python3 scripts/review_state.py mark\n"
+                "  python3 scripts/review_state.py mark   # a genesis-architect audit is "
+                "INTERNAL — it satisfies this depth gate and never counts toward the "
+                "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
             )
@@ -1144,7 +1256,7 @@ def main() -> None:
                 "Findings acknowledged by session.",
                 file=sys.stderr,
             )
-            sys.exit(0)
+            _allow()
         if override == "in_quote":
             _deny(
                 "BLOCKED: '# review-override' is not a clean trailing shell "
@@ -1159,16 +1271,19 @@ def main() -> None:
             "BLOCKED: Code changes exist without review. "
             "Run an adversarial audit first — `/review` where the optional `superpowers` "
             "plugin is installed, else `/deep-review`, or dispatch the genesis-architect "
-            "agent — save it to `python3 scripts/review_state.py evidence-path`, "
-            "then run: python3 scripts/review_state.py mark --agent-output <that file> "
-            "(add --clean if it found no new should-fix-or-worse finding)\n"
+            "agent — save it to `python3 scripts/review_state.py evidence-path`, then "
+            "re-mark: `python3 scripts/review_state.py mark --agent-output <that file>` "
+            "(a genesis-architect audit is INTERNAL and satisfies this gate; it never "
+            "counts toward the escalation cap — no outcome flag needed). Only a "
+            "non-Anthropic cross-model review (Codex/Kimi) is marked `--source external "
+            "--defects|--clean`.\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )
         return
 
     # All checks passed — allow
-    sys.exit(0)
+    _allow()
 
 
 def _deny(message: str) -> None:

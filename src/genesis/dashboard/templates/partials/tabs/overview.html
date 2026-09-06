@@ -1274,12 +1274,13 @@
                     :style="`background: ${p.cost_tier === 'free' ? '#1b5e20' : p.cost_tier === 'cheap' ? '#1a237e' : p.cost_tier === 'moderate' ? '#4a3800' : '#4a0000'}; color: ${p.cost_tier === 'free' ? '#81c784' : p.cost_tier === 'cheap' ? '#90caf9' : p.cost_tier === 'moderate' ? '#ffd54f' : '#ef9a9a'}`"
                     x-text="p.cost_tier"></span>
               <span style="color: #666;" x-text="p.invocation_count > 0 ? p.invocation_count + ' calls' : ''"></span>
-              <button @click.stop="$store.genesisDashboard.toggleProvider(p.name)"
-                      style="margin-left: auto; font-size: 0.68rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; border: 1px solid; font-weight: 500;"
-                      :style="p.status !== 'disabled'
-                        ? 'background: transparent; color: #ef9a9a; border-color: #ef9a9a;'
-                        : 'background: transparent; color: #81c784; border-color: #81c784;'"
-                      x-text="p.status !== 'disabled' ? 'disable' : 'enable'"></button>
+              <!-- No toggle here by design. This card iterates the TOOL provider
+                   registry (names like `tavily`, `groq_stt`, `ollama_embedding`),
+                   while /api/genesis/providers/<name>/toggle resolves against the
+                   CIRCUIT BREAKER registry (`groq-free`, `mistral-large-free`).
+                   The namespaces are disjoint, so this button 404'd on every
+                   click. The working toggle is on the Internals tab, which
+                   iterates routingConfig.providers. -->
             </div>
           </template>
         </div>

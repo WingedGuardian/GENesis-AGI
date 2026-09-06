@@ -204,16 +204,19 @@ class GenesisEgoContextBuilder:
         queues = snap.get("queues", {})
         if queues:
             lines.append("\n### Queues")
-            deferred = queues.get("deferred_work_queue", {})
-            dead_letter = queues.get("dead_letter_queue", {})
-            if isinstance(deferred, dict):
-                lines.append(
-                    f"- Deferred work: {deferred.get('pending', 0)} pending"
-                )
-            if isinstance(dead_letter, dict):
-                lines.append(
-                    f"- Dead letter: {dead_letter.get('count', 0)} items"
-                )
+            # A FAILED queue query leaves the producer's value None while the
+            # KEY stays present, so `.get(name, 0)` never defaults — rendering
+            # it raw puts the token "None" in this context, and defaulting it
+            # to 0 states "nothing pending" for a depth nobody measured. Say
+            # unknown; the snapshot's `errors` list carries the reason.
+            deferred = queues.get("deferred_work")
+            dead = queues.get("dead_letters")
+            lines.append(
+                f"- Deferred work: {'unknown' if deferred is None else deferred} pending"
+            )
+            lines.append(
+                f"- Dead letter: {'unknown' if dead is None else dead} items"
+            )
 
         # Surplus
         surplus = snap.get("surplus", {})
@@ -686,8 +689,9 @@ class GenesisEgoContextBuilder:
 
         Informational context for the ``confidence`` field (rendered right before
         the output contract), NOT a limiter and NOT a mechanical rescale. Reads
-        ``ego_calibration_snapshots`` ONLY (never ``calibration_curves`` — that table
-        is auto-injected into the perception context). Genesis ego only for v1 — the
+        ``ego_calibration_snapshots`` ONLY — deliberately separate from the
+        perception-facing calibration surface (``calibration_cells``, WS-2 P3).
+        Genesis ego only for v1 — the
         aggregate calibration is genesis-ego dominated; per-ego split is future work.
 
         Live flag ``EgoConfig.calibration_injection_enabled`` (default ON) is read
@@ -950,6 +954,12 @@ class GenesisEgoContextBuilder:
             '  "notifications": [\n'
             "    {\n"
             '      "content": "what to tell the user (informational, no approval needed)",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "content": "a direct question when you need the user\'s input or a decision — sent without approval; the reply comes back to you as a signal, and you\'ll see an observation if delivery or reply fails",\n'
             '      "urgency": "low|normal|high"\n'
             "    }\n"
             "  ],\n"

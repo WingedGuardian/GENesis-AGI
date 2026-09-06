@@ -62,7 +62,11 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+`scripts/cc_align_host.sh` — host-only by contract, no container leg),
+`genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
+auto-updater suppression in `~/.claude/settings.json`, because the align path
+only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
@@ -329,7 +333,16 @@ extraction pipeline is the safety net.
 
 Foreground sessions carry a durable charter + ledger (DB-backed, re-injected
 into every post-compaction window — see the `## Session Charter` block and
-the per-turn `[Charter: … | open: N]` tag).
+the per-turn `[Ledger open: N | mission: …]` inventory, one line per open row).
+
+**The ledger is the session's founding mission and OUTRANKS every follow-up.**
+Follow-ups are durable system-wide; ledger rows exist only on the ledger. In
+any status report or wrap-up, open ledger rows come FIRST, by name — never as
+"older items" or fine print under follow-ups you created yourself — and a
+wrap-up cannot say "only follow-ups left" while a ledger row is open. Every
+open row is either getting done or gets a disposition (done / absorbed /
+dropped, with the reason) — a row left undisposed is a defect, not a backlog.
+A ledger row is ONE sentence; evidence carries the detail.
 
 **Real-time capture is your responsibility.** At agreement moments — the
 user says "yes, do that", approves a plan item, or you promise work — call
@@ -337,7 +350,9 @@ user says "yes, do that", approves a plan item, or you promise work — call
 compaction summary can erase. Close items with `session_ledger_update`
 (done / absorbed-with-evidence / dropped) as work lands; set the living
 mission via `session_charter_update` when the session's purpose
-crystallizes or pivots. You are the first line of defense; ambient
+crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
+until you do, because an unset mission falls back to the raw origin prompt and
+reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
@@ -360,6 +375,37 @@ When a user shares a file path or URL in conversation:
   the knowledge base as an authoritative source?"
 - Never auto-ingest without explicit user confirmation.
 - The dashboard also supports drag-drop file upload on the Knowledge tab.
+
+## Hook Output Persistence — a withheld hook is a SILENT loss
+
+Claude Code persists a hook's stdout above a size threshold instead of
+delivering it: the full text goes to a file and you get a short preview. It is
+not an error and nothing else announces it. MEASURED on this install: the
+SessionStart injection was withheld from 195 windows across a month — sessions
+ran without identity, charter and essential knowledge and nobody noticed,
+because the preview reads as ordinary furniture at the top of a window.
+
+**If a hook result arrives as a preview + a saved path** (as of CC 2.1.246:
+`<persisted-output>`, `Output too large (N KB). Full output saved to: <path>`,
+`Preview (first 2KB)`), that hook's contribution to this window was withheld:
+
+- **SessionStart** — Read the path the wrapper names **before anything else**,
+  then tell the user it happened. Genesis parts also mirror themselves to
+  `~/.genesis/sessions/<sid>/context-<part>.md` and name it in a
+  `[genesis-ctx:<part> · mirror: …]` header, so read the mirror if the
+  wrapper's path is gone. If neither exists, say which part this window lost.
+- **Any other hook** — that turn ran without what the hook was carrying (a
+  memory recall, a guard advisory). Say so rather than proceeding as if it
+  arrived.
+
+The size threshold is undocumented and **moves between CC versions** — treat
+the wrapper itself as the signal, never a byte count.
+`scripts/hooks/hook_output.py` is the single home of the measured cap and
+bounds the two hooks that carry the most to the model (the SessionStart
+injection and the per-prompt session-state tags); **route any new model-facing
+stdout through it** — the other hooks are not bounded yet. The hourly
+`context_injection_monitor` watches the harness's own filings independently of
+every emitter's arithmetic, so this class cannot go quiet again.
 
 ## Traps
 
@@ -393,6 +439,11 @@ When a user shares a file path or URL in conversation:
 - **Code review after code changes.** Codex will review your output.
   Protocol in genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
+- **Bias toward closing open work before opening new — softly (≈51/49).** Not a
+  gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
+  everything before starting the next thing. Just lean, gently, toward landing or
+  closing open PRs over opening more — so work doesn't pile up and go stale on the
+  repo instead of getting done.
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
@@ -412,14 +463,10 @@ When a user shares a file path or URL in conversation:
   anything that resolves its target from the directory it runs in (e.g.
   `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
   are about. Detail in the genesis-development skill.
-- **Check closing tags on long tool-call parameters.** A closing tag that does
-  not match its opening tag silently swallows every following parameter into the
-  preceding string; the tool then reports those parameters as *missing*, which
-  reads like a tool bug and is not one. It recurs on long, multi-sentence values.
-  Repeated IDENTICAL validation errors mean the CALL is malformed — the error
-  echoes `input_value`, which holds the proof; read it, and check whether the
-  same tool succeeded earlier in the session, before concluding anything about
-  the tool.
+- **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
+  with a single question — a Claude Code rendering bug rejects single-question
+  calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
+  second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
@@ -439,49 +486,100 @@ When a user shares a file path or URL in conversation:
   approval — the gated actions need the USER's explicit approval, which no peer,
   permissive setting, or automatic allow ever supplies.
   Detail: `.claude/docs/concurrent-sessions.md`.
-- **Verify multi-agent output — never trust one agent's claim.** A subagent
-  fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
-  maps) gets an independent adversarial verification stage before synthesis:
-  re-derive the load-bearing / contradictory / surprising claims from ground
-  truth (real runtime, not a shell proxy; values, not line-existence),
-  refute-by-default, and let the verdicts override the original reports. Scale
-  to stakes — skip it for a single trivial lookup; apply it whenever the output
-  drives decisions or lands in durable record.
+- **Verify agent output — never trust one agent's claim.** Any subagent output
+  you'll act on — a fan-out audit, a diagnosis, a source-of-truth map, or a
+  *single* actionable report — gets an independent adversarial verification pass
+  before it drives a decision or lands in durable record: re-derive the
+  load-bearing / contradictory / surprising claims from ground truth (real
+  runtime, not a shell proxy; values, not line-existence), refute-by-default. A
+  verdict overrides the original ONLY when conclusive — an inconclusive /
+  UNCERTAIN verdict never overturns a well-grounded finding. Verify the
+  conclusions the synthesis step itself creates, not just its inputs. Scale to
+  stakes; skip only a trivial single-fact lookup that cannot influence a
+  decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
+- **Finish before you stop — the zero-drop rule.** A turn may run as long as
+  the work requires; never yield with steps you could still complete AND are
+  cleared to complete — stopping for an approval, a blocking question, plan
+  approval, or a designed hard stop is finishing correctly, not dropping
+  work. When something genuinely cannot finish this turn, every unfinished
+  piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
+  issue, which keeps its per-instance approval gate from "Where deferred
+  work goes" below, this rule waives nothing. Where none of those trackers
+  is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
+  ledger or follow-up tool — the fallback is a structured handoff that NAMES
+  every unfinished piece in your final message; a named remainder is tracked,
+  an unnamed one is dropped. An untracked remainder is a
+  drop, not a deferral, and a plan-file bullet is not a row. On the next
+  prompt, reconcile your own stranded artifacts early — ordered behind
+  anything the user's prompt makes urgent — before taking on discretionary
+  new work. The answer to "what has fallen through the cracks?" is MADE
+  zero: enumerate, then fix or file what the enumeration finds. (Origin
+  2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
+  days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
-- **Follow-up discipline**: bias = FIX NOW, not defer. A follow-up is valid
-  ONLY if the work is (1) blocked on a precondition unmet this session (incl.
-  an unmade design decision), (2) gated on time/data, or (3) big enough to
-  derail this session — or the user directs it as separate. Otherwise do it
-  now, even if unrelated/unasked; "already noted in a PR/comment" is not a
-  reason to also create a row. Valid ones: create via `follow_up_create` MCP,
-  never leave as just text. **`follow_up_create` takes a `work_state`, not a raw
-  lane** — declare the item's state and the tool DERIVES the lane, so priority
-  never decides it. It is an INTENT/tractability axis, NOT priority (a low-priority
-  item you still intend to do is `ready`, never `deferred_cold`):
-  `ready` (actionable now, just needs doing) and `blocked_on_trigger` (intended,
-  waiting on a specific time/event — REQUIRES a `revisit_condition`) → the HOT
-  `follow_up` lane (committed, actionable, dispatched/surfaced — the
-  FIX-NOW-or-valid-defer cases above); `deferred_cold` (consciously NOT pursuing
-  near-term — vague/hard/someday) → the COLD `tabled` lane (an awareness record,
-  bug-tracker semantics, never dispatched or surfaced). Genuine someday/maybe and
-  deferred known bugs are `deferred_cold`, not the hot lane. (`follow_up_update`
-  moves lanes via the same `work_state` — there is no raw-`kind` lane override on
-  either surface, so priority can't pick the lane on update either. Inbox
-  WATCH/BOOKMARK markers auto-route to `tabled` and soft-decay after 60d.)
+- **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
+  on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
+  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
+  public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
+  **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
+  and operational state purely local to this box → a local **follow-up** via
+  `follow_up_create`, never plain text. **Consciously not doing** (nitpick, someday, a
+  far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
+  never dispatched, surfaced, or filed as an issue, because we don't want it picked
+  up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
+  Two hard limits on the issue route, both non-negotiable: a public post is
+  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
+  approval carries forward, and a channel-driven session has no confirmation step of
+  its own); and a **security** defect — an unpatched bypass, a credential exposure,
+  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
+  owns it. Everything else — who may file, the command, labels, dispatched sessions,
+  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
+  Goes"). Read it before filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
   Don't assume what a function does based on its name.
 - **Self-correction loop**: persist lessons as concrete rules that PREVENT
-  mistakes, not just document them.
+  mistakes, not just document them. A rule that only names the error is not
+  preventive — state the CORRECT action, or it will be re-read while the same
+  mistake repeats.
+- **A tool call that reports parameters *missing* is usually malformed, not
+  buggy — and the echoed payload is what tells you which.** The diagnosis below
+  is encoding-independent; the concrete form is not, so take the form from your
+  own client.
+
+  **Read the echoed `input_value` first.** It shows how far each value actually
+  ran, which is what separates a malformed CALL from a wrong value or a genuine
+  tool defect — repeated identical errors on their own establish none of the
+  three, since resubmitting an invalid enum, or hitting a deterministic callee
+  defect, also fails identically every time. If a value ran PAST where it should
+  have ended and swallowed the parameters after it, fix the STRUCTURE, not the
+  text. If it ended where it should have, the structure is fine and the value or
+  the tool is the problem — and what separates those two is the value checked
+  against the tool's own documented contract, not whether that tool worked
+  earlier. Prior success proves nothing here: a defect can be input-dependent,
+  accepting one payload and wrongly rejecting the next. If the value is
+  documented-valid and still rejected, that IS the bug report. Most likely on
+  long, multi-sentence values. Never file a bug report from a payload you have
+  not read — and never suppress one because the tool worked a moment ago.
+
+  **In Claude Code specifically**, parameters are
+  `<parameter name="X">…</parameter>`. A bare `<X>…</X>` is not a shorthand: the
+  wrapper is the only recognised form, so the opening tag never starts a
+  parameter and its `</X>` closes nothing — which is what produces the run-on
+  above. This file is also the canonical instruction set for Codex, Cursor,
+  OpenCode and others (see `AGENTS.md`), whose call encodings are client-defined
+  and may be JSON or another protocol entirely. **Do not apply this
+  serialization outside Claude Code** — there it would corrupt a valid call.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
-  bug you consciously defer becomes a `tabled` record (`work_state="deferred_cold"`,
-  bug-tracker lane above), never a silent drop.
+  deferred bug follows the routing above — a Genesis-repo bug becomes an ISSUE, a
+  someday/not-pursuing one becomes `tabled` — never a silent drop.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the

@@ -545,6 +545,11 @@ def main(argv: list[str] | None = None) -> None:
         # switch + size as the server runtime, so a secrets.env-configured
         # value must reach the child too (Codex P2 on #1302)
         "GENESIS_RECALL_READ_POOL_OFF", "GENESIS_RECALL_READ_POOL_SIZE",
+        # deliberate() (Model Fusion) timeout budget — the health MCP server hosts the
+        # `deliberate` tool, so a secrets.env-set override must reach this child or the
+        # documented knob is inert and every call silently stays at the 1000s default
+        # (Codex P2 on #1587).
+        "GENESIS_DELIBERATE_TIMEOUT_S",
     }
     import os
 

@@ -69,35 +69,47 @@ def test_bump_increments_on_distinct_content(repo, _isolate_rounds):
     # Two one-line fixes to the SAME file (identical --stat, different content):
     # the round counter must key on CONTENT, so both count as distinct rounds.
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
     assert review_state.get_review_round(cwd=str(repo)) == 1
     _stage(repo, "a = 3\n")  # same stat, different content → new round
-    assert review_state.bump_review_round(cwd=str(repo)) == 2
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 2
     assert review_state.get_review_round(cwd=str(repo)) == 2
+
+
+def test_bump_treats_non_external_source_as_internal(repo, _isolate_rounds):
+    # The counting brain is fail-safe: ONLY the literal "external" counts. The default
+    # (internal) and any other value (a direct-API caller passing garbage) are treated
+    # as internal → never write the round file, even across distinct staged diffs.
+    _stage(repo, "a = 2\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 0  # default source=internal
+    assert review_state.bump_review_round(cwd=str(repo), source="garbage") == 0
+    _stage(repo, "a = 3\n")  # distinct diff — still must not count for a non-external
+    assert review_state.bump_review_round(cwd=str(repo), source="internal") == 0
+    assert review_state.get_review_round(cwd=str(repo)) == 0
 
 
 def test_remark_same_content_no_increment(repo, _isolate_rounds):
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
     # Re-mark the identical staged diff (re-ran /review, no fix) → NOT a new round.
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
 
 
 def test_branch_change_resets(repo, _isolate_rounds):
     _stage(repo, "a = 2\n")
-    review_state.bump_review_round(cwd=str(repo))
+    review_state.bump_review_round(cwd=str(repo), source="external")
     _stage(repo, "a = 3\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 2
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 2
     _git(repo, "commit", "-qm", "wip")
     _git(repo, "checkout", "-q", "-b", "feature/y")
     _stage(repo, "b = 1\n")
     assert review_state.get_review_round(cwd=str(repo)) == 0  # different branch → fresh
-    assert review_state.bump_review_round(cwd=str(repo)) == 1  # reset to 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1  # reset to 1
 
 
 def test_get_round_zero_for_other_branch(repo, _isolate_rounds):
     _stage(repo, "a = 2\n")
-    review_state.bump_review_round(cwd=str(repo))
+    review_state.bump_review_round(cwd=str(repo), source="external")
     _git(repo, "commit", "-qm", "wip")
     _git(repo, "checkout", "-q", "-b", "other")
     assert review_state.get_review_round(cwd=str(repo)) == 0
@@ -105,9 +117,27 @@ def test_get_round_zero_for_other_branch(repo, _isolate_rounds):
 
 def test_reset_clears(repo, _isolate_rounds):
     _stage(repo, "a = 2\n")
-    review_state.bump_review_round(cwd=str(repo))
+    review_state.bump_review_round(cwd=str(repo), source="external")
     review_state.reset_review_round(cwd=str(repo))
     assert review_state.get_review_round(cwd=str(repo)) == 0
+
+
+def test_legacy_counter_without_last_source_is_discarded(repo, _isolate_rounds):
+    # A round file written by the pre-source-axis (reviewer-agnostic) code has a `round`
+    # but NO `last_source`; under the old model that count was built entirely from INTERNAL
+    # self-reviews. On upgrade it must NOT be trusted (else the commit gate keeps blocking on
+    # a never-cross-model streak — the exact false block this change removes). It is discarded:
+    # get_review_round → 0, and the first EXTERNAL mark starts fresh at 1 (not legacy+1), now
+    # stamping last_source so it is trusted henceforth. Self-heals without a data repair.
+    branch = review_state.get_current_branch(cwd=str(repo))
+    rf = review_state._round_file(cwd=str(repo))
+    rf.parent.mkdir(parents=True, exist_ok=True)
+    rf.write_text(json.dumps({"branch": branch, "round": 2, "last_hash": "deadbeef"}))
+    assert review_state.get_review_round(cwd=str(repo)) == 0  # legacy discarded, not 2
+    _stage(repo, "legacy_fix = 1\n")
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1  # fresh, not 3
+    st = json.loads(rf.read_text())
+    assert st["last_source"] == "external" and st["round"] == 1
 
 
 # ── Defect-bearing streak + reset-on-clean (option (e), round-4 fix) ───────
@@ -118,22 +148,24 @@ def test_clean_mark_resets_streak(repo, _isolate_rounds):
     # rounds, then a clean review, must reset the streak to 0 — and the NEXT
     # defect-bearing round starts fresh at 1, not resume at 3.
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
     _stage(repo, "a = 3\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 2
-    assert review_state.bump_review_round(cwd=str(repo), clean=True) == 0
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 2
+    assert review_state.bump_review_round(cwd=str(repo), source="external", clean=True) == 0
     assert review_state.get_review_round(cwd=str(repo)) == 0
     _stage(repo, "a = 4\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
 
 
 def test_clean_resets_even_on_same_diff(repo, _isolate_rounds):
     # A clean re-probe of the SAME staged diff still closes the breaker (reset),
     # even though a defect-bearing re-mark of the same diff would be idempotent.
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
-    assert review_state.bump_review_round(cwd=str(repo)) == 1  # same diff, idempotent
-    assert review_state.bump_review_round(cwd=str(repo), clean=True) == 0
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
+    assert (
+        review_state.bump_review_round(cwd=str(repo), source="external") == 1
+    )  # same diff, idempotent
+    assert review_state.bump_review_round(cwd=str(repo), source="external", clean=True) == 0
 
 
 def test_defect_mark_on_same_diff_after_clean_reset_stays_zero(repo, _isolate_rounds):
@@ -141,22 +173,28 @@ def test_defect_mark_on_same_diff_after_clean_reset_stays_zero(repo, _isolate_ro
     # IDENTICAL staged diff is idempotent (nothing changed) → streak stays 0. The
     # moment a real fix is staged (hash changes) the streak resumes at 1.
     _stage(repo, "a = 2\n")
-    review_state.bump_review_round(cwd=str(repo))  # round 1
-    review_state.bump_review_round(cwd=str(repo), clean=True)  # reset, last_hash=H(a=2)
-    assert review_state.bump_review_round(cwd=str(repo)) == 0  # same diff → no new round
+    review_state.bump_review_round(cwd=str(repo), source="external")  # round 1
+    review_state.bump_review_round(
+        cwd=str(repo), source="external", clean=True
+    )  # reset, last_hash=H(a=2)
+    assert (
+        review_state.bump_review_round(cwd=str(repo), source="external") == 0
+    )  # same diff → no new round
     _stage(repo, "a = 3\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1  # real change resumes at 1
+    assert (
+        review_state.bump_review_round(cwd=str(repo), source="external") == 1
+    )  # real change resumes at 1
 
 
 def test_defect_bearing_streak_still_reaches_cap_after_clean(repo, _isolate_rounds):
     # Reset-on-clean must NOT defang the cap: after a clean reset, three fresh
     # defect-bearing rounds still reach the cap (a genuine loop is still caught).
     _stage(repo, "a = 2\n")
-    review_state.bump_review_round(cwd=str(repo))
-    review_state.bump_review_round(cwd=str(repo), clean=True)  # reset
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    review_state.bump_review_round(cwd=str(repo), source="external", clean=True)  # reset
     for i, val in enumerate(("b = 1\n", "b = 2\n", "b = 3\n"), 1):
         _stage(repo, val)
-        assert review_state.bump_review_round(cwd=str(repo)) == i
+        assert review_state.bump_review_round(cwd=str(repo), source="external") == i
     assert review_state.get_review_round(cwd=str(repo)) == review_state.ESCALATION_ROUND_CAP
 
 
@@ -184,17 +222,28 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
     )
 
 
-def _mark(repo: Path, home: Path, *, clean: bool = False) -> subprocess.CompletedProcess:
+def _mark(
+    repo: Path, home: Path, *, clean: bool = False, source: str = "external"
+) -> subprocess.CompletedProcess:
     (home / ".genesis" / "last_code_review.txt").write_text("adversarial review: OK\n")
     env = {**os.environ, "HOME": str(home)}
+    # The escalation streak is CROSS-MODEL only, so these gate/streak tests mark
+    # `--source external` (the default here) — that is the ONLY kind that advances or
+    # resets the counter. An external mark REQUIRES an outcome flag (--clean XOR
+    # --defects). Pass source="internal" to exercise a non-counting same-model review.
     args = [
         sys.executable,
         str(_REVIEW_STATE),
         "mark",
         "--agent-output",
         str(home / ".genesis" / "last_code_review.txt"),
+        "--source",
+        source,
     ]
-    if clean:
+    if source == "external":
+        args.append("--clean" if clean else "--defects")
+    elif clean:
+        # internal + clean is a valid (ignored-for-streak) combination worth exercising
         args.append("--clean")
     return subprocess.run(
         args,
@@ -204,6 +253,24 @@ def _mark(repo: Path, home: Path, *, clean: bool = False) -> subprocess.Complete
         text=True,
         timeout=30,
     )
+
+
+def _mark_raw(repo: Path, home: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run the `mark` CLI with an explicit arg list (no outcome flag injected).
+
+    Used to exercise the required-outcome validation itself — neither/both flags.
+    """
+    (home / ".genesis" / "last_code_review.txt").write_text("adversarial review: OK\n")
+    env = {**os.environ, "HOME": str(home)}
+    args = [
+        sys.executable,
+        str(_REVIEW_STATE),
+        "mark",
+        "--agent-output",
+        str(home / ".genesis" / "last_code_review.txt"),
+        *extra,
+    ]
+    return subprocess.run(args, cwd=str(repo), env=env, capture_output=True, text=True, timeout=30)
 
 
 def _reach_rounds(repo: Path, home: Path, n: int) -> None:
@@ -369,9 +436,9 @@ def test_clean_mark_via_cli_prevents_block_after_defect_rounds(repo, home):
 def test_clean_staged_mark_does_not_inflate(repo, _isolate_rounds):
     # A mark with nothing staged ("clean" content hash) is not a review round.
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
     _git(repo, "commit", "-qm", "wip")  # staged area now clean
-    assert review_state.bump_review_round(cwd=str(repo)) == 1  # no inflation
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1  # no inflation
 
 
 def test_docs_only_commit_still_blocked_at_cap(repo, home):
@@ -399,7 +466,7 @@ def test_corrupt_round_counter_does_not_crash(repo, _isolate_rounds):
     rf.parent.mkdir(parents=True, exist_ok=True)
     branch = review_state.get_current_branch(cwd=str(repo))
     rf.write_text(json.dumps({"branch": branch, "round": "not-an-int", "last_hash": "old"}))
-    result = review_state.bump_review_round(cwd=str(repo))  # must not raise
+    result = review_state.bump_review_round(cwd=str(repo), source="external")  # must not raise
     assert result == 1  # coerced the bad value to 0, then +1
 
 
@@ -430,7 +497,9 @@ def test_get_review_round_no_crash_on_truthy_non_dict(repo, _isolate_rounds):
 def test_bump_no_crash_on_truthy_non_dict(repo, _isolate_rounds):
     _write_round_file(repo, "42")
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1  # treats as fresh, no crash
+    assert (
+        review_state.bump_review_round(cwd=str(repo), source="external") == 1
+    )  # treats as fresh, no crash
 
 
 def test_gate_fails_open_on_non_dict_counter(repo, home):
@@ -461,23 +530,32 @@ def test_coerce_finite_int_rejects_non_finite():
 
 
 def test_load_round_coerces_non_finite_round_to_zero(repo, _isolate_rounds):
-    # A well-formed dict whose 'round' is a non-finite JSON number (1e999 → inf)
-    # must be coerced to 0 at the load boundary — int(inf) OverflowError escapes the
-    # plain int() guards and would crash the gate. Both the load boundary and
-    # get_review_round must fail open to 0.
+    # A well-formed CURRENT-era dict (has last_source) whose 'round' is a non-finite JSON
+    # number (1e999 → inf) must be coerced to 0 at the load boundary — int(inf) OverflowError
+    # escapes the plain int() guards and would crash the gate. Both the load boundary and
+    # get_review_round must fail open to 0. (last_source present so this exercises coercion,
+    # not the separate legacy-discard path for pre-source-axis files.)
     branch = review_state.get_current_branch(cwd=str(repo))
-    _write_round_file(repo, '{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
+    _write_round_file(
+        repo,
+        '{"branch": "' + branch + '", "round": 1e999, "last_hash": "x", "last_source": "external"}',
+    )
     assert review_state._load_round(cwd=str(repo))["round"] == 0
     assert review_state.get_review_round(cwd=str(repo)) == 0
 
 
 def test_bump_no_crash_on_infinity_round(repo, _isolate_rounds):
-    # A defect-bearing bump over an infinity 'round' must not raise; it coerces the
-    # bad value to 0 and increments to 1.
+    # A defect-bearing bump over an infinity 'round' (in a current-era file with last_source)
+    # must not raise; it coerces the bad value to 0 and increments to 1.
     branch = review_state.get_current_branch(cwd=str(repo))
-    _write_round_file(repo, '{"branch": "' + branch + '", "round": 1e999, "last_hash": "old"}')
+    _write_round_file(
+        repo,
+        '{"branch": "'
+        + branch
+        + '", "round": 1e999, "last_hash": "old", "last_source": "external"}',
+    )
     _stage(repo, "a = 2\n")
-    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
 
 
 def test_gate_fails_open_on_infinity_round(repo, home):
@@ -492,6 +570,227 @@ def test_gate_fails_open_on_infinity_round(repo, home):
     rf.write_text('{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ── Source axis: the streak is CROSS-MODEL only (--source external) ───────────
+# The escalation streak exists to catch cross-model non-convergence — an external,
+# non-Anthropic reviewer finding new defects round after round. Internal same-model
+# self/subagent reviews are free and share the author's blind spots, so they NEVER
+# count. --source (default internal) decides; an external mark still requires an
+# outcome flag (it's the only kind that moves the counter). Supersedes feea3f71/#1446:
+# its unconditional required-outcome only ever bit internal re-audits, which can no
+# longer inflate the streak at all.
+
+
+def test_internal_mark_needs_no_outcome_and_never_counts(repo, home):
+    # A bare `mark` (default --source internal, no outcome flag) is a VALID review: the
+    # marker is written (depth gate satisfied) but the round counter is never created —
+    # a same-model review cannot inflate the cross-model streak, so no flag is needed.
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home)  # no --source, no outcome
+    assert res.returncode == 0, res.stdout + res.stderr
+    key = review_state._worktree_key(cwd=str(repo))
+    assert (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+    assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
+
+
+def test_external_mark_requires_explicit_outcome(repo, home):
+    # An `--source external` mark WITHOUT an outcome flag is REFUSED (the outcome is what
+    # moves the cross-model counter): no marker written, no round file, exit 1.
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--source", "external")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "outcome" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+    assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
+
+
+def test_mark_rejects_invalid_source(repo, home):
+    # An unrecognized --source is refused (not silently coerced at the CLI boundary).
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--source", "anthropic", "--defects")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "source" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+
+
+def test_mark_rejects_valueless_source(repo, home):
+    # A valueless --source (the flag as the LAST token, no value) must be REFUSED —
+    # NOT silently defaulted to internal, which would let an intended external mark be
+    # miscounted as non-counting. Fail-closed: no marker written. (bind-atomically)
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--defects", "--source")  # --source has no value
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "source" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+    assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
+
+
+def test_source_equals_form_is_parsed(repo, home):
+    # `--source=external` (the conventional equals form) must parse like `--source external`,
+    # not be silently dropped to the internal default — else a cross-model review writes a
+    # marker WITHOUT advancing the cap (miscounted internal). Also the equals form of an
+    # invalid value is still rejected. (Codex P2 — dont_hand_roll_cli_parsing.)
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--source=external", "--defects")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert json.loads(rf.read_text())["round"] == 1  # counted as external, not dropped to internal
+    _stage(repo, "a = 3\n")
+    res2 = _mark_raw(repo, home, "--source=bogus", "--defects")
+    assert res2.returncode == 1 and "source" in res2.stderr.lower()
+
+
+def test_mark_fails_closed_on_unknown_option_typo(repo, home):
+    # A typo'd flag (e.g. `--soruce`) must FAIL CLOSED, not be silently skipped — otherwise the
+    # internal default stands and an intended external review is recorded internal, silently
+    # skipping the escalation cap. No marker, no round file. (Codex P2 — fail-closed-on-unknown.)
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--soruce", "external", "--defects")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "unknown option" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+    assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
+
+
+def test_mark_rejects_contradictory_outcome(repo, home):
+    # Passing BOTH --clean and --defects is a contradiction → refused, no marker
+    # (independent of source).
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--source", "external", "--clean", "--defects")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "both" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+
+
+def test_source_decides_counting(repo, home):
+    # The SAME defect-bearing outcome counts iff it is external. An internal --defects
+    # does NOT create/advance the round file; an external --defects advances to 1.
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--defects")  # internal (default) — must not count
+    assert res.returncode == 0, res.stderr
+    assert not rf.exists()
+    _stage(repo, "a = 3\n")
+    res = _mark_raw(repo, home, "--source", "external", "--defects")  # external — counts
+    assert res.returncode == 0, res.stderr
+    assert json.loads(rf.read_text())["round"] == 1
+
+
+def test_external_clean_resets_via_cli(repo, home):
+    # An external clean round is the streak-reset path through the CLI.
+    _reach_rounds(repo, home, 2)  # two external --defects rounds
+    _stage(repo, "clean_now = 1\n")
+    res = _mark_raw(repo, home, "--source", "external", "--clean")
+    assert res.returncode == 0, res.stderr
+    assert "streak reset" in res.stdout
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    assert json.loads(rf.read_text())["round"] == 0
+
+
+def test_internal_clean_does_not_reset_external_streak(repo, home):
+    # A self-review must NOT be able to reset a standing cross-model streak (that would
+    # be a self-rubber-stamp reset). After two external rounds, an internal --clean
+    # leaves the streak at 2.
+    _reach_rounds(repo, home, 2)  # external streak == 2
+    _stage(repo, "internal_look = 1\n")
+    res = _mark_raw(repo, home, "--source", "internal", "--clean")
+    assert res.returncode == 0, res.stderr
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    assert json.loads(rf.read_text())["round"] == 2
+
+
+def test_external_defect_loop_still_reaches_cap(repo, home):
+    # LOCKING: the source axis must NOT weaken the cap — three EXTERNAL defect rounds
+    # still hard-block the commit at the escalation cap.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)  # 3 external rounds
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "escalation cap" in res.stderr
+
+
+def test_acceptance_bar_incident_replay(repo, home):
+    # THE ACCEPTANCE BAR — replays the 2026-09-01 false-block. The real sequence was:
+    # external Codex wave-1 (defects), external Codex wave-2 (defects → mode-switch
+    # fired CORRECTLY, forcing the audit that found F1/F2), then the MANDATED internal
+    # fresh-context audit — which under the old model counted as round 3 and tripped
+    # the HARD cap, penalizing the very remedy the gate demanded. New semantics: the
+    # two external rounds reach 2 (mode-switch), the internal audit does NOT advance,
+    # so the commit proceeds behind `# audit-ack` and the hard cap NEVER fires.
+    _stage(repo, "codex_w1 = 1\n")
+    _mark(repo, home)  # external round 1 (Codex wave-1)
+    _stage(repo, "codex_w2 = 1\n")
+    _mark(repo, home)  # external round 2 (Codex wave-2) → mode-switch territory
+    _stage(repo, "audit_fix = 1\n")
+    _mark(repo, home, source="internal")  # the mandated fresh-context audit — internal
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    assert json.loads(rf.read_text())["round"] == 2, "internal audit must not advance the streak"
+    # Hard cap must NOT fire; the mode-switch audit-ack lets the commit proceed.
+    res_blocked = _run_hook('git commit -m "wip"', repo, home)
+    assert res_blocked.returncode == 2, res_blocked.stdout + res_blocked.stderr
+    assert (
+        "mode-switch" in res_blocked.stderr and "escalation cap reached" not in res_blocked.stderr
+    )
+    res_ok = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
+    assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
+
+
+def test_marker_and_round_json_carry_source(repo, home):
+    # Observability: the marker records the review source; the round file records the
+    # last external source. An internal mark writes the marker but no round file.
+    key = review_state._worktree_key(cwd=str(repo))
+    marker = home / ".genesis" / "review_markers" / f"{key}.json"
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    _stage(repo, "a = 2\n")
+    _mark(repo, home, source="internal")
+    assert json.loads(marker.read_text())["source"] == "internal"
+    assert not rf.exists()
+    _stage(repo, "a = 3\n")
+    _mark(repo, home)  # external default
+    assert json.loads(marker.read_text())["source"] == "external"
+    assert json.loads(rf.read_text())["last_source"] == "external"
+
+
+# ── Fix C: class-sweep reminder at round>=2 (369bbe0e) — advisory, never blocks ──
+
+
+def test_class_sweep_reminder_at_round_two(repo, home):
+    # On the SECOND defect-bearing round (you're looping), `mark` prints a class-sweep
+    # reminder to stderr — advisory only (exit 0), fired at the decision moment.
+    _reach_rounds(repo, home, 1)  # round 1 (no reminder)
+    _stage(repo, "second = 1\n")
+    res = _mark(repo, home)  # round 2
+    assert res.returncode == 0, res.stderr
+    assert "round 2" in res.stderr
+    assert "class" in res.stderr.lower() and "sweep" in res.stderr.lower()
+
+
+def test_no_reminder_at_round_one(repo, home):
+    # The first defect-bearing round is not a loop yet → no reminder.
+    _stage(repo, "first = 1\n")
+    res = _mark(repo, home)  # round 1
+    assert res.returncode == 0, res.stderr
+    assert "sweep" not in res.stderr.lower()
+
+
+def test_no_reminder_on_clean(repo, home):
+    # A clean mark resets the streak to 0 → never a loop → no reminder, even after
+    # prior defect-bearing rounds.
+    _reach_rounds(repo, home, 2)  # two defect rounds
+    _stage(repo, "clean_now = 1\n")
+    res = _mark(repo, home, clean=True)
+    assert res.returncode == 0, res.stderr
+    assert "sweep" not in res.stderr.lower()
 
 
 # ── A merge must NOT be able to silence the counter ───────────────────────
@@ -516,16 +815,16 @@ def test_a_forged_merge_sentinel_cannot_freeze_the_counter(repo, _isolate_rounds
     merge in its denial text; it never lets one decide the verdict.
     """
     _stage(repo, "base = 1\nfix_one = True\n")
-    assert review_state.bump_review_round(str(repo)) == 1
+    assert review_state.bump_review_round(str(repo), source="external") == 1
 
     _fabricate_merge_sentinel(repo)
 
     _stage(repo, "base = 1\nfix_two = True\n")
-    assert review_state.bump_review_round(str(repo)) == 2, (
+    assert review_state.bump_review_round(str(repo), source="external") == 2, (
         "a forged merge sentinel suppressed a real defect-bearing round"
     )
     _stage(repo, "base = 1\nfix_three = True\n")
-    assert review_state.bump_review_round(str(repo)) == 3, (
+    assert review_state.bump_review_round(str(repo), source="external") == 3, (
         "the escalation cap can be silenced by writing a file"
     )
 
@@ -539,7 +838,7 @@ def test_a_real_merge_also_does_not_suppress_rounds(repo, _isolate_rounds):
     that could be turned off silently.
     """
     _stage(repo, "base = 1\nfix_one = True\n")
-    assert review_state.bump_review_round(str(repo)) == 1
+    assert review_state.bump_review_round(str(repo), source="external") == 1
 
     _git(repo, "checkout", "-q", "main")
     (repo / "f.py").write_text("base = 1\nupstream = True\n")
@@ -553,4 +852,320 @@ def test_a_real_merge_also_does_not_suppress_rounds(repo, _isolate_rounds):
     (repo / "f.py").write_text("base = 1\nmine = True\nupstream = True\n")
     _git(repo, "add", "-A")
 
-    assert review_state.bump_review_round(str(repo)) == 2
+    assert review_state.bump_review_round(str(repo), source="external") == 2
+
+
+# ── Round-7 terminal: the LIFETIME counter and its gate ───────────────────
+#
+# The consecutive streak alone has no terminal. `# escalation-ack` calls
+# reset_review_round (review_enforcement_commit.py), so the cap is
+# indefinitely repeatable: rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, forever.
+# A PR can grind through fifteen external rounds and the gate never says
+# "enough" — only "enough, for now". The lifetime counter is what closes that:
+# acks never reset it, so round 7 forces a terminal decision (accept the
+# remaining findings and merge, or abandon and start from a clean design).
+
+
+def test_lifetime_survives_the_escalation_ack_reset(repo, _isolate_rounds):
+    """THE POINT OF THE WHOLE FEATURE: reset_review_round must not wipe it.
+
+    The consecutive counter going back to 0 is exactly what makes the existing
+    cap repeatable; if lifetime reset with it, round 7 would be unreachable and
+    this gate would be decorative.
+    """
+    for i, val in enumerate(("b = 1\n", "b = 2\n", "b = 3\n"), 1):
+        _stage(repo, val)
+        assert review_state.bump_review_round(cwd=str(repo), source="external") == i
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 3
+    review_state.reset_review_round(cwd=str(repo))
+    assert review_state.get_review_round(cwd=str(repo)) == 0, "streak must reset"
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 3, "lifetime must NOT reset"
+
+
+def test_lifetime_accumulates_across_reset_cycles(repo, _isolate_rounds):
+    """Seven rounds spread over the real ack cycle still reach seven."""
+    for n, val in enumerate((f"b = {i}\n" for i in range(1, 8)), 1):
+        _stage(repo, val)
+        review_state.bump_review_round(cwd=str(repo), source="external")
+        if n % review_state.ESCALATION_ROUND_CAP == 0:
+            review_state.reset_review_round(cwd=str(repo))  # simulates # escalation-ack
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 7
+
+
+def test_lifetime_not_advanced_by_internal_review(repo, _isolate_rounds):
+    """Same rule as the streak: internal same-model audits are free.
+
+    The round-2 mode-switch gate MANDATES an internal audit; counting it toward
+    a terminal cap would penalise the remedy the gate itself demands (#1577).
+    """
+    for val in ("b = 1\n", "b = 2\n", "b = 3\n"):
+        _stage(repo, val)
+        review_state.bump_review_round(cwd=str(repo), source="internal")
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 0
+
+
+def test_lifetime_resets_on_branch_change(repo, _isolate_rounds):
+    """A different branch is a different change, so it gets a fresh budget."""
+    _stage(repo, "b = 1\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 1
+    _git(repo, "checkout", "-q", "-b", "feature/y")
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 0
+
+
+def test_lifetime_absent_in_legacy_file_reads_zero(repo, _isolate_rounds):
+    """A counter written before this feature has no lifetime key.
+
+    It must read 0 rather than raising — an in-flight branch gets a fresh
+    budget, which errs toward LESS friction, the right direction for a new gate.
+    """
+    _stage(repo, "b = 1\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    rf = review_state._round_file(str(repo))
+    state = json.loads(rf.read_text())
+    del state["lifetime"]
+    rf.write_text(json.dumps(state))
+    assert review_state.get_review_lifetime(cwd=str(repo)) == 0
+
+
+def _reach_lifetime(repo: Path, home: Path, n: int) -> None:
+    """Drive the LIFETIME counter to n, resetting the streak as an ack would."""
+    for i in range(1, n + 1):
+        _stage(repo, f"life = {i}\n")
+        m = _mark(repo, home)
+        assert m.returncode == 0, m.stderr
+        if i % review_state.ESCALATION_ROUND_CAP == 0:
+            env = {**os.environ, "HOME": str(home)}
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import sys; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r}); "
+                    f"import review_state as r; r.reset_review_round(cwd={str(repo)!r})",
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+
+
+def test_commit_blocked_at_final_round(repo, home):
+    res_before = _run_hook('git commit -m "wip"', repo, home)
+    assert res_before.returncode == 0, "control: an unmarked branch must not block"
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "final" in res.stderr.lower()
+
+
+def test_escalation_ack_does_not_clear_the_final_round_block(repo, home):
+    """The whole point: the repeatable sigil must stop working at the terminal."""
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "final" in res.stderr.lower()
+
+
+def test_final_round_accept_allows_the_commit(repo, home):
+    """Carries its own negative control, because `returncode == 0` alone is vacuous.
+
+    A bare assertion that the acked commit passes would ALSO pass if the terminal
+    did not exist at all. The un-acked run in the same test is what makes the
+    green mean something: same state, same command, one sigil apart.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    without = _run_hook('git commit -m "wip"', repo, home)
+    assert without.returncode == 2, "control: the terminal must be blocking here"
+    res = _run_hook('git commit -m "wip"  # final-round-accept', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_final_round_accept_is_one_shot(repo, home):
+    """Chosen deliberately over a latch: the decision must END the loop.
+
+    An ack that kept working would be one more repeatable sigil, which is the
+    defect this gate exists to close.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    first = _run_hook('git commit -m "wip"  # final-round-accept', repo, home)
+    assert first.returncode == 0, first.stderr
+    again = _run_hook('git commit -m "another"', repo, home)
+    assert again.returncode == 2, again.stdout + again.stderr
+    assert "final" in again.stderr.lower()
+
+
+def test_final_round_accept_cannot_be_reused(repo, home):
+    """The sigil must be CONSUMED, not merely re-required on every commit.
+
+    Its sibling above only retries WITHOUT the sigil, so it proves the block
+    returns — not that the acceptance was spent. Re-applying the same sigil is the
+    reuse path, and if it keeps working the terminal is just a fourth repeatable
+    escape hatch, which is the whole defect this tier exists to close.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    first = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
+    assert first.returncode == 0, first.stderr
+    reused = _run_hook('git commit -m "more fixes"  # final-round-accept', repo, home)
+    assert reused.returncode == 2, reused.stdout + reused.stderr
+    assert "already used" in reused.stderr.lower(), reused.stderr
+
+
+def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
+    """The token must be spent at the ALLOW, never inside the tier that honours it.
+
+    Rule 3a is checked FIRST, but four later rules can still deny the same command.
+    Consuming inside the tier burned the one-shot token on a commit that never ran,
+    and since the consuming tier is checked first on the retry, the branch became
+    permanently uncommittable. MEASURED before the fix, at streak 7 / lifetime 7 —
+    a state this gate's own comment calls reachable — every sigil combination
+    returned 2, including the one the block message itself prints.
+    """
+    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
+    # Terminal cleared, but the escalation cap still denies: both sigils are
+    # genuinely required in this state, so this command does NOT commit.
+    denied = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
+    assert denied.returncode == 2, denied.stdout + denied.stderr
+    assert "already used" not in denied.stderr.lower()
+    # The acceptance must still be available to the co-required form.
+    ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack', repo, home)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    # ...and only NOW is it spent.
+    after = _run_hook('git commit -m "more"  # final-round-accept escalation-ack', repo, home)
+    assert after.returncode == 2, after.stdout + after.stderr
+    assert "already used" in after.stderr.lower(), after.stderr
+
+
+def test_consumption_survives_a_later_external_round(repo, home):
+    """A new review round after the accept must not hand back a fresh acceptance.
+
+    `bump_review_round` rebuilds the state dict on every write, so a field that is
+    not explicitly carried is silently dropped — the exact way `last_source` was
+    lost once already. If the flag vanished here, running one more Codex round
+    would reopen the terminal, which is precisely the loop being ended.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    assert _run_hook('git commit -m "accept"  # final-round-accept', repo, home).returncode == 0
+    _stage(repo, "after = 1\n")
+    m = _mark(repo, home)
+    assert m.returncode == 0, m.stderr
+    again = _run_hook('git commit -m "post-round"  # final-round-accept', repo, home)
+    # Assert the REASON, not just the code. A bare `returncode == 2` is satisfied by
+    # any of the sibling rules that can also block here, so it stays green even when
+    # the carry-through is deleted — measured, this exact test passed under that
+    # mutation until the message check was added.
+    assert again.returncode == 2, again.stdout + again.stderr
+    assert "already used" in again.stderr.lower(), again.stderr
+
+
+def test_a_new_branch_gets_a_fresh_acceptance(repo, home):
+    """Consumption is scoped to the change, not the machine.
+
+    Without this the flag would be a global latch that permanently disarms the
+    sigil for every future branch on the install.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    assert _run_hook('git commit -m "accept"  # final-round-accept', repo, home).returncode == 0
+    subprocess.run(
+        ["git", "checkout", "-b", "a-different-change"], cwd=repo, check=True, capture_output=True
+    )
+    # ARM THE TERMINAL ON THE NEW BRANCH. Without this the test never reaches
+    # get_final_accept_consumed at all — a fresh branch has lifetime 0, so the tier
+    # is skipped entirely and the assertion passes on a GLOBAL latch too. Measured:
+    # deleting the branch check from that accessor left this test green.
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    res = _run_hook('git commit -m "fresh start"  # final-round-accept', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "already used" not in res.stderr.lower(), res.stderr
+
+
+def test_final_ack_inside_message_does_not_bypass(repo, home):
+    """A token buried in -m is not a trailing comment (mirrors the sibling acks)."""
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    res = _run_hook('git commit -m "wip # final-round-accept"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+
+
+def test_below_final_round_the_normal_cycle_still_applies(repo, home):
+    """Guard the guard: below the terminal the ORDINARY escalation ack still works.
+
+    The first version of this test was VACUOUS and it is worth saying why.
+    It drove the counter with `_reach_lifetime`, which resets the streak on every
+    third round — so at n=3 it reset on its own last iteration and left the streak
+    at 1, where NOTHING gates. The commit passed because no rule fired, not because
+    the ack worked; deleting the sigil it names left it green. `_reach_rounds` does
+    not reset, and the un-acked control is what makes the pass mean something.
+    """
+    # NB: the counter is NOT readable in-process here. _ROUND_DIR resolves against
+    # the real $HOME at import time and only the unit tests monkeypatch it, so an
+    # in-process get_review_* in an integration test reads someone else's state —
+    # 0, which made an earlier `< FINAL_ROUND_CAP` assertion pass vacuously. State
+    # is asserted through the GATE'S BEHAVIOUR instead, which is what matters.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)  # streak 3, no reset
+    without = _run_hook('git commit -m "wip"', repo, home)
+    assert without.returncode == 2, "control: the escalation cap must be blocking here"
+    assert "escalation cap" in without.stderr.lower()
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def _refund_final_accept(repo: Path, home: Path) -> None:
+    """Clear the spent-acceptance flag so one test can exercise two acked commits.
+
+    Only for tests whose subject is something OTHER than consumption (sigil parse
+    order, message content). Consumption itself is covered by
+    test_final_round_accept_cannot_be_reused and friends, which must never call this.
+    """
+    env = {**os.environ, "HOME": str(home)}
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import sys, json; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r}); "
+            f"import review_state as r; st = r._load_round({str(repo)!r}); "
+            # Refuse to write back an empty counter: that would silently disarm the
+            # terminal and turn the caller GREEN while testing nothing.
+            "assert st.get('lifetime'), f'refund would blank the counter: {st!r}'; "
+            "st.pop('final_accept_consumed', None); "
+            f"r._write_round(st, {str(repo)!r})",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
+    """streak>=3 AND lifetime>=7 is reachable, and BOTH sigils are then required.
+
+    This is the state the unregistered-sigil bug deadlocked in ONE token order:
+    an unlisted token reads as prose and ends the leading sigil run, so everything
+    written behind it is ignored. Order must not decide the verdict, and the
+    terminal's own message must not print the losing order.
+    """
+    # _reach_rounds never resets, so 7 marks leave streak AND lifetime at 7 — the
+    # state is asserted through behaviour below, not by reading the counter (see
+    # the note in test_below_final_round_the_normal_cycle_still_applies).
+    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
+    blocked = _run_hook('git commit -m "wip"', repo, home)
+    assert blocked.returncode == 2, "control: both tiers must be live here"
+    assert "FINAL ROUND" in blocked.stderr, "the terminal must be the one blocking"
+    for cmd in (
+        'git commit -m "wip"  # final-round-accept escalation-ack',
+        'git commit -m "wip"  # escalation-ack final-round-accept',
+    ):
+        # The first accepted commit SPENDS the acceptance, so without this the
+        # second order would be blocked by consumption rather than by parsing —
+        # a green/red that says nothing about the property under test.
+        _refund_final_accept(repo, home)
+        res = _run_hook(cmd, repo, home)
+        assert res.returncode == 0, f"{cmd} -> {res.returncode}: {res.stderr}"
+
+
+def test_terminal_message_names_the_co_required_sigil(repo, home):
+    """A block that prints an insufficient command teaches an unescapable loop."""
+    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2
+    assert "final-round-accept escalation-ack" in res.stderr

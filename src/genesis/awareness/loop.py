@@ -1371,6 +1371,102 @@ _FU_WATCHDOG_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 _last_fu_watchdog_alert_at: float = 0.0
 _last_fu_watchdog_alert_key: str = ""
 
+_CTX_INJECTION_SUPERSEDED_NOTE = "superseded by current context-injection state"
+
+
+async def _check_context_injection_health(db) -> None:
+    """Alert when the harness has FILED a hook's stdout instead of injecting it.
+
+    The ground-truth watcher for the silent-context-loss class: a fresh
+    ``hook-*-stdout.txt`` under a session's tool-results dir IS the harness
+    saying "I withheld a hook's output from the model" — independent of every
+    assumption in the emitter (whose budget constant is version-volatile: it
+    dropped ~3x in one CC update and tripled the filing rate overnight). This
+    check never reads that constant, which is what keeps it correct when the
+    constant is not. Priority defaults to critical: the ~5-minute Telegram
+    path, because this class ran unnoticed for a MONTH on this install.
+
+    Best-effort — the whole body is guarded and never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.awareness import context_injection_watch_config as _cfg_mod
+        from genesis.observability.snapshots.context_injection import (
+            alert_identity,
+            context_injection,
+            derive_findings,
+        )
+
+        if not _cfg_mod.is_enabled():
+            # Resolve on the way out: an operator who DISABLES the watcher must
+            # not be left with its last critical alert standing forever on the
+            # health and outreach surfaces. Same posture as the follow-up
+            # watchdog, which resolves on this exact transition.
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="context-injection watcher disabled",
+            )
+            return
+        cfg = _cfg_mod.load_config()
+        health = await context_injection(
+            lookback_hours=float(_cfg_mod.knob_int(cfg, "lookback_hours"))
+        )
+        findings = derive_findings(health, max_listed=_cfg_mod.knob_int(cfg, "max_listed"))
+        if not findings:
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="no fresh hook-stdout filings; injection within budget",
+            )
+            return
+
+        # The identity is owned by the module that owns the state. Assembling it
+        # here meant this call site had to name every field, and it silently
+        # missed one (mis-wires): a fresh mis-wire beside an unchanged filing
+        # count hashed the same, so supersede_except_hash kept the OLD alert and
+        # skip_if_duplicate dropped the new content — the alert looked live while
+        # never reporting the condition or its remedy.
+        alert_key = alert_identity(health)
+        content_hash = hashlib.sha256(f"context_injection:{alert_key}".encode()).hexdigest()
+        await observations.supersede_except_hash(
+            db,
+            source="context_injection_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_CTX_INJECTION_SUPERSEDED_NOTE,
+        )
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="context_injection_monitor",
+            type="infrastructure_alert",
+            content=(
+                "SESSION CONTEXT IS BEING SILENTLY LOST — " + " | ".join(findings) + " "
+                "Recovery: check the per-part sizes in scripts/genesis_session_context.py "
+                "(each SessionStart hook entry has its own ~10,000-char harness cap, "
+                "measured per docs/reference/cc-compatibility.md; re-measure with "
+                "GENESIS_CTX_PROBE_BYTES after any CC update)."
+            ),
+            priority=_cfg_mod.alert_priority(cfg),
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        # WARNING, not debug. This check is the only ground-truth witness for
+        # the silent-context-loss class, and a crash here is indistinguishable
+        # from "nothing to report" on every surface the operator can see. At
+        # debug level the watcher can stop running indefinitely with no trace —
+        # the failure mode it exists to catch, applied to itself.
+        logger.warning("Failed context-injection health check", exc_info=True)
+
 
 def _created_before(row: dict, cutoff: datetime) -> bool:
     """True if the row's created_at is older than cutoff (grace boundary).
@@ -2112,6 +2208,158 @@ async def _check_cc_login_expiry(db) -> None:
         logger.debug("cc login expiry check failed", exc_info=True)
 
 
+async def _check_provider_outage_notify(db) -> None:
+    """Notify once when a provider outage passes the hour floor (5-min band).
+
+    The DECISION lives in `routing/escalation.py::sweep_due_notifications` —
+    this wrapper supplies only the clock (the tick) and the operator lever.
+    Driving it from here rather than from `breaker.tripped` events is the
+    redesign's point: "has an hour passed" is a clock question, and answering
+    it from trip events made delivery depend on traffic (a provider whose
+    traffic stopped after escalating was never reported at all — found
+    independently by two reviewers on PR #1573).
+
+    Best-effort — never raises into the tick. Dedup is durable
+    (`skip_if_duplicate` on the unresolved notify row), so overlapping ticks
+    and restarts cannot double-send.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.awareness import provider_notify_config as cfg_mod
+        from genesis.routing.escalation import sweep_due_notifications
+
+        mode = cfg_mod.effective_mode()  # fresh read per tick — no cache
+        if mode == "off":
+            # Loop contract: a disabled check resolves its own open alerts so
+            # flipping the lever off never strands one. USER-DECIDED cost:
+            # off→on re-notifies a still-dead provider.
+            await _resolve_provider_outage_notify(db)
+            return
+        priority = "critical" if mode == "live" else "high"
+
+        # LIVENESS SOURCE for the sweep (its BLOCKER fence): the breaker
+        # registry, when this process has one. A provider whose breaker reads
+        # CLOSED has proven recovery with real calls — a stale row must not
+        # page for it. Registry absent (partial boot, tests) → None, and the
+        # sweep then behaves as before; a KeyError (provider dropped from
+        # config) is raised through so the sweep's own catch skips that
+        # provider — fail toward silence.
+        provider_still_failing = None
+        try:
+            from genesis.routing.types import ProviderState
+            from genesis.runtime import GenesisRuntime
+
+            _breakers = getattr(GenesisRuntime.instance(), "_circuit_breakers", None)
+            if _breakers is not None:
+                def provider_still_failing(name, _reg=_breakers):
+                    return _reg.get(name).state != ProviderState.CLOSED
+        except Exception:
+            provider_still_failing = None
+
+        if mode == "live":
+            # MODE-UPGRADE contract (propose_only -> live): an open notify row
+            # written at priority="high" would satisfy `skip_if_duplicate`
+            # forever, so the critical row — the ONE that reaches Telegram —
+            # could never be written and the upgrade would silently deliver
+            # nothing. Resolve the demoted rows; the sweep below re-creates
+            # them at critical in this same tick, which delivers the pending
+            # notification — the point of turning the lever up.
+            await _promote_demoted_provider_notify(db)
+
+        written = await sweep_due_notifications(
+            db, priority=priority, provider_still_failing=provider_still_failing
+        )
+        if written:
+            logger.info(
+                "provider-outage sweep wrote %d notification(s) (mode=%s)",
+                written,
+                mode,
+            )
+    except Exception:
+        logger.warning("provider-outage notify check failed", exc_info=True)
+
+
+async def _open_notify_rows(db) -> list[dict]:
+    """The open NOTIFICATION rows (never the failure rows they derive from).
+
+    Discriminator: notify rows are the only writer of `outage_started_at` into
+    this (source, type) — failure rows carry `first_trip_at` instead, and no
+    third writer exists (enumerated at review). A row whose content is not JSON
+    matches neither and is left alone.
+    """
+    import json as _json
+
+    from genesis.db.crud import observations
+
+    rows = await observations.query(
+        db, source="routing", type="provider_failure", resolved=False, limit=200
+    )
+    out = []
+    for r in rows:
+        try:
+            blob = _json.loads(r.get("content") or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(blob, dict) and "outage_started_at" in blob:
+            out.append(r)
+    return out
+
+
+async def _promote_demoted_provider_notify(db) -> None:
+    """Resolve high-priority notify rows so live mode can rewrite them critical.
+
+    Without this, a row written under `propose_only` blocks the critical write
+    via `skip_if_duplicate` (dedup keys exclude priority) and upgrading the
+    lever silently delivers nothing — found at review.
+    """
+    try:
+        from genesis.db.crud import observations
+
+        demoted = [r["id"] for r in await _open_notify_rows(db)
+                   if r.get("priority") == "high"]
+        if demoted:
+            from datetime import UTC, datetime
+
+            await observations.resolve_batch(
+                db,
+                demoted,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes=(
+                    "superseded: lever raised to live — re-created at critical"
+                ),
+            )
+            logger.info(
+                "provider-outage notify: promoted %d propose_only row(s) to live",
+                len(demoted),
+            )
+    except Exception:
+        logger.warning("provider-outage notify promotion failed", exc_info=True)
+
+
+async def _resolve_provider_outage_notify(db) -> None:
+    """Resolve open notify rows when the lever is off (the check's pair)."""
+    try:
+        from genesis.db.crud import observations
+
+        ids = [r["id"] for r in await _open_notify_rows(db)]
+        if ids:
+            from datetime import UTC, datetime
+
+            await observations.resolve_batch(
+                db,
+                ids,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="provider-outage notify lever turned off",
+            )
+            logger.info(
+                "provider-outage notify disabled — resolved %d open notification(s)",
+                len(ids),
+            )
+    except Exception:
+        logger.warning("provider-outage notify resolve failed", exc_info=True)
+
+
 async def _check_cc_cap_detection(db) -> None:
     """Alert when output-expecting cognitive CC invocations return empty in a run.
 
@@ -2561,6 +2809,29 @@ async def perform_tick(
     return result
 
 
+def _approval_age(resolved_at: str | None) -> str:
+    """How long ago an approval was granted, for a log line — never a raise.
+
+    `resolved_at` is a DB column reached through a resume path that dispatches
+    real work; a log line must not be what breaks it. Anything unparseable or
+    absent degrades to "age unknown", which is also the honest rendering.
+    """
+    if not resolved_at:
+        return "age unknown"
+    try:
+        resolved = datetime.fromisoformat(str(resolved_at))
+    except (TypeError, ValueError):
+        return "age unknown"
+    if resolved.tzinfo is None:
+        resolved = resolved.replace(tzinfo=UTC)
+    minutes = int((datetime.now(UTC) - resolved).total_seconds() // 60)
+    if minutes < 0:
+        return "age unknown"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    return f"{minutes // 60}h{minutes % 60:02d}m ago"
+
+
 class AwarenessLoop:
     """The metronome — drives the 5-minute awareness tick via APScheduler."""
 
@@ -2934,6 +3205,11 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Dead-provider notification sweep — clock-driven ON PURPOSE (the
+            # trip-driven version starved when traffic stopped; PR #1573).
+            # Guarded on db internally; lever: provider_outage_notify domain +
+            # GENESIS_PROVIDER_NOTIFY_DISABLED.
+            await _check_provider_outage_notify(self._db)
             # Git-repository health (F.1) — cheap structural probe + rootfs-RO
             # write-probe. NOT gated on db_available: git health matters most
             # when the DB is broken (the observation write is guarded on db
@@ -2997,6 +3273,7 @@ class AwarenessLoop:
                     # Day-scale lifecycle signal → hourly; self-resolves when
                     # rows gain a trigger or close.
                     await _check_follow_up_watchdog(self._db)
+                    await _check_context_injection_health(self._db)
                     # Ego liveness: an ego completing NO real cycle well past its
                     # cadence (job_health.last_success gap), NOT the is_running /
                     # heartbeat proxies that stay green while deadlocked.
@@ -3459,10 +3736,28 @@ class AwarenessLoop:
                 consumed = await gate.mark_consumed(approved["id"])
                 if not consumed:
                     continue  # Another tick already consumed it
+                # Name the tick this actually runs against, and say plainly
+                # that it is not the tick that asked. A resumed reflection is
+                # dispatched with `self._last_tick_result` — the CURRENT tick —
+                # so what a person approved and what runs are about different
+                # moments. Per this method's own docstring the current tick is
+                # the only one available (the loop's scoring may never reach
+                # that depth again), NOT a freshness preference; either way the
+                # gap was invisible, because the line named only the approval.
+                #
+                # The ORIGINATING tick is not recoverable. Nothing records it:
+                # the approval context is built from a fixed key set with no
+                # tick field, and the approval key deliberately excludes
+                # per-invocation identity so recurring dispatches reuse one
+                # pending row. So this states what is known, and what is not.
                 logger.info(
-                    "Resuming %s reflection from approved request %s",
+                    "Resuming %s reflection from approval %s (approved %s) — "
+                    "running against the current tick %s, NOT the tick that "
+                    "requested it, which is not recorded",
                     depth_name,
                     approved["id"][:8],
+                    _approval_age(approved.get("resolved_at")),
+                    tick.tick_id[:8],
                 )
                 await self._cc_reflection_bridge.reflect(
                     depth,

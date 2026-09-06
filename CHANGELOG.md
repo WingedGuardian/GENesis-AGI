@@ -9,7 +9,462 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **The session charter now lists every open ledger item, not just the oldest
+  six.** The ledger is a curated list of one-line to-dos, and the old window
+  meant a session with more than six open items never saw a newly added one in
+  its own prompt — it existed only in the aggregate count. The list is now
+  effectively unbounded (a 200-row ceiling with an explicit "more than 200 —
+  the rest are not listed" note), and an oversized charter block degrades by
+  dropping whole sections with a marker rather than cutting mid-bullet, with
+  the open/closed count preserved.
+
+- **A review comment on documentation no longer blocks a merge.** The pre-merge
+  check already declined to count findings on prose, but its idea of prose was
+  narrow: markdown counted only underneath `docs/`, so a comment on a top-level
+  guide, or on one of the instruction files that shape how the assistant works,
+  was treated as a finding on code and held the merge. Any markdown, reStructured-
+  Text or AsciiDoc file now counts as documentation wherever it lives.
+
+  The narrowness was deliberate, and it is being relaxed on one specific ground:
+  a separate check, at the moment work is committed rather than merged, classifies
+  those instruction files independently and still requires a proper review before
+  they can change. So what moves is only whether a reviewer's comment on prose can
+  hold up a merge — not whether prose gets reviewed.
+
+  Reversible without another change: `merge_gate.doc_findings` accepts `skip`
+  (the default, prose never blocks), `p1_only` (only the highest severity blocks
+  on prose), or `score` (prose is treated exactly like code, the previous
+  behaviour). Findings are listed in the pre-merge report under every setting —
+  the lever decides whether they count, never whether anyone sees them.
+
 ### Added
+
+- **A `tmux kill-server` with no socket binding now draws an advisory.** tmux
+  resolves its target server from the inherited `$TMUX` variable before
+  `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address
+  the main server instead and take down every live session on it — including
+  the one issuing the command. Clearing `$TMUX` does not help: that only
+  re-targets the default socket, which is usually the main server too. A new
+  advisory-tier guard flags a `kill-server` carrying no explicit `-S`/`-L`
+  binding and points at the one safe form — binding the kill to its own
+  socket. Session-scoped kills (`kill-session`) are deliberately not flagged,
+  and the advisory never blocks anything.
+
+- **The review-round limit now has an end, not just a speed bump.** The existing
+  limit pauses after three rounds in which an independent reviewer keeps finding new
+  problems, and asks for a conscious decision to continue — but acknowledging it
+  resets the count, so the same three-round cycle can repeat without limit. A change
+  could consume fifteen rounds and never be told "enough", only "enough, for now".
+
+  A second count now runs over the whole life of a change, and at seven rounds it
+  stops rather than pausing. Two full cycles have already run by then, each of which
+  already asked for a decision; something still surfacing new problems after that is
+  not converging, and the remaining question — accept what is outstanding and ship
+  it, or abandon the branch and start from a design that does not need seven rounds —
+  is a judgement call, not one to keep deferring. Both answers require a person, so
+  the block says so and neither is available to an unattended session.
+
+  Where the decision is recorded — committing the accepted work — the acceptance is
+  spent when used: it clears one commit, once, and re-using it does not buy another
+  round. That is the whole difference between a terminal and a fourth repeatable
+  escape hatch. The limit also applies when requesting the next review, because the
+  local count sleeps through rounds that happen entirely in the cloud, which is
+  exactly the shape a long loop takes; that second check keeps no state of its own,
+  so there the acknowledgement is required every time rather than being spent once —
+  and one acknowledgement covers one request, so a single decision cannot be chained
+  into several.
+
+### Fixed
+
+- **A schema rebuild no longer destroys columns a private fork added.** The
+  ledger table rebuild (widening a constraint means rebuilding the table on
+  SQLite) copied a hardcoded upstream column list and then dropped the old
+  table — so on an install whose supported private fork had added its own
+  column, that column and all of its data were silently, irreversibly gone.
+  The rebuild now reads the live table first, re-creates any column it does
+  not recognize from that column's own declaration, and copies its data; the
+  one shape it cannot re-create (NOT NULL with no default) stops the
+  migration with a clear message before anything is dropped.
+- **When every provider fails, the log now says which ones.** A routing failure
+  recorded only how many attempts were made — but a provider skipped because its
+  circuit breaker is open, its API key is missing, or the budget is spent costs
+  no attempt at all, so "2 attempts" on a seven-provider chain looked exactly
+  like a two-provider chain that was fully tried. The exhaustion event and result
+  now name every provider involved, alongside how many the chain had to offer —
+  and the log line keeps the two kinds apart: providers whose call actually
+  failed print under `failed:`, providers passed over before any call print
+  under `skipped:` with the reason (no API key, breaker open, budget exceeded),
+  because a never-called provider labelled "failed" reads as an outage where
+  there may be none. One-time cost of reshaping the message: the Errors
+  dashboard keys manual resolutions on the message prefix, so an exhaustion
+  group resolved before this change reappears once under its new key — resolve
+  it again and it stays resolved.
+- **The temp-space watchdog no longer severs cross-session messaging when it
+  goes nuclear.** At its most aggressive cleanup tier the watchdog deleted every
+  top-level directory of Claude Code's working temp — including the directory
+  holding each live session's messaging socket. The sockets are zero bytes, so
+  deleting them reclaimed nothing, while every running session silently became
+  unreachable to its peers until restarted. The nuclear sweep now spares unix
+  sockets (and only them — all reclaimable bytes are still deleted) and logs
+  how many it preserved.
+
+- **The pre-merge check now reads the second review bot it was already fetching.**
+  Two automated reviewers comment on every pull request, and the gate that decides
+  whether a change is ready to merge only understood the format of one of them. The
+  other's comments were downloaded, iterated, matched nothing, and contributed
+  nothing — so a change carrying an unaddressed high-severity finding reported
+  exactly the same as a clean one. Both reviewers' findings now count, at the
+  severity weighting already used for the first, and a single comment carrying
+  several bundled findings is read as several rather than one.
+
+  Two things that come with reading a second format, both of which decide a merge:
+  quoted content is not a finding — a horizontal rule inside a suggested code block
+  no longer splits one advisory finding into a second, invented, blocking one; and a
+  finding a maintainer has replied to is treated as answered at every severity, not
+  only the blocking ones, so an advisory list stops re-reporting settled findings and
+  burying the unsettled.
+
+- **Marketing campaign updates now post to their own Telegram topic.** The marketing
+  campaign's tick updates previously routed to the shared Morning Reports topic; they
+  now go to a dedicated "Marketing" forum topic via a new `marketing` outreach
+  category, keeping them separate from the morning report and other digests. Existing
+  installs pick up the category automatically on restart (an additive schema
+  migration); the morning report and all other topics are unaffected.
+- **Proactive memory recall could time out completely.** The embedding provider
+  queues standard-rate requests when a model is busy, and that wait can run past
+  recall's four-and-a-half-second budget — measured at eight to thirteen seconds
+  against a budget of four and a half — so every lookup fails and sessions run with
+  no recalled memory at all. Recall now asks for the provider's priority lane, which
+  answers in about 650 milliseconds regardless of how long the prompt is.
+
+  **This costs a little more, and the amount is worth knowing: one and a half times
+  the standard embedding rate, on recall only.** At one person's usage that is a
+  fraction of a cent a month, and declining it means keeping a feature that does not
+  work. Storing memories stays on the standard rate — that runs in the background
+  with nothing waiting on it. Set `GENESIS_EMBED_PRIORITY_TIER=false` to decline the
+  faster lane; recall then falls back to keyword-only search whenever the queue is
+  longer than the deadline.
+
+  Scope: this covers the proactive-recall path served by genesis-server. An explicit
+  `memory_recall` tool call through a standalone MCP process still uses the standard
+  lane, so it can be slow without failing.
+
+  The setting is a yaml lever as well as an environment one, and the template no
+  longer overrides it: a fresh install copies `secrets.env.example` to `secrets.env`
+  and the environment is read first, so an uncommented assignment in the template
+  would have quietly outranked `memory.embed_priority_tier: false` and left the
+  documented opt-out doing nothing.
+
+- **The setup script's questions about local inference servers had no effect.** The
+  same shadowing applied to the Ollama and LM Studio addresses: the template assigned
+  them, a fresh install copied that to its environment, and the environment outranks
+  the config file — so the address the interactive setup script asks for was written
+  to the config and then ignored, and every call went to localhost regardless. Those
+  assignments are now commented out; the values they held were already the defaults.
+  The Ollama on/off switch deliberately stays assigned, because unlike the addresses
+  its default differs from the template value, and removing it would switch Ollama on
+  everywhere.
+
+- **A malformed config section could quietly weaken the private-data scan.** The
+  fingerprint harvester, which collects this install's private values so they can be
+  blocked from ever reaching a public push, read config sections the same unguarded
+  way — and its error handling covers the whole harvest, so one bad section dropped
+  not just the addresses it was reading but the timezone and private-repository
+  patterns queued behind them, with nothing logged. Sections are now read defensively
+  there too. Separately, ignoring a malformed section is no longer silent anywhere: it
+  logs which section was discarded and that defaults are in force, because two of
+  those settings fail toward spending money and toward running an autonomous job the
+  operator had switched off.
+
+- **Model routing ignored the install config, so half the system talked to the
+  wrong machine.** Settings like the local inference server's address are resolved
+  in one documented order — environment, then the install config file, then a
+  built-in default — but the routing layer expanded its placeholders from the
+  environment alone. That was invisible while the template forced the same values
+  into the environment anyway; removing those assignments so the config file could
+  work is what exposed it. An install pointing at a remote inference server ended
+  up with its dashboard, health check and embeddings reaching that server while
+  routed model calls still went to localhost. Routing now resolves those settings
+  the same way everything else does, which also means the setup script's questions
+  about local inference finally take effect. An environment variable still wins
+  where one is set, and any placeholder without a matching setting behaves exactly
+  as before.
+
+- **A quoted "false" in the install config meant true.** Settings written in
+  `genesis.yaml` are read as booleans, but a value in quotes arrives as text, and
+  any non-empty text counted as on — so `embed_priority_tier: "false"` kept the
+  paid lane running, while the same word unquoted, or written in `secrets.env`,
+  correctly turned it off. One intention, three places to write it, two answers.
+  The same spellings now mean the same thing everywhere, for every on/off setting
+  in that file.
+
+- **An override set from the dashboard could never be unset again.** Some settings
+  can be given a value in the config file or overridden in the environment, and the
+  environment always wins. The settings editor could set those overrides but had no
+  way to clear one, so the first time you typed a value there it took over
+  permanently — later edits to the config file appeared to do nothing, with no way
+  back short of hand-editing the file the editor exists to avoid. Clearing the field
+  now removes the override and hands the setting back to the config file. Required
+  credentials still cannot be blanked.
+
+- **A config file that was unreadable as settings was ignored in silence.** A
+  malformed section already said so; a malformed file did not, even though it still
+  contained everything the operator had written — including the switch that keeps
+  memory lookups off the paid lane. It now says plainly that the whole file is being
+  ignored and where it is.
+
+- **The timezone control could delete the config it exists to repair.** If the
+  file was malformed in a way that left its contents unreadable as settings, the
+  dropdown rewrote it with the timezone alone — discarding whatever else was in
+  there, silently, on the one control documented as the way to recover. It now
+  copies the original alongside first, writes the timezone, and says plainly what
+  it did and where the copy went.
+
+- **Settings the template ships commented out disappeared from the dashboard.**
+  Some defaults are deliberately left commented so the equivalent setting in
+  `genesis.yaml` keeps working. The dashboard's editor only recognised
+  uncommented lines, so those keys vanished from it and updates were rejected as
+  unknown — including several that had been invisible this way for some time.
+  They are listed again, simply with no value set.
+
+- **A one-line typo in the install config could silently disable vector memory.**
+  Accessors that read a nested setting out of `~/.genesis/config/genesis.yaml`
+  assumed the section around it was a mapping. Two shapes an ordinary edit produces
+  are not: a section whose only child is commented out (which yaml reads as empty
+  rather than absent), and a section given a plain value instead of a block. Either
+  one raised on the next read, and because the memory subsystem catches everything
+  around its own startup, the install would come up reporting a degradation and then
+  run with no vector memory at all — from a config file the operator is invited to
+  edit by hand. Every such setting — the local inference URLs, the Ollama switch, the
+  recall priority lane, the build lane, the models-file synthesis job, and the GitHub
+  identity — now falls back to its documented default instead, as does a config file
+  whose top level is malformed outright.
+- **Two branches that each add a changelog entry no longer collide over it.**
+  This file is an append-only list of independent bullets, so two branches
+  adding an entry under the same heading are not disagreeing about anything —
+  they are inserting at the same position, which git's default merge reports as
+  a conflict a human has to resolve by hand. It now merges with git's `union`
+  driver, which keeps both sides' lines instead of leaving markers. It makes no
+  promise about their ORDER — git's own documentation says union "tends to leave
+  the added lines in the resulting file in random order and the user should
+  verify the result" — so a merged section may need its entries re-sorted by
+  hand. For a list of independent bullets that is proofreading, not breakage.
+
+  Measured before the change, against the repository's own open work: of 49
+  open pull requests, 21 could not merge, and **18 of those 21 conflicted on
+  this file and nothing else** — every other file in them merged cleanly.
+  **Two things it deliberately does not do**, because the measurement above is
+  easy to over-read. It does not make a conflicting pull request mergeable on
+  GitHub: GitHub ignores a repository's `.gitattributes` in its server-side
+  merge, measured against GitHub's own merge engine on two branch pairs built to
+  collide on this file, which conflicted both with the attribute present and
+  without it. And it does not help a branch's *first* merge, which is the one an
+  already-open pull request needs — attributes resolve from the checkout rather
+  than from the commits being merged, so on a branch created before this file
+  existed the merge that introduces the rule is not governed by it. Measured on
+  a real open pull request: the changelog still conflicts.
+
+  What it does buy, stated narrowly: once a branch contains the file — every
+  branch cut after this lands, and any older branch after its first merge —
+  later merges of the base branch resolve the changelog with no hand-editing.
+  Measured in that direction across the same 18: all of them clean, with every
+  bullet from both sides intact. The structural fix is one fragment per change
+  under `changelog.d/`; this rule does not replace it.
+
+  The rule is scoped to the one file at the repository root, and the tests
+  enforce that scope over the complete tracked-file list rather than a sample.
+  The leading slash matters: a pattern without one matches the basename at
+  every depth, which would silently hand the same driver to any future
+  vendored or subproject changelog.
+
+  What `union` cannot express is a **removal**. If one side deletes lines while
+  the other edits the same place, it keeps the deleted lines and reports
+  success — so pruning an entry, reverting a commit that added one, or cutting
+  a release (which moves entries under a version heading rather than adding
+  them) can quietly come out wrong, with a zero exit code and nothing visibly
+  duplicated to catch the eye. Read the merged file in those three cases.
+
+  Union merges lines, not records, and that reaches insertion-only merges too:
+  two entries sharing an identical aligned line — the same closing sentence, the
+  same title — can collapse into one, again at exit 0. Measured across the 18
+  real colliding pull requests, every bullet from both sides survived intact in
+  all 18; the failure needs identical lines and these entries are long
+  distinctive prose. So it is a real edge with a measured rate of zero, worth
+  knowing when writing a terse or templated entry.
+
+  The attribute also governs `git revert` and `git cherry-pick`
+  (`gitattributes(5)`) and, measured here, `git merge-tree` — but only when the
+  checkout running them already carries this rule, since attributes resolve from
+  the current checkout rather than from the commits being compared. Two
+  consequences were measured rather than assumed: reverting an *older* commit
+  that added an entry is absorbed, and git then reports "nothing to commit" with
+  a non-zero exit, so a caller checking exit status still notices; and the
+  guardian's automated `git revert HEAD` on a clean tree is unaffected, because
+  there both sides equal the base and the driver never runs.
+- **A session slot started after another tmux server no longer gets the wrong
+  temp directory.** A new slot created while a tmux server started in some other
+  context is already running used to inherit that server's temp directory
+  (often the small system `/tmp` Genesis keeps Claude off of). The temp
+  directory and the OAuth-durability setting are now pinned to the slot
+  explicitly (when a usable temp directory exists at all — if none does, the
+  session is left on the system default rather than pointed at a bad path).
+
+- **Two branches can no longer pick the same database-migration number.** Each
+  new migration is now named by the UTC time it was written rather than by the
+  next free number, so nobody has to check what anyone else took — and two
+  people working at once cannot both claim the same one. The numbers already in
+  use are frozen exactly as they are; an existing install is unaffected and runs
+  nothing again. A migration that has already shipped can no longer be renamed
+  or removed either: installs that already ran it would never run its
+  replacement, so the two would drift apart with nothing to notice. And a
+  migration whose name is subtly wrong — a digit too few, filed in the wrong
+  folder — is now reported instead of being quietly skipped, which is what used
+  to happen: the file simply never ran, and the change that needed it shipped
+  without it.
+- **The wrong-repo commit check now says when it did not run.** It works out which
+  repository a `git add`/`commit` targets by reading the command text, and when that
+  text did not determine a directory — a shell variable, a command substitution, a
+  glob — it joined the unexpanded token onto the current path anyway. The result
+  cannot exist, so every lookup against it failed and the check was skipped through
+  the same branch that means "this repository is not covered". A command it could
+  not inspect was therefore indistinguishable from one it deliberately ignored.
+  It now reports that the check did not run, on **119 of 2,264 (5.3%)** real
+  `add`/`commit` commands. Deliberately an advisory and **not** a new refusal:
+  replaying those same 119 through the old behaviour, it blocked **0** of them —
+  it was failing open, so nobody has ever been wrongly stopped by this, and making
+  it refuse would newly stop 119 ordinary commands to fix a silence.
+
+- **The cold-marketing campaign no longer re-pitches the same person.** Once a
+  marketing pitch is delivered to a prospect, that prospect is marked contacted and
+  drops out of the campaign's target list — previously nothing recorded the contact,
+  so the campaign would have re-pitched every delivered target on each run. Works on
+  both the owner-approved and (future) autonomous send paths; a pitch that never
+  delivers (dropped, expired, or rejected) leaves the prospect eligible for a later,
+  re-worked pitch. (The substrate still ships off by default.)
+
+### Changed
+
+- **Mistral Large is now tracked as a paid provider.** Mistral removed the Large
+  model family from free-tier entitlement (unannounced; surfaces as
+  `403 tier_not_allowed`). The `mistral-large-free` provider is now flagged
+  `free: false`, so its spend is recorded at real rates ($0.5/$1.5 per MTok)
+  instead of $0, and call sites marked `never_pays` no longer route to it. The
+  provider name keeps its historical `-free` suffix to avoid churning the 30
+  chains that reference it. If your account tier still gets Large at $0,
+  override `free: true` in your local routing overlay.
+
+### Added
+
+- **Claude Code's auto-updater suppression now re-asserts itself, and "verified"
+  means verified.** The two kill switches (`DISABLE_AUTOUPDATER`/`DISABLE_UPDATES`
+  in the user-level `~/.claude/settings.json`) were written only at install time,
+  so a machine whose settings drifted stayed silently unprotected until someone
+  re-ran setup — twice CC self-updated past the pin that way. One shared owner now
+  re-asserts them on every install/bootstrap/update and on a daily container timer
+  (`genesis-cc-settings-align.timer`), whose unit goes red rather than staying
+  green when it cannot verify. The outcome channel is fail-closed by
+  construction: the state starts `unverified` and is promoted to `ok`/`repaired`
+  only where a post-operation read confirms both keys are on disk — an audit
+  found nine paths that previously reported success without checking (a
+  busy lock, a missing library, a write never read back, and callers that
+  discarded the outcome entirely), and each now either verifies or says plainly
+  that it could not.
+
+  Three follow-ons keep that honesty intact where it was still leaking. A repair
+  performed during the early part of a deploy is now recorded even though the
+  later check finds nothing left to fix — previously that repair vanished
+  entirely, because it happened in a separate process whose result could not
+  travel back. A verified-clean run that happens to overlap another run now
+  counts as clean, so the next unrelated repair is no longer misreported as "the
+  second in a row" and does not raise a false alarm about something repeatedly
+  rewriting the settings file. And `uninstall.sh --dry-run` no longer clears the
+  saved timer schedules for real: that was the one step in the uninstall that
+  ignored dry-run, and it can change whether a missed scheduled run replays
+  after a later reinstall.
+- **Telegram ping when someone replies to a marketing pitch.** When a real person
+  replies to one of Genesis's cold marketing emails, you now get one brief
+  Telegram notification — the sender and the first line of their reply.
+  Auto-responders (out-of-office / bounces) and spoofed senders are filtered out,
+  so you're pinged only for genuine human replies, and never for sends. The reply
+  is still recorded on the dashboard exactly as before; this just surfaces it to
+  you immediately instead of waiting for you to go look.
+
+- **Gated autonomous cold marketing outreach (inert by default).** Genesis can
+  now stage cold marketing emails to an owner-curated prospect list via the new
+  `marketing_send` tool. The recipient is resolved in code from a private
+  `marketing_prospects` store (by id — the tool never accepts a raw address),
+  respects permanent opt-outs, and every send still holds at the email
+  authorization gate for your approval. It ships OFF: nothing sends until you set
+  the `marketing_outreach` lever to `observe`/`live` (kill switch:
+  `GENESIS_MARKETING_OUTREACH_DISABLED=1`). Autonomous cold sending requires BOTH
+  affirmatively setting the lever to `live` AND the BULK capability cell earning a
+  grant through your approvals — in `observe` (or `off`) every cold send holds for
+  your explicit approval even after the cell is granted. Manage prospects and
+  opt-outs in the `marketing_prospects` table. Hardened: the `marketing_send`
+  actuator is reachable only from the `campaign` session profile (every other
+  profile — including the untrusted-inbound `mail`/`community-responder` perimeter
+  — denies it, so an injected inbound message can't reach it); arming `live` is
+  overlay-file-only and cannot be set through `settings_update` (a model can't
+  self-elevate past the observe gate); a held send to a permanently opted-out
+  prospect is refused before delivery regardless of how the pitch classified (a
+  money-pattern body that lands as FINANCIAL no longer bypasses the bulk-only
+  opt-out check); and the `pending_outreach.labeled_surplus` migration no longer
+  swallows ALTER errors (a transient lock is retried, a real failure fails loud); and an
+  already-approved cold send is halted at delivery if the lever is flipped to `off` / the
+  kill switch is set before it goes out (the outer off-switch is now honored deliver-side,
+  not only at enqueue — the held send is paused and resumes if you re-enable).
+- **Contributor-issue close loop.** When an external contributor's merged PR
+  closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
+  `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating
+  follow-up — so shipped contributor work no longer lingers as a false TODO.
+  Scoped to default-branch merges and same-repo references; idempotent, and
+  fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
+  failure fails the run and preserves the cursor to re-cover). Gated by the same
+  `repo_pulse` lever. Hardened: the originating follow-up id is resolved to its
+  canonical form at proposal time (a prefix/tagged/uppercase handle resolves to
+  the full id; an ambiguous or unknown handle is rejected rather than stored as a
+  ref the join can never match); and only issues Genesis actually CREATED are
+  treated as authoritative close-links — any issue Genesis merely ADOPTED (a
+  pre-existing open issue with a coincidental same title, or one re-found after a
+  crash) is recorded as adopted and excluded from the join, so a PR closing it never
+  falsely resolves a follow-up. (Adopt provenance no longer relies on issue
+  authorship, which cannot be trusted on a single-account install.)
+- **Contributor issues are labeled by domain and difficulty, enforced at the source.**
+  Every issue the Contributor Work-Log proposes must now carry an `area:*` domain
+  label (memory/dashboard/runtime/guardian/autonomy/channels/knowledge/eval, or
+  `area:other`) and a difficulty/environment label (`good first issue`,
+  `first-timers-only`, `needs-genesis-instance`, or `help wanted`) —
+  `contributor_issue_propose` rejects a proposal missing either (fail-closed, after
+  the privacy scan). The public PR template now prompts for a `Closes #NNN` keyword,
+  and CONTRIBUTING documents that a bare `#NNN` won't auto-close the linked issue.
+
+- **Concurrent-session awareness now says what a peer is working on, and which
+  model it runs.** When several Claude Code sessions share an install, each one
+  is shown a `[Concurrent | …]` line per peer. Those lines previously carried a
+  digest of the peer's last few tool calls — so a peer read as
+  `Bash grep -n "Version History"`, which says nothing about what it is doing.
+  They now carry the peer's model and its topic. The topic is whichever is the
+  more recent account of what that session is doing: the summary Genesis
+  already writes when it summarises a session's activity, refreshed on a cycle
+  of a couple of hours, or the session's own mission, set the moment its
+  purpose changes. A mission declared after the last summary wins; otherwise
+  the summary does. Sessions whose mission predates this release keep showing
+  the summary, because there is no honest way to know when an older mission was
+  set. Where neither exists it falls back to the session's newest in-progress
+  or open ledger item. All of those are written by Genesis rather
+  than by you: the raw first user message is deliberately never used, for the
+  same reason the peer's typed prompts are already withheld — another session's
+  user text is decontextualised in yours.
+- **A session that is working but not being typed into no longer disappears
+  from its peers.** Peer lines are hidden once a session's heartbeat is ten
+  minutes old, and the heartbeat previously only refreshed when its user typed
+  — so a session heads-down on a long task silently vanished from everyone
+  else's view exactly while it was busiest. A tool-use refresh now keeps it
+  visible. It is throttled to at most one write a minute per session; on every
+  other tool call it costs a file stat and the hook's own module load, which is
+  a few milliseconds and no database work at all.
 
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**
   Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
@@ -31,7 +486,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
   new `subsystem_stale:outreach` id is handled generically by the existing consumers
   (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
-
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —
@@ -76,8 +530,99 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   session and fail-open: a fresh session stays silent, and any read/parse miss emits
   nothing.
 
+### Changed
+
+- **The Claude Code model roster now ships infrastructure, not a preconfigured
+  provider.** `config/cc_roster.yaml` previously shipped a `glm-5.2` peer pointed at
+  `open.bigmodel.cn`, which requires Chinese real-name identity verification (实名认证)
+  to buy a Coding Plan — so on any install outside China the documented rate-limit
+  fallback could not be provisioned at all. The base config now ships only the native `claude` entry
+  plus commented examples for both Z.AI platforms (`api.z.ai` international,
+  `open.bigmodel.cn` China) and several other Anthropic-compatible providers.
+
+  **If you were using the shipped peer, you must now declare it yourself** in
+  `~/.genesis/config/cc_roster.local.yaml`, which is deep-merged over the base file
+  and is where the `cc_roster` settings domain already writes:
+
+  ```yaml
+  models:
+    glm-5.3:
+      anthropic_base_url: "https://api.z.ai/api/anthropic"
+      auth_env: ZAI_CODING_API_KEY
+      model_id: glm-5.3
+      failover_order: 1
+  ```
+
+  This matters because the failure is quiet FOR THE USER: an overlay setting
+  `default: glm-5.2` with no matching entry falls back to native Claude, so a
+  subscription-cap fallback you believed was configured would simply not engage.
+  It is not silent in the logs (`apply_active` logs an error with a traceback),
+  and the `cc_roster` settings domain rejects such a write outright — the quiet
+  path is a hand-edited overlay.
+
+  `secrets.env.example` now documents all three GLM key slots and which endpoint
+  each one serves: a Coding Plan key (`ZAI_CODING_API_KEY`) is required for a roster peer
+  because Claude Code speaks the Anthropic protocol, while a general/prepaid key
+  (`ZHIPU_API_KEY`) works only on `/api/paas/v4`. Using the general key on a coding
+  endpoint returns `1113 Insufficient balance` even when the account is funded.
+
+  The `validated:` field is unchanged but now documented as advisory only: it is
+  parsed into `RosterEntry.validated` and then acted on by nothing, so it gates
+  nothing. Stale stamps were dropped rather than carried forward unverified.
+
 ### Fixed
 
+- **Campaign names stored before the control-character fix are now cleaned at
+  startup.** Names have been sanitized at the write boundary since the previous
+  release, so nothing new lands malformed, but rows written earlier were never
+  repaired. The cleanup now runs during campaign initialization, before the
+  scheduler registers its jobs — the ordering matters, because each campaign's
+  scheduled job is keyed by its name, and renaming afterwards would leave the
+  running job pointing at a name that no longer exists. A campaign whose cleaned
+  name would collide with another campaign's is left untouched and logged rather
+  than merged.
+
+  A campaign's history now travels with the rename — both its durable health
+  record and its individual run history. Leaving either behind was not merely
+  untidy: an abandoned health record keeps reporting the job as stale on every
+  health sweep, indefinitely, because nothing checks whether the job still
+  exists; and the run history is looked up by exact name, so a scheduled-job
+  prediction spanning the cleanup would have been scored against a series with a
+  hole in it, or discarded as having no runs at all. Where the name being moved
+  into already carried an abandoned record from a deleted campaign, the campaign's
+  own live history now wins and the leftover is removed — previously the reverse
+  happened, keeping the record that could never be written to again.
+
+  One name is now refused outright: a campaign called `pending_reaper` collides
+  with an internal job the scheduler registers for itself, and would have been
+  evicted at startup with no error and no log — it would simply never run again.
+  It is rejected when a campaign is created, and a stored name that would clean up
+  into it is left alone, since a name with a stray invisible character still runs.
+
+- **YouTube transcripts are less likely to come back quietly incomplete.** When
+  Genesis fetches a video transcript it now asks for both English caption tracks and
+  prefers the original ASR (`en-orig`) over the `en` variant. Observed once: the two
+  were served as different transcriptions — different cue segmentation, and different
+  wording in the closing lines — while the same video served identical tracks hours
+  later. The cause is unknown and it did not reproduce, so this is insurance rather
+  than a diagnosed fix, but preferring `en-orig` costs only one extra small download.
+  Two real bugs fixed alongside it: the cleaning step left a stray whitespace-only
+  line in every transcript (a caption file carries both empty and single-space lines,
+  and the old filter matched only the empty ones), and the documented recovery path
+  for a video with no English captions could not work — dropping `--sub-langs`
+  narrows the request to one English-first track instead of broadening it, so it
+  could never surface the other languages it promised.
+
+- **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
+  distinct bugs: (1) analysis mode 404'd because the orchestrator slug
+  `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)
+  — switched to the live base slug `openai/gpt-oss-120b`; (2) real multi-paragraph prompts
+  false-timed-out at 240s (a 6-model frontier panel + judge legitimately runs several
+  minutes, while a trivial ping finished in ~33s) — the budget is now a single env-driven
+  knob (`GENESIS_DELIBERATE_TIMEOUT_S`, default 1000s) read per-call and threaded through
+  `core.deliberate()` (which previously hard-pinned 240s, silently overriding the backend
+  default). Also hardened the panels' one remaining concrete `x-ai/grok-4.3` slug to the
+  drift-resistant `~x-ai/grok-latest`.
 - **The morning report no longer cries "surplus heartbeat overdue" during a long
   healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
   dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
@@ -86,6 +631,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   threshold is loosened to 3 hours, matching the surplus dashboard tile's own
   liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
   scheduler watchdog, which reads a separate, per-dispatch signal.
+
+- **A partial write to the concurrent-session record no longer erases fields it
+  was not told about.** The row has several writers that each know a different
+  part of it, and all but one of its columns were overwritten unconditionally —
+  so a writer that simply did not know the model wiped the stored one. The
+  model cache holds a bounded number of sessions, so a long-lived session whose
+  entry had aged out would destroy its own model on the next write. Every
+  content column is now preserved when a writer omits it; only the source tag,
+  which has a real default, is still overwritten.
 
 - **The Queues card could report "healthy — queues are clear" for counters it
   never collected.** When the queues section of the health snapshot fails, it is
@@ -618,6 +1172,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
+- **Invisible-character stripping now covers every invisible Unicode format
+  character, not a hand-picked 13 of them.** Campaign names and awareness-signal
+  text are normalized before they reach a line-parsed prompt, to stop injected text
+  forging or concealing a line. That normalizer enumerated 13 of Unicode's 170 `Cf`
+  format characters, silently omitting concealment characters from the very families
+  it did cover — most pointedly U+061C ARABIC LETTER MARK, sibling of the
+  already-stripped LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the invisible U+E0000
+  tag block. The set is now derived from Python's Unicode database by an explicit
+  rule (strip a format character only when it is genuinely invisible — zero-width,
+  a bidi override, an invisible direction mark, or an annotation control), with a
+  test that regenerates it and fails if the two ever diverge.
+
+  Format characters that are *visible* content are deliberately preserved, so the
+  wider net does not corrupt real text: the Arabic number and end-of-ayah signs,
+  Syriac abbreviation mark, Kaithi number signs and Egyptian hieroglyph joiners all
+  pass through, as do zero-width joiner and non-joiner — stripping those would break
+  every emoji sequence (👨‍👩‍👧 → three separate people) and change Persian and Indic
+  words, where the non-joiner is orthographically required.
+
+- **A campaign name made only of invisible characters is now rejected instead of
+  being created with an empty name.**
 - **A malformed Claude Code session id can no longer create directories outside
   the session tree.** Hooks store per-session state under
   `~/.genesis/sessions/<session-id>/`, interpolating the id straight into the
@@ -691,6 +1266,38 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The review-enforcement commit escalation cap is now CROSS-MODEL only — internal
+  self-reviews never count toward it.** The cap exists to catch cross-model
+  non-convergence (an external, non-Anthropic reviewer finding new defects round after
+  round), not to penalize free same-model self-review. `review_state.py mark` gains a
+  `--source {internal,external}` (default `internal`): an `internal` mark (a
+  genesis-architect / genesis-security / any-subagent audit, the overwhelmingly common
+  case) NEVER advances or resets the streak, whatever it found, and needs no outcome
+  flag; only an `--source external` mark counts, and it still requires `--defects` (a new
+  BLOCKER/SHOULD-FIX/P1/P2 → +1) or `--clean` (none → reset). This ends the weeks of
+  false blocks — including the case where the round-2 mode-switch gate *mandated* a
+  fresh-context internal audit whose mark then tripped the hard cap, penalizing the very
+  remedy the gate demanded. Supersedes the earlier required-outcome fix (feea3f71 /
+  #1446), whose bare-mark refusal only ever bit internal re-audits; that fix's still-useful
+  parts (the outcome requirement for external marks, and the class-sweep reminder that now
+  fires on the second external round) are folded in here. On upgrade, a pre-existing round
+  counter written by the old reviewer-agnostic code (no `last_source`) is treated as legacy
+  and discarded — its count was built entirely from internal self-reviews, so preserving it
+  would keep false-blocking; the streak self-heals on the next cross-model mark (no per-install
+  data repair needed). "External" is judged by the reviewing MODEL, not the gateway: Anthropic
+  Claude via any route (incl. an OpenRouter Claude route) is internal, and Genesis's own
+  cognitive/routing systems are never reviewers — approved external methods today are Codex and
+  Kimi (on .123). `mark` also accepts the `--source=external` equals form (previously silently
+  dropped to internal).
+- **Contributor-issue privacy scan no longer over-blocks legitimate Markdown.**
+  The `scan_prose` secret-scan floor ran `detect-secrets scan --string <line>` per
+  line; argparse then misread any line whose content starts with `-` (a Markdown
+  `---` horizontal rule, a `--flag` example — both common in issue/PR prose) as an
+  unknown option (exit 2), which the fail-closed nonzero-exit branch turned into a
+  spurious BLOCK. Switched to the `--string=<value>` form so the value binds
+  literally even when it starts with a dash; secret detection is unchanged for all
+  other input. Locked with real-binary regression tests (a `---`/`--flag` body
+  scans clean; a planted key still BLOCKs).
 - **A transient `git ls-remote` failure no longer re-prompts an already-approved
   branch push.** The push-approval hook prompts only on a branch's FIRST push; a
   re-push of fixes to the same, already-published branch should be silent. But the
@@ -2829,6 +3436,134 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   results on reflection-adjacent queries). Existing installs can purge already-embedded legacy
   noise with the new `scripts/backfill_source_subsystem.py`, then
   `scripts/cleanup_subsystem_qdrant.py` — both dry-run by default; add `--apply` to commit.
+
+### Added
+
+- **You now get one Telegram when a model provider has been dead for an hour.**
+  Genesis already detected a provider failing every call and already showed it on
+  the dashboard — but nothing ever told you. The record it wrote was
+  high-priority, and only *critical* ones reach Telegram; the matching call-site
+  alert is a warning, which the outreach path filters out. So a provider could be
+  down for days while the only trace was a dashboard panel nobody was looking at.
+
+  One message, then quiet: it names the provider and how long it has been failing,
+  and does not repeat. The hour is deliberate — the underlying record is written
+  after about ten minutes, which is right for a dashboard row and far too eager
+  for a notification, since most breaker trips resolve themselves. If the provider
+  genuinely recovers and later dies again, you are told again.
+
+  Nothing new was added to receive it: this reuses the existing critical-record
+  path, so there is no new alert type and no new table. The duration is read
+  from the stored outage record rather than from memory, so it survives a
+  restart mid-outage without re-notifying — and the hourly check is driven by
+  Genesis's own 5-minute awareness tick rather than by provider traffic, so a
+  provider that goes quiet after failing still gets reported. One new lever:
+  the `provider_outage_notify` setting (`off` / `propose_only` / `live`,
+  default `live`; env `GENESIS_PROVIDER_NOTIFY_DISABLED=1` forces off) —
+  `propose_only` skips the immediate page (the record still shows on the dashboard, to the ego, and in the next morning report), and
+  turning it off resolves any open notification so re-enabling tells you about
+  a still-dead provider again.
+### Fixed
+
+- **A dead provider kept reporting itself recovered, so a multi-day outage was
+  recorded as a series of short incidents that each "recovered".** The
+  `/v1/models` health probe healed a circuit breaker whenever the model was still
+  *listed* by the provider — but a model can be listed and not callable. When an
+  account loses entitlement to a model, the listing endpoint keeps answering 200
+  while every real call returns 403, which is exactly the shape the probe read as
+  "recovered". Closing the breaker fired the recovery hook, which resolved the
+  `provider_failure` record and cleared the only per-provider "failing since"
+  timestamp Genesis keeps; the next real call failed again and the cycle
+  restarted, so the outage clock never accumulated and no surface could report a
+  duration. Measured over one real multi-day outage: eight separate failure
+  records, every one of them closed automatically while the provider was in fact
+  answering nothing at all. The rule now is symmetry: a health probe may undo
+  a health probe's own suspicion, and nothing else. If real calls broke a
+  provider, a real call has to prove it fixed.
+
+  This does not take a provider out of rotation. A tripped provider is
+  automatically put back on probation once its backoff window passes, and a
+  provider on probation is still called — so the next real request to it *is*
+  the retry, and a success clears it. What changed is only that Genesis no
+  longer announces a recovery it has not actually seen.
+
+  **What this changes for you:** a provider that is genuinely dead is now retried
+  progressively less often instead of every couple of minutes, settling at once
+  every 30 minutes — or once every 4 hours when the failure looks like an
+  exhausted quota. That is the point for a dead provider, but it also means a
+  provider whose quota resets can wait up to 4 hours before Genesis tries it
+  again, using the next provider in the chain until then. Reading the retry delay
+  the provider itself reports is the exact fix and is tracked as follow-up work.
+
+- **Disabling a provider from the dashboard now holds against health checks,
+  and re-enabling one actually clears it.** The toggle used to reach into the
+  breaker and set its fields directly, which left the new "who broke this"
+  record out of step in both directions: a provider switched off by hand could
+  be quietly switched back on by a routine health check, and a provider
+  switched back on kept a stale "real calls failed here" mark that made it
+  refuse to go green again until real traffic arrived. Both transitions are now
+  operations the breaker performs on itself, so the state and the reason for it
+  are set together, with a test that scans for code setting breaker state from
+  outside. (A disabled provider still returns to rotation when its
+  backoff window elapses — that is separate, and tracked.)
+
+- **Removed a provider toggle that could never work.** The Tool Providers card
+  on the Overview tab carried disable/enable buttons that posted the tool
+  provider's name to an endpoint which only knows routing-provider names. The
+  two are different namespaces, so every click returned "not found" and popped
+  an error. The working toggle is on the Internals tab and is unaffected.
+
+- **Upgrading in the middle of an outage no longer forgets that the outage is
+  real.** The saved breaker file written by the previous version has no record
+  of what broke a provider, and reading that silence as "a health check did it"
+  would have let the first health check after the upgrade close a breaker that
+  real calls had opened — losing the outage exactly once, at the worst moment.
+  A saved-as-failing provider with no recorded cause is now treated as broken by
+  real calls, which is the only thing it can have been.
+
+- **Alerts now say how long they have been firing.** `alert_events` has recorded
+  `created_at` for every open alert with 90-day retention since it was
+  introduced, and nothing read it — so a condition three days old was rendered
+  identically to one three minutes old. Alert messages now carry
+  `(ongoing for 3d 4h)` once an alert has been continuously open for more than an
+  hour. Enriching the message rather than adding a widget means every surface
+  that renders an alert message gains the duration at once — the dashboard
+  banner, the morning report and the outreach path. Note the existing filters
+  still apply: the morning report omits call-site warnings and the Telegram path
+  carries only whitelisted critical alerts, so for a degraded call site the
+  duration appears on the dashboard. Self-isolating: a failure to compute the
+  duration costs the suffix, never the alert.
+
+- **The dashboard could not display a tripped circuit breaker at all.** The
+  routing API emits breaker state from a lowercase-valued enum, while four
+  frontend comparisons tested against an uppercase literal — a comparison that is
+  never true. The provider dot rendered green, the toggle button read "disable",
+  and the Provider Keys indicator stayed green regardless of the real state, with
+  the "circuit breaker open" tooltip unreachable. All four now route through a
+  single case-insensitive helper, and a guard test scans the frontend directories
+  so a new file cannot reintroduce the comparison.
+
+- **The dashboard now tells "broken" apart from "not proven working yet."** A
+  provider is shown three ways instead of two: red when real calls are failing
+  and it is not being used, hollow amber when it is still in rotation but has
+  not completed a call since its last trouble, and green when it is healthy.
+  Hovering says which, and why — real calls failed, or only a health check
+  could not reach it. Previously a provider awaiting its next call looked
+  identical to one actively failing, which overstated the problem; that state
+  is now common enough to be worth naming, since recovery waits for a real call.
+
+- **Alert severity dots were always amber, including for critical alerts.** The
+  colour map was keyed lowercase while severities are emitted uppercase, so every
+  lookup missed and fell through to the warning colour. The map now normalises
+  case, covers the full emitted vocabulary, and gives an unrecognised severity its
+  own colour instead of silently painting it as a warning.
+
+- **Grouped error severity was ranked alphabetically, which inverts it.** The
+  severity vocabulary is lowercase, so a plain `MAX()` orders
+  `warning > info > error > debug > critical` — critical sorts lowest. Any group
+  mixing a critical with a warning reported "warning" and rendered amber,
+  silently downgrading the most severe events in the group. Ranking is now
+  explicit.
 
 ## [v3.0b17] - 2026-07-06
 
