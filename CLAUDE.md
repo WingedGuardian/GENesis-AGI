@@ -272,12 +272,42 @@ the question. Query SQLite `cc_sessions` for structured session data. Use
 `db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
 **Grep transcripts is LAST RESORT** — only after all above fail.
 
-**When to store back:**
-If you synthesize an answer from multiple recalled memories — something that
-connects information in a new way — store it via `memory_store` with
-`tags: ["synthesis"]` and appropriate wing/room tags. This is how the memory
-system compounds over time. Don't store routine answers; store genuine syntheses
-that would be expensive to re-derive.
+**When to store back — the test is RE-DERIVATION COST, not importance.**
+Store to Genesis memory when a future session would have to REDO WORK to know
+this. That is a question about the work you just did, which you can answer; "is
+this important?" is a question about the future, which you cannot, and it is why
+the rule below used to fire so rarely. Three concrete triggers:
+
+1. **You MEASURED something** that took real effort to obtain — a probe you had
+   to design, an enumeration across a directory, a live-state check. Store the
+   number WITH its denominator and the method, because the method is usually what
+   the next session gets wrong.
+2. **You established a durable ARCHITECTURAL fact** — X exists, X works this way,
+   X is not what its name suggests. Especially when you went looking for X
+   expecting it to be absent.
+3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
+   Use `supersedes` to link the correction to what it replaces. This is the
+   highest-value trigger and the easiest to skip, because being wrong does not
+   feel like a finding. It is the one that stops the next session paying for the
+   same mistake.
+
+Also store a genuine SYNTHESIS — an answer connecting several recalled memories
+in a new way — with `tags: ["synthesis"]`. Don't store routine answers, restatements
+of what a file already says, or anything the repo records on its own.
+
+**Do not park a durable FACT in CC file memory.** The two systems differ in
+LIFETIME, not just audience: CC file memory is for behavioural rules that must
+shape *how you work*, and it is compacted away within months, so a fact left
+there is a fact you will silently lose. Genesis memory is permanent and
+recallable system-wide. A measurement, an architecture note, or a correction
+belongs there even when it also taught you a behavioural lesson — in that case
+store BOTH: the rule in CC memory, the fact in Genesis memory.
+
+(Origin: a 2026-09-05 session measured an embedding regression, enumerated an
+init-path invariant across 33 modules, and corrected a wrong architectural claim
+of its own — then wrote only the behavioural lessons to CC memory and stored
+nothing durable until the user asked why. The routing rule was clear; nothing
+told it WHEN.)
 
 **Wings (structural domains):**
 Memories are tagged with a `wing` (top-level domain) and optional `room`
