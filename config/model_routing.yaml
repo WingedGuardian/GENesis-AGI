@@ -42,10 +42,20 @@ providers:
     # Mistral family degrades within itself before leaving the family — and
     # when Large's entitlement returns (or an install has a paid plan), the
     # chain silently uses the best available tier with no config change.
-    # PRESUMPTIVE free (user decision 2026-09-05): entitlement unverified —
-    # probes 429'd on the account-wide limit before answering; see the
-    # mistral-medium profile's free_tier note. rpm matches Large's
-    # conservative 4 until real traffic establishes a better figure.
+    # ENTITLEMENT VERIFIED 2026-09-06, PRICING STILL PRESUMED. A live probe of
+    # all three tiers on one free-tier account, same request shape, same minute:
+    #   mistral-large-latest  -> 403 tier_not_allowed
+    #   mistral-medium-latest -> 429 rate_limited
+    #   mistral-small-latest  -> 429 rate_limited
+    # The 403/429 split IS the discriminator: a tier check precedes rate
+    # limiting, so Large is refused by entitlement while Medium is merely
+    # throttled. Medium is therefore reachable on a tier that refuses Large,
+    # which is the whole premise of this rung.
+    # What that does NOT establish is $0 — a 429 proves reachable, not free.
+    # `free: true` is an account-tier COST claim and remains presumed until a
+    # completion lands and its recorded cost is checked. If it turns out
+    # metered, never_pays sites walking this rung is the exposure to fix.
+    # rpm matches Large's conservative 4 until real traffic says otherwise.
     free: true
     rpm_limit: 4
     open_duration_s: 120

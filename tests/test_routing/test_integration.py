@@ -107,17 +107,19 @@ async def test_surplus_never_pays(real_config, breakers, cost_tracker, degradati
     result = await router.route_call("12_surplus_brainstorm", [{"role": "user", "content": "brainstorm"}])
     assert result.success is False
     providers_called = {c["provider"] for c in delegate.calls}
-    # The walk actually happened. Without this, `_filter_chain` returning []
-    # short-circuits `route_call` before any attempt and BOTH assertions below
-    # pass vacuously — success is False because nothing ran, and the loop is
-    # empty. That is a worse bug than the one this test targets.
+    # This single assertion carries both halves of the invariant, which is why
+    # there is no separate per-provider `is_free` loop after it:
+    #   - EVERY free rung was tried. Without this, `_filter_chain` returning []
+    #     short-circuits `route_call` before any attempt and `success is False`
+    #     passes because nothing ran — a worse bug than the one under test.
+    #   - ONLY free rungs were tried, since `free_chain` is itself the `is_free`
+    #     filter. A separate loop over `providers_called` asserting `is_free`
+    #     could no longer fail once this equality holds; it would imply
+    #     independent coverage it does not provide.
     assert providers_called == set(free_chain), (
         f"expected every free rung to be tried; walked {sorted(providers_called)} "
         f"of {sorted(free_chain)}"
     )
-    # Only free providers
-    for p in providers_called:
-        assert real_config.providers[p].is_free
 
 
 @pytest.mark.asyncio
