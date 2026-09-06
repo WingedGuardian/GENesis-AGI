@@ -101,8 +101,62 @@ _WRAPPER_SPEC = {
         },
         0,
     ),
+    # Tool-runner front-ends that take the wrapped command directly, with no
+    # subcommand between: `uvx pytest …`, `xvfb-run pytest …`.
+    "uvx": ({"--from", "--with", "--python", "-p", "--index", "--constraints"}, 0),
+    "xvfb-run": ({"-n", "--server-num", "-s", "--server-args", "-f", "--auth-file", "-e"}, 0),
 }
 _WRAPPERS = set(_WRAPPER_SPEC)
+# Package managers / task runners that carry a real command after a literal
+# `run` subcommand: `uv run pytest …`, `poetry run pytest …`.
+#
+# Gated on the subcommand LITERAL rather than modelled as a positional-consuming
+# _WRAPPER_SPEC entry, and that distinction is load-bearing for safety. A blanket
+# `("uv", (set(), 1))` would consume the first bare word of EVERY uv subcommand,
+# so `uv rm -rf /` would eat `rm` and resolve the exe past it — HIDING a command
+# the destructive gate catches today. Revealing a wrapped command is the
+# monotonic-safe direction this resolver promises; skipping past one is not.
+# A front-end invoked with any other subcommand (`uv pip install …`) is therefore
+# left resolving to the front-end itself, exactly as before.
+_RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
+# Value-consuming flags accepted BEFORE the wrapped command, on either the
+# front-end or its `run` subcommand.
+#
+# STILL non-exhaustive — but the claim that used to sit here, that an unlisted
+# `--flag value` "can only ADD a gate hit, never remove one", was FALSE and is
+# withdrawn. It holds only for a flag AFTER `run`. Before it, the flag's value
+# becomes the first bare word, `run` is never matched as the subcommand, and the
+# carrier stays OPAQUE — a fail-OPEN miss. MEASURED through the real
+# `full_suite_guard`: `uv --color always run pytest` and
+# `uv --cache-dir /tmp/c run pytest` both exited 0 (allowed) where `uv run pytest`
+# exits 2 (blocked).
+#
+# Enumerating uv's option grammar is not the fix — that is an open set, and each
+# missing entry is the next round's finding (this list reached four). The
+# residual is closed at the CALLER instead: `full_suite_guard` treats an
+# unresolved run-carrier as unresolved rather than allowed. This list only has to
+# keep the COMMON forms resolving so that fail-closed leg stays rare.
+#
+# `--isolated` was removed: it is BOOLEAN in `uv run`, so listing it here made
+# the parser eat the command word. MEASURED: `uv run --isolated pytest` resolved
+# its exe to `tests/` and the guard allowed it. A wrongly-listed flag is the more
+# dangerous direction of this list, because it mis-parses a COMMON form rather
+# than an exotic one.
+_RUN_CARRIER_VALUE_FLAGS = frozenset(
+    {
+        "--with",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--directory",
+        "-C",
+        "--project",
+        "--extra",
+        "--group",
+        "--index",
+        "--env-file",
+    }
+)
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
 # Shell tokens that can front a SIMPLE COMMAND within a segment (after
@@ -678,6 +732,45 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _run_carrier_command_start(argv: list[str], i: int) -> int | None:
+    """Index of the command wrapped by a ``<front-end> run …`` invocation, else None.
+
+    ``argv[i]`` is the front-end (``uv``/``poetry``/…). Returns the index of the
+    first token of the WRAPPED command only when the front-end's first bare word
+    is the literal ``run``; any other subcommand (``uv pip install …``) returns
+    None so the front-end resolves as its own exe and NOTHING is skipped past.
+    That asymmetry is the safety property — see ``_RUN_CARRIERS``.
+    """
+    j = i + 1
+    while j < len(argv):  # the front-end's own flags, ahead of its subcommand
+        t = argv[j]
+        if t == "--":
+            j += 1
+            break
+        if not t.startswith("-"):
+            break
+        j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
+    # `uv tool run` is a documented ALIAS for `uvx` — "uvx is provided as a
+    # convenient alias for uv tool run, their behavior is identical" (uv help
+    # tool run). Requiring a bare `run` left that spelling opaque, so
+    # `uv tool run pytest` was allowed where `uvx pytest` was blocked. A literal
+    # two-token sequence, not a grammar: closed set, nothing to keep up with.
+    if argv[j : j + 2] == ["tool", "run"]:
+        j += 2
+    elif j < len(argv) and argv[j] == "run":
+        j += 1
+    else:
+        return None
+    while j < len(argv):  # `run`'s own flags, ahead of the wrapped command
+        t = argv[j]
+        if t == "--":
+            return j + 1
+        if not t.startswith("-"):
+            return j
+        j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
+    return None  # `uv run --flag` with no command after it
+
+
 def _strip_wrappers(argv: list[str]) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
@@ -724,6 +817,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
     open_parens = 0
+    via_uv_tool = False  # reached the command through `uvx` / `uv tool run`
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
@@ -739,9 +833,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
             continue
+        if _basename(tok) in _RUN_CARRIERS:
+            j = _run_carrier_command_start(argv, i)
+            if j is None:
+                break  # not a `run` invocation — the front-end IS the command
+            if argv[i + 1 : i + 3] == ["tool", "run"]:
+                via_uv_tool = True
+            i = j
+            continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
+        if _basename(tok) == "uvx":
+            via_uv_tool = True
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
@@ -784,6 +888,15 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 remaining -= 1  # stay on j — the token may carry another glued `)`
             else:
                 j -= 1
+    # `uv tool run ruff@0.3.0` / `uvx pytest@8.3.5` — uv documents `<package>@<version>`
+    # as a supported command name, and it executes the named tool. Left as written,
+    # the exe resolves to `pytest@8.3.5`, which matches no gate looking for `pytest`:
+    # MEASURED, `uvx pytest@8.3.5` exited 0 from full_suite_guard where `uvx pytest`
+    # exits 2. Scoped to the uv tool-runners on purpose — this is uv's spelling, not
+    # a general one, and stripping an `@` suffix off every resolved command would be
+    # inventing syntax for tools that do not have it.
+    if via_uv_tool and result and "@" in result[0]:
+        result[0] = result[0].split("@", 1)[0]
     return result
 
 

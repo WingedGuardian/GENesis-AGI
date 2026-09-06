@@ -841,3 +841,45 @@ class TestSigilRunRegression:
         # token into _KNOWN_SIGILS left all 146 tests in this file passing.
         unqueried = sorted(set(sp._KNOWN_SIGILS) - set(queried))
         assert not unqueried, f"declared in _KNOWN_SIGILS but no guard queries it: {unqueried}"
+
+
+class TestUvCarrierResolution:
+    """The RESOLVER's own contract, pinned independently of any one guard.
+
+    full_suite_guard now has a fail-closed leg for an unresolved carrier, so it
+    blocks these shapes whether or not the parse is right — which means a guard
+    test cannot distinguish a correct parse from a caught one. Measured: with the
+    leg in place, reverting the --isolated and tool-run fixes left the guard tests
+    GREEN. analyze() feeds every other consumer too (the destructive and routing
+    guards read the resolved exe), so the resolution is asserted here on its own
+    terms rather than through a caller that has its own safety net.
+    """
+
+    def _exe(self, cmd: str) -> str:
+        return [s for s in sp.analyze(cmd) if s.depth == 0][0].exe
+
+    def test_isolated_is_boolean_and_does_not_eat_the_command(self):
+        """--isolated is valueless in uv run. Listing it as value-taking made the
+        parser consume the command word as its value and resolve the path after."""
+        assert self._exe("uv run --isolated pytest tests/") == "pytest"
+
+    def test_uv_tool_run_resolves_like_uvx(self):
+        """uv documents them as identical: uvx is an alias for uv tool run."""
+        assert self._exe("uv tool run pytest tests/") == "pytest"
+        assert self._exe("uvx pytest tests/") == "pytest"
+
+    def test_a_versioned_tool_name_normalises(self):
+        """uv permits package@version; unnormalised it matches no gate."""
+        assert self._exe("uvx pytest@8.3.5 tests/") == "pytest"
+        assert self._exe("uv tool run ruff@0.3.0 check .") == "ruff"
+
+    def test_a_version_suffix_is_only_stripped_for_uv_tool_runners(self):
+        """Scoped on purpose — @ is uv's spelling, not a universal one, and
+        stripping it everywhere would invent syntax for tools that lack it."""
+        assert self._exe("some-cmd@1.2.3 arg") == "some-cmd@1.2.3"
+
+    def test_a_non_run_uv_subcommand_still_resolves_to_uv(self):
+        """The run literal is what keeps uv rm -rf / from hiding rm behind the
+        front-end. Adding tool run must not weaken that."""
+        assert self._exe("uv rm -rf /") == "uv"
+        assert self._exe("uv pip install requests") == "uv"

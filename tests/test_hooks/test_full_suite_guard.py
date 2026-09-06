@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _WORKTREE / "scripts" / "hooks" / "full_suite_guard.py"
 _PYTHON = sys.executable
@@ -183,3 +185,71 @@ class TestEndToEnd:
         # post-#1455 the redirect TARGET (errors.py) is stripped from argv, so this is a
         # bare pytest → BLOCK (no phantom .py file target).
         assert _run_guard("pytest 2> errors.py").returncode == 2
+
+
+class TestUvCarrierBypasses:
+    """Four reported shapes, all measured fail-OPEN before this change.
+
+    The resolver models uv's option grammar to find the carried command, and that
+    grammar is an OPEN set: every missing entry is the next round's finding, which
+    is how this PR reached four. Two of them are closed by encoding CLOSED-set
+    facts (`uv tool run` is a literal token pair; `pkg@version` is a documented
+    spelling), one by removing a wrongly-listed boolean flag, and the residual —
+    an unknown value-taking flag before `run` — by refusing to let an unresolved
+    carrier read as clean.
+
+    Recorded per-shape rather than as one loop so a regression names the spelling
+    that broke.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "pytest",
+            "uv run pytest",
+            "uv run --isolated pytest",  # --isolated is BOOLEAN in uv
+            "uv --color always run pytest",  # unlisted value flag BEFORE run
+            "uv --cache-dir /tmp/c run pytest",  # ditto, different flag
+            "uv tool run pytest",  # documented uvx alias
+            "uvx pytest@8.3.5",  # documented versioned name
+            "poetry run pytest",
+            "uv run pytest tests/",  # whole-directory run
+        ],
+    )
+    def test_a_full_suite_run_is_blocked_through_every_carrier_spelling(self, cmd):
+        assert _run_guard(cmd).returncode == 2, f"fail-OPEN: {cmd!r} was allowed"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "uv run pytest tests/foo.py",
+            # Targeted THROUGH an unresolved carrier — the fail-closed leg must
+            # still read the pytest args rather than blanket-blocking, or it
+            # impedes ordinary work behind an exotic flag.
+            "uv --color always run pytest tests/foo.py",
+            "uvx pytest@8.3.5 tests/foo.py",
+            "uv run pytest -k mytest",
+            # Not a pytest run at all — a carrier doing something else must not
+            # be caught by the carrier check.
+            "uv pip install requests",
+            "uv run ruff check .",
+            # A mere textual MENTION is not an invocation.
+            "echo pytest",
+            "git commit -m 'run pytest later'",
+        ],
+    )
+    def test_a_targeted_or_unrelated_command_is_not_over_blocked(self, cmd):
+        assert _run_guard(cmd).returncode == 0, f"OVER-BLOCK: {cmd!r} was refused"
+
+    def test_the_carrier_check_does_not_swallow_a_destructive_subcommand(self):
+        """`uv rm -rf /` must still resolve to `uv`, not past it.
+
+        The resolver deliberately gates on the `run` literal so a blanket
+        positional-consuming entry cannot skip over `rm` and hide it from the
+        destructive gate. Adding `tool run` must not weaken that, so this pins
+        the neighbouring safety property the change could plausibly have broken.
+        """
+        from shell_parse import analyze
+
+        seg = [s for s in analyze("uv rm -rf /") if s.depth == 0][0]
+        assert seg.exe == "uv", seg.exe
