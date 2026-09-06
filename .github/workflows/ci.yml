@@ -305,27 +305,79 @@ jobs:
           printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
-    # Catch duplicate migration prefixes before merge — two PRs creating
-    # the same NNNN_*.py prefix will collide at runtime.
+    # Migration ids, three rules: every file in a migrations directory is a
+    # legal migration (the residue is a violation, because a name that matches
+    # nothing is discovered by nothing and NEVER RUNS), no duplicate id in
+    # either namespace, and every frozen legacy file is still present under its
+    # own name (deleting or renaming one leaves the id set identical while
+    # existing installs skip the replacement forever).
+    #
+    # The legacy namespace is frozen as an ENUMERATED set, not a range: 0092
+    # lies between the endpoints and does not exist, so a range check admitted
+    # a brand-new hand-allocated 0092_*.py. New migrations use a UTC timestamp,
+    # which nobody has to allocate and two branches therefore cannot both claim.
+    #
+    # The check moved out of shell deliberately. The old glob+grep restated the
+    # runners' filename semantics in a second language and could not survive
+    # mixed-width ids in EITHER direction (both measured 2026-09-03): its
+    # 4-digit glob made timestamp migrations invisible to the guard, and
+    # widening the glob while keeping `grep -oP '^\d{4}'` truncated every
+    # 20260903… id to "2026", reporting two distinct migrations as duplicates.
+    # scripts/check_migration_prefixes.py imports the runners' own patterns, so
+    # the guard cannot drift from what actually runs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check migration prefix uniqueness
+        with:
+          # The immutability rule asks git what was ALREADY MERGED — the one
+          # question a list in the repo cannot answer for an unbounded id space.
+          # A shallow clone has no base commit to compare against, and the guard
+          # treats an unreadable --base as a violation rather than a pass.
+          fetch-depth: 0
+      - name: Check migration ids (uniqueness + immutability)
+        env:
+          # Passed via env, not interpolated into `run` — same handling the
+          # leak-detector job uses for PR_BASE_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is USELESS there — it IS the
+          # just-pushed checkout, so `--base origin/main` compares the tree with
+          # itself and the immutability rule silently checks nothing. The push
+          # event's `before` SHA is the pre-push state, which is the base that
+          # makes the post-merge run able to see a deletion that reached main
+          # outside the PR check. All-zero on branch creation, hence the guards
+          # below.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          dir="src/genesis/db/migrations"
-          dupes=$(ls "$dir"/[0-9][0-9][0-9][0-9]_*.py 2>/dev/null \
-            | xargs -I{} basename {} \
-            | grep -oP '^\d{4}' \
-            | sort | uniq -d || true)
-          if [[ -n "$dupes" ]]; then
-            echo "::error::Duplicate migration prefixes found: $dupes"
-            for p in $dupes; do
-              echo "  Files: $(ls "$dir"/${p}_*.py)"
-            done
-            exit 1
+          # Base resolution, most-specific first:
+          #   PR build        -> the PR base (what "already merged" means there);
+          #   push build      -> the pre-push SHA (see PUSH_BEFORE_SHA above);
+          #   schedule/manual -> origin/main IF it differs from the checkout.
+          # `--base` is passed only when a ref was resolved, exists, AND is not
+          # the checkout itself. A base equal to HEAD is a self-comparison: the
+          # rule would examine nothing while the log claimed "immutable against
+          # origin/main" — a verified-grammar claim that is false, and the exact
+          # silent pass the guard's own doctrine forbids. So schedule/dispatch
+          # runs on main (and any degraded push case whose `before` is
+          # unreachable) drop --base and honestly print best-effort scope; the
+          # PR and push runs are the enforcement points for immutability.
+          # Known fail-NOISY edge, accepted: a re-run of an OLD build compares
+          # its old checkout against origin/main fetched NOW and can go red on
+          # migrations that merged since — loud and explainable, never silent.
+          base="${PR_BASE_SHA:-}"
+          if [[ -z "$base" && -n "${PUSH_BEFORE_SHA:-}" && "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
           fi
-          echo "Migration prefix check: CLEAN"
+          if [[ -z "$base" ]] && git rev-parse --verify -q origin/main >/dev/null \
+             && [[ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]]; then
+            base="origin/main"
+          fi
+          if [[ -n "$base" ]]; then
+            python3 scripts/check_migration_prefixes.py --base "$base"
+          else
+            python3 scripts/check_migration_prefixes.py
+          fi
 
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress

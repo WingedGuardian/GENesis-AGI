@@ -207,14 +207,15 @@ async def _load_open_items(db_path: Path | str) -> list[dict] | None:
     one. Proceeding with [] would record an ok run and advance the cursor
     past PRs whose matches were never computed, skipping those closures
     forever; the caller must fail the run and keep the cursor instead
-    (Codex P2 on #1081). The limit is pinned at ledger_all's ceiling so
-    truncation can't silently hide newer open rows either."""
+    (Codex P2 on #1081). ledger_all is COMPLETE (keyset-paginated, raising
+    tripwire) so truncation can't silently hide newer open rows either —
+    its tripwire raise lands in the except below, which fails the run."""
     import aiosqlite
 
     try:
         async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
             db.row_factory = aiosqlite.Row
-            rows = await ledger_all(db, limit=100_000)
+            rows = await ledger_all(db)
     except Exception:
         return None
     open_rows = [r for r in rows if r.get("status") in OPEN_STATUSES]
