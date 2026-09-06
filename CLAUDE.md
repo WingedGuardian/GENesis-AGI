@@ -62,7 +62,11 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+`scripts/cc_align_host.sh` — host-only by contract, no container leg),
+`genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
+auto-updater suppression in `~/.claude/settings.json`, because the align path
+only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
@@ -329,7 +333,16 @@ extraction pipeline is the safety net.
 
 Foreground sessions carry a durable charter + ledger (DB-backed, re-injected
 into every post-compaction window — see the `## Session Charter` block and
-the per-turn `[Charter: … | open: N]` tag).
+the per-turn `[Ledger open: N | mission: …]` inventory, one line per open row).
+
+**The ledger is the session's founding mission and OUTRANKS every follow-up.**
+Follow-ups are durable system-wide; ledger rows exist only on the ledger. In
+any status report or wrap-up, open ledger rows come FIRST, by name — never as
+"older items" or fine print under follow-ups you created yourself — and a
+wrap-up cannot say "only follow-ups left" while a ledger row is open. Every
+open row is either getting done or gets a disposition (done / absorbed /
+dropped, with the reason) — a row left undisposed is a defect, not a backlog.
+A ledger row is ONE sentence; evidence carries the detail.
 
 **Real-time capture is your responsibility.** At agreement moments — the
 user says "yes, do that", approves a plan item, or you promise work — call
@@ -337,7 +350,9 @@ user says "yes, do that", approves a plan item, or you promise work — call
 compaction summary can erase. Close items with `session_ledger_update`
 (done / absorbed-with-evidence / dropped) as work lands; set the living
 mission via `session_charter_update` when the session's purpose
-crystallizes or pivots. You are the first line of defense; ambient
+crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
+until you do, because an unset mission falls back to the raw origin prompt and
+reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
@@ -360,6 +375,37 @@ When a user shares a file path or URL in conversation:
   the knowledge base as an authoritative source?"
 - Never auto-ingest without explicit user confirmation.
 - The dashboard also supports drag-drop file upload on the Knowledge tab.
+
+## Hook Output Persistence — a withheld hook is a SILENT loss
+
+Claude Code persists a hook's stdout above a size threshold instead of
+delivering it: the full text goes to a file and you get a short preview. It is
+not an error and nothing else announces it. MEASURED on this install: the
+SessionStart injection was withheld from 195 windows across a month — sessions
+ran without identity, charter and essential knowledge and nobody noticed,
+because the preview reads as ordinary furniture at the top of a window.
+
+**If a hook result arrives as a preview + a saved path** (as of CC 2.1.246:
+`<persisted-output>`, `Output too large (N KB). Full output saved to: <path>`,
+`Preview (first 2KB)`), that hook's contribution to this window was withheld:
+
+- **SessionStart** — Read the path the wrapper names **before anything else**,
+  then tell the user it happened. Genesis parts also mirror themselves to
+  `~/.genesis/sessions/<sid>/context-<part>.md` and name it in a
+  `[genesis-ctx:<part> · mirror: …]` header, so read the mirror if the
+  wrapper's path is gone. If neither exists, say which part this window lost.
+- **Any other hook** — that turn ran without what the hook was carrying (a
+  memory recall, a guard advisory). Say so rather than proceeding as if it
+  arrived.
+
+The size threshold is undocumented and **moves between CC versions** — treat
+the wrapper itself as the signal, never a byte count.
+`scripts/hooks/hook_output.py` is the single home of the measured cap and
+bounds the two hooks that carry the most to the model (the SessionStart
+injection and the per-prompt session-state tags); **route any new model-facing
+stdout through it** — the other hooks are not bounded yet. The hourly
+`context_injection_monitor` watches the harness's own filings independently of
+every emitter's arithmetic, so this class cannot go quiet again.
 
 ## Traps
 
@@ -453,6 +499,25 @@ When a user shares a file path or URL in conversation:
   decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
+- **Finish before you stop — the zero-drop rule.** A turn may run as long as
+  the work requires; never yield with steps you could still complete AND are
+  cleared to complete — stopping for an approval, a blocking question, plan
+  approval, or a designed hard stop is finishing correctly, not dropping
+  work. When something genuinely cannot finish this turn, every unfinished
+  piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
+  issue, which keeps its per-instance approval gate from "Where deferred
+  work goes" below, this rule waives nothing. Where none of those trackers
+  is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
+  ledger or follow-up tool — the fallback is a structured handoff that NAMES
+  every unfinished piece in your final message; a named remainder is tracked,
+  an unnamed one is dropped. An untracked remainder is a
+  drop, not a deferral, and a plan-file bullet is not a row. On the next
+  prompt, reconcile your own stranded artifacts early — ordered behind
+  anything the user's prompt makes urgent — before taking on discretionary
+  new work. The answer to "what has fallen through the cracks?" is MADE
+  zero: enumerate, then fix or file what the enumeration finds. (Origin
+  2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
+  days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked

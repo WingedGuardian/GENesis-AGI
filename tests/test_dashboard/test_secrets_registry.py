@@ -112,3 +112,169 @@ def test_glm_keys_carry_both_parsed_fields(key):
     assert _BARE_HOST_RE.match(entry.signup_url), (
         f"{key} signup_url is not a bare host: {entry.signup_url!r}"
     )
+
+
+# ── Commented keys stay in the registry ───────────────────────────────────────
+#
+# The template deliberately ships some assignments COMMENTED so that their
+# genesis.yaml equivalents keep working — an uncommented assignment is copied into
+# secrets.env on a fresh install and every accessor reads the environment first,
+# which makes the documented yaml lever dead on arrival. But the registry parser
+# anchored on `^KEY=`, so commenting a key ALSO deleted it from the dashboard's
+# editable set, and the PUT route rejects anything absent from _KNOWN_KEYS. One
+# fix bought another bug: the field vanishes and an update 4xx-es.
+
+_COMMENTED_BUT_SETTABLE = [
+    "OLLAMA_URL",
+    "LM_STUDIO_URL",
+    "LM_STUDIO_HEALTH_URL",
+    "GENESIS_EMBED_PRIORITY_TIER",
+    # These four were already commented — and already invisible — before the
+    # local-inference URLs joined them. The gap predates that change.
+    "TTS_ELEVENLABS_STABILITY",
+    "GENESIS_DASHBOARD_API_AUTH",
+]
+
+
+@pytest.mark.parametrize("key", _COMMENTED_BUT_SETTABLE)
+def test_commented_keys_remain_registered(key):
+    """A commented default is still a settable key, and must stay editable."""
+    keys = {d.key for d in _parse_example_file()}
+    assert key in keys, (
+        f"{key} is commented in secrets.env.example and dropped out of the dashboard "
+        "registry — the field disappears and PUT rejects it as unknown."
+    )
+
+
+def test_uncommented_keys_are_unaffected(  ):
+    """The control: ordinary assignments must still register exactly as before."""
+    keys = {d.key for d in _parse_example_file()}
+    for key in ("API_KEY_DEEPINFRA", "GENESIS_ENABLE_OLLAMA", "OLLAMA_URL"):
+        assert key in keys, key
+
+
+def test_prose_is_not_mistaken_for_a_key():
+    """The other direction. `# NOTE: ...` and similar must not become keys.
+
+    The commented-key pattern is deliberately narrow — an uppercase identifier
+    immediately followed by `=` — because a looser one would turn ordinary
+    commentary into phantom registry entries the PUT route would then accept.
+    """
+    keys = {d.key for d in _parse_example_file()}
+    bogus = {k for k in keys if not k.replace("_", "").isalnum()}
+    assert not bogus, f"non-key text registered as keys: {sorted(bogus)}"
+    # Every registered key must actually appear as an assignment in the template.
+    from genesis.env import repo_root
+
+    text = (repo_root() / "secrets.env.example").read_text()
+    for k in keys:
+        assert f"{k}=" in text, f"{k} registered but never assigned in the template"
+
+
+# ── An optional override must be reversible ───────────────────────────────────
+#
+# Registering the commented keys made them editable, which opened a ONE-WAY DOOR:
+# setting one writes an assignment into secrets.env, the environment then shadows
+# genesis.yaml permanently, and later config edits appear to do nothing. Recoverable
+# only by hand-editing the file the dashboard exists to avoid.
+
+
+def test_optional_overrides_are_flagged_clearable():
+    """The commented keys — and only those — advertise that they can be cleared."""
+    by_key = {d.key: d for d in _parse_example_file()}
+    for key in ("OLLAMA_URL", "LM_STUDIO_URL", "GENESIS_EMBED_PRIORITY_TIER"):
+        assert by_key[key].is_optional_override is True, key
+    # The control. A required credential must NOT be clearable, or the editor would
+    # happily blank an API key and report success.
+    for key in ("API_KEY_DEEPINFRA", "TELEGRAM_BOT_TOKEN"):
+        assert by_key[key].is_optional_override is False, key
+
+
+def test_clearing_an_override_comments_the_assignment_out(tmp_path, monkeypatch):
+    """Empty means UNSET, and unset must not be written as `KEY=`.
+
+    The accessors branch on `os.environ.get(key) is not None`, so an empty
+    assignment still shadows genesis.yaml — just with an empty string, which is
+    worse than the value it replaced. The line has to stop being an assignment.
+    """
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("OLLAMA_URL=http://was-set.invalid:11434\nAPI_KEY_GROQ=abc\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": ""})
+    text = env_file.read_text()
+    assert "\nOLLAMA_URL=" not in "\n" + text, f"still an active assignment:\n{text}"
+    assert "# OLLAMA_URL=http://was-set.invalid:11434" in text, text
+    # The untouched key must survive verbatim — a rewrite that loses siblings is
+    # the same data-loss shape as the timezone handler's.
+    assert "API_KEY_GROQ=abc" in text
+
+
+def test_setting_a_value_still_writes_an_assignment(tmp_path, monkeypatch):
+    """The control in the other direction: clearing must not break setting."""
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("OLLAMA_URL=http://old.invalid:11434\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": "http://new.invalid:11434"})
+    assert "OLLAMA_URL=http://new.invalid:11434" in env_file.read_text()
+
+
+def test_an_unset_key_is_not_appended_as_empty(tmp_path, monkeypatch):
+    """Clearing a key absent from the file must add nothing at all."""
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("API_KEY_GROQ=abc\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": ""})
+    assert "OLLAMA_URL" not in env_file.read_text()
+
+
+def test_opening_an_editor_seeds_the_value_so_save_is_not_a_delete():
+    """An UNTOUCHED field must mean "no change", never "delete".
+
+    Structural, because there is no JS harness here — but the failure it guards is
+    concrete and was live: `config.html` binds
+    `:value="secretsValues[k.key] ?? k.value ?? ''"`, so the displayed value comes
+    from `k.value` while `secretsValues[k.key]` stays UNDEFINED until an `input`
+    event fires. Opening a configured override and pressing Save without typing
+    therefore read as empty — and once empty meant "unset", that silently removed
+    the override the operator had just been looking at.
+    """
+    from genesis.env import repo_root
+
+    js = (repo_root() / "src/genesis/dashboard/webui/js/dashboard.js").read_text()
+    start = js.index("toggleSecretEdit(keyName)")
+    handler = js[start : start + 900]
+    assert "secretsValues" in handler and "def.value" in handler, (
+        "toggleSecretEdit must seed the edit buffer from the current value; "
+        "without it an untouched field saves as an empty string, i.e. a deletion"
+    )
+    # The backstop: seeding cannot cover a masked value, so clearing is confirmed.
+    save = js[js.index("async saveSecret(keyName)") :][:1600]
+    assert "confirm(" in save, "clearing an override must be an explicit act"
+
+
+def test_the_empty_string_is_false_for_every_boolean_accessor():
+    """Guards the sibling regression from the same commit, at the API boundary.
+
+    `_yaml_bool` answers "is this one of the words meaning no", and "" is in none
+    of them — so the token check alone read an empty quoted scalar as TRUE, where
+    the `bool()` it replaced read it as False. On `embed_priority_tier` that
+    silently selects the paid lane.
+    """
+    from genesis.env import _yaml_bool
+
+    for empty in ("", "   ", "\t"):
+        assert _yaml_bool(empty) is False, repr(empty)
+    # Controls in both directions.
+    assert _yaml_bool("false") is False
+    assert _yaml_bool("true") is True
+    assert _yaml_bool(False) is False
+    assert _yaml_bool(True) is True
