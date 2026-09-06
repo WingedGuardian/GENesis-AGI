@@ -28,7 +28,23 @@ class _FakeClock:
         return self.now
 
 
-def _success_output(text: str = "evaluation result") -> CCOutput:
+def _success_output(
+    # Default fake response echoes this file's fixture URLs the way the
+    # evaluation prompt now requires (**Source:** lines), so dispatch and
+    # lifecycle tests pass the per-URL coverage gate. A platform name alone
+    # is deliberately NOT coverage for a path-bearing URL — that rule has its
+    # own dedicated tests in test_url_failures.py.
+    text: str = (
+        "evaluation result\n"
+        "**Source:** https://example.com/article\n"
+        "**Source:** https://example.com/article-1\n"
+        "**Source:** https://example.com/article-2\n"
+        "**Source:** https://example.com/article-3\n"
+        "**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n"
+        "**Source:** https://www.linkedin.com/posts/foo-share-123-1G81/\n"
+    ),
+) -> CCOutput:
     return CCOutput(
         session_id="cc-sess-1",
         text=text,
@@ -133,6 +149,175 @@ def test_set_build_lane_wires_hook(monitor):
     sentinel = object()
     monitor.set_build_lane(sentinel)
     assert monitor._build_lane is sentinel
+
+
+@pytest.mark.asyncio
+async def test_silently_omitted_url_requeues_not_baselines(
+    monitor, inbox_dir, db, mock_invoker
+):
+    """An evaluation that never MENTIONS one of its URLs must not complete.
+
+    Silent omission emits no give-up language, so _has_url_failures cannot
+    see it; before the coverage gate, the batch was marked completed and the
+    omitted URL's line was permanently absorbed into the baseline —
+    unrecoverable, invisible loss.
+    """
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## one-thing\n"
+        "Thorough discussion of the example.com piece and nothing else.\n"
+        + "x" * 300
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "failed"
+    assert row["error_message"].startswith("partial_url_failure")
+    assert "other.org/two-thing" in row["error_message"]
+    assert row["evaluated_content"] is None
+    assert row["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_url_item_falls_through_to_coverage_gate(
+    monitor, inbox_dir, db, mock_invoker
+):
+    """A URL-bearing item classified Acknowledged must NOT baseline its URLs
+    unexamined — the Acknowledged fast-path is honored only for URL-free meta
+    notes; here the un-covering response re-queues instead."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing")
+    mock_invoker.run.return_value = _success_output(
+        "**Classification:** Acknowledged\nNoted, nothing to do."
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "failed"
+    assert row["evaluated_content"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_follow_ups_from_coverage_failed_eval(
+    monitor, inbox_dir, db, mock_invoker
+):
+    """Follow-ups/build cards only fire for COMPLETED evals — acting on an
+    eval we just declared unevaluated would let dedup block the retry's
+    corrected verdict."""
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## one-thing\nOnly this one.\n\n"
+        "### Recommendation\n```yaml\naction: ADOPT\n"
+        'next_step: "Try it"\nscope: V4\n```\n' + "x" * 300
+    )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall("SELECT id FROM follow_ups")
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_fully_covered_urls_complete_normally(
+    monitor, inbox_dir, db, mock_invoker
+):
+    """Regression guard: full coverage behaves exactly as before the gate."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## 1. one-thing\nGood piece.\n\n"
+        "## 2. two-thing\nAlso solid.\n" + "x" * 300
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] == "completed"
+    assert row["evaluated_content"] is not None
+    assert "https://example.com/one-thing" in row["evaluated_content"]
+
+
+@pytest.mark.asyncio
+async def test_supersede_does_not_burn_a_retry(monitor, inbox_dir, db):
+    """A superseded pending row keeps its retry_count.
+
+    Supersession ("the user edited the file before the old snapshot
+    dispatched") is not a failure of the item — burning a retry on it walked
+    repeatedly-edited files toward the max_retries exclusion for no reason,
+    and (because the superseded row then exceeded the reuse threshold)
+    accumulated duplicate rows instead of recycling one.
+    """
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    # A stale pending row from an earlier scan of a previous file version.
+    await inbox_items.create(
+        db,
+        id="stale-pending",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall(
+        "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    # The superseded row is recycled for the fresh delta (reuse_as_pending),
+    # evaluated, and completed — ONE row, retry budget untouched.
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
+    """At max_retries-1, a supersede must not push the row over the cap.
+
+    Before the fix, supersession incremented retry_count to the cap, the row
+    stopped being reusable, and a duplicate row was created for the fresh
+    delta while the old one sat as a permanent phantom 'failure'.
+    """
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    await inbox_items.create(
+        db,
+        id="worn-pending",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    # Two genuine failures already on the clock (max_retries default is 3).
+    await inbox_items.update_status(
+        db, "worn-pending", status="pending", retry_count=2
+    )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall(
+        "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["retry_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -1977,7 +2162,10 @@ async def test_baseline_guard_survives_file_clear(
     from genesis.db.crud import inbox_items
 
     clock = _FakeClock()
-    config = InboxConfig(watch_path=inbox_dir, batch_size=1)
+    # items_per_eval=3 pins this test's original single-batch scenario (the
+    # default is now 1); the guard under test is baseline-vs-file-clear, not
+    # batch grouping.
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1, items_per_eval=3)
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
@@ -1990,10 +2178,13 @@ async def test_baseline_guard_survives_file_clear(
         "https://example.com/article-2\n"
     )
 
+    # One canned response serves BOTH evaluations in this test, so it must
+    # cover the second drop's URL (article-3) as well.
     mock_invoker.run.return_value = _success_output(
         "# Inbox Evaluation\n\n## 1. Numenta\nGood stuff.\n\n"
         "## 2. example.com/article-1\nInteresting.\n\n"
-        "## 3. example.com/article-2\nNoted.\n" + "x" * 300
+        "## 3. example.com/article-2\nNoted.\n\n"
+        "## 4. example.com/article-3\nAlso noted.\n" + "x" * 300
     )
 
     # Write file and do first evaluation
@@ -2052,8 +2243,8 @@ async def test_baseline_guard_delta_only_new_items(
     )
 
     mock_invoker.run.return_value = _success_output(
-        "# Eval\n\n## 1. Article 1\nGood.\n\n"
-        "## 2. Article 2\nNoted.\n" + "x" * 300
+        "# Eval\n\n## 1. article-1\nGood.\n\n"
+        "## 2. article-2\nNoted.\n" + "x" * 300
     )
 
     # Initial evaluation

@@ -52,11 +52,11 @@ def _parse(raw: dict) -> InboxConfig:
         response_dir=section.get("response_dir", "_genesis"),
         check_interval_seconds=int(section.get("check_interval_seconds", 1800)),
         batch_size=int(section.get("batch_size", 5)),
-        items_per_eval=int(section.get("items_per_eval", 5)),
+        items_per_eval=int(section.get("items_per_eval", 1)),
         enabled=bool(section.get("enabled", True)),
         model=str(section.get("model", "sonnet")),
         effort=str(section.get("effort", "high")),
-        timeout_s=int(section.get("timeout_s", 600)),
+        timeout_s=int(section.get("timeout_s", 1200)),
         max_retries=int(section.get("max_retries", 3)),
         recursive=bool(section.get("recursive", False)),
         evaluation_cooldown_seconds=int(

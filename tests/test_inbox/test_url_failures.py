@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from genesis.inbox.monitor import _has_url_failures
+from genesis.inbox.monitor import _has_url_failures, _uncovered_urls
 
 # ---------------------------------------------------------------------------
 # _has_url_failures — heuristic detection
@@ -74,6 +74,138 @@ class TestHasUrlFailures:
         content = "https://youtube.com/shorts/abc\nhttps://youtube.com/watch?v=def"
         response = "I could not fetch either YouTube video — SSL errors."
         assert _has_url_failures(response, content) is True
+
+
+# ---------------------------------------------------------------------------
+# _uncovered_urls — per-URL coverage check (silent-omission detection)
+# ---------------------------------------------------------------------------
+
+class TestUncoveredUrls:
+    """Silent omission is invisible to _has_url_failures (no give-up language
+    is emitted for a URL the model never mentions). _uncovered_urls closes
+    that hole: every input URL must leave SOME trace in the response."""
+
+    def test_no_urls_returns_empty(self):
+        assert _uncovered_urls("any response", "just a note") == []
+
+    def test_silently_omitted_url_detected(self):
+        content = "https://example.com/first-article https://other.org/second-piece"
+        response = (
+            "# Inbox Evaluation\n\n## first-article\n"
+            "Deep discussion of the example.com piece only.\n"
+        )
+        assert _uncovered_urls(response, content) == [
+            "https://other.org/second-piece",
+        ]
+
+    def test_full_coverage_by_slug(self):
+        content = "https://example.com/first-article https://other.org/second-piece"
+        response = (
+            "# Inbox Evaluation\n## 1. first-article\n...\n"
+            "## 2. second-piece\n...\n"
+        )
+        assert _uncovered_urls(response, content) == []
+
+    def test_platform_name_is_not_evidence_for_a_path_bearing_url(self):
+        """A platform name identifies the SITE, never WHICH item on it.
+
+        Deliberate contract change (2026-09-06, CodeRabbit finding on #1820):
+        an earlier revision accepted "the LinkedIn post" as coverage for a
+        lone linkedin.com URL. MEASURED by probe: that let a response which
+        fetched nothing and named only the platform baseline its URL — the
+        exact silent-drop class this gate exists to catch. Domain-level
+        evidence now counts only when the domain IS the identity (no path).
+        """
+        content = "https://www.linkedin.com/posts/someone_zx9qv84k"
+        response = "# Inbox Evaluation\nThe LinkedIn post argues that agents..."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_platform_name_is_not_evidence_for_a_repo_url(self):
+        content = "https://github.com/OpenBMB/VoxCPM"
+        response = "# Inbox Evaluation\nA GitHub project worth noting."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_bare_domain_url_is_covered_by_domain_evidence(self):
+        """When the URL carries no path the domain IS the identity, so
+        domain/stem evidence is genuine evidence — not a platform gesture."""
+        content = "https://voxcpm.ai"
+        response = "# Inbox Evaluation\nvoxcpm is a tokenizer-free TTS model."
+        assert _uncovered_urls(response, content) == []
+
+    def test_domain_alias_cannot_vouch_for_two_urls_on_same_domain(self):
+        # Two linkedin URLs; response covers one by slug and says "LinkedIn"
+        # generally — the alias must NOT mark the second one covered.
+        content = (
+            "https://linkedin.com/posts/a_first-post-zx9qv84k\n"
+            "https://linkedin.com/posts/b_other-topic-qq7ttv2m"
+        )
+        response = (
+            "# Inbox Evaluation\n## LinkedIn: first-post\n"
+            "Covers zx9qv84k in depth. LinkedIn content quality varies.\n"
+        )
+        uncovered = _uncovered_urls(response, content)
+        assert uncovered == ["https://linkedin.com/posts/b_other-topic-qq7ttv2m"]
+
+    def test_coverage_is_case_insensitive(self):
+        content = "https://github.com/OpenBMB/VoxCPM"
+        response = "# Inbox Evaluation\nvoxcpm is a tokenizer-free TTS model."
+        assert _uncovered_urls(response, content) == []
+
+    def test_youtube_video_id_counts_as_coverage(self):
+        content = "https://youtube.com/watch?v=dQw4w9WgXcQ"
+        response = "# Inbox Evaluation\nThe video (dQw4w9WgXcQ) demonstrates..."
+        assert _uncovered_urls(response, content) == []
+
+    def test_template_placeholder_urls_never_demand_coverage(self):
+        # A pasted API doc line like api.github.com/repos/{slug} is prose,
+        # not a fetchable URL (MEASURED: 1 such false flag in the 133-item
+        # historical corpus replay, 2026-09-06).
+        content = "Call https://api.github.com/repos/{repo_slug} to list them"
+        response = "# Inbox Evaluation\nA note about GitHub API usage."
+        assert _uncovered_urls(response, content) == []
+
+    @pytest.mark.parametrize(
+        ("content", "response"),
+        [
+            # Reproductions from the adversarial review (5/5 passed the stem
+            # rung before _GENERIC_STEM_TOKENS): incidental English words
+            # matching a shortener's domain stem or alias are NOT evidence.
+            (
+                "https://search.app/nuXmqZ9",
+                "# Inbox Evaluation\nI ran a web search to verify the claim.",
+            ),
+            (
+                "https://share.google/XyZabQ7pL",
+                "# Inbox Evaluation\nPlease share feedback on this analysis.",
+            ),
+            (
+                "https://medium.com/@someone/deep-dive-abcdefgh",
+                "# Inbox Evaluation\nMedium confidence in this assessment.",
+            ),
+            (
+                "https://read.cv/someperson",
+                "# Inbox Evaluation\nA good read overall, worth noting.",
+            ),
+            (
+                "https://news.ycombinator.com/item?id=4159",
+                "# Inbox Evaluation\nNo real news here beyond the headline.",
+            ),
+        ],
+    )
+    def test_generic_stem_words_are_not_coverage_evidence(
+        self, content, response
+    ):
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_shortener_covered_by_verbatim_source_line(self):
+        # The prompt now requires echoing each URL verbatim — the compliant
+        # form for opaque shorteners whose target is discussed by title.
+        content = "https://lnkd.in/p/eYssnmfd"
+        response = (
+            "# Inbox Evaluation\n## Some Article Title\n"
+            "**Source:** https://lnkd.in/p/eYssnmfd\nGreat piece about agents."
+        )
+        assert _uncovered_urls(response, content) == []
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +361,26 @@ class TestCountUrlFailures:
         from genesis.db.crud import inbox_items
         count = await inbox_items.count_url_failures(db, "/test/f.md")
         assert count == 0
+
+    async def test_counts_coverage_variant_messages(self, db):
+        """The storm guard must also count coverage-gate failures — their
+        error_message carries the uncovered URLs after the base prefix."""
+        from genesis.db.crud import inbox_items
+
+        now = datetime.now(UTC)
+        await inbox_items.create(
+            db, id=str(uuid.uuid4()), file_path="/test/f.md",
+            content_hash="h-cov", status="failed",
+            created_at=now.isoformat(),
+        )
+        await db.execute(
+            "UPDATE inbox_items SET error_message = "
+            "'partial_url_failure: uncovered https://x.com/a' "
+            "WHERE content_hash = 'h-cov'",
+        )
+        await db.commit()
+        count = await inbox_items.count_url_failures(db, "/test/f.md")
+        assert count == 1
 
     async def test_counts_recent_failures(self, db):
         from genesis.db.crud import inbox_items

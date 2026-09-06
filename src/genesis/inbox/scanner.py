@@ -187,9 +187,10 @@ def extract_urls(text: str) -> list[str]:
 class Item:
     """A single unit of inbox evaluation carved out of a file's delta.
 
-    ``kind`` is ``"url"`` for a line containing one or more URLs, or
-    ``"note"`` for a contiguous block of non-URL prose. ``text`` is the
-    original (un-normalized) content used for evaluation and for the
+    ``kind`` is ``"url"`` for a line containing one or more URLs — possibly
+    prefixed by the user's annotation prose from the line(s) directly above
+    it — or ``"note"`` for a standalone block of non-URL prose. ``text`` is
+    the original (un-normalized) content used for evaluation and for the
     per-item baseline; ``urls`` lists every URL found in a ``"url"`` item.
     """
 
@@ -204,11 +205,15 @@ def segment_items(delta_text: str) -> list[Item]:
     Rules:
     - A line containing >=1 URL becomes its own ``"url"`` item (a multi-URL
       line stays one item; all its URLs are listed in ``Item.urls``).
-    - A contiguous run of non-URL, non-blank lines becomes one ``"note"`` item.
-    - Blank lines separate note blocks and are not items themselves.
+    - Prose directly above a URL line (no blank line between) is the user's
+      annotation for that URL — it rides in the URL item's ``text`` so the
+      evaluator sees the stated intent with the link, and both lines enter
+      the baseline together when the item completes.
+    - A contiguous run of non-URL, non-blank lines otherwise becomes one
+      ``"note"`` item. Blank lines separate note blocks and are not items.
     - Within the delta, a URL line is de-duplicated by its tracking-normalized
-      form (the same article re-pasted with different share params → one item),
-      mirroring ``normalize_url_line`` used elsewhere for dedup.
+      form (the same article re-pasted with different share params → one item).
+      An annotation above a deduped re-paste survives as a standalone note.
 
     Order of first appearance is preserved.
     """
@@ -231,13 +236,22 @@ def segment_items(delta_text: str) -> list[Item]:
             continue
         urls = extract_urls(stripped)
         if urls:
-            # A URL line ends any pending prose block before it.
-            _flush_note()
             norm = normalize_url_line(stripped)
             if norm in seen_urls:
+                # The first occurrence already carries its own context; keep
+                # any annotation above this re-paste rather than losing it
+                # with the duplicate line.
+                _flush_note()
                 continue
             seen_urls.add(norm)
-            items.append(Item(text=stripped, kind="url", urls=urls))
+            # Adjacent prose (no blank line between) is this URL's annotation.
+            if note_buf:
+                intent = "\n".join(note_buf).strip()
+                note_buf.clear()
+                text = f"{intent}\n{stripped}" if intent else stripped
+            else:
+                text = stripped
+            items.append(Item(text=text, kind="url", urls=urls))
         else:
             note_buf.append(line)
     _flush_note()

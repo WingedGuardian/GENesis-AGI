@@ -477,7 +477,7 @@ async def count_url_failures(
     cutoff = (datetime.now(UTC) - timedelta(hours=since_hours)).isoformat()
     cursor = await db.execute(
         """SELECT COUNT(*) FROM inbox_items
-           WHERE file_path = ? AND error_message = 'partial_url_failure'
+           WHERE file_path = ? AND error_message LIKE 'partial_url_failure%'
              AND created_at > ?""",
         (file_path, cutoff),
     )

@@ -23,22 +23,8 @@ from genesis.mcp.health.settings import (
 from genesis.mcp.health_mcp import mcp
 
 # ── Fixtures ───────────────────────────────────────────────────────────
-
-
-@pytest.fixture()
-def config_dir(tmp_path: Path) -> Path:
-    """Provide a temporary config directory."""
-    return tmp_path
-
-
-@pytest.fixture(autouse=True)
-def _patch_config_dir(config_dir: Path):
-    """Redirect all config reads/writes to the temp dir."""
-    with (
-        patch("genesis.mcp.health.settings._CONFIG_DIR", config_dir),
-        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", config_dir),
-    ):
-        yield
+# config_dir + the autouse settings-isolation patch live in this directory's
+# conftest.py so EVERY test_mcp file gets isolation, not only this one.
 
 
 def _write_config(config_dir: Path, filename: str, data: dict) -> Path:

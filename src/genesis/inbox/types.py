@@ -39,11 +39,11 @@ class InboxConfig:
     # is segmented into items and grouped into batches of this size, so a
     # 16-URL drop becomes ~4 evals instead of one mega-batch. ``batch_size``
     # above is legacy (files-per-cycle) and no longer governs eval grouping.
-    items_per_eval: int = 5
+    items_per_eval: int = 1
     enabled: bool = True
     model: str = "sonnet"
     effort: str = "high"
-    timeout_s: int = 3600
+    timeout_s: int = 1200
     max_retries: int = 3
     recursive: bool = False
     # timezone removed — uses genesis.env.user_timezone()

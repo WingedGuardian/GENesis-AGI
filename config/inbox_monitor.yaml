@@ -8,16 +8,17 @@ inbox_monitor:
   response_dir: "_genesis"
   check_interval_seconds: 1800
   # items_per_eval: how many items (URLs / prose blocks) go into ONE Claude
-  # evaluation. A file's NEW content is segmented into items and grouped into
-  # batches of this size, so a 16-URL drop becomes ~4 evals (each its own
-  # Genesis-N.genesis.md), not one mega-evaluation. Default 5.
-  items_per_eval: 5
+  # evaluation. Default 1: each item gets its own evaluation, so per-URL
+  # coverage checking is exact, the evaluated baseline advances per item, and
+  # one item's depth is never diluted by its batch neighbours. Raise it to
+  # trade evaluation depth for fewer CC sessions.
+  items_per_eval: 1
   # batch_size is LEGACY (files-per-cycle) and no longer governs eval grouping;
   # items_per_eval replaces it. Kept for backward compatibility.
   batch_size: 1
   model: "sonnet"
-  effort: "medium"
-  timeout_s: 900
+  effort: "high"
+  timeout_s: 1200
   # max_retries: 3        # Max retry attempts before permanently excluding a failed item
   # recursive: false      # Set true to scan subdirectories recursively
   # timezone uses system setting from ~/.genesis/config/genesis.yaml
