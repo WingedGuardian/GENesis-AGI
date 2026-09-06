@@ -1161,13 +1161,23 @@ In bypass or auto permission mode the CC binary injects a meta message:
 > Do your work through the Bash tool wherever it can accomplish the job: read
 > files with cat, head, or sed -n, search with grep and find, and **make file
 > changes with sed, heredocs, or short scripts**, rather than using the
-> dedicated Read, Edit, or Write tools.
+> dedicated Read, Edit, or Write tools. Fall back to a dedicated tool only when
+> Bash genuinely cannot do the job.
 
 **Provenance (established, not inferred):** the text is compiled into the CC
-binary and emitted purely on permission mode (`e.bypass ? … : e.steerOnly ? …`);
-it is in no `settings.json`, `CLAUDE.md`, output-style, or agent file. Because it
-is gated on MODE (where nothing prompts, so the dedicated tools' permission value
-is gone), it is an **efficiency heuristic** — it makes no correctness claim. The
+binary; it is in no `settings.json`, `CLAUDE.md`, output-style, or agent file.
+
+**It reaches a session by three routes, not one.** The selector falls through
+the bypass flag, then the steer-only flag, then — and this is the one that
+matters — a `bashFirst` flag, which is a COHORT assignment
+(`bashFirstSessionAssignment`, resolving to forced/cohort/none) rather than a
+permission mode. **A default-mode session can therefore receive this message.**
+An earlier draft of this section said it was emitted purely on permission mode;
+that was read off a truncated transcription and is wrong.
+
+It is still an **efficiency heuristic** making no correctness claim — but that
+follows from what the message SAYS, not from where it is gated: it is phrased as
+a preference and carries its own escape hatch back to the dedicated tools. The
 same is true of the sibling `AgentTool`/workflows restriction lines: also in the
 binary (`grep -c -a -F` → 2 occurrences each), also not install config. Neither
 is install-specific; both apply to every CC user of this version.
@@ -1190,15 +1200,22 @@ Three reasons the split is correct HERE specifically (all universal to any
 Genesis clone, since the machinery is tracked):
 1. **`sed`'s silent-failure contract** above is `sed`, not this box — a
    mis-anchored edit that changes nothing, or the wrong thing, returns exit 0.
-2. **`Edit`/`Write` fire five PostToolUse hooks** wired in the tracked
+2. **`Edit`/`Write` fire five EDIT-SPECIFIC PostToolUse hooks** wired in the tracked
    `.claude/settings.json` (`edit_verify_advisory`, `file_modification_audit`,
    `edit_failure_sensor`, `subsystem_traps`, `file_context`); a `Bash` write
-   fires none of them — it bypasses the repo's own post-edit verification plane.
+   fires none of them, so the repo's own post-edit verification plane never
+   sees the change.
 3. **Heredoc writes sit in blocked-compound blast radius** — a PreToolUse block
    discards the whole call including the heredoc, silently.
-MEASURED cost of ignoring this in practice: **75.2% of realistic edit anchors in
-this repo carry a `sed` regex metacharacter** (3,678 / 4,892 removed lines ≥8
-chars over 200 commits on `src/` + `scripts/`) — the unsafe case is the common
+MEASURED cost of ignoring this in practice, **and state the dialect or the
+number means nothing**: `sed` uses BRE by default, where `+ ? | ( ) { }` are
+literal. Counting only the characters BRE actually treats as special
+(`. * [ ] ^ $ \`), **54.9% of realistic edit anchors in this repo carry one**
+(2,750 / 5,013 removed lines ≥8 chars over the last 200 non-merge commits on
+`src/` + `scripts/`; re-derivable, 2026-09-06). The same corpus scores 74.0%
+against an ERE set, which is what an earlier revision of this line reported as
+"75.2%" — a real number for the wrong dialect. Either way the unsafe case is the
+common
 one, not a tail. A "short script" that does a literal `str.replace` AND asserts
 its occurrence count is acceptable — it re-implements Edit's two checks by hand.
 

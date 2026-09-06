@@ -107,6 +107,28 @@ _CONCESSIVE = (
     "not simply",
 )
 
+# "bypass" is also the NAME of a Claude Code permission mode, and this repo
+# documents that mode. A name is not a claim: "in bypass/auto mode the binary
+# injects a meta message" says nothing about a gate failing, and no rewording
+# fixes it, because the mode is called what it is called.
+#
+# Matched at the outcome's own offset, because the qualifier FOLLOWS the word
+# here where a negator precedes it. The trailing "mode" is REQUIRED, and that
+# requirement is the whole safety of this carve-out.
+#
+# The first version of this exemption matched those two namings as PREFIXES,
+# with a comment claiming it was narrow. It was not: a prefix admits every
+# continuation, so an ordinary claim that merely begins with the same words was
+# exempted too. MEASURED against the pre-change detector: 9 constructed cases
+# went from caught to missed. The cases themselves are in the parametrized data
+# below, where this file's own rule permits them; describing them here would
+# make this comment the thing it is warning about.
+#
+# An exemption broadened from anchored to unanchored loosens a gate while
+# reading as a tightening — the failure this file exists to prevent, committed
+# inside this file.
+_MODE_NAME_RE = re.compile(r"bypass(?:/|\s+or\s+)auto\b\s*(?:permission\s+)?mode\b")
+
 # How close the two halves must be to read as one claim. A construct in one
 # paragraph and the word "bypass" three paragraphs later is not a recipe.
 _WINDOW = 240
@@ -210,15 +232,24 @@ def _recipe_hits(text: str) -> list[tuple[str, str]]:
         for m in re.finditer(re.escape(construct.lower()), low):
             window = low[max(0, m.start() - _WINDOW) : m.end() + _WINDOW]
             for outcome in _OUTCOMES:
-                at = window.find(outcome)
-                if at < 0:
-                    continue
-                lead = window[max(0, at - _NEGATION_LOOKBACK) : at]
-                for phrase in _CONCESSIVE:
-                    lead = lead.replace(phrase, " ")
-                if any(neg in lead for neg in _NEGATORS):
-                    continue  # denied, not asserted — see _NEGATORS
-                hits.append((construct, outcome))
+                # EVERY occurrence, not just the first. `find` returned one
+                # offset, so a window opening with a denied or mode-named
+                # mention ("never a bypass …", "in bypass/auto mode …") took
+                # the `continue` below and the outcome was abandoned for that
+                # construct — a real claim later in the SAME window was never
+                # examined. Fail-open, and exactly the shape a carve-out makes
+                # more likely, so the two changes belong together.
+                for om in re.finditer(re.escape(outcome), window):
+                    at = om.start()
+                    if _MODE_NAME_RE.match(window, at):
+                        continue  # a mode's NAME, not a claim — see _MODE_NAME_RE
+                    lead = window[max(0, at - _NEGATION_LOOKBACK) : at]
+                    for phrase in _CONCESSIVE:
+                        lead = lead.replace(phrase, " ")
+                    if any(neg in lead for neg in _NEGATORS):
+                        continue  # denied, not asserted — see _NEGATORS
+                    hits.append((construct, outcome))
+                    break  # one hit per (construct, outcome) window
     return hits
 
 
@@ -276,6 +307,45 @@ def test_markdown_carries_no_bypass_recipe():
         # denial and swallowed a real recipe.
         ("an ANSI-C span is not only able to bypass the gate", True),
         ("a here" + "-doc does not just bypass it, it hides the command", True),
+        # MODE NAME — "bypass" naming a CC permission mode is not a claim that
+        # anything was defeated, and this repo has to be able to document that
+        # mode. No rewording removes the collision; the mode is called this.
+        ("in bypass/auto mode the binary suggests heredocs", False),
+        ("in bypass or auto permission mode, prefer heredocs", False),
+        # …and the carve-out is NARROW, which a prefix match was NOT. Each of
+        # these was silently allowed by the first version of the exemption and
+        # caught by the detector it replaced. The trailing "mode" is what makes
+        # the naming a naming; without it the words are an ordinary claim.
+        ("a heredoc leaves the gate in bypass mode", True),
+        ("a heredoc will bypass or auto-approve the command", True),
+        ("a heredoc will bypass or automatically allow the push", True),
+        ("a heredoc flips the gate to bypass/auto and nothing runs", True),
+        ("an ANSI-C span makes the hook bypass/auto-return zero", True),
+        # A DOTTED IDENTIFIER IS NOT EXEMPT. An earlier revision skipped any
+        # outcome preceded by ".", to let a quoted gating expression stand. It
+        # applied to all ten outcomes and to markdown paths, so `state.disarm`,
+        # `cfg.defeat` and `docs/guard.bypass.md` all went quiet. The prose was
+        # reworded to describe the mechanism instead, which is what the failure
+        # message tells authors to do.
+        ("a heredoc leaves it at state.disarm forever", True),
+        ("see docs/guard.bypass.md — a heredoc is enough", True),
+        # FAIL-OPEN REGRESSION — a denied or mode-named FIRST mention used to
+        # abandon the whole outcome for that construct, so a real claim later
+        # in the same window went unexamined. Both must still flag.
+        # The denied mention is kept well clear of the real one: _NEGATION_LOOKBACK
+        # is 40 chars, so a nearer "never" would legitimately suppress the second
+        # claim too and the case would prove nothing about the first-only bug.
+        (
+            "never a bypass in the ordinary case; the detector is careful here, "
+            "yet a heredoc will bypass the gate",
+            True,
+        ),
+        # …and the MIRROR of it, which is what distinguishes "walks every
+        # occurrence" from "walks the last one". A last-occurrence-only scan
+        # passes every other case in this list, so without this pair the class
+        # would pin nothing about the traversal at all.
+        ("a heredoc will bypass the gate; in benign cases this is never a bypass", True),
+        ("in bypass/auto mode a heredoc will bypass the gate outright", True),
     ],
 )
 def test_the_detector_discriminates(prose, should_flag):
