@@ -773,7 +773,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: e425b35c 2026-08-21
+verified: 788dd9a9 2026-09-06
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -839,7 +839,53 @@ verified: e425b35c 2026-08-21
   same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
   per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
   config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
-  verify → stage), MEASURED ~5.5 min live.
+  verify → stage), MEASURED ~5.5 min live. **Bite-relay (independent capability on the
+  same daily tick):** its OWN `bite_relay_mode` lever (off/observe/live, ships off),
+  DECOUPLED from the auto-run above — it READS a structured HTTP `data_module`
+  (`pipeline` op, distinct from the SSH reasoning module) and pushes ONE owner Telegram
+  nudge when a company advances into an engaged stage ({in_conversation, interviewing,
+  offer}). Dedup is a PERMANENT per-(company, stage) `career_bite` observation (a
+  point event — `unresolved_only=False`, 365d TTL — unlike the re-emittable
+  `career_outreach_nudged` marker); observe SEEDS the ledger without nudging. Health-
+  gated on the DATA module SEPARATELY: an unhealthy/absent data bridge is a CLEAN SKIP
+  (not a job-health failure — the read service is legitimately down when the search is
+  dormant), while a read the service answered with an error IS a failure. Being a pure
+  read + owner-nudge (no CLI dispatch, no outreach send), it can run `live` while the
+  auto-run stays gated. Hardening: external company names are control-char-sanitized
+  (`strip_control_chars` — collapses newlines / Unicode line+paragraph separators /
+  zero-width+bidi) before the `parse_mode="HTML"` nudge, so a crafted name can't forge
+  or conceal notification lines; a present-but-wrong-type pipeline bucket/entry surfaces
+  as a job-health failure (distinct from a legitimately-absent stage) rather than a
+  silent "no advances"; EVERY malformed entry shape (non-dict, missing/null/blank/
+  whitespace-only id, or an id that is not `str`/`int` — `bool`, `float` and containers
+  are all rejected, since `9` vs `9.0` and a repr-ordered container both re-key the
+  marker) is decided by ONE validation choke point (`_bite_entry_id`), whose
+  normalization is hash-identical to `_bite_hash` so routing
+  through it never changes an existing marker's dedup identity; the
+  deliver-before-`_record_bite` crash-window is closed by a PERMANENT
+  `outreach_history` delivered-`(signal_type, topic)` lookup (`delivered_topic_exists`,
+  unwindowed — the outreach pipeline's own 24h dedup is NOT longer than this job's daily
+  retry interval, so the `REJECTED` branch is belt-and-suspenders, not the recovery), and
+  a recovery consumes no nudge-cap slot since it sends nothing and reports as ONE counted
+  summary line (never one detail per entry — `details` feeds job-health's unbounded
+  `last_error`); the per-tick scan ceiling
+  is a ROTATING window (contiguous windows, one whole ceiling per tick-DAY, no persistent
+  cursor) so an oversized response bounds work without permanently excluding the tail —
+  full coverage in `ceil(len/ceiling)` CONSECUTIVE tick-days, with a missed tick or the
+  live nudge cap deferring entries to a later cycle rather than dropping them; and the
+  auto-run no-progress warning excludes bite activity, since the two
+  sub-capabilities are independent. That independence is ENFORCED in `gather`: each
+  branch is awaited under its own guard, so a raise in one becomes that branch's
+  `errors=1` result and the other still runs — and because that also removes the raise
+  from the runner's own `except`, the exception rides out on `CareerOutreachResult.raised`
+  so the runner still emits the ERROR-severity `career_outreach_monitor.failed` event with
+  its traceback (an isolated crash must not go quiet in the ERROR stream). Misconfig fails LOUD, not
+  silent: an invalid `bite_relay_mode` fails **closed to `off`** (its `observe` seeds
+  permanent markers, so degrading to `observe` like the auto-run would silently suppress
+  the backlog); an ENABLED lever whose `data_module` is unset/unresolvable records a
+  job-health **failure** (not a green no-op); and pause is rechecked **before** the
+  pipeline read AND again after the data-module health probe (itself an awaited external
+  call), not only between nudges.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

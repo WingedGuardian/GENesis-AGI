@@ -134,23 +134,25 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         pass
     try:
         result = await sched._career_outreach_monitor.gather()
-        if result.mode == "off":
-            # Disabled-by-config: record NOTHING (neither success nor failure) so the
-            # actuator stays invisible in job-health on installs that never enabled it
-            # (surplus convention — cf. _guard.SKIP). An unreachable bridge is NOT this
-            # case — it surfaces errors=1 and is recorded as a failure below.
+        if result.mode == "off" and result.bite_mode == "off":
+            # BOTH levers disabled-by-config: record NOTHING (neither success nor
+            # failure) so the actuator stays invisible in job-health on installs that
+            # never enabled it (surplus convention — cf. _guard.SKIP). If EITHER
+            # sub-capability ran, its health is recorded below. An unreachable bridge is
+            # NOT this case — it surfaces errors=1 and is recorded as a failure below.
             return
         if (
             result.auto_runs
             or result.nudged
             or result.verify_failed
+            or result.bites
             or result.errors
         ):
             logger.info(
-                "Career outreach: mode=%s auto_runs=%d working=%d nudged=%d "
-                "verify_failed=%d errors=%d",
-                result.mode, result.auto_runs, result.drafts_working,
-                result.nudged, result.verify_failed, result.errors,
+                "Career outreach: mode=%s bite_mode=%s auto_runs=%d working=%d nudged=%d "
+                "verify_failed=%d bites=%d errors=%d",
+                result.mode, result.bite_mode, result.auto_runs, result.drafts_working,
+                result.nudged, result.verify_failed, result.bites, result.errors,
             )
         # No-progress visibility: the engine drafted but its own accuracy gate refused
         # every attempt (verify_failed) and nothing staged/nudged. verify_failed is
@@ -161,6 +163,11 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         # occurred) the failure is recorded below — a "verifier refused every attempt"
         # warning would be a second, misleading diagnosis. Cross-tick threshold
         # alerting (durable counters) is a tracked follow-up.
+        # NOTE: `result.bites` is deliberately EXCLUDED from this suppression. The
+        # bite-relay is an INDEPENDENT sub-capability (a pipeline read), unrelated to the
+        # auto-run's verifier; a successful bite must not mask a persistently-broken
+        # auto-run verifier. This warning is about auto-run progress only (auto_runs /
+        # nudged). Bites still appear in the info-log above.
         if (
             result.verify_failed
             and not result.errors
@@ -189,6 +196,19 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         # a dispatch errored; an unhealthy remote (health_ok=False, errors=0) is a
         # clean skip and records success.
         if result.errors:
+            # A sub-capability that RAISED was caught inside gather() so the sibling
+            # capability could still run — which also means it never reaches the `except`
+            # below, the only emitter of the ERROR-severity `career_outreach_monitor.failed`
+            # event carrying the traceback. Re-emit it here so an isolated crash is still
+            # visible in the ERROR stream (dashboard / health_errors), not just in
+            # job-health's last_error and the log.
+            if result.raised is not None and sched._event_bus:
+                await sched._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "career_outreach_monitor.failed",
+                    "Career outreach sub-capability raised (isolated from its sibling)",
+                    **failure_details(exc=result.raised),
+                )
             record_failure(
                 "career_outreach_monitor", "; ".join(result.details) or "dispatch error"
             )
