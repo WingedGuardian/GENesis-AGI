@@ -331,6 +331,60 @@ def test_a_credential_split_by_the_input_cap_is_not_written_out(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not available")
+def test_an_overcap_capture_keeps_the_newest_output(tmp_path):
+    """When the cap bites, the log must keep the NEWEST bytes — the dying words.
+
+    The newest rows sit at the BOTTOM of the capture, and the whole point of
+    this log is why the session died. A cap taken from the top keeps the oldest
+    scrollback, discards the dying words, and stamps a marker claiming the
+    opposite ("earlier output dropped"). So three assertions: the last line
+    printed survives, the first line printed is gone, and the marker is there.
+
+    The cap (700) is far above the newest lines' byte count and far below the
+    oldest filler's, so the verdict cannot hinge on pane geometry (trailing
+    blank rows cost at most a few bytes against a wide margin).
+    """
+    home = tmp_path / "home"
+    (home / ".genesis" / "logs").mkdir(parents=True)
+    fake_claude = tmp_path / "fakeclaude.sh"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        # ~2,800 bytes of numbered old filler, then the dying words.
+        "for i in $(seq -w 0 49); do printf 'OLD-%s %s\\n' \"$i\" "
+        "\"$(printf 'x%.0s' $(seq 1 50))\"; done\n"
+        "echo 'DYINGWORDS123'\n"
+        "exit 0\n"
+    )
+    fake_claude.chmod(0o755)
+
+    sock = f"ccexit-newest-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    inner = (
+        f"HOME={home} '{fake_claude}'; __ec=$?; "
+        f"HOME={home} GENESIS_CC_TAIL_CAP=700 '{_CAPTURE}' 7 $__ec >/dev/null 2>&1; "
+        "exit $__ec"
+    )
+    try:
+        subprocess.run(
+            ["tmux", "-L", sock, "new-session", "-d", "-s", "t",
+             "-x", "200", "-y", "12", inner],
+            check=True, capture_output=True, text=True,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            r = subprocess.run(["tmux", "-L", sock, "has-session", "-t", "t"], capture_output=True)
+            if r.returncode != 0:
+                break
+            time.sleep(0.2)
+    finally:
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    body = _log_for(home, "7").read_text()
+    assert "DYINGWORDS123" in body, f"the dying words were truncated away:\n{body}"
+    assert "OLD-00 " not in body, f"oldest scrollback survived an over-cap capture:\n{body}"
+    assert "earlier output dropped" in body, f"truncation marker missing:\n{body}"
+
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not available")
 def test_tail_is_withheld_when_scrubber_is_unavailable(tmp_path):
     """Fail CLOSED: with no usable scrubber the tail is WITHHELD, never raw.
 

@@ -60,7 +60,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 - **Long terminal lines are redacted as one line, not as fragments.** A
   terminal stores a line longer than the window is wide as several rows.
   The capture now reassembles them before scanning, so a value that happens to
-  straddle the right edge is treated as the single value it is.
+  straddle the right edge is treated as the single value it is. And when a
+  capture exceeds its byte cap, the newest output is what survives — the cap
+  used to keep the oldest scrollback and discard the dying words the log
+  exists to record.
 - **The scrubber runs on any supported Python.** Its patterns use only
   widely-available regex syntax, so the capture path works with whatever
   `python3` an install provides rather than requiring a recent one — it is

@@ -254,6 +254,18 @@ class TestScrubRedactsBareProviderTokens:
     def test_jwt(self):
         assert R in s.scrub("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0." + "h" * 40)
 
+    def test_jwt_with_empty_claims_payload(self):
+        # `{}` encodes to `e30` — a valid signed JWT whose second segment does
+        # not begin `eyJ`. Requiring that prefix on the payload missed the
+        # whole bearer token.
+        assert R in s.scrub("Bearer eyJhbGciOiJIUzI1NiJ9.e30." + "h" * 43)
+
+    def test_jwt_with_whitespace_prefixed_payload(self):
+        # A JSON payload with leading whitespace base64-encodes to a segment
+        # starting `IH`/`ICJ` — still a valid JWT the payload-prefix assumption
+        # let through.
+        assert R in s.scrub("eyJhbGciOiJIUzI1NiJ9.IHsiYSI6MX0." + "h" * 43)
+
     def test_bare_token_alone_on_its_own_line(self):
         # The captured-output shape: no label, no assignment, just the value
         # surrounded by prose the tool printed around it.
@@ -468,10 +480,29 @@ class TestEnvAssignmentAnchorKeepsBaselineRecall:
     def test_empty_quoted_value_is_not_a_secret(self):
         # The dominant historical false positive: an ordinary code constant
         # whose NAME contains a secret word and whose value is empty.
+        # MEASURED (PR #1580 body): all 16 assignments the value floor stopped
+        # matching over 779,899 tracked lines were EMPTY — so the floor's whole
+        # measured precision gain lives at length zero, and the exclusion stops
+        # there.
         assert R not in s.scrub('_OAUTH_SRC=""')
 
-    def test_trivial_quoted_value_is_not_a_secret(self):
-        assert R not in s.scrub('API_MODE="on"')
+    def test_short_quoted_value_is_still_redacted(self):
+        # A quoted value under a secret-hint name is redacted at ANY non-zero
+        # length: the parent redacted `API_KEY="abc"` and a length floor above
+        # 1 quietly traded that recall for a precision gain the corpus
+        # measurement attributes entirely to empty values. Real short secrets
+        # exist (a 4-digit PIN, a test token); over-redacting a short config
+        # word is this module's cheap direction.
+        assert R in s.scrub('API_KEY="abc"')
+        assert R in s.scrub("AUTH_TOKEN='12'")
+
+    def test_short_quoted_value_with_spaces_is_redacted(self):
+        assert R in s.scrub("API_KEY='a b'")
+
+    def test_short_unquoted_value_is_left_alone(self):
+        # The unquoted floor stays at 6: with no closing delimiter a short
+        # unquoted word (`API_MODE=on`) is far likelier config than credential.
+        assert R not in s.scrub("API_MODE=on")
 
 
 class TestScrubIsLinearAcrossInputShapes:
@@ -817,6 +848,35 @@ class TestPemPrivateKeysAreRedacted:
         kept = sum(1 for ln in out.splitlines() if "KEEPME" in ln)
         assert kept == 6, f"only {kept}/6 decorated diagnostic lines survived:\n{out}"
 
+    def test_a_serialized_block_on_one_line_is_redacted(self):
+        """A PEM block serialized onto ONE line — a JSON log field, an escaped
+        env value — carries BOTH markers in that line, and neither ends it.
+
+        Both-markers-in-one-line is a closed test no mention can satisfy by
+        accident in the shapes the mention pins cover (a grep hit names one
+        marker per line), so redacting the whole line is safe and line-granular
+        — the documented safe direction for a one-line block.
+        """
+        text = (
+            "before\n"
+            '{"key":"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg\\n'
+            '-----END PRIVATE KEY-----"}\n'
+            "after"
+        )
+        out = s.scrub(text)
+        assert "MIIEvQIBADANBg" not in out, f"one-line key body survived:\n{out}"
+        assert "before" in out and "after" in out
+
+    def test_a_one_line_mention_of_both_markers_is_the_accepted_cost(self):
+        """Pinned as a DECISION: a single line naming both markers (a grep -e
+        pair, a doc sentence) is redacted. One diagnostic line lost is the
+        cheap direction; a serialized real key persisted is not."""
+        out = s.scrub(
+            "grep -e '-----BEGIN RSA PRIVATE KEY-----'"
+            " -e '-----END RSA PRIVATE KEY-----' dump.log"
+        )
+        assert out == R
+
     def test_a_certificate_is_not_a_private_key(self):
         """Only PRIVATE KEY armour redacts. A certificate is public material,
         and treating it as a key would blank ordinary TLS diagnostics."""
@@ -869,7 +929,10 @@ class TestPatternsStayPortable:
         import."""
         import re as _re
 
-        possessive = _re.compile(r"(?:\*\+|\?\+|\{\d+(?:,\d*)?\}\+)")
+        # `\+\+` covers the possessive one-or-more (`x++`), which the original
+        # detector missed: `[A-Z0-9_]++` would have passed this guard and then
+        # raised `re.error` at import on Python < 3.11, withholding every tail.
+        possessive = _re.compile(r"(?:\*\+|\?\+|\+\+|\{\d+(?:,\d*)?\}\+)")
         offenders = {
             name: possessive.findall(obj.pattern)
             for name, obj in vars(s).items()
@@ -885,6 +948,7 @@ class TestPatternsStayPortable:
         compiled regexes, so it is worth proving it SEES one."""
         import re as _re
 
-        possessive = _re.compile(r"(?:\*\+|\?\+|\{\d+(?:,\d*)?\}\+)")
+        possessive = _re.compile(r"(?:\*\+|\?\+|\+\+|\{\d+(?:,\d*)?\}\+)")
         assert possessive.search(r"(?P<key>_*+[A-Z]{2,512}+)")
+        assert possessive.search(r"(?P<key>[A-Z0-9_]++)")  # possessive one-or-more
         assert not possessive.search(r"(?P<key>_{0,4}[A-Z]{2,512})")

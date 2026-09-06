@@ -110,17 +110,20 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
             # total: a real tail stays height*width (~40KB) and the cap bites
             # only a pathological geometry.
             #
-            # When the cap DOES bite, the trailing PARTIAL line is dropped
-            # rather than handed on. A byte cut lands anywhere, and several
-            # patterns need a terminator that may sit just past it — a URL
-            # credential is recognised by its `@host`, so `postgres://u:pw`
-            # with the cut before the `@` matches nothing and the password
-            # would be written out. Cutting on a line boundary means no pattern
-            # is ever shown half a value: the over-long line is dropped whole.
+            # When the cap DOES bite, keep the NEWEST bytes: the newest rows
+            # sit at the BOTTOM of the capture, and the dying words are the
+            # whole point of this log — a cap taken from the top kept the
+            # oldest scrollback and discarded them (while the marker claimed
+            # the opposite). The leading PARTIAL line is dropped rather than
+            # handed on: a byte cut lands anywhere, and several patterns need
+            # their whole value on one line — a URL credential is recognised
+            # by its `://u:pw@host` shape, so a line cut mid-URL could show a
+            # pattern half a value. Cutting on a line boundary means the
+            # over-long line is dropped whole, never half-shown.
             _cap="${GENESIS_CC_TAIL_CAP:-262144}"
             _feed=$(printf '%s\n' "$_tail")
             if [ "$(printf '%s' "$_feed" | wc -c)" -gt "$_cap" ]; then
-                _feed=$(printf '%s' "$_feed" | head -c "$_cap" | sed '$d')
+                _feed=$(printf '%s' "$_feed" | tail -c "$_cap" | sed '1d')
                 _truncated=1
             else
                 _truncated=0

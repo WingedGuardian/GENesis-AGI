@@ -100,7 +100,19 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
     # 350/1587/5319ms, so a full 256KB capture crossed the scrub timeout and
     # the entire diagnostic was withheld. 4096 is far above any real JWT
     # segment (a signature is 43 chars, a fat payload a few hundred).
-    r"|eyJ[A-Za-z0-9_\-]{8,4096}\.eyJ[A-Za-z0-9_\-]{8,4096}\.[A-Za-z0-9_\-]{8,4096}"  # JWT
+    # The PAYLOAD segment is a generic base64url run, floor 2: requiring it to
+    # start `eyJ` assumed the JSON claims always encode to that prefix, and an
+    # empty claims object (`{}` → `e30`) or leading JSON whitespace (` {` →
+    # `IH…`) are valid signed JWTs that assumption let through whole. Only the
+    # HEADER keeps the `eyJ` anchor — it is what bounds the match starts, so
+    # the failed-candidate cost profile is unchanged (MEASURED after the
+    # change: 256KB of repeated failed candidates ≈ 0.3s, linear). Precision
+    # residual, measured the same way as the pattern trades above: a dotted
+    # token like `eyJournalfile.name.extension123` (8+ char base64url runs
+    # around both dots) now redacts; over 825,937 tracked lines the only line
+    # the widened payload segment newly matches is this comment's own example,
+    # and over-redaction is this module's cheap direction.
+    r"|eyJ[A-Za-z0-9_\-]{8,4096}\.[A-Za-z0-9_\-]{2,4096}\.[A-Za-z0-9_\-]{8,4096}"  # JWT
     r"|csk-[A-Za-z0-9_\-]{20,}"    # Cerebras (the shipping unanchored sk- caught
                                    # these as a SUBSTRING accident; the anchor
                                    # made that a miss, so name them explicitly)
@@ -195,11 +207,19 @@ def _redact_pem_blocks(text: str) -> str:
     i, n = 0, len(lines)
     while i < n:
         line = lines[i]
+        if _PEM_BEGIN_LINE.search(line) and _PEM_END_LINE.search(line):
+            # A whole block on ONE line — plain armour, or serialized with
+            # trailing syntax (a JSON log field, an escaped env value), where
+            # neither marker ends the physical line and the mention test above
+            # would wave the key through. BOTH markers in one line is a closed
+            # test a mention does not meet in the pinned shapes (a grep hit or
+            # prose names one marker per line); the rare line that names both
+            # (`grep -e BEGIN… -e END…`) is lost whole — the cheap direction,
+            # pinned as a decision in the tests.
+            out.append(_REDACTED)
+            i += 1
+            continue
         if _armour_line(_PEM_BEGIN_LINE, line):
-            if _armour_line(_PEM_END_LINE, line):
-                out.append(_REDACTED)  # a whole block written on one line
-                i += 1
-                continue
             end = next(
                 (j for j in range(i + 1, n) if _armour_line(_PEM_END_LINE, lines[j])),
                 None,
@@ -306,8 +326,14 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # .env-style UPPER_SNAKE=value. The bare pattern over-redacts (PYTHONPATH=…,
 # EDITOR=…), so it is gated to keys whose NAME signals a secret. A quoted value
 # is captured whole (so a multi-word secret like KEY='a b c' is not left with
-# its tail exposed after the first space); an unquoted value is a 6+ run of
-# non-space so short non-secret values aren't touched.
+# its tail exposed after the first space) and redacted at ANY non-zero length —
+# only an EMPTY quoted value is passed through, because the corpus measurement
+# behind the value floor (16 newly-unmatched assignments over 779,899 tracked
+# lines) found every one of them empty: the floor's whole measured precision
+# gain lives at length zero, and a higher floor quietly stopped redacting the
+# short quoted secrets the parent caught (`API_KEY="abc"`, a 4-digit PIN). An
+# unquoted value keeps the 6+ floor: with no closing delimiter, a short bare
+# word (`API_MODE=on`) is far likelier config than credential.
 # LINEAR BY CONSTRUCTION, on every character class — a perf property measured
 # on one input shape is not a perf property (the first fix here benchmarked an
 # all-alphanumeric run, the exact class its anchor excluded, and was quadratic
@@ -338,8 +364,8 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 #     real key observed on an install: 31 chars.
 #
 # The lookbehind admits a LEADING underscore for recall (`_MY_SECRET=…`), and
-# the quoted-value floor is what removes the historical noise: an empty or
-# trivial quoted value (`_OAUTH_SRC=""`) is not a secret.
+# the empty-quoted exclusion is what removes the historical noise: an empty
+# quoted value (`_OAUTH_SRC=""`) is not a secret.
 #
 # The bound it replaces was a FAIL-OPEN, and a subtle one: capping the key did
 # not merely miss long names, it slid the match FORWARD past the name's prefix,
@@ -349,7 +375,7 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 _ENV_ASSIGNMENT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?P<key>_{0,4}[A-Z][A-Z0-9_]{2,512})"
     r"(?P<sep>\s*=\s*)"
-    r"(?P<val>\"[^\"]{6,}\"|'[^']{6,}'|[^\s]{6,})",
+    r"(?P<val>\"[^\"]+\"|'[^']+'|[^\s]{6,})",
 )
 _SECRET_KEY_HINT = re.compile(
     r"KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|API|CRED|PRIVATE", re.IGNORECASE
