@@ -134,6 +134,14 @@ class Segment:
     redirects: list[str] = field(
         default_factory=list
     )  # expansion redirect targets excised from argv
+    #: HOW a nested segment was reached — "" at the top level, "script" through an
+    #: interpreter's inline script (`bash -c '…'`), "substitution" through `$(…)`
+    #: or backticks. The two nesting kinds mean different things to a refusal: an
+    #: inline script IS the content of its wrapper (the wrapper is not a separate
+    #: step), while a substitution's command runs IN ADDITION to the host command
+    #: carrying it. Innermost kind wins through deeper recursion, so a command
+    #: substituted inside an inline script still reads "substitution".
+    via: str = ""
 
 
 def _redirect_operator_len(command: str, i: int) -> int | None:
@@ -806,15 +814,15 @@ def analyze(command: str) -> list[Segment]:
         out.append(
             Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
         )
-        nested = []
+        nested: list[tuple[str, str]] = []
         if exe in _NESTED:
             script = _nested_script(argv)
             if script:
-                nested.append(script)
+                nested.append((script, "script"))
         # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
         # expansion redirect target, so a nested command stays visible to the guards.
-        nested.extend(_substitutions(raw))
-        for script in nested:
+        nested.extend((s, "substitution") for s in _substitutions(raw))
+        for script, kind in nested:
             for inner in analyze(script):
                 out.append(
                     Segment(
@@ -824,6 +832,10 @@ def analyze(command: str) -> list[Segment]:
                         raw=inner.raw,
                         depth=inner.depth + 1,
                         redirects=inner.redirects,
+                        # Innermost kind wins: a segment already tagged by a deeper
+                        # recursion keeps its own tag; only this level's direct
+                        # children (via == "") take this branch's kind.
+                        via=inner.via or kind,
                     )
                 )
     return out

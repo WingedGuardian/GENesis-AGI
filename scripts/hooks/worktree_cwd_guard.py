@@ -40,6 +40,24 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, run_guard, tool_input  # noqa: E402
 
+try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import remember as _remember_command  # noqa: E402
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _remember_command(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort this
+        module's load — and CC reads a non-2 exit as a NON-blocking error, so the
+        relocation this hook exists to refuse would proceed. A missing note must
+        never become a missing block.
+        """
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in. See ``_remember_command``."""
+
+
 # Matches 'git worktree remove' with optional flags
 _WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")
 
@@ -278,6 +296,7 @@ def main() -> int:
     try:
         # Handlers operate on the tool-input dict (command / action fields).
         data = tool_input(read_payload())
+        _remember_command(data.get("command") if isinstance(data, dict) else None)
 
         # Determine mode from CLI args
         if "--exit-worktree" in sys.argv:
@@ -291,5 +310,19 @@ def main() -> int:
     return 0
 
 
+def _main_with_note() -> int:
+    """``main`` plus the discarded-write footnote on any refusal.
+
+    Wrapping HERE rather than inside ``run_guard`` covers all five of this guard's
+    ``return 2`` sites with one insertion, while leaving the shared fail-closed
+    wrapper — imported by 19 files — untouched. A crash still reaches ``run_guard``
+    and still fails CLOSED; it simply carries no note, which is the safe direction.
+    """
+    code = main()
+    if code == 2:
+        _warn_discarded()
+    return code
+
+
 if __name__ == "__main__":
-    run_guard(main, "worktree_cwd_guard")
+    run_guard(_main_with_note, "worktree_cwd_guard")

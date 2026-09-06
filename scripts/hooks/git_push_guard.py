@@ -118,6 +118,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hook_input import field, read_payload, run_guard  # noqa: E402
 
+try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import prompt_note as _prompt_discarded  # noqa: E402
+    from discarded_write import remember as _remember_command  # noqa: E402
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _remember_command(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort this
+        module's load — and CC reads a non-2 exit as a NON-blocking error, so the
+        push or merge this hook exists to gate would proceed unchecked. A missing
+        note must never become a missing block.
+        """
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in. See ``_remember_command``."""
+
+    def _prompt_discarded(_command=None):
+        """No-op stand-in returning no note. See ``_remember_command``."""
+        return None
+
+
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
 # advisory to its documented default — never crash this module at load time.
@@ -5937,7 +5960,16 @@ def _ask(reason: str) -> int:
     permission prompt and runs the tool only on explicit approval — a gate the
     agent cannot self-satisfy. Verified to render in a wrapped child session
     2026-07-27.
+
+    The collateral note goes INTO ``reason``, not to stderr: the operator is reading
+    a dialog, and stderr is not part of it. Declining drops every other step in the
+    command too, which is exactly the fact a "block the push?" prompt hides. Appended
+    defensively — ``_prompt_discarded`` is the no-op stand-in when the cosmetic helper
+    is unimportable, and a note must never be able to cost this gate its prompt.
     """
+    extra = _prompt_discarded()
+    if extra:
+        reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {
@@ -6077,6 +6109,7 @@ def main() -> int:
         cmd = field(payload, "command")
         if not cmd:
             return 0
+        _remember_command(cmd)
 
         # Analyze the command into the segments it actually executes (wrappers
         # like sudo/env and /path/to/git stripped, nested `bash -c` recursed,
@@ -7090,6 +7123,20 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     return 0 if failures == 0 else 1
 
 
+def _main_with_note() -> int:
+    """``main`` plus the discarded-write footnote on any refusal.
+
+    Wrapping HERE rather than inside ``run_guard`` covers all of this guard's
+    ``return 2`` sites with one insertion, while leaving the shared fail-closed
+    wrapper — imported by 19 files — untouched. A crash still reaches ``run_guard``
+    and still fails CLOSED; it simply carries no note, which is the safe direction.
+    """
+    code = main()
+    if code == 2:
+        _warn_discarded()
+    return code
+
+
 if __name__ == "__main__":
     # Report mode: `git_push_guard.py --check-pr <N> [--repo OWNER/REPO]` — the
     # canonical pre-merge check (same functions as enforcement). No hook payload.
@@ -7104,4 +7151,4 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
-    run_guard(main, "git_push_guard")
+    run_guard(_main_with_note, "git_push_guard")
