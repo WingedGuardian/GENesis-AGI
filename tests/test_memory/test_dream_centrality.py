@@ -135,3 +135,74 @@ async def test_centrality_skips_zero_scores(phase_kwargs):
     cursor = await db.execute("SELECT memory_id FROM centrality_cache")
     rows = [r[0] for r in await cursor.fetchall()]
     assert rows == ["bridge"]
+
+
+async def test_unavailable_graph_keeps_the_existing_cache(phase_kwargs):
+    """"Store unreachable" must NOT masquerade as "no bridges exist".
+
+    The fail-open chain this pins shut: centrality_scores returning [] on an
+    unavailable backend read as an empty result, the recompute wiped
+    centrality_cache, the importance shield computed no threshold, and
+    bridge-node protection silently disappeared. Unavailability now raises,
+    and the recompute must leave the previous cache STANDING.
+    """
+    from genesis.memory.graph import GraphUnavailableError
+
+    db = phase_kwargs["db"]
+    await db.execute(
+        "INSERT INTO centrality_cache (memory_id, centrality_score, computed_at) "
+        "VALUES ('mem-prior', 0.7, '2026-01-01T00:00:00+00:00')"
+    )
+    await db.commit()
+
+    with patch(
+        "genesis.memory.graph.centrality_scores",
+        new_callable=AsyncMock,
+        side_effect=GraphUnavailableError("backend down"),
+    ):
+        report = await run_centrality_recompute(**phase_kwargs)
+
+    assert report.get("graph_unavailable") is True
+    cursor = await db.execute("SELECT COUNT(*) FROM centrality_cache")
+    assert (await cursor.fetchone())[0] == 1, (
+        "an unavailable graph wiped the shield's threshold population"
+    )
+
+
+async def test_empty_graph_still_supersedes_the_cache(phase_kwargs):
+    """CONTROL for the fix above: a REAL empty result (zero bridges) must keep
+    clearing stale rows — the unavailability fix must not turn every empty
+    run into a keep."""
+    db = phase_kwargs["db"]
+    await db.execute(
+        "INSERT INTO centrality_cache (memory_id, centrality_score, computed_at) "
+        "VALUES ('mem-stale', 0.7, '2026-01-01T00:00:00+00:00')"
+    )
+    await db.commit()
+
+    with patch(
+        "genesis.memory.graph.centrality_scores",
+        new_callable=AsyncMock,
+        return_value=[],
+    ):
+        report = await run_centrality_recompute(**phase_kwargs)
+
+    assert not report.get("graph_unavailable")
+    cursor = await db.execute("SELECT COUNT(*) FROM centrality_cache")
+    assert (await cursor.fetchone())[0] == 0
+
+
+async def test_centrality_scores_raises_when_networkx_absent(db):
+    """The producer half of the contract: unavailability is a typed raise,
+    never an empty list wearing "no bridges" clothing."""
+    from genesis.memory import graph as graph_mod
+    from genesis.memory import graphstore_nx
+
+    # Patch where the flag LIVES (the NetworkX store), not where it used to.
+    # graph.py deliberately does not re-export it: a patch aimed at the facade
+    # would silently no-op, which is worse than failing loudly.
+    with (
+        patch.object(graphstore_nx, "_NX_AVAILABLE", False),
+        pytest.raises(graph_mod.GraphUnavailableError),
+    ):
+        await graph_mod.centrality_scores(db, top_n=None)

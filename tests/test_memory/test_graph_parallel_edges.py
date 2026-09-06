@@ -59,6 +59,12 @@ async def _make_db(links):
     db = await aiosqlite.connect(":memory:")
     db.row_factory = aiosqlite.Row
     await db.execute(_SCHEMA)
+    # The loader applies recall's visibility predicate; empty here, so the
+    # parallel-edge expectations below are unaffected.
+    await db.execute(
+        "CREATE TABLE memory_metadata ("
+        " memory_id TEXT PRIMARY KEY, invalid_at TEXT, deprecated INTEGER)"
+    )
     for src, tgt, link_type, strength in links:
         await db.execute(
             "INSERT INTO memory_links VALUES (?, ?, ?, ?, '2026-09-02')",
@@ -103,9 +109,13 @@ async def parallel_db():
 
 async def test_parallel_edges_both_survive_the_load(parallel_db):
     """Both typed A→B rows must exist in the loaded graph, not just one."""
-    from genesis.memory.graph import _ensure_graph
+    from genesis.memory.graphstore_nx import NetworkxGraphStore
 
-    graph = await _ensure_graph(parallel_db)
+    # The NetworkX LOADER is what this asserts on (edge count in the built
+    # projection), so it addresses that store directly rather than the facade —
+    # which owns a production singleton and, after the seam, may hold a backend
+    # with no MultiDiGraph at all.
+    graph = await NetworkxGraphStore()._ensure_graph(parallel_db)
     # 5 rows in, 5 edges out. A DiGraph collapses each multi-type pair to one
     # edge and yields 3.
     assert graph.number_of_edges() == 5

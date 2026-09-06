@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Graph-enriched recall no longer surfaces memories that recall itself
+  hides.** When a memory was returned, Genesis also showed its graph
+  neighbours — but that traversal never applied the visibility filter the rest
+  of recall uses, so consolidated-away and expired memories were presented as
+  live context. They are now filtered out of the graph entirely. On this
+  install that changed the neighbour list for roughly a quarter of enriched
+  results, and 6.5% of them turned out to have had neighbours that were
+  *entirely* hidden memories.
+
 - **The session charter now lists every open ledger item, not just the oldest
   six.** The ledger is a curated list of one-line to-dos, and the old window
   meant a session with more than six open items never saw a newly added one in
@@ -78,6 +87,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A graph backend that cannot answer no longer erases the shield's memory.**
+  "The graph store is unreachable" and "no bridge memories exist" used to look
+  identical — an empty answer — so a missing library or unreachable backend
+  made the nightly centrality pass wipe its cache, and the importance shield
+  then protected nothing until the backend came back AND the pass re-ran.
+  Unavailability is now its own loud signal: the pass keeps the previous
+  bridge-node population standing and says why, while a genuinely empty graph
+  still supersedes stale rows. Two writers also stopped leaving the cached
+  graph stale: superseding a memory now tells the graph about the new
+  succession edge, and the integrity sweep that purges a dead memory's edges
+  now invalidates the cache it just made wrong.
 - **A schema rebuild no longer destroys columns a private fork added.** The
   ledger table rebuild (widening a constraint means rebuilding the table on
   SQLite) copied a hardcoded upstream column list and then dropped the old

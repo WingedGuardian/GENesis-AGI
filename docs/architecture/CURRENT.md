@@ -206,6 +206,47 @@ any live flip. Centrality persistence widened from top-500 to all-nonzero
 (`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
 
+**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
+run through a `GraphStore` protocol with one implementation today,
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+`memory/graph.py` is a facade that owns the single production instance and the
+backend choice. The contract, and the reason the seam exists: a read that cannot
+REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
+means genuinely empty. Collapsing the two is how a missing NetworkX import once
+disarmed the shield above (an empty result read as "no bridges", wiping
+`centrality_cache`). CI runs no type checker, so conformance is asserted by a
+test rather than the annotation. Cache freshness is cross-process: besides the
+`invalidate_graph_cache()` flag that every `memory_links` writer flips (13 call
+sites, 9 modules), the store compares SQLite's `PRAGMA data_version`, so a write
+committed by ANOTHER process is observed — previously the server served a
+projection predating any dream-job write until it happened to write a link
+itself. The token is stamped BEFORE the load on purpose: in WAL the read
+snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
+projection that is missing a mid-load commit (MEASURED 2026-09-06). Prepared for
+the graph-DB adoption (issue #1641), where a server-backed engine becomes
+another `GraphStore` with no reader touched.
+
+Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
+`memory_links` writers, while the visibility predicate below reads
+`memory_metadata`. Deprecation is covered incidentally (its writers rewire
+links); TIME-DRIVEN expiry is not — a future `invalid_at` arrives with no write
+event, so a quiet process serves the memory until an unrelated rebuild
+(measured exposure: 114 memories, 4 with edges).
+
+**Traversal is visibility-filtered (2026-09-06)** — every graph backend, and the
+recursive-CTE fallback, apply the SAME predicate normal recall applies:
+bitemporally-expired (`invalid_at <= now`) or `deprecated != 0` memories are
+absent from the graph, root and neighbours alike. Previously `traverse()`
+applied neither, and its consumer (`mcp/memory/core.py`) emits raw memory_ids
+into `graph_neighbors` with no hydration — so the model was shown, as live
+context, memories `search_ranked` and `graph_expansion` deliberately hide.
+MEASURED on the live graph: 11.3% of edges, 23.8% of top-5 slices, and 6.5% of
+roots whose neighbours were ENTIRELY hidden memories. The predicate deliberately
+ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
+rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
+the graph `centrality_scores` runs on, hence the shield's bridge-node
+population.
+
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
 (`memory_links.copy_external_links`) so they don't dangle on the soft-deleted
