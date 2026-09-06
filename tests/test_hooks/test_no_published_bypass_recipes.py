@@ -127,7 +127,7 @@ _CONCESSIVE = (
 # An exemption broadened from anchored to unanchored loosens a gate while
 # reading as a tightening — the failure this file exists to prevent, committed
 # inside this file.
-_MODE_NAME_RE = re.compile(r"bypass(?:/|\s+or\s+)auto\b\s*(?:permission\s+)?mode\b")
+_MODE_NAME_RE = re.compile(r"\bbypass(?:/|\s+or\s+)auto\b\s*(?:permission\s+)?mode\b")
 
 # How close the two halves must be to read as one claim. A construct in one
 # paragraph and the word "bypass" three paragraphs later is not a recipe.
@@ -321,6 +321,10 @@ def test_markdown_carries_no_bypass_recipe():
         ("a heredoc will bypass or automatically allow the push", True),
         ("a heredoc flips the gate to bypass/auto and nothing runs", True),
         ("an ANSI-C span makes the hook bypass/auto-return zero", True),
+        # The outcome scan finds "bypass" INSIDE a longer word too, and the
+        # exemption is matched at that offset — so without a leading boundary
+        # the naming could be claimed by a word that merely ends in it.
+        ("a heredoc turns on nobypass/auto mode handling", True),
         # A DOTTED IDENTIFIER IS NOT EXEMPT. An earlier revision skipped any
         # outcome preceded by ".", to let a quoted gating expression stand. It
         # applied to all ten outcomes and to markdown paths, so `state.disarm`,
