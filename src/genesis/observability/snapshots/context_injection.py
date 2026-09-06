@@ -146,6 +146,31 @@ def _safe_path(path: object) -> str:
     return _PATH_UNSAFE.sub("?", str(path))
 
 
+def _safe_session_id(value: object) -> str:
+    """Escape a session directory name that will be used as a KEY.
+
+    Deliberately separate from :func:`_safe_path`, which is a DISPLAY escape and
+    is lossy on purpose — it maps every disallowed character to a single ``?``.
+    That is right for prose and wrong for an identifier: ``sess\\nx`` and
+    ``sess\\tx`` both render ``sess?x``, and this value is deduplicated with
+    ``dict.fromkeys`` to produce ``filing_sessions``. MEASURED before this
+    existed: the two names collide, so two affected sessions counted as one and
+    one of them was omitted from the restart list the operator acts on.
+
+    A cap or an escape that merges two identities into one is the same defect
+    whichever end it happens at, and it is worse than a visibly mangled name
+    because the undercount still LOOKS like an exact total.
+
+    Injective by construction: everything outside the allowed set becomes
+    ``\\UXXXXXXXX``, and the backslash introducer is itself outside that set, so
+    no escaped form can be produced by any other input. Session directories are
+    UUIDs in practice, so this escapes nothing on the normal path.
+    """
+    return "".join(
+        c if c.isalnum() or c in "._~+-" else f"\\U{ord(c):08X}" for c in str(value)
+    )
+
+
 def _safe_text(text: object) -> str:
     """Escape PROSE read off disk on its way into an observation.
 
@@ -374,7 +399,9 @@ class InjectionHealth:
                 "size": size,
                 "age_h": age_h,
                 "producer": producer,
-                "session": _safe_path(path.parent.parent.name),
+                # KEY, not display — this is deduplicated into `filing_sessions`
+                # and drives the restart list, so it needs an injective escape.
+                "session": _safe_session_id(path.parent.parent.name),
             }
         )
 

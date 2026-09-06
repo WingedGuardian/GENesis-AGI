@@ -1671,3 +1671,46 @@ def test_absent_last_prompt_time_files_stay_silent_in_the_freshness_probe(tmp_pa
     h = _collect(projects)
     assert not h.errors, h.errors
     assert not ci.derive_findings(h)
+
+
+def test_two_session_names_that_differ_only_in_escaped_bytes_stay_distinct(tmp_path):
+    """The stored session id is a KEY, so its escape must be injective.
+
+    `_safe_path` is a DISPLAY escape and lossy on purpose — every disallowed
+    character becomes a single `?`. Applied to the identifier, `sess\\nx` and
+    `sess\\tx` both rendered `sess?x`, and `filing_session_ids` deduplicates with
+    `dict.fromkeys`, so two affected sessions counted as ONE and one of them was
+    dropped from the restart list the operator acts on.
+
+    Worse than a mangled name, because the undercount still reads as an exact
+    total. Same defect as a truncated key merging two identities, one mechanism
+    over.
+    """
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\nx", name="hook-1-stdout.txt",
+          body=b"## Session Configuration\n\npayload")
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\tx", name="hook-2-stdout.txt",
+          body=b"## Session Configuration\n\npayload")
+    h = _collect(tmp_path)
+
+    ids = h.filing_session_ids
+    assert len(ids) == 2, f"two distinct sessions collapsed to one: {ids}"
+    assert h.filing_sessions == 2, "the reported total under-counts"
+    # Still safe: the escape must not reintroduce what the display escape removed.
+    for sid in ids:
+        assert not any(c in sid for c in "\n\r\t"), sid
+
+
+def test_the_injective_escape_cannot_be_forged_by_a_literal_escape_sequence(tmp_path):
+    """A name that already LOOKS escaped must not collide with the real thing.
+
+    Injectivity only holds if the escape introducer is itself escaped —
+    otherwise a session literally named `sess\\U0000000Ax` maps onto the encoding
+    of `sess<newline>x`, which is the collision this fix removes, reachable by
+    anyone who can name a directory.
+    """
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\nx", name="hook-1-stdout.txt",
+          body=b"## Session Configuration\n\npayload")
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\\U0000000Ax",
+          name="hook-2-stdout.txt", body=b"## Session Configuration\n\npayload")
+    h = _collect(tmp_path)
+    assert len(h.filing_session_ids) == 2, h.filing_session_ids
