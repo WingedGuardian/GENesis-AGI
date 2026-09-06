@@ -572,6 +572,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Related memories now show how strongly they are actually connected, and the same
+  question gives the same answer twice.** When a memory could be reached by more than
+  one route of equal length, the graph walk credited it to whichever route it happened
+  to look at first and reported THAT connection's strength — often the weaker one. It
+  now uses the strongest connection that actually reaches it. Because strength is also
+  what orders these results before the top few are shown, an understated memory sank in
+  that ordering and could drop out of view.
+  Measured against the live graph: of every connection the walk computes, 6.4% were
+  understated, affecting half of all lookups — but most of those never reach you, so
+  the number that matters is smaller. Of the related memories actually shown, the set
+  changes on 1.9% of lookups and their order on 8.2%. The same change also removes a
+  second oddity: which related memories you saw could shift between runs on identical
+  data, purely from database row order — 3.1% of lookups before, none after. Nothing
+  changes about which memories are *reachable*, and no connection is ever credited with
+  a lower strength than before.
 - **Campaign names stored before the control-character fix are now cleaned at
   startup.** Names have been sanitized at the write boundary since the previous
   release, so nothing new lands malformed, but rows written earlier were never
