@@ -424,6 +424,39 @@ class TestRunUnderDeployLock:
 
 
 class TestRunUnderReceiptScope:
+    def test_receipt_refused_with_an_exclusive_hold(self, station):
+        """A `validated` receipt claims the recorded SHA was SERVING for the whole
+        run. The SHA is read before the command, and an exclusive hold is the writer
+        mode — it permits a command that moves the checkout, after which the receipt
+        names the old SHA. A false claim in the ledger built to make the claim
+        trustworthy (CodeRabbit Major, 2026-09-06)."""
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--exclusive", "--receipt", "--", "true"],
+            env=station["env"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        assert "requires a SHARED hold" in r.stderr
+        assert _receipts(station["env"]) == []
+
+    def test_receipts_write_into_a_directory_that_does_not_exist_yet(self, station, tmp_path):
+        """Append mode raises when the parent is missing and the appender only WARNS,
+        so the row would vanish with a stderr line nobody reads — in the ledger that
+        is the whole point of the feature. A validation hold writes no state file, so
+        nothing else creates the directory for it."""
+        env = dict(station["env"])
+        env["GENESIS_DEPLOY_RECEIPTS"] = str(tmp_path / "fresh" / "nested" / "receipts.jsonl")
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        rows = _receipts(env)
+        assert [row["status"] for row in rows] == ["validated"]
+
     def test_receipt_refused_from_a_worktree_copy(self, station, tmp_path):
         """--receipt's SHA claim is about the SERVING tree (architect SF4): a
         worktree copy recording its branch HEAD as 'validated' would falsify

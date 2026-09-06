@@ -74,6 +74,13 @@ acquire_deploy_lock_sh() { _acquire_deploy_lock -s "$1"; }
 #   disappearing (a silently missing receipt reads as "nothing happened").
 append_deploy_receipt() {
     local status="$1" sha="$2" dpath="$3" note="${4:-}"
+    # Make the write self-sufficient: append mode raises FileNotFoundError when the
+    # parent directory is absent, and this function only WARNS on failure — so the
+    # row would be dropped with a stderr line nobody reads. The deploy path happens
+    # to mkdir ~/.genesis earlier via its state write, but a validation hold writes
+    # no state, and an operator-set GENESIS_DEPLOY_RECEIPTS can name a fresh
+    # directory. The ledger is the point of #1699 (CodeRabbit Minor, 2026-09-06).
+    mkdir -p "$(dirname "$GENESIS_DEPLOY_RECEIPTS")" 2>/dev/null || true
     if ! RECEIPT_OUT="$GENESIS_DEPLOY_RECEIPTS" RECEIPT_STATUS="$status" \
          RECEIPT_SHA="$sha" RECEIPT_PATH="$dpath" RECEIPT_NOTE="$note" \
          python3 - <<'PY'

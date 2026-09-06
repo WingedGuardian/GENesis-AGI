@@ -65,6 +65,18 @@ esac
 # worktree branch's HEAD as "validated" while the server serves main (architect
 # SF4). Running FROM a worktree is fine; sourcing the SHA from one is not.
 if [ "$RECEIPT" -eq 1 ]; then
+    # A `validated` receipt claims "this SHA was the serving tree for the whole
+    # run". The SHA is read BEFORE the command, and an EXCLUSIVE hold is precisely
+    # the writer mode — it permits a command that moves the checkout, after which
+    # the receipt would name the OLD SHA. That is not a weaker claim, it is a false
+    # one, in the ledger built to make the claim trustworthy (CodeRabbit Major,
+    # 2026-09-06). A validation holds SHARED; there is no honest exclusive receipt.
+    if [ "$MODE" != "sh" ]; then
+        echo "ERROR: --receipt requires a SHARED hold (--shared, the default)." >&2
+        echo "       An exclusive hold may move the checkout under the run, so the" >&2
+        echo "       recorded SHA would not be the one that was served." >&2
+        exit 1
+    fi
     if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
        [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
         echo "ERROR: --receipt refused from a worktree copy — the recorded SHA must be" >&2
