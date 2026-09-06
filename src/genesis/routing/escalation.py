@@ -106,6 +106,23 @@ class ProviderEscalation:
                 state["trip_count"] = 0
                 state["first_trip_at"] = None
                 state["escalated"] = False
+                # RETIRE THE DURABLE CLOCK TOO. Resetting only the in-memory
+                # window left the boundary half-drawn: a prior unresolved
+                # `provider_failure` row survives the gap, `skip_if_duplicate`
+                # then suppresses the new incident's row, and
+                # `notify_provider_if_due` measures the outage from the OLD
+                # row's `created_at` — reporting a duration that spans the very
+                # gap this re-anchor just declared meaningless. The comment
+                # above used to present that as a feature ("the durable clock is
+                # untouched"); it is the same fabricated span the reset exists
+                # to prevent, arriving by the other path (CodeRabbit Major, #1632).
+                #
+                # Recovery already resolves this row unconditionally, so a row
+                # that SURVIVES the gap means recovery was never observed. The
+                # note says superseded rather than recovered, because nothing
+                # here witnessed the provider come back — an operator reading
+                # the resolved row must not infer one.
+                self._supersede_open_incident(provider, gap_s)
         state["last_trip_at"] = now.isoformat()
 
         state["trip_count"] += 1
@@ -247,8 +264,45 @@ class ProviderEscalation:
                 exc_info=True,
             )
 
-    async def _resolve_observation(self, provider: str) -> None:
-        """Resolve the lingering provider_failure observation on recovery.
+    def _supersede_open_incident(self, provider: str, gap_s: float) -> None:
+        """Close a prior incident's durable row when a gap starts a new one.
+
+        Sync, and dispatched exactly like `record_recovery`'s resolve: the
+        re-anchor runs on the sync trip path, so a caller with no running loop
+        (a unit test) must not raise here. Skipping the resolve in that case is
+        the same trade `record_recovery` already makes — the row self-heals on
+        the next recovery, and a crash on the routing hot path would be worse.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "_supersede_open_incident('%s'): no running loop; skipping resolve",
+                provider,
+            )
+            return
+        tracked_task(
+            self._resolve_observation(
+                provider,
+                reason=(
+                    f"superseded: provider '{provider}' was silent for "
+                    f"{gap_s / 3600:.0f}h, so this trip starts a new incident. "
+                    f"Recovery was never observed — this row was retired, not resolved."
+                ),
+            ),
+            name=f"escalation-supersede-{provider}",
+            event_bus=self._event_bus,
+            subsystem=Subsystem.ROUTING,
+        )
+
+    async def _resolve_observation(self, provider: str, *, reason: str = "") -> None:
+        """Resolve the lingering provider_failure observation.
+
+        ``reason`` overrides the recovery wording for the SUPERSEDE path (a gap
+        large enough to start a new incident). The DB action is identical — the
+        row closes either way — and the distinction lives in
+        ``resolution_notes``, which is what an operator reads afterwards to
+        understand why the row went away without the provider coming back.
 
         Keyed on the deterministic per-provider content_hash, so only THIS
         provider's row resolves — a different, still-down provider's row is
@@ -291,9 +345,8 @@ class ProviderEscalation:
                     source="routing",
                     content_hash=content_hash,
                     resolved_at=self._clock().isoformat(),
-                    resolution_notes=(
-                        f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
-                    ),
+                    resolution_notes=reason
+                    or f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)",
                 )
             if resolved:
                 logger.info(

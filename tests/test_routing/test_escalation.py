@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -857,6 +858,77 @@ class TestTripWindowReanchor:
         assert state["trip_count"] == 1, "the stale count must not carry over"
         assert state["first_trip_at"] == t["now"].isoformat()
         assert state["first_trip_at"] != first_anchor
+
+
+    async def test_a_gap_retires_the_previous_incidents_durable_clock(
+        self, empty_db, event_bus
+    ):
+        """The boundary must close the DURABLE clock too, not just the window.
+
+        Resetting only the in-memory counters left the boundary half-drawn: the
+        prior incident's unresolved `provider_failure` row survives the gap,
+        `skip_if_duplicate` then suppresses the new incident's row, and
+        `notify_provider_if_due` measures the outage from the OLD row's
+        `created_at` — reporting a duration spanning the very gap the re-anchor
+        just declared meaningless.
+
+        Recovery resolves that row unconditionally, so a row surviving the gap
+        means recovery was never observed. Hence "superseded", not "recovered":
+        the note must not let an operator infer the provider came back.
+        """
+        from datetime import timedelta
+
+        from genesis.db.crud import observations
+
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+
+        # Incident 1: escalate to a durable row.
+        for _ in range(_TRIP_THRESHOLD):
+            await esc._on_event(_make_event("prov-boundary"))
+        await asyncio.sleep(0)  # let the deferred create land
+        rows = await observations.unresolved_by_hash(
+            empty_db,
+            source="routing",
+            content_hash=ProviderEscalation._provider_content_hash("prov-boundary"),
+            limit=10,
+        )
+        assert len(rows) == 1, f"incident 1 should leave one unresolved row: {rows}"
+
+        # A gap wide enough to be a NEW incident.
+        t["now"] += timedelta(hours=25)
+        await esc._on_event(_make_event("prov-boundary"))
+        # The supersede resolves TWO rows, so one tick is not enough — poll the
+        # condition with a bounded deadline rather than sleeping a guessed span.
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if not await observations.unresolved_by_hash(
+                empty_db,
+                source="routing",
+                content_hash=ProviderEscalation._provider_content_hash("prov-boundary"),
+                limit=10,
+            ):
+                break
+
+        still_open = await observations.unresolved_by_hash(
+            empty_db,
+            source="routing",
+            content_hash=ProviderEscalation._provider_content_hash("prov-boundary"),
+            limit=10,
+        )
+        assert still_open == [], (
+            "the prior incident's clock must be retired, or the new incident "
+            f"reports a duration spanning the gap: {still_open}"
+        )
+
+        cur = await empty_db.execute(
+            "SELECT resolution_notes FROM observations WHERE type = 'provider_failure'"
+        )
+        notes = [r[0] for r in await cur.fetchall()]
+        assert notes and all("superseded" in (n or "") for n in notes), notes
+        assert not any("recovered" in (n or "") for n in notes), (
+            "nothing observed the provider recover — the note must not imply it"
+        )
 
     async def test_backoff_scale_gaps_never_reanchor(self, empty_db, event_bus):
         """Gaps a real continuing outage produces (backoff cap 30min/4h plus
