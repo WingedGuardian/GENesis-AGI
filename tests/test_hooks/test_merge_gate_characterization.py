@@ -262,10 +262,11 @@ _PIN_RECEIPTS_BODY = (
     "CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-28\n"
     "CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, "
     "check_cc_running_versions.sh clean, sign-off recorded\n"
-    # These cases assert an ALLOW, so the body must satisfy every body-reading gate,
-    # not just the pin one — the E2E obligation (§8.12) reads the same body and
-    # fails closed without a declaration. A case whose subject is the pin gate must
-    # not start failing for an unrelated missing line.
+    # Kept, but no longer load-bearing: it dated from when the E2E reader (§8.12)
+    # blocked on a body with no declaration, so a pin case would have failed for an
+    # unrelated missing line. That reader is advisory since 2026-09-06 and can no
+    # longer steal this allow. The line stays because these cases assert an ALLOW
+    # and a body that answers every body-reading gate keeps the subject unambiguous.
     "E2E: none — pin bump only, no runtime surface to verify\n"
 )
 
@@ -1093,6 +1094,28 @@ _CASES: list[tuple[str, object, int, str]] = [
         ),
         0,
         "",
+    ),
+    # "Advisory" has to mean the merge arm CONTINUES INTO the blocking gates, not
+    # merely that it exits 0 when everything downstream is already green — which is
+    # all the five cases above can prove, since they run with every other gate
+    # passing. The blocking version `return 2`'d here, so every later check was
+    # skipped for exactly this population; if a future edit "tidies" the advisory
+    # branch with an early `return 0`, Codex-at-head freshness, the TOCTOU head
+    # binding and both finding scans go silently unenforced on every PR that lacks
+    # an E2E line, and the cases above stay green. This is the same shape as the
+    # `if False:` mutation measured on the blocking version (see the comment above),
+    # one gate further on. So: undeclared body AND a stale Codex review — the
+    # DOWNSTREAM gate must still be the thing that decides. (Kimi P2, 2026-09-06.)
+    (
+        "e2e_advisory_does_not_short_circuit_downstream_gates",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            reviews=_reviews_jsonl(STALE),
+        ),
+        2,
+        "has not reviewed the current head",
     ),
     (
         "pin_unchanged_allows_through_main",

@@ -4907,8 +4907,13 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
     nothing blocks:
       * body UNREADABLE → reported undeclared. An unread body is an unanswered
         question, not a pass — the row will still be opened post-merge.
-      * createdAt UNREADABLE → reported undeclared, naming the cause, rather than
-        assuming the pre-convention exemption.
+      * createdAt UNREADABLE, parser LOADED → reported undeclared, naming the
+        cause, rather than assuming the pre-convention exemption.
+      * createdAt UNREADABLE *and* parser MISSING → neither the exemption nor the
+        stripping can be established, so this returns whatever the bare presence
+        scan below finds: a body carrying an ``E2E:`` line is reported declared
+        (degraded), one without it undeclared. Stating that exception here because
+        the line above read as unconditional and is not (Kimi P3, 2026-09-06).
       * parser module MISSING → the body is still scanned for a bare ``E2E:``
         line and a NOTE says the comment/fence stripping was unavailable.
 
@@ -6709,8 +6714,15 @@ def main() -> int:
                 # What WILL close the obligation is a durable row: a follow-on PR
                 # (issue #1718, half B) teaches the repo-pulse worker to open one
                 # per merged PR, auto-closed with the reason recorded when the diff
-                # is documentation-only. **UNBUILT as of this commit** — 0 of the 5
-                # repo_pulse modules contain it. Until it lands, this NOTE is the
+                # is documentation-only. **UNBUILT as of this commit** — MEASURED as
+                # zero occurrences of `parse_e2e`, `e2e_declaration` or the row's
+                # dedup key anywhere under src/, and repo_pulse_gh.PR_FIELDS still
+                # lacks the `createdAt` the lane needs. (Stated that way on purpose:
+                # the earlier phrasing counted "repo_pulse modules", a denominator
+                # three reviewers agreed on and none of us had measured — it is 4 or
+                # 6 depending on whether you count the crud and scripts modules. A
+                # grep for the thing itself does not depend on how you count.)
+                # Until it lands, this NOTE is the
                 # only thing that remembers, which is a deliberate and tracked gap,
                 # not a covered one. Say so rather than implying coverage: the
                 # measured miss rate the block was justified by is unmitigated in

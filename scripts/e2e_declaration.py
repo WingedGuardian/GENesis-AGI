@@ -370,20 +370,25 @@ def is_pre_cutoff(created_at: str | None) -> bool:
         return False
 
 
-#: What the gate prints when a body has no usable declaration. Names BOTH valid
-#: forms and the §8.13 seam, so an author reading the block knows that `none` is a
-#: real option AND that it does not end the obligation.
+#: What the advisory prints when a body has no usable declaration. Names BOTH
+#: valid forms and the §8.13 seam, so an author reading the NOTE knows that `none`
+#: is a real option AND that it does not end the obligation. Nothing here is
+#: enforced — which raises the bar on this text rather than lowering it: an
+#: advisory earns its reading or gets skipped.
 GUIDANCE = (
     "Add an E2E: line to the PR body — one of:\n"
     f"  {MARKER}: <one-line plan for the post-merge verification>\n"
     f"  {MARKER}: none — <reason there is no runtime surface to verify>\n"
-    # A CONCRETE example, not only the bracketed template: an author blocked by
-    # this gate needs a line they can copy, and `test_every_example_in_the_
-    # guidance_passes_the_parser` runs every concrete example here through the
-    # parser so the gate can never again prescribe a remedy it would refuse.
+    # A CONCRETE example, not only the bracketed template: an author reading this
+    # needs a line they can copy, and `test_every_example_in_the_guidance_passes_
+    # the_parser` runs every concrete example here through the parser so this text
+    # can never prescribe a remedy the parser would refuse. That test predates the
+    # advisory downgrade and outlives it: the examples were WORSE than useless when
+    # the reader rejected its own printed remedy, and are still the whole value now
+    # that nothing forces anyone to read them.
     # BOTH forms get a concrete, copyable example. Offering one only for `none`
-    # meant the single line a blocked author could copy was the one that creates NO
-    # obligation — on a gate whose purpose is creating them (Kimi P3, 2026-09-06).
+    # meant the single copyable line was the one that creates NO obligation — in
+    # text whose purpose is prompting them (Kimi P3, 2026-09-06).
     f"For example:  {MARKER}: restart genesis-server and confirm /api/genesis/health answers 200\n"
     f"         or:  {MARKER}: none — docs only, no runtime surface\n"
     "`none` is a legitimate answer for a docs/prose PR. Leaving the line out does "
