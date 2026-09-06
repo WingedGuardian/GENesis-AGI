@@ -135,12 +135,25 @@ def test_entitlement_403_is_not_quota():
 
 
 def test_entitlement_markers_outrank_quota_keywords():
-    # Order matters: these all carry a quota keyword too ("subscription",
-    # "plan", "limit"). Entitlement is checked FIRST, so it wins.
+    # PRECEDENCE. Only these two actually contest the ordering: each contains a
+    # member of _QUOTA_KEYWORDS ("subscription", "plan"), so with the checks in
+    # the other order the quota arm would win and return QUOTA_EXHAUSTED. This
+    # is the property the fix exists for, and it is what makes the test bite.
     for msg in (
-        "tier_not_allowed",
         "This model is not available in your subscription tier",
         "Your plan does not have access to this model",
+    ):
+        assert classify_error(403, msg) == ErrorCategory.NOT_ENTITLED, msg
+
+
+def test_entitlement_markers_match_without_any_quota_keyword():
+    # MARKER PRESENCE, a weaker and separate property. Neither string contains a
+    # quota keyword, so ordering is irrelevant to them — without the entitlement
+    # markers they would fall through to PERMANENT, never QUOTA_EXHAUSTED.
+    # Kept apart from the precedence test above because grouping them together
+    # let a comment claim all four contested the ordering when only two did.
+    for msg in (
+        "tier_not_allowed",
         "You are not authorized to use this model",
     ):
         assert classify_error(403, msg) == ErrorCategory.NOT_ENTITLED, msg

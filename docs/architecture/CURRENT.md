@@ -1707,7 +1707,7 @@ verified: ee9ebf85c 2026-09-05
   like from outside. The 403-on-use half of that is now classified in its own
   right: `NOT_ENTITLED` (`retry.py` `_ENTITLEMENT_MARKERS`, checked BEFORE
   `_QUOTA_KEYWORDS` because an entitlement message names the plan/tier/
-  subscription it lacks and three of those words are quota keywords). It takes
+  subscription it lacks, and two of those words are themselves quota keywords). It takes
   one behaviour from each neighbour — fail-fast like PERMANENT, so a dead
   provider cannot spend the chain's aggregate `max_total_s` before the walk
   reaches a working one; the 4h cap like QUOTA_EXHAUSTED, since an entitlement

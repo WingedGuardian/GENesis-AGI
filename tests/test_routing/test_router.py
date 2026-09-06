@@ -675,8 +675,12 @@ async def test_entitlement_403_fails_fast_and_chain_reaches_a_working_provider(
     assert result.success is True
     assert result.provider_used == "free-2"
     assert result.fallback_used is True
-    # The breaker recorded it (unlike RATE_LIMITED/BAD_REQUEST) and holds the
-    # long cap, so the next call skips the dead provider outright.
+    # The breaker RECORDED it — unlike RATE_LIMITED/BAD_REQUEST, which are
+    # deliberately not provider-health signals and record nothing. That is what
+    # the assertion below proves, and it is all it proves: one walk records one
+    # failure against a threshold of 3, so the provider is NOT yet held out.
+    # What the recorded category buys is the cap it will carry when the third
+    # failure does open the breaker (4h, not 30m).
     cb = breakers.get("free-1")
     assert cb.last_failure_category == ErrorCategory.NOT_ENTITLED
 

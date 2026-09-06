@@ -20,8 +20,8 @@ _QUOTA_KEYWORDS = frozenset({
 # A 403 that means "your tier may not use this model" — checked BEFORE
 # _QUOTA_KEYWORDS, because the two vocabularies overlap and quota would
 # otherwise win: an entitlement message naturally names the thing you do not
-# have ("subscription", "plan", "tier"), and three of those words are quota
-# keywords. Order is the whole fix; see ErrorCategory.NOT_ENTITLED for why the
+# have ("subscription", "plan", "tier"), and two of those three — "subscription"
+# and "plan" — are themselves quota keywords. Order is the whole fix; see ErrorCategory.NOT_ENTITLED for why the
 # distinction has to exist at all.
 #
 # Provenance, because these are matched against live vendor prose. The first
