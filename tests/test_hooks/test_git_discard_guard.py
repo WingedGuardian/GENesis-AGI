@@ -582,3 +582,296 @@ def test_no_additional_context_when_nothing_snapshotted(repo, snap_log, monkeypa
     )
     assert _gd.main() == 0
     assert capsys.readouterr().out == ""
+
+
+# ── whole-tree rewind: a LOUD NOTE, never a block ────────────────────────────
+# Origin 2026-08-31: `git checkout <commit> -- .` reverted two already-merged
+# PRs. The broad pathspec matches every tracked path, so the command rewrites the
+# WHOLE worktree to that commit; the reversion then sits inside the author's own
+# diff looking deliberate. The first was found by luck, the second only by a
+# second, different check.
+#
+# It is a NOTE and not a block on purpose, and these tests pin that: `checkout`
+# is a snapshot verb, so the pre-command tree IS recoverable, and this module's
+# admission test for a block is UNRECOVERABILITY (clean, submodule-recursion).
+# What failed was noticing, not recovering — the generic snapshot note fires on
+# every checkout and never said "you just rewound the tree".
+
+
+def _rewind_ctx(cmd: str, repo: Path, monkeypatch, capsys) -> str:
+    """Run the guard and return its additionalContext (empty string if silent)."""
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(repo)}
+    )
+    assert _gd.main() == 0, "the rewind path must NEVER block — it is advisory"
+    out = capsys.readouterr().out
+    if not out.strip():
+        return ""
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_acceptance_the_2026_08_31_incident_shape_is_named(repo, snap_log, monkeypatch, capsys):
+    """The replay: if it does not fire on the command that actually caused the
+    incident, it does not ship."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
+    assert "WHOLE-TREE REWIND" in ctx
+    assert old in ctx, "the note must name the commit being rewound to"
+    # It must say what the command DOES, not merely that a snapshot exists — the
+    # generic note already said that on 2026-08-31 and the reversion still shipped.
+    assert "every tracked path" in ctx
+    assert "looking deliberate" in ctx
+    # …and scoped honestly. The predicate is deliberately generous (any operand
+    # ending in `/`), so it also fires on `git checkout main -- tests/`, which
+    # does NOT touch the whole tree. An unconditional "rewrites EVERY tracked
+    # path" would be false for those firings — in a module whose entire ethos is
+    # not over-claiming, and immediately before a recovery instruction premised
+    # on a whole-tree rewind.
+    assert "UNDER THE PATHSPEC YOU GAVE" in ctx
+    # And point at the conflict-aware alternatives that fail loudly instead.
+    for safe in ("merge --squash", "cherry-pick", "apply --3way"):
+        assert safe in ctx
+
+
+@pytest.mark.parametrize(
+    "cmd_t,label",
+    [
+        ("git checkout {old} -- .", "the incident shape"),
+        ("git checkout {old} .", "no -- separator"),
+        ("git checkout {old} :/", "magic repo-root pathspec"),
+        ("git checkout {old} -- src/", "a directory operand"),
+        ("git restore --source={old} .", "restore, attached source"),
+        ("git restore -s {old} .", "restore, separated source"),
+        ("git read-tree -u {old}", "read-tree -u: whole tree, no pathspec at all"),
+    ],
+)
+def test_rewind_shapes_fire(cmd_t, label, repo, snap_log, monkeypatch, capsys):
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(cmd_t.format(old=old), repo, monkeypatch, capsys)
+    assert "WHOLE-TREE REWIND" in ctx, f"should fire: {label}"
+
+
+@pytest.mark.parametrize(
+    "cmd_t,label",
+    [
+        ("git checkout -- tracked.py", "plain local discard of one file"),
+        ("git checkout .", "THE common local discard — first operand is a pathspec"),
+        ("git checkout src/", "directory local discard"),
+        ("git checkout HEAD -- .", "discard back to where I already am"),
+        ("git checkout @ -- .", "@ is a HEAD alias"),
+        ("git checkout feature", "branch switch, no pathspec"),
+        ("git restore .", "restore reads the INDEX with no --source"),
+        ("git read-tree {old}", "read-tree without -u touches only the index"),
+        ("git status", "not a rewrite at all"),
+    ],
+)
+def test_ordinary_work_stays_quiet(cmd_t, label, repo, snap_log, monkeypatch, capsys):
+    """A note that fires on the everyday discard gets ignored, and then it is
+    worth nothing on the day it matters."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(cmd_t.format(old=old), repo, monkeypatch, capsys)
+    assert "WHOLE-TREE REWIND" not in ctx, f"must stay quiet: {label}"
+
+
+def test_the_rewind_path_never_blocks(repo, snap_log, monkeypatch, capsys):
+    """The design contract this change must not break: for the RECOVERABLE verbs
+    the hook is advisory and never exits non-zero. A rewind is recoverable — the
+    snapshot runs first — so it warns and allows."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": f"git checkout {old} -- ."}, "cwd": str(repo)},
+    )
+    assert _gd.main() == 0
+
+
+def test_the_recovery_command_in_the_note_ACTUALLY_WORKS(repo, snap_log, monkeypatch, capsys):
+    """EXECUTE the recovery command against the post-rewind state.
+
+    This is the test that matters, and its absence is what let a bad one ship.
+    The first version of this note recommended `git stash apply --index <sha>`,
+    and a test that merely string-matched that command was green — while the
+    command itself, run for real, exits 1 and writes CONFLICT MARKERS into the
+    file the user is trying to rescue. A whole-tree rewind leaves every tracked
+    path staged-modified, which is exactly what `stash apply` refuses to merge
+    into.
+
+    So: perform a real rewind, pull the command out of the note, run it, and
+    assert the pre-command content came back. Nothing weaker can distinguish a
+    usable recovery instruction from a harmful one.
+    """
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "tracked.py").write_text("MY-UNCOMMITTED-WORK\n")
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": f"git checkout {old} -- ."}, "cwd": str(repo)},
+    )
+    assert _gd.main() == 0
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    rewind_line = next(line for line in ctx.splitlines() if "WHOLE-TREE REWIND" in line)
+
+    # Perform the destruction the note describes.
+    _git(repo, "checkout", old, "--", ".")
+    assert (repo / "tracked.py").read_text() == "orig\n", "the rewind must have happened"
+
+    # Extract the recommended command verbatim and run it.
+    snap = _rows(snap_log)[-1]["sha"]
+    assert f"git checkout {snap[:12]} -- ." in rewind_line, (
+        "the note must recommend the restore-from-snapshot form"
+    )
+    assert "git stash apply" not in rewind_line.split("NOT `git stash apply`")[0], (
+        "it must not RECOMMEND stash apply — that form conflicts here"
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", snap[:12], "--", "."],
+        check=True,
+        capture_output=True,
+        env=_GIT_ENV,
+    )
+    assert (repo / "tracked.py").read_text() == "MY-UNCOMMITTED-WORK\n", (
+        "the recovery command the note gives must actually restore the work"
+    )
+
+
+def test_the_note_warns_against_the_command_that_does_not_work(repo, snap_log, monkeypatch, capsys):
+    """`git stash apply` is the obvious thing to reach for and it makes this
+    situation worse, so the note says so rather than staying silent."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
+    line = next(x for x in ctx.splitlines() if "WHOLE-TREE REWIND" in x)
+    assert "NOT `git stash apply`" in line
+    assert "conflict markers" in line
+
+
+# ── the tripwire: recurrence must be COUNTABLE, not argued ───────────────────
+# The owner's decision (2026-09-06) was "loud note now, block if it recurs". That
+# only means something if recurrence can be measured, so every match writes a
+# flag to the snapshot log.
+
+
+def test_a_rewind_is_flagged_in_the_snapshot_log(repo, snap_log, monkeypatch, capsys):
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
+    assert _rows(snap_log)[-1].get("tree_rewind") is True
+
+
+def test_an_ordinary_discard_is_not_flagged(repo, snap_log, monkeypatch, capsys):
+    _rewind_ctx("git checkout -- tracked.py", repo, monkeypatch, capsys)
+    row = _rows(snap_log)[-1]
+    assert "tree_rewind" not in row, "the flag must mean something when present"
+
+
+def test_the_log_row_stays_metadata_only(repo, snap_log, monkeypatch, capsys):
+    """The row deliberately carries no command text and no commit-ish: this log is
+    durable and a Bash payload can carry credentials."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
+    row = _rows(snap_log)[-1]
+    assert set(row) == {"ts", "cwd", "sha", "tree_rewind"}
+    assert old not in json.dumps(row)
+
+
+def test_an_overridden_rewind_is_silent_but_still_counted(repo, snap_log, monkeypatch, capsys):
+    """`# discard-override` says "I know" — so drop the note, but still record it.
+    Whether to escalate to a block is a question about how often this HAPPENS, and
+    an acknowledged rewind is still a rewind."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(f"git checkout {old} -- .  # discard-override", repo, monkeypatch, capsys)
+    assert "WHOLE-TREE REWIND" not in ctx
+    assert _rows(snap_log)[-1].get("tree_rewind") is True
+
+
+def test_a_broken_rewind_predicate_never_costs_the_snapshot(repo, snap_log, monkeypatch, capsys):
+    """The snapshot is the actual recovery mechanism; this note is a courtesy on
+    top. A bug in the courtesy must not take the mechanism down with it."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    monkeypatch.setattr(
+        _gd, "_tree_rewind_segments", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    ctx = _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
+    assert _rows(snap_log), "the snapshot must still have been taken"
+    assert "snapshotted the worktree" in ctx
+    assert "WHOLE-TREE REWIND" not in ctx
+
+
+# ── multi-repo compounds: the sha and the flag must follow the RIGHT repo ────
+# `git -C A … && git -C B checkout <c> -- .` is ordinary here (this box runs many
+# worktrees). Before these existed, the note advertised the FIRST snapshotted
+# repo's sha regardless of which repo was rewound — measured: a sha that does not
+# even resolve in the repo the reader is standing in.
+
+
+@pytest.fixture
+def two_repos(tmp_path: Path) -> tuple[Path, Path, str]:
+    """Two repos with DIFFERENT content — identical trees hash identically and
+    would mask a wrong-sha bug entirely."""
+    made = []
+    for name, body in (("A", "alpha"), ("B", "bravo")):
+        r = tmp_path / name
+        r.mkdir()
+        _git(r, "init", "-q", "-b", "main")
+        (r / "tracked.py").write_text(f"{body}-v1\n")
+        _git(r, "add", "-A")
+        _git(r, "commit", "-qm", "v1")
+        made.append(r)
+    a, b = made
+    b_old = _git(b, "rev-parse", "HEAD").strip()
+    (b / "tracked.py").write_text("bravo-v2\n")
+    _git(b, "commit", "-qam", "v2")
+    (a / "tracked.py").write_text("alpha-dirty\n")
+    (b / "tracked.py").write_text("bravo-dirty\n")
+    return a, b, b_old
+
+
+def test_the_note_carries_the_REWOUND_repos_sha_not_another(
+    two_repos, snap_log, monkeypatch, capsys
+):
+    a, b, b_old = two_repos
+    cmd = f"git -C {a} rm -r --cached tracked.py && git -C {b} checkout {b_old} -- ."
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(a.parent)}
+    )
+    assert _gd.main() == 0
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    line = next(x for x in ctx.splitlines() if "WHOLE-TREE REWIND" in x)
+
+    by_cwd = {row["cwd"]: row["sha"] for row in _rows(snap_log)}
+    assert str(a) in by_cwd and str(b) in by_cwd, "both repos should be snapshotted"
+    assert by_cwd[str(b)][:12] in line, "must offer the REWOUND repo's snapshot"
+    assert by_cwd[str(a)][:12] not in line, "must not offer an unrelated repo's sha"
+    assert str(b) in line, "and must name which repo it is talking about"
+
+
+def test_only_the_rewound_repo_is_flagged_in_the_log(two_repos, snap_log, monkeypatch, capsys):
+    """The tripwire decides whether this becomes a block, so an inflated count
+    argues for one on false evidence."""
+    a, b, b_old = two_repos
+    cmd = f"git -C {a} rm -r --cached tracked.py && git -C {b} checkout {b_old} -- ."
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(a.parent)}
+    )
+    assert _gd.main() == 0
+    flagged = {row["cwd"] for row in _rows(snap_log) if row.get("tree_rewind")}
+    assert flagged == {str(b)}
+
+
+def test_attached_short_source_form_fires(repo, snap_log, monkeypatch, capsys):
+    """`git restore -s<sha> .` — git accepts it and performs the rewind. Its long
+    twin `--source=<sha>` was handled from the start; this spelling was not, so
+    two spellings of one command behaved differently."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(f"git restore -s{old} .", repo, monkeypatch, capsys)
+    assert "WHOLE-TREE REWIND" in ctx
+
+
+@pytest.mark.parametrize("pathspec", [".", "./", ":/", ":/.", "*"])
+def test_every_broad_pathspec_in_the_set_is_covered(pathspec, repo, snap_log, monkeypatch, capsys):
+    """Pins the whole constant. Trimming it to {'.', './', ':/'} previously left
+    the suite green, so `:/.` and `*` were carried without any test."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    ctx = _rewind_ctx(f"git checkout {old} -- {pathspec}", repo, monkeypatch, capsys)
+    assert "WHOLE-TREE REWIND" in ctx, f"{pathspec} is in the constant but unpinned"

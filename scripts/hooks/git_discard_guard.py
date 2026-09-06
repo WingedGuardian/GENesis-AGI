@@ -160,6 +160,63 @@ _SUBMODULE_RECURSE_VERBS = frozenset({"checkout", "restore", "switch", "reset", 
 # recursion → the superproject snapshot suffices → not blocked). Bare
 # `submodule.recurse` (no value) and any other value are treated as ON.
 _SUBMODULE_RECURSE_FALSE = frozenset({"false", "0", "no", "off"})
+# ── whole-tree rewind: a LOUD NOTE, deliberately NOT a block ──────────────────
+# `git checkout <commit> -- .` is not "discard my edits" — the broad pathspec
+# matches every tracked path, so it rewrites the WHOLE worktree to that commit
+# and silently reverts anything merged since. MEASURED 2026-08-31: one such
+# command reverted two already-merged PRs; the first was found by luck and the
+# second only by a second, different check.
+#
+# WHY THIS IS A NOTE AND NOT A BLOCK, since every other guard here that fires is
+# a block. The admission test for a block in this module is UNRECOVERABILITY —
+# `clean` (stash cannot capture untracked files) and submodule-recursion (stash
+# cannot capture submodule worktrees). A tree rewind fails that test: `checkout`
+# is in _SNAPSHOT_VERBS, so `git stash create` runs first and the pre-command
+# worktree is recoverable. MEASURED on the real hook: exit 0, snapshot taken,
+# recovery sha in the note.
+#
+# So the thing that failed in 2026-08-31 was not recovery, it was NOTICING. The
+# snapshot note fires identically for every checkout/restore/switch/reset — it is
+# routine furniture, and it never said "you just rewound the tree". This makes
+# the note SPECIFIC for this shape while leaving the exit code alone, which keeps
+# the module's stated contract intact ("for the recoverable verbs this hook is
+# advisory and NEVER exits non-zero") and costs no completeness claim: a spelling
+# this misses degrades to the ordinary snapshot note, not to a hole.
+#
+# THE TRIPWIRE (owner decision 2026-09-06): a match writes `tree_rewind: true`
+# onto the row for the repo that was rewound, so recurrence is COUNTABLE rather
+# than argued. If a rewind reverts merged work again despite this note, that is
+# the measured evidence to escalate to a block; without it the escalation would
+# rest on the same n=1 the first attempt did.
+#
+# COUNT EVENTS, NOT ROWS — this hook is wired twice (the .claude/settings.json
+# Bash matcher AND bash_safety_hook.sh's advisory invocation), so one rewind
+# normally writes TWO identical-cwd rows. A naive `grep -c` therefore roughly
+# doubles the count, which pushes in the wrong direction for a decision about
+# whether to add a block:
+#   jq -r 'select(.tree_rewind) | .ts + " " + .cwd' \
+#       ~/.genesis/git_discard_snapshots.jsonl | sort -u | wc -l
+# Also note the count is only meaningful for rows dated after this shipped —
+# building it generated probe rows against throwaway repos under ~/tmp.
+#
+# `switch` is carried for symmetry with _SUBMODULE_RECURSE_VERBS. Precisely: GIT
+# rejects this shape — VERIFIED on 2.43, `git switch <ref> -- .` exits "fatal:
+# only one reference expected", because switch takes no pathspec — but the
+# PREDICATE here still matches it, so the note is emitted for a command that will
+# then fail. Cosmetic (the note is advisory and the command never runs), and
+# listed so a future git that grows a pathspec is covered. Do not read this as
+# "the predicate cannot fire on switch": it can.
+_TREE_REWIND_VERBS = frozenset({"checkout", "restore", "switch", "read-tree"})
+# A source that is NOT these is a rewind to some OTHER commit. `HEAD`/`@` mean
+# "discard my uncommitted edits back to where I already am", which reverts no
+# merged work and is exactly what the snapshot net exists for.
+_TREE_REWIND_HEAD_ALIASES = frozenset({"HEAD", "@"})
+# LITERAL broad-pathspec tokens — never a filesystem test (this stays argv-only,
+# subprocess-free, like every other predicate here). A directory operand is
+# matched by the trailing-slash rule below rather than by stat'ing it.
+# `-A`/`--all` were here initially and are removed: none of these verbs accepts
+# them, so they only ever produced a warning for a command git itself rejects.
+_TREE_REWIND_BROAD_PATHSPECS = frozenset({".", "./", ":/", ":/.", "*"})
 # `git clean` is the ONE unrecoverable verb — `git stash create` cannot capture
 # untracked files, which is exactly what clean deletes, so the snapshot net
 # gives clean ZERO protection and it must keep a real block. The block is a
@@ -415,6 +472,194 @@ def _submodule_recurse_violation(cmd: str) -> str | None:
     return None
 
 
+def _rewind_source(argv: list[str], verb: str) -> str | None:
+    """The commit-ish a tree-rewriting git command reads FROM, or None.
+
+    Per-verb rather than one generic rule, because the verbs genuinely differ and
+    a single positional rule mis-reads them:
+      * ``restore`` takes its source ONLY from ``--source=X`` / ``-s X``. Reading
+        it positionally would make ``git restore . src/`` claim ``.`` as a source
+        commit, when restore with no ``--source`` reads the INDEX and rewinds
+        nothing.
+      * ``checkout`` / ``read-tree`` take it as the first bare operand before any
+        ``--`` separator.
+    Returns None for ``HEAD``/``@`` — "put my tracked files back how they already
+    are" reverts no merged work, and is the ordinary local discard the snapshot
+    net already covers.
+    """
+    if verb == "restore":
+        for i, tok in enumerate(argv):
+            if tok.startswith("--source="):
+                src = tok.split("=", 1)[1]
+                return None if src in _TREE_REWIND_HEAD_ALIASES else src or None
+            if tok in ("-s", "--source") and i + 1 < len(argv):
+                src = argv[i + 1]
+                return None if src in _TREE_REWIND_HEAD_ALIASES else src or None
+            if tok.startswith("-s") and not tok.startswith("--") and len(tok) > 2:
+                # Attached SHORT form `-s<commit-ish>`, which git accepts and
+                # performs the rewind for. Its long twin `--source=<c>` was
+                # handled from the start and this was not — same class, and the
+                # asymmetry meant two spellings of one command behaved
+                # differently (measured: `-s <c> .` warned, `-s<c> .` was silent).
+                src = tok[2:]
+                return None if src in _TREE_REWIND_HEAD_ALIASES else src or None
+        return None
+    try:
+        start = argv.index(verb) + 1
+    except ValueError:
+        return None
+    for tok in argv[start:]:
+        if tok == "--":
+            return None  # `git checkout -- .` — no source, a plain local discard
+        if tok.startswith("-"):
+            continue  # a flag, not the operand we want
+        if tok in _TREE_REWIND_BROAD_PATHSPECS or tok.endswith("/"):
+            # `git checkout .` / `git checkout src/` — the first bare operand is
+            # a PATHSPEC, not a commit-ish, so this is the ordinary local discard
+            # (identical to `git checkout -- .`) and rewinds nothing. A commit-ish
+            # is never one of these tokens, so refusing them here cannot hide a
+            # real rewind — and without this the most common discard in the repo
+            # would read as its own source and warn on every use.
+            return None
+        return None if tok in _TREE_REWIND_HEAD_ALIASES else tok
+    return None
+
+
+def _rewrites_whole_tree(argv: list[str], verb: str) -> bool:
+    """Does this argv apply *source* across the whole worktree rather than to
+    named paths?
+
+    ``read-tree`` is its own case and has no pathspec at all: ``-u`` / ``--reset``
+    is what makes it write the WORKTREE (without them it only loads the index),
+    and when it does, it does so for every path. Requiring a pathspec there would
+    miss the shape entirely.
+
+    For the others it is a LITERAL broad-pathspec token — ``.`` / ``./`` / ``:/``
+    / ``*`` — or any operand ending in ``/`` (a directory). Deliberately no
+    filesystem test: this predicate stays argv-only and subprocess-free like every
+    other one here, and being ADVISORY it can afford to be generous — a false
+    positive costs one over-eager note, never a refused command.
+    """
+    if verb == "read-tree":
+        return bool({"-u", "--reset"} & set(argv))
+    # Scan every operand after the verb rather than only those following the
+    # source token. Locating the source by VALUE (`argv.index(source)`) silently
+    # fails for the attached spelling `--source=<sha>`, where the sha is not a
+    # token of its own — measured: `git restore -s <c> .` was detected and
+    # `git restore --source=<c> .` was not, for the same command.
+    # Safe because a commit-ish is never a broad-pathspec token, and
+    # `_rewind_source` now refuses those outright, so the source can never be
+    # mistaken for the pathspec that makes this fire.
+    try:
+        start = argv.index(verb) + 1
+    except ValueError:
+        return False
+    for tok in argv[start:]:
+        if tok == "--":
+            continue
+        if tok in _TREE_REWIND_BROAD_PATHSPECS or tok.endswith("/"):
+            return True
+    return False
+
+
+def _tree_rewind_segments(cmd: str, payload: dict) -> list[tuple[str, bool, str | None]]:
+    """``(source_commitish, overridden, cwd)`` for every whole-tree rewind in *cmd*.
+
+    The **cwd is part of the result on purpose**. A payload can touch several
+    repos (``git -C A … && git -C B checkout <c> -- .`` is ordinary here, where
+    worktrees are the norm), and a recovery instruction naming another repo's
+    snapshot is a FALSE recovery promise — the sha does not even resolve there.
+    MEASURED before this returned cwd: a two-repo compound advertised repo A's
+    sha for a rewind in repo B.
+
+    NEVER blocks — the caller turns this into a louder note and a countable log
+    flag. ``# discard-override`` suppresses the NOTE (the author has said they
+    know) but is still reported here so the caller can log the tripwire either
+    way: an override is exactly the case where knowing it happened still matters.
+
+    RESIDUALS, stated because this is a note and may be generous but must not be
+    dishonest. Each degrades to the ordinary snapshot note — the status quo
+    before this existed — never to a wrong claim:
+      * a pathspec from ``--pathspec-from-file`` is invisible to an argv check;
+      * an aliased spelling (``git co``) is invisible to every predicate here;
+      * an abbreviated flag (``--sour=X``) is not matched;
+      * magic pathspec prefixes (``:(top)``, ``:!``) are not in the broad set, so
+        ``git checkout <c> -- ':(top)'`` is silent;
+      * clustered short options (``git read-tree -um <c>``) are not decomposed —
+        cluster decomposition is the flag-semantics tar pit this module removed.
+    """
+    found: list[tuple[str, bool, str | None]] = []
+    for seg in analyze(cmd):
+        if seg.exe != "git":
+            continue
+        verbs = [v for v in seg.argv[1:] if v in _TREE_REWIND_VERBS]
+        if not verbs:
+            continue
+        verb = verbs[0]
+        source = _rewind_source(seg.argv, verb)
+        if source is None:
+            continue
+        if not _rewrites_whole_tree(seg.argv, verb):
+            continue
+        cwd = None
+        with contextlib.suppress(Exception):
+            cwd = _segment_cwd(seg, payload)
+        found.append((source, has_trailing_override(seg.raw, _OVERRIDE_SIGIL), cwd))
+    return found
+
+
+def _tree_rewind_note(source: str, cwd: str | None, snapshot_sha: str | None) -> str:
+    """The specific warning. Says what the command DOES, not merely that a
+    snapshot exists — the generic note already said that on 2026-08-31 and the
+    reversion still shipped.
+
+    TWO things here were wrong when first written, both caught by EXECUTING them
+    rather than reading them, and both are the reason this docstring is long:
+
+    1. It recommended ``git stash apply --index <sha>``. MEASURED on git 2.43
+       against the real post-rewind state: **exit 1, and conflict markers written
+       into the file the user is trying to rescue.** A whole-tree rewind leaves
+       every tracked path staged-modified, which is exactly what ``stash apply``
+       refuses to merge into. ``git checkout <snap> -- .`` restores it cleanly
+       (exit 0, byte-identical). Handing someone a command that makes their
+       situation worse is a FALSE RECOVERY PROMISE — the failure this module
+       treats as severe enough to justify its second hard block.
+    2. It asserted the command "rewrites EVERY tracked path". The predicate is
+       deliberately generous (any operand ending in ``/``), so it also fires on
+       ``git checkout main -- tests/``, which does not. The wording now matches
+       what argv actually proves.
+
+    The repo is NAMED because a payload can rewind one repo while snapshotting
+    several; an unqualified sha sends the reader to the wrong worktree.
+    """
+    where = f" in {cwd}" if cwd else ""
+    if snapshot_sha:
+        recover = (
+            f" To undo it, restore every tracked path from the pre-command "
+            f"snapshot: git checkout {snapshot_sha[:12]} -- .   (NOT `git stash "
+            f"apply` — a rewind leaves every path staged, which stash apply "
+            f"refuses to merge into; measured, it exits 1 and writes conflict "
+            f"markers into your files.)"
+        )
+    else:
+        recover = (
+            " No snapshot was taken for that repo, so there is no recovery point "
+            "here — check the snapshot log before you commit."
+        )
+    return (
+        f"[git-discard-guard] WHOLE-TREE REWIND{where}: this rewrites every tracked "
+        f"path UNDER THE PATHSPEC YOU GAVE from '{source}' — with `.` or `:/` that "
+        f"is the entire worktree, not just the files you edited. Anything merged "
+        f"since '{source}' is reverted, and because the revert lands in YOUR "
+        f"working tree it shows up inside your own diff looking deliberate, which "
+        f"is why the last one was found only by luck. Before committing, diff "
+        f"against the upstream branch in BOTH directions, not just `git diff`. If "
+        f"you meant to apply someone's changes onto a moved base, use `git merge "
+        f"--squash`, `git cherry-pick`, or `git apply --3way` — those FAIL LOUDLY "
+        f"on conflict where this succeeds silently.{recover}"
+    )
+
+
 def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     """Best-effort recovery net. NEVER blocks, never raises past its own
     boundary; one snapshot per distinct resolved cwd. Returns the human-facing
@@ -430,6 +675,17 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     seen_cwds: set[str] = set()
     deadline = time.monotonic() + _TOTAL_SNAPSHOT_BUDGET_S
     budget_hit = False
+    # Never raises past here — a predicate bug must not cost the snapshot, which
+    # is the actual recovery mechanism; the note is a courtesy on top of it.
+    try:
+        rewinds = _tree_rewind_segments(cmd, payload)
+    except Exception:
+        rewinds = []
+    # cwd -> sha, so a rewind's note carries ITS OWN repo's recovery point. A
+    # payload can snapshot several repos while rewinding one; a sha from the
+    # wrong repo does not even resolve there.
+    sha_by_cwd: dict[str, str] = {}
+    rewound_cwds = {cwd for _, _, cwd in rewinds if cwd}
     for seg in analyze(cmd):
         if seg.exe != "git":
             continue
@@ -452,11 +708,27 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         sha = _snapshot_worktree(cwd, timeout=min(_GIT_TIMEOUT_S, remaining))
         if not sha:
             continue
+        sha_by_cwd[cwd] = sha
         row = {
             "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
             "cwd": cwd,
             "sha": sha,
         }
+        if cwd in rewound_cwds:
+            # THE TRIPWIRE, scoped to the repo that was actually rewound. It was
+            # payload-scoped (`if rewinds:`) at first, which flagged every repo in
+            # a compound — MEASURED: a two-repo command flagged both, so one event
+            # scored two. Since the documented purpose is "the measured evidence
+            # to escalate to a block", an inflated count pushes in exactly the
+            # wrong direction: it manufactures the case for one.
+            #
+            # Recorded even when the note is suppressed by `# discard-override`,
+            # because how often this HAPPENS is the question, and an acknowledged
+            # rewind is still a rewind. A bare boolean keeps the row METADATA ONLY
+            # — the source commit-ish is deliberately NOT logged, for the same
+            # reason the command is not: this log is durable and a Bash payload
+            # can carry credentials.
+            row["tree_rewind"] = True
         log_path = _snapshot_log_path()
         with contextlib.suppress(OSError):
             log_path = _write_log_row(row) or log_path
@@ -471,6 +743,15 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             f"conflicts). For a DELETED/overwritten file (rm/mv), pull it straight "
             f"from the snapshot: git checkout {sha[:12]} -- <path>. (log: {log_path})"
         )
+    # One note per distinct (source, repo), each carrying THAT repo's snapshot —
+    # never a sha borrowed from another repo in the same compound. Only for
+    # sources the author has not already acknowledged with the override.
+    seen_rewinds: set[tuple[str, str | None]] = set()
+    for source, overridden, rewind_cwd in rewinds:
+        if overridden or (source, rewind_cwd) in seen_rewinds:
+            continue
+        seen_rewinds.add((source, rewind_cwd))
+        notes.append(_tree_rewind_note(source, rewind_cwd, sha_by_cwd.get(rewind_cwd or "")))
     if budget_hit:
         notes.append(
             "[git-discard-guard] NOTE: hit the ~"
