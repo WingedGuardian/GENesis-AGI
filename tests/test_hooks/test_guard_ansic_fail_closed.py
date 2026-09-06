@@ -70,6 +70,10 @@ NV = "--no-" + "ver" + "ify"
 ADMIN = "--" + "admin"
 COMMIT = "com" + "mit"
 
+# The one-line spelling every continuation case is compared against: the fix's
+# guarantee is that a continued command resolves exactly like this one.
+_JOINED_FORCE_PUSH = f"{GIT} {PUSH} origin main {FORCE}"
+
 # The obfuscation prefix these cases are built from; see the module
 # docstring for why it is held as fixture data rather than described.
 ANSIC = "echo ok 2>$(echo $'a\\'b)c') && "
@@ -634,75 +638,125 @@ class TestAcceptanceCorpus:
         cmd = f"{GIT} {PUSH} origin main && x=$'a\\'b<<PWN'\n{GIT} {PUSH} origin evil {FORCE}\nPWN"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) != "block", r.stdout + r.stderr
+        # SECOND severity, and the reason the continuation tests no longer carry
+        # this assertion: the misleading-consent class is still LIVE here. The
+        # prompt describes an ordinary push while the shell runs a force push to
+        # another ref, so a human approves under the wrong description. Locked so
+        # a fix flips it deliberately, exactly as the continuation lock was.
+        assert _decision(r) == "ask", r.stdout + r.stderr
+        assert FORCE not in r.stdout, (
+            "the prompt now names the flag — re-derive this rather than loosening it"
+        )
 
     @pytest.mark.parametrize(
         "label,cmd_tpl",
         [
-            # Two DISTINCT parse signatures, which is the point of enumerating
-            # rather than spot-checking one form:
+            # Two DISTINCT parse signatures, which is why this enumerates rather
+            # than spot-checking one form:
             #   'space + backslash'    -> segments as ['\\', None]
             #   'no space + backslash' -> segments as [None, None]  (exe is 'git\')
-            # A fix keying on the " \" TOKEN shape closes the first two and
-            # leaves the third silently open. The durable fix is continuation
-            # JOINING before segmentation, not token recognition after it.
+            # A fix keying on the " \" TOKEN shape would close the first two and
+            # leave the third silently open. The durable fix — the one this
+            # branch ships — is continuation JOINING before segmentation, not
+            # token recognition after it, so all three close together.
             ("space_backslash", "{GIT} \\\n{PUSH} origin main {FORCE}"),
             ("space_backslash_then_space", "{GIT} \\\n {PUSH} origin main {FORCE}"),
             ("no_space_backslash", "{GIT}\\\n {PUSH} origin main {FORCE}"),
         ],
     )
-    def test_line_continuation_is_documented_residue(self, tmp_path, label, cmd_tpl):
-        """DOCUMENTED RESIDUE (not closed by this PR) — the WHOLE class, not one form.
+    def test_continuation_resolves_exactly_like_the_joined_spelling(
+        self, tmp_path, label, cmd_tpl
+    ):
+        """CLOSED (was DOCUMENTED RESIDUE) — the WHOLE class, not one form.
 
-        A `\\`-newline continuation tokenizes cleanly, so the tokenizability
-        probe never fires — analyze() mis-attributing it is the SEPARATE
-        mis-segmentation class (follow-up `dc5ae7ff`). Locked here so the
-        boundary is explicit and a future fix flips these deliberately rather
-        than silently.
+        The prior lock existed so a future fix would flip this deliberately
+        rather than silently. This is that flip: the shared parser now folds an
+        unquoted `\\`-newline before segmentation, which is precisely the
+        durable fix the prior docstring predicted would be required.
 
-        This is the one residue class measured to BOTH mis-parse and really
-        execute: bash joins the continuation before reading the command, so the
-        push actually runs. The `$( )` shapes mis-parse but never execute, which
-        makes them parser defects rather than gate bypasses.
+        It was the one residue class where the mis-parse also let a real command
+        reach the shell unexamined: bash joins the two halves before reading the
+        command, so the push ran and no gate ever saw the flag. The shapes locked
+        above mis-parse too — and, measured, the shell does go on to run what
+        follows them, which an earlier version of this docstring denied — but the
+        fail-closed net still routes those to a human, so they are parser defects
+        rather than open holes.
 
-        NOT residue, asserted as the control in the sibling test below: a
-        continuation AFTER the subcommand (`git push \\<NL>origin`) still
-        resolves to `push`, because the subcommand was already read.
+        Assert PARITY with the joined spelling AND the same reason. A matching
+        verdict is not a matching reason: `_decision` collapses everything to
+        one of three labels, so a future tightening of the net could make both
+        spellings read `block` for different causes and this would pass with the
+        fold reverted. The prior lock's demand was flag ATTRIBUTION, and only
+        the reason string tests that.
         """
         cmd = cmd_tpl.format(GIT=GIT, PUSH=PUSH, FORCE=FORCE)
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", f"{label}: {r.stdout + r.stderr}"
+        r_joined = _run(_PUSH_GUARD, _JOINED_FORCE_PUSH, cwd=str(tmp_path))
+        assert _decision(r) == _decision(r_joined) == "block", (
+            f"{label}: continued={_decision(r)} joined={_decision(r_joined)}\n"
+            + r.stdout
+            + r.stderr
+        )
+        assert r.stderr == r_joined.stderr, (
+            f"{label}: the continued spelling blocks for a DIFFERENT reason than "
+            f"the joined one\ncontinued: {r.stderr!r}\njoined:    {r_joined.stderr!r}"
+        )
 
-    def test_continuation_after_subcommand_downgrades_the_verdict(self, tmp_path):
-        """A THIRD severity in the same class — measured, and worse than it reads.
+    def test_continuation_before_the_flag_keeps_the_flag_attributed(self, tmp_path):
+        """The THIRD severity in that class, also closed — and it was the worst.
 
         `git push \\<NL>origin main {FORCE}` was assumed harmless by two
         independent readings, on the reasoning that `push` still resolves. It
-        does — but the FLAG is severed into the next segment:
+        does — but before this fix the FLAG was severed into the next segment:
 
             seg[0] argv=['git', 'push', '\\\\']          <- subcommand, no flag
             seg[1] argv=['origin', 'main', '--force']    <- flag, no exe
 
-        So the guard sees an ORDINARY push and emits `ask` instead of the hard
-        block a force-push warrants, and the prompt reads "git push needs your
-        approval before publishing externally" — it never mentions the force.
-        Bash, having joined the continuation before reading the command, really
-        does force-push. Consent is obtained under a description that omits the
-        dangerous flag, which is a worse failure than a silent allow: a silent
-        allow leaves no record of the operator agreeing to anything.
+        so the guard saw an ORDINARY push and emitted `ask`, behind a prompt
+        that never mentioned the force. Bash, having joined the continuation
+        before reading the command, really did force-push. Consent obtained
+        under a description that omits the dangerous flag is worse than a silent
+        allow: a silent allow at least leaves no record of the operator having
+        agreed to anything.
 
-        PRE-EXISTING, not introduced here — measured identical on the base
-        branch (base: ask, this branch: ask; plain force-push blocks on both,
-        which validates the comparison). Locked so the eventual segmentation fix
-        has to address flag ATTRIBUTION, not just subcommand resolution.
+        The prior lock demanded that the eventual fix address flag ATTRIBUTION,
+        not merely subcommand resolution. Folding before segmentation does
+        exactly that — the flag now lands in the same segment as the exe — so
+        the verdict is the hard block a force-push warrants.
+
+        Scope, so this does not read as more than it is: what is closed here is
+        the CONTINUATION spelling. The general "an approval prompt must not
+        obtain consent under a description omitting the dangerous flag" concern
+        is NOT closed — it survives on the decoy residue above, which is why
+        that test carries the prompt-text assertion this one no longer needs.
         """
         cmd = f"{GIT} {PUSH} \\\norigin main {FORCE}"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        decision = _decision(r)
-        assert decision == "ask", r.stdout + r.stderr
-        # The point of the finding: the approval text omits the force flag.
-        assert FORCE not in r.stdout, (
-            "prompt now names the force flag — the downgrade may be fixed; "
-            "re-derive this test rather than loosening it"
+        r_joined = _run(_PUSH_GUARD, _JOINED_FORCE_PUSH, cwd=str(tmp_path))
+        assert _decision(r) == _decision(r_joined) == "block", (
+            f"continued={_decision(r)} joined={_decision(r_joined)}\n"
+            + r.stdout
+            + r.stderr
+        )
+        assert r.stderr == r_joined.stderr, (
+            f"blocks for a DIFFERENT reason than the joined form\n"
+            f"continued: {r.stderr!r}\njoined:    {r_joined.stderr!r}"
+        )
+
+    def test_a_benign_continuation_is_not_newly_refused(self, tmp_path):
+        """The allow direction, which every other case here leaves untested.
+
+        The parser change is a JOIN, and a join under an incomplete context
+        model is the direction that makes a command VANISH — so the fold must
+        also leave harmless multi-line commands alone. Asserted end-to-end
+        through the guard, not just at the parser level.
+        """
+        r = _run(_PUSH_GUARD, f"{GIT} \\\nstatus", cwd=str(tmp_path))
+        r_joined = _run(_PUSH_GUARD, f"{GIT} status", cwd=str(tmp_path))
+        assert _decision(r) == _decision(r_joined) == "allow", (
+            f"continued={_decision(r)} joined={_decision(r_joined)}\n"
+            + r.stdout
+            + r.stderr
         )
 
 

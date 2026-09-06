@@ -572,6 +572,42 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The shared command parser now understands an unquoted backslash, so the safety
+  hooks read a multi-line command the way the shell runs it.** It previously handled a
+  backslash only inside a double-quoted string; everywhere else the escaped character
+  was treated as if it stood alone. The practical effect for you is that commands
+  written across several lines — the ordinary way a long command gets typed — are now
+  matched against the guards as one command rather than as disconnected pieces, in both
+  directions: a long delete is checked against the path it will actually operate on, and
+  a long test or push command is recognised for what it is. An escaped separator or
+  quote is likewise read as the literal character it is, and a comment ending in a
+  backslash no longer absorbs the line after it. The line-continuation rule follows the
+  shell's own parity rule. Measured across 15,845 real commands from this install's
+  history: 2.1% are segmented differently, and from that segmentation change alone no
+  guard verdict moves in either direction. Verdicts DO move because of the companion fix
+  below, which the same work uncovered.
+- **A deletion behind `eval`, `sudo` and their relatives is now seen by the
+  protected-path guard.** These commands run whatever follows them, so a delete written
+  that way is a delete — but the guard reads a command's executable to decide whether it
+  is looking at one, and for several of these it was reading the prefix instead. The
+  effect was narrow and easy to miss: the same deletion written across two lines *was*
+  caught, because the old mis-split happened to leave the delete visible on its own. So
+  correcting that split is what brought this to light, and the joined spelling had never
+  been covered at all.
+
+  Two mechanisms, because one is not enough. The parser now resolves the prefixes that
+  pass their arguments through unchanged, which fixes it for every hook rather than this
+  one. That list is a whitelist though, and a whitelist says nothing about what is not on
+  it, so the guard additionally declines to certify a command whose prefix it could not
+  resolve — falling back to the conservative check it already used for a command it
+  cannot read. Deliberately narrow: it only applies where resolution genuinely failed,
+  because a prefix the parser DID resolve already tells us what runs. An earlier, broader
+  version of this refused ordinary commands like searching a protected directory for a
+  pattern, which is measured and locked against.
+
+  One prefix is deliberately left unresolved: `chroot` changes what every path in the
+  command means, so reading its operands as ordinary paths would be worse than not
+  reading them. It is refused rather than interpreted.
 - **Campaign names stored before the control-character fix are now cleaned at
   startup.** Names have been sanitized at the write boundary since the previous
   release, so nothing new lands malformed, but rows written earlier were never
