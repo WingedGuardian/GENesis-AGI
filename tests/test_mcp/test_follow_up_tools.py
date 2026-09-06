@@ -737,3 +737,218 @@ async def test_update_blocked_still_works_untouched(db):
     assert res["status"] == "blocked"
     actionable = await follow_ups.get_actionable(db, limit=50)
     assert any(r["id"] == fid for r in actionable)  # still visible
+
+
+# ─── external state: the surface follow_up proposals never had ───────────────
+#
+# A follow-up's issue link and its repo-pulse completion proposal both live
+# outside the follow_ups row. Neither was reachable from the listing, so a triage
+# pass could not tell a filed row from an unfiled one, and completion proposals
+# for follow_up targets were written and then rendered nowhere at all (the
+# charter block is ledger-only by design — it renders a session_ledger_update
+# confirm command — and the dashboard panel lists ledger only).
+
+
+async def _seed_posted_issue(db, *, follow_up_id, number=101, repo="Owner/Repo"):
+    await db.execute(
+        "INSERT INTO pending_issue_posts "
+        "(id, request_id, repo, title, body, source, source_ref, cell_domain, cell_verb,"
+        " cell_risk_class, held_at, mode, status, issue_number, issue_url, adopted) "
+        "VALUES (?, ?, ?, 't', 'b', 'follow_up', ?, 'github', 'issue_create', 'bulk',"
+        " '2026-01-01T00:00:00', 'live', 'posted', ?, ?, 0)",
+        (f"p-{number}", f"req-{number}", repo, follow_up_id, number, f"https://x/{number}"),
+    )
+    await db.commit()
+
+
+async def _seed_proposal(db, *, item_id, pr_number=42):
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations "
+        "(id, run_id, observed_at, tier, item_id, item_text, pr_number, pr_title,"
+        " confidence, rationale, status, target_kind) "
+        "VALUES (?, 'r1', '2026-01-02T00:00:00', 'exact', ?, 'txt', ?, 'a pr title',"
+        " 0.9, 'why', 'proposed', 'follow_up')",
+        (f"ann-{item_id}-{pr_number}", item_id, pr_number),
+    )
+    await db.commit()
+
+
+async def _one_followup(db, content="a row that triage will look at"):
+    res = await follow_up_tools._impl_follow_up_create(
+        content=content, reason="r", strategy="ego_judgment", work_state="ready"
+    )
+    return res["id"]
+
+
+async def test_list_surfaces_the_linked_issue(db):
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        await _seed_posted_issue(db, follow_up_id=fid, number=777)
+        res = await follow_up_tools._impl_follow_up_list()
+    row = next(r for r in res["follow_ups"] if r["id"] == fid)
+    assert row["issue"]["number"] == 777
+    assert row["issue"]["url"] == "https://x/777"
+    assert res["external_state"]["issues"] == "ok"
+
+
+async def test_list_surfaces_a_pulse_completion_proposal(db):
+    """THE REPRO for the missing surface: this annotation is written for a
+    follow_up target, and before this change no caller rendered it anywhere."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        await _seed_proposal(db, item_id=fid, pr_number=1313)
+        res = await follow_up_tools._impl_follow_up_list()
+    row = next(r for r in res["follow_ups"] if r["id"] == fid)
+    assert row["pulse_proposal"]["pr_number"] == 1313
+    assert row["pulse_proposal"]["pr_title"] == "a pr title"
+    assert res["external_state"]["proposals"] == "ok"
+
+
+async def test_unlinked_row_has_no_issue_key_at_all(db):
+    """Absence, not None — a present-but-null key reads as 'checked, has none',
+    which is a different claim from 'no link found'."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        res = await follow_up_tools._impl_follow_up_list()
+    row = next(r for r in res["follow_ups"] if r["id"] == fid)
+    assert "issue" not in row
+    assert "pulse_proposal" not in row
+
+
+async def test_proposal_for_a_different_row_is_not_attached(db):
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db, content="the row under test, left untouched")
+        await _seed_proposal(db, item_id="some-other-id-entirely", pr_number=9)
+        res = await follow_up_tools._impl_follow_up_list()
+    row = next(r for r in res["follow_ups"] if r["id"] == fid)
+    assert "pulse_proposal" not in row
+
+
+async def test_absent_pulse_tables_report_unavailable_not_clean(db):
+    """Fail-closed: 'could not look' must not be reported as 'looked, found
+    nothing'. A pre-0062 install has no pulse tables; the listing must still
+    return, and must say the proposal source was unreadable rather than implying
+    the row has no pending proposal."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        await db.execute("DROP TABLE IF EXISTS repo_pulse_annotations")
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list()
+    assert "error" not in res, "a missing optional table must not fail the listing"
+    assert res["external_state"]["proposals"] == "unavailable"
+    # the independent source still worked
+    assert res["external_state"]["issues"] == "ok"
+    assert any(r["id"] == fid for r in res["follow_ups"])
+
+
+async def test_absent_issue_table_reports_unavailable_not_clean(db):
+    """MIRROR of the pulse case, for the OTHER source. Without this the issues
+    half of the fail-closed mechanism is untested: a mutation making availability
+    unconditionally 'ok' changes behaviour only when this branch raises, and
+    nothing else in this file makes it raise."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        await db.execute("DROP TABLE IF EXISTS pending_issue_posts")
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list()
+    assert "error" not in res, "a missing optional table must not fail the listing"
+    assert res["external_state"]["issues"] == "unavailable"
+    assert res["external_state"]["proposals"] == "ok", "the sources are independent"
+    assert any(r["id"] == fid for r in res["follow_ups"])
+
+
+async def test_newest_proposal_wins_when_a_row_has_several(db):
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        await _seed_proposal(db, item_id=fid, pr_number=100)
+        await db.execute(
+            "UPDATE repo_pulse_annotations SET observed_at = '2026-01-01T00:00:00'"
+            " WHERE pr_number = 100"
+        )
+        await _seed_proposal(db, item_id=fid, pr_number=200)
+        await db.execute(
+            "UPDATE repo_pulse_annotations SET observed_at = '2026-06-01T00:00:00'"
+            " WHERE pr_number = 200"
+        )
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list()
+    row = next(r for r in res["follow_ups"] if r["id"] == fid)
+    assert row["pulse_proposal"]["pr_number"] == 200, "the most recent proposal must win"
+
+
+async def test_proposal_lookup_cannot_be_truncated_by_a_row_cap(db):
+    """The query is bounded by the rows being decorated, not by a limit. Seed far
+    more proposals than the listing returns and assert the decorated row still
+    resolves — a global scan under a default cap would drop the oldest and report
+    'ok', which is a truncated read wearing a complete one's clothes."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        fid = await _one_followup(db)
+        # Its proposal is the OLDEST, so a DESC-ordered capped scan cuts it.
+        await _seed_proposal(db, item_id=fid, pr_number=1)
+        await db.execute(
+            "UPDATE repo_pulse_annotations SET observed_at = '2020-01-01T00:00:00'"
+            " WHERE pr_number = 1"
+        )
+        # MUST exceed list_annotations' default cap (500) or this test asserts
+        # nothing: under the cap a global scan still finds the row and the test
+        # passes with the bounding deleted. Verified by mutation — at 39 rows it
+        # did exactly that.
+        await db.executemany(
+            "INSERT INTO repo_pulse_annotations "
+            "(id, run_id, observed_at, tier, item_id, item_text, pr_number, pr_title,"
+            " confidence, rationale, status, target_kind) "
+            "VALUES (?, 'r1', '2026-06-01T00:00:00', 'exact', ?, 'txt', ?, 't',"
+            " 0.9, 'why', 'proposed', 'follow_up')",
+            [(f"ann-noise-{n}", f"noise-{n}", n) for n in range(2, 620)],
+        )
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list(limit=5)
+    row = next(r for r in res["follow_ups"] if r["id"] == fid)
+    assert row["pulse_proposal"]["pr_number"] == 1
+    assert res["external_state"]["proposals"] == "ok"
+
+
+async def test_empty_listing_does_not_fabricate_availability(db):
+    """With no rows to decorate the sources are still probed, so the map reports
+    what was actually reachable rather than asserting 'ok' for a check that never
+    ran."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await db.execute("DROP TABLE IF EXISTS pending_issue_posts")
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list(status_filter="failed")
+    assert res["follow_ups"] == []
+    assert res["external_state"]["issues"] == "unavailable"
+
+
+async def test_a_busy_row_cannot_hide_another_rows_proposal(db):
+    """CodeRabbit's case, and the one the previous fix missed: filtering a CAPPED
+    listing by item id bounds WHICH rows are considered, not HOW MANY return. With
+    one follow-up holding far more than the cap in newer proposals, a second
+    follow-up's older proposal fell past the limit and its row came back
+    undecorated — while external_state still reported the source as read."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        busy = await _one_followup(db, content="the noisy row that crowds the query out")
+        quiet = await _one_followup(db, content="the row whose older proposal must survive")
+        # quiet's proposal is the OLDEST of all.
+        await _seed_proposal(db, item_id=quiet, pr_number=1)
+        await db.execute(
+            "UPDATE repo_pulse_annotations SET observed_at = '2020-01-01T00:00:00'"
+            " WHERE pr_number = 1"
+        )
+        # busy alone carries more than the 500 cap, all newer.
+        await db.executemany(
+            "INSERT INTO repo_pulse_annotations "
+            "(id, run_id, observed_at, tier, item_id, item_text, pr_number, pr_title,"
+            " confidence, rationale, status, target_kind) "
+            "VALUES (?, 'r1', '2026-06-01T00:00:00', 'exact', ?, 'txt', ?, 't',"
+            " 0.9, 'why', 'proposed', 'follow_up')",
+            [(f"ann-busy-{n}", busy, n) for n in range(2, 620)],
+        )
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list(limit=50)
+    rows = {r["id"]: r for r in res["follow_ups"]}
+    assert rows[quiet].get("pulse_proposal", {}).get("pr_number") == 1, (
+        "a busy sibling must not push this row's proposal out of the result"
+    )
+    assert "pulse_proposal" in rows[busy]
+    assert res["external_state"]["proposals"] == "ok"
