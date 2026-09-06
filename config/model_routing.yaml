@@ -34,6 +34,21 @@ providers:
     free: false
     rpm_limit: 4
     open_duration_s: 120
+  mistral-medium-free:
+    type: mistral
+    model: mistral-medium-latest
+    profile: mistral-medium
+    # The rung DIRECTLY BELOW Large in every chain that carries Large, so the
+    # Mistral family degrades within itself before leaving the family — and
+    # when Large's entitlement returns (or an install has a paid plan), the
+    # chain silently uses the best available tier with no config change.
+    # PRESUMPTIVE free (user decision 2026-09-05): entitlement unverified —
+    # probes 429'd on the account-wide limit before answering; see the
+    # mistral-medium profile's free_tier note. rpm matches Large's
+    # conservative 4 until real traffic establishes a better figure.
+    free: true
+    rpm_limit: 4
+    open_duration_s: 120
   mistral-small-free:
     type: mistral
     model: mistral-small-latest
@@ -279,6 +294,7 @@ call_sites:
     - mistral-small-free
     - openrouter-free
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     # Additional free providers so an essential reflection (3_micro_reflection
@@ -293,6 +309,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     default_paid: false
     never_pays: true
   5_deep_reflection:
@@ -320,6 +337,7 @@ call_sites:
     - gemini-free
     - nvidia-nim-deepseek
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-deepseek-v4-flash
   # V4 placeholder: cognitive state IS actively maintained today, but via direct
   # DB writes (awareness/loop.py, cc/reflection_bridge*.py), NOT this call site.
@@ -340,6 +358,7 @@ call_sites:
     chain:
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - openrouter-free
     - nvidia-nim-deepseek
@@ -347,6 +366,7 @@ call_sites:
   13_morning_report:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -391,6 +411,7 @@ call_sites:
   21_session_observer:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -413,13 +434,17 @@ call_sites:
   # Adversarial challenge of synthesis output. Must stay model-independent from
   # synthesis across the WHOLE chain, not just the primary: synthesis falls back
   # to groq-free, so a groq-led challenge could self-approve under a DeepSeek
-  # outage. This challenge leads with mistral-large-free (disjoint from every
-  # synthesis provider — deepseek-flash / groq) + paid Kimi as the deep fallback.
+  # outage. This challenge leads with the MISTRAL family (disjoint from every
+  # synthesis provider — deepseek-flash / groq): Large, then Medium as the free
+  # in-family rung, then paid Kimi as the deep fallback. Medium is what keeps a
+  # dead/entitlement-blocked Large from sending EVERY challenge to paid Kimi
+  # (measured live 2026-09-05 while Large returned 403 tier_not_allowed).
   # NIM's free Kimi was retired 2026-08 (404-for-account). Locked by
   # test_config_invariants::test_adversarial_challenge_sites_are_model_independent.
   dream_cycle_synthesis_challenge:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     # Paid Kimi via OpenRouter as last-resort fallback — a non-DeepSeek, non-groq
     # family, so the challenge stays model-independent from synthesis across the
     # whole chain even when the free tier is down. Only billed during an outage.
@@ -434,6 +459,7 @@ call_sites:
     # from the DeepSeek entity_challenge while surviving a free-tier outage.
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-gemma4
     retry_profile: background
   # MW-2 relationship classifier — coarse relationship judgment
@@ -448,6 +474,7 @@ call_sites:
     - openrouter-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-gemma4
     retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
@@ -466,6 +493,7 @@ call_sites:
     - openrouter-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-gemma4
     retry_profile: background
   # Adversarial challenge of an entity-node "merge" verdict. Flipped pairing
@@ -506,23 +534,27 @@ call_sites:
     chain:
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-nemo
   30_triage_calibration:
     chain:
     - lmstudio-30b
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     retry_profile: background
   31_outcome_classification:
     chain:
     - glm51
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     never_pays: false
   32_delta_assessment:
     chain:
     - glm51
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     never_pays: false
   33_skill_refiner:
@@ -531,12 +563,14 @@ call_sites:
     - groq-free
     - nvidia-nim-deepseek
     - mistral-large-free
+    - mistral-medium-free
     description: LLM-driven skill improvement proposals
   34_research_synthesis:
     chain:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - nvidia-nim-deepseek
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
@@ -546,6 +580,7 @@ call_sites:
     - openrouter-deepseek-v4
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     default_paid: true
     description: Judge + store procedures from struggle detection and extraction
       pipeline candidates
@@ -560,6 +595,7 @@ call_sites:
   41_reflection_json_salvage:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     - openrouter-deepseek-v4
     default_paid: true
@@ -579,6 +615,7 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     default_paid: true
     description: Post-execution retrospective learning extraction
@@ -588,6 +625,7 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     default_paid: true
     description: Pre-mortem failure analysis before committing to execution
@@ -596,6 +634,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     never_pays: true
     retry_profile: background
@@ -612,6 +651,7 @@ call_sites:
     - nvidia-nim-deepseek
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     default_paid: true
     retry_profile: background
@@ -621,6 +661,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     description: Draft content for various platforms
   23_outreach_review:
@@ -628,6 +669,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     description: "Outreach pre-send cross-vendor review (free chain). Renamed from 23_fresh_eyes_review 2026-05-10 (disambiguates from executor Gate 2 at 17_executor_review)."
   36_code_auditor:
     chain:
@@ -644,6 +686,7 @@ call_sites:
     chain:
     - groq-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-nemo
     default_paid: true
     retry_profile: background
@@ -654,6 +697,7 @@ call_sites:
     - groq-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     - openrouter-free
     - openrouter-deepseek-v4-flash
     default_paid: true
@@ -662,6 +706,7 @@ call_sites:
   41_resume_review_pass1:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     - groq-free
     - openrouter-free
@@ -670,6 +715,7 @@ call_sites:
   42_resume_review_pass2:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - gemini-free
     - groq-free
     - openrouter-free
@@ -712,6 +758,7 @@ call_sites:
   cc_update_analysis:
     chain:
     - mistral-large-free
+    - mistral-medium-free
     - groq-free
     - gemini-free
     default_paid: true
@@ -766,6 +813,7 @@ call_sites:
     - groq-free
     - gemini-free
     - mistral-large-free
+    - mistral-medium-free
     default_paid: false
     retry_profile: user_facing
     dispatch: api
