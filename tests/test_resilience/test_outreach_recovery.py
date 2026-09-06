@@ -262,3 +262,28 @@ def test_backoff_schedule_matches_spec():
     """Backoff schedule matches the design: 1m, 5m, 15m, 1h, 1h."""
     assert _BACKOFF_SCHEDULE == (60, 300, 900, 3600, 3600)
     assert _MAX_RETRIES == 5
+
+
+@pytest.mark.asyncio
+async def test_retry_request_opts_out_of_pipeline_deferral(worker):
+    """A recovery re-submission must carry defer_retry=False.
+
+    The failing row stays open via reset_to_pending, so it IS the retry. If
+    the re-submission's own failure deferred a fresh row, that row would be
+    this one's shadow — enqueued under signal_type "deferred_retry" while the
+    original sits under its source signal_type, so _defer's has_open dedup
+    cannot see the original and BOTH deliver when the channel recovers
+    (issue #1781's dual-owner class).
+    """
+    from genesis.outreach.types import OutreachStatus
+
+    result = MagicMock()
+    result.status = OutreachStatus.DELIVERED
+    result.error = None
+    worker._pipeline.submit_raw = AsyncMock(return_value=result)
+
+    await worker._retry(_make_item())
+
+    (_content, request) = worker._pipeline.submit_raw.await_args.args
+    assert request.defer_retry is False
+    assert request.signal_type == "deferred_retry"

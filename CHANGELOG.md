@@ -11,6 +11,38 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **An out-of-memory kill inside a deliberately capped job no longer pages as a
+  container emergency.** Some background jobs run under their own memory cap on
+  purpose, so a runaway one is killed without touching anything else — that is
+  the containment working. But the kill counter the monitor watches aggregates
+  every such event up to the container, so a contained kill paged as "processes
+  OOM-killed in the container" and pointed at your sessions as the likely
+  victims, while the container itself had gigabytes free. One stuck indexing
+  job produced eleven emergency pages in two hours this way.
+
+  The monitor now asks the system journal which unit actually died before
+  paging. A kill fully accounted for by known capped jobs is recorded in the
+  log and the durable snapshot but does not page; anything else — an unknown
+  unit, no record, or no journal to ask — pages exactly as before, now naming
+  the killed unit when it is known. The set of "known capped jobs" is
+  configurable. Attribution can only ever downgrade an explained kill, never
+  silence an unexplained one.
+
+- **A delivery hiccup can no longer page the same alert twice.** When sending
+  an alert to Telegram failed transiently, two independent recovery mechanisms
+  both took ownership of the retry: the durable alert queue kept its copy for
+  the next pass, and the delivery pipeline separately queued its own retry.
+  Each then delivered — one alert, two pages, minutes apart, in the middle of
+  exactly the kind of incident where you are reading the channel carefully.
+
+  The durable queue is now the single owner: a caller that carries its own
+  retry tells the pipeline not to queue a second one. The queue's fourteen-day
+  patience is kept deliberately — the pipeline's own retry gives up after
+  about an hour and a half, so handing the alert over would have traded the
+  duplicate for a page silently lost in any longer outage. The same rule stops
+  a failed retry from queueing a shadow copy of itself, which was quietly
+  possible before and delivered doubles the same way.
+
 - **Per-session memory on the dashboard now counts the whole session, not just
   one process of it.** A Claude Code session is not a single program: alongside
   the main process it runs a language server and a fleet of MCP servers, and

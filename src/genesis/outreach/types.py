@@ -178,6 +178,19 @@ class OutreachRequest:
     # is the forum topic id (None for a DM). Ignored for non-telegram channels.
     target_chat_id: str | None = None
     target_thread_id: int | None = None
+    # False = on delivery failure, do NOT hand the retry to the deferred-work
+    # queue. For callers that carry their OWN durable retry — the alert-queue
+    # drain (14-day file queue, retried every awareness tick) and the recovery
+    # worker's own re-submissions (the failing row stays open via
+    # reset_to_pending) — a deferral makes TWO independent retriers own one
+    # delivery, and each success is the other's duplicate. MEASURED incident
+    # class: a double-paged OOM alert on 2026-09-05 (issue #1781 — recovery
+    # delivered at 08:31:57, the kept queue entry resent at 08:35:42) and the
+    # 2026-07 outage's 690 duplicate deferred rows. Deliberately NOT the
+    # inverse design (unlink the queue entry on deferral): recovery's whole
+    # retry budget is ~82 minutes before it discards the row, so that trade
+    # swaps a duplicate for a DROPPED page on any outage longer than that.
+    defer_retry: bool = True
 
 
 @dataclass(frozen=True)

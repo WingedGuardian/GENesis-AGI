@@ -50,6 +50,12 @@ fi
 CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 CC_TMP_BUDGET_MB=500
 SACRED_GROUND_MB=150
+# Units whose OOM kill is CONTAINMENT WORKING, not a container emergency: they
+# run inside their own MemoryMax scope on purpose (issue #1775 — 11 emergency
+# pages for the code-intel indexer dying at its own 2G cap, attributed to "the
+# container" and blamed on CC sessions, while `free` showed 17.8 GB available).
+# Space-separated unit-name prefixes; override in watchgod.conf or the env.
+OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel-}"
 
 # ── Load config ──────────────────────────────────────────────
 load_config() {
@@ -448,6 +454,64 @@ _read_oom_kill() {
     awk '/^oom_kill /{print $2; found=1} END{exit !found}' "$OOM_EVENTS_FILE" 2>/dev/null
 }
 
+# Attribution reads the systemd journal because the killer cgroup is usually a
+# TRANSIENT scope, deleted with its job — every surviving cgroup shows the kill
+# only as an inherited aggregate (measured: local=0 at every level) — while the
+# journal names the unit and outlives the scope. The query window is a CURSOR:
+# each successful read advances a durable epoch marker, and the next read asks
+# only for lines SINCE it. That is what keeps attribution honest during a
+# thrashing contained job: without it, a contained kill's line from the
+# PREVIOUS increment still inside a fixed lookback could account for a NEW
+# kill that left no line of its own (a non-main process dying inside a
+# surviving scope writes no unit-failure line) and silence a page. A missing
+# cursor (first run) falls back to a short lookback computed from the LIVE
+# poll interval; a failed query does not advance the cursor. Every failure
+# direction lands on the unattributed PAGE, never on silence.
+_OOM_CURSOR_FILE="$(dirname "$LOG_FILE")/.oom_journal_cursor"
+
+_oom_killed_units() {
+    # Echo unit names the user journal says were oom-killed since the cursor,
+    # one per line. rc!=0 = journal UNAVAILABLE (no journalctl, or the query
+    # failed) — the caller degrades to the unattributed page. rc=0 with empty
+    # output = journal readable, no oom-kill record (also unattributed).
+    command -v journalctl >/dev/null 2>&1 || return 1
+    # Computed per call, not at load time: load_config re-sources watchgod.conf
+    # every tick and may change POLL_INTERVAL — a frozen window shorter than
+    # one poll gap would miss every contained kill and re-open the false pages.
+    local _fallback_s=$(( POLL_INTERVAL * 2 + 60 ))
+    local _since="-${_fallback_s} seconds" _cursor _now
+    _cursor=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || _cursor=""
+    [[ "$_cursor" =~ ^[0-9]+$ ]] && _since="@${_cursor}"
+    _now=$(date +%s)
+    local out rc=0
+    out=$(journalctl --user --since "$_since" --no-pager -o cat 2>/dev/null) || rc=$?
+    [[ $rc -ne 0 ]] && return 1
+    # Advance the cursor only on a SUCCESSFUL read (this function runs in a
+    # command substitution, but file writes escape the subshell).
+    printf '%s' "$_now" > "$_OOM_CURSOR_FILE" 2>/dev/null || true
+    # `-o cat` renders systemd's line as `<unit>: Failed with result 'oom-kill'.`
+    # A unit name can legally contain ':' (template instances); cut would then
+    # truncate it, and a truncated name cannot match a contained prefix — so a
+    # pathological name mis-classifies toward PAGING, the safe direction.
+    printf '%s
+' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1 | sort -u
+}
+
+_oom_units_all_contained() {
+    # $1 = newline-separated non-empty unit list. rc 0 = EVERY unit matches a
+    # contained prefix; any unmatched unit → rc 1 (one uncontained kill pages).
+    local u p ok
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        ok=0
+        for p in $OOM_CONTAINED_UNIT_PREFIXES; do
+            [[ "$u" == "$p"* ]] && { ok=1; break; }
+        done
+        [[ $ok -eq 1 ]] || return 1
+    done <<<"$1"
+    return 0
+}
+
 check_oom_events() {
     # $1 = previous baseline count. Echoes the (possibly-updated) baseline so the
     # caller can carry it to the next tick. On an increment: durable snapshot +
@@ -465,13 +529,33 @@ check_oom_events() {
             echo
         } >> "$OOM_LOG" 2>/dev/null || true
         log WARN "cgroup OOM kill detected (oom_kill ${prev} -> ${cur}); snapshot → ${OOM_LOG}"
-        # Emergency tier (pages): an OOM kill is a discrete serious event — the
-        # usual reason a CC session vanishes with no crash message — not routine
-        # tier pressure, so unlike ORANGE it warrants a proactive page (per the
-        # 2026-08-19 decision). Deduped per distinct oom_kill total.
-        queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
-            "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
-            "watchgod:oom:${cur}"
+        # ATTRIBUTE before paging (issue #1775): the root counter aggregates
+        # oom_kill from every descendant cgroup, so a by-design kill inside a
+        # resource-capped child scope reads identically to genuine container
+        # pressure. Ask the journal which unit died; when EVERY killed unit is
+        # a known contained scope, the cap did its job — record it (snapshot +
+        # WARN log stay either way) and do not page. Anything else — a
+        # non-contained unit, no record, or no journal — pages exactly as
+        # before: attribution can only ever DOWNGRADE a known-contained kill,
+        # never silence an unknown one.
+        local _oom_units="" _oom_who="unattributed"
+        if _oom_units=$(_oom_killed_units); then
+            [[ -n "$_oom_units" ]] && _oom_who=$(printf '%s' "$_oom_units" | paste -sd, -)
+        else
+            _oom_units=""
+        fi
+        if [[ -n "$_oom_units" ]] && _oom_units_all_contained "$_oom_units"; then
+            log WARN "OOM kill contained in [${_oom_who}] — its own resource cap fired, not container pressure; not paging (snapshot kept)"
+        else
+            # Emergency tier (pages): an OOM kill is a discrete serious event —
+            # the usual reason a CC session vanishes with no crash message —
+            # not routine tier pressure, so unlike ORANGE it warrants a
+            # proactive page (per the 2026-08-19 decision). Deduped per
+            # distinct oom_kill total.
+            queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
+                "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}; killed unit(s): ${_oom_who}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
+                "watchgod:oom:${cur}"
+        fi
         # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
         # keep the most recent ~1000 lines so a thrashing container can't leak it.
         local oom_lines

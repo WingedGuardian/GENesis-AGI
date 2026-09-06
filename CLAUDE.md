@@ -467,6 +467,9 @@ every emitter's arithmetic, so this class cannot go quiet again.
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
+- **Diagnosis before fixes.** Always pause to tell the user the diagnosis
+  before rushing to fixes — unless they tell you not to, or the matter is
+  time-urgent.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.

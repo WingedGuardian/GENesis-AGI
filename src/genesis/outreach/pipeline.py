@@ -552,7 +552,7 @@ class OutreachPipeline:
                 logger.warning(
                     "No adapter/recipient for channel %s — dropping (best-effort)", channel,
                 )
-            else:
+            if not best_effort:
                 logger.warning("No adapter/recipient for channel %s — deferring", channel)
                 await self._defer(
                     outreach_id, channel, formatted.text, request,
@@ -938,9 +938,23 @@ class OutreachPipeline:
     async def _defer(
         self, outreach_id: str, channel: str, content: str,
         request: OutreachRequest, reason: str,
-    ) -> None:
+    ) -> bool:
+        """Hand the failed delivery to the deferred-work queue.
+
+        Returns True when the RETRY IS NOW OWNED by the recovery worker — a row
+        was enqueued, or an open row for this topic already exists (the earlier
+        row's retries cover this send). False when no handoff happened (no
+        queue configured, or the enqueue itself failed) and the caller's own
+        durability, if any, must stay in force. The result's `retry_deferred`
+        carries this to callers so two retriers never own one delivery.
+        """
+        if not request.defer_retry:
+            # The caller carries its OWN durable retry (alert-queue drain, or a
+            # recovery re-submission whose row is still open) — deferring here
+            # would put two retriers on one delivery (issue #1781).
+            return False
         if not self._deferred_queue:
-            return
+            return False
         try:
             # Dedup-at-defer: a repeated delivery failure of the SAME topic must
             # not enqueue a fresh row each time (2026-07 outage: 690 duplicate
@@ -959,7 +973,9 @@ class OutreachPipeline:
                     "topic %r already queued",
                     outreach_id, request.topic,
                 )
-                return
+                # Suppressed-as-duplicate still means recovery OWNS a retry for
+                # this topic — the open row's delivery covers this send.
+                return True
             # "outreach_fallback" — deferred-queue work tag (not in model_routing.yaml).
             # No own routing chain; used for cost/event tracking only.
             await self._deferred_queue.enqueue(
@@ -990,3 +1006,5 @@ class OutreachPipeline:
             )
         except Exception:
             logger.exception("Failed to defer outreach %s", outreach_id)
+            return False
+        return True

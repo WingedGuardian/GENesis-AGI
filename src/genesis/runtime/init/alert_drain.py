@@ -69,11 +69,24 @@ def _make_drainer(rt):
                 # namespace (never cross-suppressing a live guardian_alert).
                 signal_type="queued_alert",
                 source_id=identity,
+                # This drain IS the durable retry (14-day file queue, retried
+                # every awareness tick). The pipeline must not ALSO defer a
+                # retry to the recovery worker — its whole budget is ~82
+                # minutes before it discards the row, so handing ownership
+                # over would trade this queue's durability away, and keeping
+                # both owners double-delivers (issue #1781).
+                defer_retry=False,
             ),
         )
         # DELIVERED and REJECTED are both TERMINAL → unlink. REJECTED means the
         # pipeline's own dedup found it redundant; retrying would wedge the entry
-        # in the queue forever. FAILED/HELD/PENDING → keep + retry next tick.
+        # in the queue forever. FAILED/HELD/PENDING → keep + retry next tick —
+        # and because the request above carries `defer_retry=False`, a FAILED
+        # send leaves THIS queue as the delivery's ONLY retrier. Before that
+        # flag existed the pipeline also deferred its own retry, and two
+        # independent retriers owned one delivery: recovery delivered at
+        # 08:31:57 and the kept entry resent at 08:35:42 — one OOM alert, two
+        # pages (issue #1781, MEASURED from the journal + outreach rows).
         return result.status in (OutreachStatus.DELIVERED, OutreachStatus.REJECTED)
 
     async def _drainer() -> None:

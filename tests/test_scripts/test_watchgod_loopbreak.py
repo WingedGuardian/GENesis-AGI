@@ -37,6 +37,31 @@ exit 0
 """
 
 
+# journalctl stub — the OOM attribution path queries the user journal, and a
+# test must never read the REAL one (host-dependent: a live install's journal
+# could carry a genuine contained kill and flip a paging assertion). Installed
+# in every sandbox: STUB_JOURNAL is the `-o cat` output (default empty =
+# journal readable, nothing attributable → unattributed page, the pre-#1775
+# behaviour every older test asserts), STUB_JOURNAL_RC simulates an
+# unavailable journal.
+_JOURNALCTL_STUB = r"""#!/usr/bin/env bash
+[[ -n "${STUB_JOURNAL_ARGLOG:-}" ]] && echo "$*" >> "$STUB_JOURNAL_ARGLOG"
+[[ "${STUB_JOURNAL_RC:-0}" != 0 ]] && exit "${STUB_JOURNAL_RC}"
+# Minimal --since honoring, just enough to test the cursor: when
+# STUB_JOURNAL_TS is set and the query asks for lines since an epoch AFTER it
+# (--since "@<epoch>"), the stubbed line is out of window - print nothing.
+if [[ -n "${STUB_JOURNAL_TS:-}" ]]; then
+  for a in "$@"; do
+    if [[ "$a" == @* && "${a#@}" -gt "${STUB_JOURNAL_TS}" ]]; then
+      exit 0
+    fi
+  done
+fi
+[[ -n "${STUB_JOURNAL:-}" ]] && printf '%s\n' "${STUB_JOURNAL}"
+exit 0
+"""
+
+
 def _make_exec(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -51,6 +76,7 @@ def _sandbox(tmp_path):
     bind = tmp_path / "bin"
     bind.mkdir()
     _make_exec(bind / "tmux", _TMUX_STUB)
+    _make_exec(bind / "journalctl", _JOURNALCTL_STUB)
     return home, cctmp, bind
 
 
@@ -240,3 +266,156 @@ def test_oom_unavailable_is_noop(tmp_path):
     )
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
     assert "BASELINE=3" in out.stdout, out.stdout  # baseline preserved, no crash
+
+
+# ── Issue #1775: attribute the kill before paging ────────────────────────
+
+
+_KILL_LINE = "code-intel-4408aa696643-cbm-4107466.scope: Failed with result 'oom-kill'."
+
+
+def test_oom_contained_kill_snapshots_but_does_not_page(tmp_path):
+    """The false-alarm class this closes: a kill inside a known resource-capped
+    scope is containment working — durable snapshot + WARN log, no page."""
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": _KILL_LINE},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "BASELINE=5" in out.stdout, out.stdout  # baseline still advances
+    # The durable record survives — only the PAGE is downgraded.
+    oom_log = (home / ".genesis" / "logs" / "oom_events.log").read_text()
+    assert "oom_kill 4 -> 5 (+1)" in oom_log, oom_log
+    assert not (home / ".genesis" / "alerts" / "calls.log").exists(), "must not page"
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "contained in [code-intel-4408aa696643-cbm-4107466.scope]" in wg_log, wg_log
+
+
+def test_oom_noncontained_unit_pages_and_names_it(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {
+            "OOM_EVENTS_FILE": str(oom),
+            "STUB_JOURNAL": "run-u1234.scope: Failed with result 'oom-kill'.",
+        },
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    calls = (home / ".genesis" / "alerts" / "calls.log").read_text()
+    assert "emergency watchgod:oom" in calls, calls
+    assert "run-u1234.scope" in calls, calls  # the page NAMES the killed unit
+
+
+def test_oom_mixed_units_page(tmp_path):
+    # One contained + one not → page: attribution may only downgrade a kill
+    # when EVERY killed unit is accounted for.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 6)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {
+            "OOM_EVENTS_FILE": str(oom),
+            "STUB_JOURNAL": _KILL_LINE
+            + "\nrun-u1234.scope: Failed with result 'oom-kill'.",
+        },
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "emergency watchgod:oom" in (home / ".genesis" / "alerts" / "calls.log").read_text()
+
+
+def test_oom_journal_unavailable_degrades_to_the_page(tmp_path):
+    # No journal → the pre-attribution behaviour, unattributed page. Never
+    # silence on missing evidence.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL_RC": "1"},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    calls = (home / ".genesis" / "alerts" / "calls.log").read_text()
+    assert "emergency watchgod:oom" in calls, calls
+    assert "unattributed" in calls, calls
+
+
+def test_oom_contained_prefixes_are_configurable(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {
+            "OOM_EVENTS_FILE": str(oom),
+            "STUB_JOURNAL": "myjob-heavy.scope: Failed with result 'oom-kill'.",
+            "OOM_CONTAINED_UNIT_PREFIXES": "myjob-",
+        },
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert not (home / ".genesis" / "alerts" / "calls.log").exists()
+
+
+def test_oom_stale_contained_line_cannot_account_for_a_new_kill(tmp_path):
+    """The cursor closes the one silence path attribution had.
+
+    Scenario: a contained kill's journal line is consumed by increment N; a
+    SECOND increment follows whose kill left no line of its own (a non-main
+    process dying inside a surviving scope writes no unit-failure record).
+    Under a fixed lookback the old line was still in window and silently
+    accounted for the new kill; with the cursor advanced past it, the second
+    increment reads an EMPTY journal and pages unattributed.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    snippet = (
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{oom}"; '
+        # The stubbed line "exists" 10s in the past; the first call's fallback
+        # window (relative --since, no @epoch) sees it, the cursor written by
+        # that call is NEWER, so the second call's @cursor query does not.
+        + 'STUB_JOURNAL_TS=$(( $(date +%s) - 10 )); export STUB_JOURNAL_TS; '
+        + 'r1=$(check_oom_events 4); echo "B1=$r1"; '
+        + f'printf \'%s\' "low 0\nhigh 0\nmax 0\noom 3\noom_kill 6\noom_group_kill 0\n" > "{oom}"; '
+        + 'sleep 1; r2=$(check_oom_events "$r1"); echo "B2=$r2"'
+    )
+    out = _run(home, bind, snippet, {"STUB_JOURNAL": _KILL_LINE})
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "B1=5" in out.stdout and "B2=6" in out.stdout, out.stdout
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "contained in [" in wg_log, wg_log  # first increment: downgraded
+    calls = home / ".genesis" / "alerts" / "calls.log"
+    assert calls.exists(), "second increment must PAGE — its kill has no line"
+    body = calls.read_text()
+    assert "unattributed" in body and "oom_kill 5->6" in body, body
+
+
+def test_oom_journal_query_uses_the_cursor_after_the_first_read(tmp_path):
+    # Mechanism pin: call 1 has no cursor file → relative fallback window;
+    # call 2 must query --since "@<epoch>" with the epoch call 1 recorded.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    arglog = tmp_path / "journal_args.log"
+    snippet = (
+        _PRELUDE
+        + f'OOM_EVENTS_FILE="{oom}"; '
+        + 'r1=$(check_oom_events 4); '
+        + f'printf \'%s\' "low 0\nhigh 0\nmax 0\noom 3\noom_kill 6\noom_group_kill 0\n" > "{oom}"; '
+        + 'r2=$(check_oom_events "$r1"); true'
+    )
+    out = _run(home, bind, snippet, {"STUB_JOURNAL_ARGLOG": str(arglog)})
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    lines = arglog.read_text().splitlines()
+    assert len(lines) == 2, lines
+    assert " seconds" in lines[0] and "@" not in lines[0], lines[0]  # fallback window
+    assert "@" in lines[1], lines[1]  # cursor used

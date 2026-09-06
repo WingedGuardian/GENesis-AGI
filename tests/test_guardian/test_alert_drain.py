@@ -114,3 +114,26 @@ def test_wire_sets_drainer_when_loop_present():
 
     alert_drain.wire(_RT(loop=_Loop()))
     assert callable(installed.get("fn"))
+
+
+@pytest.mark.asyncio
+async def test_drain_request_opts_out_of_pipeline_deferral(tmp_path, monkeypatch):
+    """THE #1781 lock: the drain's request must carry defer_retry=False.
+
+    This queue is the alert's durable retrier (14-day file queue, retried
+    every awareness tick). If the pipeline ALSO defers a failed send to the
+    recovery worker, two independent retriers own one delivery — MEASURED
+    2026-09-05: recovery delivered the OOM alert at 08:31:57 and the kept
+    queue entry resent it at 08:35:42, one alert paged twice. The inverse
+    design (unlink the entry on deferral) was reviewed and REJECTED: recovery
+    discards a row after ~82 minutes of backoff, so it trades the duplicate
+    for a DROPPED page on any longer outage.
+    """
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: tmp_path)
+    _enqueue(tmp_path, dedupe_key="watchgod:oom:155")
+    pipeline = _FakePipeline(OutreachStatus.FAILED)
+    await alert_drain._make_drainer(_RT(pipeline=pipeline))()
+    (_, request) = pipeline.calls[0]
+    assert request.defer_retry is False
+    # And FAILED keeps the entry — this queue stays the single owner.
+    assert len(list(tmp_path.glob("*.json"))) == 1
