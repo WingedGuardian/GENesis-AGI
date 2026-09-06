@@ -272,12 +272,42 @@ the question. Query SQLite `cc_sessions` for structured session data. Use
 `db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
 **Grep transcripts is LAST RESORT** — only after all above fail.
 
-**When to store back:**
-If you synthesize an answer from multiple recalled memories — something that
-connects information in a new way — store it via `memory_store` with
-`tags: ["synthesis"]` and appropriate wing/room tags. This is how the memory
-system compounds over time. Don't store routine answers; store genuine syntheses
-that would be expensive to re-derive.
+**When to store back — the test is RE-DERIVATION COST, not importance.**
+Store to Genesis memory when a future session would have to REDO WORK to know
+this. That is a question about the work you just did, which you can answer; "is
+this important?" is a question about the future, which you cannot, and it is why
+the rule below used to fire so rarely. Three concrete triggers:
+
+1. **You MEASURED something** that took real effort to obtain — a probe you had
+   to design, an enumeration across a directory, a live-state check. Store the
+   number WITH its denominator and the method, because the method is usually what
+   the next session gets wrong.
+2. **You established a durable ARCHITECTURAL fact** — X exists, X works this way,
+   X is not what its name suggests. Especially when you went looking for X
+   expecting it to be absent.
+3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
+   Use `supersedes` to link the correction to what it replaces. This is the
+   highest-value trigger and the easiest to skip, because being wrong does not
+   feel like a finding. It is the one that stops the next session paying for the
+   same mistake.
+
+Also store a genuine SYNTHESIS — an answer connecting several recalled memories
+in a new way — with `tags: ["synthesis"]`. Don't store routine answers, restatements
+of what a file already says, or anything the repo records on its own.
+
+**Do not park a durable FACT in CC file memory.** The two systems differ in
+LIFETIME, not just audience: CC file memory is for behavioural rules that must
+shape *how you work*, and it is compacted away within months, so a fact left
+there is a fact you will silently lose. Genesis memory is permanent and
+recallable system-wide. A measurement, an architecture note, or a correction
+belongs there even when it also taught you a behavioural lesson — in that case
+store BOTH: the rule in CC memory, the fact in Genesis memory.
+
+(Origin: a 2026-09-05 session measured an embedding regression, enumerated an
+init-path invariant across 33 modules, and corrected a wrong architectural claim
+of its own — then wrote only the behavioural lessons to CC memory and stored
+nothing durable until the user asked why. The routing rule was clear; nothing
+told it WHEN.)
 
 **Wings (structural domains):**
 Memories are tagged with a `wing` (top-level domain) and optional `room`
@@ -355,6 +385,18 @@ until you do, because an unset mission falls back to the raw origin prompt and
 reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
+
+**PR-body convention — `E2E:` (required, merge-gated):** every PR body declares
+the POST-MERGE end-to-end verification its change needs, on its own line:
+`E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
+The merge gate blocks a PR that declares neither — and a `none` carrying no real
+reason (a bare `none`, a placeholder, or a refusal word like TBD). Merge time
+only, never on push. PRs created before the convention are exempt; if the PR's
+creation date cannot be READ, the gate blocks rather than assuming the
+exemption. `none` is a fine answer for a docs PR; what is refused is leaving the
+decision unmade. It does NOT release
+the validator, which assumes every merged PR has an E2E and hunts for one anyway
+— the line is its first lead, not a boundary.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -443,7 +485,9 @@ every emitter's arithmetic, so this class cannot go quiet again.
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
-  repo instead of getting done.
+  repo instead of getting done. (Merge-DRIVING specifically — when to actively
+  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
