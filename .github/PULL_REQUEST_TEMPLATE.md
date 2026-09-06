@@ -23,17 +23,19 @@ Closes #
 - [ ] `pytest -v` passes
 - [ ] `docs/architecture/CURRENT.md` updated (entry prose + `verified:` stamp) if subsystem capabilities changed
 
-<!-- REQUIRED, and the merge gate enforces it: declare the POST-MERGE end-to-end
+<!-- OPTIONAL but worth 10 seconds: declare the POST-MERGE end-to-end
      verification this change needs. Replace the line below with one of:
 
        E2E: <one-line plan for the post-merge verification>
        E2E: none — <reason there is no runtime surface to verify>
 
-     `none` is a legitimate answer for a docs/prose PR — what is not legitimate is
-     leaving the decision unmade. Note it passes the gate but does NOT release the
-     validator, which assumes every merged PR has an E2E and hunts for one anyway;
-     the line is its first lead, not a boundary. (This guidance lives inside a
-     comment on purpose: the gate strips comments before reading, so the template
-     itself can never satisfy the gate.) -->
+     `none` is a legitimate answer for a docs/prose PR. Leaving the line empty
+     does not block the merge — but nothing else records the decision yet either:
+     the per-merge verification row that will carry this automatically is not
+     built (issue #1718), so today this line is the only record. Once it exists,
+     declaring here pre-fills that row with what YOU know instead of leaving a
+     validator to reverse-engineer it from the diff days later. (This guidance
+     lives inside a comment on purpose: comments are stripped before the line is
+     read, so the template can never fill itself in.) -->
 
 E2E:

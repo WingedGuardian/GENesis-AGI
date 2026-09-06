@@ -27,18 +27,19 @@ def _pin_required_ci_workflows(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _hermetic_e2e_declaration(monkeypatch):
-    """Give EVERY hook test a PR body that satisfies the E2E-obligation gate (§8.12).
+    """Keep the ADVISORY E2E read hermetic for EVERY hook test (§8.12).
 
-    That gate fails CLOSED on an unreadable body and on an unreadable ``createdAt``
-    — deliberately, since it guards every merge — so without this pin each test
-    that drives the merge gate or its report would make a LIVE ``gh pr view`` call:
-    green on a dev box with gh authenticated and PR "1" answering, red in CI, and
-    in both cases testing the network rather than the thing under test.
+    The reader shells out to ``gh pr view`` for the body and for ``createdAt``, so
+    without this pin each test that drives the merge arm or its report would make a
+    LIVE call: green on a dev box with gh authenticated and PR "1" answering, red in
+    CI, and in both cases testing the network rather than the thing under test.
 
-    This is the hermetic DEFAULT, not a waiver. The gate's own behaviour — every
-    verdict, both fail directions, the cutoff, and the degraded path — is exercised
-    in tests/test_hooks/test_e2e_plan_gate.py, which overrides these per case; a
-    later ``monkeypatch.setenv`` in any test wins over this one."""
+    Since 2026-09-06 the reader is advisory, so what this prevents is NOTE noise on
+    unrelated tests, not a false block — nothing here can fail a merge. It is still
+    the hermetic default rather than a waiver: the reader's own behaviour (every
+    classification, both report directions, the cutoff, the degraded path) is
+    exercised in tests/test_hooks/test_e2e_plan_gate.py, which overrides these per
+    case; a later ``monkeypatch.setenv`` in any test wins over this one."""
     monkeypatch.setenv("_TEST_GH_PR_BODY", "E2E: none — hermetic default for hook tests\n")
     monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
     yield

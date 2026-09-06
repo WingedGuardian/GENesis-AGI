@@ -1048,17 +1048,21 @@ _CASES: list[tuple[str, object, int, str]] = [
         0,
         "",
     ),
-    # ── E2E obligation (§8.12) ──────────────────────────────────────────────
-    # These drive the REAL merge command through the hook. The gate's first
-    # "wiring" tests were source-string greps, and MEASURED: replacing the
-    # enforcement branch with `if False:` left the call in place, so all 147
-    # tests stayed green while the gate did nothing. A grep proves a call exists;
-    # only an exit code proves it BLOCKS.
+    # ── E2E obligation (§8.12) — ADVISORY, never blocking ───────────────────
+    # These drive the REAL merge command through the hook, which is the only
+    # thing that proves a verdict: MEASURED on the blocking version, replacing
+    # the enforcement branch with `if False:` left the call in place and all 147
+    # tests stayed green. A grep proves a call exists; only an exit code proves
+    # what it DOES. The exit code these now assert is 0 — the owner reversed the
+    # hard-fail on 2026-09-06 because the block never made the JUDGMENT
+    # deterministic (an LLM decides either way; a block only guarantees a
+    # sentence exists, not that it is true) while taxing every merge on an n=2
+    # justification. The obligation lives in the per-merge row instead.
     (
-        "e2e_declaration_absent_blocks_merge",
+        "e2e_declaration_absent_is_advisory_not_blocking",
         lambda mp: _run(mp, _merge_cmd(), pr_body="A body that never decided.\n"),
-        2,
-        "no post-merge E2E decision",
+        0,
+        "no post-merge E2E decision",  # the NOTE still fires, on a passing merge
     ),
     (
         "e2e_none_with_reason_allows_merge",
@@ -1077,9 +1081,9 @@ _CASES: list[tuple[str, object, int, str]] = [
         "",
     ),
     (
-        "e2e_bare_none_blocks_merge",
+        "e2e_bare_none_is_advisory_not_blocking",
         lambda mp: _run(mp, _merge_cmd(), pr_body="E2E: none\n"),
-        2,
+        0,
         "no post-merge E2E decision",
     ),
     (

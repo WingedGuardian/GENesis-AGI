@@ -4881,33 +4881,38 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
 
 
 def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
-    """Block a merge whose PR body never DECIDED about a post-merge E2E (§8.12).
+    """Report whether a PR body DECIDED about its post-merge E2E (§8.12).
 
-    Returns (should_block, message). The obligation is one line in the PR body —
-    either a plan or an explicit reasoned ``none`` (see scripts/e2e_declaration.py
-    for the full convention and why its parsing is what it is).
+    Returns ``(undeclared, message)``. ``undeclared`` is a FINDING, not a
+    verdict: no caller blocks on it. The merge arm prints an advisory NOTE and
+    proceeds; ``--check-pr`` prints an ``advisory`` row that never counts toward
+    `failures`. Keeping the severity in the CALLERS is what let this become
+    advisory without touching a line of the classification below.
 
     GUARD AXIOMS, stated because every gate change owes them:
-      * VERDICT: block, at MERGE time only. The push arm never calls this — a
-        body is written and revised while a PR is open, so demanding it at push
-        would gate the wrong moment.
-      * AUDIENCE: the agent. The message names both valid forms verbatim.
-      * BACKGROUND: none. Background sessions cannot merge PRs by design, so this
-        cannot impede one.
+      * VERDICT: **advisory** (owner decision 2026-09-06, reversing the
+        2026-09-05 hard-fail). A block only guaranteed that a SENTENCE EXISTS,
+        never that it was true, so it added no determinism to the judgment —
+        while taxing every merge on an n=2 justification. The obligation is
+        MEANT to be carried by a per-merge row from the repo-pulse worker; that
+        row is UNBUILT (issue #1718, half B), so in the interim this advisory is
+        the only record. See the merge-arm comment.
+      * AUDIENCE: the agent — and both callers print the WHOLE message, whose
+        tail is ``GUIDANCE`` (both valid forms plus copyable examples). Printing
+        only its first line silently drops the remedy; that is the failure this
+        line exists to prevent, not a claim about the string's contents.
+      * BACKGROUND: none — background sessions cannot merge PRs by design.
 
-    Fail directions, each chosen rather than inherited:
-      * body UNREADABLE → BLOCK. This gate guards EVERY merge, so an unreadable
-        body is an unanswered question, not a pass. (The pin gate fails open on
-        the same read because it guards only the rare pin-bump path — the
-        divergence is deliberate, not an oversight.)
-      * createdAt UNREADABLE → BLOCK, naming the cause. Treating it as "old"
-        would turn the transition window into a permanent hole.
+    "Fail direction" now means which way an UNREADABLE input is REPORTED, since
+    nothing blocks:
+      * body UNREADABLE → reported undeclared. An unread body is an unanswered
+        question, not a pass — the row will still be opened post-merge.
+      * createdAt UNREADABLE → reported undeclared, naming the cause, rather than
+        assuming the pre-convention exemption.
       * parser module MISSING → the body is still scanned for a bare ``E2E:``
-        line and a NOTE says the comment/fence stripping was unavailable. Losing
-        the invisibility defence must not lose the whole gate.
+        line and a NOTE says the comment/fence stripping was unavailable.
 
-    NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
-    escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
+    No override sigil exists because there is nothing to override.
     """
     # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
     # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
@@ -6685,20 +6690,53 @@ def main() -> int:
                     # above records as measured (architect SHOULD-FIX, 2026-09-06).
                     print(receipts_msg, file=sys.stderr)
 
-                # E2E obligation (§8.12). Sits beside the pin gate because it is
-                # the same KIND of check — a merge-time read of the PR body, which
-                # stays mutable after any CI run — and because both are cheap
-                # reads that should fail before the expensive finding scans.
-                # Like the pin gate it carries NO override sigil: `E2E: none —
-                # <reason>` is the escape hatch, and it costs one honest sentence.
-                should_block, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
-                if should_block:
+                # E2E obligation (§8.12) — ADVISORY, never blocking (owner
+                # decision 2026-09-06, reversing the 2026-09-05 hard-fail call).
+                #
+                # The gate never made the JUDGMENT deterministic: whether a change
+                # needs an E2E is an LLM call either way, and a block only
+                # guarantees that a SENTENCE EXISTS, not that it is true —
+                # `E2E: none — docs only` on a code PR passes and the gate cannot
+                # tell. Worse, a mandatory field produces compliance text: a line
+                # typed to get past a gate is the cheapest thing that passes, which
+                # is lower-quality signal than a line written because the author
+                # had something to say. Against that, the block's measured
+                # justification was 1-of-2 merges (n=2) — far under this repo's own
+                # bar for escalating past advisory — while binding EVERY merge
+                # forever, including external contributors who have never heard of
+                # the convention.
+                #
+                # What WILL close the obligation is a durable row: a follow-on PR
+                # (issue #1718, half B) teaches the repo-pulse worker to open one
+                # per merged PR, auto-closed with the reason recorded when the diff
+                # is documentation-only. **UNBUILT as of this commit** — 0 of the 5
+                # repo_pulse modules contain it. Until it lands, this NOTE is the
+                # only thing that remembers, which is a deliberate and tracked gap,
+                # not a covered one. Say so rather than implying coverage: the
+                # measured miss rate the block was justified by is unmitigated in
+                # the interim, and a message claiming otherwise is worse than
+                # silence.
+                #
+                # Branch on the RETURNED FLAG, never on the message text. Both arms
+                # must apply the same predicate to the same value or "report and
+                # enforcement share a function so they cannot disagree" stops being
+                # true — sharing the call while re-deriving severity from a string
+                # prefix is the divergence wearing the invariant's clothes.
+                undeclared, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
+                if undeclared:
                     print(
-                        f"BLOCKED: PR #{pr_num} — no post-merge E2E decision in the PR body.",
+                        f"NOTE: PR #{pr_num} — no post-merge E2E decision in the PR "
+                        f"body. Not blocking. The obligation row that will carry this "
+                        f"automatically is NOT built yet (issue #1718), so right now "
+                        f"this NOTE is the only record. Declaring one takes 10 seconds:",
                         file=sys.stderr,
                     )
+                    # The WHOLE message: its tail is GUIDANCE, which carries both
+                    # valid forms and two copyable examples. Printing only line 0
+                    # ended a colon-promise with a restatement of the problem and
+                    # dropped the remedy — an advisory minus its remedy is noise,
+                    # which is the strongest argument for ignoring it.
                     print(e2e_msg, file=sys.stderr)
-                    return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6984,14 +7022,20 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
     failures += 1 if blocked else 0
-    # E2E obligation (§8.12), same tier and same reason as pin-receipts: a
-    # merge-time read of a mutable body, so CI could never be its authority.
-    blocked, msg = _check_e2e_plan(pr_num, repo=repo)
-    print(f"e2e-plan       : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
-    if blocked:
+    # E2E obligation (§8.12) — ADVISORY. Reported so the declaration is visible
+    # at merge time, but it NEVER contributes to `failures`: the enforcement arm
+    # does not block on it either, and a report row that counted a gate the gate
+    # does not enforce would be the report and the enforcement disagreeing —
+    # the one property this whole report rests on not doing.
+    undeclared, msg = _check_e2e_plan(pr_num, repo=repo)
+    if undeclared:
+        print(f"e2e-plan       : advisory — {msg.splitlines()[0]}")
+        # Indented tail, the same idiom pin-receipts and scheduled-review use —
+        # the remedy is the point of an advisory.
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
-    failures += 1 if blocked else 0
+    else:
+        print(f"e2e-plan       : {msg.splitlines()[0]}")
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]

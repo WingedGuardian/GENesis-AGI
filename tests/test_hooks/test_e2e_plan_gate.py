@@ -1,17 +1,25 @@
-"""The E2E-obligation merge gate (`_check_e2e_plan` in git_push_guard.py, §8.12).
+"""The E2E-obligation READER (`_check_e2e_plan` in git_push_guard.py, §8.12).
+
+ADVISORY since 2026-09-06 (owner reversal of the 2026-09-05 hard-fail). The
+function's first return value is `undeclared` — a FINDING, not a verdict. NO
+caller blocks on it: the merge arm prints a NOTE and proceeds, and the
+`--check-pr` row never counts toward `failures`. Every name and assertion below
+is about the CLASSIFICATION, never a merge verdict; the exit-code proof that
+nothing blocks lives in tests/test_hooks/test_merge_gate_characterization.py,
+whose `e2e_*` cases drive the real merge command.
 
 The parser's own semantics are covered in tests/test_scripts/test_e2e_declaration.py.
-What is tested HERE is the gate's contract, which is a different thing and fails in
-different directions:
+What is tested HERE:
 
-  * it blocks at MERGE time and nowhere else (a body is written and revised while a
-    PR is open — gating a push would gate the wrong moment);
-  * pre-cutoff PRs are exempt, so landing this does not retro-block the open queue;
-  * every unreadable input BLOCKS rather than passing, and says which one;
+  * it is read at MERGE time and nowhere else (a body is written and revised while
+    a PR is open — reading it at push would read the wrong moment);
+  * pre-cutoff PRs are exempt, so the convention never reached back over the queue;
+  * every unreadable input is REPORTED UNDECLARED rather than passing silently,
+    and says which one;
   * a missing parser module degrades to a presence-only scan with a NOTE, rather
-    than taking the whole gate down with it;
-  * the report row mirrors the enforcement arm (they call the same function, so a
-    bug in one is a bug in both — the property the whole report rests on).
+    than taking the whole reader down with it;
+  * the report row and the merge arm consume the SAME returned flag, so they
+    cannot disagree — the property the whole report rests on.
 
 Network-free throughout via the `_TEST_GH_*` env seams.
 """
@@ -49,53 +57,53 @@ def _post_cutoff(monkeypatch):
     monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
 
 
-class TestVerdicts:
+class TestClassification:
     def test_plan_passes(self, guard, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_BODY", _PLAN)
-        blocked, msg = guard._check_e2e_plan("100")
-        assert not blocked, msg
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert not undeclared, msg
         assert "plan" in msg
 
     def test_none_with_reason_passes(self, guard, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_BODY", _NONE)
-        blocked, msg = guard._check_e2e_plan("100")
-        assert not blocked, msg
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert not undeclared, msg
         assert "none" in msg
 
-    def test_absent_declaration_blocks(self, guard, monkeypatch):
+    def test_absent_declaration_is_reported_undeclared(self, guard, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_BODY", "A body that never decided.\n")
-        blocked, msg = guard._check_e2e_plan("100")
-        assert blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert undeclared
         assert "E2E: <one-line plan" in msg and "E2E: none —" in msg
 
-    def test_bare_none_blocks_and_says_why(self, guard, monkeypatch):
-        """The message must name THIS mistake, not just block.
+    def test_bare_none_is_undeclared_and_says_why(self, guard, monkeypatch):
+        """The message must name THIS mistake, not merely report one.
 
-        `"reason" in msg` was vacuous: GUIDANCE is appended to every block message
+        `"reason" in msg` was vacuous: GUIDANCE is appended to every message
         and itself contains "<reason there is no runtime surface to verify>", so the
         assertion passed for the generic detail too (CodeRabbit Minor, 2026-09-06).
         Assert the specific detail, and assert the generic one is ABSENT."""
         monkeypatch.setenv("_TEST_GH_PR_BODY", "E2E: none\n")
-        blocked, msg = guard._check_e2e_plan("100")
-        assert blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert undeclared
         assert "needs a REASON" in msg, "must name the bare-`none` mistake specifically"
         assert "no real content" not in msg, "must not fall back to the generic detail"
 
-    def test_placeholder_block_uses_the_generic_detail(self, guard, monkeypatch):
+    def test_placeholder_uses_the_generic_detail(self, guard, monkeypatch):
         """The control that makes the assertion above discriminating: a DIFFERENT
         invalid shape must produce a DIFFERENT detail."""
         monkeypatch.setenv(
             "_TEST_GH_PR_BODY", "E2E: <one-line plan for the post-merge verification>\n"
         )
-        blocked, msg = guard._check_e2e_plan("100")
-        assert blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert undeclared
         assert "no real content" in msg
         assert "needs a REASON" not in msg
 
-    def test_block_message_names_the_validator_seam(self, guard, monkeypatch):
-        """§8.13: `none` passes this gate but does NOT release the validator. An
-        author reading the block must learn the whole contract, or `none` becomes
-        folklore for "no E2E needed"."""
+    def test_advisory_message_names_the_validator_seam(self, guard, monkeypatch):
+        """§8.13: `none` satisfies this reader but does NOT release the validator.
+        An author reading the advisory must learn the whole contract, or `none`
+        becomes folklore for "no E2E needed"."""
         monkeypatch.setenv("_TEST_GH_PR_BODY", "nothing\n")
         _, msg = guard._check_e2e_plan("100")
         assert "validator" in msg.lower()
@@ -108,23 +116,23 @@ class TestVerdicts:
         assert "E2E obligation declared" in capsys.readouterr().err
 
 
-class TestFailDirections:
-    def test_unreadable_body_blocks(self, guard, monkeypatch):
+class TestReportDirections:
+    def test_unreadable_body_is_reported_undeclared(self, guard, monkeypatch):
         """Diverges from the pin gate on purpose: that one fails OPEN on an
         unreadable body because it guards the rare pin-bump path; this one guards
         EVERY merge, so an unread body is an unanswered question."""
         monkeypatch.delenv("_TEST_GH_PR_BODY", raising=False)
         monkeypatch.setattr(guard, "_pr_body_text", lambda *a, **k: None)
-        blocked, msg = guard._check_e2e_plan("100")
-        assert blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert undeclared
         assert "unreadable" in msg.lower()
 
-    def test_unreadable_created_at_blocks_naming_the_cause(self, guard, monkeypatch):
+    def test_unreadable_created_at_is_undeclared_naming_the_cause(self, guard, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_BODY", _PLAN)
         monkeypatch.delenv("_TEST_GH_PR_CREATED_AT", raising=False)
         monkeypatch.setattr(guard, "_pr_created_at", lambda *a, **k: None)
-        blocked, msg = guard._check_e2e_plan("100")
-        assert blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert undeclared
         assert "createdAt" in msg
 
     def test_parser_unavailable_degrades_to_presence_scan(self, guard, monkeypatch, capsys):
@@ -132,18 +140,18 @@ class TestFailDirections:
         line still passes, and the NOTE says what protection was unavailable."""
         monkeypatch.setenv("_TEST_GH_PR_BODY", _PLAN)
         monkeypatch.setattr(guard, "_load_e2e_declaration", lambda: None)
-        blocked, msg = guard._check_e2e_plan("100")
-        assert not blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert not undeclared
         assert "degraded" in msg
         err = capsys.readouterr().err
         assert "WITHOUT comment/fence stripping" in err
         assert "hidden in an HTML comment" in err, "the NOTE must name what is now unprotected"
 
-    def test_parser_unavailable_still_blocks_a_body_with_no_line(self, guard, monkeypatch):
+    def test_parser_unavailable_still_reports_a_body_with_no_line(self, guard, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_BODY", "no declaration here\n")
         monkeypatch.setattr(guard, "_load_e2e_declaration", lambda: None)
-        blocked, _ = guard._check_e2e_plan("100")
-        assert blocked
+        undeclared, _ = guard._check_e2e_plan("100")
+        assert undeclared
 
     def test_degraded_fallback_refuses_the_untouched_pr_template(self, guard):
         """The degraded path cannot strip HTML comments, and the shipped template's
@@ -179,8 +187,8 @@ class TestFailDirections:
         monkeypatch.setenv("_TEST_GH_PR_BODY", "an old body, no declaration\n")
         monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2020-01-01T00:00:00Z")
         monkeypatch.setattr(guard, "_load_e2e_declaration", lambda: None)
-        blocked, msg = guard._check_e2e_plan("100")
-        assert not blocked, msg
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert not undeclared, msg
         assert "n/a" in msg
 
     def test_the_degraded_cutoff_mirror_matches_the_parser(self, guard):
@@ -196,11 +204,11 @@ class TestCutoff:
         """The transition rule: landing this must not retro-block the open queue."""
         monkeypatch.setenv("_TEST_GH_PR_BODY", "an old body, no declaration\n")
         monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2020-01-01T00:00:00Z")
-        blocked, msg = guard._check_e2e_plan("100")
-        assert not blocked
+        undeclared, msg = guard._check_e2e_plan("100")
+        assert not undeclared
         assert "n/a" in msg
 
-    def test_post_cutoff_pr_is_bound(self, guard, monkeypatch):
+    def test_post_cutoff_pr_is_in_scope(self, guard, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_BODY", "a new body, no declaration\n")
         monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
         assert guard._check_e2e_plan("100")[0] is True
@@ -222,6 +230,23 @@ class TestWiring:
         text = _GUARD.read_text()
         assert "e2e-plan       :" in text, "the report must carry the row"
         assert text.count("_check_e2e_plan(") >= 3, "def + merge arm + report row"
+
+    def test_both_arms_branch_on_the_returned_flag_not_the_message_text(self):
+        """Sharing the FUNCTION was never the invariant — sharing the PREDICATE is.
+
+        The advisory rewrite briefly had the merge arm discard the returned bool and
+        re-derive severity from `e2e_msg.startswith(("ok", "n/a"))` while the report
+        row used the bool. Both agreed that day, so every test passed; the coupling
+        was invisible and unlocked, and renaming a label to "declared (plan)" — or a
+        case change, since startswith is case-sensitive — would have made the merge
+        arm emit a NOTE on a PR the report calls ok. That is the report/enforcement
+        divergence wearing the shared-function invariant's clothes (architect
+        SHOULD-FIX, 2026-09-06)."""
+        text = _GUARD.read_text()
+        assert "e2e_msg.startswith" not in text, (
+            "the merge arm must branch on the returned flag; re-deriving severity "
+            "from the message text recreates the divergence this file forbids"
+        )
 
 
 class TestEndToEndThroughTheHook:

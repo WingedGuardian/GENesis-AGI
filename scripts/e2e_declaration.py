@@ -17,7 +17,7 @@ THE CONVENTION, in the PR body:
 The point is NOT to force an E2E onto a docs PR. It is to make the DECISION explicit
 — the obligation-side twin of "a check that could not run must say so" (#1683).
 
-`none` PASSES THE GATE BUT DOES NOT RELEASE THE VALIDATOR (spec §8.13). A validation
+`none` SATISFIES THIS READER BUT DOES NOT RELEASE THE VALIDATOR (spec §8.13). A validation
 session assumes every merged PR has an end-to-end test and hunts for it; this line is
 its first LEAD, never a boundary. So `none` is a declaration, not an authority — a
 builder who forgets, or who declares `none` wrongly, is still caught from the merge
@@ -40,8 +40,10 @@ deliberately rather than re-learned:
   * Horizontal whitespace only (`[^\\S\\n]`) around the colon. Plain `\\s*` crosses
     newlines, which let an EMPTY marker borrow the NEXT line's text as its value.
   * Markdown wrappers are tolerated (`-`, `*`, `>`, `- [x]`, `**E2E**`, `` `E2E` ``).
-    Blocking a compliant PR at merge time is how an operator learns to route around
-    a gate.
+    Refusing to read a compliant PR's declaration is how an operator learns to
+    ignore the advisory. (Written when this reader gated the merge; it is
+    advisory since 2026-09-06, and the tolerance is worth keeping either way —
+    an advisory nobody's declaration matches is an advisory nobody reads.)
   * EVERY occurrence is considered, not the first: a leftover template line above a
     filled one must not veto the filled one.
   * Placeholders are derived from the shipped examples, never hand-listed.
@@ -53,8 +55,8 @@ That rejection is right for a 32-hex id, where any trailing text means the line 
 prose about an id rather than a claim on it. Here the trailing text IS the payload,
 so both-end anchoring cannot be copied. What replaces it is line-START anchoring plus
 a substance check on the reason: prose like "the E2E: I ran it by hand" does not
-begin a line at the marker, and `E2E: none` with no reason is INVALID (blocks) rather
-than a silent pass.
+begin a line at the marker, and `E2E: none` with no reason is INVALID (reported
+undeclared) rather than a silent pass.
 
 Pure functions, stdlib only, no I/O — so the merge gate and the repo-pulse worker can
 both load it without dragging in the other's dependencies.
@@ -97,7 +99,7 @@ _REFUSAL_WORDS = frozenset({"todo", "tbd", "pending", "n/a", "na", "yes", "no", 
 #: 2026-09-06): at 12 this rejected `none — docs only` (8 alnum) — the exact string
 #: this module's own GUIDANCE prints as the remedy. On a gate with NO override
 #: sigil that is a closed loop: the author is blocked, types the suggested line
-#: verbatim, and is blocked identically, with nothing in the message naming an
+#: verbatim, and is refused identically, with nothing in the message naming an
 #: undocumented length rule. A false BLOCK here is worse than a false pass, and
 #: `test_every_example_in_the_guidance_passes_the_parser` now makes the class
 #: unrepeatable: any example this module tells an author to write must survive it.
@@ -384,8 +386,10 @@ GUIDANCE = (
     # obligation — on a gate whose purpose is creating them (Kimi P3, 2026-09-06).
     f"For example:  {MARKER}: restart genesis-server and confirm /api/genesis/health answers 200\n"
     f"         or:  {MARKER}: none — docs only, no runtime surface\n"
-    "`none` is a legitimate answer for a docs/prose PR; what is not legitimate is "
-    "leaving the decision unmade. Note it passes this gate but does NOT release the "
-    "validator, which assumes every merged PR has an E2E and hunts for one anyway "
-    "(spec §8.13) — the line is its first lead, not a boundary."
+    "`none` is a legitimate answer for a docs/prose PR. Leaving the line out does "
+    "NOT block the merge — but nothing else records the decision yet either "
+    "(the per-merge obligation row is unbuilt, issue #1718), so right now this "
+    "line is the only record. Note `none` does NOT release the validator, which "
+    "assumes every merged PR has an E2E and hunts for one anyway (spec §8.13) — "
+    "the line is its first lead, not a boundary."
 )
