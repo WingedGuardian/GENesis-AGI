@@ -40,6 +40,17 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset: a stripped-env/systemd/sandbox invocation leaves HOME
+# unset, which under `set -u` aborts at the first ${HOME} use — here STATE_FILE,
+# before any deploy work. Same passwd fallback update.sh carries, for the same
+# reason; fail closed if unresolvable. (Guarded by
+# tests/test_scripts/test_home_guard_coverage.py.)
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # GENESIS_DEPLOY_ROOT: test seam (install-agnostic tests point it at a fixture
 # tree so no test ever reinstalls or restarts the real runtime). Unset = the
 # checkout this script lives in, which is the only production form.

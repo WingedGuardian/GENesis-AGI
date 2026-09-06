@@ -27,9 +27,25 @@ def text() -> str:
 
 
 def test_flock_guard_present(text: str) -> None:
-    assert 'UPDATE_LOCK_FILE="$HOME/.genesis/locks/update.lock"' in text
+    """The whole-run, refuse-immediately hold. Since #1699 the PATH comes from
+    scripts/lib/deploy_lock.sh rather than a literal here, so that the code-only
+    deploy wrapper and validation holds contend on the SAME file — but update.sh
+    keeps `-n` (refuse now), which is the property this test exists for."""
+    assert 'UPDATE_LOCK_FILE="$GENESIS_DEPLOY_LOCK"' in text
     assert 'exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"' in text
     assert 'flock -n "$_UPDATE_LOCK_FD"' in text
+
+
+def test_the_shared_lock_constant_still_resolves_to_the_historical_path(text: str) -> None:
+    """Indirection must not have MOVED the lock: a different path would silently
+    stop excluding an in-flight update.sh from an older checkout (and vice versa).
+    Assert both halves — update.sh sources the lib, and the lib's default is the
+    same path the literal used to be."""
+    assert 'source "$SCRIPT_DIR/lib/deploy_lock.sh"' in text, (
+        "update.sh must source the lib that defines the shared lock path"
+    )
+    lib = (REPO_ROOT / "scripts" / "lib" / "deploy_lock.sh").read_text()
+    assert 'GENESIS_DEPLOY_LOCK="${GENESIS_DEPLOY_LOCK:-$HOME/.genesis/locks/update.lock}"' in lib
 
 
 def test_nohup_fallback_closes_lock_fd(text: str) -> None:

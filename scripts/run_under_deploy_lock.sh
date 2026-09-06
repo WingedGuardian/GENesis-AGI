@@ -23,6 +23,17 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset, before sourcing the lib: deploy_lock.sh derives both
+# its lock and receipts paths from ${HOME}, so under `set -u` a stripped-env
+# invocation would abort inside the source rather than here. The scanner only
+# flags scripts that dereference $HOME directly, which this one does not — the
+# exposure arrives through the lib, so the guard belongs here anyway.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # GENESIS_DEPLOY_ROOT: test seam, same contract as deploy_code_only.sh.
 GENESIS_ROOT="${GENESIS_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # shellcheck source=lib/deploy_lock.sh
