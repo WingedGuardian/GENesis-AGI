@@ -105,6 +105,13 @@ def _exclusive_create_0600(path: Path, payload: bytes) -> bool:
     ``os.link`` fails with ``FileExistsError`` if the destination exists, so two
     concurrent first-pairings can't both "win" and clobber each other's identity
     (which ``os.replace`` would, silently orphaning the loser's keys)."""
+    # Record which ancestor levels do NOT yet exist, BEFORE creating them: each
+    # one mkdir creates is a new entry in ITS OWN parent, and only an fsync of
+    # that parent makes the entry durable. Syncing just the leaf would leave the
+    # keyfile reachable only through a directory chain that may not survive a
+    # power loss (`~/.genesis` normally pre-exists, so this is usually just the
+    # `federation` level — but restore-before-bootstrap ordering can create more).
+    created = [p for p in (path.parent, *path.parent.parents) if not p.exists()]
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)  # mkdir mode is ignored if the dir already exists
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -122,11 +129,21 @@ def _exclusive_create_0600(path: Path, payload: bytes) -> bool:
         # file alone doesn't guarantee the link/rename survives a crash or power
         # loss, and a keyfile that vanishes on reboot regenerates a DIFFERENT
         # identity, orphaning peer relationships + caps sealed under the old key.
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        # AND the parent of every level mkdir just created (see `created` above):
+        # on first pairing the mkdir also created the `federation` dir itself — a
+        # new entry in ITS parent — and syncing only the new dir does not make
+        # that entry durable. Deduplicated + ordered leaf-upward; fsyncing an
+        # already-durable directory is a harmless no-op.
+        _sync_dirs: list[Path] = [path.parent]
+        for _made in created:
+            if _made.parent not in _sync_dirs:
+                _sync_dirs.append(_made.parent)
+        for _dir in _sync_dirs:
+            dir_fd = os.open(str(_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         return True
     finally:
         if tmp.exists():

@@ -81,3 +81,74 @@ def test_exclusive_create_refuses_to_clobber_existing():
     assert path.read_bytes() == original  # original untouched
     # and no stray temp file was left behind
     assert not list(path.parent.glob("*.tmp.*"))
+
+
+def test_first_create_fsyncs_directory_and_its_parent(monkeypatch):
+    """Durability of the FIRST pairing: fsyncing the new `federation` dir makes
+    the keyfile's directory entry durable, but on first pairing mkdir() also
+    created the `federation` dir itself — a new entry in its PARENT — and only
+    an fsync of the parent makes THAT durable. A keyfile that vanishes on
+    power loss regenerates a different identity, orphaning peer relationships."""
+    opened: dict[int, str] = {}
+    fsynced: list[str] = []
+    real_open, real_fsync = os.open, os.fsync
+
+    def rec_open(path, flags, *a, **k):
+        fd = real_open(path, flags, *a, **k)
+        opened[fd] = str(path)
+        return fd
+
+    def rec_fsync(fd):
+        fsynced.append(opened.get(fd, f"<unrecorded fd {fd}>"))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", rec_open)
+    monkeypatch.setattr(os, "fsync", rec_fsync)
+    keystore.load_or_create_identity()
+    fed_dir = str(keystore.federation_dir())
+    parent = str(keystore.federation_dir().parent)
+    assert fed_dir in fsynced, f"federation dir not fsynced (fsynced: {fsynced})"
+    assert parent in fsynced, f"parent dir not fsynced (fsynced: {fsynced})"
+
+
+def test_identity_key_is_covered_by_backup_and_restore():
+    """Disaster recovery: the identity keyfile must be named in backup.sh's
+    Tier-1 creds spec and in restore.sh's placement guidance — MEASURED at zero
+    federation references before this pin (an unpaired install skips it via the
+    [ -f ] guard, so coverage costs nothing until first pairing)."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    backup = (root / "scripts" / "backup.sh").read_text(encoding="utf-8")
+    restore = (root / "scripts" / "restore.sh").read_text(encoding="utf-8")
+    assert ".genesis/federation/identity.key:federation_identity.key" in backup
+    # pin the actual placement HINT, not a mere mention (a comment would pass)
+    assert "federation_identity.key → ~/.genesis/federation/identity.key" in restore
+
+
+def test_fsync_covers_every_newly_created_directory_level(monkeypatch, tmp_path):
+    """When mkdir creates SEVERAL levels (restore-before-bootstrap ordering, where
+    ~/.genesis does not exist yet), each new level is an entry in its own parent —
+    every one of those parents must be fsynced, not just the leaf's."""
+    deep = tmp_path / "a" / "b" / "genesis_home"
+    monkeypatch.setenv("GENESIS_HOME", str(deep))
+    opened: dict[int, str] = {}
+    fsynced: list[str] = []
+    real_open, real_fsync = os.open, os.fsync
+
+    def rec_open(path, flags, *a, **k):
+        fd = real_open(path, flags, *a, **k)
+        opened[fd] = str(path)
+        return fd
+
+    def rec_fsync(fd):
+        fsynced.append(opened.get(fd, f"<unrecorded fd {fd}>"))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", rec_open)
+    monkeypatch.setattr(os, "fsync", rec_fsync)
+    keystore.load_or_create_identity()
+    # every level mkdir created (federation, genesis_home, b, a) is an entry in a
+    # parent that must be durable — a/b/genesis_home/federation and its ancestors
+    for expected in (deep / "federation", deep, deep.parent, deep.parent.parent):
+        assert str(expected) in fsynced, f"{expected} not fsynced (fsynced: {fsynced})"

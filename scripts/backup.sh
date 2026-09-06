@@ -650,12 +650,18 @@ if $_ENCRYPT_READY; then
         done < <(find "$HOME/.ssh" -maxdepth 1 -type f -print0)
     fi
     # Named single files → creds/<flatname>.gpg
+    # federation_identity.key: the install's federation identity keypair
+    # (Ed25519 + X25519, created lazily on first pairing — absent until then,
+    # and the [ -f ] guard below skips it cleanly). Losing it orphans every
+    # paired peer relationship and every write-cap sealed under the derived
+    # seal key, so it is Tier-1 critical like the SSH keys.
     for _spec in \
         "$HOME/.config/gh/hosts.yml:gh_hosts.yml" \
         "$HOME/.claude/.credentials.json:claude_credentials.json" \
         "$HOME/.claude.json:claude.json" \
         "$HOME/.genesis/guardian_remote.yaml:guardian_remote.yaml" \
         "$HOME/.genesis/config/genesis.yaml:genesis.yaml" \
+        "$HOME/.genesis/federation/identity.key:federation_identity.key" \
         "$HOME/.genesis/release-fingerprints.txt:release-fingerprints.txt"; do
         _srcf="${_spec%%:*}"; _dstn="${_spec##*:}"
         [ -f "$_srcf" ] || continue
