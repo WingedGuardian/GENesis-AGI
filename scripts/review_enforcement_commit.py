@@ -596,17 +596,24 @@ def _worktree_root(cwd: str) -> str:
     return os.path.realpath(cwd)
 
 
-def _merge_note(cwd: str | None) -> str:
-    """A hint appended to a cap/mode-switch denial when a merge is mid-flight.
+def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
+    """A hint appended to a denial when a merge is mid-flight.
 
-    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict or the round
-    counter: those sentinels are unauthenticated files that any actor with shell
-    access can create (``echo x > .git/MERGE_HEAD``), and `git merge --no-commit`
-    leaves one indefinitely without any forgery at all. Keying an EXEMPTION off
-    them would let the actor this gate exists to constrain silence it
-    permanently with one write — measured: a forged sentinel froze the counter
-    across three further distinct defect rounds. Telling the author what the
-    gate can see is safe; letting that state decide the verdict is not.
+    ``gate`` selects the consequence clause, because the two gates are misled by
+    a merge in DIFFERENT ways and a reader needs the one that applies: the round
+    counter sees another round, the depth gate sees a large authored change.
+    Sharing one wording would describe the wrong problem half the time.
+
+    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict, the round
+    counter, or the depth classification: those sentinels are unauthenticated
+    files that any actor with shell access can create (``echo x >
+    .git/MERGE_HEAD``), and `git merge --no-commit` leaves one indefinitely
+    without any forgery at all. Keying an EXEMPTION off them would let the actor
+    this gate exists to constrain silence it permanently with one write —
+    measured: a forged sentinel froze the counter across three further distinct
+    defect rounds. Telling the author what the gate can see is safe; letting that
+    state decide the verdict is not. Adding a second caller does not weaken that:
+    this still only ever returns TEXT.
     """
     try:
         out = subprocess.run(
@@ -629,6 +636,15 @@ def _merge_note(cwd: str | None) -> str:
         return ""
     if not merging:
         return ""
+    if gate == "depth":
+        return (
+            "\n\nNOTE: a merge/rebase appears to be in progress. This gate "
+            "classifies substantiality from the staged diff, so pulling upstream "
+            "in reads as a large authored change even though the merged code "
+            "arrived already reviewed on its own PR. If this commit IS only that "
+            "merge, say so in the depth-ack — the audit it asks for would be an "
+            "audit of somebody else's landed work, not of yours."
+        )
     return (
         "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "
         "keys on the staged diff, so pulling upstream in to resolve a conflict "
@@ -1210,6 +1226,7 @@ def main() -> None:
                 "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
+                + _merge_note(cwd, gate="depth")
             )
             return
 
