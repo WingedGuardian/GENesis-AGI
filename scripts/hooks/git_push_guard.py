@@ -1226,7 +1226,28 @@ def _inline_title(body: str) -> str:
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
-    raw = first[0].strip() if first else ""
+    return _safe_title(first[0].strip() if first else "")
+
+
+def _safe_title(raw: str) -> str:
+    """Defang and bound one finding title. BOTH producers end here.
+
+    This exists because "sanitise at the producer" was implemented once and was
+    still wrong: `_inline_title` was treated as the single producer on the
+    strength of `_coderabbit_title` ENDING with `return _inline_title(body)`.
+    It has an EARLIER return for the bold-title line, which is the path a
+    CodeRabbit finding actually takes — so the common case never reached the
+    sanitiser. MEASURED: a hostile bold title came back through
+    `_coderabbit_title` with CR, ESC, RLO and ZWSP intact while the same body
+    through `_inline_title` came back clean (CodeRabbit Major, PR #1638, round 3
+    — on the fix for round 2's finding).
+
+    The lesson is in the shape, not the instance: a function ending in a
+    delegation does not delegate on every path, and "there is one producer" is a
+    claim about EVERY return statement. Both producers now converge here, and
+    `test_no_title_producer_returns_unsanitised_text` walks the AST to keep it
+    that way rather than trusting the next reader to notice.
+    """
     safe = "".join(" " if _gate_text_unsafe(ch) else ch for ch in raw)
     if len(safe) <= _INLINE_TITLE_MAX_CHARS:
         return safe
@@ -1466,7 +1487,11 @@ def _coderabbit_title(body: str) -> str:
             continue
         stripped = line.strip()
         if stripped.startswith("**") and stripped.rstrip("*").strip():
-            return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
+            # Through _safe_title, NOT a bare slice: this is the branch a real
+            # CodeRabbit finding takes, so it is the one that matters most.
+            return _safe_title(
+                _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()
+            )
     return _inline_title(body)
 
 

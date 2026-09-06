@@ -3952,6 +3952,44 @@ class TestReportRendersGateDetail:
         for cp in ("\r", "\x1b", "\u202e", "\u200b"):
             assert cp not in out, f"U+{ord(cp):04X} survived the real pipeline:\n{out!r}"
 
+    def test_no_title_producer_returns_unsanitised_text(self, guard_module):
+        """LOCK the chokepoint — a convention is what the last fix got wrong.
+
+        Sanitising "at the producer" was implemented once and was still wrong:
+        `_coderabbit_title` ENDS with `return _inline_title(body)`, so it read as
+        a delegation, but its bold-title branch returns earlier with a bare
+        slice — and that is the branch a real CodeRabbit finding takes. The
+        common case never reached the sanitiser.
+
+        Reading every return by hand is exactly the check that failed, so this
+        walks the AST instead: every `return` in either producer must hand back a
+        call to `_safe_title` (or to the other producer, which ends there). A
+        future third producer, or a new early return in one of these two, fails
+        here instead of shipping another hole.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        allowed = {"_safe_title", "_inline_title", "_coderabbit_title"}
+        for fn_name in ("_inline_title", "_coderabbit_title"):
+            src = textwrap.dedent(inspect.getsource(getattr(guard_module, fn_name)))
+            tree = ast.parse(src)
+            returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value]
+            assert returns, f"{fn_name}: no return found — did the parse work?"
+            for node in returns:
+                assert isinstance(node.value, ast.Call), (
+                    f"{fn_name} line {node.lineno}: returns a raw expression, not a "
+                    f"call to the sanitising chokepoint"
+                )
+                fn = node.value.func
+                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                assert name in allowed, (
+                    f"{fn_name} line {node.lineno}: returns {name}(...), which is "
+                    f"not one of {sorted(allowed)} — untrusted title text would "
+                    f"reach a terminal unsanitised"
+                )
+
     def test_a_lone_P2_cannot_forge_on_the_advisory_stderr_path(
         self, guard_module, monkeypatch, capsys
     ):
