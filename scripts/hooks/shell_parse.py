@@ -913,30 +913,50 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str]) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Handles a bare ``-c`` (script is the next token), a combined short bundle
-    where ``c`` is last (``-lc 'script'`` → next token), and an inline value
-    (``-c'script'`` → the rest of the token after ``c``).
+    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
+    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
+    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
+
+    An earlier version read a bundle whose ``c`` was not last as an INLINE value
+    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
+    parser then reported a segment whose executable was ``e``, and a guard keyed
+    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
+
+    MEASURED 2026-09-06 against the real interpreters, both directions:
+    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
+    token, while the glued spelling that branch modelled is refused outright —
+    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
+    So the branch modelled a form none of these shells accepts and dropped one
+    they all do, and deleting it is strictly a widening.
     """
     for i, tok in enumerate(argv[1:], 1):
         if not tok.startswith("-") or tok.startswith("--"):
             continue
-        pos = tok.find("c")
-        if pos <= 0:
+        if "c" not in tok[1:]:
             continue
-        if pos == len(tok) - 1:  # 'c' is the last flag in the bundle
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        else:  # inline script glued after the 'c'
-            return tok[pos + 1 :]
+        if i + 1 < len(argv):
+            return argv[i + 1]
     return ""
 
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand(argv: list[str]) -> str | None:
-    """The git subcommand for an argv whose executable is git, skipping git
-    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+def git_subcommand_index(argv: list[str]) -> int | None:
+    """Index of the git subcommand token in ``argv``, or None.
+
+    Exposed alongside :func:`git_subcommand` because a caller that needs the
+    OPERANDS after the subcommand cannot recover this index on its own.
+    ``argv.index(name)`` returns the FIRST token equal to the name, and a global
+    option's operand may equal the subcommand's own name — ``git -C worktree worktree
+    remove /tmp/x`` selects the ``-C`` operand, so the operand list starts one
+    token early, the removal is not recognised, and the guard falls OPEN. Found
+    by cross-model review, 2026-09-03.
+
+    The alternative was for the caller to repeat the option-skipping loop below.
+    That is replica drift: two copies of one rule, diverging silently the next
+    time the option table grows. One scan, one source of truth.
+    """
     if not argv or _basename(argv[0]) != "git":
         return None
     i = 1
@@ -948,8 +968,15 @@ def git_subcommand(argv: list[str]) -> str | None:
         if t.startswith("-"):
             i += 1
             continue
-        return t
+        return i
     return None
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git
+    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+    i = git_subcommand_index(argv)
+    return None if i is None else argv[i]
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:
