@@ -628,28 +628,33 @@ def test_the_budget_lock_can_itself_fail():
         assert not _budget_offenders(sample), f"false positive on: {label}"
 
 
-def test_the_audit_reserve_fits_the_line_it_reserves_for(tmp_path):
-    """The reserve is DERIVED from the renderer, and must stay ahead of it.
+def test_the_audit_worst_counter_exceeds_any_real_part(tmp_path):
+    """The reserve's counter width must dominate any counter a real part emits.
 
-    Rebuilds the same worst case `_AUDIT_LINE_RESERVE` is computed from, so the
-    constant and the line cannot drift. This is the pin the old round number
-    lacked: 120 was chosen once and the line grew past it, and because
-    `_cut_here` fills the ceiling by construction, `room` at `emit_final` time
-    is ALWAYS exactly the reserve — so being short by any amount truncates
-    deterministically rather than occasionally.
+    The reserve is DERIVED from ``_audit_line(... _AUDIT_WORST_COUNTER ...)``, so
+    "the reserve fits a line built from _AUDIT_WORST_COUNTER" is a tautology and
+    cannot catch the original defect (a 5-digit reserve while a 6+-digit
+    `intended` clipped the mirror pointer). The NON-tautological invariant is the
+    one that actually protects the pointer: ``_AUDIT_WORST_COUNTER`` is larger
+    than any counter a real part can render.
+
+    ``intended``/``emitted``/``dropped`` are CHARACTER counts of a single hook
+    part. Even a pathological multi-MB identity file is well under 10**8 chars;
+    10**9 is a 10x margin past that. Assert the constant clears that ceiling — a
+    constant shrunk back toward 5 digits fails HERE, independently of how the
+    reserve is derived from it. The impossible beyond-constant case is the
+    structural backstop's job (the pointer-preserving fallback, proven in
+    test_emit_final_prefers_a_pointer_fallback_over_clipping_the_tail).
     """
-    worst = _ctx._audit_line(
-        "identity-user",
-        99_999,
-        99_999,
-        cut=("x" * _ctx._AUDIT_BLOCK_LABEL_MAX, 99_999),
-        where=(
-            f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
-        ),
+    realistic_max_part_chars = 10**9  # 1 GB in one hook part — absurd, deliberately
+    assert realistic_max_part_chars <= _ctx._AUDIT_WORST_COUNTER, (
+        f"_AUDIT_WORST_COUNTER ({_ctx._AUDIT_WORST_COUNTER}) is not comfortably "
+        "above the largest counter a real part can render — a large part would "
+        "clip the audit line's mirror pointer"
     )
-    assert len(worst) + 1 <= _ctx._AUDIT_LINE_RESERVE, (
-        f"reserve {_ctx._AUDIT_LINE_RESERVE} < worst-case audit line {len(worst)} + newline"
-    )
+    # And the reserve derived from it is a positive, sane size (guards against a
+    # derivation that silently collapsed to the +16 slack alone).
+    assert _ctx._AUDIT_LINE_RESERVE > 100, _ctx._AUDIT_LINE_RESERVE
 
 
 def test_the_block_label_in_an_audit_line_is_bounded(tmp_path, monkeypatch, capsys):

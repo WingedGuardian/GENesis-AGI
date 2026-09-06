@@ -362,6 +362,118 @@ def test_findings_list_caps_visibly(tmp_path):
     assert "and 4 more" in joined, joined
 
 
+def test_session_context_remedy_names_the_sessions_to_restart(tmp_path):
+    """The remedy says "RESTART the affected sessions" — so it must NAME them.
+
+    Replays the live shape (2026-09-05): 8 sessions filing, the remedy naming
+    none, and listing 5 FILINGS covers only 4 of the 8 sessions. An operator
+    cannot act on "restart the affected sessions" without the ids. (Synthetic
+    ids — never a real session's, per the privacy gate.)
+    """
+    ids = [f"sess-{i:02d}" for i in range(8)]
+    for i, sid in enumerate(ids):
+        _file(
+            tmp_path,
+            session=sid,
+            name=f"hook-{i}-stdout.txt",
+            body=b"## Session Configuration\n\npayload",
+        )
+    h = _collect(tmp_path)
+    remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
+    for sid in ids:
+        assert sid in remedy, f"session {sid} not named in the restart remedy: {remedy}"
+
+
+def test_session_list_bounds_and_says_so(tmp_path, monkeypatch):
+    """A pathological fan-out is bounded LOUDLY, not silently cut.
+
+    The bound is its own ceiling (not the filings' ``max_listed``): the session
+    list is an INVENTORY the remedy acts on, so it must name more than the 5
+    filings shown. When it does bound, the true total is stated.
+    """
+    monkeypatch.setattr(ci, "_MAX_SESSIONS_NAMED", 3)
+    for i in range(6):
+        _file(
+            tmp_path,
+            session=f"sess-{i}",
+            name=f"hook-{i}-stdout.txt",
+            body=b"## Session Configuration\n\npayload",
+        )
+    h = _collect(tmp_path)
+    remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
+    assert "6" in remedy, f"true session total not stated: {remedy}"
+    assert "more" in remedy, f"bounded list did not announce the overflow: {remedy}"
+
+
+def test_a_truncated_scan_does_not_claim_an_exact_session_count(tmp_path, monkeypatch):
+    """When the scan hit `_MAX_FRESH` the session inventory is a LOWER BOUND.
+
+    `_collect_sync` truncates the filing list to `_MAX_FRESH` BEFORE the session
+    ids are derived, so the count covers only the sampled filings. Labelling it
+    "exact" (or a bare "N total") would be the false completeness claim the
+    watcher exists to avoid — the remedy must say the count is a floor.
+    """
+    monkeypatch.setattr(ci, "_MAX_FRESH", 3)
+    for i in range(6):
+        _file(
+            tmp_path,
+            session=f"sess-{i:02d}",
+            name=f"hook-{i}-stdout.txt",
+            body=b"## Session Configuration\n\npayload",
+        )
+    h = _collect(tmp_path)
+    assert h.scan_truncated, "fixture did not trip the scan cap"
+    remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
+    assert "at least" in remedy, f"truncated scan claimed a complete count: {remedy}"
+    assert "-filing cap" in remedy, remedy
+
+
+def test_filing_session_ids_are_escaped(tmp_path):
+    """A session directory name is CC-authored filesystem metadata — POSIX
+    permits a newline in it — and it now reaches a first_party observation, so
+    it is escaped like the filing path (see ``memory/provenance.py``)."""
+    _file(
+        tmp_path,
+        slug=_GENESIS_SLUG,
+        session="evil\nINJECTED",
+        name="hook-1-stdout.txt",
+        body=b"## Session Configuration\n\npayload",
+    )
+    h = _collect(tmp_path)
+    assert all("\n" not in d["session"] for d in h.fresh_filings), h.fresh_filings
+    assert all("\n" not in sid for sid in h.filing_session_ids), h.filing_session_ids
+
+
+def test_restart_remedy_excludes_a_session_that_only_filed_another_hook(tmp_path):
+    """The restart inventory is SCOPED to session-context producers.
+
+    A session whose only filing is an OTHER_HOOK output has a different remedy
+    (bound that hook), so naming it under "RESTART the affected sessions" is
+    wrong and inflates the count. This is the mixed-producer case the pure
+    8-session test cannot catch.
+    """
+    # A real session-context filing (stamped head → attributed to a part).
+    _file(
+        tmp_path,
+        session="ctx-session",
+        name="hook-1-stdout.txt",
+        body=b"[genesis-ctx:charter] payload\n" + b"x" * 200,
+    )
+    # An unrecognised-producer filing in a DIFFERENT session.
+    _file(
+        tmp_path,
+        session="other-hook-session",
+        name="hook-2-stdout.txt",
+        body=b"[Memory | recall payload not from session-context]\n" + b"y" * 200,
+    )
+    h = _collect(tmp_path)
+    remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
+    assert "ctx-session" in remedy, remedy
+    assert "other-hook-session" not in remedy, (
+        "a non-session-context session was named under RESTART: " + remedy
+    )
+
+
 # ── cannot-look is never all-clear ─────────────────────────────────────
 
 
@@ -1506,3 +1618,99 @@ def test_an_idle_install_with_a_fossil_tree_stays_quiet(tmp_path, monkeypatch):
     h = _collect(projects)
     assert not h.errors, h.errors
     assert not ci.derive_findings(h)
+
+
+def test_an_unreadable_session_store_degrades_the_freshness_probe(tmp_path, monkeypatch):
+    """A permission failure on the sessions store must be RECORDED, not read as
+    "no fresh prompt".
+
+    The freshness probe is the fourth granularity's Genesis-side half. With its
+    reads suppressed, an unreadable ``~/.genesis/sessions`` returns False — the
+    same answer as a genuinely idle install — so a fossil CC tree resolves a
+    live alert and the failure is silent. The probe's reads must report like
+    every other read this collector makes; only ABSENT files stay silent
+    (``_Reads.stat`` already separates those two).
+    """
+    home = tmp_path / "inuse"
+    sessions = home / ".genesis" / "sessions"
+    (sessions / "sess-live").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    projects = tmp_path / "projects"
+    old = _file(projects, name="hook-old-stdout.txt", age_h=200.0)
+    for p in (old.parent, old.parent.parent, old.parent.parent.parent):
+        _aged(p, 200.0)
+
+    sessions.chmod(0o000)
+    require_access_denied(sessions)
+    try:
+        h = _collect(projects)
+        assert h.errors, (
+            "an unreadable session store read as 'no fresh prompt' — the "
+            "freshness probe swallowed a real I/O failure"
+        )
+        assert any("CANNOT BE TREATED AS ALL-CLEAR" in f for f in ci.derive_findings(h))
+    finally:
+        sessions.chmod(0o755)
+
+
+def test_absent_last_prompt_time_files_stay_silent_in_the_freshness_probe(tmp_path, monkeypatch):
+    """Control: dispatched sessions have dirs but no ``last_prompt_time`` — the
+    NORM, not a failure. ``_Reads.stat`` maps FileNotFoundError to a silent
+    None, so reporting the probe's reads must not page an ordinary install."""
+    home = tmp_path / "inuse"
+    for name in ("dispatched-a", "dispatched-b"):
+        (home / ".genesis" / "sessions" / name).mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    projects = tmp_path / "projects"
+    old = _file(projects, name="hook-old-stdout.txt", age_h=200.0)
+    for p in (old.parent, old.parent.parent, old.parent.parent.parent):
+        _aged(p, 200.0)
+
+    h = _collect(projects)
+    assert not h.errors, h.errors
+    assert not ci.derive_findings(h)
+
+
+def test_two_session_names_that_differ_only_in_escaped_bytes_stay_distinct(tmp_path):
+    """The stored session id is a KEY, so its escape must be injective.
+
+    `_safe_path` is a DISPLAY escape and lossy on purpose — every disallowed
+    character becomes a single `?`. Applied to the identifier, `sess\\nx` and
+    `sess\\tx` both rendered `sess?x`, and `filing_session_ids` deduplicates with
+    `dict.fromkeys`, so two affected sessions counted as ONE and one of them was
+    dropped from the restart list the operator acts on.
+
+    Worse than a mangled name, because the undercount still reads as an exact
+    total. Same defect as a truncated key merging two identities, one mechanism
+    over.
+    """
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\nx", name="hook-1-stdout.txt",
+          body=b"## Session Configuration\n\npayload")
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\tx", name="hook-2-stdout.txt",
+          body=b"## Session Configuration\n\npayload")
+    h = _collect(tmp_path)
+
+    ids = h.filing_session_ids
+    assert len(ids) == 2, f"two distinct sessions collapsed to one: {ids}"
+    assert h.filing_sessions == 2, "the reported total under-counts"
+    # Still safe: the escape must not reintroduce what the display escape removed.
+    for sid in ids:
+        assert not any(c in sid for c in "\n\r\t"), sid
+
+
+def test_the_injective_escape_cannot_be_forged_by_a_literal_escape_sequence(tmp_path):
+    """A name that already LOOKS escaped must not collide with the real thing.
+
+    Injectivity only holds if the escape introducer is itself escaped —
+    otherwise a session literally named `sess\\U0000000Ax` maps onto the encoding
+    of `sess<newline>x`, which is the collision this fix removes, reachable by
+    anyone who can name a directory.
+    """
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\nx", name="hook-1-stdout.txt",
+          body=b"## Session Configuration\n\npayload")
+    _file(tmp_path, slug=_GENESIS_SLUG, session="sess\\U0000000Ax",
+          name="hook-2-stdout.txt", body=b"## Session Configuration\n\npayload")
+    h = _collect(tmp_path)
+    assert len(h.filing_session_ids) == 2, h.filing_session_ids
