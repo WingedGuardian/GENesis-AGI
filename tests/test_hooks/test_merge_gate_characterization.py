@@ -262,6 +262,11 @@ _PIN_RECEIPTS_BODY = (
     "CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-28\n"
     "CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, "
     "check_cc_running_versions.sh clean, sign-off recorded\n"
+    # These cases assert an ALLOW, so the body must satisfy every body-reading gate,
+    # not just the pin one — the E2E obligation (§8.12) reads the same body and
+    # fails closed without a declaration. A case whose subject is the pin gate must
+    # not start failing for an unrelated missing line.
+    "E2E: none — pin bump only, no runtime surface to verify\n"
 )
 
 
@@ -279,6 +284,9 @@ def _run(
     head_pin: str | None = None,
     base_pin: str | None = None,
     pr_body: str | None = None,
+    # E2E obligation (§8.12): the conftest pins a POST-cutoff default, so a case
+    # only passes this to exercise the pre-convention exemption.
+    created_at: str | None = None,
     router=None,
 ) -> int:
     """Drive ``main()`` in-process: granular seams via env, un-seamed gh via the
@@ -308,6 +316,7 @@ def _run(
         ("_TEST_GH_HEAD_PIN_FILE", head_pin),
         ("_TEST_GH_BASE_PIN_FILE", base_pin),
         ("_TEST_GH_PR_BODY", pr_body),
+        ("_TEST_GH_PR_CREATED_AT", created_at),
     ):
         if value is not None:
             monkeypatch.setenv(seam, value)
@@ -1039,10 +1048,59 @@ _CASES: list[tuple[str, object, int, str]] = [
         0,
         "",
     ),
+    # ── E2E obligation (§8.12) ──────────────────────────────────────────────
+    # These drive the REAL merge command through the hook. The gate's first
+    # "wiring" tests were source-string greps, and MEASURED: replacing the
+    # enforcement branch with `if False:` left the call in place, so all 147
+    # tests stayed green while the gate did nothing. A grep proves a call exists;
+    # only an exit code proves it BLOCKS.
+    (
+        "e2e_declaration_absent_blocks_merge",
+        lambda mp: _run(mp, _merge_cmd(), pr_body="A body that never decided.\n"),
+        2,
+        "no post-merge E2E decision",
+    ),
+    (
+        "e2e_none_with_reason_allows_merge",
+        lambda mp: _run(
+            mp, _merge_cmd(), pr_body="E2E: none — docs only, no runtime surface\n"
+        ),
+        0,
+        "",
+    ),
+    (
+        "e2e_plan_allows_merge",
+        lambda mp: _run(
+            mp, _merge_cmd(), pr_body="E2E: restart the server and curl the health endpoint\n"
+        ),
+        0,
+        "",
+    ),
+    (
+        "e2e_bare_none_blocks_merge",
+        lambda mp: _run(mp, _merge_cmd(), pr_body="E2E: none\n"),
+        2,
+        "no post-merge E2E decision",
+    ),
+    (
+        "e2e_pre_cutoff_pr_is_exempt_at_merge",
+        lambda mp: _run(
+            mp, _merge_cmd(), pr_body="an old body, no declaration\n", created_at="2020-01-01T00:00:00Z"
+        ),
+        0,
+        "",
+    ),
     (
         "pin_unchanged_allows_through_main",
         lambda mp: _run(
-            mp, _merge_cmd(), head_pin=_PIN_BASE, base_pin=_PIN_BASE, pr_body="no receipts"
+            mp,
+            _merge_cmd(),
+            head_pin=_PIN_BASE,
+            base_pin=_PIN_BASE,
+            # "no receipts" is the point of THIS case (an unchanged pin needs none);
+            # the E2E line is present only so the allow is not stolen by a different
+            # body-reading gate (§8.12).
+            pr_body="no receipts\nE2E: none — unchanged pin, no runtime surface\n",
         ),
         0,
         "",
