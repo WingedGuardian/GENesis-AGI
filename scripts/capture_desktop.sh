@@ -61,6 +61,17 @@ fi
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 "${USER_}@${HOST}")
 mkdir -p "$OUTDIR"
 
+remote_latest() {
+  "${SSH[@]}" "powershell.exe -NoProfile -Command \"\$d=Join-Path \$env:USERPROFILE 'Pictures\\GenesisCaptures'; \$f=Get-ChildItem \$d -Filter cap-*.png -ErrorAction Ignore | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if(\$f){\$f.Name}\"" 2>/dev/null | tr -d '\r\n' || true
+}
+
+# Record what already exists BEFORE triggering. Without this the poll below
+# returns the first capture it finds — which on any machine that has ever run
+# a capture is a STALE one, reported as a fresh success. Measured: a run after
+# the DPI fix returned a 30-minute-old file and its old resolution, which read
+# as "the fix changed nothing".
+PRIOR=$(remote_latest)
+
 # Trigger. The task returns immediately and its body runs asynchronously in the
 # interactive session, so we wait on the OUTPUT, not on this call.
 if ! "${SSH[@]}" "powershell.exe -NoProfile -Command \"Start-ScheduledTask -TaskName GenesisCapture\"" >/dev/null 2>&1; then
@@ -68,18 +79,24 @@ if ! "${SSH[@]}" "powershell.exe -NoProfile -Command \"Start-ScheduledTask -Task
   exit 4
 fi
 
-# Poll for a capture newer than we started. Condition-based, not a fixed sleep.
-START_EPOCH=$(date -u +%s)
+# Poll for a capture that is genuinely NEW — different from what was there
+# before the trigger. Condition-based, not a fixed sleep.
 LATEST=""
-deadline=$(( START_EPOCH + TIMEOUT ))
+deadline=$(( $(date -u +%s) + TIMEOUT ))
 while [[ $(date -u +%s) -lt $deadline ]]; do
-  LATEST=$("${SSH[@]}" "powershell.exe -NoProfile -Command \"\$d=Join-Path \$env:USERPROFILE 'Pictures\\GenesisCaptures'; \$f=Get-ChildItem \$d -Filter cap-*.png -ErrorAction Ignore | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if(\$f){\$f.Name}\"" 2>/dev/null | tr -d '\r\n' || true)
-  [[ -n "$LATEST" ]] && break
-  sleep 2
+  CANDIDATE=$(remote_latest)
+  if [[ -n "$CANDIDATE" && "$CANDIDATE" != "$PRIOR" ]]; then LATEST="$CANDIDATE"; break; fi
+  sleep 1
 done
 
 if [[ -z "$LATEST" ]]; then
-  echo "TIMEOUT: no capture appeared within ${TIMEOUT}s" >&2
+  # Distinguish "nothing ran" from "something ran but produced nothing new",
+  # because they need different fixes and look identical from here.
+  if [[ -n "$PRIOR" ]]; then
+    echo "TIMEOUT: no NEW capture within ${TIMEOUT}s (newest is still ${PRIOR}) — the task did not produce one" >&2
+  else
+    echo "TIMEOUT: no capture appeared within ${TIMEOUT}s (none existed before either)" >&2
+  fi
   exit 5
 fi
 

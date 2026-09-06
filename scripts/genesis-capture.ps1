@@ -108,8 +108,31 @@ function Write-Meta { param([string]$Line) Add-Content -Path $meta -Value $Line 
 try {
     Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient, UIAutomationTypes
 
+    # DPI AWARENESS MUST COME BEFORE ANY MEASUREMENT.
+    #
+    # Windows lies to a DPI-unaware process: on a 1920x1080 display at 125%
+    # scaling it reports 1536x864 (1920 * 96/120), and every subsequent
+    # measurement — VirtualScreen, UI Automation BoundingRectangle, the bitmap
+    # we allocate — comes back in that virtualised space. The capture then
+    # SUCCEEDS and produces a downscaled image while reporting the scaled size
+    # as though it were the real one.
+    #
+    # That is not cosmetic. SendInput's absolute mode addresses the PHYSICAL
+    # desktop, so a coordinate read from a virtualised capture or UIA tree is
+    # off by the scale factor — up to ~125px at the screen edge on a 125%
+    # display. MEASURED 2026-09-06: before/after SetProcessDPIAware on the same
+    # machine, GetSystemMetrics went 1536x864 -> 1920x1080 at monitor DPI 120.
+    Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class GenesisDpi {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+'@ -ErrorAction Stop
+    $dpiAware = [GenesisDpi]::SetProcessDPIAware()
+
     $sid = (Get-Process -Id $PID).SessionId
     Write-Meta "session_id=$sid"
+    Write-Meta "dpi_aware=$dpiAware"
     Write-Meta "interactive=$([System.Environment]::UserInteractive)"
     Write-Meta "mode=$Mode"
 
