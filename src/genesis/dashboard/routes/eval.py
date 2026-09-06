@@ -16,6 +16,12 @@ _DIMENSIONS = (
 )
 
 # Which metric to extract as the "headline" value per dimension
+#: Dimensions whose headline metric carries a definition-version marker in its
+#: snapshot metrics. A change in the marker is a series break, not a trend.
+_HEADLINE_DEFN_KEY = {
+    "ego": "approval_rate_defn",
+}
+
 _HEADLINE_METRIC = {
     "memory": "precision_at_5",
     "system": "composite_score",
@@ -81,12 +87,28 @@ async def metrics_compounding():
 
         headline_key = _HEADLINE_METRIC.get(dim, "")
         series = []
+        # A headline metric whose DEFINITION changed cannot be plotted as one
+        # line. The ego's approval_rate denominator changed on 2026-09-06
+        # (tabled/withdrawn stopped counting as rejections), which shrinks the
+        # denominator and raises the rate — so an unmarked sparkline would show
+        # a rise caused by nothing but the redefinition. Carry the definition
+        # per point and name where it breaks, rather than dropping points and
+        # blanking the chart.
+        defn_key = _HEADLINE_DEFN_KEY.get(dim)
+        series_break_at = None
+        prev_defn = None
         for snap in snapshots:
             metrics = snap.get("metrics", {})
+            defn = metrics.get(defn_key) if defn_key else None
+            if (defn_key and series_break_at is None and series
+                    and defn != prev_defn):
+                series_break_at = snap.get("period_end")
+            prev_defn = defn
             series.append({
                 "period_end": snap.get("period_end"),
                 "value": metrics.get(headline_key),
                 "sample_count": snap.get("sample_count", 0),
+                "definition": defn,
                 "metrics": metrics,
             })
 
@@ -97,6 +119,10 @@ async def metrics_compounding():
                 latest.get("metrics", {}).get(headline_key) if latest else None
             ),
             "series": series,
+            # Non-null when this dimension's headline metric was redefined
+            # inside the plotted window: the period_end where the new
+            # definition starts. Consumers must not read across it as a trend.
+            "series_break_at": series_break_at,
             "weeks_of_data": len(series),
         }
 
