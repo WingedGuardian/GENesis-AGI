@@ -19,6 +19,34 @@ from genesis.session_awareness.ledger_escalation_link import (
 
 logger = logging.getLogger(__name__)
 
+# Follow-up sources whose CONTENT has not been through a redaction pass and so
+# must never reach this report. The report is an EGRESS surface — it renders
+# `content[:200]` into a Telegram message — and these carry text this system did
+# not author.
+#
+# `ledger_escalation` reproduces `session_ledger` row text verbatim, and real
+# rows on a live install have carried credentials a session pasted into the
+# ledger. Those rows ship `domain=None`, which every bucket's exact-match
+# `user_world` filter already excludes — but the follow-up's own body ASKS the
+# reader to classify it, so a guarantee resting on that default holds only until
+# someone answers the question the feature itself poses.
+_UNREDACTED_CONTENT_SOURCES = frozenset({_LEDGER_ESCALATION_SOURCE})
+
+
+def _drop_unredacted_sources(rows: list[dict]) -> list[dict]:
+    """Remove rows whose source is not safe to render to an egress surface.
+
+    ONE chokepoint applied to EVERY bucket, rather than a filter at the bucket
+    that happened to prompt it. The first version of this guarded only the
+    "Needs your input" list; `blocked/failed` and `completed (24h)` render the
+    same `content` field to the same Telegram message and had no filter at all,
+    so the leak had three doors and one was shut. A source-exclusion rule that
+    each new bucket must REMEMBER to apply is a convention, and conventions are
+    what reviewers find one instance of at a time — so a bucket now has to route
+    through here to render anything.
+    """
+    return [row for row in rows if row.get("source") not in _UNREDACTED_CONTENT_SOURCES]
+
 # Convert to tuple for db.execute() compatibility (requires sequence, not frozenset)
 _INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
 
@@ -852,19 +880,7 @@ class MorningReportGenerator:
         user_items = await follow_ups.get_pending(
             self._db, strategy="user_input_needed", domain="user_world",
         )
-        # Ledger escalations never reach this report, whatever their domain.
-        # Their content reproduces `session_ledger` row text VERBATIM, and real
-        # rows have carried credentials a session pasted into the ledger; this
-        # report renders content[:200] into a Telegram message. They ship
-        # domain=None, which the exact-match filter above already excludes — but
-        # the follow-up's own body asks the reader to classify it, and choosing
-        # `user_world` would otherwise put unredacted ledger text on the wire.
-        # A documented privacy guarantee that holds only until someone answers a
-        # question the feature itself poses is not a guarantee. Enforce it here,
-        # where the egress is, rather than relying on the domain default.
-        user_items = [
-            fu for fu in user_items if fu.get("source") != _LEDGER_ESCALATION_SOURCE
-        ]
+        user_items = _drop_unredacted_sources(user_items)
         if user_items:
             shown = (
                 f" (showing 5 of {len(user_items)})" if len(user_items) > 5 else ""
@@ -878,6 +894,7 @@ class MorningReportGenerator:
         # Blocked/failed items
         blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
         blocked += await follow_ups.get_by_status(self._db, "blocked", domain="user_world")
+        blocked = _drop_unredacted_sources(blocked)
         if blocked:
             shown = (
                 f" (showing 5 of {len(blocked)})" if len(blocked) > 5 else ""
@@ -894,6 +911,7 @@ class MorningReportGenerator:
         completed = await follow_ups.get_recently_completed(
             self._db, hours=24, limit=5, domain="user_world",
         )
+        completed = _drop_unredacted_sources(completed)
         if completed:
             lines.append("**Completed (24h):**")
             for row in completed:

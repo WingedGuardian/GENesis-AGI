@@ -61,6 +61,13 @@ logger = logging.getLogger(__name__)
 # for that disposition is answered and gets completed.
 _TERMINAL_LEDGER_STATUSES = frozenset({"done", "absorbed", "dropped"})
 
+# The follow_ups statuses reconcile must still consider. `follow_ups.status`
+# admits six values (schema/_tables.py); these are the four that are not
+# terminal. Enumerated rather than expressed as "not completed/failed" because
+# the query filters by ONE status at a time — see the reconcile read, where
+# filtering after the bound starved the rows the sweep exists to close.
+_NON_TERMINAL_FOLLOW_UP_STATUSES = ("pending", "scheduled", "in_progress", "blocked")
+
 # Bound on the pending-escalations read during reconcile. Derived from capacity,
 # not from history: the dedup precheck allows at most ONE escalation per ledger
 # row, so the pending population can never exceed the number of unresolved
@@ -246,11 +253,23 @@ async def _reconcile(db: aiosqlite.Connection) -> tuple[int, bool]:
     # only 'pending' would strand exactly the escalations someone engaged with —
     # and since `exists_by_dedup_key` spans all statuses, nothing would ever
     # re-create them, so the row would stay open with no live follow-up.
-    escalations = [
-        fu
-        for fu in await fu_crud.get_by_source(db, ESCALATION_SOURCE, limit=_RECONCILE_READ_LIMIT)
-        if fu.get("status") not in ("completed", "failed")
-    ]
+    # FILTER SERVER-SIDE, THEN BOUND — one status at a time, each with its own
+    # limit. Fetching by source and filtering in Python put the cap BEFORE the
+    # filter: `get_by_source` orders created_at DESC, so once completed
+    # escalations outnumber the bound they fill it entirely and the older PENDING
+    # ones — the only rows reconcile exists to close — are never seen.
+    #
+    # This is the SAME cap-before-filter shape as the forward pass's starvation
+    # bug, recreated forty lines away while fixing it. The lesson generalises:
+    # where a cap and a filter both apply, the filter goes first — and one
+    # instance of a class is never the population.
+    escalations: list[dict] = []
+    for status in _NON_TERMINAL_FOLLOW_UP_STATUSES:
+        escalations.extend(
+            await fu_crud.get_by_source(
+                db, ESCALATION_SOURCE, status=status, limit=_RECONCILE_READ_LIMIT
+            )
+        )
     if len(escalations) >= _RECONCILE_READ_LIMIT:
         logger.warning(
             "ledger escalation: reconcile read hit its %d-row bound; "

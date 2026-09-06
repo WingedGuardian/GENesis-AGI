@@ -610,12 +610,90 @@ async def test_escalations_never_reach_the_morning_report(db, sessions_dir):
     await db.execute("UPDATE follow_ups SET domain='user_world' WHERE id=?", (fid,))
     await db.commit()
 
-    from genesis.outreach import morning_report as mr
+    from genesis.outreach.morning_report import MorningReportGenerator
 
-    items = await fu_crud.get_pending(db, strategy="user_input_needed", domain="user_world")
-    survivors = [i for i in items if i.get("source") != mr._LEDGER_ESCALATION_SOURCE]
-    assert survivors == [], "a classified escalation must still be excluded"
-    assert not any("TOKEN-CANARY" in (i["content"] or "") for i in survivors)
+    # Call the REAL renderer. The first version of this test ran the CRUD query
+    # itself and then filtered with a list comprehension IN THE TEST — so it
+    # asserted its own filtering, never the report's, and stayed green with the
+    # exclusion deleted from morning_report.py entirely. Verified by mutation.
+    gen = MorningReportGenerator.__new__(MorningReportGenerator)
+    gen._db = db
+    rendered = await gen._get_follow_ups_summary() or ""
+    assert "TOKEN-CANARY" not in rendered, (
+        "verbatim ledger text reached the report that renders content[:200] to Telegram"
+    )
+
+
+@pytest.mark.parametrize("status", ["failed", "blocked"])
+async def test_no_report_bucket_renders_an_escalation(db, sessions_dir, status):
+    """EVERY bucket, not just the one that prompted the fix.
+
+    `_get_follow_ups_summary` renders three lists from the same `content` field
+    to the same Telegram message — needs-your-input, blocked/failed, and
+    completed-24h. The first fix filtered only the first, so the leak had three
+    doors and one was shut.
+    """
+    from genesis.outreach.morning_report import MorningReportGenerator
+
+    await _mk_row(db, session_id="s1", text="TOKEN-CANARY-xyz", created_days_ago=30)
+    _mk_liveness(sessions_dir, "s1", days_ago=30)
+    await _sweep(db, sessions_dir)
+    fid = (await _escalations(db))[0]["id"]
+    # The row is classified AND lands in the bucket under test.
+    await db.execute(
+        "UPDATE follow_ups SET domain='user_world', status=? WHERE id=?", (status, fid)
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator.__new__(MorningReportGenerator)
+    gen._db = db
+    assert "TOKEN-CANARY" not in (await gen._get_follow_ups_summary() or "")
+
+
+async def test_reconcile_does_not_starve_older_rows_behind_completed_ones(
+    db, sessions_dir, monkeypatch
+):
+    """The reverse pass must FILTER before it BOUNDS.
+
+    `get_by_source` orders created_at DESC, so fetching by source and filtering
+    non-terminal in Python puts the cap before the filter: once completed
+    escalations outnumber the bound they fill it entirely and the older pending
+    rows — the only ones reconcile exists to close — are never examined. Same
+    class as the forward pass's starvation bug.
+    """
+    monkeypatch.setattr(esc, "_RECONCILE_READ_LIMIT", 3)
+    rows = [await _mk_row(db, session_id="s1", text=f"i{i}", created_days_ago=30) for i in range(5)]
+    _mk_liveness(sessions_dir, "s1", days_ago=30)
+    await _sweep(db, sessions_dir, max_per_run=99)
+    assert len(await _escalations(db)) == 5
+
+    # Close every escalation EXCEPT the one belonging to rows[0]. Identify it by
+    # dedup key, not by list position: all five ledger rows share a timestamp, so
+    # the sweep's order does not track the order they were created in.
+    keep = escalation_dedup_key(rows[0])
+    for i, e in enumerate(await _escalations(db)):
+        if e["dedup_key"] == keep:
+            # Make the surviving PENDING row unambiguously the OLDEST. The five
+            # follow-ups are created microseconds apart, and `get_by_source`
+            # orders created_at DESC — without an explicit spread the row under
+            # test lands inside the bound by luck and the test proves nothing
+            # (measured: it stayed green with the filter back after the bound).
+            await db.execute(
+                "UPDATE follow_ups SET created_at=? WHERE id=?",
+                ((NOW - timedelta(days=99)).isoformat(), e["id"]),
+            )
+        else:
+            await db.execute(
+                "UPDATE follow_ups SET created_at=? WHERE id=?",
+                ((NOW - timedelta(days=i)).isoformat(), e["id"]),
+            )
+            await fu_crud.update_status(db, e["id"], "completed")
+    await db.commit()
+    await sc_crud.ledger_update(db, rows[0], status="done", evidence="landed")
+
+    # With the cap before the filter, the 3-row bound is consumed by completed
+    # rows and this reconcile finds nothing.
+    assert (await _sweep(db, sessions_dir))["reconciled"] == 1
 
 
 # ------------------------------------------------------------- empty state
