@@ -552,11 +552,17 @@ call_sites:
   38a_procedure_novelty_llm:
     chain:
     - openrouter-deepseek-v4
+    - glm51
     default_paid: true
     description: Cross-task_type procedure dedup judgment (is a new procedure
       redundant with existing ones). S-tier only — precision is the safety
       property (validated 0 false-merges on deepseek-v4); fires per novel
-      procedure, low volume.
+      procedure, low volume. glm51 is the second rung and is held to the same
+      bar on TIER, not on evidence — glm-5.1 matches deepseek-v4-pro at S for
+      both intelligence_tier and reasoning (config/model_profiles.yaml), but
+      the 0-false-merge result was measured on deepseek-v4 alone. A chain of
+      one meant a single provider outage took dedup judgment offline
+      entirely; the ordering keeps the validated model first.
   41_reflection_json_salvage:
     chain:
     - mistral-large-free
