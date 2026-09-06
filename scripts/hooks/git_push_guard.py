@@ -4797,16 +4797,31 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+#: MIRROR of e2e_declaration.E2E_CUTOFF_ISO, for the degraded path only. Without it
+#: the cutoff exemption was gated on the parser importing, so a PRE-CUTOFF PR was
+#: BLOCKED whenever the module could not load — a false block on a gate with no
+#: override, against the one population the cutoff exists to protect (CodeRabbit
+#: Minor, 2026-09-06; an earlier comment here claimed a reorder had fixed this, when
+#: the reorder only removed a wasted round-trip). Duplicating a constant invites
+#: drift, so `test_the_degraded_cutoff_mirror_matches_the_parser` locks the two
+#: together and fails the moment either moves.
+_E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
+
 #: Last-resort matcher for the E2E declaration, used ONLY when
 #: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
 #: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
-#: addition: `(?!<)` refuses a value that opens with a placeholder bracket, so the
-#: shipped PR template — whose guidance lives in an HTML comment this degraded path
-#: cannot strip — cannot satisfy the gate. Kept adjacent to the loader so the two
-#: are read together; the real pattern remains the parser's.
+#: addition: the value must contain NO `<…>` placeholder span, because this path
+#: cannot strip HTML comments and the shipped template's guidance lives in one.
+#: An earlier version used `(?!<)`, which only guards the FIRST character — so the
+#: template's own `E2E: none — <reason there is no runtime surface to verify>` line
+#: matched, and every straight-from-template PR would have satisfied the degraded
+#: gate while the comment right here claimed it could not (Kimi P2, 2026-09-06,
+#: reproduced). A real one-line declaration does not carry an angle-bracketed span;
+#: a template line always does. Kept adjacent to the loader so the two are read
+#: together; the real pattern remains the parser's.
 _E2E_FALLBACK_RE = re.compile(
     r"^[^\S\n]*(?:[-*+>][^\S\n]*)*(?:\[[ xX]\][^\S\n]*)?"
-    r"[*_`]{0,2}E2E[*_`]{0,2}[^\S\n]*:[^\S\n]*(?!<)(\S[^\n]*)$",
+    r"[*_`]{0,2}E2E[*_`]{0,2}[^\S\n]*:[^\S\n]*(?![^\n]*<[^<>\n]*>)(\S[^\n]*)$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -4826,8 +4841,16 @@ def _load_e2e_declaration():
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)
+        # Registered before exec (dataclasses resolve their module from sys.modules),
+        # and popped on failure so a half-initialised entry cannot poison a later
+        # import — the same hygiene the sibling loader in e2e_declaration.py argues
+        # for. The two loaders disagreeing about it is how one of them ends up wrong.
         sys.modules["_e2e_declaration"] = mod
-        spec.loader.exec_module(mod)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("_e2e_declaration", None)
+            raise
         return mod
     except Exception:
         return None
@@ -4886,20 +4909,35 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
     NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
     escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
     """
-    # Module FIRST, then the timestamp: the cutoff exemption is only consulted when
-    # the parser is present, so loading in the other order spent a gh round-trip
-    # whose answer was then discarded — and, worse, blocked a PRE-CUTOFF PR in
-    # degraded mode, where the exemption never ran (architect NOTE, 2026-09-06).
+    # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
+    # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
+    # module was missing — a false block, on a gate with no override, against the one
+    # population the exemption exists to protect. Degraded mode compares the mirror
+    # constant lexicographically: both values are ISO-8601 UTC of the same shape, so
+    # that ordering is exact without a parser.
     mod = _load_e2e_declaration()
-    if mod is not None:
-        created_at = _pr_created_at(pr_num, repo=repo)
-        if created_at is None:
+    created_at = _pr_created_at(pr_num, repo=repo)
+    if created_at is None:
+        if mod is None:
+            # Neither the parser NOR the timestamp: nothing can be established, and
+            # the presence scan below still runs. Fail toward asking for a line.
+            print(
+                f"NOTE: PR #{pr_num} — createdAt unreadable AND the E2E parser could "
+                f"not load; the pre-convention exemption could not be checked.",
+                file=sys.stderr,
+            )
+        else:
             return True, (
                 f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
                 f"pre-convention exemption cannot be established. Re-run; if it "
                 f"persists, the gh read is failing."
             )
-        if mod.is_pre_cutoff(created_at):
+    else:
+        if mod is not None:
+            exempt = mod.is_pre_cutoff(created_at)
+        else:
+            exempt = created_at.strip() < _E2E_CUTOFF_FALLBACK
+        if exempt:
             return False, f"n/a (PR created {created_at}, before the convention)"
 
     body = _pr_body_text(pr_num, repo)
@@ -4918,8 +4956,10 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
         # would have passed — while REJECTING `- E2E: …`, `* E2E: …`, `> E2E: …` and
         # checkbox forms, the exact markdown tolerance the real pattern exists for.
         # Two matchers for one rule, selected by an exception handler, is the defect;
-        # this one is derived from the same shape and refuses a placeholder value
-        # (`(?!<)`), so the template cannot satisfy it.
+        # this one is derived from the same shape and refuses any value carrying a
+        # `<…>` span, so no template line can satisfy it. (The narrower `(?!<)` this
+        # comment used to name was itself the bug — it guarded only the first
+        # character; see the pattern's own docstring.)
         found = _E2E_FALLBACK_RE.search(body)
         if found:
             print(

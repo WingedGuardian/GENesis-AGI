@@ -161,12 +161,30 @@ def _load_sibling_readable_body():
     Falls back to the local scanner below if that module cannot be loaded (it carries
     imports this one deliberately does not need). Degrading the STRIPPING is safe in
     the direction that matters: the local copy implements the same rules."""
+    import sys
+
+    name = "_cc_pin_receipts_for_e2e"
     try:
         path = Path(__file__).resolve().parent / "check_cc_pin_receipts.py"
-        spec = importlib.util.spec_from_file_location("_cc_pin_receipts_for_e2e", path)
+        spec = importlib.util.spec_from_file_location(name, path)
         if spec and spec.loader:
             mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            # REGISTERED BEFORE exec: that module's dataclasses resolve their own
+            # module out of sys.modules, so exec-ing an unregistered module raises
+            # `AttributeError: 'NoneType' object has no attribute '__dict__'`.
+            # Without this line the load ALWAYS failed and the local fallback
+            # silently ran instead — so the docstring's "the SAME scanner the pin
+            # gate uses, so the two can never disagree" was false in every run
+            # (Kimi P2, 2026-09-06). The guard's own _load_pin_receipt_checker
+            # carries this line and says why; I read that comment and did not copy
+            # it. On failure the half-initialised entry is removed so a later
+            # import of the real module is not poisoned.
+            sys.modules[name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
             fn = getattr(mod, "readable_body", None)
             if callable(fn):
                 return fn
@@ -308,10 +326,23 @@ def parse_e2e(body: str | None) -> dict:
         if _reason_is_real(value):
             best = {"kind": "plan", "text": value, "detail": ""}
         elif not saw_invalid_detail:
-            saw_invalid_detail = (
-                "the E2E: line has no real content (empty, a placeholder, or a "
-                "template value left unfilled)"
-            )
+            # Name the ACTUAL rule. A terse-but-real plan ("manual", "smoke",
+            # "run CI") fails only the length floor, and telling that author the
+            # line "has no real content" is a false diagnosis on a gate with no
+            # override — it sends them guessing (Kimi P3, 2026-09-06). Say which
+            # rule bit, and quote what they wrote back to them.
+            shown = _strip_formatting(value)[:60]
+            if sum(ch.isalnum() for ch in _strip_formatting(value)) < _MIN_SUBSTANCE:
+                saw_invalid_detail = (
+                    f"the E2E: line is too short to be a plan ({shown!r}) — give at "
+                    f"least a few words saying what will be run, or use "
+                    f"`E2E: none — <reason>`"
+                )
+            else:
+                saw_invalid_detail = (
+                    "the E2E: line has no real content (a placeholder, or a "
+                    "template value left unfilled)"
+                )
 
     if best is not None:
         return best
@@ -348,7 +379,11 @@ GUIDANCE = (
     # this gate needs a line they can copy, and `test_every_example_in_the_
     # guidance_passes_the_parser` runs every concrete example here through the
     # parser so the gate can never again prescribe a remedy it would refuse.
-    f"For example:  {MARKER}: none — docs only, no runtime surface\n"
+    # BOTH forms get a concrete, copyable example. Offering one only for `none`
+    # meant the single line a blocked author could copy was the one that creates NO
+    # obligation — on a gate whose purpose is creating them (Kimi P3, 2026-09-06).
+    f"For example:  {MARKER}: restart genesis-server and confirm /api/genesis/health answers 200\n"
+    f"         or:  {MARKER}: none — docs only, no runtime surface\n"
     "`none` is a legitimate answer for a docs/prose PR; what is not legitimate is "
     "leaving the decision unmade. Note it passes this gate but does NOT release the "
     "validator, which assumes every merged PR has an E2E and hunts for one anyway "

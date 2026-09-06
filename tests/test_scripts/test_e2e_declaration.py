@@ -45,6 +45,32 @@ def e2e():
 # ── the two valid forms ──────────────────────────────────────────────────────
 
 
+def test_the_sibling_scanner_actually_loads(e2e):
+    """The module claims it uses the SAME body scanner as the pin gate "so the two
+    can never disagree". That was FALSE in every run: the sibling resolves its
+    dataclasses out of sys.modules, so exec-ing it unregistered raised
+    AttributeError and the load silently fell back to the local copy (Kimi P2,
+    2026-09-06). A claim of shared behaviour has to be executable, or it is just a
+    comment."""
+    assert e2e._load_sibling_readable_body() is not None
+
+
+def test_the_two_scanners_agree_on_marker_visibility(e2e):
+    """Guard-the-guard: with the sibling now genuinely loading, assert the local
+    fallback and the shared scanner reach the same verdict on the cases that matter,
+    so a future divergence is caught rather than assumed away."""
+    bodies = [
+        "E2E: a plain declaration\n",
+        "<!--\nE2E: hidden in a comment\n-->\nreal text\n",
+        "```\nE2E: inside a fence\n```\n",
+        "intro\n<!-- unterminated\nE2E: after an open comment\n",
+    ]
+    for body in bodies:
+        shared = e2e.readable_body(body)
+        local = e2e._local_readable_body(body)
+        assert bool(e2e._MARKER_RE.search(shared)) == bool(e2e._MARKER_RE.search(local)), body
+
+
 def test_plan_form_is_read(e2e):
     r = e2e.parse_e2e("Some body\n\nE2E: run the migration on a fresh DB and check 92 applied\n")
     assert r["kind"] == "plan"
@@ -281,17 +307,23 @@ def test_every_example_in_the_guidance_passes_the_parser(e2e):
     # GUIDANCE only — it is the text the GATE prints. The module docstring also
     # says `E2E: none` while explaining that a bare one is INVALID, and scraping
     # that would assert the parser accepts the very shape the docs call refused.
-    examples = _re.findall(r"E2E: (none[^\n]*)", e2e.GUIDANCE)
+    examples = _re.findall(r"E2E: ([^\n]+)", e2e.GUIDANCE)
     concrete = [
         ex.strip()
         for ex in examples
         if "<" not in ex  # placeholder templates are meant to be rejected
     ]
-    assert concrete, "the guidance must show at least one concrete `none` example"
+    # BOTH forms, not just `none`: scraping only the none-examples would let a
+    # broken PLAN example ship (Kimi P3, 2026-09-06).
+    kinds = {e2e.parse_e2e(f"E2E: {ex}\n")["kind"] for ex in concrete}
+    assert concrete, "the guidance must show at least one concrete example"
     for ex in concrete:
-        assert e2e.parse_e2e(f"E2E: {ex}\n")["kind"] == "none", (
+        assert e2e.parse_e2e(f"E2E: {ex}\n")["kind"] in {"none", "plan"}, (
             f"guidance offers {ex!r} but the parser rejects it"
         )
+    assert kinds == {"none", "plan"}, (
+        f"the guidance must show a concrete example of BOTH forms; got {kinds}"
+    )
 
 
 @pytest.mark.parametrize("reason", ["docs only", "prose-only", "no runtime surface"])

@@ -69,10 +69,28 @@ class TestVerdicts:
         assert "E2E: <one-line plan" in msg and "E2E: none —" in msg
 
     def test_bare_none_blocks_and_says_why(self, guard, monkeypatch):
+        """The message must name THIS mistake, not just block.
+
+        `"reason" in msg` was vacuous: GUIDANCE is appended to every block message
+        and itself contains "<reason there is no runtime surface to verify>", so the
+        assertion passed for the generic detail too (CodeRabbit Minor, 2026-09-06).
+        Assert the specific detail, and assert the generic one is ABSENT."""
         monkeypatch.setenv("_TEST_GH_PR_BODY", "E2E: none\n")
         blocked, msg = guard._check_e2e_plan("100")
         assert blocked
-        assert "reason" in msg.lower()
+        assert "needs a REASON" in msg, "must name the bare-`none` mistake specifically"
+        assert "no real content" not in msg, "must not fall back to the generic detail"
+
+    def test_placeholder_block_uses_the_generic_detail(self, guard, monkeypatch):
+        """The control that makes the assertion above discriminating: a DIFFERENT
+        invalid shape must produce a DIFFERENT detail."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_BODY", "E2E: <one-line plan for the post-merge verification>\n"
+        )
+        blocked, msg = guard._check_e2e_plan("100")
+        assert blocked
+        assert "no real content" in msg
+        assert "needs a REASON" not in msg
 
     def test_block_message_names_the_validator_seam(self, guard, monkeypatch):
         """§8.13: `none` passes this gate but does NOT release the validator. An
@@ -126,6 +144,51 @@ class TestFailDirections:
         monkeypatch.setattr(guard, "_load_e2e_declaration", lambda: None)
         blocked, _ = guard._check_e2e_plan("100")
         assert blocked
+
+    def test_degraded_fallback_refuses_the_untouched_pr_template(self, guard):
+        """The degraded path cannot strip HTML comments, and the shipped template's
+        guidance lives in one — so without this the template's own
+        `E2E: none — <reason …>` line satisfied the gate and EVERY
+        straight-from-template PR passed, while the comment beside the regex claimed
+        it could not (Kimi P2, 2026-09-06, reproduced)."""
+        template = (
+            Path(__file__).resolve().parents[2] / ".github" / "PULL_REQUEST_TEMPLATE.md"
+        ).read_text()
+        assert guard._E2E_FALLBACK_RE.search(template) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "E2E: restart the server and curl the health endpoint",
+            "- E2E: run the migration on a fresh DB",
+            "- [x] E2E: smoke the installer",
+            "**E2E**: replay the failing case",
+        ],
+    )
+    def test_degraded_fallback_still_accepts_real_declarations(self, guard, line):
+        """The control: tightening against the template must not blind the fallback
+        to the shapes it exists to read."""
+        assert guard._E2E_FALLBACK_RE.search(line) is not None
+
+    def test_degraded_mode_still_honours_the_cutoff(self, guard, monkeypatch):
+        """A PRE-CUTOFF PR must stay exempt even when the parser cannot load.
+
+        It did not: the exemption was gated on the module importing, so a broken
+        install turned into a false BLOCK on a gate with no override, against
+        exactly the population the cutoff protects (CodeRabbit Minor, 2026-09-06)."""
+        monkeypatch.setenv("_TEST_GH_PR_BODY", "an old body, no declaration\n")
+        monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2020-01-01T00:00:00Z")
+        monkeypatch.setattr(guard, "_load_e2e_declaration", lambda: None)
+        blocked, msg = guard._check_e2e_plan("100")
+        assert not blocked, msg
+        assert "n/a" in msg
+
+    def test_the_degraded_cutoff_mirror_matches_the_parser(self, guard):
+        """The lock on the duplicated constant: two copies of a policy date drift,
+        and a drifted mirror silently changes who is exempt in degraded mode."""
+        mod = guard._load_e2e_declaration()
+        assert mod is not None, "the parser must be loadable in the repo under test"
+        assert guard._E2E_CUTOFF_FALLBACK == mod.E2E_CUTOFF_ISO
 
 
 class TestCutoff:
