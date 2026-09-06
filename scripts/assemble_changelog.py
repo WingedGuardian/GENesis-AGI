@@ -586,7 +586,13 @@ def main(argv: list[str] | None = None) -> int:
         # A second read anywhere re-opens the window this closes.
         original = CHANGELOG.read_text(encoding="utf-8")
         result = splice(original, render_sections(fragments))
-    except FragmentError as exc:
+    # OSError and UnicodeDecodeError alongside FragmentError: the TARGET can fail
+    # to read as readily as a fragment can — missing, unreadable, or not UTF-8 —
+    # and only FragmentError was caught, so those escaped as a traceback and
+    # broke the documented single-line + status-2 contract that `--check` already
+    # honours for the same failures. MEASURED before this: a valid fragment plus
+    # an absent CHANGELOG.md exited with FileNotFoundError, not 2.
+    except (FragmentError, OSError, UnicodeDecodeError) as exc:
         print(f"changelog.d: {exc}", file=sys.stderr)
         return 2
 

@@ -453,6 +453,43 @@ def test_the_staged_changelog_keeps_the_targets_permissions(
     assert stat.S_IMODE(cl.stat().st_mode) == 0o644
 
 
+@pytest.mark.parametrize(
+    ("label", "write_target"),
+    [
+        ("missing", None),
+        ("not utf-8", b"\xff\xfe not text"),
+    ],
+)
+def test_a_target_that_cannot_be_read_exits_two_rather_than_tracebacking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    label: str,
+    write_target: bytes | None,
+) -> None:
+    """The TARGET can fail to read as readily as a fragment can.
+
+    The assembly read was wrapped in a handler catching only `FragmentError`, so
+    a missing, unreadable or non-UTF-8 CHANGELOG.md escaped as a traceback and
+    broke the single-line + status-2 contract that `--check` already honours for
+    exactly these failures.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md", body="- **Landed.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    if write_target is not None:
+        cl.write_bytes(write_target)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+
+    assert ac.main([]) == 2, f"{label}: must exit 2, not raise"
+    err = capsys.readouterr().err.strip()
+    assert err.startswith("changelog.d:"), err
+    assert len(err.splitlines()) == 1, f"the contract is ONE line, got: {err!r}"
+    # A failed read must consume nothing.
+    assert len(list(d.iterdir())) == 1
+
+
 def test_a_rollback_that_cannot_restore_says_so_and_names_the_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
