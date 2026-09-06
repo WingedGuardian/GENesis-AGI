@@ -120,9 +120,28 @@ _WRAPPERS = set(_WRAPPER_SPEC)
 # left resolving to the front-end itself, exactly as before.
 _RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
 # Value-consuming flags accepted BEFORE the wrapped command, on either the
-# front-end or its `run` subcommand. Non-exhaustive BY DESIGN: an unlisted
-# `--flag value` leaves `value` resolving as the exe, which can only ADD a
-# gate hit (an over-block on an exotic form), never remove one.
+# front-end or its `run` subcommand.
+#
+# STILL non-exhaustive — but the claim that used to sit here, that an unlisted
+# `--flag value` "can only ADD a gate hit, never remove one", was FALSE and is
+# withdrawn. It holds only for a flag AFTER `run`. Before it, the flag's value
+# becomes the first bare word, `run` is never matched as the subcommand, and the
+# carrier stays OPAQUE — a fail-OPEN miss. MEASURED through the real
+# `full_suite_guard`: `uv --color always run pytest` and
+# `uv --cache-dir /tmp/c run pytest` both exited 0 (allowed) where `uv run pytest`
+# exits 2 (blocked).
+#
+# Enumerating uv's option grammar is not the fix — that is an open set, and each
+# missing entry is the next round's finding (this list reached four). The
+# residual is closed at the CALLER instead: `full_suite_guard` treats an
+# unresolved run-carrier as unresolved rather than allowed. This list only has to
+# keep the COMMON forms resolving so that fail-closed leg stays rare.
+#
+# `--isolated` was removed: it is BOOLEAN in `uv run`, so listing it here made
+# the parser eat the command word. MEASURED: `uv run --isolated pytest` resolved
+# its exe to `tests/` and the guard allowed it. A wrongly-listed flag is the more
+# dangerous direction of this list, because it mis-parses a COMMON form rather
+# than an exotic one.
 _RUN_CARRIER_VALUE_FLAGS = frozenset(
     {
         "--with",
@@ -136,7 +155,6 @@ _RUN_CARRIER_VALUE_FLAGS = frozenset(
         "--group",
         "--index",
         "--env-file",
-        "--isolated",
     }
 )
 # Interpreters that run a script string passed after -c; recurse into it.
@@ -732,9 +750,17 @@ def _run_carrier_command_start(argv: list[str], i: int) -> int | None:
         if not t.startswith("-"):
             break
         j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
-    if j >= len(argv) or argv[j] != "run":
+    # `uv tool run` is a documented ALIAS for `uvx` — "uvx is provided as a
+    # convenient alias for uv tool run, their behavior is identical" (uv help
+    # tool run). Requiring a bare `run` left that spelling opaque, so
+    # `uv tool run pytest` was allowed where `uvx pytest` was blocked. A literal
+    # two-token sequence, not a grammar: closed set, nothing to keep up with.
+    if argv[j : j + 2] == ["tool", "run"]:
+        j += 2
+    elif j < len(argv) and argv[j] == "run":
+        j += 1
+    else:
         return None
-    j += 1
     while j < len(argv):  # `run`'s own flags, ahead of the wrapped command
         t = argv[j]
         if t == "--":
@@ -791,6 +817,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
     open_parens = 0
+    via_uv_tool = False  # reached the command through `uvx` / `uv tool run`
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
@@ -810,11 +837,15 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             j = _run_carrier_command_start(argv, i)
             if j is None:
                 break  # not a `run` invocation — the front-end IS the command
+            if argv[i + 1 : i + 3] == ["tool", "run"]:
+                via_uv_tool = True
             i = j
             continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
+        if _basename(tok) == "uvx":
+            via_uv_tool = True
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
@@ -857,6 +888,15 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 remaining -= 1  # stay on j — the token may carry another glued `)`
             else:
                 j -= 1
+    # `uv tool run ruff@0.3.0` / `uvx pytest@8.3.5` — uv documents `<package>@<version>`
+    # as a supported command name, and it executes the named tool. Left as written,
+    # the exe resolves to `pytest@8.3.5`, which matches no gate looking for `pytest`:
+    # MEASURED, `uvx pytest@8.3.5` exited 0 from full_suite_guard where `uvx pytest`
+    # exits 2. Scoped to the uv tool-runners on purpose — this is uv's spelling, not
+    # a general one, and stripping an `@` suffix off every resolved command would be
+    # inventing syntax for tools that do not have it.
+    if via_uv_tool and result and "@" in result[0]:
+        result[0] = result[0].split("@", 1)[0]
     return result
 
 

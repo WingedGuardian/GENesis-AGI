@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 from shell_parse import (  # noqa: E402
     Segment,
+    _basename,
     analyze,
     has_trailing_override,
     is_pytest_invocation,
@@ -124,6 +125,39 @@ def _targets_specific_test(args: list[str]) -> bool:
     return has_selector or (has_file and not has_dir)
 
 
+#: Front-ends that can carry another command. If the resolver could not see PAST
+#: one of these, the segment is UNRESOLVED — which is not the same as clean.
+_CARRIER_EXES = frozenset({"uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye"})
+
+
+def _carried_pytest_args(seg: Segment) -> list[str] | None:
+    """Args after a literal `pytest` token inside an UNRESOLVED carrier, else None.
+
+    The resolver models uv's option grammar to find the carried command, and that
+    grammar is an OPEN set: a value-taking flag before `run` swallows `run`
+    itself, so the carrier stays opaque and the segment resolves to `uv`.
+    MEASURED: `uv --color always run pytest` was ALLOWED where `uv run pytest`
+    blocks. Four such gaps were reported on this PR alone, which is the signature
+    of enumerating someone else's CLI rather than a list that was merely short.
+
+    So this does not extend the grammar. It asks a CLOSED question — does the
+    literal token `pytest` appear in a carrier's argv — and hands the tokens after
+    it to the SAME `_targets_specific_test` used on a resolved run. An unknown uv
+    flag can no longer decide the verdict; at worst it costs one extra token
+    before `pytest`, which this does not read.
+
+    Returns None when the segment is not a carrier, or carries no pytest token —
+    `uv pip install requests` must stay allowed.
+    """
+    if _basename(seg.exe) not in _CARRIER_EXES:
+        return None  # resolved to a real command (or not a carrier at all)
+    for i, tok in enumerate(seg.argv[1:], start=1):
+        name = _basename(tok).split("@", 1)[0]  # uv permits `pytest@8.3.5`
+        if name == "pytest":
+            return seg.argv[i + 1 :]
+    return None
+
+
 def main() -> None:
     cmd = field(read_payload(), "command")
     if not cmd:
@@ -134,13 +168,17 @@ def main() -> None:
         return  # parse failure → fail open; never wrongly block a legit command
 
     pytest_segs = [s for s in segments if is_pytest_invocation(s)]
-    if not pytest_segs:
+    # Unresolved carriers are evaluated on the same rule, not waved through.
+    carried = [a for a in (_carried_pytest_args(s) for s in segments) if a is not None]
+    if not pytest_segs and not carried:
         return
     if any(has_trailing_override(s.raw, _OVERRIDE) for s in segments):
         return  # explicit opt-in to a local full/dir run
 
-    # Block if ANY pytest segment is a non-targeted (bare or directory) run.
-    if all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs):
+    # Block if ANY pytest run — resolved or carried — is non-targeted.
+    resolved_ok = all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs)
+    carried_ok = all(_targets_specific_test(a) for a in carried)
+    if resolved_ok and carried_ok:
         return
 
     print(
