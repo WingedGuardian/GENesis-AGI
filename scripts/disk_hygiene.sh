@@ -33,6 +33,8 @@
 #      → scripts/prune_contributor_issue_posts.py (Contributor Work-Log hold
 #      store; held rows never pruned)
 #  12. Retention prune of entity_merge_journal (>180d) → scripts/prune_entity_merge_journal.py
+#  13. Retention prune of ~/.genesis/deploy_receipts.jsonl (newest lines kept,
+#      under the deploy-station lock — see lib/deploy_lock.sh)
 #      (reversibility snapshot store; generous window so unmerge_entity outlives
 #      the mis-merge discovery horizon)
 #
@@ -149,6 +151,22 @@ main() {
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
+
+    echo "--- deploy receipts retention prune (newest lines kept) ---"
+    # ~/.genesis/deploy_receipts.jsonl (lib/deploy_lock.sh) grows one line per
+    # deploy/validation. The prune itself lives in that lib, beside the append it
+    # bounds and where tests can reach it; this is the daily call site. Subshell:
+    # the lib is sourced for this block only, and its lock fd dies with it.
+    (
+        # shellcheck source=lib/deploy_lock.sh
+        source "$REPO_DIR/scripts/lib/deploy_lock.sh"
+        prune_deploy_receipts
+        case $? in
+            0) ;;
+            2) echo "deploy receipts prune skipped (deploy station busy)" ;;
+            *) echo "deploy receipts prune exited $?" ;;
+        esac
+    ) || echo "deploy receipts prune subshell exited $?"
 
     echo "--- contributor work-log terminal-row prune (>30d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \

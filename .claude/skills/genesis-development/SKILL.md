@@ -1918,7 +1918,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 
 | Change type | Deploy path |
 |---|---|
-| Runtime code | `git pull` + server restart (update.sh does both) |
+| Runtime code | `scripts/deploy_code_only.sh` (pull + reinstall + restart under the deploy-station lock, with watchdog/guardian standdown, post-restart health verify and a SHA receipt — issue #1699); full deploys via update.sh. Never the bare pull/reinstall/restart chain. On a failed health verify it ALERTS AND HOLDS — no auto-revert (moving main backwards under live sessions is the bigger hazard; owner decision 2026-09-06). Validation/E2E runs against the live server go through `scripts/run_under_deploy_lock.sh` (shared hold, so a deploy can't land mid-measurement; `--receipt` records the validated SHA). Cadence rule: validators SAMPLE, they don't chase — deploy `main@HEAD` at a cadence, record the receipt, bisect the merge range on failure; per-PR granularity is CI's job. |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
