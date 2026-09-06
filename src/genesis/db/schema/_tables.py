@@ -1848,7 +1848,13 @@ TABLES = {
             -- human sets approved_at. NULL = unreviewed; the apply path filters
             -- on approved_at IS NOT NULL so no merge is ever auto-applied.
             approved_at  TEXT,
-            approved_by  TEXT
+            approved_by  TEXT,
+            -- Adjudication-policy version (MW-3 PR-2b): which prompt policy
+            -- produced this verdict. NULL = judged under the pre-Option-1
+            -- sub-item-vs-parent prompt; such 'distinct' verdicts are excluded
+            -- from settled_pair_keys so the sweep re-opens them under the
+            -- same-referent policy. Stamped by record_verdict on every write.
+            policy       TEXT
         )
     """,
     # Reversibility journal (PR-1): a pre-delete snapshot of the loser's identity

@@ -443,7 +443,17 @@ async def test_live_phase0_stale_on_norm_drift(file_db):
     counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
     assert counts["stale"] == 1 and counts["merged"] == 0
     assert await _status(db, b) == "active"  # not applied
-    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "stale"
+    # DELIBERATE FLIP (MW-3 PR-2b): this used to assert the verdict PARKED at
+    # 'stale' until the weekly sweep. The stale branch now re-enqueues the
+    # re-resolved pair, and Phase 0 runs before the drain's pending query — so
+    # the SAME drain re-judges it with current identities (the scripted router
+    # answers 'distinct'). The staleness disposition is still observable in
+    # counts, the merge still did not apply, and the voided approval must NOT
+    # resurrect on the fresh verdict.
+    assert counts.get("reenqueued") == 1
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "distinct"
+    assert row["approved_at"] is None, "a voided approval resurrected on re-judgment"
 
 
 @pytest.mark.asyncio
@@ -1142,3 +1152,255 @@ async def test_apply_cancelled_mid_merge_rolls_back(file_db, monkeypatch):
 
     assert await _status_fresh(b) != "merged"  # loser not tombstoned
     assert await _verdict_fresh(adj_crud.pair_key(a, b)) == "proposed_merge"  # claim rolled back
+
+
+@pytest.mark.asyncio
+async def test_stale_on_norm_drift_reenqueues_the_resolved_pair(file_db, monkeypatch):
+    """MW-3 PR-2b rail (c): a norm-drift stale pair re-enters the queue at
+    APPLY time. Before this, a stale verdict waited for the WEEKLY sweep to
+    rediscover it — 9→1 shard convergence took weeks by construction (the
+    sweep's own comment routes the convergence redesign here)."""
+    db = file_db
+    monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", True)
+    a = await _mk_entity(db, "lambda", "lambda")
+    b = await _mk_entity(db, "lambdaa", "lambdaa")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="lambda",
+        norm_b="OLD-DIFFERENT-NORM",  # drifted → stale at apply
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+
+    counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
+
+    assert counts["stale"] == 1
+    assert counts.get("reenqueued") == 1
+    # The re-enqueued row is CONSUMED by the same drain (Phase 0 writes it
+    # before the pending query runs), so the proof of the queue path is a
+    # completed row for the pair plus a fresh, policy-stamped verdict — not a
+    # row still sitting pending.
+    rows = await db.execute_fetchall(
+        "SELECT payload_json, status FROM deferred_work_queue "
+        "WHERE work_type='entity_adjudication'"
+    )
+    consumed = [
+        (json.loads(r[0]), r[1])
+        for r in rows
+        if {json.loads(r[0])["entity_id"], json.loads(r[0])["similar_entity_id"]} == {a, b}
+    ]
+    assert consumed, "the re-resolved pair never entered the queue"
+    assert consumed[0][1] == "completed", f"queue row not consumed: {consumed}"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "distinct"  # re-judged with current identities
+    assert row["policy"] == adj_crud.POLICY_VERSION
+
+
+@pytest.mark.asyncio
+async def test_stale_reenqueue_respects_the_enqueue_gate(file_db, monkeypatch):
+    """With the enqueue gate OFF, staleness handling is unchanged and nothing
+    lands in the queue — the gate's contract keeps governing this producer."""
+    db = file_db
+    monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", False)
+    a = await _mk_entity(db, "sigma", "sigma")
+    b = await _mk_entity(db, "sigmaa", "sigmaa")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="sigma",
+        norm_b="OLD-DIFFERENT-NORM",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+
+    counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
+
+    assert counts["stale"] == 1
+    rows = await db.execute_fetchall(
+        "SELECT payload_json FROM deferred_work_queue "
+        "WHERE work_type='entity_adjudication' AND status='pending'"
+    )
+    assert not rows, "the enqueue gate stopped governing the stale re-enqueue"
+    # Counter truth (Codex P2, round 1): a gate-suppressed enqueue must not
+    # be reported as a re-enqueue.
+    assert counts.get("reenqueued", 0) == 0, "reenqueued counted a suppressed insert"
+
+
+@pytest.mark.asyncio
+async def test_stale_reenqueue_skips_an_already_settled_resolved_pair(file_db, monkeypatch):
+    """The guard that protects settled decisions from the new producer: when
+    the RE-RESOLVED pair (distinct from the stored one, via a merged-away
+    entity) already carries a non-stale verdict, re-enqueueing would re-judge
+    a settled question — it must be skipped."""
+    db = file_db
+    monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", True)
+    a = await _mk_entity(db, "tau", "tau")
+    b = await _mk_entity(db, "tauu", "tauu")
+    c = await _mk_entity(db, "tauuu", "tauuu")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="tau",
+        norm_b="tauu",  # correct stored norms — drift comes from the merge below
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+    # b merges away → at apply time the pair resolves to (a, c), which differs
+    # from the stored (a, b) → stale. The RESOLVED pair is already settled:
+    await db.execute(
+        "UPDATE entities SET status='merged', merged_into=? WHERE entity_id=?", (c, b)
+    )
+    await db.commit()
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=c, verdict="distinct")
+
+    counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
+
+    assert counts["stale"] == 1
+    assert counts.get("reenqueued") is None, "a settled resolved pair was re-enqueued"
+    rows = await db.execute_fetchall(
+        "SELECT payload_json FROM deferred_work_queue "
+        "WHERE work_type='entity_adjudication' AND status='pending'"
+    )
+    payloads = [json.loads(r[0]) for r in rows]
+    assert not any(
+        {p["entity_id"], p["similar_entity_id"]} == {a, c} for p in payloads
+    ), f"settled pair re-entered the queue: {payloads}"
+
+
+@pytest.mark.asyncio
+async def test_human_reject_of_a_pre_policy_row_stays_settled(db):
+    """A human reject stamps current policy, so rejecting a PRE-policy proposal
+    cannot land in the re-open lane — the sweep re-proposing the very merge a
+    human just declined would override the human's recorded decision."""
+    await adj_crud.record_verdict(
+        db, entity_a="h1", entity_b="h2", verdict="proposed_merge",
+        loser_id="h2", survivor_id="h1",
+    )
+    key = adj_crud.pair_key("h1", "h2")
+    # Simulate a pre-migration row: judged before the policy column existed.
+    await db.execute(
+        "UPDATE entity_adjudications SET policy = NULL WHERE pair_key = ?", (key,)
+    )
+    await db.commit()
+    assert await adj_crud.reject(db, pair_key=key, reason="same name, different things")
+    row = await adj_crud.get_by_pair(db, "h1", "h2")
+    assert row["verdict"] == "distinct"
+    assert row["policy"] == adj_crud.POLICY_VERSION
+    assert key in await adj_crud.settled_pair_keys(db), (
+        "a human-rejected pair re-entered the re-open lane"
+    )
+
+
+# ── PR #1729 review round 1: re-judgment + counter-truth rails ───────────────
+
+
+@pytest.mark.asyncio
+async def test_reopened_prepolicy_distinct_is_rejudged_and_stamped(db):
+    """A pre-policy ``distinct`` row (policy IS NULL) is the exact class
+    ``settled_pair_keys`` re-opens (MW-3 PR-2b). The processor's dedup must
+    honor the SAME predicate: re-judge the pair and stamp the current policy —
+    otherwise the sweep re-nominates it every run while the processor no-ops
+    it, and the reopen mechanism is inert (Codex P1, PR #1729 round 1)."""
+    a = await _mk_entity(db, "beta svc", "beta svc")
+    b = await _mk_entity(db, "beta service", "beta service")
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=b, verdict="distinct")
+    # Simulate a verdict written before the policy column existed.
+    await db.execute("UPDATE entity_adjudications SET policy = NULL")
+    await db.commit()
+    await _enqueue(db, a, b)
+    router = _router({})  # scripted: both models say distinct
+
+    counts = await adj.run_adjudication_drain(db, router, mode="propose_only", budget=10)
+
+    assert counts.get("noop", 0) == 0, "reopened row was no-opped, not re-judged"
+    assert counts["distinct"] == 1
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "distinct"
+    assert row["policy"] == adj_crud.POLICY_VERSION  # stamped → self-limiting
+
+
+@pytest.mark.asyncio
+async def test_live_rejudgment_of_stale_pair_lands_as_proposal(db):
+    """Live mode auto-merges only NEVER-judged pairs. A re-judgment — the
+    prior verdict is ``stale`` (norm drift invalidated whatever approval
+    existed) or a reopened pre-policy ``distinct`` — must land as
+    ``proposed_merge`` behind the human gate, never as a direct
+    ``merge_entity`` (Codex P1, PR #1729 round 1: a norm drift must not turn
+    an invalidated proposal into an unapproved destructive merge)."""
+    a = await _mk_entity(db, "gamma db", "gamma db")
+    b = await _mk_entity(db, "gamma database", "gamma database")
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=b, verdict="stale")
+    await _enqueue(db, a, b)
+    router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
+
+    counts = await adj.run_adjudication_drain(db, router, mode="live", budget=10)
+
+    assert counts["proposed"] == 1 and counts["merged"] == 0
+    assert await _status(db, a) == "active" and await _status(db, b) == "active"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge"
+    assert row["approved_at"] is None  # waits for the human gate
+
+
+@pytest.mark.asyncio
+async def test_live_rejudgment_of_a_reopened_prepolicy_distinct_lands_as_proposal(db):
+    """The OTHER half of the guard above, which its docstring claims and its
+    body never seeded.
+
+    ``existing is None`` gates the live auto-merge lane, and two distinct
+    classes make ``existing`` non-None: a ``stale`` verdict, and a re-opened
+    pre-policy ``distinct``. The sibling test seeds only the first, so a
+    half-revert that re-admits the pre-policy-``distinct`` class to auto-merge
+    SURVIVED all 73 tests (measured). The full revert is caught, which is
+    exactly what hid it — a multi-clause guard needs one mutant per clause.
+
+    This is not hypothetical arithmetic: the live store holds 3,180 ``distinct``
+    rows and no ``policy`` column yet, so every one of them enters this class
+    the moment the migration lands. Currently latent — ``mode: propose_only``
+    in config — which makes it a surface to pin BEFORE live mode is enabled,
+    not after.
+    """
+    a = await _mk_entity(db, "delta api", "delta api")
+    b = await _mk_entity(db, "delta apis", "delta apis")
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=b, verdict="distinct")
+    # A verdict written before the policy column existed — the re-opened class.
+    await db.execute("UPDATE entity_adjudications SET policy = NULL")
+    await db.commit()
+    await _enqueue(db, a, b)
+    router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
+
+    counts = await adj.run_adjudication_drain(db, router, mode="live", budget=10)
+
+    assert counts["merged"] == 0, "a re-opened pre-policy row auto-merged unapproved"
+    assert counts["proposed"] == 1
+    assert await _status(db, a) == "active" and await _status(db, b) == "active"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge"
+    assert row["approved_at"] is None  # the human gate still owns this decision
+
+
+@pytest.mark.asyncio
+async def test_sweep_enqueued_counter_counts_only_real_insertions(db, monkeypatch):
+    """``enqueue_adjudication`` is a silent no-op behind its kill switch (and
+    on dedup); the sweep's ``enqueued`` count must report rows actually
+    inserted, not attempts (Codex P2, PR #1729 round 1 — same class as the
+    stale-branch ``reenqueued`` counter)."""
+    monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", False)
+    await _mk_entity(db, "neural monitor", "neural monitor")
+    await _mk_entity(db, "neural-monitor", "neural-monitor")
+
+    result = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=50)
+
+    pending = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE, limit=100)
+    assert len(pending) == 0
+    assert result["enqueued"] == 0, "sweep reported an enqueue the gate suppressed"
