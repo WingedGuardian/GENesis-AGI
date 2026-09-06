@@ -53,8 +53,10 @@ import contextlib
 import datetime as dt
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -104,6 +106,7 @@ def _unreleased_line_index(lines: list[str]) -> int | None:
     """
     fence_char: str | None = None
     fence_len = 0
+    found: list[int] = []
     for i, ln in enumerate(lines):
         if fence_char is not None:
             stripped = ln.strip()
@@ -116,8 +119,21 @@ def _unreleased_line_index(lines: list[str]) -> int | None:
             fence_char, fence_len = run[0], len(run)
             continue
         if _UNRELEASED_HEADING_RE.match(ln):
-            return i
-    return None
+            found.append(i)
+    if len(found) > 1:
+        # Splicing into the FIRST of two is a coin toss that looks decisive.
+        # A second `## [Unreleased]` is what a half-finished release fold leaves
+        # behind (step 3 adds a fresh empty section above the renamed one), so
+        # this is reachable from the documented procedure, not just from a typo
+        # — and the entries would land in whichever copy happened to come first,
+        # which may be the one already closed under a version heading.
+        human = ", ".join(str(i + 1) for i in found)
+        raise FragmentError(
+            f"CHANGELOG.md has {len(found)} '## [Unreleased]' headings "
+            f"(lines {human}); refusing to guess which one the entries belong "
+            "under. Leave exactly one."
+        )
+    return found[0] if found else None
 
 
 # Block constructs that stay block constructs when spliced in. CommonMark allows
@@ -200,6 +216,20 @@ def _validate_body(name: str, body: str) -> None:
     allows all of them up to three spaces of indent. Enumerating the reported
     spelling is how a class ships in pieces — which happened here twice.
     """
+    if "\x00" in body:
+        # UTF-8 decoding accepts NUL, so a fragment carrying one reaches this
+        # point looking like ordinary text and is spliced verbatim. What it
+        # breaks is everything downstream that is NOT a Markdown renderer: git
+        # treats a NUL-bearing file as binary, so `git diff` on the release
+        # commit renders as "Binary files differ" and the CI check that pairs a
+        # vanished fragment against the CHANGELOG.md diff cannot find its entry.
+        # Cheaper to refuse the byte than to explain the release that will not
+        # verify.
+        raise FragmentError(
+            f"{name}: fragment contains a NUL byte; CHANGELOG.md must stay text "
+            "(git treats a NUL-bearing file as binary, and the release fold is "
+            "verified by reading its diff)"
+        )
     if not body.startswith("- "):
         raise FragmentError(
             f"{name}: fragment must start with a Markdown bullet ('- '), because "
@@ -251,6 +281,18 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
     """
     directory = FRAGMENT_DIR if directory is None else directory
     if not directory.is_dir():
+        # ABSENT and NOT-A-DIRECTORY are different facts and only one of them is
+        # benign. Nothing there yet is the ordinary state between releases, so
+        # it returns empty. But a FILE (or a symlink to one) named `changelog.d`
+        # is a broken tree, and returning empty for it means the release folds
+        # zero entries and says so in the cheerful voice it uses when there
+        # genuinely are none — the silent skip this whole directory exists to
+        # make impossible, arriving at the one moment nobody can still fix it.
+        if directory.exists() or directory.is_symlink():
+            raise FragmentError(
+                f"{directory.name}: exists but is not a directory; refusing to "
+                "treat a broken changelog.d as 'no entries to release'"
+            )
         return []
     out: list[tuple[str, str, Path, str]] = []
     for path in sorted(directory.iterdir()):
@@ -582,7 +624,27 @@ def main(argv: list[str] | None = None) -> int:
     # handler: exactly the duplicate-entry re-run state described below.
     # `replaced` is set BEFORE the replace so the seam does not exist; rolling
     # back a replace that never ran rewrites the file with its own bytes.
-    tmp = CHANGELOG.with_name(CHANGELOG.name + ".tmp")
+    # Create the staging file EXCLUSIVELY, under a name nobody can predict.
+    # `CHANGELOG.md.tmp` was both guessable and opened through whatever already
+    # sat at that path: `write_text` FOLLOWS a symlink, so a tracked or planted
+    # link there meant the fold overwrote the link's target and exited 0, and
+    # the later `replace` could leave CHANGELOG.md as that symlink while every
+    # fragment was deleted. `mkstemp` opens with O_CREAT|O_EXCL, which refuses
+    # an existing path of any kind — regular file, symlink or directory — so
+    # there is nothing to follow and no name to pre-place. It stays in
+    # CHANGELOG.md's own directory because `replace` is only atomic within one
+    # filesystem, which is the property the whole fold rests on.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=CHANGELOG.parent, prefix=CHANGELOG.name + ".", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    # mkstemp creates 0600, and `replace` carries the SOURCE's mode onto the
+    # destination — so without this the release fold would silently make
+    # CHANGELOG.md owner-only. Carry the target's existing mode across instead
+    # of assuming a default; CHANGELOG.md is known to exist, having just been
+    # read into `original`.
+    os.chmod(tmp, stat.S_IMODE(CHANGELOG.stat().st_mode))
     removed: list[tuple[Path, str]] = []
     replaced = False
     try:
@@ -650,25 +712,53 @@ def main(argv: list[str] | None = None) -> int:
         # DATA first, cosmetics last: the restores must never be prevented by
         # the tmp cleanup failing — when unlink itself is what is broken, a
         # cleanup-first handler dies before restoring anything.
+        # Each restore is guarded SEPARATELY. An unguarded loop stops at the
+        # first failure, so the fragments after it stay deleted — and the raise
+        # escapes before the reassuring message below prints, leaving the
+        # operator with a traceback and no statement of what was and was not put
+        # back. Recovery that reports itself as all-or-nothing while being
+        # partial is worse than recovery that admits the gap.
+        unrestored: list[str] = []
         for done, text in removed:
-            done.write_text(text, encoding="utf-8")
+            try:
+                done.write_text(text, encoding="utf-8")
+            except OSError as restore_exc:
+                unrestored.append(f"{done.name} ({restore_exc.strerror or restore_exc})")
         # Restore the changelog only if the replace ran (or was armed): a
         # failure BEFORE it must not rewrite the target at all — the file is
         # still the pre-fold original, and blindly rewriting it here would be
         # the one place this handler could itself clobber a concurrent edit.
         if replaced:
-            CHANGELOG.write_text(original, encoding="utf-8")
+            try:
+                CHANGELOG.write_text(original, encoding="utf-8")
+            except OSError as restore_exc:
+                unrestored.append(f"{CHANGELOG.name} ({restore_exc.strerror or restore_exc})")
         with contextlib.suppress(OSError):
             # A stranded .tmp is cosmetic; the data above is already restored.
             tmp.unlink(missing_ok=True)
-        print(
-            f"changelog.d: interrupted mid-fold ({exc!r}); every "
-            "already-removed fragment and CHANGELOG.md have been restored, so "
-            "nothing was lost and a rerun is correct. (After a hard kill, "
-            "recover with git: the fragments and CHANGELOG.md are tracked "
-            "files.)",
-            file=sys.stderr,
-        )
+        if unrestored:
+            # Say it plainly and name every file. The operator's next move
+            # differs completely from the clean-rollback case: a rerun here
+            # would fold the surviving fragments a SECOND time, so they must
+            # recover from git before doing anything else.
+            print(
+                f"changelog.d: interrupted mid-fold ({exc!r}), AND the rollback "
+                f"could not restore {len(unrestored)} file(s): "
+                + "; ".join(unrestored)
+                + ". The tree is half-folded — do NOT rerun, because that would "
+                "duplicate the entries that did survive. Recover with git: the "
+                "fragments and CHANGELOG.md are tracked files.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"changelog.d: interrupted mid-fold ({exc!r}); every "
+                "already-removed fragment and CHANGELOG.md have been restored, "
+                "so nothing was lost and a rerun is correct. (After a hard kill, "
+                "recover with git: the fragments and CHANGELOG.md are tracked "
+                "files.)",
+                file=sys.stderr,
+            )
         # UnicodeDecodeError included: a fragment rewritten as non-UTF-8
         # mid-run must exit as the documented single-line + status 2, not a
         # traceback the CI job cannot classify.

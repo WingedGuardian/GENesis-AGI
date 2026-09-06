@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,51 @@ def test_content_that_is_not_a_bullet_is_rejected(tmp_path: Path) -> None:
 
 def test_a_missing_directory_is_not_an_error(tmp_path: Path) -> None:
     assert ac.collect_fragments(tmp_path / "nope") == []
+
+
+def test_a_changelog_d_that_is_not_a_directory_is_an_error(tmp_path: Path) -> None:
+    """ABSENT and NOT-A-DIRECTORY are different facts; only one is benign.
+
+    Both used to return `[]`. Nothing there yet is the ordinary state between
+    releases. A FILE named `changelog.d` is a broken tree, and returning empty
+    for it folds zero entries while reporting the cheerful "no fragments to
+    assemble" — the silent skip this directory exists to prevent, arriving at
+    the one moment nobody can still fix it.
+    """
+    broken = tmp_path / "changelog.d"
+    broken.write_text("this is a file, not a directory")
+    with pytest.raises(ac.FragmentError, match="not a directory"):
+        ac.collect_fragments(broken)
+
+
+def test_a_nul_byte_in_a_fragment_is_rejected(tmp_path: Path) -> None:
+    """UTF-8 decoding accepts NUL, so it reaches the splice looking like text.
+
+    What it breaks is downstream of Markdown: git treats a NUL-bearing file as
+    binary, so the release commit's `git diff` renders as "Binary files differ"
+    and the CI check that pairs a vanished fragment against the CHANGELOG.md
+    diff cannot find its entry.
+    """
+    with pytest.raises(ac.FragmentError, match="NUL byte"):
+        ac._validate_body("20260101000000-added-x.md", "- entry\x00smuggled\n")
+
+
+def test_two_unreleased_headings_are_refused_rather_than_guessed(
+    tmp_path: Path,
+) -> None:
+    """Splicing into the first of two is a coin toss that looks decisive.
+
+    Reachable from the documented release procedure, not just a typo: step 3
+    adds a fresh empty `## [Unreleased]` above the renamed section, so a
+    half-finished fold leaves exactly this shape — and the entries would land
+    under whichever came first, which may be the section already closed under a
+    version heading.
+    """
+    with pytest.raises(ac.FragmentError, match=r"2 '## \[Unreleased\]' headings"):
+        ac.splice(
+            "# Changelog\n\n## [Unreleased]\n\n## [Unreleased]\n\n",
+            {"Added": ["- an entry"]},
+        )
 
 
 # ── ordering ─────────────────────────────────────────────────────────────────
@@ -356,6 +402,94 @@ def test_main_writes_the_entry_and_consumes_the_fragments(
     assert _run_main(tmp_path, monkeypatch, []) == 0
     assert "- **Landed.** body" in (tmp_path / "CHANGELOG.md").read_text()
     assert list((tmp_path / "changelog.d").iterdir()) == []
+
+
+def test_a_symlink_at_the_staging_path_cannot_capture_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The staging file must be created, never opened through something existing.
+
+    `CHANGELOG.md.tmp` was a predictable name, and `write_text` FOLLOWS a
+    symlink — so a link planted (or committed) at that path meant the fold
+    wrote the assembled changelog over the link's TARGET and exited 0, and the
+    later `replace` could leave CHANGELOG.md as the symlink with every fragment
+    already deleted.
+
+    MEASURED against the pre-fix code with this exact setup: exit 0, and
+    VICTIM.txt contained the rendered changelog.
+    """
+    victim = tmp_path / "victim.txt"
+    victim.write_text("PRECIOUS CONTENT\n")
+    (tmp_path / "CHANGELOG.md.tmp").symlink_to(victim)
+
+    assert _run_main(tmp_path, monkeypatch, []) == 0
+
+    assert victim.read_text() == "PRECIOUS CONTENT\n", (
+        "the fold wrote through the planted symlink and destroyed its target"
+    )
+    changelog = tmp_path / "CHANGELOG.md"
+    assert not changelog.is_symlink(), "CHANGELOG.md was replaced BY the symlink"
+    assert "- **Landed.** body" in changelog.read_text(), "the fold must still work"
+
+
+def test_the_staged_changelog_keeps_the_targets_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`replace` carries the SOURCE's mode onto the destination.
+
+    Creating the staging file with `mkstemp` closes the symlink hole but opens
+    a quieter one: mkstemp creates 0600, so without carrying the target's mode
+    across, a release fold would silently make CHANGELOG.md owner-only.
+    """
+    cl = tmp_path / "CHANGELOG.md"
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md", body="- **Landed.** body")
+    cl.write_text(CHANGELOG_SKELETON)
+    cl.chmod(0o644)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+
+    assert ac.main([]) == 0
+    assert stat.S_IMODE(cl.stat().st_mode) == 0o644
+
+
+def test_a_rollback_that_cannot_restore_says_so_and_names_the_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A partial rollback must not report itself as a clean one.
+
+    The restores used to run unguarded, so the first `OSError` stopped the loop
+    AND escaped before the message printed: later fragments stayed deleted, and
+    the operator got a traceback instead of a statement of what survived. The
+    remedy the message gives is opposite in the two cases — a clean rollback
+    invites a rerun, a partial one must forbid it, because rerunning folds the
+    surviving fragments a second time.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md", body="- **Landed.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+
+    real_write = Path.write_text
+
+    def failing_write(self: Path, data: str, **kw: object) -> int:
+        if self.parent.name == "changelog.d":  # the restore, not the staging write
+            raise OSError(13, "Permission denied")
+        return real_write(self, data, **kw)  # type: ignore[arg-type]
+
+    # Fail the unlink so the fold enters its rollback, then fail the restore.
+    monkeypatch.setattr(Path, "unlink", lambda self, **kw: (_ for _ in ()).throw(
+        OSError(30, "Read-only file system")
+    ))
+    monkeypatch.setattr(Path, "write_text", failing_write)
+
+    assert ac.main([]) == 2
+    err = capsys.readouterr().err
+    assert "could not restore" in err, err
+    assert "20260904210000-fixed-thing.md" in err, "the unrestored file must be NAMED"
+    assert "do NOT rerun" in err, "a partial rollback must forbid the rerun"
 
 
 def test_main_dry_run_consumes_nothing(

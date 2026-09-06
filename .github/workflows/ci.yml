@@ -398,6 +398,9 @@ jobs:
           # base commit, and the check treats an unreadable base as a violation
           # rather than a pass.
           fetch-depth: 0
+          # This job only READS the tree, so it has no use for a credential
+          # left behind in .git/config where every later step can reach it.
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
