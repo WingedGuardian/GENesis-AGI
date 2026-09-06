@@ -30,7 +30,31 @@ _VENV_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python"
 
 # Re-exec under the Genesis venv so `import genesis` + yaml/dotenv resolve, no
 # matter how gmodel was invoked (symlink on PATH, bare python3, etc.).
-if _VENV_PYTHON.is_file() and Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+#
+# "Am I in the venv?" is answered by sys.prefix, NOT by comparing interpreter
+# paths. A venv's `bin/python` is a SYMLINK to the base interpreter, so
+# `Path(sys.executable).resolve()` yields `/usr/bin/pythonX.Y` for BOTH the venv
+# and the system interpreter — the old comparison was therefore False under a
+# bare `python3`, the re-exec was skipped, and gmodel ran outside the venv.
+#
+# That failed SILENTLY and in the worst possible direction: without the venv,
+# `from dotenv import load_dotenv` below raises ImportError, the except swallows
+# it, secrets.env is never read, and every roster peer is reported as
+# `key ✗ (…)`. So `python3 scripts/gmodel` told the user that a perfectly
+# configured peer had no credentials — the discovery command actively denying a
+# sanctioned route. MEASURED 2026-09-06: `python3 scripts/gmodel` -> `key ✗`,
+# `.venv/bin/python scripts/gmodel` -> `key ✓`, same key, same file.
+#
+# sys.prefix is the venv root under a venv and the base prefix otherwise, which
+# is the actual question, and it is unaffected by how bin/python is linked.
+# The sentinel is a HANG guard, not a nicety. The failure mode of a re-exec
+# whose "am I there yet?" test never becomes true is an infinite exec loop, and
+# sys.prefix can legitimately fail to match a venv that was relocated or built
+# with --copies. One hop is all this ever needs, so enforce exactly one.
+_REEXEC_SENTINEL = "GENESIS_GMODEL_REEXEC"
+_IN_VENV = Path(sys.prefix).resolve() == (_REPO_ROOT / ".venv").resolve()
+if _VENV_PYTHON.is_file() and not _IN_VENV and not os.environ.get(_REEXEC_SENTINEL):
+    os.environ[_REEXEC_SENTINEL] = "1"
     os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 # Source checkout fallback (pip -e installs also satisfy the import directly).
@@ -47,7 +71,16 @@ if _SECRETS.is_file():
 
         load_dotenv(str(_SECRETS), override=False)
     except ImportError:
-        pass
+        # SAY SO. Swallowing this is what made the venv bug above invisible:
+        # the roster then reports every peer as `key ✗`, which reads as "you
+        # have not configured a key" rather than "this process cannot see your
+        # keys". A wrong answer wearing the right answer's grammar.
+        print(
+            "gmodel: WARNING — python-dotenv is unavailable, so secrets.env was NOT "
+            "loaded. Any 'key ✗' below means THIS PROCESS cannot see your keys, not "
+            f"that they are missing. Run it under the venv: {_VENV_PYTHON} {__file__}",
+            file=sys.stderr,
+        )
 
 from genesis.cc import roster  # noqa: E402
 
