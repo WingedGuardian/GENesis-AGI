@@ -134,11 +134,18 @@ class EgoContextBuilder:
         queues = snap.get("queues", {})
         if queues:
             lines.append("\n### Queues")
+            # A FAILED queue query leaves the producer's value None while the
+            # KEY stays present, so `.get(name, 0)` never defaults — rendering
+            # it raw puts the token "None" in this context, and defaulting it
+            # to 0 states "nothing pending" for a depth nobody measured. Say
+            # unknown; the snapshot's `errors` list carries the reason.
+            deferred = queues.get("deferred_work")
+            dead = queues.get("dead_letters")
             lines.append(
-                f"- Deferred work: {queues.get('deferred_work', 0)} pending"
+                f"- Deferred work: {'unknown' if deferred is None else deferred} pending"
             )
             lines.append(
-                f"- Dead letter: {queues.get('dead_letters', 0)} items"
+                f"- Dead letter: {'unknown' if dead is None else dead} items"
             )
 
         # Surplus
