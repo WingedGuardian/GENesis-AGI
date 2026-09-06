@@ -1923,8 +1923,10 @@ TABLES = {
                         CHECK(status IN ('open','in_progress','done','absorbed','dropped')),
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
-                        CHECK(added_by IN ('foreground','ambient','pulse')),
+                        CHECK(added_by IN ('foreground','ambient','pulse',
+                                           'ambient_ledger_extractor')),
             evidence    TEXT,
+            source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,
             updated_at  TEXT
         )
@@ -1967,7 +1969,8 @@ TABLES = {
             matched_item_id TEXT,
             match_score     REAL,
             duplicate_of    TEXT,
-            mode            TEXT NOT NULL DEFAULT 'shadow'
+            mode            TEXT NOT NULL DEFAULT 'shadow',
+            promoted_item_id TEXT  -- session_ledger row this proposal became (live mode); NULL = unpromoted, retryable
         )
     """,
     # ── Repo-pulse annotator (session-manager PR-4a) ─────────────────────
