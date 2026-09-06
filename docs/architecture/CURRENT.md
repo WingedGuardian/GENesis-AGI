@@ -206,6 +206,26 @@ any live flip. Centrality persistence widened from top-500 to all-nonzero
 (`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
 
+**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
+run through a `GraphStore` protocol with one implementation today,
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+`memory/graph.py` is a facade that owns the single production instance and the
+backend choice. The contract, and the reason the seam exists: a read that cannot
+REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
+means genuinely empty. Collapsing the two is how a missing NetworkX import once
+disarmed the shield above (an empty result read as "no bridges", wiping
+`centrality_cache`). CI runs no type checker, so conformance is asserted by a
+test rather than the annotation. Cache freshness is cross-process: besides the
+`invalidate_graph_cache()` flag that every `memory_links` writer flips (13 call
+sites, 9 modules), the store compares SQLite's `PRAGMA data_version`, so a write
+committed by ANOTHER process is observed — previously the server served a
+projection predating any dream-job write until it happened to write a link
+itself. The token is stamped BEFORE the load on purpose: in WAL the read
+snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
+projection that is missing a mid-load commit (MEASURED 2026-09-06). Prepared for
+the graph-DB adoption (issue #1641), where a server-backed engine becomes
+another `GraphStore` with no reader touched.
+
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
 (`memory_links.copy_external_links`) so they don't dangle on the soft-deleted

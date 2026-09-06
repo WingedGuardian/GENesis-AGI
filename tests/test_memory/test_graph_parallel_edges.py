@@ -103,9 +103,13 @@ async def parallel_db():
 
 async def test_parallel_edges_both_survive_the_load(parallel_db):
     """Both typed A→B rows must exist in the loaded graph, not just one."""
-    from genesis.memory.graph import _ensure_graph
+    from genesis.memory.graphstore_nx import NetworkxGraphStore
 
-    graph = await _ensure_graph(parallel_db)
+    # The NetworkX LOADER is what this asserts on (edge count in the built
+    # projection), so it addresses that store directly rather than the facade —
+    # which owns a production singleton and, after the seam, may hold a backend
+    # with no MultiDiGraph at all.
+    graph = await NetworkxGraphStore()._ensure_graph(parallel_db)
     # 5 rows in, 5 edges out. A DiGraph collapses each multi-type pair to one
     # edge and yields 3.
     assert graph.number_of_edges() == 5

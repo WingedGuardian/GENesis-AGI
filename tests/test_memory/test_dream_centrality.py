@@ -196,9 +196,13 @@ async def test_centrality_scores_raises_when_networkx_absent(db):
     """The producer half of the contract: unavailability is a typed raise,
     never an empty list wearing "no bridges" clothing."""
     from genesis.memory import graph as graph_mod
+    from genesis.memory import graphstore_nx
 
+    # Patch where the flag LIVES (the NetworkX store), not where it used to.
+    # graph.py deliberately does not re-export it: a patch aimed at the facade
+    # would silently no-op, which is worse than failing loudly.
     with (
-        patch.object(graph_mod, "_NX_AVAILABLE", False),
+        patch.object(graphstore_nx, "_NX_AVAILABLE", False),
         pytest.raises(graph_mod.GraphUnavailableError),
     ):
         await graph_mod.centrality_scores(db, top_n=None)
