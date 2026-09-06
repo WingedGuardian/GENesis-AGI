@@ -354,8 +354,13 @@ memory came back at all, **MRR** is how near the top it landed.
   bar is noise, not a result.
 - **The first three weeks are blank** because no recalls were judged yet. They
   render as a gap rather than as zeros.
-- **Store size is reconstructed**, by counting rows created on or before each
-  week. It cannot see deletions, so it is biased high on the older weeks.
+- **The x-axis is evenly spaced by snapshot, not by date.** Sixteen of the
+  eighteen intervals are exactly seven days; two in June are about half that,
+  and are drawn the same width as the rest.
+- **Store size is reconstructed**, by counting rows that exist *today* and were
+  created on or before each week. It cannot see deletions: a memory created in
+  May and deleted in July is missing from May's figure too. That understates the
+  early weeks, which flatters the growth multiple rather than the quality lines.
 - **Precision is not plotted, and it is the metric that has slipped.** Proactive
   recall returns a fixed *number* of memories rather than everything above a
   relevance bar, so when fewer memories are genuinely relevant than the budget

@@ -57,8 +57,10 @@ def _db_path(explicit: str | None) -> Path:
         from genesis.env import genesis_db_path
 
         candidates.append(Path(genesis_db_path()))
-    except Exception:  # noqa: BLE001 - standalone run without the package is fine
-        pass
+    except Exception as exc:  # noqa: BLE001 - standalone run without the package is fine
+        # Say so. Falling through in silence means a chart can be regenerated from
+        # a different database and committed as evidence with nothing to notice.
+        print(f"note: project db resolver unavailable ({exc!r}); trying the default path")
     candidates.append(Path.home() / "genesis" / "data" / "genesis.db")
 
     for cand in candidates:
@@ -117,11 +119,20 @@ def render(rows: list[dict]) -> str:
         raise SystemExit("not enough measured weeks to plot")
 
     max_pool = max(r["pool"] for r in rows) or 1
-    # Growth is measured over the JUDGED window, not the full row range: the
-    # headline claims quality held WHILE the store grew, and quality is only
-    # observed from the first week carrying a judged sample. Spending the three
-    # unmeasured weeks in the numerator would claim coverage the data lacks.
-    growth = rows[-1]["pool"] / (measured[0]["pool"] or 1)
+    # Growth spans the JUDGED window at BOTH ends, and the legend below reports
+    # that same window. The headline claims quality held WHILE the store grew, so
+    # a ratio reaching outside the weeks where quality was observed would claim
+    # coverage the data lacks — and a legend on a different span would let the
+    # image contradict its own headline, which is precisely what it did.
+    # A zero denominator is refused rather than papered over with `or 1`, which
+    # would turn an empty first week into a spectacular fictional multiplier.
+    first_pool, last_pool = measured[0]["pool"], measured[-1]["pool"]
+    if not first_pool:
+        raise SystemExit(
+            "cannot state growth: the first judged week reconstructs to an empty "
+            "store, which would make any ratio meaningless"
+        )
+    growth = last_pool / first_pool
     plot_w, plot_h = W - PAD_L - PAD_R, H - PAD_T - PAD_B
 
     def x(i: int) -> float:
@@ -182,7 +193,10 @@ def render(rows: list[dict]) -> str:
         f'{PAD_T + plot_h:.1f} Z" fill="url(#poolFill)"/>'
     )
 
-    # sample-count bars — the honesty layer: n varies ~7..493 across weeks
+    # sample-count bars — the honesty layer. Judged-sample size varies by an order
+    # of magnitude between weeks, so a high point on a thin bar is noise; drawing
+    # the counts is what lets a reader see which points to trust. Scaled to the
+    # run's own maximum rather than a fixed figure, so it does not go stale.
     max_n = max((r["n"] for r in rows), default=1) or 1
     for i, r in enumerate(rows):
         if not r["n"]:
@@ -222,7 +236,7 @@ def render(rows: list[dict]) -> str:
             (MRR, f"MRR  {mrr_seen[0]['mrr']:.2f} → {mrr_seen[-1]['mrr']:.2f}")
         )
     legend.append(
-        (POOL, f"store size  {rows[0]['pool']:,} → {rows[-1]['pool']:,} (reconstructed)")
+        (POOL, f"store size  {first_pool:,} → {last_pool:,} over the judged window (reconstructed)")
     )
     lx = PAD_L
     for colour, label in legend:
@@ -250,7 +264,9 @@ def main() -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(render(rows))
 
-    measured = [r for r in rows if r["n"] > 0]
+    # Same predicate render() uses, so the summary cannot report more points than
+    # the chart draws.
+    measured = [r for r in rows if r["n"] > 0 and r["hit"] is not None]
     print(
         f"wrote {dest} — {len(rows)} weeks ({len(measured)} measured), "
         f"{rows[0]['date']}..{rows[-1]['date']}, "
