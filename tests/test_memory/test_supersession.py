@@ -76,6 +76,13 @@ async def test_store_with_supersedes_marks_old_deprecated(store, db):
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.memory_links_crud") as mock_links:
         mock_mem.upsert = AsyncMock(return_value="id")
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.create_metadata = AsyncMock(return_value=None)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_mem.mark_superseded = AsyncMock(return_value=True)
@@ -112,6 +119,13 @@ async def test_store_with_supersedes_updates_qdrant(store, db):
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.memory_links_crud") as mock_links:
         mock_mem.upsert = AsyncMock(return_value="id")
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.create_metadata = AsyncMock(return_value=None)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_mem.mark_superseded = AsyncMock(return_value=True)
@@ -158,6 +172,13 @@ async def test_store_with_supersedes_skips_qdrant_for_fts5_only(store, db):
          patch("genesis.memory.store.update_payload") as mock_update, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.create_metadata = AsyncMock(return_value=None)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
 
@@ -177,6 +198,13 @@ async def test_store_with_supersedes_creates_succeeded_by_link(store, db):
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.memory_links_crud") as mock_links:
         mock_mem.upsert = AsyncMock(return_value="id")
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.create_metadata = AsyncMock(return_value=None)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_mem.mark_superseded = AsyncMock(return_value=True)
@@ -204,6 +232,13 @@ async def test_store_without_supersedes_skips_deprecation(store, db):
          patch("genesis.memory.store.update_payload") as mock_update, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.create_metadata = AsyncMock(return_value=None)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
 
@@ -230,6 +265,13 @@ async def test_supersedes_failure_does_not_block_store(store, db):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.create_metadata = AsyncMock(return_value=None)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
 
@@ -347,6 +389,13 @@ async def test_supersede_skips_qdrant_for_non_embedded(store, status):
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.memory_links_crud") as mock_links:
         mock_mem.mark_superseded = AsyncMock(return_value=True)
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). These ids are non-hex, so the real
+        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
         mock_mem.get_metadata = AsyncMock(return_value={
             "memory_id": "old", "collection": "episodic_memory",
             "embedding_status": status, "deprecated": 0,
@@ -357,3 +406,74 @@ async def test_supersede_skips_qdrant_for_non_embedded(store, status):
         await store._mark_superseded("old", "new", "2026-03-11T12:00:00")
 
     mock_update.assert_not_called()
+
+
+@pytest.mark.asyncio()
+async def test_store_lets_an_unresolved_supersede_out(store, db):
+    """store() must NOT swallow SupersedeUnresolved.
+
+    Added because a mutation survived: re-widening the call site's
+    ``except Exception`` to catch this error broke nothing, since every other
+    test either calls ``_mark_superseded`` directly or mocks ``store`` whole.
+    That except clause IS the live defect (a session was told its correction
+    landed while the stale memory stayed in recall), so it needs a test that
+    reaches it.
+    """
+    from genesis.memory.store import SupersedeUnresolved
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        # The handle names no memory — the resolver's NOT_FOUND verdict.
+        mock_mem.resolve_id = AsyncMock(return_value=([], "not_found"))
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        with pytest.raises(SupersedeUnresolved) as exc:
+            await store.store(
+                "a correction", "conversation", supersedes="deadbeef",
+            )
+
+    assert exc.value.reason == "not_found"
+    # The new memory was still written before the supersede was attempted —
+    # that is why the MCP layer reports instead of raising to the caller.
+    assert exc.value.stored_memory_id
+    mock_mem.mark_superseded.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+async def test_dedup_short_circuit_still_supersedes(store, db):
+    """BLOCKER: the dedup early-return skipped the supersede entirely.
+
+    ``store()`` returns at the dedup check ~300 lines above the supersede
+    block, so a correction whose content already existed deprecated nothing —
+    and because nothing raised, the MCP layer then reported
+    ``superseded: True``. That is worse than the silence this change fixes: an
+    affirmative false claim. It is also the LIKELIEST path, because retrying a
+    failed supersede re-sends the same content with a corrected id.
+    """
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links, \
+         patch.object(MemoryStore, "_mark_superseded", new=AsyncMock(return_value=[])) as ms:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        # The content is already stored — the dedup short-circuit fires.
+        mock_mem.find_exact_duplicate = AsyncMock(return_value="pre-existing-id")
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        out = await store.store(
+            "a correction", "conversation", supersedes="old-memory-id",
+        )
+
+    assert out == "pre-existing-id"
+    ms.assert_awaited_once()
+    # and it must supersede TOWARD the memory that actually exists
+    assert ms.await_args[0][1] == "pre-existing-id"

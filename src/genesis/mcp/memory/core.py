@@ -824,8 +824,20 @@ async def memory_store(
     room: str | None = None,
     collection: str | None = None,
     supersedes: str | None = None,
-) -> str:
+) -> str | dict:
     """Store memory with source metadata and type tag. Returns memory_id.
+
+    Return shape depends on ``supersedes``, which the caller controls: without
+    it you get the memory_id string, exactly as before. WITH it you get a dict
+    ``{"memory_id", "superseded", ...}`` reporting whether the deprecation
+    actually happened — because it can fail on its own while the store
+    succeeds, and reporting only the id is what let that failure go unnoticed.
+    A partially-applied supersede adds ``partial`` naming the steps that did
+    not land.
+
+    This tool is also reachable over HTTP as ``POST /api/t/memory_store``
+    (``dashboard/routes/tool_api.py``), which accepts ``supersedes`` like any
+    other parameter — so the conditional shape is visible to that door too.
 
     Args:
         memory_class: Optional classification — "rule", "fact", or "reference".
@@ -836,7 +848,13 @@ async def memory_store(
             collection routing when provided (e.g. "knowledge_base").
         supersedes: Memory ID that this new memory replaces. The old memory
             will be marked as deprecated with a ``succeeded_by`` link to the
-            new one. Use when correcting stale facts.
+            new one. Use when correcting stale facts. Accepts the same short
+            ``id:<8-char>`` handles the proactive hook prints and
+            ``memory_expand`` accepts; an ambiguous handle is never guessed.
+            When it cannot be resolved the memory is STILL STORED and the
+            returned dict says so — do not retry the store, or you will
+            duplicate the memory (measured: that retry happened twice on
+            2026-09-06 while this path was silent).
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -847,21 +865,71 @@ async def memory_store(
     # external-influenced session's writes stop landing first_party via the
     # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
     from genesis.memory.provenance import session_origin_from_env
+    from genesis.memory.store import SupersedeUnresolved
 
-    return await memory_mod._store.store(
-        content,
-        source,
-        memory_type=memory_type,
-        tags=tags,
-        confidence=confidence,
-        memory_class=memory_class,
-        source_pipeline="conversation",
-        origin_class=session_origin_from_env(),
-        wing=wing,
-        room=room,
-        collection=collection,
-        supersedes=supersedes,
-    )
+    # Collector for steps that failed AFTER the SQLite deprecation landed. The
+    # Qdrant payload write and the link create are best-effort and swallow
+    # their own exceptions, and the vector leg of hybrid recall filters on that
+    # Qdrant payload — so without this a partial supersede would be reported as
+    # a complete one, which is the class of lie this whole change exists to stop.
+    degraded: list[str] = []
+
+    try:
+        memory_id = await memory_mod._store.store(
+            content,
+            source,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            memory_class=memory_class,
+            source_pipeline="conversation",
+            origin_class=session_origin_from_env(),
+            wing=wing,
+            room=room,
+            collection=collection,
+            supersedes=supersedes,
+            supersede_degraded=degraded,
+        )
+    except SupersedeUnresolved as exc:
+        # The memory IS durable; only the deprecation failed. Report both
+        # halves rather than raising — an exception here reads as "the store
+        # failed" and invites the retry that duplicates the memory.
+        return {
+            "memory_id": exc.stored_memory_id,
+            "superseded": False,
+            "supersedes_requested": supersedes,
+            "reason": exc.reason,
+            "candidates": exc.candidates,
+            "candidates_truncated": exc.truncated,
+            "warning": (
+                f"The memory WAS stored ({exc.stored_memory_id}). The supersede "
+                f"did NOT happen: {supersedes!r} is {exc.reason}. The old memory "
+                "is still live in recall. Re-run memory_store with the SAME "
+                "content and a full 36-char memory id: the content will not be "
+                "duplicated, and the supersede will be applied to the memory "
+                "that already landed. There is no standalone supersede tool."
+            ),
+        }
+
+    if supersedes is None:
+        return memory_id
+
+    report: dict = {
+        "memory_id": memory_id,
+        "superseded": True,
+        "supersedes_requested": supersedes,
+    }
+    if degraded:
+        # The deprecation landed in SQLite but a later step did not. Say which,
+        # rather than letting "superseded: True" stand for a partial outcome.
+        report["partial"] = degraded
+        report["warning"] = (
+            "The SQLite deprecation applied, but these steps did NOT: "
+            + ", ".join(degraded)
+            + ". If 'qdrant_payload' is listed the old memory may still surface "
+            "in vector recall even though FTS now hides it."
+        )
+    return report
 
 
 @mcp.tool()

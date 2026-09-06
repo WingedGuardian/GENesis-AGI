@@ -434,6 +434,37 @@ async def invalidate_memory(
     return cursor.rowcount > 0
 
 
+async def resolve_id(db: aiosqlite.Connection, id_or_prefix: str) -> tuple[list[str], str]:
+    """Resolve a full memory id OR a short hex handle to the memory row(s).
+
+    Thin wrapper over the shared resolver so WRITE paths accept the same short
+    handles the READ paths already do. ``memory_expand`` resolves ``id:<8-char>``
+    handles because the proactive hook hands them out
+    (``mcp/memory/core.py::_resolve_id_prefixes``); ``supersedes`` did not, so an
+    8-char handle hit an exact-match UPDATE, matched nothing, and the caller was
+    told the store succeeded.
+
+    ``full_len=36`` — memory ids are DASHED uuid4 (36 chars), not the 32-char
+    ``uuid4().hex`` the resolver defaults to. NOTE the mechanism, because the
+    obvious reading is wrong: a COMPLETE 36-char id is PASSTHROUGH under either
+    value (``len(mid) >= full_len`` is true at 32 as well). What ``36`` actually
+    changes is the 32-to-35-char band — a TRUNCATED paste of a real id, which
+    the default would wave through as "full length" into an exact-match lookup
+    that cannot hit, and which 36 lets prefix-resolve instead.
+
+    Returns ``(matches, outcome)`` — see ``crud/_id_resolve``.
+    """
+    from genesis.db.crud._id_resolve import resolve_unique_prefix
+
+    return await resolve_unique_prefix(
+        db,
+        table="memory_metadata",
+        id_column="memory_id",
+        raw_id=id_or_prefix,
+        full_len=36,
+    )
+
+
 async def mark_superseded(
     db: aiosqlite.Connection,
     old_id: str,
