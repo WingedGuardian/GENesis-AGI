@@ -117,7 +117,8 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
             # the opposite). The leading PARTIAL line is dropped rather than
             # handed on: a byte cut lands anywhere, and several patterns need
             # their whole value on one line — a URL credential is recognised
-            # by its `://u:pw@host` shape, so a line cut mid-URL could show a
+            # by its scheme-then-user-then-password-then-host shape, so a line
+            # cut mid-URL could show a
             # pattern half a value. Cutting on a line boundary means the
             # over-long line is dropped whole, never half-shown.
             _cap="${GENESIS_CC_TAIL_CAP:-262144}"
