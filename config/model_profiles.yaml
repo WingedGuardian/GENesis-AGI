@@ -196,6 +196,52 @@ profiles:
     last_reviewed: "2026-09-03"
     review_source: provider_pricing_page
 
+  mistral-medium:
+    display_name: "Mistral Medium (latest)"
+    provider: mistral
+    api_id: "mistralai/mistral-medium-latest"
+    # Tier is INFERRED from Mistral's own positioning of Medium 3 as its
+    # frontier-class workhorse, not benchmarked on this install — no routing
+    # history exists for it yet. Revisit against real call outcomes once it
+    # carries traffic; the rest of the row mirrors the vendor pricing page.
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.40
+    cost_per_mtok_out: 2.00
+    latency: moderate
+    strengths:
+      - JSON instruction following
+      - strong quality-per-cost
+    weaknesses:
+      - 128k context is small
+    best_for: [memory_consolidation, fact_extraction, triage, outreach_draft]
+    avoid_for: [creative_writing, long_context_work]
+    free_tier:
+      # ENTITLEMENT VERIFIED 2026-09-06; PRICING STILL PRESUMED (user decision
+      # 2026-09-05). A live probe of all three tiers on one free-tier account,
+      # same request shape, same minute:
+      #     mistral-large-latest  -> 403 tier_not_allowed
+      #     mistral-medium-latest -> 429 rate_limited
+      #     mistral-small-latest  -> 429 rate_limited
+      # A tier check precedes rate limiting, so Large is refused by entitlement
+      # while Medium is only throttled — Medium IS reachable on a tier that
+      # refuses Large. What the 429 does NOT establish is $0: it proves
+      # reachable, not free. `available: true` therefore remains an
+      # account-tier COST assumption until a completion's billed cost is read.
+      # Keep this comment and the one on `mistral-medium-free` in
+      # config/model_routing.yaml in agreement — they were briefly contradictory
+      # (one VERIFIED, one UNVERIFIED) after the entitlement probe landed in only
+      # one of them.
+      available: true
+      provider: mistral
+      note: "Presumed free-tier; entitlement unverified as of 2026-09-05."
+    last_reviewed: "2026-09-05"
+    review_source: provider_pricing_page
+
   mistral-small:
     display_name: "Mistral Small (latest)"
     provider: mistral

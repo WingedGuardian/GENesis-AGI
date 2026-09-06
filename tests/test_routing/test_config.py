@@ -133,7 +133,9 @@ def test_load_full_yaml(monkeypatch):
     # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
     # 2026-08-19: 26 → 25 after removing dead nvidia-nim-kimi (moonshotai/kimi-k2.6
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
-    assert len(cfg.providers) == 25
+    # 2026-09-05: 25 -> 26 with mistral-medium-free — the in-family rung
+    # directly below Large (presumptive free tier; see model_routing.yaml).
+    assert len(cfg.providers) == 26
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -222,14 +224,20 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["29_retrospective_triage"].chain == [
         "groq-free",
         "mistral-large-free",
+        "mistral-medium-free",
         "openrouter-nemo",
     ]
     assert cfg.call_sites["30_triage_calibration"].default_paid is True
-    # lmstudio-30b filtered out, only mistral-large-free remains
-    assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large-free"]
+    # lmstudio-30b filtered out; the Mistral family rungs remain (Large, then
+    # Medium directly below it — the in-family fallback added 2026-09-05).
+    assert cfg.call_sites["30_triage_calibration"].chain == [
+        "mistral-large-free",
+        "mistral-medium-free",
+    ]
     assert cfg.call_sites["31_outcome_classification"].chain == [
         "glm51",
         "mistral-large-free",
+        "mistral-medium-free",
     ]
 
     # mistral-large-free provider (consolidated from mistral-free + mistral-large).
