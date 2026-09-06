@@ -1,0 +1,38 @@
+# Code-intel index health (awareness hourly band).
+#
+# The code indexer can fail permanently and say nothing. MEASURED on a live
+# install 2026-09-05: the main repo's index request was euthanized to a
+# <hash>.failed.json marker after 5 genuine failures (a state index_marker.py
+# describes as "never retried"), its database sat as a 164 MB .db.corrupt for
+# two weeks, and the runner logged "index failed" 35 times — while no awareness
+# check covered code-intel and nothing in src/ read either signal. It did not
+# fail silently; it failed loudly into a log file, which is the same thing.
+#
+# This check reads the indexer's OWN artifacts on disk (euthanized request
+# markers + the index database for the configured target). It never asks the
+# code-intel tool how it is doing: a tool that has crashed cannot report its own
+# health, and its daemon may not be running at all.
+#
+# Values here merge over built-in defaults; a .local.yaml overlay merges over
+# this file. Env kill switch: GENESIS_CODE_INTEL_HEALTH_DISABLED=1.
+
+enabled: true
+
+# Which path code-intel is expected to have an index for. Empty = repo root.
+#
+# LEAVE THIS EMPTY unless you have also re-pointed the indexer. Every writer of
+# an index request hardcodes the repo root today (the post-commit hook,
+# disk_reclaim, the gitnexus surplus job), and the runner indexes whatever the
+# request names — nothing in that path reads this file.
+#
+# The knob exists because the index's on-disk name derives from the FULL path,
+# so an install that genuinely indexes a subdirectory needs this check to
+# follow. But it steers ONLY this check: set it on its own and the check will
+# look for an index nothing ever builds, reporting ABSENT forever. Narrowing the
+# indexer means changing the writers AND setting this to match.
+indexed_path: ""
+
+# high = the morning report. A dead code index degrades tool quality; it does
+# not lose the user's data or session context. `critical` (the ~5-minute
+# Telegram path) is reserved for the context-loss class.
+alert_priority: high
