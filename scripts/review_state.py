@@ -67,9 +67,28 @@ _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # commit, but the round count must SURVIVE commits — a review→fix→re-review loop
 # commits between rounds, and the whole point is to notice when that loop runs long.
 _ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
-# After this many review rounds on one change, the commit gate blocks pending an
-# explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md prose cap.
+# After this many CONSECUTIVE review rounds on one change, the commit gate blocks
+# pending an explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md
+# prose cap.
 ESCALATION_ROUND_CAP = 3
+# After this many rounds over the branch's WHOLE LIFE, the commit gate blocks
+# pending a '# final-round-accept' — and unlike the cap above, that block returns
+# on every subsequent commit.
+#
+# WHY A SECOND COUNTER EXISTS. `# escalation-ack` makes the gate call
+# reset_review_round, so the consecutive cap is indefinitely REPEATABLE:
+# rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, without end. A change can consume
+# fifteen external review rounds and the machine never says "enough" — only
+# "enough, for now", once every three rounds. The consecutive counter cannot
+# express a terminal because resetting it is exactly what the ack is for.
+#
+# 7 is the start of the THIRD cycle: two complete free/audit/stop cycles have
+# already run, each of which already demanded a fresh decision. A change still
+# surfacing new defects from an independent reviewer after that is not converging,
+# and the remaining question is a judgement call a machine should not keep
+# deferring — accept the outstanding findings and merge, or abandon the branch and
+# restart from a design that does not need seven rounds.
+FINAL_ROUND_CAP = 7
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
@@ -674,9 +693,39 @@ def bump_review_round(
     # current state defect-free, so no review→fix loop is in progress. Record the
     # current content hash so the NEXT defect-bearing mark on a distinct diff
     # correctly reads as a new (round-1) streak.
+    # The lifetime count is carried through EVERY write below. Read once here, from
+    # the same-branch state only — a counter belonging to another branch is a
+    # different change and contributes nothing.
+    _prev = _load_round(cwd)
+    lifetime = (
+        _coerce_finite_int(_prev.get("lifetime", 0))
+        if _prev and _prev.get("branch") == branch
+        else 0
+    )
+    # Carried through every write below for the same reason as `lifetime`: each
+    # branch here REBUILDS the state dict, so a field that is not named again is
+    # dropped. A spent acceptance that vanished on the next marked round would
+    # hand the change a fresh one — reopening the terminal by simply running
+    # another review, which is the loop this tier exists to end.
+    consumed = (
+        bool(_prev.get("final_accept_consumed"))
+        if _prev and _prev.get("branch") == branch
+        else False
+    )
     if clean:
+        # A clean round resets the STREAK but not the lifetime. A change that
+        # alternates clean and defect-bearing rounds has still consumed every one
+        # of them, and resetting here would hand it an unbounded budget by simply
+        # converging occasionally.
         _write_round(
-            {"branch": branch, "round": 0, "last_hash": content_hash, "last_source": "external"},
+            {
+                "branch": branch,
+                "round": 0,
+                "lifetime": lifetime,
+                "last_hash": content_hash,
+                "last_source": "external",
+                "final_accept_consumed": consumed,
+            },
             cwd,
         )
         return 0
@@ -686,9 +735,15 @@ def bump_review_round(
     # a transient git timeout).
     if content_hash in ("clean", "unknown"):
         return get_review_round(cwd=cwd)
-    state = _load_round(cwd)
+    state = _prev
     if not state or state.get("branch") != branch:
-        state = {"branch": branch, "round": 1, "last_hash": content_hash, "last_source": "external"}
+        state = {
+            "branch": branch,
+            "round": 1,
+            "lifetime": 1,
+            "last_hash": content_hash,
+            "last_source": "external",
+        }
     elif state.get("last_hash") != content_hash:
         # A distinct staged diff → new defect-bearing round. Coerce the stored
         # round defensively: a corrupt / partial-write / version-skewed value must
@@ -699,20 +754,121 @@ def bump_review_round(
         state = {
             "branch": branch,
             "round": prev + 1,
+            "lifetime": lifetime + 1,
             "last_hash": content_hash,
             "last_source": "external",
+            "final_accept_consumed": consumed,
         }
     # else: same branch + same staged diff → same round (idempotent re-mark).
     _write_round(state, cwd)
     return _coerce_finite_int(state.get("round", 0))
 
 
-def reset_review_round(cwd: str | None = None) -> None:
-    """Delete the round counter (e.g. after the change lands). Never raises."""
-    import contextlib
+def get_final_accept_consumed(cwd: str | None = None) -> bool:
+    """True once this branch has spent its ONE final-round acceptance.
 
-    with contextlib.suppress(OSError):
-        _round_file(cwd).unlink(missing_ok=True)
+    Branch-scoped on purpose: a global latch would permanently disarm the sigil
+    for every later change on the install. Never raises — an unreadable or
+    foreign-branch counter reads as "not consumed", which fails toward letting a
+    genuine acceptance through rather than stranding a change behind a gate whose
+    state it cannot see.
+    """
+    state = _load_round(cwd)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+        return False
+    return bool(state.get("final_accept_consumed"))
+
+
+def consume_final_accept(cwd: str | None = None) -> None:
+    """Spend this branch's final-round acceptance. Best-effort, never raises.
+
+    Recorded at the moment the gate ALLOWS the acked commit, because a PreToolUse
+    hook has no post-execution callback — there is no later point at which to
+    learn the commit succeeded. Burning it on allow is the deliberate direction:
+    if the commit then fails for an unrelated reason the change is stuck, and at
+    round seven "stuck" means "take it to the user", which is the intent.
+
+    No-ops when no same-branch counter exists. That state is unreachable from the
+    only caller — the terminal fires on ``lifetime >= FINAL_ROUND_CAP``, which
+    requires exactly such a counter — so writing a synthetic one here could only
+    invent a lifetime that was never counted.
+
+    ONE-SHOT IS NOT A HARD GUARANTEE, and the limit is worth naming: both this and
+    ``get_final_accept_consumed`` compare against ``get_current_branch``, which
+    returns ``"unknown"`` on a git timeout or read error. A transient git failure
+    therefore makes this a silent no-op and makes the read report "not consumed",
+    refunding the acceptance. That is the correct direction for a best-effort
+    counter that must never raise into a commit — it fails toward letting a real
+    decision through rather than stranding a change behind state it cannot see —
+    but nobody should read "one-shot" as tamper-proof.
+    """
+    branch = get_current_branch(cwd=cwd)
+    state = _load_round(cwd)
+    if not branch or not state or state.get("branch") != branch:
+        return
+    _write_round({**state, "final_accept_consumed": True}, cwd)
+
+
+def get_review_lifetime(cwd: str | None = None) -> int:
+    """Counted review rounds over this branch's WHOLE life. Never raises.
+
+    Differs from ``get_review_round`` in exactly one way that matters: an
+    ``# escalation-ack`` resets the consecutive streak and does NOT reset this.
+    That asymmetry is the feature — the streak measures "is the current loop
+    running long", this measures "has this change consumed more review than it
+    is worth". Returns 0 for a different branch (a new change starts fresh) or
+    a counter written before this field existed.
+    """
+    state = _load_round(cwd)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+        return 0
+    return _coerce_finite_int(state.get("lifetime", 0))
+
+
+def reset_review_round(cwd: str | None = None) -> None:
+    """Reset the CONSECUTIVE streak, PRESERVING the lifetime count. Never raises.
+
+    Deliberately a rewrite rather than the unlink this used to do. The only
+    caller is the escalation-cap ack, whose purpose is to clear the streak so the
+    next stop is a fresh cap away — but deleting the file would take the lifetime
+    counter with it, and a terminal that its own ack erases is not a terminal.
+    So: streak to 0, lifetime and branch carried forward.
+
+    ``last_hash`` is dropped on purpose. It exists to make a re-mark of the SAME
+    staged diff idempotent within a streak; once the streak is reset, the next
+    defect-bearing mark must be free to count as round 1 whether or not the diff
+    moved in between.
+
+    ``last_source`` MUST be written even though this function does not record a
+    review. ``_load_round`` discards any counter carrying ``round`` without
+    ``last_source`` as a pre-source-axis legacy file — so omitting it here makes
+    the very next read throw the whole counter away, silently taking the lifetime
+    count with it and leaving the terminal unreachable. Only external rounds are
+    ever counted, so a surviving lifetime implies external provenance.
+    """
+    state = _load_round(cwd)
+    lifetime = _coerce_finite_int(state.get("lifetime", 0)) if state else 0
+    branch = state.get("branch") if state else None
+    if not lifetime or not branch:
+        # Nothing worth carrying — keep the original delete so a stale/foreign
+        # counter is cleared outright rather than resurrected as an empty shell.
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            _round_file(cwd).unlink(missing_ok=True)
+        return
+    _write_round(
+        {
+            "branch": branch,
+            "round": 0,
+            "lifetime": lifetime,
+            "last_source": "external",
+            # Carried for the same reason as `lifetime`: an escalation-ack resets
+            # the streak, and must not also refund a spent final acceptance.
+            "final_accept_consumed": bool(state.get("final_accept_consumed")),
+        },
+        cwd,
+    )
 
 
 def get_current_branch(cwd: str | None = None) -> str:

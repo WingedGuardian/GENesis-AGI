@@ -48,6 +48,39 @@ not to confirm:
   itself a review failure.
 - **End with a verdict:** `Ready to merge: Yes | No | With fixes` + a one-line reason.
 
+### Documentation is out of scope for review
+
+Do not review CHANGELOG entries, release notes, README, or ordinary `docs/`
+prose, and do not raise findings on them. They ship no behaviour: an imprecise
+sentence in a changelog cannot break an install, while a review round spent on
+one costs the same as a round spent on the code that can. Skip them and put the
+whole budget on executable code.
+
+This does NOT relax factual accuracy where prose makes a CHECKABLE claim about
+behaviour — "restores the previous behaviour exactly", "defaults to off", a
+config key or a path. If such a statement contradicts the diff it describes, that
+is a code-adjacent defect and is still worth one line. The distinction is between
+*wrong* and merely *improvable*: report the first, ignore the second.
+
+<!-- BEGIN prose-review-scope (temporary; remove this block to restore full prose review) -->
+### Prompts, skills and other prose: basic factual accuracy only
+
+Markdown, agent and skill definitions, and other prose surfaces get a
+FACTUAL-ACCURACY pass, not the adversarial enumeration above. Check that what the
+text asserts matches the code it describes — a named file, function, flag,
+default or command that does not exist, or a claim the diff contradicts. Stop
+there.
+
+Do not enumerate wording, structure, tone, completeness, redundancy, or
+hypothetical misreadings by a future reader, and do not open a finding whose
+remedy is a rewrite for clarity. Prose in this repository is deliberately long
+and argumentative because it has to survive being read out of context by a fresh
+session; density there is a feature, and reviewing it as if it were code produces
+volume without defects.
+
+Executable code is unaffected by this section — review it in full.
+<!-- END prose-review-scope -->
+
 ## GitNexus — Code Intelligence (advisory)
 
 This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,
@@ -86,7 +119,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **aws-fde-delivery** — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** — Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
 - **cc-update** — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
-- **closing-session** — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "work the PR queue", "close out the open PRs", "review and fix the open PRs", "drive #1234 to green", "what's blocking our PRs". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
+- **closing-session** — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
 - **content-publish** — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
 - **debugging** — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
@@ -199,6 +232,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 **genesis-outreach**
 
+- `marketing_prospects_list` — List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets the campaign may pitch — so it can enumerate → personalise a pitch → call ``marketing_send(prospect_id, subject, body)``.
 - `marketing_send` — Stage a COLD marketing email to a curated prospect. Returns a neutral queued/refused JSON status.
 - `outreach_digest` — Generate a digest of recent outreach activity.
 - `outreach_engagement` — Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged, not_useful, ambivalent, ignored; 'replied' maps to 'useful').

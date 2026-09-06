@@ -156,6 +156,33 @@ _on_signal_prestop() {
     exit 1
 }
 
+# ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
+# deploy can repair the keys.
+#
+# bootstrap.sh runs as a SUBPROCESS later in this script and calls
+# cc_ensure_local, which may repair CC's auto-updater suppression. That repair
+# sets CC_SUPPRESSION_STATE in the SUBPROCESS, where it dies; the in-process
+# call in _sync_deploy_targets then finds an already-correct file and reports
+# `ok`, so a real repair reaches neither update_history nor the deploy output —
+# and bootstrap's own message is usually cut by its `tail -10`.
+#
+# cc_ensure_updater_suppressed leaves a durable breadcrumb on any non-ok
+# outcome. CLEARING the file here is what lets the consumer tell "repaired
+# during THIS deploy" from a breadcrumb left weeks ago: anything present after
+# the subprocess was written by this deploy, BY CONSTRUCTION. This replaced an
+# epoch watermark compared with `-gt` — an ordering that rode on the wall
+# clock, so a clock rollback, a snapshot restore carrying a future-dated
+# breadcrumb, or a same-second overwrite each made a GENUINE repair read as a
+# clean deploy. Existence cannot be reordered. The epoch inside the file is
+# display data only, and no reader may compare it again.
+rm -f "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true
+if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
+    # The clear is load-bearing for attribution; a file that survives it would
+    # quietly restore the old weeks-ago-breadcrumb misattribution for one run.
+    echo "  WARNING: could not clear $HOME/.genesis/cc_suppression_outcome —" \
+         "a suppression outcome reported later in this deploy may predate it"
+fi
+
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
 if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
@@ -506,13 +533,57 @@ _sync_deploy_targets() {
         # swallowing it — symmetric with the host-side pin failures accumulated
         # above, so a container left on a stale CC pin is surfaced in
         # update_history, not silently dropped.
+        # Clear any inherited value first: the `+set` probe below catches a
+        # LIBRARY that predates the state variable only if nothing else already
+        # put the name in scope — an exported CC_SUPPRESSION_STATE=ok from the
+        # parent environment, or an earlier in-process call, would defeat it.
+        # cc_settings_align.sh does the same, for the same reason.
+        unset CC_SUPPRESSION_STATE
         if ! cc_ensure_local; then
             echo "  WARNING: container Claude Code sync failed"
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
         fi
+        # cc_ensure_local also re-asserts auto-updater suppression (it sets
+        # CC_SUPPRESSION_STATE). Surface a non-ok outcome the same way as a version
+        # sync failure: an unsuppressed auto-updater makes the pin advisory, and a
+        # REPEATED repair means something on this box keeps rewriting settings.json
+        # — neither should live only as a line in a long deploy log.
+        # UNSET is not ok. `cc_ensure_local` sourced from a revision that predates
+        # the state variable — version skew across a partial deploy — would sail
+        # through a `${VAR:-ok}` default as a clean deploy that verified nothing.
+        # scripts/cc_settings_align.sh already refuses that read for the same
+        # reason; this is the sibling consumer of the same channel, so it refuses
+        # it too. The `+set` test distinguishes unset from empty; `:-` cannot.
+        if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
+        elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
+        else
+            # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier
+            # in this same deploy, as a subprocess, and may already have repaired
+            # the keys — leaving this call nothing to do and nothing to report.
+            # The breadcrumb is the only surviving evidence, and the file was
+            # CLEARED at the top of this script — so its mere existence now
+            # means "written during this deploy". No epoch comparison: that is
+            # the wall-clock ordering this channel used to ride on, and a clock
+            # rollback or restored snapshot made a genuine repair read as clean.
+            _supp_line="$(cat "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
+            _supp_state="${_supp_line%% *}"
+            if [ -n "$_supp_state" ]; then
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${_supp_state}"
+                echo "  NOTE: auto-updater suppression was '${_supp_state}' earlier in this" \
+                     "deploy (bootstrap) — recording it, since this later check found the" \
+                     "file already correct and would otherwise have reported a clean run"
+            fi
+        fi
         cc_shadow_scan || true
     else
+        # Without the marker, a deploy that never ran the container CC sync OR
+        # the suppression check recorded "success" with an empty degraded list —
+        # the whole block above is behind this file check, so its absence must
+        # be a first-class degraded cause, same as any failure inside it.
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
+        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_env_missing"
     fi
     echo ""
 }

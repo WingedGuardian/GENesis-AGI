@@ -2,20 +2,37 @@
 name: closing-session
 description: >
   This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE
-  rather than to write new code — "work the PR queue", "close out the open PRs",
-  "review and fix the open PRs", "drive #1234 to green", "what's blocking our
-  PRs". It owns the In Review column: it reads each PR's gate status, verifies
-  and fixes review findings on PRs OTHER sessions built, replies in-thread, and
-  stops at the merge gate for the user's per-PR approval. Do NOT load it for
-  building a feature and opening its PR — that is a build session
-  (`genesis-development`).
-# `_extract_keywords()` reduces a prompt to bare words and `_score_skill()`
-# reads THIS list only — never the description prose above. So every trigger
-# phrase advertised there has to appear here as the words it decomposes into:
-# "work the PR queue" -> work, queue; "drive #1234 to green" -> drive, green.
-# Without them the skill advertises triggers that cannot fire (Codex P2, #1638).
-keywords: [prs, codex, merge, merging, mergeable, unmerged, work, queue, drive,
-  green, closing, blocking]
+  rather than to write new code — "close out the open PRs", "review and fix the
+  open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the
+  In Review column: it reads each PR's gate status, verifies and fixes review
+  findings on PRs OTHER sessions built, replies in-thread, and stops at the
+  merge gate for the user's per-PR approval. Do NOT load it for building a
+  feature and opening its PR — that is a build session (`genesis-development`).
+# `_extract_keywords()` reduces a prompt to bare WORDS and `_score_skill()` reads
+# THIS list only — never the description prose above. There is no phrase or
+# co-occurrence matching, and one keyword hit scores 2 against a `_MIN_SCORE` of
+# 2, so every entry here fires the skill ON ITS OWN.
+#
+# That is why this list holds only terms distinctive to the PR queue. An earlier
+# round added `work`, `queue`, `drive`, `green` and `blocking` so that the phrase
+# triggers advertised above could fire; measured against the scorer, each of them
+# then fired alone — "work on the dashboard", "drive to the store", "make the
+# tests green" all surfaced this skill, which explicitly forbids opening new
+# work, and consumed one of the two catalog-nudge slots doing it (Codex P2,
+# #1638, second round on its own first-round fix).
+#
+# The description above now advertises only triggers that CAN fire, all via
+# `prs`. Phrase triggers ("work the PR queue") need co-occurrence matching the
+# scorer does not have — that mechanism gap is issue #1799; until it is closed,
+# this skill is loaded by name for those.
+#
+# MEASURED against the real scorer, both directions, on 6 advertised triggers and
+# 7 control prompts: advertised 6/6 fire before AND after; false positives
+# 7/7 -> 1/7. The survivor is "closing the loop on that email", which scores via
+# the skill's own NAME token (`closing-session` -> {closing, session}), not via
+# this list — its keyword-only score is 0.0. No keyword edit can reach that one;
+# it needs either a rename or the scorer fix (also #1799).
+keywords: [prs, codex, mergeable, unmerged]
 consumer: cc_foreground
 phase: 10
 skill_type: workflow
@@ -42,11 +59,49 @@ The split also satisfies the "reviewer ≠ implementer, fresh context" contract
 **structurally rather than by discipline**: a closing session has no memory of
 writing the code it reviews, because it did not write it.
 
-**The handoff artifact is the PR itself.** Nothing has to be remembered across
-the session boundary, because the boundary IS a durable artifact — it survives
-compaction, session death, and machine restarts. That is what makes the split
-safe, and it is why this skill needs no handoff state and no resume protocol:
-it re-reads the queue on every pass.
+**The handoff artifact is the PR itself.** Nothing about the WORK has to be
+remembered across the session boundary, because the boundary IS a durable
+artifact — it survives compaction, session death, and machine restarts, and this
+skill re-reads the queue on every pass rather than resuming a position in it.
+
+**But the PR is not the whole handoff, because the working tree is not
+disposable.** The build session's branch stays checked out in its worktree, and
+two mechanical facts follow:
+
+- `git worktree add` REFUSES a branch already checked out elsewhere (measured:
+  `fatal: '<branch>' is already used by worktree at '<path>'`). `--force` gets
+  past it and gives you two trees on one branch, which is how a commit lands on
+  top of another session's uncommitted work.
+- The review marker and the escalation-round counter are keyed by the
+  **worktree path** (`sha256(realpath(toplevel))[:12]`, `review_state.py:65-79`).
+  A detached-HEAD replacement tree is therefore a *different key*: the escalation
+  counter reads 0 on a branch that has already spent three rounds, and the cap
+  silently stops protecting exactly the PR that most needs it.
+
+So the protocol is **reuse the build session's worktree in place** — it is the
+only tree that inherits the counters — after establishing it is not live:
+
+```bash
+git -C <worktree> status --short          # uncommitted work = another session's
+# a session ROOTED there — compare each pid's cwd, never grep command lines:
+for p in $(pgrep -x node); do
+  [ "$(readlink /proc/$p/cwd)" = "<worktree>" ] && echo "LIVE: pid $p"
+done
+```
+
+**Do not substitute `pgrep -af claude | grep <worktree>` for that loop.** The
+grep matches any command line CONTAINING the path — including the very command
+you are running, since your own shell invocation carries it. Measured while
+writing this section: that form reported a live session in a worktree where
+`/proc/<pid>/cwd` showed none. It is the same self-match that makes
+`pgrep -f pytest` report itself; the repo already documents that one.
+
+If it IS live, the PR is not yours to work; take the next one. Never
+`git worktree remove` it, and never assume it is stale — the standing rule
+(`references/worktrees.md`) is that every other worktree is an active session
+until shown otherwise. There is no PR-level claim or lease in the system today,
+so this check is the whole interlock, and it is advisory: it makes a collision
+visible, it does not prevent one.
 
 ### The constraint this session type is measured against
 
@@ -114,8 +169,20 @@ the session type most exposed to both.
   the change under review — and step 3 requires the PR's code checked out, since
   verifying a finding means reading the code the finding is about.
 
-Before calling any red live, date the code: `git log -1 --format=%ad -- <file>`,
-or check the reflog for when the tree last moved.
+Before calling any red live, establish freshness by comparing REFS, not dates:
+
+```bash
+git fetch origin main --quiet
+git merge-base --is-ancestor origin/main HEAD && echo "contains current main"
+```
+
+Dating the code (`git log -1 --format=%ad -- <file>`) does not answer the
+question and will mislead in both directions: it reports the last commit
+touching that file on the current `HEAD`, so a fully current tree holding an
+unchanged old file looks stale, while a stale branch carrying one recent
+unrelated commit looks current. Only a fetch plus an ancestry comparison
+establishes that the checkout actually contains `origin/main` — which is the
+false blocker this section exists to prevent.
 
 *"Verify against actual code" needs the companion clause "verify against actual
 CURRENT code."*
@@ -158,13 +225,25 @@ toss, and the wrong one (retargeting a base that was only unreadable, pushing a
 fix for a review that was never requested) looks like progress. Read the
 diagnosis before choosing the move (Codex P2, PR #1638).
 
+**`base-branch` is the exception that proves the rule, and it cuts against the
+paragraph above it.** Both of its blocking messages are a SINGLE line, so
+`_print_gate_detail()` emits nothing beneath either one — there are no detail
+lines to read. The only discriminator is the summary text itself: *"targets
+base 'X', not the default branch"* is a real retarget, while *"could not
+confirm … (base=?, default=?)"* is a failed API read wearing the same label
+because the gate fails closed. So for this one gate, match the wording. It is
+the single place where "never key on the message text" has to yield, and it is
+called out here precisely so nobody has to rediscover it during a transient
+GitHub failure by retargeting a PR that was fine.
+
 | Gate | Not-passing states | Move |
 |---|---|---|
 | `mergeable` | anything other than `MERGEABLE` — including `CONFLICTING`, `UNKNOWN`, and `unreadable` | Rebase/merge main and push for a conflict; re-read for the other two. **Check this FIRST when CI looks odd — a conflicting PR silently suppresses the whole suite.** `unreadable`/`UNKNOWN` mean the query failed: not "fine", never a pass. |
 | `ci` | `red` | Classify `introduced \| inherited \| environment` WITH evidence. Do §0 first — an inherited red is very often already fixed on main. |
 | `ci` | `pending` | Still running. Wait and re-read; never propose a merge on pending. |
 | `ci` | `absent` / `incomplete` | The suite never ran, or a required workflow is missing from the rollup. Usually a conflicting branch or a dropped trigger — check `mergeable` before anything else. **Counts as a failure ONLY in the canonical public repo** (`check_pr_report` increments on these two states only where `_scheduled_gate_applies(repo)` holds): a private fork, the voice repo and the backups repo run no such workflow, so `absent` there is the normal state and not a block. Read the repo before treating it as one. |
-| `base-branch` | `BLOCK` | PR targets a non-default base. Retarget. |
+| `base-branch` | `BLOCK` — *"targets base 'X', not the default branch 'Y'"* | The base really is wrong. Retarget — or append `# stale-review-override` for a deliberate stacked PR. |
+| `base-branch` | `BLOCK` — *"could not confirm … (base=?, default=?)"* | **Not a base problem: the query failed.** Fail-closed, so it wears the same label. RETRY the read. Retargeting here changes a base that was never shown to be wrong. |
 | `pin-receipts` | `BLOCK` | Moves the CC pin without its receipts. The detail lines name what is missing. |
 | `codex-at-head` | `BLOCK` | Covers BOTH "no Codex review found" and "review is stale" — they are different situations with the same remedy shape. The detail lines say which, and carry the `git log <reviewed>..<head>` command. Push any pending fix, comment `@codex review`, wait. |
 | `codex-at-head` | `ok (STALE review of <sha>, delta since is trivial)` | A **PASS**, not a block — the delta since the review is trivial. **Except on the hook surface**, which gets no leniency at all. |
@@ -260,7 +339,20 @@ not assume the absence of a recorded dependency means there is none.
 
 ## Working the queue
 
-1. List the open PRs. `--check-pr` each one.
+1. List the open PRs — **completely**. `gh pr list` defaults to `--limit 30`, and
+   a listing whose result count equals its limit is a truncated read, not a
+   complete one. Pass a limit well above the queue size and reconcile the count
+   against an independent denominator before trusting it:
+
+   ```bash
+   gh pr list --state open --limit 200 --json number,title | jq length
+   gh search prs --repo <owner>/<repo> --state open --json number --limit 200 | jq length
+   ```
+
+   The two numbers must agree; if either equals its limit, raise both and re-run.
+   Re-reading the same capped list on every pass never discovers the remainder,
+   so the omitted PRs are neither checked nor weighed when sorting by cost — they
+   simply never enter the queue. Then `--check-pr` each one.
 2. **Sort by what is cheapest to close**, not by number. A PR blocked only on a
    stale review is minutes; one with a live P1 in a subsystem you have not read
    is not. Clearing the cheap ones first is what makes the rate.
