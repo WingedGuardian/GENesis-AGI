@@ -326,3 +326,45 @@ class TestQuotedParenRedirectTargetRegression:
         assert r.returncode == 0, (
             f"benign command wrongly blocked: out={r.stdout!r} err={r.stderr!r}"
         )
+
+
+def test_an_opaque_command_still_gets_the_parsed_brace_check(fake_home):
+    """REGRESSION PIN: the probe firing must never REMOVE a reason to block.
+
+    The untokenizable branch used to return right after its substring check, on
+    the assumption that the check is a superset of the parsed path below. It
+    stopped being one when brace expansion was added to the parsed path only —
+    an expanded operand is caught there and is invisible to a substring scan.
+
+    So a command that merely TRIPPED the probe skipped the check that would have
+    blocked it, which means making the probe MORE sensitive made this guard MORE
+    permissive. MEASURED before the fix, over 51,052 real commands: one verdict
+    flipped from block to allow for exactly that reason.
+
+    The precondition assertion below is load-bearing, not decoration. A first
+    version of this test used an operand whose PARENT is itself protected, so the
+    substring path caught it and the test passed against the unfixed code —
+    green while pinning nothing. Mutation testing is what exposed that.
+    """
+    import sys as _sys
+
+    _sys.path.insert(0, str(_WORKTREE / "scripts" / "hooks"))
+    import protected_paths_guard as g
+    import shell_parse as sp
+
+    # Assembled per this suite's convention. case/esac makes it opaque; the
+    # braced operand is what must still be caught.
+    opaque = "case x in x) true;; esac; " + "rm -rf " + H + "/.claude/{projects,scratch}"
+
+    assert sp.untokenizable(opaque), "fixture is stale: this no longer trips the probe"
+    assert g._legacy_substring_block(opaque, g._protected_dirs()) is None, (
+        "fixture is VACUOUS: the substring path already catches this, so the "
+        "test would pass with the fall-through removed"
+    )
+
+    r = _run(opaque, fake_home)
+
+    assert r.returncode == 2, (
+        "an opaque command skipped the parsed brace-expansion check: "
+        f"rc={r.returncode} {r.stderr[:200]}"
+    )
