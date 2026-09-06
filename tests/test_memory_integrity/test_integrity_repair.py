@@ -782,3 +782,44 @@ async def test_clean_reconcile_does_not_invalidate(tmp_path, monkeypatch):
 
     assert result.ghosts_deleted == 0
     assert not calls
+
+
+@pytest.mark.asyncio
+async def test_partial_ghost_sweep_still_invalidates(tmp_path, monkeypatch):
+    """A raise mid-loop AFTER a periodic commit leaves the earlier ghosts'
+    memory_links deletions durable — the invalidation must still fire on that
+    partial sweep (finally-scoped), or the cached graph keeps the purged edges
+    until an unrelated write refreshes it (CodeRabbit Major, PR #1725)."""
+    path = await _db(tmp_path)
+    await _seed(path, "ok", created_at=_OLD)
+    client = _points(
+        {
+            "episodic_memory": {
+                "ok": {"created_at": _OLD},
+                "ghost_old": {"created_at": _OLD},
+                "ghost_old2": {"created_at": _OLD},
+            }
+        }
+    )
+    calls = []
+    monkeypatch.setattr(
+        "genesis.memory.graph.invalidate_graph_cache", lambda: calls.append(1)
+    )
+    # Commit after every row so the first ghost's deletions are DURABLE before
+    # the injected failure on the second — the exact window the finding names.
+    monkeypatch.setattr(integrity_repair, "_SWEEP_COMMIT_EVERY", 1)
+    real_lock = integrity_repair.memory_id_lock
+    seen = {"n": 0}
+
+    def _failing_lock(pid):
+        seen["n"] += 1
+        if seen["n"] >= 2:
+            raise RuntimeError("injected mid-sweep failure")
+        return real_lock(pid)
+
+    monkeypatch.setattr(integrity_repair, "memory_id_lock", _failing_lock)
+
+    with pytest.raises(RuntimeError):
+        await _run(path, client, monkeypatch, tmp_path)
+
+    assert calls, "a partial sweep left committed deletions with a clean cache"

@@ -362,42 +362,47 @@ async def run_reconcile(
         # and our sweep — which would strand a vector-only ghost. A ghost has no
         # metadata row by definition, so the sweep is a completeness no-op in the
         # normal case. Shared serialized connection, periodic commit, never rollback.
-        for i, (pid, coll) in enumerate(deletable, 1):
-            async with memory_id_lock(pid):
+        try:
+            for i, (pid, coll) in enumerate(deletable, 1):
+                async with memory_id_lock(pid):
+                    try:
+                        await asyncio.to_thread(
+                            qdrant_ops.delete_point, qdrant_client, collection=coll, point_id=pid
+                        )
+                    except Exception:
+                        logger.warning(
+                            "reconcile: ghost point delete failed for %s — left for next run",
+                            pid,
+                            exc_info=True,
+                        )
+                        ghost_delete_failed += 1
+                        continue
+                    await db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (pid,))
+                    await db.execute(
+                        "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (pid, pid)
+                    )
+                    await db.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (pid,))
+                    await db.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (pid,))
+                    deleted.append(pid)
+                if i % _SWEEP_COMMIT_EVERY == 0:
+                    await db.commit()
+            await db.commit()
+        finally:
+            if deleted:
+                # This sweep deletes memory_links rows directly (no CRUD), and this
+                # module previously contained zero invalidations — the cached graph
+                # kept ghost edges until an unrelated write refreshed it. The other
+                # of the two known invalidation gaps (issue #1641). Once per sweep,
+                # not per row: invalidation is a flag flip, rebuild happens lazily.
+                # finally-scoped: a raise mid-loop after a periodic commit leaves
+                # earlier deletions DURABLE — the cache must go dirty even on a
+                # partial sweep (CodeRabbit Major, PR #1725).
                 try:
-                    await asyncio.to_thread(
-                        qdrant_ops.delete_point, qdrant_client, collection=coll, point_id=pid
-                    )
-                except Exception:
-                    logger.warning(
-                        "reconcile: ghost point delete failed for %s — left for next run",
-                        pid,
-                        exc_info=True,
-                    )
-                    ghost_delete_failed += 1
-                    continue
-                await db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (pid,))
-                await db.execute(
-                    "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (pid, pid)
-                )
-                await db.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (pid,))
-                await db.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (pid,))
-                deleted.append(pid)
-            if i % _SWEEP_COMMIT_EVERY == 0:
-                await db.commit()
-        await db.commit()
-        if deleted:
-            # This sweep deletes memory_links rows directly (no CRUD), and this
-            # module previously contained zero invalidations — the cached graph
-            # kept ghost edges until an unrelated write refreshed it. The other
-            # of the two known invalidation gaps (issue #1641). Once per sweep,
-            # not per row: invalidation is a flag flip, rebuild happens lazily.
-            try:
-                from genesis.memory.graph import invalidate_graph_cache
+                    from genesis.memory.graph import invalidate_graph_cache
 
-                invalidate_graph_cache()
-            except ImportError:
-                pass
+                    invalidate_graph_cache()
+                except ImportError:
+                    pass
 
     # ── Repair: mirrors (re-read → requeue for re-embed) ──
     mirrors_requeued = 0
