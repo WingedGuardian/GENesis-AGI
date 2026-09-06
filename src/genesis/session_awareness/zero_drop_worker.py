@@ -41,6 +41,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -80,6 +81,37 @@ HEARTBEAT_SUBSYSTEM = "zero_drop"
 
 BRANCH_CLASSES = (CLASS_UNPUSHED, CLASS_PUSHED_NO_PR)
 ALL_CLASSES = (*BRANCH_CLASSES, CLASS_DIRTY)
+
+# The alert prose owns these characters: `|` separates rendered rows, `·`
+# separates fields within one, and `[ ]` wraps the row list. A branch name may
+# legally contain any of them (git forbids space, `~^:?*[\`, and control
+# characters — but not `|` or `·`), and a branch name is content this process
+# did not author. Substituted rather than deleted so the text stays readable.
+_ALERT_GRAMMAR_CHARS = str.maketrans({"|": "/", "·": "-", "[": "(", "]": ")"})
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+# Display bound for one rendered identity. MEASURED on this install 2026-09-05:
+# 211 local branches, longest name 45 chars (p95 36); longest worktree path 114,
+# so the longest possible `@detached:<path>` identity is ~124. 160 clears every
+# real value with headroom, and the value is NOT lost — the whole identity stays
+# in `zero_drop_findings.branch` and comes back intact from `zero_drop_status`,
+# which is also where you read the name to pass to `zero_drop_ack`. A bounded
+# preview backed by an intact record is a selection; the key itself is never cut.
+_RENDER_LIMIT = 160
+
+
+def _render_identity(value: str) -> str:
+    """One untrusted identity, safe to splice into the alert's prose.
+
+    Branch names and worktree paths reach a MODEL through the observation this
+    builds. Flattening newlines and neutralising the row grammar stops a chosen
+    name from forging an extra row (or an extra field inside one) that a reader
+    would attribute to the detector itself.
+    """
+    flattened = _WHITESPACE_RUN.sub(" ", (value or "").translate(_ALERT_GRAMMAR_CHARS)).strip()
+    if len(flattened) <= _RENDER_LIMIT:
+        return flattened
+    return f"{flattened[:_RENDER_LIMIT]}<+{len(flattened) - _RENDER_LIMIT} chars omitted>"
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +226,25 @@ def _gh_runner(repo_path: str):
     return _run
 
 
+def _worktree_budget_s(cfg: dict) -> float:
+    """Wall-clock ceiling for the worktree leg, DERIVED from the debounce.
+
+    The per-call timeout bounds ONE status call; nothing bounded how many could
+    hang. With ~161 worktrees at 30s each, a stalled mount turns a 12-second
+    sweep into an 80-minute one — and the exclusive `detector.lock` is held for
+    the whole of it, so every session boundary and the daily hygiene floor get
+    `lock_busy` and exit. That is an indefinite silent outage of the subsystem,
+    indistinguishable from ordinary debounce.
+
+    So the budget comes from the debounce interval rather than a chosen number:
+    a sweep must finish well inside its own window, or sweeps serialize and
+    starve each other. A quarter of the interval is 15 minutes at the default,
+    which is ~70x the MEASURED 12.3s over 161 worktrees — it cannot cut a
+    healthy sweep, and it bounds a sick one to a fraction of its window.
+    """
+    return knob_int(cfg, "min_interval_minutes") * 60 / 4
+
+
 async def _resolve_base_ref(root: str, runner=None) -> str | None:
     """The ref every branch's ahead-count is measured against, or None.
 
@@ -218,7 +269,7 @@ async def _resolve_base_ref(root: str, runner=None) -> str | None:
     return name if rc == 0 and name else None
 
 
-async def _observe_worktrees(root: str, *, runner=None) -> dict:
+async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None = None) -> dict:
     """Per-worktree dirty state + the newest mtime among the dirty paths.
 
     Sequential by design. MEASURED 2026-09-05: 161 worktrees in 12.3s with 0
@@ -251,15 +302,29 @@ async def _observe_worktrees(root: str, *, runner=None) -> dict:
     if "error" in listing:
         # The enumeration itself failed — there is no per-item granularity to
         # fall back to, so the whole class freezes.
-        return {"observations": [], "errors": [str(listing["error"])], "held": None, "prunable": 0}
+        return {
+            "observations": [],
+            "errors": [str(listing["error"])],
+            "held": None,
+            "prunable": 0,
+            "unvisited": 0,
+        }
 
     observations: list[dict] = []
     errors: list[str] = []
     held: set[str] = set()
     prunable = 0
+    unvisited = 0
+    deadline = time.monotonic() + budget_s if budget_s else None
     for wt in listing["worktrees"]:
         if wt.get("prunable"):
             prunable += 1
+            continue
+        if deadline is not None and time.monotonic() > deadline:
+            # Out of budget. Everything not yet visited is HELD, exactly like an
+            # unreadable one: we did not look, so we may not resolve it.
+            unvisited += 1
+            held.add(worktree_identity(wt))
             continue
         status = await worktree_status(wt["path"], runner=runner)
         if "error" in status:
@@ -270,7 +335,12 @@ async def _observe_worktrees(root: str, *, runner=None) -> dict:
         newest = None
         for _xy, rel in entries:
             try:
-                mtime = datetime.fromtimestamp(os.stat(os.path.join(wt["path"], rel)).st_mtime, UTC)
+                # lstat, not stat: a dirty entry may be (or traverse) a symlink,
+                # and following it would date this worktree's work by a file
+                # outside it — and disclose that file's mtime into a finding.
+                mtime = datetime.fromtimestamp(
+                    os.lstat(os.path.join(wt["path"], rel)).st_mtime, UTC
+                )
             except OSError:
                 continue  # a deleted path has no mtime; other entries still date it
             if newest is None or mtime > newest:
@@ -281,6 +351,7 @@ async def _observe_worktrees(root: str, *, runner=None) -> dict:
         "errors": errors,
         "held": held,
         "prunable": prunable,
+        "unvisited": unvisited,
     }
 
 
@@ -359,7 +430,7 @@ async def _maintain_alert(
         max_listed = knob_int(cfg, "max_listed")
         listed = findings[:max_listed]
         rows = " | ".join(
-            f"{f['branch']} · {f['class']}"
+            f"{_render_identity(f['branch'])} · {f['class']}"
             + (f" · +{f['ahead_count']}" if f.get("ahead_count") else "")
             for f in listed
         )
@@ -583,7 +654,7 @@ async def _run_locked(
     # ── Worktree leg: independent of the branch legs ─────────────────────────
     dirty_findings: list[dict] | None = None
     dirty_held: set[str] = set()
-    observed = await _observe_worktrees(repo_path)
+    observed = await _observe_worktrees(repo_path, budget_s=_worktree_budget_s(cfg))
     if observed["held"] is None:
         # The enumeration itself failed — no per-item granularity to fall back
         # on, so the whole class freezes.
@@ -602,8 +673,14 @@ async def _run_locked(
             **classified_wt["stages"],
             "prunable_skipped": observed["prunable"],
             "unreadable": len(observed["errors"]),
+            "unvisited_over_budget": observed["unvisited"],
             "held_total": len(dirty_held),
         }
+        if observed["unvisited"]:
+            degraded["worktrees_budget"] = (
+                f"{observed['unvisited']} worktree(s) never visited — the leg ran out of "
+                f"its wall-clock budget; their findings are held"
+            )
         if observed["errors"]:
             degraded["worktrees"] = (
                 f"{len(observed['errors'])} of "
@@ -639,6 +716,15 @@ async def _run_locked(
                 escalation_k=escalation_k,
                 held=held,
             )
+            if applied[cls].get("duplicate_identities"):
+                # Two entries for one identity in a single sweep is bug-shaped,
+                # not routine — the store survives it, but a count that lands
+                # only in last_run.json is a count nobody reads. Degraded, so it
+                # reaches the blindness alarm like any other leg fault.
+                degraded[f"{cls}_duplicates"] = (
+                    f"{applied[cls]['duplicate_identities']} duplicate identity/identities "
+                    f"in one sweep — first sighting kept"
+                )
         except Exception as exc:  # noqa: BLE001 — one class, not the sweep
             logger.warning("zero_drop reconcile failed for class %s", cls, exc_info=True)
             degraded[cls] = f"reconcile failed: {type(exc).__name__}: {exc}"[:200]

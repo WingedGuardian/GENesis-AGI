@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,20 @@ STATUS_TIMEOUT_S = 30.0
 # TAB-separated so a branch name containing a space survives the split; git ref
 # names cannot contain a TAB (check-ref-format forbids control characters).
 _REF_FORMAT = "%(refname:short)\t%(objectname)\t%(ahead-behind:{base})\t%(committerdate:iso-strict)"
+
+# `base` is spliced into a git FORMAT STRING, where `%(...)` is a directive. It
+# arrives from `refs/remotes/origin/HEAD` — i.e. whatever the remote's default
+# branch is named — and a git ref name may legally contain `%`, `(` and `)`. A
+# name carrying a format directive would inject extra fields into the output the
+# classifier trusts to be four TAB-separated columns. Refuse such a base rather
+# than sanitising it: a ref name that cannot be safely formatted is not a value
+# we accept, and the caller falls back to the documented default and says so.
+_SAFE_BASE_REF = re.compile(r"^[A-Za-z0-9._/@+-]{1,255}$")
+
+
+def is_safe_base_ref(base: str | None) -> bool:
+    """True iff *base* can be spliced into a git format string unambiguously."""
+    return bool(base) and bool(_SAFE_BASE_REF.match(base))
 
 
 async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
@@ -83,6 +98,8 @@ async def list_local_branches(
 
     Returns ``{"branches": [{branch, tip_sha, ahead, behind, tip_date}]}``.
     """
+    if not is_safe_base_ref(base):
+        return {"error": f"unsafe base ref for a git format string: {base[:80]!r}"}
     run = runner or default_runner
     rc, out, err = await run(
         [

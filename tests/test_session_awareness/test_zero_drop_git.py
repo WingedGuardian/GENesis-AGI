@@ -240,3 +240,86 @@ async def test_a_successful_ls_remote_that_parses_to_NOTHING_is_an_error(repo):
         return 0, "deadbeef\trefs/tags/v1\n", ""
 
     assert "error" in await g.list_remote_branch_names(str(repo), runner=_unexpected_shape)
+
+
+@pytest.mark.parametrize(
+    "base",
+    ["origin/%(objectname)", "origin/(x)", "origin/a b", "origin/a\tb", "", "x" * 300],
+)
+async def test_an_unsafe_base_ref_is_REFUSED_not_sanitised(repo, base):
+    """`base` is spliced into a git FORMAT STRING, where `%(...)` is a
+    directive — and a git ref name may legally contain `%`, `(` and `)`. A name
+    carrying a directive would inject extra fields into output the classifier
+    trusts to be four TAB-separated columns. A ref name that cannot be safely
+    formatted is not a value we accept."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    assert not g.is_safe_base_ref(base)
+    out = await g.list_local_branches(str(repo), base=base)
+    assert "error" in out and "unsafe base ref" in out["error"]
+
+
+@pytest.mark.parametrize(
+    "base", ["origin/main", "main", "origin/release/1.2", "upstream/feat_x-1@a"]
+)
+def test_ordinary_base_refs_are_accepted(base):
+    """The guard must not reject the names a real fork actually uses."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    assert g.is_safe_base_ref(base)
+
+
+async def test_a_dirty_symlink_is_dated_by_ITSELF_not_by_its_target(repo, tmp_path):
+    """`os.stat` follows symlinks. A dirty entry that is a symlink would then be
+    dated by a file OUTSIDE the worktree — dating this worktree's work by
+    something unrelated, and disclosing that file's mtime into a finding."""
+    import os
+
+    from genesis.session_awareness.zero_drop_worker import _observe_worktrees
+
+    outside = tmp_path / "ancient.txt"
+    outside.write_text("x\n")
+    os.utime(outside, (0, 0))  # 1970
+    os.symlink(outside, repo / "link.txt")
+
+    out = await _observe_worktrees(str(repo))
+    obs = next(o for o in out["observations"] if o["path"] == str(repo))
+
+    assert obs["entries"], "the symlink should show as untracked"
+    assert obs["newest_mtime"] is not None
+    assert obs["newest_mtime"].year > 2000, (
+        f"the entry was dated by its TARGET, not itself: {obs['newest_mtime']}"
+    )
+
+
+async def test_observe_worktrees_SKIPS_a_real_prunable_worktree(repo, tmp_path):
+    """The worker-level assertion, against real git rather than a fake listing:
+    a worktree whose directory is gone is ABSENT, not unreadable. Treating it as
+    unreadable would freeze the whole dirty class on every sweep from then on."""
+    import shutil
+
+    from genesis.session_awareness.zero_drop_worker import _observe_worktrees
+
+    wt = tmp_path / "doomed"
+    _git(repo, "worktree", "add", "-q", "-b", "doomed", str(wt))
+    shutil.rmtree(wt)
+
+    out = await _observe_worktrees(str(repo))
+
+    assert out["prunable"] == 1
+    assert out["errors"] == [], "a gone worktree must not be reported as unreadable"
+    assert out["held"] == set(), "and it must not be quarantined either — it is absent"
+    assert [o["path"] for o in out["observations"]] == [str(repo)]
+
+
+async def test_base_ref_resolution_returns_None_when_there_is_no_origin_HEAD(repo):
+    """None, not the fallback string. Returning "origin/main" on failure makes
+    "resolved to origin/main" and "guessed origin/main" the same value, so the
+    caller cannot say which happened — and a wrong base inflates every
+    ahead-count."""
+    from genesis.session_awareness.zero_drop_worker import _resolve_base_ref
+
+    assert await _resolve_base_ref(str(repo)) is None  # fresh repo: no origin/HEAD
+
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    assert await _resolve_base_ref(str(repo)) == "origin/trunk"
