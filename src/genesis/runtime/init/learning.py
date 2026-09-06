@@ -9,7 +9,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.env import cc_project_dir, user_timezone
+from genesis.env import cc_project_dir, genesis_home, user_timezone
 from genesis.runtime.init.process_reaper import _wire_process_reaper
 from genesis.runtime.init.rate_limit_resume import _wire_rate_limit_resume
 
@@ -767,6 +767,71 @@ async def init(rt: GenesisRuntime) -> None:
             id="idea_lane_decay",
             max_instances=1,
             misfire_grace_time=3600,
+        )
+
+        async def _ledger_escalation_sweep() -> None:
+            # Escalate a session_ledger row nobody can dispose of any more (row
+            # untouched >= stale_days AND its session quiet >= quiet_days) into a
+            # user_input_needed follow-up, and complete escalations whose row has
+            # since been disposed. Lives here (learning scheduler) rather than in
+            # the awareness loop because it MUTATES — it creates follow-ups — and
+            # the awareness _check_* family is documented read-and-alert only.
+            # Hourly, so the reverse sync closes a follow-up within the hour of
+            # its row being disposed.
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping ledger escalation",
+                    exc_info=True,
+                )
+                return
+            if rt._db is None:
+                return
+            try:
+                from genesis.session_awareness.ledger_escalation import run_sweep
+                from genesis.session_awareness.ledger_escalation_config import (
+                    is_enabled,
+                )
+
+                if not is_enabled():
+                    rt.record_job_success("ledger_escalation")
+                    return
+                result = await run_sweep(
+                    rt._db,
+                    now=datetime.now(UTC),
+                    sessions_dir=genesis_home() / "sessions",
+                )
+                if result["reconcile_failed"]:
+                    # The forward pass ran but the reverse sync did not. Half a
+                    # run is not a successful run: recording success here would
+                    # let a permanently dead reverse sync — escalations stuck
+                    # pending for rows disposed weeks ago — sit behind a green
+                    # job-health tile indefinitely.
+                    rt.record_job_failure(
+                        "ledger_escalation",
+                        "reverse sync could not read the ledger",
+                    )
+                else:
+                    rt.record_job_success("ledger_escalation")
+                if result["created"] or result["reconciled"]:
+                    logger.info(
+                        "Ledger escalation: created %d, reconciled %d, deferred %d",
+                        result["created"],
+                        result["reconciled"],
+                        result["deferred"],
+                    )
+            except Exception as exc:
+                rt.record_job_failure("ledger_escalation", exc=exc)
+                logger.exception("Ledger escalation sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _ledger_escalation_sweep,
+            CronTrigger(minute=17, timezone=user_timezone()),
+            id="ledger_escalation",
+            max_instances=1,
+            misfire_grace_time=1800,
         )
 
         async def _run_recovery() -> None:

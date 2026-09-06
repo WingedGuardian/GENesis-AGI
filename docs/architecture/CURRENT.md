@@ -1493,6 +1493,35 @@ verified: 29a382e7 2026-09-03
   propose_only). Retention 45d via `scripts/prune_repo_pulse.py`
   (disk-hygiene). Telemetry: `call_site_last_run` row `repo_pulse` (not a
   critical site — failed runs self-heal by re-covering their window).
+- **Undisposed-ledger escalation (2026-09-06)**: repo-pulse above CLOSES a
+  ledger row whose work landed in a cited PR; this is the other half — the row
+  whose work never landed and whose session died. A `session_ledger` row is
+  rendered by its OWN session's injection and by nothing else, so a dead
+  session's open rows become unreachable by every process and person.
+  `session_awareness/ledger_escalation.py` (learning scheduler, hourly at :17 —
+  it MUTATES, so not the read-and-alert awareness band) escalates a row
+  untouched ≥ `stale_days` whose owning session has been quiet ≥ `quiet_days`
+  (`~/.genesis/sessions/<sid>/last_prompt_time`, content preferred over mtime so
+  a backup restore cannot make every dead session look live) into a
+  `user_input_needed` follow-up. BOTH thresholds are load-bearing: a stale row
+  in a LIVE session is that session's to dispose. Reverse sync completes the
+  follow-up once the row reaches a terminal status. The link is the follow-up's
+  `dedup_key` (`session_awareness/ledger_escalation_link.py`, whose formula the
+  two import-free hooks inline under a parity test) — this sweep is the WRITER
+  its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
+  `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
+  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  cannot ask the owner to dispose of something nobody committed to.
+  **Trap: it must never write `session_ledger`** — an evidence write would bump
+  `updated_at` and read as a disposition the owner never made, i.e. the sweep
+  answering its own question. **Do not touch blind: `ledger_escalation` is
+  deliberately ABSENT from the morning report.** Follow-up content reproduces
+  ledger row text verbatim, and real rows on a live install have carried
+  plaintext credentials a session pasted in; the morning report renders
+  `content[:200]` into Telegram. Wiring this source to any egress surface needs
+  a redaction pass first. Follow-ups ship `domain=None` (unclassified) because
+  the sweep cannot tell a dropped user errand from a stale internal dev item —
+  both shapes are really in the ledger.
 
 ## 10. Learning & evaluation
 
