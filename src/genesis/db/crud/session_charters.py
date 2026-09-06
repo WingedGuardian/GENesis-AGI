@@ -22,7 +22,26 @@ from datetime import UTC, datetime
 import aiosqlite
 
 VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "dropped"})
-VALID_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
+# "ambient" means a DISPATCHED Claude Code session (see _default_added_by);
+# "ambient_ledger_extractor" is the detached Haiku extractor that watches a
+# session from the outside. They must stay distinct: the shadow report's leak
+# invariant keys on the extractor value to assert it has written nothing live,
+# and a shared value would make that check unable to tell them apart on the
+# very day it starts mattering. Mirrored by a schema CHECK (the session_ledger_ambient_extractor migration).
+VALID_ADDED_BY = frozenset(
+    {"foreground", "ambient", "pulse", "ambient_ledger_extractor"}
+)
+# The subset a CALLER may name. `ambient_ledger_extractor` is INTERNAL
+# provenance — the detached worker sets it on its own writes — and it is not an
+# input any caller supplies. Leaving it in the one shared allow-list let anyone
+# calling the public `session_ledger_add` MCP tool claim that identity, which
+# breaks the shadow report's leak invariant precisely: that check asserts the
+# extractor has written nothing live, so a caller able to forge the value makes
+# a real leak and a forged row indistinguishable.
+#
+# Two names because they answer two questions — "is this value storable?" and
+# "may this value be asked for?" — and the public surface needs the second.
+CALLER_SETTABLE_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
 
 # Living-field bounds (enforced here so every writer shares them)
 MAX_POINTERS = 12
@@ -191,6 +210,23 @@ async def set_pointers(db: aiosqlite.Connection, session_id: str, pointers: list
     return cursor.rowcount > 0
 
 
+def _one_line(text: str) -> str:
+    """Ledger text as ONE line, capped. Whitespace runs collapse to one space.
+
+    `.strip()` alone trims only the ENDS, so an embedded newline survived into
+    two model-facing renderers that emit one line PER ROW — the charter block
+    re-injected into every post-compaction window, and the per-prompt inventory
+    tag. A single row then rendered as two, and the second line was
+    indistinguishable from a genuine ledger row in Genesis's own voice.
+
+    Normalised HERE, at the write chokepoint, rather than in each renderer: both
+    renderers and `charter.md` inherit one rule, and a renderer added later
+    cannot forget it. A row is one sentence by convention, so collapsing
+    internal whitespace loses nothing real.
+    """
+    return " ".join(text.split())[:MAX_LEDGER_TEXT_CHARS]
+
+
 async def ledger_add(
     db: aiosqlite.Connection,
     *,
@@ -198,21 +234,51 @@ async def ledger_add(
     text: str,
     source_ref: str | None = None,
     added_by: str = "foreground",
+    evidence: str | None = None,
+    source_quote: str | None = None,
+    commit: bool = True,
 ) -> str:
-    """Add an open ledger item and return its id."""
+    """Add an open ledger item and return its id.
+
+    *commit=False* leaves the INSERT inside the caller's open transaction —
+    for a caller that must make the insert atomic with its OWN bookkeeping
+    write. The promotion path is why this exists: inserting the row and
+    stamping ``promoted_item_id`` on the claiming shadow event must land
+    together, because a crash between them leaves a ledger row no event
+    claims — which the next sweep can duplicate once the row closes, and
+    which the leak invariant reads as an unattributed write. Default True
+    preserves every existing caller byte-for-byte.
+
+    TWO PROVENANCE FIELDS, because two different writers answer two different
+    questions and they must not share a column:
+
+    *source_quote* is where the row CAME FROM — the extractor's verified
+    transcript quote. Only the writer that created the row sets it, and no
+    resolver overwrites it. The shadow report's live-mode leak invariant asks
+    each extractor row exactly this, so it has to survive the row's whole life.
+
+    *evidence* is how the row was RESOLVED — `repo_pulse_worker` replaces it
+    with PR attribution when it absorbs an item. That is correct behaviour for
+    a resolution field and fatal for a provenance one: sharing the column meant
+    a promoted extractor row lost its quote the moment repo-pulse touched it,
+    and then failed the invariant it had satisfied the day before.
+    """
     if added_by not in VALID_ADDED_BY:
         raise ValueError(f"invalid added_by: {added_by!r}")
-    text = text.strip()[:MAX_LEDGER_TEXT_CHARS]
+    text = _one_line(text)
     if not text:
         raise ValueError("ledger text must be non-empty")
     item_id = _new_id()
     await db.execute(
         """INSERT INTO session_ledger
-           (id, session_id, text, status, source_ref, added_by, created_at)
-           VALUES (?, ?, ?, 'open', ?, ?, ?)""",
-        (item_id, session_id, text, source_ref, added_by, _now_iso()),
+           (id, session_id, text, status, source_ref, added_by, evidence,
+            source_quote, created_at)
+           VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+        (item_id, session_id, text, source_ref, added_by, evidence,
+         source_quote, _now_iso()),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return item_id
 
 
@@ -233,7 +299,7 @@ async def ledger_update(
         sets.append("status = ?")
         params.append(status)
     if text is not None:
-        text = text.strip()[:MAX_LEDGER_TEXT_CHARS]
+        text = _one_line(text)
         if not text:
             raise ValueError("ledger text must be non-empty")
         sets.append("text = ?")
@@ -277,21 +343,56 @@ async def ledger_list(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+# One fetch of the ledger_all keyset walk. A module constant so tests can
+# shrink it and genuinely cross page boundaries with a small corpus.
+_LEDGER_ALL_PAGE = 10_000
+
+
 async def ledger_all(
     db: aiosqlite.Connection,
     *,
-    limit: int = 10000,
+    hard_cap: int = 200_000,
 ) -> list[dict]:
-    """All ledger rows across sessions, oldest first (incl. added_by).
+    """All ledger rows across sessions, oldest first (incl. added_by) — COMPLETE.
 
-    Read seam for the shadow precision report (leak-invariant check needs
-    the added_by column across every session). Assumes a Row factory.
+    Read seam for the shadow precision report and repo-pulse matching, both of
+    which state facts about the WHOLE ledger — the leak invariant convicts on
+    absence, so a silently truncated read turns "row not seen" into "row not
+    written". Keyset-paginated internally (created_at, id) so no single fetch
+    is unbounded; *hard_cap* is a resource tripwire that RAISES rather than
+    truncates — a caller that needs a verdict refuses it instead of computing
+    over a partial corpus. Sized from capacity, not history: 200k rows of this
+    table is ~100MB in memory, far past any plausible real ledger (the live
+    table holds thousands). Assumes a Row factory.
     """
-    lim = max(1, min(int(limit), 100000))
-    cursor = await db.execute(
-        "SELECT * FROM session_ledger ORDER BY created_at ASC LIMIT ?", (lim,)
-    )
-    return [dict(r) for r in await cursor.fetchall()]
+    rows: list[dict] = []
+    last: tuple[str, str] | None = None
+    page = _LEDGER_ALL_PAGE
+    while True:
+        if last is None:
+            cursor = await db.execute(
+                "SELECT * FROM session_ledger ORDER BY created_at ASC, id ASC "
+                "LIMIT ?",
+                (page,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM session_ledger "
+                "WHERE (created_at, id) > (?, ?) "
+                "ORDER BY created_at ASC, id ASC LIMIT ?",
+                (*last, page),
+            )
+        batch = [dict(r) for r in await cursor.fetchall()]
+        rows.extend(batch)
+        if len(rows) > hard_cap:
+            raise RuntimeError(
+                f"ledger_all: session_ledger exceeds the {hard_cap}-row "
+                "tripwire — refusing a partial read; raise hard_cap "
+                "deliberately if the table is legitimately this large"
+            )
+        if len(batch) < page:
+            return rows
+        last = (batch[-1]["created_at"], batch[-1]["id"])
 
 
 async def ledger_counts(db: aiosqlite.Connection, session_id: str) -> dict[str, int]:

@@ -240,6 +240,17 @@ the procedure (step 5).
    Run `scripts/check_cc_running_versions.sh` here too: after `update.sh` replaces the binary,
    every session open across the deploy is still mapped to the previous one, so post-deploy
    validation done in an un-relaunched session re-checks the version you just moved away from.
+   **Confirm the pin can still hold.** `update.sh` re-asserts auto-updater suppression
+   automatically (via `cc_ensure_local` → `cc_ensure_updater_suppressed`), so watch its output for
+   a `! CC auto-updater suppression was MISSING` line — that means something on this machine
+   rewrote `~/.claude/settings.json`, and a repeat is worth investigating rather than letting it
+   be silently re-repaired every run. To check by hand on either machine:
+   ```bash
+   python3 -c "import json,os;p=os.path.expanduser('~/.claude/settings.json');e=(json.load(open(p)) if os.path.exists(p) else {}).get('env',{});print({k:e.get(k) for k in ('DISABLE_AUTOUPDATER','DISABLE_UPDATES')})"
+   ```
+   Both must read `1`. A missing file, or either key `None`, means **not suppressed** — and a pin
+   with an un-suppressed auto-updater is not a pin. See §Auto-Updater Suppression Requires
+   User-Level Settings.
 10. **Leverage + capture.** For each newly-available capability Genesis would want, file the
     detection→behavior follow-up. Store what was learned to memory + this doc + the KB so the next
     update executes rather than rediscovers.
@@ -505,6 +516,45 @@ Genesis hooks read input through `scripts/hooks/hook_input.py`
 (`read_payload()` / `field()` / `tool_response()` / `session_id()`), which reads
 stdin, extracts the `tool_input`-nested fields, and warns on a malformed payload
 so a broken contract can't silently fail open again.
+
+#### Hook OUTPUT: a decision channel and a context channel, capped differently
+
+These are separate, and conflating them produces a plausible-but-wrong safety
+worry. CC **files** a hook's stdout above a per-hook-entry size cap (10,000
+characters on 2.1.246 — version-volatile; it sat near the high-20s K on 2.1.218)
+and shows the model a ~2 KB preview. That cap governs stdout as **model-visible
+context**.
+
+It does **not** gate the control-plane parse of `hookSpecificOutput`. A
+PreToolUse `deny` is parsed and honoured however long its
+`permissionDecisionReason` is — so an oversized reason does **not** cause the
+gate to fail open.
+
+MEASURED 2026-09-03 on CC 2.1.246, via `claude -p --settings <probe>` with a
+PreToolUse hook emitting a `deny` whose reason length was varied, discriminating
+on a **disk side effect** (the denied command writes a marker file) rather than
+on wording:
+
+| reason chars | hook stdout bytes | marker written | verdict |
+|---|---|---|---|
+| 500 | 617 | no | BLOCKED (control) |
+| 15,000 | 15,117 | no | BLOCKED |
+| 200,000 | 200,117 | no | BLOCKED |
+
+The small-reason control arm is load-bearing: without it, "not blocked" at the
+large size is indistinguishable from a probe that never worked. In all three
+arms the reason also reached the model, so it is not silently discarded.
+
+Two cautions. **Re-measure both numbers after a CC pin bump** — the stdout cap
+has already moved once across a version bump, and this one could too. And do not
+transfer either result to the other channel, or to a tool result: per-tool
+`maxResultSizeChars` is a third budget again.
+
+Genesis's own gates are unaffected either way: every blocking hook uses **exit
+code 2 with the reason on stderr**, whose verdict comes from the exit status and
+therefore cannot be weakened by a long reason. `permissionDecision` appears in
+the tree only as `allow` and `ask`. The measurement matters for any future hook
+that denies via JSON.
 
 `session_id` is a special case: a dozen hooks interpolate it into a filesystem
 path (`~/.genesis/sessions/<id>/`), and several `mkdir(parents=True)` — so an id
@@ -845,14 +895,102 @@ project directory. The auto-updater runs in contexts where repo settings don't a
 **user-level** `~/.claude/settings.json` on every machine running Genesis (container
 + host VM). This is the file with authority for global CC behavior.
 
-**Automated:** `scripts/install.sh` and `scripts/host-setup.sh` now create or merge
-these env vars into `~/.claude/settings.json` during setup (preserving any existing
-keys). Fresh installs no longer need manual intervention.
+**Automated — and re-asserted on every align, not just at setup.** Both keys are owned
+by one shared function, **`cc_ensure_updater_suppressed`** (`scripts/lib/cc_version.sh`):
 
-This file is per-machine and NOT tracked in the repo. Without the install-script
-automation, CC silently bumps versions out from under us — we discovered this when
-the host VM was running 2.1.119 despite the 2.1.87 script pin, and again mid-session
-when the container auto-updated from 2.1.159 to 2.1.160.
+- `scripts/install.sh` (container) and `scripts/host-setup.sh` (host) call it at setup —
+  it creates `~/.claude/settings.json` when absent and merges into an existing one,
+  preserving every other key.
+- **`cc_ensure_local` calls it FIRST on every align** — i.e. on every `install.sh`,
+  `bootstrap.sh`, and `update.sh` run. Deliberately ahead of the pin/npm checks, because
+  the common path is "already at pin", which returns early, and that steady state is
+  exactly when settings drift would otherwise go unnoticed.
+- **A dedicated daily timer makes it RECURRING** — `genesis-cc-settings-align.timer`
+  (`scripts/cc_settings_align.sh`). Container-side, its own unit, deliberately NOT folded
+  into `genesis-cc-align.timer`: that one is **host-only by contract** and its unit is
+  hardened on that basis, so a container-side filesystem write there would invalidate both
+  the contract and the sandbox rationale. A dedicated unit also means its status carries
+  exactly one meaning — "suppression verified or not" — with no other work to conflate it
+  with, so it can fail loudly without muddying an unrelated outcome.
+  This matters because the align path only helps a box that RUNS an align: measured on a
+  live install, `update.sh` had not run for **14 days**, which is precisely the window in
+  which a drifted settings file stays silently unprotected.
+- **A non-ok outcome reaches health, not just the log** — the function sets
+  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed` / `contended` / `unverified`),
+  `update.sh` folds anything other than `ok` into `HOST_CC_DEGRADED` → `update_history` →
+  deploy health (the same channel a *version* sync failure uses), and the **service**
+  (`genesis-cc-settings-align.service`, driven by the timer of the same name) exits
+  non-zero so the unit enters `failed` — visible in
+  `systemctl --user status genesis-cc-settings-align.service`. `ok` and `repaired` are EARNED, never defaulted: the state starts `unverified` at
+  function entry and is promoted only where a post-operation READ confirms both keys
+  (the reconciler's re-read; the python3-less create's grep-back of its own literals;
+  the read-only check the align timer runs even when another run holds the write
+  lock). A path added later that sets nothing therefore reports `unverified`, which
+  every consumer treats as not-ok — fail closed by construction, not by review.
+  Every path that did not
+  positively verify suppression exits non-zero, including the structural ones (no lock,
+  library missing, function renamed away): a run that checked nothing must never report
+  success, or the unit becomes a green light for an unguarded updater.
+- **The write is a compare-and-swap, not a blind replace.** `settings.json` is rewritten by
+  OTHER processes — CC itself persists it on a `/config` change or a permission grant
+  (MEASURED: modified mid-session while several CC sessions were live). `os.replace` is
+  atomic for *readers* but is not a CAS, so a stale in-memory copy would silently revert a
+  concurrent writer. The helper re-checks file identity immediately before the rename and
+  retries the whole read-modify instead of clobbering, with a short randomized backoff so
+  the three attempts do not all land inside one contended window. Ownership, mode and
+  xattrs are carried across (a fresh inode would otherwise widen a credential-bearing
+  file), and the write is `fsync`ed before the rename.
+
+  **POSIX ACLs are carried, not refused.** `shutil.copystat` reproduces
+  `system.posix_acl_access` on the replacement inode for the file's owner (MEASURED on
+  ext4/CPython 3.12; setting that xattr does not require privilege). An earlier revision
+  refused to write at all when an ACL was present, assuming a rename could not preserve
+  one — a false premise with a severe cost: a *default* ACL on `$HOME` or `~/.claude`
+  (routine on NFS and corporate images) gives every file created inside one, so the
+  reconciler would never write, suppression would never be established, and the timer would
+  fail daily forever with no self-heal. The carry is now VERIFIED after the copy and the
+  write abandoned only if it genuinely did not survive.
+
+  The replacement also gets a fresh mtime (`os.utime`) rather than the source's. `copystat`
+  carries times too, which would restore the pre-write timestamp and hide the repair from
+  every mtime+size change detector — measured: a same-length value correction left size and
+  mtime byte-identical. A file this thing rewrote must look rewritten, not least because
+  the remediation advice below starts with comparing timestamps.
+  **Residual, stated honestly:** the few syscalls between the final check and the rename are
+  irreducible without a lock the other writers do not take. A single run therefore cannot
+  prove persistence — a **repeat `repaired` across timer ticks** is the real "something on
+  this machine keeps rewriting settings.json" signal, and the timer gives that signal a
+  receiver: it remembers the previous outcome and **fails the unit on the second
+  consecutive repair**. Without that the signal existed only as identical journal lines in
+  a unit that stayed green, precisely during the long gaps between deploys when
+  `update.sh` (the other consumer of the state) is not running at all.
+
+It is idempotent and silent when correct, and **loud when it repairs drift**
+(`! CC auto-updater suppression was MISSING in … — restored: …` on stderr, so it shows
+up in update/bootstrap output). It never overwrites a settings file it cannot parse —
+a corrupt or foreign file is reported and left alone, since destroying operator settings
+is worse than the drift.
+
+**Why the re-assert exists (2026-08-26):** setup-time-only was not enough. This install
+was found with `DISABLE_AUTOUPDATER=1` present but **`DISABLE_UPDATES` missing** from the
+user-level file, and nothing in the recurring paths (`update.sh`, `genesis-cc-align.timer`,
+`cc_version.sh`) re-checked it — so a drifted install stayed silently unprotected and the
+pin could be violated with no signal. The npm pin only governs what a *deliberate* install
+writes; these two keys are what stop CC moving on its own.
+
+This file is per-machine and NOT tracked in the repo. Without this automation CC silently
+bumps versions out from under us — discovered when the host VM was running 2.1.119 despite
+the 2.1.87 script pin, and again mid-session when the container auto-updated from 2.1.159
+to 2.1.160.
+
+**Known coverage gap (the HOST's `settings.json` only):** the container is reconciled on
+every align *and* daily via `genesis-cc-settings-align.timer` (above). The host's
+user-level file is written by `host-setup.sh` at setup, and `genesis-cc-align.timer`
+re-aligns the host's CC *version* through the guardian gateway but cannot reach the host's
+`settings.json` — there is no gateway op for it. So
+host *version* drift self-heals nightly, host *settings* drift does not: re-run
+`host-setup.sh`, or check the file by hand, if the host is ever suspected of
+self-updating.
 
 ### Cache Inflation (since ~2.1.100, accepted)
 
@@ -915,6 +1053,107 @@ already catches `CCError` on resumes and recovers via `_recover_stale_resume()`.
 Mitigated, not eliminated.
 
 ---
+
+### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
+
+**Undocumented in the hooks reference, settings reference, troubleshooting and
+error docs, and not configurable** (no settings key, env var or flag — the
+`MAX_MCP_OUTPUT_TOKENS` lever is for MCP tools only). Above the threshold the
+harness writes the hook's whole stdout to
+`~/.claude/projects/<slug>/<session>/tool-results/hook-<uuid>-stdout.txt` and
+hands the model a `<persisted-output>` wrapper with a **2,000-character
+preview**. Nothing errors. The session simply runs without whatever sat below
+the preview.
+
+**Measured on this install's pinned binary, via ~25 real probe sessions**
+(`GENESIS_CTX_PROBE_BYTES=<n>` makes `scripts/genesis_session_context.py` emit
+exactly n filler characters; classify from the new session's transcript —
+inline vs `Output too large`):
+
+| Fact | Value | Evidence |
+|---|---|---|
+| Threshold | **exactly 10,000 chars** | 10,000 inline / 10,001 filed |
+| Unit | **characters**, not bytes | 6,000 two-byte chars (12,044 B) inline |
+| Scope | **per hook entry** | two SessionStart hooks × 9,000 chars → both inline |
+| Mode | same in `-p` and interactive | both file at 10,001 |
+| Version volatility | **yes** | on 2.1.218 the threshold sat near the high 20 Ks (filings were rare, 28–32 KB); the 2.1.246 update dropped it to 10 K and the filing rate on this box tripled the same day (2–6/day → 16–21/day) |
+| Remote tunability | **UNVERIFIED — do not assume either way** | CC does use remote feature gates generally (the `we("tengu_<name>", <default>)` idiom appears throughout the bundle), and the TOOL-result threshold resolver consults a per-name override map. But the hook path does not visibly go through that resolver, and the minified symbol is reused across bundles, so nothing ties a remote gate to THIS threshold. Treat a cap change as possible without a version bump, and rely on the filings watcher rather than on the pin, but do not state remote tunability as fact |
+
+**Ordering between hook entries is COMPLETION order, not declaration order**
+(MEASURED 2026-08-30, 6 real sessions). The part doing a subprocess + a DB read
+lands last in 6/6 runs even though it is declared first, and the two disk-only
+parts swap between runs. So do not reason about where one hook's block sits
+relative to another's — and note this cannot be measured by "read the newest
+transcript": with concurrent sessions on the box that picks someone else's, which
+briefly produced a phantom "the charter part vanished" result here. Attribute a
+probe to its own transcript by before/after set difference.
+
+**Which hook events can put stdout in front of the model at all** (READ from
+the bundle's attachment renderer, 2.1.246, and corroborated by the published
+hooks reference): only **SessionStart**, **UserPromptSubmit**,
+**UserPromptExpansion** — the docs additionally name `PostModelSwitch`. Every
+other event (PreToolUse, PostToolUse, **Stop**, SubagentStop, PreCompact,
+SessionEnd) reaches the model ONLY through JSON `additionalContext` /
+`systemMessage`, and each of those strings is run through the SAME 10,000-char
+persistence path. Two consequences worth stating plainly: a Stop hook that
+`print`s advice on exit 0 is **inert** (its stdout goes to the debug log), and
+an oversized JSON advisory can lose its *decision*, not merely its prose —
+which is why `scripts/hooks/hook_output.py` trims named free-text fields and
+never the envelope.
+
+**Reading a filed payload back is safe and idempotent.** The Read tool's
+`maxResultSizeChars` is `Infinity` (it short-circuits the threshold resolver
+and is exempt from the ~200,000-char per-message aggregate budget), so a 30 KB
+filed part comes back whole, once, and cannot be re-persisted. Its real limits
+are 2,000 lines / 25,000 tokens, and exceeding those is an *error*, not a
+silent wrapper. That is what makes "Read the path the wrapper names" a viable
+recovery instruction rather than a loop.
+
+**Identity via CLAUDE.md `@import` was evaluated as an alternative and
+REJECTED** (measured 2026-08-30, real `claude -p` probes). Imports do work:
+they survive `-p` and `--system-prompt`, and a 14,430-char imported file
+arrives whole. Two disqualifiers: (1) a **missing import is a SILENT skip** —
+no warning, no note — and `src/genesis/identity/USER.md` is gitignored and
+absent on a fresh clone, so every clone would silently lose the user profile,
+which is precisely this class of bug; (2) the only suppression lever,
+`--setting-sources user`, drops project **hooks** along with project CLAUDE.md
+(controlled: with the flag both a project hook sentinel and a CLAUDE.md
+sentinel disappear; without it both appear), so executor/eval lanes — which run
+with a worktree cwd — would lose their guards. `--bare` also skips CLAUDE.md
+auto-discovery but forces `ANTHROPIC_API_KEY`-only auth, which this install
+does not use. CLAUDE.md itself has a 4 MiB ceiling and is dropped whole above
+it (no truncation); the docs recommend under 200 lines for adherence.
+
+Consequence: the SessionStart injection ships as **four hook entries**
+(`--part charter | identity-core | identity-user | knowledge`), each held under
+`_PART_BUDGET = 9_800` — enforced at a single chokepoint (`BoundedStdout` in
+`scripts/hooks/hook_output.py`) so a block that forgets to check its budget
+cannot overrun. The DEGRADE decisions live there too: a caller says what the
+fallback looks like (`emit_or_degrade(pointer=…, notice=…)`) and never computes
+characters, because every number it used to compute by hand — the divider,
+`print`'s newline, the closing-line reserve, the room remaining — was found
+wrong by review at least once. The full intended text is mirrored to
+`~/.genesis/sessions/<sid>/context-<part>.md` so an in-band cut stays
+recoverable. Each part opens with a `[genesis-ctx:<part> · mirror: …]` recovery
+header, which sits inside the harness's 2 KB preview by construction — the one
+place a filed part is still visible. Backed by an awareness watcher over the
+harness's own filings (`context_injection_monitor`, critical → Telegram) that
+never reads our constant.
+**After any CC bump, re-run the probe** at 9,978 / 9,979 (the exact edge
+including the 22-char probe wrapper) and at two-hook 9 K + 9 K; if either
+moves, the constants to revisit are `HOOK_STDOUT_CAP` in
+`scripts/hooks/hook_output.py` — its ONE home, which every emitter reads — and
+the part budgets. Do NOT edit `genesis_session_context._HOOK_STDOUT_CAP`: it is
+a re-export assigned from that constant, so changing it moves nothing while
+looking like it did.
+
+Measurement traps met while establishing this, so the next person does not
+repeat them: (1) the `Output too large (NNkB)` parenthetical is the OUTPUT's
+size, not the cap; (2) a Bash TOOL result probe does not transfer to hooks
+(tools carry per-tool `maxResultSizeChars`); (3) an interactive probe with no
+typed turn writes no transcript, and "newest transcript" mis-attributes a
+concurrent session's — identify your own transcript by before/after set
+difference and send a real turn.
 
 ## Known Risks
 

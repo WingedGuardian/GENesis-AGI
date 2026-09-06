@@ -1205,6 +1205,7 @@ class CCInvoker:
         timed_out = False
         terminated_after_result = False
         line_count = 0
+        multi_block_seen = False
 
         try:
             async with asyncio.timeout(invocation.timeout_s):
@@ -1226,6 +1227,35 @@ class CCInvoker:
                         # durability layer can parse a reset time off it.
                         rate_limit_raw = event_raw
                     logger.debug("CC stream event #%d: type=%s", line_count, etype)
+
+                    # `StreamEvent.from_raw` keeps only the FIRST recognized
+                    # content block, which is lossless only while CC emits one
+                    # block per line. MEASURED 2026-09-04 against CC 2.1.246 on
+                    # this exact surface (`claude -p --output-format stream-json
+                    # --verbose`, two probes): 8/8 assistant lines carried
+                    # exactly one block, 0 multi-block — including a
+                    # thinking→text→tool_use turn and three PARALLEL tool calls,
+                    # which the API packs into a single message and the CLI split
+                    # across three lines. The version matters: this is a property
+                    # of a CLI build, not of the protocol.
+                    #
+                    # So this RECORDS the assumption rather than defending
+                    # against it — it is a log line, and nothing polls it. It
+                    # earns its keep by making a future batching CC diagnosable
+                    # in one grep instead of a week of missing tool calls.
+                    # Invocation-scoped on purpose: cross-invocation de-dup
+                    # belongs to the log aggregator, and one line per affected
+                    # turn is what tells you WHICH turns were lossy.
+                    if etype == "assistant" and not multi_block_seen:
+                        n_blocks = StreamEvent.recognized_blocks(event_raw)
+                        if n_blocks > 1:
+                            multi_block_seen = True
+                            logger.warning(
+                                "CC assistant line carried %d recognized content "
+                                "blocks — StreamEvent.from_raw keeps only the "
+                                "first; tool calls and answer text may be dropped",
+                                n_blocks,
+                            )
 
                     event = StreamEvent.from_raw(event_raw)
 
