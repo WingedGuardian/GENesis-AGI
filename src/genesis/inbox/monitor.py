@@ -149,6 +149,124 @@ def _has_url_failures(response_text: str, input_content: str) -> bool:
     return any(p in lower for p in _URL_FAILURE_PATTERNS)
 
 
+# Path-tail tokens too generic to count as evidence that a SPECIFIC URL was
+# evaluated (they name a content TYPE, not a content identity).
+_GENERIC_URL_TOKENS: frozenset[str] = frozenset(
+    {
+        "article",
+        "articles",
+        "channel",
+        "comments",
+        "google",
+        "profile",
+        "report",
+        "research",
+        "review",
+        "search",
+        "shorts",
+        "status",
+        "stories",
+        "update",
+        "updates",
+    }
+)
+
+# Domain stems / platform aliases that are common English words — an
+# incidental "I ran a web search" or "medium confidence" must never count as
+# evidence that a search.app / medium.com link was evaluated (MEASURED: 5/5
+# constructed silent drops passed the stem rung before this exclusion;
+# adversarial review 2026-09-06).
+_GENERIC_STEM_TOKENS: frozenset[str] = _GENERIC_URL_TOKENS | frozenset(
+    {
+        "apps",
+        "docs",
+        "link",
+        "mail",
+        "medium",
+        "news",
+        "open",
+        "read",
+        "share",
+        "sites",
+    }
+)
+
+
+def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
+    """Return the input URLs the response shows NO evidence of covering.
+
+    ``_has_url_failures`` only catches give-up LANGUAGE — a model that
+    silently omits a URL emits none, so omission was undetectable by
+    construction (the silent-drop hazard). This closes that hole: every URL
+    sent for evaluation must leave a trace in the response.
+
+    Evidence ladder, per URL (case-insensitive):
+    1. The full URL (scheme/www-insensitive) appears verbatim.
+    2. Its path tail (slug) appears, or a distinctive tail token does —
+       len >= 6, or len >= 4 containing a digit (video ids, short slugs),
+       excluding :data:`_GENERIC_URL_TOKENS`.
+    3. Domain-level evidence (bare domain, platform alias from
+       :data:`_DOMAIN_TO_NAMES`, or the domain stem) — accepted ONLY when
+       this item carries a single URL on that domain, because "the LinkedIn
+       post" cannot vouch for two different LinkedIn URLs; aliases and stems
+       that are common English words (:data:`_GENERIC_STEM_TOKENS`) never
+       count, because "medium confidence" is not evidence about medium.com.
+
+    A miss is deliberately cheap: the caller re-queues the item through the
+    existing partial-failure retry path (max_retries-capped) — it never
+    deletes data. Matching is therefore tuned generous-but-attributable.
+    """
+    urls = _extract_urls(input_content)
+    if not urls:
+        return []
+    lower = response_text.lower()
+
+    def _bare(u: str) -> str:
+        b = u.lower().split("://", 1)[-1]
+        return b.removeprefix("www.")
+
+    domain_counts: dict[str, int] = {}
+    for u in urls:
+        d = _bare(u).split("/", 1)[0]
+        domain_counts[d] = domain_counts.get(d, 0) + 1
+
+    uncovered: list[str] = []
+    for u in urls:
+        if "{" in u or "}" in u:
+            # A template placeholder (e.g. api.github.com/repos/{slug}) from
+            # pasted prose is not a fetchable URL — never demand coverage.
+            continue
+        bare = _bare(u).rstrip("/")
+        if bare in lower:
+            continue
+        domain = bare.split("/", 1)[0]
+        tail = bare.rsplit("/", 1)[-1]
+        if tail != domain:
+            if len(tail) > 3 and tail in lower:
+                continue
+            tokens = [t for t in re.split(r"[?&=/_\-.]+", tail) if t]
+            if any(
+                (len(t) >= 6 or (len(t) >= 4 and any(c.isdigit() for c in t)))
+                and t not in _GENERIC_URL_TOKENS
+                and t in lower
+                for t in tokens
+            ):
+                continue
+        if domain_counts[domain] == 1:
+            if domain in lower:
+                continue
+            if any(
+                n not in _GENERIC_STEM_TOKENS and n in lower
+                for n in _DOMAIN_TO_NAMES.get(domain, [])
+            ):
+                continue
+            stem = domain.split(".")[0]
+            if len(stem) > 3 and stem not in _GENERIC_STEM_TOKENS and stem in lower:
+                continue
+        uncovered.append(u)
+    return uncovered
+
+
 _ACKNOWLEDGED_RE = re.compile(
     r"\*\*Classification:\*\*\s*Acknowledged",
     re.IGNORECASE,
@@ -158,6 +276,7 @@ _ACKNOWLEDGED_RE = re.compile(
 # that evaluations commonly use instead of the raw URL domain.
 _DOMAIN_TO_NAMES: dict[str, list[str]] = {
     "linkedin.com": ["linkedin"],
+    "lnkd.in": ["linkedin"],
     "github.com": ["github"],
     "youtube.com": ["youtube"],
     "youtu.be": ["youtube"],
@@ -981,11 +1100,16 @@ class InboxMonitor:
             # both the empty-delta and new-content paths).
             existing = await inbox_items.get_by_file_path(self._db, str(f))
             if existing and existing["status"] == "pending":
+                # Supersession is not a failure of the item — preserve the
+                # retry budget (the default failed-path increment would walk
+                # repeatedly-edited files toward max_retries exclusion and
+                # block row recycling near the cap).
                 await inbox_items.update_status(
                     self._db,
                     existing["id"],
                     status="failed",
                     error_message="superseded_by_modification",
+                    retry_count=existing["retry_count"],
                 )
             # Likewise supersede rows PARKED on a pending approval for this
             # file: the fresh delta below is a superset of the parked one (the
@@ -1709,8 +1833,12 @@ class InboxMonitor:
 
         completed_at = self._clock().isoformat()
 
-        # Acknowledged: pure-meta note, no response file.
-        if _is_acknowledged(output.text):
+        # Acknowledged: pure-meta note, no response file. Honored ONLY for
+        # URL-free items — a URL-bearing item claiming Acknowledged would
+        # baseline its URLs with zero coverage evidence (the silent-loss
+        # class the coverage gate below exists to close), so it falls
+        # through to the normal path and its gates instead.
+        if _is_acknowledged(output.text) and not _extract_urls(item.content):
             logger.info(
                 "Item classified as Acknowledged — no response file (batch %s)",
                 batch_id[:8],
@@ -1765,7 +1893,65 @@ class InboxMonitor:
                 errors.append(err)
                 logger.error(err)
 
-        # Follow-ups (deduped per recommendation; non-fatal).
+        # URL-fetch give-up -> mark failed (retry); do NOT baseline these lines.
+        if _has_url_failures(output_text, item.content):
+            logger.warning(
+                "URL failures in batch %s — marking failed to retry (response kept)",
+                batch_id[:8],
+            )
+            await inbox_items.mark_url_failure(
+                self._db,
+                item.id,
+                response_path=str(response_path) if response_path else None,
+                processed_at=completed_at,
+            )
+            if session_id is not None:
+                await self._session_manager.complete(session_id)
+            return False
+
+        # Coverage gate: a URL the response never MENTIONS emitted no give-up
+        # language, so the check above cannot see it. Do NOT baseline the
+        # batch — re-queue through the same partial-failure retry path
+        # (max_retries-capped), so silent omission is a retry, never a
+        # permanent invisible loss.
+        uncovered = _uncovered_urls(output_text, item.content)
+        if uncovered:
+            # Bound the stored message: whole URLs, first 5, with an explicit
+            # count for the rest (a pasted mega-drop must not balloon the row).
+            shown = ", ".join(uncovered[:5])
+            if len(uncovered) > 5:
+                shown += f" (+{len(uncovered) - 5} more)"
+            logger.warning(
+                "Batch %s response covers no trace of %d URL(s) — "
+                "marking failed to retry (response kept): %s",
+                batch_id[:8],
+                len(uncovered),
+                shown,
+            )
+            await inbox_items.mark_url_failure(
+                self._db,
+                item.id,
+                response_path=str(response_path) if response_path else None,
+                processed_at=completed_at,
+                error_message="partial_url_failure: uncovered " + shown,
+            )
+            if session_id is not None:
+                await self._session_manager.complete(session_id)
+            return False
+
+        # Success: baseline ONLY this batch's lines.
+        await self._complete_batch_baseline(
+            item,
+            completed_at,
+            response_path=response_path,
+        )
+        if session_id is not None:
+            await self._session_manager.complete(session_id)
+
+        # Follow-ups + build lane fire only for evaluations that actually
+        # COMPLETED — a coverage-failed eval retries, and acting on it here
+        # would create rows from an evaluation we just declared unevaluated
+        # (dedup would then block the retry's corrected verdict).
         if output_text:
             try:
                 fu_count = await self._create_follow_ups_from_eval(
@@ -1801,31 +1987,6 @@ class InboxMonitor:
                         "Build-lane eval handling failed (non-fatal)",
                         exc_info=True,
                     )
-
-        # URL-fetch give-up -> mark failed (retry); do NOT baseline these lines.
-        if _has_url_failures(output_text, item.content):
-            logger.warning(
-                "URL failures in batch %s — marking failed to retry (response kept)",
-                batch_id[:8],
-            )
-            await inbox_items.mark_url_failure(
-                self._db,
-                item.id,
-                response_path=str(response_path) if response_path else None,
-                processed_at=completed_at,
-            )
-            if session_id is not None:
-                await self._session_manager.complete(session_id)
-            return False
-
-        # Success: baseline ONLY this batch's lines.
-        await self._complete_batch_baseline(
-            item,
-            completed_at,
-            response_path=response_path,
-        )
-        if session_id is not None:
-            await self._session_manager.complete(session_id)
         await self._notify_batch(
             message_queue,
             item,
@@ -2045,6 +2206,15 @@ class InboxMonitor:
                 parts.append(
                     "\n### URLs found (you MUST attempt to fetch each one "
                     "and report the result):\n",
+                )
+                parts.append(
+                    "Quote each URL VERBATIM in your evaluation (a "
+                    "`**Source:** <url>` line in that item's section). A "
+                    "mechanical coverage check re-queues the whole item as "
+                    "unevaluated when an input URL appears nowhere in your "
+                    "response — this matters most for shortened links "
+                    "(lnkd.in, share.google) whose target you discuss by "
+                    "title.\n"
                 )
                 for i, url in enumerate(urls, 1):
                     parts.append(f"{i}. {url}")
@@ -2284,19 +2454,32 @@ def _compute_new_content(old_content: str, new_content: str) -> str:
     Lines are compared after URL tracking-param normalization, so the same
     article re-pasted with different share/tracking params is not treated as
     new. The original (un-normalized) line is kept in the output for evaluation.
+
+    An elided already-evaluated line leaves a blank-line separator in its
+    place (when new lines surround it), so two new lines that were NOT
+    adjacent in the source never become adjacent in the delta —
+    ``segment_items`` would otherwise attach the first as the second's
+    annotation.
     """
     old_lines = {
         normalize_url_line(line.strip()) for line in old_content.splitlines() if line.strip()
     }
     new_lines = new_content.splitlines()
     result: list[str] = []
+    elided_since_last = False
     for line in new_lines:
         stripped = line.strip()
         if stripped and normalize_url_line(stripped) not in old_lines:
+            if elided_since_last and result and result[-1].strip():
+                # Mark the discontinuity an elided baselined line leaves.
+                result.append("")
+            elided_since_last = False
             result.append(line)
         elif not stripped and result:
             # Keep blank lines between new items for readability
             result.append(line)
+        elif stripped:
+            elided_since_last = True
     # Strip trailing blank lines
     while result and not result[-1].strip():
         result.pop()

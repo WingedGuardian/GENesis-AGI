@@ -37,9 +37,10 @@ inbox_monitor:
     assert cfg.response_dir == "_genesis"
     assert cfg.check_interval_seconds == 1800
     assert cfg.batch_size == 5
+    assert cfg.items_per_eval == 1
     assert cfg.model == "sonnet"
     assert cfg.effort == "high"
-    assert cfg.timeout_s == 600
+    assert cfg.timeout_s == 1200
     assert cfg.enabled is True
     assert cfg.max_retries == 3
     assert cfg.recursive is False

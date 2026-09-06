@@ -242,7 +242,12 @@ async def test_get_all_known_recent_processing_not_expired(db):
 # ── Monitor edge cases ─────────────────────────────────────────────────
 
 
-def _success_output(text: str = "evaluation result") -> CCOutput:
+def _success_output(
+    # Default fake response names the fixture domains so single-URL fixtures
+    # pass the per-URL coverage gate (lifecycle mechanics are under test here;
+    # coverage-gate behavior has its own dedicated tests).
+    text: str = "evaluation result for example.com / linkedin content",
+) -> CCOutput:
     return CCOutput(
         session_id="cc-sess-1", text=text, model_used="sonnet",
         cost_usd=0.05, input_tokens=100, output_tokens=200,
@@ -645,6 +650,48 @@ def test_compute_new_content_blank_lines_preserved():
     delta = _compute_new_content(old, new)
     assert "new item 1" in delta
     assert "new item 2" in delta
+
+
+def test_compute_new_content_marks_elision_with_separator():
+    """An already-baselined line elided BETWEEN two new lines must leave a
+    blank-line separator, so the two new lines do not become falsely adjacent
+    in the delta (segment_items would otherwise attach the first as the
+    second's annotation)."""
+    from genesis.inbox.monitor import _compute_new_content
+
+    old = "Random old note\n"
+    new = (
+        "TODO: reorganize this file\n"
+        "Random old note\n"
+        "https://example.com/new\n"
+    )
+    delta = _compute_new_content(old, new)
+    lines = delta.splitlines()
+    assert "TODO: reorganize this file" in lines
+    assert "https://example.com/new" in lines
+    assert "Random old note" not in delta
+    # The elision point is marked: the two new lines are NOT adjacent.
+    todo_i = lines.index("TODO: reorganize this file")
+    url_i = lines.index("https://example.com/new")
+    assert url_i - todo_i > 1
+    assert lines[todo_i + 1].strip() == ""
+
+
+def test_compute_new_content_elision_separator_reaches_segmentation():
+    """Composed: the elided-line delta must segment into a standalone note and
+    an unannotated URL item — never one merged annotation item."""
+    from genesis.inbox.monitor import _compute_new_content
+    from genesis.inbox.scanner import segment_items
+
+    old = "Random old note\n"
+    new = (
+        "TODO: reorganize this file\n"
+        "Random old note\n"
+        "https://example.com/new\n"
+    )
+    items = segment_items(_compute_new_content(old, new))
+    assert [i.kind for i in items] == ["note", "url"]
+    assert items[1].text == "https://example.com/new"
 
 
 def test_compute_new_content_dedups_tracking_param_variants():
