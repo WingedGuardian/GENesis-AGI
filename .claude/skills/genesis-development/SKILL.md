@@ -883,7 +883,6 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   knowing the rule, it is believing you already applied it.
 
   A corpus run only ever yields `did not, here`, and by the rule above it is
-  corpus run only ever yields `did not, here`, and by the rule above it is
   structurally blind to the shape nobody typed. Run the corpus as
   corroboration, never as the proof, and pair it with a control that DOES flip
   — an unflipped corpus and an inert measurement look identical.
@@ -919,14 +918,33 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   This does NOT loosen the fail-closed mandate above, and the two are easy to
   read as contradicting each other. Rule (b) is scoped to the git-operation
   blind-spot net — a guard whose trigger is deliberately broad and whose false
-  positive is one confirmation. It is NOT a template for every guard: the
-  protected-paths and destructive-command guards hard-block an unreliable parse
-  even when a person is present, by design, because their false negative is an
-  irreplaceable path or a broad recursive removal and their false positive is a
-  rewrite. Within the net, the two rules are scoped by who is present: `ask` is
-  the interactive form of the refusal, and where a session is unattended
-  fail-closed governs and (c) applies. The operation proceeds unverified in
-  neither case.
+  positive is one confirmation. It is NOT a template for every guard: where the
+  false negative is an irreplaceable path or a broad recursive removal and the
+  false positive is a rewrite, that asymmetry justifies refusing outright rather
+  than asking. Neither the protected-paths nor the destructive-command guard has
+  an `ask` branch at all — both return only 0 or 2 — so a person's presence
+  genuinely cannot change their verdict.
+
+  One clause of that used to read "hard-block an unreliable parse", and it is
+  FALSE. MEASURED 2026-09-06 through both live hook entries, controls flipping:
+  each guard refuses on the PARSED path and then falls back to a DIFFERENT
+  matcher, neither a subset nor a superset of it — it misses spellings the
+  parser catches, AND it drops the target tests the parser applies, so it also
+  refuses commands the parser allows. **A guard's fail direction is a property
+  of its DEGRADED path, and that path has to be read in BOTH directions.** The
+  two differ in what their fallback is for: `destructive_command_guard`'s is
+  fail-open by design and says so in its own docstring, so argue with the design
+  rather than patching it; `protected_paths_guard`'s calls itself "conservative:
+  over-blocks, never under", which is true relative to the old guard it
+  reinstates (`protected_paths_guard.py:33-35`) and false of the parsed resolver
+  it stands in for — one sentence, two readings, and that ambiguity is the
+  defect. Verify a docstring's stated direction IN CONTEXT; never quote it as a
+  fact. The shapes are deliberately not enumerated here, per the rule above.
+
+  Within the git-operation blind-spot net, the two rules are scoped by who is
+  present: `ask` is the interactive form of the refusal, and where a session is
+  unattended fail-closed governs and (c) applies. The operation proceeds
+  unverified in neither case.
 
   This is the shipped shape now, not an aspiration, and one distinction inside
   it must stay visible. The shared parser still degrades to a naive split with
