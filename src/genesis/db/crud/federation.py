@@ -26,6 +26,8 @@ back as ``bytes``.
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -208,6 +210,38 @@ def _require_hitl_state(state: str) -> None:
         raise ValueError(f"hitl_state must be one of {_HITL_STATES}, got {state!r}")
 
 
+# The ISO-8601 instant shapes SQLite's datetime() actually parses: a full
+# date+time, optional fractional seconds, optional 'Z' or ±HH:MM offset. The
+# COLON in the offset is required — SQLite rejects the basic '+0000' form that
+# strftime('%z') and `date +%z` emit, and Python's fromisoformat ACCEPTS it, so
+# neither check alone is sufficient (both are applied below). Date-only values
+# and SQLite's own modifiers ('now', Julian numerics) are deliberately excluded:
+# a retention cutoff must name an instant.
+_SQL_INSTANT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+)
+
+
+def _require_sql_instant(value: str, *, field: str) -> None:
+    """Reject a timestamp SQLite's ``datetime()`` would silently return NULL for.
+
+    NULL is the dangerous value here, not an error: ``x < NULL`` is NULL, never
+    true, so an unparseable timestamp makes a comparison quietly fail to match.
+    On a retention CUTOFF that means the entire pass prunes nothing and returns
+    0 — indistinguishable from "nothing to prune", on every run, forever. Fail
+    loud instead, matching this module's other closed-set guards.
+    """
+    if not isinstance(value, str) or not _SQL_INSTANT_RE.match(value):
+        raise ValueError(
+            f"{field} must be an ISO-8601 instant SQLite can parse "
+            f"(YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]), got {value!r}"
+        )
+    try:  # shape is right — now reject an impossible calendar value (month 13)
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} is not a valid instant: {value!r}") from exc
+
+
 async def append_message(
     db: SerializedConnection,
     *,
@@ -254,6 +288,14 @@ async def append_message(
     provenance (``external_untrusted``), whatever the caller passed.
     """
     _require_direction(direction)
+    # created_at is what retention compares against, and SQLite's datetime()
+    # NULLs anything it can't parse — a row stored with an unparseable stamp
+    # would be silently un-prunable FOREVER. Pin the contract at the writer, so
+    # prune_bodies' "malformed rows fail toward retention" stays a statement
+    # about corrupt data rather than about ordinary callers. (No caller exists
+    # yet — PR2's poll-loop and approval-drain are the first, which is exactly
+    # when an unpinned format convention would drift.)
+    _require_sql_instant(created_at, field="created_at")
     # Inbound peer content is untrusted — force the quarantine provenance
     # UNCONDITIONALLY (not just when the caller omits it): peer-sourced content
     # must never be stored as trusted, so an explicit origin_class on an inbound
@@ -428,19 +470,41 @@ async def set_hitl_state(
 async def prune_bodies(db: aiosqlite.Connection, *, before: str) -> int:
     """Retention: null the prunable bodies (plaintext/ciphertext/nonce) of
     messages created strictly before ``before`` (ISO ts), PRESERVING the chain
-    skeleton (seq/prev_hash/payload_hash) so a pruned transcript still verifies.
+    skeleton (seq/prev_hash/payload_hash). Scope of what "verifies" after a
+    prune: the retained skeleton still proves chain LINKAGE (every
+    ``prev_hash`` matches its predecessor's ``payload_hash``, no gaps, no
+    reordering), but a pruned row's ``payload_hash`` can no longer be
+    recomputed from its content — the bodies are gone, deliberately. That
+    matches the chain's threat model (out-of-band corruption/reordering
+    detection, not a DB-writing adversary — see the migration docstring).
+
+    Timestamps are compared as INSTANTS (``datetime()`` on both sides), not
+    text: valid ISO timestamps with different UTC offsets order wrong under a
+    textual compare, in both directions. Note ``datetime()`` truncates to whole
+    SECONDS, so a row less than a second before the cutoff is not pruned this
+    pass (it is on the next one) — sub-second retention precision is not a
+    property this offers.
+
+    ``before`` is validated up front and raises on anything ``datetime()``
+    would NULL: an unparseable cutoff would otherwise make the whole pass a
+    silent no-op returning 0, indistinguishable from "nothing to prune". A
+    stored ``created_at`` that cannot parse compares NULL and is simply never
+    pruned — rows fail toward retention, never toward data loss (and
+    :func:`append_message` validates ``created_at`` on the way in, so such a
+    row cannot originate here).
 
     Only messages whose body is done being needed (``_PRUNABLE_HITL_STATES`` —
     sent/rejected/quarantined/received; a superset of the two truly-terminal
     states) are pruned — a ``held``/``approved``-but-undelivered outbound still needs its
     payload to be sent once the owner approves, so pruning it (even when old)
     would lose the message permanently. Rows are never deleted — a gap would break
-    verification. Returns the number of rows pruned. Idempotent."""
+    linkage verification. Returns the number of rows pruned. Idempotent."""
+    _require_sql_instant(before, field="before")
     placeholders = ", ".join("?" for _ in _PRUNABLE_HITL_STATES)
     cursor = await db.execute(
         "UPDATE federation_messages "
         "SET plaintext = NULL, ciphertext = NULL, nonce = NULL "
-        f"WHERE created_at < ? AND hitl_state IN ({placeholders}) "
+        f"WHERE datetime(created_at) < datetime(?) AND hitl_state IN ({placeholders}) "
         "AND (plaintext IS NOT NULL OR ciphertext IS NOT NULL OR nonce IS NOT NULL)",
         (before, *_PRUNABLE_HITL_STATES),
     )

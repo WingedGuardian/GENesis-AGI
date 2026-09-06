@@ -706,6 +706,102 @@ async def test_prune_bodies_preserves_chain_skeleton(db):
 
 
 @pytest.mark.asyncio
+async def test_prune_compares_timestamps_as_instants_not_text(db):
+    """created_at < before must compare INSTANTS, not text: a textual compare is
+    wrong in both directions for valid ISO timestamps with different UTC
+    offsets. '2026-08-01T00:00:00-05:00' (= 05:00Z) sorts textually BEFORE an
+    '…03:00:00Z' cutoff though it is after it (would be wrongly pruned), and
+    '2026-08-01T05:00:00+05:00' (= 00:00Z) sorts textually AFTER it though it is
+    before it (would be wrongly kept)."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m-late",  # instant AFTER the cutoff, textually before it
+        contact_id="c1",
+        direction="in",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        plaintext="keep-me",
+        created_at="2026-08-01T00:00:00-05:00",
+        hitl_state="received",
+    )
+    await fed.append_message(
+        db,
+        msg_id="m-early",  # instant BEFORE the cutoff, textually after it
+        contact_id="c1",
+        direction="in",
+        seq=2,
+        prev_hash="h1",
+        payload_hash="h2",
+        plaintext="prune-me",
+        created_at="2026-08-01T05:00:00+05:00",
+        hitl_state="received",
+    )
+    pruned = await fed.prune_bodies(db, before="2026-08-01T03:00:00Z")
+    # NB the count alone is INERT here — the textual compare also pruned exactly
+    # one row, just the WRONG one. These two per-row assertions are what bite.
+    assert pruned == 1
+    assert (await fed.get_message(db, "m-late"))["plaintext"] == "keep-me"
+    assert (await fed.get_message(db, "m-early"))["plaintext"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_rejects_a_cutoff_sqlite_cannot_parse(db):
+    """An unparseable cutoff must raise, not silently prune NOTHING. datetime()
+    returns NULL for it, `x < NULL` is never true, so the pass would return 0
+    on every run forever — indistinguishable from "nothing to prune", while the
+    whole table's bodies leak past retention. '+0000' is the sharp case: it is
+    what strftime('%z')/`date +%z` emit, Python's fromisoformat ACCEPTS it, and
+    SQLite rejects it (only the colon form parses)."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m1",
+        contact_id="c1",
+        direction="in",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        plaintext="body",
+        created_at="2026-08-01T00:00:00Z",
+        hitl_state="received",
+    )
+    for bad in (
+        "2026-08-15T00:00:00+0000",
+        "garbage",
+        "now",
+        "2026-08-15",
+        "",
+        "2026-13-45T00:00:00Z",
+    ):
+        with pytest.raises(ValueError):
+            await fed.prune_bodies(db, before=bad)
+    # the body is untouched, and a VALID cutoff still prunes
+    assert (await fed.get_message(db, "m1"))["plaintext"] == "body"
+    assert await fed.prune_bodies(db, before="2026-08-15T00:00:00Z") == 1
+
+
+@pytest.mark.asyncio
+async def test_append_rejects_unparseable_created_at(db):
+    """Pin the stamp format at the WRITER: a row stored with a created_at that
+    SQLite's datetime() NULLs would be silently un-prunable forever."""
+    await _contact(db)
+    with pytest.raises(ValueError):
+        await fed.append_message(
+            db,
+            msg_id="m1",
+            contact_id="c1",
+            direction="in",
+            seq=1,
+            payload_hash="h1",
+            created_at="31-08-2026 midnight",
+            hitl_state="received",
+        )
+    assert await fed.get_message(db, "m1") is None  # nothing landed
+
+
+@pytest.mark.asyncio
 async def test_append_to_unknown_contact_raises(db):
     """A message for a non-existent contact must fail LOUD (not silently insert
     an orphan whose head never moved) regardless of PRAGMA foreign_keys."""

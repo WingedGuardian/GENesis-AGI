@@ -5,11 +5,20 @@ users' Genesis installs. ``federation_contacts`` holds one row per paired peer
 (pinned Ed25519 identity key + X25519 encryption key + relay mailbox coordinates
 + a SecretBox-sealed write-cap, NEVER a plaintext cap). ``federation_messages``
 is the per-contact, per-direction hash-chained transcript — every message links
-to the previous one's ``payload_hash`` so tampering or reordering is detectable.
+to the previous one's ``payload_hash``, so OUT-OF-BAND corruption or reordering
+(a bad restore, filesystem damage, a sync bug) is detectable on verify. The
+chain is NOT a defense against an adversary who can write to this database —
+such a writer can recompute the whole chain; there is deliberately no signature
+column in v1 (message signatures live at the transport layer, and a DB-writing
+adversary is outside this table's threat model).
 
 The bodies (``plaintext``/``ciphertext``) are prunable by the disk-hygiene
 retention path; the chain skeleton (``seq``/``prev_hash``/``payload_hash``) is
-NEVER deleted, so a pruned transcript still verifies.
+NEVER deleted, so a pruned transcript still verifies AS A CHAIN — every
+``prev_hash`` still matches its predecessor's ``payload_hash``, with no gaps
+or reordering. What a pruned row can no longer do is prove its own
+``payload_hash`` against its content: the bodies that hash was taken over are
+gone, deliberately.
 
 Outbound peer messages are held for owner approval (``hitl_state='held'`` +
 a linked ``approval_requests`` row) exactly like the WS-8 email autonomy gate
