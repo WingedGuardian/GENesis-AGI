@@ -50,6 +50,11 @@ from genesis.guardian.state_machine import (
     GuardianState,
 )
 
+# genesis.util is import-safe on the host (stdlib-only chain); genesis.observability
+# is NOT — its package __init__ pulls aiohttp/aiosqlite, which the Guardian venv
+# does not carry. See genesis/util/host_boot.py.
+from genesis.util.host_boot import read_boot_id
+
 logger = logging.getLogger(__name__)
 
 _STARTED_AT = datetime.now(UTC)
@@ -439,6 +444,23 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     sm = ConfirmationStateMachine(config)
     sm.load_state(state_path)
 
+    # Each timer tick is a fresh oneshot process, so the state on disk is the
+    # only continuity — including across a host reboot, where an escalation
+    # episode would otherwise resume mid-climb against a container that is
+    # legitimately still bootstrapping. Recovery budgets are preserved; see
+    # ConfirmationStateMachine.reset_if_rebooted.
+    #
+    # Contained like every other host-side helper in this tick: this runs BEFORE
+    # the heartbeat write and the `finally: save_state`, so an exception here
+    # would leave the Guardian silent and get it restart-looped by the container
+    # watchdog — a worse outcome than carrying stale state for one tick.
+    try:
+        sm.reset_if_rebooted(read_boot_id())
+    except Exception:
+        logger.warning(
+            "boot-aware state reset failed — carrying state forward", exc_info=True,
+        )
+
     dispatcher = _build_dispatcher(config)
     snapshots = SnapshotManager(config)
     diagnosis_engine = DiagnosisEngine(config)
@@ -545,17 +567,29 @@ async def _check_cycle(
         # so auto-reset (routes CONFIRMED_DEAD→HEALTHY while STILL down,
         # all_alive=False) neither pings nor clears — the storm stays suppressed.
         if sm.state.down_alert_sent and snapshot.all_alive:
-            if transition.old_state == GuardianState.CONFIRMED_DEAD:
-                # Autonomous recovery (container returned on its own — process()
-                # detected all_alive). The recovery-engine / CC-resolved /
-                # approval / self-heal paths clear the flag at their own
-                # recovery point + emit their own success alert, so
-                # down_alert_sent is already False here for them — no double-ping.
-                await dispatcher.send(Alert(
-                    severity=AlertSeverity.INFO,
-                    title="Genesis recovered",
-                    body="Genesis is back online — all health signals passing.",
-                ))
+            # The flag alone is the right predicate — do NOT also require
+            # old_state == CONFIRMED_DEAD.
+            #
+            # The recovery engine (recovery.py) and the approval gates below
+            # clear the flag at their own recovery point AND emit their own
+            # success alert, so they cannot double-ping here. But the CC-resolved
+            # firewall does NOT clear it, and the AWAITING_SELF_HEAL -> HEALTHY
+            # transition does not either — the "Genesis self-healed" alert is
+            # behind a branch whose only caller dispatches on
+            # state == AWAITING_SELF_HEAL, so it is unreachable. Keying on
+            # old_state therefore left the latch stuck True after those
+            # episodes, permanently muting every LATER down-alert.
+            #
+            # A post-reboot episode reset makes that guaranteed rather than
+            # occasional: the host reboots while the user is paged "Genesis
+            # down", the reset forces current_state to HEALTHY, the container
+            # comes back healthy, and the CRITICAL is never closed out. This
+            # branch is now the single close-out point for every predecessor.
+            await dispatcher.send(Alert(
+                severity=AlertSeverity.INFO,
+                title="Genesis recovered",
+                body="Genesis is back online — all health signals passing.",
+            ))
             sm.clear_down_alert_sent()
         await _handle_healthy(config, snapshots)
 
