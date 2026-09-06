@@ -74,6 +74,130 @@ async def test_set_contact_state(db):
 
 
 @pytest.mark.asyncio
+async def test_set_contact_state_revoked_is_terminal(db):
+    """Revocation is the owner's final decision: a revoked contact can never be
+    transitioned again, so a stale activation worker racing the revoke can't
+    resurrect the contact or clear revoked_at (mirrors the HITL terminal-state
+    guard on set_hitl_state)."""
+    await _contact(db, state="pending")
+    assert await fed.set_contact_state(db, "c1", state="revoked", revoked_at="2026-09-01T00:00:00Z")
+    # a stale worker's activation must be refused, not clobber the revocation
+    assert await fed.set_contact_state(db, "c1", state="active") is False
+    assert await fed.set_contact_state(db, "c1", state="pending") is False
+    row = await fed.get_contact(db, "c1")
+    assert row["state"] == "revoked"
+    assert row["revoked_at"] == "2026-09-01T00:00:00Z"  # never clobbered back to NULL
+
+
+@pytest.mark.asyncio
+async def test_set_contact_state_expected_current_cas(db):
+    """expected_current makes the transition a compare-and-swap — it only applies
+    when the row is still in that state, so two racing workers can't both win."""
+    await _contact(db, state="pending")
+    # wrong expected state → no-op
+    assert (
+        await fed.set_contact_state(db, "c1", state="active", expected_current="revoked") is False
+    )
+    assert (await fed.get_contact(db, "c1"))["state"] == "pending"
+    # correct expected state → applies; a second identical CAS then loses
+    assert await fed.set_contact_state(db, "c1", state="active", expected_current="pending")
+    assert (
+        await fed.set_contact_state(db, "c1", state="active", expected_current="pending") is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_revoke_requires_stamp_and_stamp_requires_revoke(db):
+    """revoked_at travels ONLY with the revoke transition: a revoke without a
+    stamp would be permanently un-stampable (the terminal guard refuses any
+    later re-stamp), and a stamp on a non-revoke transition would mint an
+    active contact carrying a revocation timestamp."""
+    await _contact(db, state="pending")
+    with pytest.raises(ValueError):
+        await fed.set_contact_state(db, "c1", state="revoked")  # no stamp
+    with pytest.raises(ValueError):
+        await fed.set_contact_state(db, "c1", state="active", revoked_at="2026-09-01T00:00:00Z")
+    assert (await fed.get_contact(db, "c1"))["state"] == "pending"  # nothing applied
+
+
+@pytest.mark.asyncio
+async def test_create_contact_rejects_unknown_state(db):
+    """create_contact's state param is validated against the same closed set —
+    a typo fails loud as ValueError, not as a downstream IntegrityError."""
+    with pytest.raises(ValueError):
+        await _contact(db, cid="bad", state="actve")
+
+
+@pytest.mark.asyncio
+async def test_set_hitl_state_rejects_unknown_states(db):
+    """Same closed-set validation on the HITL side: a typo'd target state or
+    expected_current must fail LOUD, not silently produce a CAS that can never
+    match (returning False forever)."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        payload_hash="h1",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="held",
+    )
+    with pytest.raises(ValueError):
+        await fed.set_hitl_state(db, "m1", hitl_state="aproved")
+    with pytest.raises(ValueError):
+        await fed.set_hitl_state(db, "m1", hitl_state="approved", expected_current="hld")
+
+
+@pytest.mark.asyncio
+async def test_set_contact_state_rejects_unknown_states(db):
+    """Target and expected states are validated against the closed contact-state
+    set — a typo must fail LOUD, not silently create an un-enumerable state that
+    bypasses the terminal guard (or a CAS that can never match)."""
+    await _contact(db, state="pending")
+    with pytest.raises(ValueError):
+        await fed.set_contact_state(db, "c1", state="zombie")
+    with pytest.raises(ValueError):
+        await fed.set_contact_state(db, "c1", state="active", expected_current="pnding")
+
+
+@pytest.mark.asyncio
+async def test_append_requires_active_contact(db):
+    """The append CAS also requires state='active': a message can't be appended
+    to a pending (not-yet-activated) contact, and owner revocation that commits
+    before an in-flight worker's append wins the race — the append fails instead
+    of landing on a revoked contact."""
+    await _contact(db, cid="p1", state="pending")
+    with pytest.raises(ValueError):
+        await fed.append_message(
+            db,
+            msg_id="m1",
+            contact_id="p1",
+            direction="in",
+            seq=1,
+            payload_hash="h1",
+            created_at="2026-08-31T00:00:00Z",
+            hitl_state="received",
+        )
+    # revocation race: contact was active when the worker read it, revoke lands first
+    await _contact(db, cid="a1", state="active")
+    assert await fed.set_contact_state(db, "a1", state="revoked", revoked_at="2026-09-01T00:00:00Z")
+    with pytest.raises(ValueError):
+        await fed.append_message(
+            db,
+            msg_id="m2",
+            contact_id="a1",
+            direction="in",
+            seq=1,
+            payload_hash="h1",
+            created_at="2026-09-01T00:00:01Z",
+            hitl_state="received",
+        )
+    assert await fed.get_message(db, "m2") is None  # rolled back, nothing landed
+
+
+@pytest.mark.asyncio
 async def test_append_advances_chain_head_atomically(db):
     """The load-bearing invariant: appending a message moves the contact's
     per-direction chain head in the same transaction, so chain_tip reflects the

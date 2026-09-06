@@ -36,6 +36,20 @@ if TYPE_CHECKING:
 # contacts
 # ---------------------------------------------------------------------------
 
+# The closed contact-state set (matches the CHECK constraint in the DDL).
+_CONTACT_STATES = ("pending", "active", "revoked")
+
+# States a contact can never LEAVE — revocation is the owner's final decision.
+# set_contact_state refuses to transition out of these so a stale activation
+# worker racing the revoke can't resurrect the contact (mirrors
+# _TERMINAL_HITL_STATES on the message side).
+_TERMINAL_CONTACT_STATES = ("revoked",)
+
+
+def _require_contact_state(state: str) -> None:
+    if state not in _CONTACT_STATES:
+        raise ValueError(f"contact state must be one of {_CONTACT_STATES}, got {state!r}")
+
 
 async def create_contact(
     db: aiosqlite.Connection,
@@ -53,6 +67,7 @@ async def create_contact(
 ) -> str:
     """Insert a paired-peer row. ``peer_write_cap_enc`` is SecretBox-sealed by
     the caller (never a plaintext cap). Returns ``contact_id``."""
+    _require_contact_state(state)  # typo fails loud, not as a downstream IntegrityError
     await db.execute(
         """INSERT INTO federation_contacts
              (contact_id, display_name, peer_ed25519_pub, peer_x25519_pub,
@@ -102,13 +117,51 @@ async def set_contact_state(
     contact_id: str,
     *,
     state: str,
+    expected_current: str | None = None,
     revoked_at: str | None = None,
 ) -> bool:
-    """Transition a contact's state (e.g. pending→active, →revoked). Returns
-    whether a row changed. ``revoked_at`` is stamped when moving to revoked."""
+    """Transition a contact's state (pending→active, →revoked). Returns whether
+    a row changed. ``revoked_at`` is stamped when moving to revoked (and never
+    cleared by a later transition — COALESCE keeps the existing stamp).
+
+    Mirrors :func:`set_hitl_state`'s race-safety guards:
+    - ``revoked`` is TERMINAL: a revoked contact can never be transitioned
+      again, so a stale activation worker racing the owner's revoke can't
+      resurrect the contact or clear ``revoked_at`` — whichever call commits
+      last would otherwise erase the owner's decision;
+    - ``expected_current`` (optional) makes the update a compare-and-swap: it
+      only applies when the row is still in that state, so two workers racing
+      the same transition don't both "succeed".
+
+    Both ``state`` and ``expected_current`` are validated against the closed
+    contact-state set — a typo fails loud rather than creating an un-enumerable
+    state (or a CAS that can never match; note ``expected_current="revoked"``
+    passes validation but can never match, because the terminal guard excludes
+    revoked rows from the UPDATE entirely).
+
+    ``revoked_at`` travels ONLY with the revoke transition, and is REQUIRED
+    there: a revoke without a stamp would be permanently un-stampable (the
+    terminal guard refuses any later re-stamp), and a stamp on a non-revoke
+    transition would mint an active contact carrying a revocation timestamp."""
+    _require_contact_state(state)
+    if (state == "revoked") != (revoked_at is not None):
+        raise ValueError(
+            "revoked_at is required when (and only when) transitioning to "
+            f"'revoked' — got state={state!r}, revoked_at={revoked_at!r}"
+        )
+    conds = [
+        "contact_id = ?",
+        f"state NOT IN ({', '.join('?' for _ in _TERMINAL_CONTACT_STATES)})",
+    ]
+    params: list = [contact_id, *_TERMINAL_CONTACT_STATES]
+    if expected_current is not None:
+        _require_contact_state(expected_current)
+        conds.append("state = ?")
+        params.append(expected_current)
     cursor = await db.execute(
-        "UPDATE federation_contacts SET state = ?, revoked_at = ? WHERE contact_id = ?",
-        (state, revoked_at, contact_id),
+        "UPDATE federation_contacts SET state = ?, revoked_at = COALESCE(?, revoked_at) "
+        f"WHERE {' AND '.join(conds)}",
+        (state, revoked_at, *params),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -119,6 +172,9 @@ async def set_contact_state(
 # ---------------------------------------------------------------------------
 
 _DIRECTIONS = ("in", "out")
+
+# The closed HITL-state set (matches the CHECK constraint in the DDL).
+_HITL_STATES = ("proposed", "held", "approved", "sent", "rejected", "quarantined", "received")
 
 # HITL states whose message body is safe to prune. A NON-terminal outbound
 # message (proposed/held/approved-but-undelivered) still needs its plaintext/
@@ -142,6 +198,11 @@ _INBOUND_ORIGIN_CLASS = "external_untrusted"
 def _require_direction(direction: str) -> None:
     if direction not in _DIRECTIONS:
         raise ValueError(f"direction must be one of {_DIRECTIONS}, got {direction!r}")
+
+
+def _require_hitl_state(state: str) -> None:
+    if state not in _HITL_STATES:
+        raise ValueError(f"hitl_state must be one of {_HITL_STATES}, got {state!r}")
 
 
 async def append_message(
@@ -179,8 +240,11 @@ async def append_message(
     predecessor — which ``UNIQUE(contact,direction,seq)`` alone does not prevent
     (it only rejects a duplicate seq). Genesis (first message) is ``seq = 1``,
     ``prev_hash = None``, matched against the fresh contact's ``(0, NULL)`` tip.
-    The CAS also subsumes the unknown-contact check (no matching row → 0 rows),
-    uniformly regardless of ``PRAGMA foreign_keys``.
+    The CAS also requires the contact to be ``state='active'`` — a message can't
+    land on a pending or revoked contact, so owner revocation that commits before
+    an in-flight worker's append wins the race — and it subsumes the
+    unknown-contact check (no matching row → 0 rows), uniformly regardless of
+    ``PRAGMA foreign_keys``.
     """
     _require_direction(direction)
     # inbound peer content is untrusted — force the quarantine provenance when the
@@ -200,14 +264,16 @@ async def append_message(
         # `IS ?` compares NULL correctly (genesis prev_hash=None ↔ head IS NULL).
         cur = await db.execute(
             f"UPDATE federation_contacts SET {col_seq} = ?, {col_head} = ? "
-            f"WHERE contact_id = ? AND {col_seq} = ? AND {col_head} IS ?",
+            f"WHERE contact_id = ? AND state = 'active' "
+            f"AND {col_seq} = ? AND {col_head} IS ?",
             (seq, payload_hash, contact_id, seq - 1, prev_hash),
         )
         if cur.rowcount == 0:
             raise ValueError(
                 f"append_message: chain-tip CAS failed for contact {contact_id!r} "
                 f"direction={direction} (expected prior seq={seq - 1}, "
-                f"prev_hash={prev_hash!r}) — unknown contact, out-of-order, or fork"
+                f"prev_hash={prev_hash!r}) — unknown/inactive/revoked contact, "
+                "out-of-order, or fork"
             )
         await db.execute(
             """INSERT INTO federation_messages
@@ -317,10 +383,16 @@ async def set_hitl_state(
       owner's decision;
     - ``expected_current`` (optional) makes the update a compare-and-swap: it only
       applies when the row is still in that state, so two workers racing the same
-      transition don't both "succeed"."""
+      transition don't both "succeed".
+
+    Both states are validated against the closed HITL set — a typo'd
+    ``expected_current`` would otherwise silently produce a CAS that can never
+    match (returning False forever, indistinguishable from losing the race)."""
+    _require_hitl_state(hitl_state)
     conds = ["msg_id = ?", f"hitl_state NOT IN ({', '.join('?' for _ in _TERMINAL_HITL_STATES)})"]
     params: list = [msg_id, *_TERMINAL_HITL_STATES]
     if expected_current is not None:
+        _require_hitl_state(expected_current)
         conds.append("hitl_state = ?")
         params.append(expected_current)
     cursor = await db.execute(
