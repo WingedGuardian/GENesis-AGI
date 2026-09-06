@@ -47,7 +47,7 @@ check_bash: true
 
 # Deny-list, not an allow-list: an allow-list on "*.py" silently misses the
 # extensionless script, the notebook and the heredoc — which is exactly the
-# shape the origin incident took (a file in /home/ubuntu/tmp/).
+# shape the origin incident took (an ad-hoc script written to a temp directory).
 excludes:
   # Docs may quote an endpoint while discussing it.
   - "*.md"
