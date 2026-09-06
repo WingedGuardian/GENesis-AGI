@@ -265,6 +265,40 @@ async def test_redirects_survive_a_same_norm_active_entity_of_another_type(db):
 
 
 @pytest.mark.asyncio
+async def test_query_resolves_both_the_active_and_the_merged_same_norm_entity(db):
+    """End-to-end cover for the redirect, which no test had.
+
+    The fix for the round-1 P2 was in the PRODUCER — it deleted a
+    ``norm_name in active_norms`` skip from ``merged_norm_redirects`` — and the
+    sibling test above pins it correctly: restoring that skip turns it RED
+    (measured). Nothing here rescues an unheld fix, and an earlier version of
+    this docstring wrongly claimed it did, on the strength of a mutation to the
+    CONSUMER that the fix commit never touched.
+
+    What was genuinely uncovered is the consumer. ``resolve_query_entities``
+    unions the survivor into the active map rather than overwriting it, which
+    is what makes the producer's output reach a caller — and
+    ``test_entity_query.py`` has no merge-following coverage at all, so
+    replacing that union with an overwrite breaks the user-visible behaviour
+    with every existing test still green (measured). That gap is what this
+    closes.
+    """
+    person = await _mk(db, "Atlas", "atlas", etype="person")
+    concept = await _mk(db, "Atlas", "atlas", etype="concept")
+    device = await _mk(db, "Atlas device", "atlas device", etype="device")
+    await _tombstone(db, concept, device)
+
+    weights = await entity_query.resolve_query_entities(db, "Atlas")
+
+    assert person in weights, "the active same-norm entity must still resolve"
+    assert device in weights, (
+        "the merged entity's survivor must resolve by the OLD surface form — "
+        "dropping it is the defect this pins"
+    )
+    assert concept not in weights, "a tombstone is never itself a live target"
+
+
+@pytest.mark.asyncio
 async def test_enqueue_adjudication_reports_whether_it_inserted(db, monkeypatch):
     """The enqueue helper must tell callers whether a row actually landed:
     both silent no-op paths (pending-row dedup, kill switch) previously

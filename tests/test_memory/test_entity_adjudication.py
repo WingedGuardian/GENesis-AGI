@@ -1353,6 +1353,43 @@ async def test_live_rejudgment_of_stale_pair_lands_as_proposal(db):
 
 
 @pytest.mark.asyncio
+async def test_live_rejudgment_of_a_reopened_prepolicy_distinct_lands_as_proposal(db):
+    """The OTHER half of the guard above, which its docstring claims and its
+    body never seeded.
+
+    ``existing is None`` gates the live auto-merge lane, and two distinct
+    classes make ``existing`` non-None: a ``stale`` verdict, and a re-opened
+    pre-policy ``distinct``. The sibling test seeds only the first, so a
+    half-revert that re-admits the pre-policy-``distinct`` class to auto-merge
+    SURVIVED all 73 tests (measured). The full revert is caught, which is
+    exactly what hid it — a multi-clause guard needs one mutant per clause.
+
+    This is not hypothetical arithmetic: the live store holds 3,180 ``distinct``
+    rows and no ``policy`` column yet, so every one of them enters this class
+    the moment the migration lands. Currently latent — ``mode: propose_only``
+    in config — which makes it a surface to pin BEFORE live mode is enabled,
+    not after.
+    """
+    a = await _mk_entity(db, "delta api", "delta api")
+    b = await _mk_entity(db, "delta apis", "delta apis")
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=b, verdict="distinct")
+    # A verdict written before the policy column existed — the re-opened class.
+    await db.execute("UPDATE entity_adjudications SET policy = NULL")
+    await db.commit()
+    await _enqueue(db, a, b)
+    router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
+
+    counts = await adj.run_adjudication_drain(db, router, mode="live", budget=10)
+
+    assert counts["merged"] == 0, "a re-opened pre-policy row auto-merged unapproved"
+    assert counts["proposed"] == 1
+    assert await _status(db, a) == "active" and await _status(db, b) == "active"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge"
+    assert row["approved_at"] is None  # the human gate still owns this decision
+
+
+@pytest.mark.asyncio
 async def test_sweep_enqueued_counter_counts_only_real_insertions(db, monkeypatch):
     """``enqueue_adjudication`` is a silent no-op behind its kill switch (and
     on dedup); the sweep's ``enqueued`` count must report rows actually
