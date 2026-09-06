@@ -344,9 +344,23 @@ def _subsystem_enabled(name: str) -> bool:
             # collapses the first two. Without this branch a deliberately-
             # disabled detector goes silent and then reads overdue at 48h,
             # forever — the permanent false alarm this function exists to
-            # prevent. The env kill switch is per-process on the hook side and
-            # not visible from here; it only stops the SessionStart spawn, so
-            # the daily disk-hygiene sweep keeps the pulse alive anyway.
+            # prevent.
+            #
+            # The env kill switch is NOT covered, and this comment used to
+            # claim it was — it said the variable "only stops the SessionStart
+            # spawn, so the daily disk-hygiene sweep keeps the pulse alive".
+            # False: zero_drop_worker._run() honours GENESIS_ZERO_DROP_DISABLED
+            # for EVERY trigger, hygiene included, returning before any
+            # heartbeat. So setting it the obvious way (a systemd unit, a shell
+            # profile, a container env) stops the pulse entirely, while this
+            # function — which cannot read another process's environment —
+            # still reports the subsystem as enabled, and the overdue alarm
+            # fires anyway. Using the documented kill switch in the documented
+            # way therefore buys the exact false alarm this branch exists to
+            # prevent. Not fixed here: the repair is either to scope the
+            # worker's check to `trigger == "session_start"` or to read the
+            # variable here too, and picking between those is a design call
+            # rather than a comment edit.
             from genesis.session_awareness.zero_drop_config import effective_mode
 
             return effective_mode() != "off"
