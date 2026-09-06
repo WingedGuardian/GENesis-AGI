@@ -62,10 +62,61 @@ if [[ "$args" == *list-panes* ]]; then
     # survive that (set -euo pipefail). Absent panes file -> no output,
     # exercising the probe's "cannot enumerate" path.
     if [[ -n "${FAKE_TMUX_LIST_PANES_FAIL:-}" ]]; then exit 1; fi
+    if [[ "$args" == *session_id* ]]; then
+        # The consent block's 5-field SNAPSHOT format. Served from its own
+        # file so the slot-map probe (pane_pid format) keeps its fixture.
+        # A second snapshot file, when present, is consumed from the SECOND
+        # call on — that is how a test moves the world between the disclose
+        # and the confirm (the projection compare must then stand down).
+        n=0; [[ -f "${FAKE_TMUX_SNAP_N:-/nonexistent}" ]] && n=$(cat "$FAKE_TMUX_SNAP_N")
+        echo $(( n + 1 )) > "${FAKE_TMUX_SNAP_N:-/dev/null}" 2>/dev/null || true
+        if [[ "$n" -ge 1 && -f "${FAKE_TMUX_SNAP2:-/nonexistent}" ]]; then
+            cat "$FAKE_TMUX_SNAP2"
+        elif [[ -f "${FAKE_TMUX_SNAP:-/nonexistent}" ]]; then
+            cat "$FAKE_TMUX_SNAP"
+        fi
+        exit 0
+    fi
     [[ -f "$FAKE_TMUX_PANES" ]] && cat "$FAKE_TMUX_PANES"
     exit 0
 fi
+if [[ "$args" == *kill-session* ]]; then
+    # Record the exact target so tests can assert kill-BY-ID, and let a test
+    # inject a failure (the announce-and-attach path).
+    prev=""; tgt=""
+    for a in "$@"; do
+        if [[ "$prev" == "-t" ]]; then tgt="$a"; fi
+        prev="$a"
+    done
+    echo "$tgt" >> "${FAKE_TMUX_KILLLOG:-/dev/null}" 2>/dev/null || true
+    exit "${FAKE_TMUX_KILL_RC:-0}"
+fi
 exit 0
+"""
+
+
+# Fake venv python: cc-slot resolves GENESIS_ROOT from HOME and consults a venv
+# python for the slot-map liveness verdict. Fake it so the map's annotation
+# branch can be driven directly; the probe's own logic is unit-tested in
+# tests/test_cc/test_slot_liveness.py.
+_FAKE_VENV_PY = """#!/usr/bin/env bash
+if [[ "$*" == *slot_liveness* ]]; then
+  # Ordered call log (which probe ran, in which order) + an optional per-probe
+  # sleep so the whole-map deadline is exercisable (else every fake probe
+  # returns instantly and a per-probe vs shared budget are indistinguishable).
+  [[ -n "${FAKE_PROBE_LOG:-}" ]] && echo liveness >> "$FAKE_PROBE_LOG"
+  if [[ -n "${FAKE_PROBE_SLEEP:-}" ]]; then sleep "$FAKE_PROBE_SLEEP"; fi
+  # FAKE_LIVENESS may be a comma-separated SEQUENCE; each call consumes the next
+  # entry (last one repeats). Empty -> no verdict line (probe "unavailable").
+  n=0; [[ -f "$FAKE_LIVENESS_N" ]] && n=$(cat "$FAKE_LIVENESS_N")
+  IFS="," read -ra _v <<< "${FAKE_LIVENESS:-}"
+  idx=$n; (( idx >= ${#_v[@]} )) && idx=$(( ${#_v[@]} - 1 ))
+  echo "${_v[$idx]:-}"
+  echo "note"
+  echo $(( n + 1 )) > "$FAKE_LIVENESS_N"
+  exit 0
+fi
+exit 1
 """
 
 
@@ -86,23 +137,45 @@ def door(tmp_path):
 
     home = tmp_path / "home"
     home.mkdir()
+    venv_bin = home / "genesis" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    fake_py = venv_bin / "python"
+    fake_py.write_text(_FAKE_VENV_PY)
+    fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
 
     log = tmp_path / "tmux.log"
     sessions = tmp_path / "sessions.txt"
     listing = tmp_path / "list.txt"
     panes = tmp_path / "panes.txt"
+    probe_log = tmp_path / "probe_log.txt"
+    snap = tmp_path / "snap.txt"
+    snap2 = tmp_path / "snap2.txt"
+    killlog = tmp_path / "kill.log"
 
-    def run(*args: str) -> subprocess.CompletedProcess:
-        env = {
+    def _env() -> dict:
+        return {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "HOME": str(home),
             "FAKE_TMUX_LOG": str(log),
             "FAKE_TMUX_SESSIONS": str(sessions),
             "FAKE_TMUX_LIST": str(listing),
             "FAKE_TMUX_PANES": str(panes),
+            "FAKE_LIVENESS_N": str(tmp_path / "liveness_calls.txt"),
+            # Test-controlled knobs, forwarded from the test's os.environ so a
+            # test can drive the verdict without changing the fixture signature.
+            "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
+            "FAKE_PROBE_SLEEP": os.environ.get("_TEST_FAKE_PROBE_SLEEP", ""),
+            "FAKE_PROBE_LOG": str(probe_log),
             "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get(
                 "_TEST_FAKE_LIST_PANES_FAIL", ""),
+            "FAKE_TMUX_SNAP": str(snap),
+            "FAKE_TMUX_SNAP2": str(snap2),
+            "FAKE_TMUX_SNAP_N": str(tmp_path / "snap_calls.txt"),
+            "FAKE_TMUX_KILLLOG": str(killlog),
+            "FAKE_TMUX_KILL_RC": os.environ.get("_TEST_FAKE_KILL_RC", "0"),
         }
+    def run(*args: str) -> subprocess.CompletedProcess:
+        env = _env()
         # Only set when a test asks: the door must be exercised with a REAL
         # inherited TMPDIR to see what it passes on, and an unconditional entry
         # would change every other test's environment.
@@ -120,6 +193,11 @@ def door(tmp_path):
             timeout=30,
         )
 
+    run.env_fn = _env  # so the pty runner builds the IDENTICAL environment
+    run.probe_log = probe_log  # ordered log of which slot-map probes ran
+    run.snap = snap  # consent-block snapshot 1 (5-field lines)
+    run.snap2 = snap2  # snapshot served from the SECOND call on (TOCTOU tests)
+    run.killlog = killlog  # exact kill-session targets, one per line
     run.home = home  # so a test can make the temp-dir candidates unusable
     return run, log, sessions, listing, panes
 
@@ -206,6 +284,89 @@ class TestManualMode:
             f"empty one poisons the server it starts:\n{body}\n{proc.stderr}"
         )
         assert "-e TMPDIR=" not in body, f"pinned an unusable TMPDIR:\n{body}"
+
+    def test_slot_map_marks_a_session_with_no_claude(self, door):
+        """The map must SAY a slot has no claude and name an action that works.
+
+        The action changed with the consent kill-and-recreate: the hostname
+        door now detects a bare slot, discloses it, and rebuilds the pane with
+        the slot's full environment on a yes — so the honest advice is to go
+        BACK THROUGH THE DOOR. (While the door could not heal, this same test
+        asserted the OPPOSITE direction — the note had to say "run 'claude'"
+        and must NOT point at the door, because `new-session -A` silently
+        re-attached to the bare shell. The inversion is deliberate and this
+        docstring is its record.)
+        """
+        run, _log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("4242\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "no claude" in proc.stderr, (
+            f"a claude-less slot was listed as if healthy:\n{proc.stderr}"
+        )
+        # The advice must point at the door that now actually rebuilds.
+        assert "through this slot's door" in proc.stderr, (
+            f"the note does not name the door rebuild:\n{proc.stderr}"
+        )
+
+    def test_slot_map_leaves_a_live_slot_unannotated(self, door):
+        run, _log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|1|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("4242\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "ALIVE"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert "cc-1  attached" in proc.stderr, proc.stderr
+        assert "no claude" not in proc.stderr, (
+            f"a live slot was wrongly annotated:\n{proc.stderr}"
+        )
+
+    def test_slot_map_is_silent_when_the_probe_cannot_run(self, door):
+        """No verdict must never render as a verdict."""
+        run, _log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("4242\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = ""
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "cc-1" in proc.stderr
+        assert "no claude" not in proc.stderr, (
+            f"an absent verdict was rendered as one:\n{proc.stderr}"
+        )
+
+    def test_the_door_survives_a_session_dying_during_the_slot_map(self, door):
+        """A session can vanish between listing and inspecting it (the server
+        shuts down when the last slot's claude exits). Under set -euo pipefail a
+        `var=$(tmux ... | tr ...)` whose first component fails would abort the
+        whole door; the `|| true` guard must keep the login alive."""
+        run, log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("4242\n")
+        os.environ["_TEST_FAKE_LIST_PANES_FAIL"] = "1"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIST_PANES_FAIL", None)
+        assert proc.returncode == 0, (
+            f"the door died when a listed session went away:\n{proc.stderr}"
+        )
+        assert "new-session" in log.read_text(), (
+            f"the door never reached the launch:\n{proc.stderr}"
+        )
 
     def test_allocation_skips_existing_sessions(self, door):
         run, log, sessions, listing, _panes = door
@@ -303,6 +464,41 @@ class TestManualMode:
 
 
 
+class TestSlotMapBudget:
+    """The slot map is COSMETIC and must never be what makes a login feel slow."""
+
+    def test_one_deadline_is_shared_across_probes(self, door):
+        """A per-probe timeout is not a budget: N slots each finishing just
+        under it still cost N x budget. Twelve slots at 1s each, with a shared
+        ~6s deadline, must stop probing partway through — strictly fewer than
+        twelve probes run."""
+        run, log, _sessions, listing, panes = door
+        listing.write_text("".join(f"cc-{i}|0|ts\n" for i in range(1, 13)))
+        panes.write_text("4242\n")  # non-empty so a probe is attempted per slot
+        os.environ["_TEST_FAKE_PROBE_SLEEP"] = "1"
+        try:
+            result = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_PROBE_SLEEP", None)
+        assert "Existing slots" in result.stderr
+        probes = run.probe_log.read_text().split().count("liveness")
+        assert probes < 12, (
+            f"every slot was probed ({probes}); the map is spending per-probe "
+            f"budget rather than one shared deadline"
+        )
+        # And once the budget is spent the map must stop calling tmux AT ALL.
+        # Bounding each call without bounding the aggregate is not a ceiling:
+        # every remaining slot would still pay a round-trip (plus the -k grace),
+        # which is how a wedged server could outlast the declared budget.
+        listings = [
+            ln for ln in log.read_text().splitlines() if "list-panes" in ln
+        ]
+        assert len(listings) < 12, (
+            f"list-panes ran for every slot ({len(listings)}); the deadline "
+            f"bounds each call but not the map"
+        )
+
+
 class TestHostnameMode:
     def test_hostname_parses_trailing_slot(self, door):
         run, log, _sessions, _listing, _panes = door
@@ -359,3 +555,218 @@ class TestBootstrapWrapper:
         text = _BOOTSTRAP.read_text()
         assert 'rm -rf "$HOME/.genesis/session-owners"' in text
         assert 'rm -f "$HOME/.genesis/session-guard.disabled"' in text
+
+
+# ── Consent kill-and-recreate (the hostname door heals, with consent) ────────
+
+
+_SNAP = "930000|$7|0|4242|bash\n"
+
+
+def _poisoned_slot(door, snap: str = _SNAP):
+    """Arrange cc-1 as an existing, bare (claude-less) slot for hostname mode."""
+    run, log, sessions, _listing, _panes = door
+    sessions.write_text("cc-1\n")
+    run.snap.write_text(snap)
+    return run, log
+
+
+def _run_door_pty(run, mode: str, feed: bytes):
+    """Run the door under a pty so the consent `read < /dev/tty` is reachable,
+    with the EXACT environment the subprocess runner builds."""
+    import pty
+    import select
+
+    env = run.env_fn()
+    pid, fd = pty.fork()
+    if pid == 0:  # child: pty session leader
+        try:
+            os.execve("/bin/bash", ["bash", str(_CC_SLOT), mode], env)  # noqa: S606
+        except Exception:  # noqa: BLE001
+            os._exit(127)
+    os.write(fd, feed)
+    out = b""
+    while True:
+        try:
+            r, _, _ = select.select([fd], [], [], 8)
+        except OSError:
+            break
+        if not r:
+            break
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
+
+
+class TestConsentRebuild:
+    """The consent kill sits ABOVE every latch, so each gate below reads
+    post-kill reality on its only read — the staleness class that took the
+    predecessor through 7 review rounds is closed by construction. Every
+    failure direction here must land on ATTACH, never on a kill."""
+
+    def test_no_tty_reports_but_never_kills(self, door):
+        # A piped/dispatched entry has nobody to consent: detect-and-tell,
+        # then the ordinary attach. The decliner keeps the manual route.
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED"
+        try:
+            proc = run("genesis-3-1")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "runs NO claude" in proc.stderr, proc.stderr
+        assert "tmux attach -t cc-1" in proc.stderr  # the manual route survives
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+        assert "new-session" in log.read_text()  # attach still happened
+
+    def test_yes_kills_by_id_then_falls_through_to_create(self, door):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        # Kill BY ID — the measured compare-and-swap — never by name.
+        assert run.killlog.read_text().strip() == "$7", (
+            f"kill target was not the session id:\n{run.killlog.read_text()!r}\n{out}"
+        )
+        assert "rebuilding it fresh" in out, out
+        assert "new-session" in log.read_text()  # the untouched create path ran
+
+    def test_default_no_leaves_the_slot_alone(self, door):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+        assert "leaving cc-1 as it is" in out, out
+        assert "new-session" in log.read_text()
+
+    def test_projection_change_between_disclose_and_confirm_stands_down(self, door):
+        # Consent was given for a STATE, not a slot: vim starting mid-prompt
+        # changes the pane-command projection, and the yes must not kill it.
+        run, log = _poisoned_slot(door)
+        run.snap2.write_text("930000|$7|0|4242|vim\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+        assert "changed while you decided" in out, out
+        assert "new-session" in log.read_text()
+
+    def test_server_generation_change_stands_down(self, door):
+        # MEASURED motive: across server generations the id counter restarts
+        # at $0, so a stale id CAN name an innocent session — only the
+        # server-PID compare makes the kill safe. Same id, new server: no kill.
+        run, log = _poisoned_slot(door)
+        run.snap2.write_text("940000|$7|0|4242|bash\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+        assert "changed while you decided" in out, out
+
+    def test_claude_appearing_mid_prompt_stands_down(self, door):
+        # The projection can be identical while a claude just started under
+        # the same pane pid's tree — the liveness RE-probe is the last word.
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,ALIVE"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+        assert "changed while you decided" in out, out
+
+    def test_kill_failure_is_announced_and_attach_continues(self, door):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        os.environ["_TEST_FAKE_KILL_RC"] = "1"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_KILL_RC", None)
+        assert code == 0, out
+        assert "could not end cc-1" in out, out
+        assert "new-session" in log.read_text()  # -A absorbs the interleaving
+
+    def test_alive_slot_never_sees_the_consent_path(self, door):
+        run, log = _poisoned_slot(door)
+        os.environ["_TEST_FAKE_LIVENESS"] = "ALIVE"
+        try:
+            proc = run("genesis-3-1")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "runs NO claude" not in proc.stderr
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+
+    def test_malformed_session_id_fails_toward_attach(self, door):
+        # A snapshot whose id field is not `$N` (garbage, or a fake tmux)
+        # must never reach disclosure, let alone the kill.
+        run, log = _poisoned_slot(door, snap="930000|7|0|4242|bash\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED"
+        try:
+            proc = run("genesis-3-1")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "runs NO claude" not in proc.stderr
+        assert not run.killlog.exists() or run.killlog.read_text() == ""
+
+    def test_session_id_validation_is_anchored(self, door):
+        """A trailing-glob id check accepted `$7` followed by ANY text.
+
+        Not exploitable (the value is quoted into `kill-session -t`), but this
+        block's contract is that a value it cannot fully account for never
+        reaches the kill. Uses a shell-metacharacter-bearing id assembled here
+        so the assertion is about the ANCHOR, not about quoting.
+        """
+        run, log = _poisoned_slot(door, snap="930000|$7 ; echo pwned|0|4242|bash\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED,POISONED"
+        try:
+            code, out = _run_door_pty(run, "genesis-3-1", b"y\n")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert code == 0, out
+        assert not run.killlog.exists() or run.killlog.read_text() == "", (
+            f"a malformed session id reached the kill:\n{run.killlog.read_text()}"
+        )
+        assert "runs NO claude" not in out, (
+            f"a malformed id should fall through to attach before disclosure:\n{out}"
+        )
+        assert "new-session" in log.read_text()
+
+    def test_f2_falsifier_no_forbidden_mechanisms(self):
+        """F2, pre-registered with the user: the rebuild uses NO send-keys,
+        NO respawn-pane, NO set-environment — those are the imitation-class
+        mechanisms whose create/heal drift generated four review rounds — and
+        exactly ONE new-session invocation exists (the create path IS the
+        heal path)."""
+        text = _CC_SLOT.read_text()
+        assert "send-keys" not in text
+        assert "respawn-pane" not in text
+        assert "set-environment" not in text
+        invocations = [
+            ln for ln in text.splitlines()
+            if "new-session" in ln and not ln.lstrip().startswith("#")
+        ]
+        assert len(invocations) == 1, invocations
