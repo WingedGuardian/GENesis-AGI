@@ -224,24 +224,41 @@ class TestWiring:
     tests/test_hooks/test_merge_gate_characterization.py (the `e2e_*` cases drive
     a real `gh pr merge` and assert the exit code); what remains here is only the
     property no exit code can show — that the REPORT and the ENFORCEMENT call the
-    same function, so the two can never disagree."""
+    same function.
+
+    Sharing the function does NOT make them unable to disagree, and an earlier
+    version of this docstring said it did. Severity lives in each CALLER (that is
+    what the advisory downgrade moved), so the two mappings can diverge while the
+    classifier stays shared. What keeps them agreeing is behavioural and lives in
+    the characterization file: `test_merge_arm_advisory_follows_the_flag_not_the_
+    message_text` and `test_check_pr_report_e2e_row_is_advisory_and_never_flips_
+    the_verdict`. MEASURED 2026-09-06 that without those two, re-adding the
+    report's failure increment, or re-deriving the merge arm's severity from the
+    message text under a different variable name, both left the suite green."""
 
     def test_report_and_enforcement_share_one_function(self):
         text = _GUARD.read_text()
         assert "e2e-plan       :" in text, "the report must carry the row"
         assert text.count("_check_e2e_plan(") >= 3, "def + merge arm + report row"
 
-    def test_both_arms_branch_on_the_returned_flag_not_the_message_text(self):
-        """Sharing the FUNCTION was never the invariant — sharing the PREDICATE is.
+    def test_no_arm_re_derives_severity_from_the_message_text(self):
+        """A belt to the behavioural brace, kept ONLY because it is free.
 
-        The advisory rewrite briefly had the merge arm discard the returned bool and
-        re-derive severity from `e2e_msg.startswith(("ok", "n/a"))` while the report
-        row used the bool. Both agreed that day, so every test passed; the coupling
-        was invisible and unlocked, and renaming a label to "declared (plan)" — or a
-        case change, since startswith is case-sensitive — would have made the merge
-        arm emit a NOTE on a PR the report calls ok. That is the report/enforcement
-        divergence wearing the shared-function invariant's clothes (architect
-        SHOULD-FIX, 2026-09-06)."""
+        The real lock is `test_merge_arm_advisory_follows_the_flag_not_the_message_
+        text` in the characterization file, which fails however the re-derivation is
+        spelled. This grep pins one historical spelling and nothing more: MEASURED
+        2026-09-06 that renaming the local to `e2e_text` and reinstating
+        `startswith(("ok", "n/a"))` left THIS assertion green while the forbidden
+        behaviour was fully back. A negative grep on an identifier locks a name, and
+        a name is the cheapest thing in a refactor to change — so do not let this
+        test's presence read as coverage.
+
+        Why the original divergence matters: the advisory rewrite briefly had the
+        merge arm discard the returned bool and re-derive severity from the message,
+        while the report row used the bool. Both agreed that day, so everything
+        passed — and any label change ("declared (plan)", or a case flip, since
+        startswith is case-sensitive) would have made the merge arm emit a NOTE on a
+        PR the report calls ok."""
         text = _GUARD.read_text()
         assert "e2e_msg.startswith" not in text, (
             "the merge arm must branch on the returned flag; re-deriving severity "

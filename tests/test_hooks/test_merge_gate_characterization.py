@@ -1117,6 +1117,112 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "has not reviewed the current head",
     ),
+    # The case above pins only the FIRST downstream gate. An early return placed
+    # after freshness would still bypass everything later while it stayed green.
+    #
+    # COUNT THE GATES FROM THE CODE, NOT FROM THIS COMMENT. As of 2026-09-06 the
+    # merge arm runs FIVE gates after the E2E advisory: Codex freshness
+    # (git_push_guard.py:6761), the TOCTOU head binding (:6785), the review-body
+    # scan (:6797), the inline scan (:6814), and the scheduled-Claude review
+    # (:6855). There is one case below for each.
+    #
+    # An earlier revision of this comment said "one case per remaining gate" while
+    # covering four of the five — the scheduled-review gate was unpinned, and a
+    # `return 0` before :6845 left the entire suite green with every required
+    # scheduled review unenforced for exactly this population. Three consecutive
+    # review rounds each added the gates the previous reviewer named and each
+    # stopped one short; what broke the run was enumerating the arm from the
+    # source instead of from the last finding. If you add a gate to that arm, add
+    # a case here and update the list above — the list is load-bearing.
+    #
+    # Each case leaves everything upstream of the gate under test clean, so that
+    # gate is the only thing that can produce the block.
+    (
+        "e2e_advisory_still_reaches_head_binding",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None),
+            pr_body="A body that never decided.\n",
+        ),
+        2,
+        "bound to the Codex-verified head",
+    ),
+    (
+        "e2e_advisory_still_reaches_review_body_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            router=_router(review_lines=_REVIEW_BODY_P1),
+        ),
+        2,
+        "review-body gate did not pass",
+    ),
+    (
+        "e2e_advisory_still_reaches_inline_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "inline review gate did not pass",
+    ),
+    (
+        "e2e_advisory_still_reaches_scheduled_review",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            scheduled="",
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # ── SAME CLASS, PRE-EXISTING MEMBERS: the `# ci-override` paths ────────────
+    # The E2E advisory is not the only "print a NOTE and continue" path in the
+    # merge arm — the CI gate has two, and their ids say `_continues` while
+    # nothing checked that anything continues: both asserted exit 0 with every
+    # downstream gate green, which is the shape this file's own comment above
+    # calls insufficient ("only an exit code proves what it DOES"). MEASURED
+    # 2026-09-06: a `return 0` after the CI-absent NOTE left 699 tests green.
+    # Covered here rather than filed, because "fix the class" means the
+    # population and not just the member this PR happened to touch — the whole
+    # point of the round that found it. One downstream gate each is enough to
+    # catch an early return; the per-gate enumeration above belongs to the path
+    # this PR actually changes.
+    (
+        "ci_absent_override_still_reaches_inline_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci="[]",
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "inline review gate did not pass",
+    ),
+    (
+        "ci_incomplete_override_still_reaches_inline_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci=json.dumps(
+                [
+                    {
+                        "name": "Analyze (python)",
+                        "workflowName": "CodeQL",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                    }
+                ]
+            ),
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "inline review gate did not pass",
+    ),
     (
         "pin_unchanged_allows_through_main",
         lambda mp: _run(
@@ -1164,6 +1270,30 @@ def test_merge_gate_aggregation(case_id, thunk, expected_rc, expected_msg, monke
     assert rc == expected_rc, f"{case_id}: expected exit {expected_rc}, got {rc}. stderr:\n{err}"
     if expected_msg:
         assert expected_msg in err, f"{case_id}: {expected_msg!r} not in stderr:\n{err}"
+
+
+def test_merge_arm_advisory_follows_the_flag_not_the_message_text(monkeypatch, capsys):
+    """The merge arm decides from the RETURNED FLAG, never from the message prose.
+
+    Behavioural lock. The equivalent assertion in test_e2e_plan_gate.py was a
+    negative grep for the literal `e2e_msg.startswith`, which pins a variable
+    SPELLING: MEASURED 2026-09-06 that renaming the local and reinstating the
+    re-derivation left that lock green while the forbidden behaviour was back.
+    A name is the cheapest thing in a refactor to change.
+
+    Here the classifier is made to return `declared` under a label that does NOT
+    start with "ok"/"n/a". Any arm that re-derives severity from the text emits
+    the undeclared NOTE on a PR the report calls declared — the exact
+    report/enforcement divergence — and this test fails however it is spelled."""
+    monkeypatch.setattr(_mod, "_check_e2e_plan", lambda *a, **k: (False, "declared (plan)"))
+    rc = _run(monkeypatch, _merge_cmd())
+    err = capsys.readouterr().err
+    assert rc == 0, f"a declared PR must not be blocked. stderr:\n{err}"
+    assert "no post-merge E2E decision" not in err, (
+        "the merge arm emitted the UNDECLARED advisory for a declaration the "
+        "classifier reported as present — it is reading the message text, not "
+        f"the returned flag. stderr:\n{err}"
+    )
 
 
 def test_findings_not_fetched_when_freshness_blocks(monkeypatch):
@@ -1292,6 +1422,36 @@ def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
     assert "BLOCK" in sched_line
     assert rc == 1
+
+
+def test_check_pr_report_e2e_row_is_advisory_and_never_flips_the_verdict(monkeypatch, capsys):
+    """The `e2e-plan` row reports, and NEVER counts toward the report's verdict.
+
+    Until this existed, the ONLY reference to `e2e-plan` anywhere in tests/ was a
+    source-string grep asserting the label appears in the file. MEASURED
+    2026-09-06: re-adding `failures += 1 if undeclared else 0` to the report arm —
+    the report blocking a PR the merge arm allows, which is precisely the
+    divergence the arm's own comment forbids — left the whole suite green.
+
+    Locks three things no grep can: the row is labelled `advisory`, the remedy
+    tail is rendered under it, and the verdict stays 0."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "A body that never decided.\n")
+    monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    e2e_line = next(ln for ln in out.splitlines() if ln.startswith("e2e-plan"))
+    assert "advisory" in e2e_line, e2e_line
+    assert "BLOCK" not in e2e_line, "an advisory row must not wear the blocking label"
+    assert "E2E: none —" in out, (
+        "the remedy tail must reach the operator — an advisory minus its remedy "
+        "is the strongest argument for ignoring it"
+    )
+    assert rc == 0, (
+        "an undeclared E2E flipped the report's verdict while the merge arm allows "
+        "it — report and enforcement disagreeing is the one thing this report rests "
+        "on not doing"
+    )
 
 
 def test_check_pr_report_ci_absent_fails_verdict_on_canonical(monkeypatch, capsys):

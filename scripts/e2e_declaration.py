@@ -97,10 +97,12 @@ _REFUSAL_WORDS = frozenset({"todo", "tbd", "pending", "n/a", "na", "yes", "no", 
 #: A reason/plan must carry real content — but the floor is deliberately LOW, and
 #: the placeholder/refusal checks above it do the real work. MEASURED (architect,
 #: 2026-09-06): at 12 this rejected `none — docs only` (8 alnum) — the exact string
-#: this module's own GUIDANCE prints as the remedy. On a gate with NO override
-#: sigil that is a closed loop: the author is blocked, types the suggested line
-#: verbatim, and is refused identically, with nothing in the message naming an
-#: undocumented length rule. A false BLOCK here is worse than a false pass, and
+#: this module's own GUIDANCE prints as the remedy. When this reader still GATED
+#: the merge, with no override sigil, that was a closed loop: the author was
+#: blocked, typed the suggested line verbatim, and was refused identically, with
+#: nothing in the message naming an undocumented length rule. A false refusal here
+#: is worse than a false pass — it was worse as a block, and it is still worse as
+#: an advisory, because a reader who is wrongly corrected stops reading. And
 #: `test_every_example_in_the_guidance_passes_the_parser` now makes the class
 #: unrepeatable: any example this module tells an author to write must survive it.
 #: 7 admits "docs only" and "prose-only"; "x", "ok" and "n/a" still fail.
@@ -270,8 +272,9 @@ def parse_e2e(body: str | None) -> dict:
       * ``none``    — an explicit, reasoned "no runtime surface" (the reason).
       * ``absent``  — no ``E2E:`` line at all.
       * ``invalid`` — a line exists but says nothing (empty, placeholder, a bare
-        ``none`` with no reason, a refusal word). Treated as absent by the gate,
-        but reported differently so the author is told WHICH mistake they made.
+        ``none`` with no reason, a refusal word). Classified as undeclared, the
+        same as absent, but reported differently so the author is told WHICH
+        mistake they made.
 
     CRLF is normalised first: GitHub's textarea stores bodies with `\\r\\n`, and a
     line-anchored `$` would otherwise never match a real line (the defect
@@ -330,8 +333,10 @@ def parse_e2e(body: str | None) -> dict:
         elif not saw_invalid_detail:
             # Name the ACTUAL rule. A terse-but-real plan ("manual", "smoke",
             # "run CI") fails only the length floor, and telling that author the
-            # line "has no real content" is a false diagnosis on a gate with no
-            # override — it sends them guessing (Kimi P3, 2026-09-06). Say which
+            # line "has no real content" is a false diagnosis that sends them
+            # guessing (Kimi P3, 2026-09-06). It mattered more when this reader
+            # gated the merge with no override; it still matters, because an
+            # advisory that misdiagnoses is one nobody reads twice. Say which
             # rule bit, and quote what they wrote back to them.
             shown = _strip_formatting(value)[:60]
             if sum(ch.isalnum() for ch in _strip_formatting(value)) < _MIN_SUBSTANCE:

@@ -4807,6 +4807,33 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
 #: together and fails the moment either moves.
 _E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
 
+# The remedy, for the degraded path where scripts/e2e_declaration.py could not be
+# loaded and its GUIDANCE is therefore unreachable. Deliberately short: the full
+# version lives in the module, and a second long copy here would be a replica to
+# drift. Both forms, because an author who can only copy the `none` line gets the
+# one answer that creates no obligation.
+_E2E_GUIDANCE_FALLBACK = (
+    "Add an E2E: line to the PR body — one of:\n"
+    "  E2E: <one-line plan for the post-merge verification>\n"
+    "  E2E: none — <reason there is no runtime surface to verify>"
+)
+
+
+def _e2e_undeclared(pr_num: str, detail: str, mod) -> tuple[bool, str]:
+    """Build an `undeclared` verdict that ALWAYS carries the remedy.
+
+    Structural, not a convention: the callers open with "Declaring one takes 10
+    seconds:" and then print this whole string, so a return that omits the forms
+    answers a colon-promise with a restatement of the problem. Three of the four
+    undeclared returns used to do exactly that while a docstring two functions up
+    claimed the tail was always GUIDANCE — the claim was true only of the path
+    someone happened to check (fresh-context audit, 2026-09-06). Routing every
+    return through here makes the property hold by construction; the docstring
+    now describes the code instead of hoping for it.
+    """
+    tail = mod.GUIDANCE if mod is not None else _E2E_GUIDANCE_FALLBACK
+    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{tail}"
+
 #: Last-resort matcher for the E2E declaration, used ONLY when
 #: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
 #: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
@@ -4898,9 +4925,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
         row is UNBUILT (issue #1718, half B), so in the interim this advisory is
         the only record. See the merge-arm comment.
       * AUDIENCE: the agent — and both callers print the WHOLE message, whose
-        tail is ``GUIDANCE`` (both valid forms plus copyable examples). Printing
-        only its first line silently drops the remedy; that is the failure this
-        line exists to prevent, not a claim about the string's contents.
+        tail is the remedy (both valid forms plus, when the parser loaded,
+        copyable examples). Printing only its first line silently drops that.
+        Every ``undeclared`` return is built by ``_e2e_undeclared``, which
+        appends the remedy, so this is a property of the code rather than a
+        claim about it — the earlier wording asserted the tail was always
+        GUIDANCE while three of the four returns omitted it.
       * BACKGROUND: none — background sessions cannot merge PRs by design.
 
     "Fail direction" now means which way an UNREADABLE input is REPORTED, since
@@ -4937,10 +4967,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
                 file=sys.stderr,
             )
         else:
-            return True, (
-                f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
-                f"pre-convention exemption cannot be established. Re-run; if it "
-                f"persists, the gh read is failing."
+            return _e2e_undeclared(
+                pr_num,
+                "could not read the PR's createdAt, so the pre-convention "
+                "exemption cannot be established. Re-run; if it persists, the "
+                "gh read is failing",
+                mod,
             )
     else:
         if mod is not None:
@@ -4952,10 +4984,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
 
     body = _pr_body_text(pr_num, repo)
     if body is None:
-        return True, (
-            f"E2E obligation: PR #{pr_num}'s body is unreadable, so the declaration "
-            f"cannot be confirmed. This gate guards every merge — an unread body is "
-            f"an unanswered question, not a pass."
+        return _e2e_undeclared(
+            pr_num,
+            "the PR body is unreadable, so the declaration cannot be confirmed. "
+            "Reported undeclared rather than assumed declared — an unread body is "
+            "an unanswered question, not a pass",
+            mod,
         )
 
     if mod is None:
@@ -4979,9 +5013,10 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
                 file=sys.stderr,
             )
             return False, "ok (degraded: parser unavailable)"
-        return True, (
-            f"E2E obligation: no E2E: line found in PR #{pr_num}'s body (parser "
-            f"unavailable, presence-only scan)."
+        return _e2e_undeclared(
+            pr_num,
+            "no E2E: line found in the body (parser unavailable, presence-only scan)",
+            mod,
         )
 
     result = mod.parse_e2e(body)
@@ -4996,7 +5031,7 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
         return False, f"ok ({label})"
 
     detail = result.get("detail") or "no E2E: line in the PR body"
-    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{mod.GUIDANCE}"
+    return _e2e_undeclared(pr_num, detail, mod)
 
 
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:

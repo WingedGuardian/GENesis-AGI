@@ -2054,9 +2054,10 @@ merge, the Pre-Merge Gate below governs unchanged.
 
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
-BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
-(mergeable → CI → base-invariant → Codex-freshness → scheduled-Claude-review →
-review-body → inline findings), so the report and the gate can never disagree —
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses, in the gate's own order
+(mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
+Codex-freshness → head-binding → review-body → inline findings →
+scheduled-Claude-review), so the two read the same state —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
 before any merge** — never hand-roll a

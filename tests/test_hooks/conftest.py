@@ -34,10 +34,20 @@ def _hermetic_e2e_declaration(monkeypatch):
     LIVE call: green on a dev box with gh authenticated and PR "1" answering, red in
     CI, and in both cases testing the network rather than the thing under test.
 
-    Since 2026-09-06 the reader is advisory, so what this prevents is NOTE noise on
-    unrelated tests, not a false block — nothing here can fail a merge. It is still
-    the hermetic default rather than a waiver: the reader's own behaviour (every
-    classification, both report directions, the cutoff, the degraded path) is
+    Since 2026-09-06 the E2E reader is advisory, so ITS verdict cannot fail a merge
+    and what this prevents for that gate is NOTE noise, not a false block.
+
+    But do not read that as "nothing here can fail a merge" — an earlier version of
+    this docstring said exactly that and it is FALSE. ``_TEST_GH_PR_BODY`` is a
+    SHARED seam: ``_check_pin_receipts`` reads the same body via ``_pr_body_text``
+    and DOES block. MEASURED 2026-09-06 — feeding it this fixture's body with a
+    forward pin returns blocked=True ("CC pin moves FORWARD … but the PR body is
+    missing 2 required gate receipt(s)"). So changing or deleting the default here
+    silently changes what every pin-gate test in this directory is fed; edit it only
+    with those tests in view.
+
+    Still the hermetic default rather than a waiver: the E2E reader's own behaviour
+    (every classification, both report directions, the cutoff, the degraded path) is
     exercised in tests/test_hooks/test_e2e_plan_gate.py, which overrides these per
     case; a later ``monkeypatch.setenv`` in any test wins over this one."""
     monkeypatch.setenv("_TEST_GH_PR_BODY", "E2E: none — hermetic default for hook tests\n")

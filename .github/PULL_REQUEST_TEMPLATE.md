@@ -36,6 +36,10 @@ Closes #
      declaring here pre-fills that row with what YOU know instead of leaving a
      validator to reverse-engineer it from the diff days later. (This guidance
      lives inside a comment on purpose: comments are stripped before the line is
-     read, so the template can never fill itself in.) -->
+     read, so the template can never fill itself in.)
 
-E2E:
+     The marker is NOT pre-printed below. A bare `E2E:` parses as *present but
+     empty*, which is reported as undeclared — so shipping one in the template
+     would fire the advisory, with its full remedy block, on every PR whose
+     author simply left the template alone. An advisory that fires on everything
+     is one nobody reads. Type the whole line, or type nothing. -->
