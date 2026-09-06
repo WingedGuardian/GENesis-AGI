@@ -6,8 +6,11 @@ from __future__ import annotations
 import json
 
 from genesis.session_awareness.ledger_extractor import (
+    ASSISTANT_SNIPPET_CHARS,
     MAX_AGREEMENTS,
+    MAX_DELTA_CHARS,
     MAX_LEDGER_TEXT_CHARS,
+    USER_TURN_CHARS,
     build_prompt,
     content_hash,
     match_proposals,
@@ -60,22 +63,62 @@ def test_build_prompt_sanitizes_boundary_markers():
 
 
 def test_build_prompt_drops_oldest_on_overflow():
-    turns = [_turn(f"turn {i} " + "x" * 1400, ref=f"u-{i}") for i in range(30)]
+    # Sized FROM the budget so the fixture cannot stop overflowing when the
+    # per-turn caps are tuned — which is exactly what happened when the
+    # user/assistant split was inverted and this test quietly stopped
+    # exercising overflow at all.
+    per_turn = USER_TURN_CHARS + ASSISTANT_SNIPPET_CHARS
+    n_turns = (MAX_DELTA_CHARS // per_turn) + 5
+    turns = [
+        _turn(
+            f"turn {i} " + "x" * USER_TURN_CHARS,
+            snippet="z" * ASSISTANT_SNIPPET_CHARS,
+            ref=f"u-{i}",
+        )
+        for i in range(n_turns)
+    ]
     prompt, included, truncated = build_prompt(turns)
     assert truncated is True
-    assert 0 < len(included) < 30
+    assert 0 < len(included) < n_turns
     # newest survive, oldest dropped
-    assert included[-1]["turn_ref"] == "u-29"
+    assert included[-1]["turn_ref"] == f"u-{n_turns - 1}"
     assert included[0]["turn_ref"] != "u-0"
-    # numbering matches included order (quote/turn resolution contract)
-    assert f"1. USER: {included[0]['user_text']}" in prompt
+    # Numbering matches included order — the contract quote/turn resolution
+    # depends on. Asserted without assuming which line opens the block: a turn
+    # WITH an assistant snippet is rendered "ASSISTANT (preceding): ...\nUSER:
+    # ...", so pinning "1. USER:" silently stopped testing the numbering the
+    # moment snippets entered the fixture.
+    assert prompt.count("\n1. ") == 1
+    assert included[0]["user_text"] in prompt
+    assert f"\n{len(included)}. " in prompt
 
 
 def test_build_prompt_caps_turn_text():
+    """Caps are applied, asserted against the constants rather than literals."""
     prompt, included, _ = build_prompt([_turn("y" * 9000, snippet="z" * 9000)])
     assert len(included) == 1
-    assert len(included[0]["user_text"]) == 1500
-    assert len(included[0]["assistant_snippet"]) == 500
+    assert len(included[0]["user_text"]) == USER_TURN_CHARS
+    assert len(included[0]["assistant_snippet"]) == ASSISTANT_SNIPPET_CHARS
+
+
+def test_the_assistant_gets_the_larger_share_of_each_turn():
+    """The direction of the split, pinned with its reason.
+
+    A work item's SUBJECT lives in the assistant's proposal; the user's turn
+    frequently carries only the assent that ratifies it. The budget was
+    1500/500 the other way for the whole of v1, which asked the model to write
+    a work item from the half of the exchange that does not contain one — and
+    when it could not, it paraphrased the assent. Measured on the recorded
+    shadow corpus: 23% of would-be-promoted rows were re-extractions of one
+    standing process directive.
+
+    Asserted as an inequality, not as two numbers, so the values can be tuned
+    without silently inverting the intent.
+    """
+    assert ASSISTANT_SNIPPET_CHARS > USER_TURN_CHARS, (
+        "the assistant snippet is the content source and must not be the "
+        "smaller budget"
+    )
 
 
 # ── parse_verdict (fail-closed matrix) ───────────────────────────────────
