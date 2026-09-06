@@ -14,6 +14,7 @@ from genesis.learning.events import LEARNING_EVENTS
 from genesis.learning.harvesting.debrief import parse_debrief
 from genesis.learning.observation_writer import ObservationWriter
 from genesis.learning.procedural.extractor import extract_procedure
+from genesis.learning.response_context import fenced
 from genesis.learning.triage.classifier import TriageClassifier
 from genesis.learning.triage.prefilter import should_skip
 from genesis.learning.triage.summarizer import build_summary
@@ -239,7 +240,29 @@ def build_triage_pipeline(
         ):
             try:
                 logger.debug("Running deprecated procedure extraction (legacy 500-char path)")
-                summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
+                # Both fields are untrusted, and this prompt's output becomes a
+                # STORED PROCEDURE that later sessions recall and follow — so an
+                # injection here PERSISTS, where the same trick against a grader
+                # skews one verdict. That makes it the highest-consequence
+                # instance of the class the grader prompts already closed, and it
+                # gets the SAME helper rather than a second mechanism: a
+                # per-payload delimiter proven absent from the payload it fences.
+                # Before this it was a bare f-string, so a response carrying
+                # `RESPONSE>>>` ended the region early and its own `## Outcome`
+                # heading landed where `_PROMPT_TEMPLATE`'s real one goes.
+                #
+                # The `[:500]` slice is PRE-EXISTING and deliberately left alone
+                # here: it is a silent truncation with no marker (the defect this
+                # PR fixed for the graders), but changing it would alter what this
+                # legacy path feeds the extractor, which is a separate decision.
+                # Fenced at the sliced value, so the delimiter is proven absent
+                # from the text actually emitted rather than from its longer source.
+                summary_text = "\n".join(
+                    [
+                        *fenced("Request", summary.user_text),
+                        *fenced("Response", summary.response_text[:500]),
+                    ]
+                )
                 await extract_procedure(
                     db,
                     summary_text=summary_text,
