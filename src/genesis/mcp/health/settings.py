@@ -95,8 +95,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "Ambient session-ledger extractor (session-manager PR-3) — "
             "master `enabled` + `mode` off/shadow/live. Shadow logs "
-            "proposals only (live session_ledger never written); `live` is "
-            "reserved and coerced to shadow until the data-gated flip PR. "
+            "proposals only; `live` also promotes the qualifying ones "
+            "into the real ledger as added_by='ambient_ledger_extractor'. "
+            "Live requires BOTH mode=live and live_opt_in=true (renewed "
+            "opt-in — legacy overlays persisted `live` while it was "
+            "reserved). An invalid mode degrades to shadow, never to live. "
             "Read at worker startup — takes effect next compaction."
         ),
         config_filename="session_ledger_shadow.yaml",
@@ -318,6 +321,26 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Read live each hourly tick — no restart."
         ),
         config_filename="follow_up_watchdog.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "context_injection_watch": SettingsDomain(
+        name="context_injection_watch",
+        description=(
+            "Context-injection watcher (awareness hourly band) — master `enabled` + "
+            "`lookback_hours` / `max_listed` / `alert_priority`. Watches the GROUND "
+            "TRUTH of the silent-context-loss class: a hook-stdout file the Claude "
+            "Code harness persisted instead of injecting (the session then ran "
+            "without that hook's content, invisibly). Scoped to this install's "
+            "checkouts and attributed per producer, so another hook's filing is "
+            "reported too, with its own remedy. One deduped, self-resolving "
+            "infrastructure_alert; "
+            "default priority critical (~5-min Telegram path — this class ran "
+            "unnoticed for a month). Read-and-alert only. off (or env "
+            "GENESIS_CONTEXT_INJECTION_WATCH_DISABLED=1) silences it. Read live each "
+            "hourly tick — no restart."
+        ),
+        config_filename="context_injection_watch.yaml",
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
     ),
@@ -1228,11 +1251,11 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
 
     errors: list[str] = []
     for key, value in changes.items():
-        if key not in ("enabled", "mode"):
-            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
-        elif key == "enabled":
+        if key not in ("enabled", "mode", "live_opt_in"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode, live_opt_in")
+        elif key in ("enabled", "live_opt_in"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif value not in MODES:
             errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
@@ -1709,6 +1732,33 @@ def _validate_follow_up_watchdog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_context_injection_watch(changes: dict) -> list[str]:
+    """Validate context-injection watcher lever changes (see
+    genesis.awareness.context_injection_watch_config)."""
+    from genesis.awareness.context_injection_watch_config import (
+        _VALID_ALERT_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_provider_outage_notify(changes: dict) -> list[str]:
     """Validate dead-provider notify lever changes (see
     genesis.awareness.provider_notify_config)."""
@@ -1730,6 +1780,7 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
+    "context_injection_watch": _validate_context_injection_watch,
     "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,

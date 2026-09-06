@@ -18,6 +18,16 @@ import aiosqlite
 # pulses.
 _HEARTBEAT_FUTURE_CORRUPT_DAYS = 1
 
+# The Errors dashboard groups events by the first N characters of the message
+# (the SUBSTR in ``query_grouped_errors``), and that prefix feeds the
+# PERSISTENT resolution key (dashboard/routes/errors.py) — so an emitter whose
+# message varies per occurrence must keep its first N characters stable, or
+# one recurring problem splits into many groups and a manually resolved group
+# resurrects under a new key. Emitters that need a variable diagnostic tail
+# pad their stable head to this width (see the router's exhaustion message);
+# import THIS constant rather than restating the number.
+MSG_GROUP_PREFIX_LEN = 80
+
 
 def _safe_details_json(details: dict | None) -> str | None:
     """Serialize event details to JSON, degrading gracefully (OBS-002).
@@ -167,6 +177,11 @@ async def prune(
     keep_latest_per_subsystem: bool = False,
 ) -> int:
     """Delete events older than the given ISO timestamp. Returns count deleted.
+
+    *older_than* is an ISO cutoff, NOT a day count. The DELETE compares it
+    lexically, which is chronological ONLY because every ``events.timestamp`` is
+    written as a UTC isoformat string — a row in another format or a local
+    offset would sort wrongly and be pruned (or spared) silently.
 
     If *event_type* is provided, only events of that type are pruned.
 
@@ -420,7 +435,7 @@ async def query_grouped_errors(
     db.row_factory = aiosqlite.Row
     rows = await db.execute_fetchall(
         f"""SELECT subsystem, event_type,
-                   SUBSTR(message, 1, 80) AS msg_prefix,
+                   SUBSTR(message, 1, {MSG_GROUP_PREFIX_LEN}) AS msg_prefix,
                    -- Rank by SEVERITY, not alphabetically. The vocabulary is
                    -- lowercase (Severity StrEnum), so a plain MAX() orders
                    -- warning > info > error > debug > critical -- i.e. critical
