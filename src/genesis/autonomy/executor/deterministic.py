@@ -108,24 +108,26 @@ def validate_command(command: str) -> str | None:
 async def _read_limited(
     stream: asyncio.StreamReader,
     limit: int = _MAX_STREAM_BYTES,
-) -> bytes:
-    """Read up to *limit* bytes from *stream*, discarding the rest."""
+) -> tuple[bytes, int]:
+    """Retain up to *limit* bytes while counting and draining the full stream."""
     chunks: list[bytes] = []
-    total = 0
+    retained_size = 0
+    total_size = 0
     while True:
         chunk = await stream.read(8192)
         if not chunk:
             break
-        remaining = limit - total
+        total_size += len(chunk)
+        remaining = limit - retained_size
         if remaining <= 0:
             continue
         if len(chunk) > remaining:
             chunks.append(chunk[:remaining])
-            total = limit
+            retained_size = limit
         else:
             chunks.append(chunk)
-            total += len(chunk)
-    return b"".join(chunks)
+            retained_size += len(chunk)
+    return b"".join(chunks), total_size
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +223,14 @@ async def execute_deterministic_step(
         # Hard timeout prevents a hung subprocess from blocking the
         # executor semaphore indefinitely.
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                asyncio.gather(
-                    _read_limited(proc.stdout),
-                    _read_limited(proc.stderr),
-                ),
-                timeout=_HARD_TIMEOUT_S,
+            (stdout_bytes, stdout_total), (stderr_bytes, stderr_total) = (
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        _read_limited(proc.stdout),
+                        _read_limited(proc.stderr),
+                    ),
+                    timeout=_HARD_TIMEOUT_S,
+                )
             )
             await proc.wait()
         except asyncio.CancelledError:
@@ -275,9 +279,9 @@ async def execute_deterministic_step(
     # Cap stored output for result_json
     max_output = 50_000
     if len(stdout) > max_output:
-        stdout = stdout[:max_output] + f"\n... (truncated, {len(stdout_bytes)} bytes total)"
+        stdout = stdout[:max_output] + f"\n... (truncated, {stdout_total} bytes total)"
     if len(stderr) > max_output:
-        stderr = stderr[:max_output] + f"\n... (truncated, {len(stderr_bytes)} bytes total)"
+        stderr = stderr[:max_output] + f"\n... (truncated, {stderr_total} bytes total)"
 
     result_text = ""
     if stdout:
