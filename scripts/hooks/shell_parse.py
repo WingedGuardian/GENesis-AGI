@@ -906,21 +906,29 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str]) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Handles a bare ``-c`` (script is the next token), a combined short bundle
-    where ``c`` is last (``-lc 'script'`` → next token), and an inline value
-    (``-c'script'`` → the rest of the token after ``c``).
+    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
+    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
+    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
+
+    An earlier version read a bundle whose ``c`` was not last as an INLINE value
+    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
+    parser then reported a segment whose executable was ``e``, and a guard keyed
+    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
+
+    MEASURED 2026-09-06 against the real interpreters, both directions:
+    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
+    token, while the glued spelling that branch modelled is refused outright —
+    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
+    So the branch modelled a form none of these shells accepts and dropped one
+    they all do, and deleting it is strictly a widening.
     """
     for i, tok in enumerate(argv[1:], 1):
         if not tok.startswith("-") or tok.startswith("--"):
             continue
-        pos = tok.find("c")
-        if pos <= 0:
+        if "c" not in tok[1:]:
             continue
-        if pos == len(tok) - 1:  # 'c' is the last flag in the bundle
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        else:  # inline script glued after the 'c'
-            return tok[pos + 1 :]
+        if i + 1 < len(argv):
+            return argv[i + 1]
     return ""
 
 

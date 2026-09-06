@@ -659,17 +659,15 @@ class TestPipEditableArm:
         covered it; review reported it alongside two genuine regressions, and
         restating it as one would have been wrong.
 
-        Asserted as CURRENT behaviour so the gap is visible rather than implicit.
-        The delegation follow-up is what closes it — if this test starts failing,
-        the gap was closed and this test should be deleted, not repaired.
+        The FLAG-TOKEN fix below is what closed it — see
+        TestEditableFlagIsAToken. Kept as a positive control there.
         """
-        assert _run(f"pip install -qe {_WT}").returncode == 0
+        assert _run(f"pip install -qe {_WT}").returncode == 2
 
     @pytest.mark.parametrize(
         "cmd",
         [
             f"pip install ruff && ls {_WT} && grep {_E} foo /dev/null",
-            f"pip install requests --extra-index-url https://example.invalid/s && ls {_WT}",
             f"grep -rn 'pip install {_E}' {_WT}",
             f"echo 'never pip install {_E} from a worktree' >> {_WT}/notes.md",
             f"git commit -m 'docs: explain pip install {_E} risk in {_WT}'",
@@ -678,14 +676,19 @@ class TestPipEditableArm:
     def test_a_mere_mention_is_blocked_and_that_is_intended(self, cmd):
         """THE ACCEPTED FRICTION, pinned so it reads as a choice, not a bug.
 
-        None of these installs anything: an unrelated `-e` from grep, the `-e`
-        inside `--extra-index-url`, the phrase as a search pattern, as prose, and
-        in a commit message. All are refused. MEASURED at 12/6000 real commands.
+        None of these installs anything: an unrelated `-e` belonging to grep, the
+        phrase as a search pattern, as prose, and in a commit message. All are
+        refused, because deciding WHICH command a real `-e` token belongs to is
+        the command-position question this arm cannot answer (see the hook).
 
         This is the cost side of the trade and it is deliberately paid. Anyone
         reading a block on one of these should route around it (see the hook's
         comment), not sharpen the predicate — that path was taken once and
         produced the bypasses pinned above.
+
+        `--extra-index-url` USED to be in this list. It is not friction of this
+        kind: no `-e` TOKEN exists in it at all, so no command could own one.
+        It moved to TestEditableFlagIsAToken.
         """
         r = _run(cmd)
         assert r.returncode == 2, r.stdout + r.stderr
@@ -697,6 +700,134 @@ class TestPipEditableArm:
         mistaken for a regression test."""
         r = _run(f"pip download {_E} {_WT}")
         assert r.returncode == 0, r.stderr
+
+
+class TestEditableFlagIsAToken:
+    """Two DIFFERENT axes get confused here, and only one of them is an open set.
+
+    COMMAND POSITION — "is `pip install` the command, or is it text?" — needs
+    shell grammar, which this arm has no tokenizer for. That axis was anchored
+    once, fell open on leading redirections and the `command`/`env` wrappers, and
+    was reverted. It stays reverted; the pins above are what keep it that way.
+
+    FLAG TOKEN — "is there a `-e` OPTION here at all?" — needs no grammar. It is
+    a claim about one whitespace-delimited word, decidable from the word alone.
+    The old predicate did not make that claim: `-e` was an unanchored SUBSTRING,
+    so every long option whose name begins with `e` supplied one
+    (`--extra-index-url`, `--exclude-files`, `--exists-action`), as did any
+    package name with an `-e...` inside it (`pytest-env`). Because the block
+    below also fires when the cwd is a worktree, an ORDINARY pip command run from
+    ANY worktree was hard blocked — MEASURED twice in one session, and a block
+    discards the whole Bash call.
+
+    The same substring blindness ran the other way: `-qe` and `-ve` are real
+    editable installs (VERIFIED against pip's own parser, 2026-09-06: `-qe X`,
+    `-ve X`, `-eX`, `--editable=X` all reach the editable code path) and none
+    contains a literal `-e`, so the arm never saw them.
+
+    Both directions, because a predicate that fires on nothing and a predicate
+    that fires on everything each pass a one-directional suite.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # A long option whose NAME begins with e — no `-e` token anywhere.
+            f"pip install -q detect-secrets --exclude-files x && ls {_WT}",
+            f"pip install requests --extra-index-url https://example.invalid/s && ls {_WT}",
+            f"pip install requests --exists-action w && ls {_WT}",
+            # A package name carrying `-e` inside it.
+            f"pip install pytest-env && ls {_WT}",
+        ],
+    )
+    def test_a_long_option_or_package_name_is_not_the_editable_flag(self, cmd):
+        """FALSE-POSITIVE PIN. Each names a worktree, so the second condition is
+        satisfied and the decision really is reached — without that these would
+        pass against any version and pin nothing."""
+        r = _run(cmd)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    def test_an_ordinary_pip_command_run_from_a_worktree_is_not_blocked(self, tmp_path):
+        """THE REPORTED DEFECT, end to end: no worktree is NAMED, but the cwd IS
+        one, so the cwd branch supplies the second condition and an ordinary
+        install was hard blocked from every worktree."""
+        main = tmp_path / "main"
+        main.mkdir()
+        subprocess.run(["git", "init", "-q", str(main)], check=True)
+        subprocess.run(
+            ["git", "-C", str(main), "commit", "-q", "--allow-empty", "-m", "init"],
+            check=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@e",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@e",
+            },
+        )
+        wt = tmp_path / "wt"
+        subprocess.run(
+            ["git", "-C", str(main), "worktree", "add", "-q", "-b", "x", str(wt)],
+            check=True,
+        )
+        assert _run("pip install -q detect-secrets --exclude-files x", cwd=str(wt)).returncode == 0
+        # TRUE-POSITIVE CONTROL from the same cwd — the arm is not simply inert.
+        assert _run("pip install -e .", cwd=str(wt)).returncode == 2
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"pip install {_E} {_WT}",
+            f"pip install -qe {_WT}",
+            f"pip install -ve {_WT}",
+            f"pip install {_E}{_WT}",
+            f"pip install --editable {_WT}",
+            f"pip install --editable={_WT}",
+            f"pip install foo {_WT} {_E}",
+            f"pip install '{_E}' {_WT}",
+        ],
+    )
+    def test_every_spelling_pip_accepts_still_blocks(self, cmd):
+        """TRUE-POSITIVE CONTROL, one per clause of the predicate: bare, bundled
+        (two letters and a different second letter), glued value, long form, long
+        form with `=`, the flag at end of line, and a quoted flag."""
+        r = _run(cmd)
+        assert r.returncode == 2, r.stdout + r.stderr
+
+    @pytest.mark.parametrize("abbrev", ["--ed", "--edi", "--edit", "--editab"])
+    def test_an_abbreviated_long_flag_still_blocks(self, abbrev):
+        """The half of the token claim that is easiest to get wrong, because
+        spelling out the flag LOOKS like the careful thing to do.
+
+        optparse binds any UNAMBIGUOUS abbreviation, so pip really installs from
+        `--ed`. MEASURED against pip's own parser, 2026-09-06: each of these
+        reaches "not a valid editable requirement" — i.e. the editable code path
+        — while `--e` is refused as ambiguous. The old SUBSTRING caught them all
+        by accident (`--edit` contains a literal `-e`), so matching only the full
+        spelling would have narrowed a hard block while looking like a
+        tightening. `--editable` is pip install's only `--ed…` option, so the
+        prefix cannot collide.
+        """
+        assert _run(f"pip install {abbrev} {_WT}").returncode == 2, abbrev
+        assert _run(f"pip install {abbrev}={_WT}").returncode == 2, abbrev
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"2>/dev/null pip install {_E} {_WT}",
+            f"command pip install {_E} {_WT}",
+            f"env pip install {_E} {_WT}",
+            f"if true; then pip install {_E} {_WT}; fi",
+            f"(pip install {_E} {_WT})",
+        ],
+    )
+    def test_the_command_position_axis_is_untouched(self, cmd):
+        """CROSS-AXIS CONTROL. These are the shapes the command-position
+        anchoring lost. A flag-token claim says nothing about where the command
+        starts, so every one of them must still block — if one of these ever goes
+        green-by-allowing, the two axes have been confused again."""
+        r = _run(cmd)
+        assert r.returncode == 2, r.stdout + r.stderr
 
 
 class TestWorktreeForceRemovalArm:
@@ -720,6 +851,47 @@ class TestWorktreeForceRemovalArm:
     def test_force_removal_still_blocks(self, cmd):
         """TRUE-POSITIVE CONTROL — the reason the arm exists."""
         assert _run(cmd).returncode == 2
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git worktree remove -f\t/tmp/wt",
+            "git worktree remove\t-f\t/tmp/wt",
+            "git worktree remove /tmp/wt -f",
+        ],
+    )
+    def test_a_blank_that_is_not_a_space_is_still_a_blank(self, cmd):
+        """The `-f` alternative used to be the two characters `-f` followed by a
+        LITERAL SPACE, so the shell's other word separators did not end the flag:
+        a tab between `-f` and its operand, or `-f` as the last word on the line,
+        both ran a forced removal and were allowed. VERIFIED: bash splits on
+        IFS (space, tab, newline), and a trailing flag needs no separator at all.
+
+        This is a closed-set token claim — `-f` delimited by any blank or by end
+        of line — and it makes no claim about where the command starts, so it
+        cannot reintroduce the command-position bypasses this arm was reverted
+        over (see test_the_shapes_the_anchored_predicate_let_through_still_block).
+        """
+        assert _run(cmd).returncode == 2, cmd
+
+    @pytest.mark.parametrize("abbrev", ["--f", "--fo", "--forc"])
+    def test_an_abbreviated_force_flag_still_blocks(self, abbrev):
+        """The twin of the pip abbreviation pin, and the reason the leading blank
+        could not be added on its own.
+
+        git's parse-options binds any unambiguous abbreviation. MEASURED on a
+        scratch repo, 2026-09-06: `--f`, `--fo` and `--forc` each returned 0 and
+        the worktree was really gone, while `--foo` was refused as an unknown
+        option. `git worktree remove -h` lists `-f, --[no-]force` as its only
+        option, so the prefix cannot collide. The old `-f ` matched these by
+        accident (`--f ` contains `-f `), so anchoring the short flag at a blank
+        without this clause would have dropped a real forced removal.
+        """
+        assert _run(f"git worktree remove {abbrev} /tmp/wt").returncode == 2, abbrev
+
+    def test_a_path_that_merely_ends_in_dash_f_is_not_the_flag(self):
+        """The other direction of the leading anchor — the FP it buys."""
+        assert _run("git worktree remove /tmp/wt-f").returncode == 0
 
     @pytest.mark.parametrize(
         "cmd",

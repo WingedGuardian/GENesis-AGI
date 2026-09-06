@@ -445,6 +445,46 @@ class TestMentionIsNotExecution:
         assert result.returncode == 2, result.stdout + result.stderr
 
 
+class TestTheUntokenizableFallbackIsAlsoFailClosed:
+    """When shlex cannot read the command the guard drops to the coarse
+    extractor, and that extractor carried the SAME adjacency assumption the
+    parsed route had already been fixed for: it required `git` immediately
+    followed by the subcommand, so `git -C <dir> <sub> <op> <target>` inside an
+    untokenizable command produced no target and fell OPEN.
+
+    The fix DELETES the assumption rather than modelling git's option grammar in
+    the fallback: knowing which global options take a value is exactly the
+    open-set claim this branch refuses to make in a regex. Anchoring only on the
+    subcommand and the operation can over-match, never under-match, and this
+    branch is reached only for text nothing can parse — where over-blocking is
+    the declared correct side.
+    """
+
+    # An unbalanced quote inside $'...' — shlex raises, bash runs it fine.
+    _UNPARSEABLE = "; echo $'a\\'b)c'"
+
+    def test_a_removal_behind_a_global_option_blocks(self, guard_cmd: str) -> None:
+        inner = f"git -C /srv/genesis {_SUB} {_OP} /tmp/some-worktree{self._UNPARSEABLE}"
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    def test_the_adjacent_spelling_that_already_blocked_still_blocks(self, guard_cmd: str) -> None:
+        """TWIN — the clause above is a widening, so pin the case it widens FROM.
+        A fix that replaced the pattern instead of relaxing it would satisfy the
+        first test and silently drop this one."""
+        inner = f"{_PHRASE} /tmp/some-worktree{self._UNPARSEABLE}"
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    def test_a_parseable_mention_is_unaffected(self, guard_cmd: str) -> None:
+        """TRUE-NEGATIVE CONTROL. The widened pattern is consulted on the parsed
+        route too (it gates the carrier fallback), so a mention in a command that
+        parses cleanly must still be allowed — otherwise the widening has
+        quietly reverted the branch."""
+        result = _run_guard(guard_cmd, {"command": f"grep -rn '{_SUB} {_OP}' scripts/"})
+        assert result.returncode == 0, result.stderr
+
+
 class TestCommandCarriersAreNotAHole:
     """A parser is NARROWER than the regex it replaced along an axis the
     migration never named: executables that carry a command STRING.
@@ -501,6 +541,106 @@ class TestCommandCarriersAreNotAHole:
         """
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"rg '{_SUB} {_OP}' -l | xargs wc -l",
+            f"find . -name '*.sh' -exec grep -l '{_SUB} {_OP}' {{}} +",
+            f'echo "$(find . -name x) mentions {_SUB} {_OP} here"',
+            f"ssh box 'ls' && echo 'the {_SUB} {_OP} doc'",
+            f"docker ps && echo '{_SUB} {_OP} runbook step'",
+        ],
+    )
+    def test_a_mention_that_HAS_a_carrier_is_still_allowed(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """The cases the class above could not see, and the reason they exist.
+
+        Every mention case above is carrier-FREE, so none of them can detect a
+        change to the carrier gate — they were green on both sides of one. These
+        are mention + carrier: two read-only searches and three lines of prose
+        that happen to sit next to `rg`/`find`/`ssh`/`docker`. MEASURED: all five
+        blocked when the phrase pattern was widened without a separate `git`
+        conjunct, and the coarse extractor then INVENTED the target from the
+        following word ("Cannot remove worktree 'runbook'").
+
+        What separates them from the carried removals above is that a removal
+        names the executable it is about to run. That is the conjunct, and this
+        is the half of it that no true-positive test can pin.
+        """
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_carried_removal_behind_a_global_flag_blocks(self, guard_cmd: str) -> None:
+        """TRUE-POSITIVE TWIN of the conjunct above — a carried removal keeps its
+        `git` token, including the `git -C <dir>` spelling the phrase pattern was
+        widened to reach in the first place. MEASURED allow before this branch."""
+        inner = f'ssh box "git -C /x {_SUB} {_OP} /tmp/wt"'
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"/usr/bin/find /tmp -name 'wt-*' -exec {_PHRASE} {{}} \\;",
+            f"/usr/bin/eval '{_PHRASE} /tmp/wt-x'",
+            f'/usr/bin/ssh box "{_PHRASE} /tmp/wt-x"',
+        ],
+    )
+    def test_a_carrier_named_by_its_path_is_still_a_carrier(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """REGRESSION PIN vs origin/main, which blocked all three.
+
+        The carrier test was a regex over the RAW text requiring the name to
+        follow the start of the string or one of a few separators, so `/` did not
+        end the preceding word and a path-qualified carrier matched nothing. The
+        parser has already resolved and BASENAMED the executable by this point
+        (`/usr/bin/find` -> `find`), so asking IT closes the whole list at once
+        rather than one name per review round — and no new name has to be
+        guessed, which is the property that makes it a class fix.
+        """
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"bash -ce '{_PHRASE} /tmp/wt-x'",
+            f"bash -cx '{_PHRASE} /tmp/wt-x'",
+            f"sh -ce '{_PHRASE} /tmp/wt-x'",
+        ],
+    )
+    def test_a_shell_bundle_whose_c_is_not_last_still_blocks(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """REGRESSION PIN vs origin/main, which blocked all three.
+
+        The parser treated a bundle whose `c` was not the final letter as an
+        INLINE script — `-ce` yielded the script "e" — so the real script was
+        never recursed into and the removal was allowed. MEASURED against the
+        real interpreters, 2026-09-06: `bash -ce '<cmd>'` and `bash -cx '<cmd>'`
+        RUN <cmd> from the NEXT token, while the glued spelling the old branch
+        modelled (`bash -c'<cmd>'`, `sh -c'<cmd>'`, `dash -c'<cmd>'`) is refused
+        outright with "invalid option" / "Illegal option". The branch modelled a
+        form that does not exist and lost one that does.
+        """
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [f"bash -c '{_PHRASE} /tmp/wt-x'", f"bash -lc '{_PHRASE} /tmp/wt-x'"],
+    )
+    def test_the_bundle_spellings_that_already_worked_still_work(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """TWIN of the clause above — `c` alone and `c` last in the bundle both
+        took the next token before and must still. A fix that moved the whole
+        branch could satisfy the pin above while breaking these."""
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
 
     def test_a_target_arriving_on_stdin_is_a_known_gap_in_every_version(
         self, guard_cmd: str

@@ -81,29 +81,80 @@ fi
 # pip install -e from/to worktree — catches both explicit worktree paths AND
 # "pip install -e ." run from inside a worktree directory.
 #
-# DELIBERATELY OVER-MATCHING — do not "fix" this into an anchored predicate.
-# An earlier revision of this PR keyed it on command position so the phrase could
-# not match inside a heredoc, a grep pattern or a commit message. Cross-model
-# review found three fail-OPEN bypasses in that version, and replaying the same
-# shapes against the sibling arm found five more: a leading redirection
-# (`2>/dev/null <cmd>`), a bundled short flag (`-qe`), and the `command` / `env`
-# wrappers all slipped past the anchor while the substring form caught each one.
+# DELIBERATELY OVER-MATCHING ON COMMAND POSITION — do not "fix" that. An earlier
+# revision of this PR keyed the arm on command position so the phrase could not
+# match inside a heredoc, a grep pattern or a commit message. Cross-model review
+# found fail-OPEN bypasses in that version — a leading redirection
+# (`2>/dev/null <cmd>`) and the `command` / `env` wrappers — that the crude form
+# caught. The reason is structural, not a bug to patch: this arm runs SHELL-side
+# in the global user-level hook with no access to the canonical tokenizer
+# (scripts/hooks/shell_parse.py), so anchoring the COMMAND means modelling shell
+# grammar with a regex. That is an open set, and the review loop finds one member
+# of it per round without converging. Over-blocking there is friction;
+# under-blocking risks the editable-install spiral that OOM-crashed this
+# container on 2026-03-16, so friction is the correct side to err on.
 #
-# The reason is structural, not a bug to patch. This arm runs SHELL-side in the
-# global user-level hook, with no access to the canonical tokenizer
-# (scripts/hooks/shell_parse.py), so it is modelling shell grammar with a regex.
-# That is an open set: every named bypass is one member of it, and the review
-# loop finds them one per round without converging.
+# THE FLAG IS A DIFFERENT AXIS, and it is closed. "Is there a `-e` OPTION here?"
+# is a claim about one whitespace-delimited word, decidable from the word alone
+# with no grammar at all — so it neither buys nor costs anything on the axis
+# above. The old predicate did not make that claim: `-e` was an unanchored
+# SUBSTRING, so every long option whose name starts with `e` supplied one
+# (`--extra-index-url`, `--exclude-files`, `--exists-action`), as did a package
+# name with `-e` inside it (`pytest-env`). Because the `_gc`/`_gd` check below
+# also fires when the CWD is a worktree, an ORDINARY pip command run from ANY
+# worktree was hard blocked — MEASURED twice in one session, and a block discards
+# the whole Bash call. The same blindness ran the other way: `-qe` / `-ve` are
+# real editable installs carrying no literal `-e`, so the arm never saw them.
 #
-# Over-blocking here is friction (MEASURED: 12/6000 real commands); under-
-# blocking risks the editable-install spiral that OOM-crashed this container
-# on 2026-03-16. Friction is the correct side to err on.
+# The token form below is what pip actually accepts, VERIFIED 2026-09-06 against
+# pip's own parser: `-e X`, `-qe X`, `-ve X`, `-eX` (glued value) and
+# `--editable=X` all reach the editable code path. The optional quote lets
+# `pip install '-e' .` keep matching, which the substring form covered.
 #
-# The durable fix is DELEGATION to a Python guard — the idiom this file
-# already uses for rm and git-clean below, which is how those arms get the
-# real tokenizer without leaving the shell. Filed as a follow-up rather than
-# done inline, because it needs a guard that does not yet exist.
-if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
+# The LONG form is matched by the prefix `--ed`, not by the full spelling,
+# because optparse accepts any UNAMBIGUOUS abbreviation and pip therefore really
+# installs from `--ed`, `--edi`, `--edit` and `--editab` (MEASURED against pip's
+# own parser, 2026-09-06: each reaches "not a valid editable requirement", i.e.
+# the editable code path; `--e` is rejected as ambiguous). The old substring
+# caught those by accident, since `--edit` contains a literal `-e`, so spelling
+# out `--editable` here would have been a silent NARROWING of a hard block.
+# `--editable` is the only `--ed…` option pip install has, so the prefix cannot
+# collide; a hypothetical future pip that accepted a 3-character `--e` is the
+# stated residual.
+#
+# The SHORT form has two clauses, and the split is the whole trick. A token
+# STARTING `-e` is unambiguous: `e` is the first option letter, so whatever is
+# glued after it is its value — no knowledge of any other flag is needed, which
+# is what keeps this a closed-set claim rather than a model of pip's option
+# table. A token where `e` is deeper in a BUNDLE (`-qe`, `-ve`) is ambiguous
+# with a glued value that merely contains an e, so that clause borrows the shape
+# the git-clean and force-push arms below already use — a run of letters that
+# must END, at a blank, at end of line, or where a path-like value begins.
+#
+# MEASURED against a generated matrix of 158,312 command shapes, graded by pip's
+# OWN parser (optparse with pip's option spec) rather than by another regex, so
+# the grader is not the thing under test. Of the 36,499 shapes that really are
+# editable installs, the old substring missed 16,635 (45.6%) and this predicate
+# misses 11,994 (32.9%). BOTH directions, because a catch rate alone would hide
+# the cost:
+#   * real installs the old form caught and this one does not: 117 (0.07% of the
+#     matrix) — all of them a BUNDLE with a glued value that is neither path-like
+#     nor quoted (`-qepytest-env`). pip rejects such a value as "not a valid
+#     editable requirement" anyway, and every worktree path starts with `/`, `.`
+#     or `~`, which the terminator does cover.
+#   * NEW false positives: 2,354 (1.5%) — a glued value on some OTHER short
+#     option that happens to contain an e (`pip install -Urequests`). This is the
+#     price of the bundle clause, and the bundle clause is what closes `-qe` /
+#     `-ve`. Separating those two would mean knowing which short options take a
+#     value, i.e. modelling pip's option table — the open set this file refuses.
+# Both figures come from a generated matrix rather than real traffic, so they
+# describe the predicate, not this install's command mix.
+#
+# The durable fix for the command-position axis is DELEGATION to a Python guard —
+# the idiom this file already uses for rm and git-clean below, which is how those
+# arms get the real tokenizer without leaving the shell. Filed as a follow-up
+# rather than done inline, because it needs a guard that does not yet exist.
+if echo "$CMD" | grep -qE "pip install.*[[:space:]][\"']?(--ed|-e|-[a-zA-Z]+e[a-zA-Z]*([[:space:]=./~\"']|\$))"; then
     _block=0
     # Check 1: explicit worktree path in command
     echo "$CMD" | grep -qiE "worktree" && _block=1
@@ -166,7 +217,32 @@ fi
 # Inside a genesis checkout the project-level worktree_cwd_guard.py already covers
 # this with the real parser; this arm is the belt for everywhere else, where
 # no project hooks are loaded.
-if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
+#
+# The FLAG, as in the pip arm above, is the one axis here that is closed and was
+# wrong, in BOTH of its spellings.
+#
+# Short: `-f` used to require a LITERAL SPACE after it, so the shell's other word
+# separators did not end the flag — a tab before the operand, or `-f` as the last
+# word on the line, ran a forced removal and were allowed. It now ends at any
+# blank, a quote, or end of line, and must START at one too, so the `-f` inside a
+# path like `/tmp/wt-f` is no longer read as the flag.
+#
+# Long: `--force` is matched by the prefix `--f`, because git's parse-options
+# accepts any unambiguous abbreviation. MEASURED 2026-09-06 on a scratch repo —
+# `--f`, `--fo` and `--forc` each returned 0 and the worktree was really gone,
+# while `--foo` was refused as an unknown option. `git worktree remove -h` lists
+# `-f, --[no-]force` as its ONLY option, so nothing else can collide. The old
+# predicate caught these by accident (`--f ` contains `-f `), so requiring the
+# full spelling — or adding the leading blank without this clause — would have
+# been a silent NARROWING of a hard block that exists because a forced removal
+# destroys uncommitted work irrecoverably.
+#
+# Both are claims about one word and say nothing about where the command starts,
+# so neither can reintroduce the command-position bypasses this arm was reverted
+# over. MEASURED over a generated matrix of 18,018 shapes graded by git's own
+# option grammar: of the 9,996 that really are forced removals the old predicate
+# missed 3,927 (39%) and this one misses 0, with 0 real removals lost.
+if echo "$CMD" | grep -qE "worktree remove.*(--f[a-zA-Z]*|[[:space:]][\"']?-f([[:space:]\"']|$))"; then
     echo "BLOCKED: git worktree remove --force destroys uncommitted work in the worktree." >&2
     echo "Use git worktree remove without --force, or ask the user first." >&2
     exit 2

@@ -87,6 +87,61 @@ class TestRemovedArms:
         assert _run("git worktree remove --force /tmp/wt").returncode == 0
 
 
+class TestInlineEditableArmSpellsTheFlagAsAToken:
+    """The same substring defect as the global hook's pip arm, one layer down.
+
+    This inline copy reads `(-e|--editable) +<path containing worktree>`, so it
+    saw only the spelling with a literal `-e` and a following SPACE. VERIFIED
+    2026-09-06 against pip's own parser: `-qe X`, `-ve X`, `-eX` and
+    `--editable=X` all reach the editable code path, and none of them has that
+    shape — so three real editable installs to a worktree passed this layer.
+
+    Not a hole in the SYSTEM: the global user-level arm
+    (scripts/bash_safety_hook.sh) refuses all of them, and that is what actually
+    stopped them. It is a hole in the belt, and it is the same defect, so it is
+    fixed with the same closed-set token claim rather than left as the one
+    instance nobody named.
+
+    The change is a strict WIDENING — `-e` survives verbatim, `--editable` is now
+    reached by its own prefix `--ed` (optparse binds any unambiguous abbreviation,
+    so pip really installs from `--ed`), and the required separator became
+    optional — so no spelling this arm caught before can have been lost. Both
+    directions are asserted anyway, because "strict widening" is an argument and
+    the tests are the evidence.
+
+    NOTE for anyone extending this predicate: the whole guard lives inside a
+    single-quoted `bash -c '…'` in settings.json, so a `'` anywhere in the pattern
+    TERMINATES the blob and every arm after it disappears. That is why this copy
+    has no quoted-flag tolerance while its sibling in bash_safety_hook.sh does.
+    `test_guard_is_syntactically_valid` is what catches the mistake.
+    """
+
+    _WT = "/srv/genesis/.claude/worktrees/somebranch"
+
+    @pytest.mark.parametrize(
+        "flag",
+        ["-e ", "--editable ", "--editable=", "--ed ", "--edit ", "-qe ", "-ve ", "-e"],
+    )
+    def test_every_spelling_pip_accepts_blocks(self, flag):
+        assert _run(f"pip install {flag}{self._WT}").returncode == 2, flag
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # No `-e` TOKEN anywhere — a long option whose name starts with `e`,
+            # and a package name carrying `-e` inside it.
+            "pip install requests --extra-index-url https://example.invalid/worktree/s",
+            "pip install -q detect-secrets --exclude-files x",
+            "pip install pytest-env",
+            # An editable install that names no worktree is this arm's business
+            # to ignore — the cwd branch lives in the global hook, not here.
+            "pip install -e .",
+        ],
+    )
+    def test_what_it_ignored_before_it_still_ignores(self, cmd):
+        assert _run(cmd).returncode == 0, cmd
+
+
 class TestInlineDiscardFloor:
     """The inline blob keeps ONLY the reset --hard speed-bump (2026-08-24
     recoverability redesign). reset is recoverable (the snapshot net undoes it),
