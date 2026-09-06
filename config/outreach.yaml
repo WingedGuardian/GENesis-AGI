@@ -18,6 +18,8 @@ channel_preferences:
   content: telegram
   # Ego notifications — informational, no approval needed. Routed to default topic.
   notification: telegram
+  # Marketing campaign updates — routed to the dedicated Marketing topic.
+  marketing: telegram
 
 thresholds:
   blocker: 0.0
@@ -31,6 +33,10 @@ thresholds:
   content: 0.0
   # Ego notifications always deliver — the ego already judged relevance.
   notification: 0.0
+  # Marketing digests are owner-facing + only sent when material, so 0.0 exempts
+  # them from the salience gate (still subject to quiet-hours + the shared daily
+  # cap, like notification/content — marketing is not in _BYPASS_CATEGORIES).
+  marketing: 0.0
 
 rate_limits:
   max_daily: 5
@@ -61,6 +67,9 @@ delivery_routing:
   # not an official proposal. They belong in the private DM, never a
   # supergroup topic. (Official proposals go to the Ego Proposals topic.)
   notification: dm
+  # Marketing updates go to the dedicated Marketing topic — never DM. Pinned
+  # explicitly (not left to `default`) so it holds on installs whose default is dm.
+  marketing: supergroup
 
 health_alerts:
   # Only these alert IDs go to Telegram (CRITICAL severity only).
