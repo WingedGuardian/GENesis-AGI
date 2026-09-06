@@ -61,6 +61,11 @@ For each extraction, provide:
   being relevant — a wrong "temporary" causes the memory to be forgotten.
 - expires_at: for "temporary" only — ISO date/time it stops being relevant, if
   known (otherwise omit)
+- preference_domain: for speech_act="preference" only — the DOMAIN the
+  preference is scoped to, 1-3 lowercase words ("work", "vehicles", "food",
+  "code style"). A preference is rarely universal: capturing its domain lets a
+  later conflicting preference coexist as a different-context truth instead of
+  overwriting this one. Omit if the preference is genuinely general.
 
 For each extraction that has a temporal reference AND describes a concrete
 action (something that happened, was decided, or will happen), additionally
@@ -153,6 +158,18 @@ Respond with a JSON object inside backticks containing:
       "relationships": [],
       "temporal": "2026-05-12",
       "event": {"subject": "user", "verb": "applied", "object": "Solutions Engineer at Salesforce"}
+    },
+    {
+      "content": "User prefers muted colors for work materials, not for personal projects",
+      "type": "preference",
+      "confidence": 0.85,
+      "entities": [],
+      "relationships": [],
+      "speech_act": "preference",
+      "speech_act_confidence": 0.9,
+      "provenance": "user",
+      "durability": "permanent",
+      "preference_domain": "work"
     }
   ],
   "session_keywords": ["agentmail", "email", "outreach", "evaluation"],
@@ -202,6 +219,9 @@ class Extraction:
     assertion_provenance: str | None = None
     durability: str = "permanent"
     expires_at: str | None = None
+    # Domain a preference is scoped to (speech_act="preference" only; open
+    # vocab, normalized lowercase). # GROUNDWORK(mw-4-preference-domain)
+    preference_domain: str | None = None
 
 
 @dataclass
@@ -364,6 +384,9 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
         expires_at = item.get("expires_at")
         if expires_at is not None:
             expires_at = str(expires_at).strip() or None
+        preference_domain = judgment.normalize_preference_domain(
+            item.get("preference_domain"), speech_act=speech_act
+        )
 
         extractions.append(Extraction(
             content=content,
@@ -381,6 +404,7 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
             assertion_provenance=assertion_provenance,
             durability=durability,
             expires_at=expires_at,
+            preference_domain=preference_domain,
         ))
 
     return ParsedResponse(
@@ -427,4 +451,5 @@ def extractions_to_store_kwargs(
         "assertion_provenance": extraction.assertion_provenance,
         "durability": extraction.durability,
         "expires_at": extraction.expires_at,
+        "preference_domain": extraction.preference_domain,
     }
