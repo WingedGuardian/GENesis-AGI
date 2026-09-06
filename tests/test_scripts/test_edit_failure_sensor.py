@@ -1,9 +1,15 @@
 """Tests for scripts/edit_failure_sensor.py — the Edit/Write outcome sensor.
 
-The sensor was blind to failures for its first 7 weeks (12,737 rows, 0
-failures) because it was registered only for PostToolUse, which fires solely
-on successful tool calls. These tests pin the failure path (PostToolUseFailure)
-and the success path against a real temp SQLite DB.
+The sensor recorded 0 failures in 25k rows over ~8 weeks (#1597): on current
+Claude Code a failed Edit fires NO PostToolUse/PostToolUseFailure hook. Both
+successes and failures ARE in the session transcript, so the sensor now scans it
+on the Stop event and records EVERY Edit/Write outcome (success=0 on is_error,
+else success=1) — one population, deduped by tool_use_id. These tests pin that
+path against a real temp SQLite DB, using byte-real transcript-record shapes.
+
+Fixture ids are synthetic, low-entropy ``toolu_`` values on purpose — these
+fixtures may reach the public repo; a real high-entropy id both leaks an
+identifier and can trip the detect-secrets floor.
 """
 
 from __future__ import annotations
@@ -20,16 +26,20 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "edit_failure_sensor.py"
 
+# Mirror of the live schema (incl. the #1597 dedup column + unique index) so the
+# INSERT OR IGNORE dedup path is exercised exactly as in production.
 _SCHEMA = """
 CREATE TABLE tool_call_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT,
     tool_name TEXT NOT NULL,
     file_path TEXT,
-    success INTEGER NOT NULL,
+    success INTEGER NOT NULL DEFAULT 1,
     error_snippet TEXT,
-    timestamp TEXT NOT NULL
+    timestamp TEXT NOT NULL,
+    tool_use_id TEXT
 );
+CREATE UNIQUE INDEX idx_tco_tool_use_id ON tool_call_outcomes(tool_use_id);
 """
 
 
@@ -54,7 +64,8 @@ def _rows(db_path):
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.execute(
-            "SELECT tool_name, file_path, success, error_snippet FROM tool_call_outcomes"
+            "SELECT tool_name, file_path, success, error_snippet, tool_use_id "
+            "FROM tool_call_outcomes ORDER BY id"
         )
         return cur.fetchall()
     finally:
@@ -67,68 +78,204 @@ def _run_process(monkeypatch, db_path, payload):
     module._process(payload)
 
 
-class TestFailurePath:
-    def test_post_tool_use_failure_records_failure(self, monkeypatch, sensor_db):
-        _run_process(
-            monkeypatch,
-            sensor_db,
-            {
-                "hook_event_name": "PostToolUseFailure",
-                "tool_name": "Edit",
-                "session_id": "s1",
-                "tool_input": {"file_path": "/tmp/x.py"},
-                "tool_error": "String to replace not found in file (old_string not found)",
-                "tool_error_code": 1,
-            },
-        )
-        rows = _rows(sensor_db)
-        assert rows == [
-            ("Edit", "/tmp/x.py", 0, "String to replace not found in file (old_string not found)")
-        ]
+# --- Transcript-fixture builders (byte-real shapes captured 2026-09-02) --------
 
-    def test_failure_without_error_text_still_records(self, monkeypatch, sensor_db):
-        _run_process(
-            monkeypatch,
-            sensor_db,
-            {
-                "hook_event_name": "PostToolUseFailure",
-                "tool_name": "Write",
-                "tool_input": {"file_path": "/tmp/y.py"},
-            },
-        )
-        rows = _rows(sensor_db)
-        assert rows[0][2] == 0
-        assert "no error text" in rows[0][3]
+_MISSING = object()
 
-    def test_error_snippet_capped_at_200(self, monkeypatch, sensor_db):
-        _run_process(
-            monkeypatch,
-            sensor_db,
-            {
-                "hook_event_name": "PostToolUseFailure",
-                "tool_name": "Edit",
-                "tool_input": {"file_path": "/tmp/z.py"},
-                "tool_error": "x" * 500,
-            },
+
+def _tool_use(tid, name="Edit", file_path="/tmp/x.py", sidechain=False):
+    return {
+        "type": "assistant",
+        "isSidechain": sidechain,
+        "session_id": "s1",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tid,
+                    "name": name,
+                    "input": {"file_path": file_path, "old_string": "a", "new_string": "b"},
+                }
+            ]
+        },
+    }
+
+
+def _tool_result(tid, is_error=_MISSING, text="String to replace not found in file.", sidechain=False):
+    """is_error=_MISSING → a SUCCESS result (real successes omit the key entirely).
+    Pass True/1/"true" for a failure, or False/"false" for an explicit success."""
+    result = {"type": "tool_result", "tool_use_id": tid}
+    if is_error is not _MISSING:
+        result["is_error"] = is_error
+    failure = is_error is True or is_error == 1 or (isinstance(is_error, str) and is_error.lower() == "true")
+    result["content"] = (
+        f"<tool_use_error>{text}</tool_use_error>" if failure else "The file has been updated."
+    )
+    rec = {
+        "type": "user",
+        "isSidechain": sidechain,
+        "session_id": "s1",
+        "timestamp": "2026-09-02T22:00:00+00:00",
+        "message": {"content": [result]},
+    }
+    if failure:
+        rec["toolUseResult"] = f"Error: {text}"
+    return rec
+
+
+def _write_transcript(tmp_path, records, name="transcript.jsonl"):
+    path = tmp_path / name
+    with path.open("w") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return path
+
+
+def _stop_payload(transcript_path):
+    return {
+        "hook_event_name": "Stop",
+        "session_id": "s1",
+        "transcript_path": str(transcript_path),
+    }
+
+
+# --- Stop outcome-scan path ---------------------------------------------------
+
+
+class TestStopScan:
+    def test_records_edit_failure(self, monkeypatch, sensor_db, tmp_path):
+        """The key #1597 case: a real failed-Edit transcript pair → one success=0 row."""
+        tp = _write_transcript(
+            tmp_path,
+            [_tool_use("toolu_fail01", file_path="/tmp/x.py"), _tool_result("toolu_fail01", is_error=True)],
         )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        rows = _rows(sensor_db)
+        assert len(rows) == 1
+        tool_name, file_path, success, snippet, tid = rows[0]
+        assert (tool_name, file_path, success, tid) == ("Edit", "/tmp/x.py", 0, "toolu_fail01")
+        assert "String to replace not found" in snippet
+
+    def test_records_edit_success(self, monkeypatch, sensor_db, tmp_path):
+        """Success (is_error omitted) → success=1 row, tool_use_id set, no snippet."""
+        tp = _write_transcript(
+            tmp_path, [_tool_use("toolu_ok01", file_path="/tmp/ok.py"), _tool_result("toolu_ok01")]
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        assert _rows(sensor_db) == [("Edit", "/tmp/ok.py", 1, None, "toolu_ok01")]
+
+    def test_mixed_success_and_failure(self, monkeypatch, sensor_db, tmp_path):
+        tp = _write_transcript(
+            tmp_path,
+            [
+                _tool_use("toolu_s", name="Write", file_path="/tmp/s.py"),
+                _tool_result("toolu_s"),
+                _tool_use("toolu_f", file_path="/tmp/f.py"),
+                _tool_result("toolu_f", is_error=True),
+            ],
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        rows = {r[4]: r[2] for r in _rows(sensor_db)}
+        assert rows == {"toolu_s": 1, "toolu_f": 0}
+
+    @pytest.mark.parametrize(
+        "is_error,expected_success",
+        [
+            (True, 0),      # JSON bool
+            (1, 0),         # numeric drift
+            ("true", 0),    # string drift
+            (False, 1),     # explicit success
+            ("false", 1),   # string false must NOT read as failure
+            (_MISSING, 1),  # real successes omit the key
+        ],
+    )
+    def test_is_error_classification(self, monkeypatch, sensor_db, tmp_path, is_error, expected_success):
+        tp = _write_transcript(
+            tmp_path, [_tool_use("toolu_v"), _tool_result("toolu_v", is_error=is_error)]
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        assert _rows(sensor_db)[0][2] == expected_success
+
+    def test_idempotent_rescan(self, monkeypatch, sensor_db, tmp_path):
+        """Stop re-fires every turn; re-scanning the same transcript stays stable."""
+        tp = _write_transcript(
+            tmp_path,
+            [
+                _tool_use("toolu_ok"), _tool_result("toolu_ok"),
+                _tool_use("toolu_bad"), _tool_result("toolu_bad", is_error=True),
+            ],
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        assert len(_rows(sensor_db)) == 2
+
+    def test_sidechain_skipped(self, monkeypatch, sensor_db, tmp_path):
+        """v1 is main-session only — sub-agent (isSidechain) outcomes are skipped, both
+        success and failure, so the base-rate population stays symmetric."""
+        tp = _write_transcript(
+            tmp_path,
+            [
+                _tool_use("toolu_ss", sidechain=True), _tool_result("toolu_ss", sidechain=True),
+                _tool_use("toolu_sf", sidechain=True), _tool_result("toolu_sf", is_error=True, sidechain=True),
+            ],
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        assert _rows(sensor_db) == []
+
+    def test_non_edit_write_ignored(self, monkeypatch, sensor_db, tmp_path):
+        tp = _write_transcript(
+            tmp_path,
+            [
+                _tool_use("toolu_b", name="Bash"), _tool_result("toolu_b"),
+                _tool_use("toolu_bf", name="Bash"), _tool_result("toolu_bf", is_error=True),
+            ],
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        assert _rows(sensor_db) == []
+
+    def test_far_apart_tool_use_and_result(self, monkeypatch, sensor_db, tmp_path):
+        filler = [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+        records = (
+            [_tool_use("toolu_far", file_path="/tmp/f.py")]
+            + filler * 50
+            + [_tool_result("toolu_far", is_error=True)]
+        )
+        tp = _write_transcript(tmp_path, records)
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        rows = _rows(sensor_db)
+        assert len(rows) == 1 and rows[0][4] == "toolu_far"
+
+    def test_malformed_lines_skipped(self, monkeypatch, sensor_db, tmp_path):
+        tp = tmp_path / "t.jsonl"
+        with tp.open("w") as fh:
+            fh.write("{not json\n")
+            fh.write(json.dumps(_tool_use("toolu_ok")) + "\n")
+            fh.write("\n")  # blank line
+            fh.write(json.dumps(_tool_result("toolu_ok", is_error=True)) + "\n")
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
+        rows = _rows(sensor_db)
+        assert len(rows) == 1 and rows[0][4] == "toolu_ok"
+
+    def test_error_snippet_capped_at_200(self, monkeypatch, sensor_db, tmp_path):
+        tp = _write_transcript(
+            tmp_path, [_tool_use("toolu_long"), _tool_result("toolu_long", is_error=True, text="x" * 500)]
+        )
+        _run_process(monkeypatch, sensor_db, _stop_payload(tp))
         assert len(_rows(sensor_db)[0][3]) == 200
 
-    def test_non_edit_write_failure_ignored(self, monkeypatch, sensor_db):
-        _run_process(
-            monkeypatch,
-            sensor_db,
-            {
-                "hook_event_name": "PostToolUseFailure",
-                "tool_name": "Bash",
-                "tool_input": {"command": "false"},
-                "tool_error": "exit 1",
-            },
-        )
+    def test_missing_transcript_path_no_rows(self, monkeypatch, sensor_db):
+        _run_process(monkeypatch, sensor_db, {"hook_event_name": "Stop", "session_id": "s1"})
+        assert _rows(sensor_db) == []
+
+    def test_nonexistent_transcript_no_crash(self, monkeypatch, sensor_db, tmp_path):
+        _run_process(monkeypatch, sensor_db, _stop_payload(tmp_path / "nope.jsonl"))
         assert _rows(sensor_db) == []
 
 
-class TestSuccessPath:
-    def test_post_tool_use_records_success(self, monkeypatch, sensor_db):
+class TestNonScanEventsIgnored:
+    """The sensor is Stop-only now; a stray PostToolUse payload must record nothing."""
+
+    def test_post_tool_use_payload_ignored(self, monkeypatch, sensor_db):
         _run_process(
             monkeypatch,
             sensor_db,
@@ -137,52 +284,38 @@ class TestSuccessPath:
                 "tool_name": "Edit",
                 "session_id": "s2",
                 "tool_input": {"file_path": "/tmp/a.py"},
-                "tool_output": "The file /tmp/a.py has been updated.",
+                "tool_response": {"filePath": "/tmp/a.py"},
             },
         )
-        assert _rows(sensor_db) == [("Edit", "/tmp/a.py", 1, None)]
+        assert _rows(sensor_db) == []
 
-    def test_soft_error_marker_in_success_output_records_failure(
-        self, monkeypatch, sensor_db
-    ):
+    def test_session_end_also_scans(self, monkeypatch, sensor_db, tmp_path):
+        """SessionEnd is an accepted fallback trigger (also carries transcript_path)."""
+        tp = _write_transcript(
+            tmp_path, [_tool_use("toolu_se"), _tool_result("toolu_se", is_error=True)]
+        )
         _run_process(
             monkeypatch,
             sensor_db,
-            {
-                "hook_event_name": "PostToolUse",
-                "tool_name": "Edit",
-                "tool_input": {"file_path": "/tmp/b.py"},
-                "tool_output": "Error: old_string not found",
-            },
+            {"hook_event_name": "SessionEnd", "session_id": "s1", "transcript_path": str(tp)},
         )
-        assert _rows(sensor_db)[0][2] == 0
+        assert len(_rows(sensor_db)) == 1
 
-    def test_missing_event_name_defaults_to_success_path(self, monkeypatch, sensor_db):
-        # Older payloads without hook_event_name must keep working.
-        _run_process(
-            monkeypatch,
-            sensor_db,
-            {
-                "tool_name": "Write",
-                "tool_input": {"file_path": "/tmp/c.py"},
-                "tool_output": "ok",
-            },
-        )
-        assert _rows(sensor_db)[0][2] == 1
+
+# --- Subprocess E2E (drive the real script over stdin, as CC does) ------------
 
 
 class TestSubprocessEndToEnd:
-    def test_stdin_pipe_failure_event(self, sensor_db):
-        """Drive the real script as CC does: JSON on stdin, env-pointed DB."""
-        payload = json.dumps(
-            {
-                "hook_event_name": "PostToolUseFailure",
-                "tool_name": "Edit",
-                "session_id": "e2e",
-                "tool_input": {"file_path": "/tmp/e2e.py"},
-                "tool_error": "old_string not found",
-            }
+    def test_stop_scan_via_stdin(self, sensor_db, tmp_path):
+        tp = _write_transcript(
+            tmp_path,
+            [
+                _tool_use("toolu_e2eok", file_path="/tmp/ok.py"), _tool_result("toolu_e2eok"),
+                _tool_use("toolu_e2ebad", file_path="/tmp/bad.py"),
+                _tool_result("toolu_e2ebad", is_error=True),
+            ],
         )
+        payload = json.dumps(_stop_payload(tp))
         result = subprocess.run(
             [sys.executable, str(SCRIPT)],
             input=payload,
@@ -192,7 +325,8 @@ class TestSubprocessEndToEnd:
             env={"GENESIS_DB_PATH": str(sensor_db), "PATH": "/usr/bin:/bin"},
         )
         assert result.returncode == 0
-        assert _rows(sensor_db) == [("Edit", "/tmp/e2e.py", 0, "old_string not found")]
+        rows = {r[4]: r[2] for r in _rows(sensor_db)}
+        assert rows == {"toolu_e2eok": 1, "toolu_e2ebad": 0}
 
     def test_malformed_stdin_never_raises(self, sensor_db):
         result = subprocess.run(
@@ -205,3 +339,203 @@ class TestSubprocessEndToEnd:
         )
         assert result.returncode == 0
         assert _rows(sensor_db) == []
+
+
+class TestSoftFailureFallback:
+    """A tool_result that omits `is_error` but says it failed IS a failure.
+
+    The predecessor sensor keyed on these phrasings because it had no flag to
+    read at all. Dropping them made correctness depend on one payload field
+    never changing shape — the exact class of blindness #1597 was, where a hook
+    that never fired left the sensor at 0 failures in 25k rows.
+
+    MEASURED over this install's 1,463 transcripts, 13,135 paired Edit/Write
+    results: of the 373 carrying `is_error=True`, 138 also match a marker (so
+    the markers are a SUBSET of the flag, never a replacement); of the 12,762
+    WITHOUT the flag, 0 match any marker. The fallback changes nothing on real
+    traffic — which is exactly what a defensive fallback should cost.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "old_string not found in file",
+            "String to replace not found in file.",
+            "old_string is not unique in the file",
+            "The file was not modified — no changes were made",
+            "old_string and new_string are the same",
+        ],
+    )
+    def test_a_soft_failure_without_the_flag_is_recorded_as_a_failure(
+        self, tmp_path, monkeypatch, sensor_db, text
+    ):
+        db = sensor_db
+        rec = {
+            "type": "user",
+            "isSidechain": False,
+            "session_id": "s1",
+            "timestamp": "2026-09-02T22:00:00+00:00",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_soft", "content": text}
+                ]
+            },
+        }
+        tp = _write_transcript(tmp_path, [_tool_use("toolu_soft"), rec])
+        _run_process(monkeypatch, db, _stop_payload(tp))
+        rows = _rows(db)
+        assert len(rows) == 1, rows
+        assert rows[0][2] == 0, f"soft failure recorded as success: {rows[0]}"
+        assert text[:20] in (rows[0][3] or ""), "the failure text must be kept"
+
+    def test_an_ordinary_success_is_still_a_success(self, tmp_path, monkeypatch, sensor_db):
+        """CONTROL, and the one that matters most: the real success payload is a
+        file snippet, so a fallback keyed on loose words would flip 12,762
+        results at a stroke."""
+        db = sensor_db
+        tp = _write_transcript(
+            tmp_path, [_tool_use("toolu_ok"), _tool_result("toolu_ok")]
+        )
+        _run_process(monkeypatch, db, _stop_payload(tp))
+        rows = _rows(db)
+        assert len(rows) == 1 and rows[0][2] == 1, rows
+
+    def test_a_success_whose_snippet_MENTIONS_an_error_is_still_a_success(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        """A successful Edit's result contains a snippet of the edited FILE. That
+        is why the predecessor's bare `Error:` marker is not carried over: source
+        and log text contain it constantly, and a specific phrasing cannot be
+        typed by accident the way that word can."""
+        db = sensor_db
+        rec = {
+            "type": "user",
+            "isSidechain": False,
+            "session_id": "s1",
+            "timestamp": "2026-09-02T22:00:00+00:00",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_snip",
+                        "content": (
+                            "The file has been updated:\n"
+                            '    logger.error("Error: could not reach the provider")'
+                        ),
+                    }
+                ]
+            },
+        }
+        tp = _write_transcript(tmp_path, [_tool_use("toolu_snip"), rec])
+        _run_process(monkeypatch, db, _stop_payload(tp))
+        rows = _rows(db)
+        assert len(rows) == 1 and rows[0][2] == 1, rows
+
+    def test_the_explicit_flag_still_wins_over_a_clean_body(self, tmp_path, monkeypatch, sensor_db):
+        """The flag is primary; the markers are the fallback, not a replacement."""
+        db = sensor_db
+        rec = {
+            "type": "user",
+            "isSidechain": False,
+            "session_id": "s1",
+            "timestamp": "2026-09-02T22:00:00+00:00",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_flag",
+                        "is_error": True,
+                        "content": "something went wrong in a way nobody phrased",
+                    }
+                ]
+            },
+        }
+        tp = _write_transcript(tmp_path, [_tool_use("toolu_flag"), rec])
+        _run_process(monkeypatch, db, _stop_payload(tp))
+        rows = _rows(db)
+        assert len(rows) == 1 and rows[0][2] == 0, rows
+
+
+class TestTheScanCutoffLosesNothing:
+    """The tail window must not orphan a result whose tool_use straddles it.
+
+    The cutoff only ever moves FORWARD, so a call skipped once for want of its
+    paired `tool_use` is skipped on every later Stop too — the outcome is gone
+    for good, not merely deferred. Two ways that happened:
+
+      * a `tool_use` record LARGER than the window: the seek lands inside it and
+        the partial-line discard removes it, while its `tool_result` remains;
+      * an exact line-boundary cutoff: `readline()` then discarded a COMPLETE
+        first record rather than a partial one.
+
+    Exercised against a SHRUNK window rather than a real 25 MB transcript. The
+    bound is the mechanism; building 25 MB per test to prove it would be a
+    quarter of a gigabyte across this class for no extra coverage.
+    """
+
+    @staticmethod
+    def _module_with_window(monkeypatch, db_path, window):
+        module = _load_module()
+        monkeypatch.setattr(module, "_DB_PATH", db_path)
+        monkeypatch.setattr(module, "_MAX_SCAN_BYTES", window)
+        return module
+
+    def test_a_tool_use_larger_than_the_window_is_still_paired(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        huge = _tool_use("toolu_huge")
+        huge["message"]["content"][0]["input"]["new_string"] = "x" * 4000
+        records = [huge, _tool_result("toolu_huge", is_error=True)]
+        tp = _write_transcript(tmp_path, records)
+        assert tp.stat().st_size > 4000
+
+        module = self._module_with_window(monkeypatch, sensor_db, 500)
+        module._process(_stop_payload(tp))
+
+        rows = _rows(sensor_db)
+        assert len(rows) == 1, (
+            "the result was orphaned by the cutoff and would never be recorded "
+            f"on any later scan either: {rows}"
+        )
+        assert rows[0][2] == 0 and rows[0][4] == "toolu_huge"
+
+    def test_a_cutoff_landing_on_a_line_boundary_keeps_that_line(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        """The off-by-one, isolated: the window is sized to the exact byte length
+        of the trailing records, so its start IS a line boundary."""
+        records = [_tool_use("toolu_edge"), _tool_result("toolu_edge", is_error=True)]
+        tail_bytes = sum(len(json.dumps(r)) + 1 for r in records)
+        padding = {"type": "user", "isSidechain": False, "message": {"content": []}}
+        full = tmp_path / "padded.jsonl"
+        with full.open("w") as fh:
+            for _ in range(20):
+                fh.write(json.dumps(padding) + "\n")
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+
+        module = self._module_with_window(monkeypatch, sensor_db, tail_bytes)
+        module._process(_stop_payload(full))
+
+        rows = _rows(sensor_db)
+        assert len(rows) == 1, f"a complete record on the cutoff was discarded: {rows}"
+        assert rows[0][4] == "toolu_edge"
+
+    def test_an_untruncated_transcript_takes_no_recovery_pass(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        """CONTROL. The recovery pass reads a second window; it must not run for
+        the ordinary case, which is every transcript under the bound."""
+        records = [_tool_use("toolu_small"), _tool_result("toolu_small", is_error=True)]
+        tp = _write_transcript(tmp_path, records)
+        module = self._module_with_window(monkeypatch, sensor_db, 10_000_000)
+        calls = []
+        real = module._recover_earlier_tool_uses
+        monkeypatch.setattr(
+            module,
+            "_recover_earlier_tool_uses",
+            lambda *a, **kw: calls.append(a) or real(*a, **kw),
+        )
+        module._process(_stop_payload(tp))
+        assert calls == [], "recovery ran on an untruncated transcript"
+        assert len(_rows(sensor_db)) == 1

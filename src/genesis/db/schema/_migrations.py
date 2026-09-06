@@ -2193,6 +2193,17 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "cc_sessions.topic_updated_at",
     )
 
+    # Dedup key for the Stop-hook Edit/Write outcome scanner (#1597). Mirrored
+    # in migration 0092 for the standalone runner; added here so an existing DB
+    # gets the column on the base create_all_tables path BEFORE the unique index
+    # idx_tco_tool_use_id is built (INDEXES runs before numbered migrations —
+    # schema_both_build_paths / the #1123/#1127 bootstrap-crash class).
+    await _try_alter(
+        db,
+        "ALTER TABLE tool_call_outcomes ADD COLUMN tool_use_id TEXT",
+        "tool_call_outcomes.tool_use_id",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

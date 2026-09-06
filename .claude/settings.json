@@ -389,6 +389,15 @@
                         "timeout": 30
                     }
                 ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook edit_failure_sensor.py",
+                        "timeout": 30
+                    }
+                ]
             }
         ],
         "SessionEnd": [
@@ -440,11 +449,6 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_modification_audit_hook.py",
-                        "timeout": 10
-                    },
-                    {
-                        "type": "command",
-                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook edit_failure_sensor.py",
                         "timeout": 10
                     },
                     {
@@ -509,18 +513,6 @@
                     {
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
-                        "timeout": 10
-                    }
-                ]
-            }
-        ],
-        "PostToolUseFailure": [
-            {
-                "matcher": "Edit|Write",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook edit_failure_sensor.py",
                         "timeout": 10
                     }
                 ]
