@@ -55,6 +55,11 @@ _discarded_write_note() {
     [ "$rc" -eq 2 ] || return 0
     # A delegated Python guard already emitted it — see the rm delegation below.
     [ "${_NOTE_ALREADY_EMITTED:-0}" -eq 1 ] && return 0
+    # An absent interpreter or helper (a detached copy of this script has no
+    # hooks/ beside it) is a silent no-op: python3's own `can't open file`
+    # error on stderr would otherwise ride the refusal as unrelated noise.
+    command -v python3 >/dev/null 2>&1 || return 0
+    [ -r "$SCRIPT_DIR/hooks/discarded_write.py" ] || return 0
     # `timeout 1` is a BELT, not the fix. This hook is registered with a 5-SECOND
     # budget (user-level settings), far tighter than the Python guards', and a hook
     # killed before its `exit 2` is read by CC as a NON-blocking error — i.e. the
@@ -250,6 +255,10 @@ case "$CMD" in
             _rc=0
             printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/git_discard_guard.py" >&2 || _rc=$?
             if [ "$_rc" -eq 2 ]; then
+                # The guard already printed the discarded-write note at its own
+                # exit-2 sites (stderr passed through above) — same suppression
+                # as the rm delegation, or the EXIT trap emits it a second time.
+                _NOTE_ALREADY_EMITTED=1
                 exit 2
             elif [ "$_rc" -eq 0 ]; then
                 _handled=1

@@ -640,3 +640,71 @@ class TestDiscardedWriteNote:
     def test_a_BROKEN_helper_cannot_turn_an_allow_into_a_block(self, tmp_path):
         """The other direction, which a `set -e` or a stray `exit` would break."""
         assert self._run_detached_copy(tmp_path, "echo hi").returncode == 0
+
+    def test_a_missing_helper_adds_no_noise_to_the_refusal(self, tmp_path):
+        """An unavailable helper is a silent no-op, not a stderr contributor.
+
+        A detached copy of this script has no `hooks/` beside it, so the trap's
+        python3 call would print `can't open file …discarded_write.py` into the
+        refusal's stderr — failure output from a cosmetic helper, attached to an
+        unrelated block. The trap must check availability and stand down.
+        """
+        r = self._run_detached_copy(tmp_path, f"cp a b && {self._BLOCKER}")
+        assert r.returncode == 2
+        assert "discarded_write.py" not in r.stderr, (
+            "the trap leaked its own helper-invocation failure into the refusal"
+        )
+        assert "Traceback" not in r.stderr
+
+    def test_a_partially_synced_hooks_dir_adds_no_traceback_to_the_refusal(self, tmp_path):
+        """The availability check's blind spot: helper PRESENT, its import absent.
+
+        `[ -r …/discarded_write.py ]` passes, python3 runs, and an unguarded
+        module-level `from shell_parse import …` tracebacks into the refusal's
+        stderr — the same noise class as the missing helper, one dependency
+        deeper. The helper's own contract says every entry point degrades to
+        silence, so the import must too.
+        """
+        copy = tmp_path / "bash_safety_hook.sh"
+        copy.write_text(HOOK.read_text())
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        # the helper alone — deliberately NOT its shell_parse dependency
+        hooks.joinpath("discarded_write.py").write_text(
+            (HOOK.parent / "hooks" / "discarded_write.py").read_text()
+        )
+        env = dict(os.environ)
+        env.pop("GENESIS_BASH_ALLOWLIST", None)
+        r = subprocess.run(
+            ["bash", str(copy)],
+            input=json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": f"cp a b && {self._BLOCKER}"}}
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=_OUTSIDE,
+        )
+        assert r.returncode == 2, "a broken import must not turn a block into an allow"
+        assert "Traceback" not in r.stderr, (
+            "the helper's import failure leaked into the refusal"
+        )
+        assert "ModuleNotFoundError" not in r.stderr
+
+    def test_the_note_appears_exactly_once_when_a_delegated_guard_emitted_it(self):
+        """A delegated Python guard that already printed the note (its stderr is
+        passed through) must suppress the EXIT trap's copy — for EVERY delegation
+        site, not just the rm one. `git clean` routes through git_discard_guard,
+        which calls the helper at its own exit-2 sites; without the suppression
+        flag the trap re-derives it and the operator reads the note twice (and
+        the hook pays the parse twice inside one 5s budget — the exact mechanism
+        the module docstring records as letting a refused `rm -rf` run)."""
+        r = _run("cp a b && git clean -fd")
+        assert r.returncode == 2
+        assert r.stderr.count(self._MARKER) == 1, r.stderr
+
+    def test_the_rm_delegation_also_emits_the_note_exactly_once(self):
+        """The control on the site that already carries the suppression flag."""
+        r = _run("cp a b && rm -rf /")
+        assert r.returncode == 2
+        assert r.stderr.count(self._MARKER) == 1, r.stderr

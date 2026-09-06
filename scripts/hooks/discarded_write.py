@@ -63,7 +63,13 @@ import signal
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shell_parse import analyze, split_segments  # noqa: E402
+try:
+    from shell_parse import analyze, split_segments  # noqa: E402
+except Exception:  # noqa: BLE001 — cosmetic: a partially-synced hooks/ (this file
+    # present, shell_parse absent) must degrade to SILENCE, not traceback into the
+    # refusal's stderr. Calling None below raises TypeError, which the predicate's
+    # blanket handler converts to False — the documented fail-open.
+    analyze = split_segments = None  # type: ignore[assignment]
 
 #: A cheap FIRST PASS, not the bound. Both checks are O(n) scans, so an obviously
 #: enormous command is refused without paying a parse at all.

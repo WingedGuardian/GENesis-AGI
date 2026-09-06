@@ -498,3 +498,50 @@ def test_every_configured_bash_blocker_is_wired_for_the_note():
                 )
     assert checked_scripts >= 8, f"blocker walk went blind: {checked_scripts}"
     assert checked_inline >= 1, "the inline settings.json blocker was not seen"
+
+
+def test_the_inline_settings_blocker_is_silent_when_the_helper_is_absent(tmp_path):
+    """An unavailable helper must add NOTHING to the inline blocker's refusal.
+
+    The inline settings.json hook resolves the helper via CLAUDE_PROJECT_DIR; on
+    a partial checkout (or a mis-set project dir) python3 prints its own
+    `can't open file` error into the refusal's stderr — failure output from a
+    cosmetic helper riding an unrelated block. Availability is checked before
+    invoking, so the degraded shape is silence, and the block itself is
+    unaffected either way.
+    """
+    import json as _json
+    import os
+    import re
+
+    repo = _HOOKS.parents[1]
+    settings = _json.loads((repo / ".claude" / "settings.json").read_text())
+    inline = None
+    for entry in settings["hooks"]["PreToolUse"]:
+        if entry.get("matcher") != "Bash":
+            continue
+        for h in entry["hooks"]:
+            cmd = h["command"]
+            if "exit 2" in cmd and not re.search(r"genesis-hook\s+\S+\.py", cmd):
+                inline = cmd
+    assert inline is not None, "the inline settings.json blocker was not found"
+
+    blocked = "git reset --" + "hard"  # split so safety hooks don't trip on the fixture
+    payload = _json.dumps({"tool_name": "Bash", "tool_input": {"command": blocked}})
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(tmp_path)  # no scripts/hooks/ beneath it
+    proc = subprocess.run(
+        ["bash", "-c", inline.removeprefix("bash -c ").strip("'")]
+        if inline.startswith("bash -c ")
+        else ["bash", "-c", inline],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "BLOCKED" in proc.stderr
+    assert "discarded_write.py" not in proc.stderr, (
+        "the inline blocker leaked its helper-invocation failure into the refusal"
+    )
