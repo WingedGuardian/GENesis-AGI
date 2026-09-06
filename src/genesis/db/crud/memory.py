@@ -353,6 +353,7 @@ async def create_metadata(
     assertion_provenance: str | None = None,
     durability: str | None = None,
     expires_at: str | None = None,
+    preference_domain: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
@@ -367,11 +368,13 @@ async def create_metadata(
     ``MemoryStore.store()``; NULL = legacy/unclassified (gates treat it
     fail-closed at gate time).
     ``speech_act`` / ``speech_act_confidence`` / ``assertion_provenance`` /
-    ``durability`` / ``expires_at`` are the MW-1 Tier-0 extraction judgment
+    ``durability`` / ``expires_at`` / ``preference_domain`` are the MW-1 Tier-0
+    (+ the MW-4 ``preference_domain`` satellite) extraction judgment
     axes — WRITE-ONLY (no reader yet). NULL = unclassified; expiry is opt-in
     (``durability='temporary'`` + an elapsed canonicalized ``expires_at``
     only). Contract in ``memory/judgment.py``.
-    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
+    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-4-preference-domain
+    # / mw-5-speech-act-protection)
     """
     # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
     # at the write gate. Unparseable valid_at (LLM temporal strings like
@@ -384,8 +387,8 @@ async def create_metadata(
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
         "origin_class, speech_act, speech_act_confidence, assertion_provenance, "
-        "durability, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "durability, expires_at, preference_domain) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             memory_id,
             created_at,
@@ -404,6 +407,7 @@ async def create_metadata(
             assertion_provenance,
             durability,
             canonical_iso(expires_at),
+            preference_domain,
         ),
     )
     await db.commit()

@@ -133,6 +133,7 @@ class MemoryStore:
         assertion_provenance: str | None = None,
         durability: str | None = None,
         expires_at: str | None = None,
+        preference_domain: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -418,12 +419,14 @@ class MemoryStore:
             # join (as origin_class's FTS fallback is), and a consumer that
             # needs vector-path parity owns adding it to the payload + the
             # re-embed recovery path together.
-            # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
+            # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl
+            # / mw-4-preference-domain / mw-5-speech-act-protection)
             speech_act=speech_act,
             speech_act_confidence=speech_act_confidence,
             assertion_provenance=assertion_provenance,
             durability=durability,
             expires_at=expires_at,
+            preference_domain=preference_domain,
         )
 
         # Mechanical code anchors (entity layer) — regex-only, every write

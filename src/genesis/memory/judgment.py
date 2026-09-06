@@ -76,6 +76,31 @@ def normalize_provenance(value: object) -> str | None:
     return None
 
 
+def normalize_preference_domain(value: object, *, speech_act: str) -> str | None:
+    """Coerce an LLM ``preference_domain`` qualifier; None unless it qualifies a preference.
+
+    Open vocabulary BY DESIGN — domains are an open set ("work", "vehicles",
+    "food"), so this normalizes shape (strip, lowercase, collapse inner
+    whitespace) rather than validating membership. Dropped entirely when the
+    ``speech_act`` is not ``preference``: the domain qualifies a preference,
+    and a stray domain on a claim is noise that would dilute the column.
+    Consumer: MW-4 ranking — a conflict between two preferences that carry
+    different domains dissolves into two coexisting scoped statements instead
+    of newest-wins. # GROUNDWORK(mw-4-preference-domain)
+
+    ACCEPTED: ``speech_act`` here is the NORMALIZED value, and
+    ``normalize_speech_act`` is exact-match — so an LLM emitting "Preference"
+    lands as "observation" and loses the domain with it. Case-folding there
+    would also promote "Rule"/"Decision" into PROTECTED_SPEECH_ACTS, changing
+    protection eligibility; that is an MW-1/MW-5 decision, not this
+    satellite's. Locked by test_capitalized_speech_act_normalizes_away.
+    """
+    if speech_act != "preference" or not isinstance(value, str):
+        return None
+    domain = " ".join(value.split()).lower()
+    return domain or None
+
+
 def clamp_unit(value: object, default: float = 0.5) -> float:
     """Coerce a confidence to [0.0, 1.0]; non-numeric → ``default``."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
