@@ -32,6 +32,7 @@ param(
     [switch]$Install,
     [switch]$Uninstall,
     [switch]$Clear,
+    [switch]$Stop,
     [string]$StateDir = "",
     [int]$PollMs = 40,
     [int]$BeatSeconds = 5
@@ -52,7 +53,39 @@ if ($Clear) {
     exit 0
 }
 
+function Stop-GenesisWatcher {
+    <#
+      .SYNOPSIS
+        Ask a running watcher to exit, then verify it did.
+      .DESCRIPTION
+        Stop-ScheduledTask cannot do this: the wscript launcher has already
+        exited, so the task owns nothing. Signal politely via a stop file, then
+        confirm by PID and kill if the loop is wedged. Verifying rather than
+        assuming, because an orphaned poller is invisible in the task list.
+    #>
+    $stop = [System.IO.Path]::Combine($StateDir, "watcher.stop")
+    $pidf = [System.IO.Path]::Combine($StateDir, "watcher.pid")
+    if (-not (Test-Path $pidf)) { return "no watcher pid recorded" }
+    $wpid = [int]((Get-Content $pidf -Raw).Trim())
+    Set-Content -Path $stop -Value "stop" -Encoding utf8
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 250
+        if (-not (Get-Process -Id $wpid -ErrorAction SilentlyContinue)) {
+            Remove-Item $pidf -Force -ErrorAction Ignore
+            return "stopped pid $wpid"
+        }
+    }
+    Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue
+    Remove-Item $pidf, $stop -Force -ErrorAction Ignore
+    return "pid $wpid ignored the stop file and was killed"
+}
+
+if ($Stop) { Stop-GenesisWatcher; exit 0 }
+
 if ($Uninstall) {
+    # Stop FIRST. Unregistering a task does not kill a process it no longer
+    # owns, so uninstalling without this silently leaves the poller running.
+    Stop-GenesisWatcher
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Ignore
     if (-not $t) { "NOT_REGISTERED $TaskName"; exit 0 }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -89,8 +122,26 @@ public static class GenesisKeys {
 
 $VK_ESCAPE = 0x1B
 $lastBeat = [DateTime]::MinValue
+$StopPath = [System.IO.Path]::Combine($StateDir, "watcher.stop")
+Remove-Item $StopPath -Force -ErrorAction Ignore
+
+# Own PID recorded so a stopper can fall back to killing us if the polite
+# route is ignored (a wedged loop still needs to die).
+Set-Content -Path ([System.IO.Path]::Combine($StateDir, "watcher.pid")) -Value $PID -Encoding utf8
 
 while ($true) {
+    # Under the wscript shim, Task Scheduler does NOT own this process: the
+    # launcher exits immediately, the task reports finished, and
+    # Stop-ScheduledTask therefore cannot stop us. Without a signal of our own
+    # every install/start cycle leaves another poller behind - MEASURED, six of
+    # them accumulated during one afternoon of testing, none visible as a
+    # running task. This is the cost of the no-console shim, paid here.
+    if (Test-Path $StopPath) {
+        Remove-Item $StopPath -Force -ErrorAction Ignore
+        Remove-Item ([System.IO.Path]::Combine($StateDir, "watcher.pid")) -Force -ErrorAction Ignore
+        exit 0
+    }
+
     # 0x8000 = down RIGHT NOW. 0x0001 = pressed since this process last asked.
     # Both are needed: a quick tap between polls is released before the next
     # poll sees it, so checking only the high bit would silently miss exactly
