@@ -15,9 +15,18 @@
 #
 # Reader/writer semantics come from flock(2) itself: `-s` holders coexist with
 # each other and exclude `-x`, so a deploy waits for in-flight validations and
-# a validation waits for an in-flight deploy. The lock dies with the process
-# (kernel-released fd) — no stale-lock state is possible, the same property
-# pytest_lock.py documents for the test lock.
+# a validation waits for an in-flight deploy. There is no lock FILE to go stale:
+# the kernel releases the lock when the last copy of the fd closes, so a crashed
+# or SIGKILLed holder needs no cleanup — the same property pytest_lock.py
+# documents for the test lock.
+#
+# That is NOT the same as "no stale hold is possible", and the earlier wording
+# here said so wrongly. An fd is inherited by children, and the lock survives
+# until EVERY copy closes — so a process that outlives its parent keeps the hold.
+# MEASURED 2026-09-06: a backgrounded grandchild held the lock after the
+# acquiring script exited, and a new acquirer was refused. Two consequences the
+# callers handle rather than the lib: run_under_deploy_lock.sh closes the fd in
+# the wrapped command, and the guardian renewer's residue is bounded (below).
 #
 # RECEIPTS: every deploy/validation appends one JSON line to
 # ~/.genesis/deploy_receipts.jsonl — {ts, status, sha, path, by, note?} —
@@ -45,8 +54,10 @@ DEPLOY_LOCK_HELD_RC=200
 _DEPLOY_RECEIPTS_KEEP=2000
 
 # _acquire_deploy_lock <-x|-s> <wait_seconds>
-#   Opens the lock fd (kept in _DEPLOY_LOCK_FD; kernel-released on process
-#   exit, inherited by exec'd children so a wrapped command keeps the hold)
+#   Opens the lock fd (kept in _DEPLOY_LOCK_FD; kernel-released when the LAST
+#   copy of the fd closes — the acquiring process's own copy is what holds it
+#   for the duration, so a caller that runs a child does NOT need the child to
+#   inherit it, and should close it in the child: see the leak note below)
 #   and blocks up to <wait_seconds> for the requested mode. Returns 0 holding
 #   the lock, DEPLOY_LOCK_HELD_RC on timeout, 1 on setup failure.
 #   Callers pick the wait: deploys use a short bound (a stuck deploy should
@@ -56,9 +67,16 @@ _acquire_deploy_lock() {
     mkdir -p "$(dirname "$GENESIS_DEPLOY_LOCK")" || return 1
     # Append-mode open: never truncates, and works for shared holders too.
     exec {_DEPLOY_LOCK_FD}>>"$GENESIS_DEPLOY_LOCK" || return 1
-    if ! flock "$mode" -w "$wait_s" "$_DEPLOY_LOCK_FD"; then
+    local flock_rc=0
+    flock "$mode" -w "$wait_s" "$_DEPLOY_LOCK_FD" || flock_rc=$?
+    if [ "$flock_rc" -ne 0 ]; then
         exec {_DEPLOY_LOCK_FD}>&-
-        return "$DEPLOY_LOCK_HELD_RC"
+        # flock exits 1 when the timeout expires — that, and only that, is
+        # contention. Anything else (a usage error, EMFILE, a signal) is a SETUP
+        # failure, and reporting it as "the lock is held" sends the operator
+        # hunting for a holder that does not exist (Kimi P3, 2026-09-06).
+        [ "$flock_rc" -eq 1 ] && return "$DEPLOY_LOCK_HELD_RC"
+        return 1
     fi
     return 0
 }
@@ -107,6 +125,33 @@ with open(os.environ["RECEIPT_OUT"], "a", encoding="utf-8") as f:
 PY
     then
         echo "  WARNING: deploy receipt not written ($GENESIS_DEPLOY_RECEIPTS)" >&2
+    fi
+    return 0
+}
+
+# prune_deploy_receipts
+#   Trim the receipts ledger to the newest _DEPLOY_RECEIPTS_KEEP lines. Lives
+#   HERE, beside the append it bounds, rather than inline in disk_hygiene.sh:
+#   the unbounded-growth it prevents is this file's own, the cap constant is
+#   this file's, and inline in the groom script it was unreachable by any test —
+#   so a drift in the tail/wc logic would silently stop pruning and nothing
+#   would notice until the ledger was huge (Kimi P3, 2026-09-06).
+#   Takes the lock EXCLUSIVE (nonblocking) so the rewrite cannot interleave with
+#   an append: a busy station skips today's prune and bounded growth resumes
+#   tomorrow, which is the right trade for a daily groom — queueing it behind a
+#   2h validation hold would be backwards.
+#   Returns 0 when it pruned or had nothing to do, 2 when the station was busy.
+prune_deploy_receipts() {
+    [ -f "$GENESIS_DEPLOY_RECEIPTS" ] || return 0
+    acquire_deploy_lock_ex 0 || return 2
+    # A .tmp orphaned by a kill between tail and mv would sit forever; clear it
+    # before (re)writing.
+    rm -f "$GENESIS_DEPLOY_RECEIPTS.tmp"
+    local lines
+    lines="$(wc -l < "$GENESIS_DEPLOY_RECEIPTS" 2>/dev/null || echo 0)"
+    if [ "$lines" -gt "$_DEPLOY_RECEIPTS_KEEP" ]; then
+        tail -n "$_DEPLOY_RECEIPTS_KEEP" "$GENESIS_DEPLOY_RECEIPTS" > "$GENESIS_DEPLOY_RECEIPTS.tmp" \
+            && mv "$GENESIS_DEPLOY_RECEIPTS.tmp" "$GENESIS_DEPLOY_RECEIPTS"
     fi
     return 0
 }

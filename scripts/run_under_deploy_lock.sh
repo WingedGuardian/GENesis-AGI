@@ -88,13 +88,35 @@ fi
 rc=0
 "acquire_deploy_lock_$MODE" "$WAIT_S" || rc=$?
 if [ "$rc" -ne 0 ]; then
-    echo "ERROR: deploy lock not acquired within ${WAIT_S}s ($GENESIS_DEPLOY_LOCK, mode $MODE)." >&2
+    # Same split deploy_code_only.sh makes: only a timeout means a holder exists.
+    if [ "$rc" -eq "$DEPLOY_LOCK_HELD_RC" ]; then
+        echo "ERROR: deploy lock not acquired within ${WAIT_S}s ($GENESIS_DEPLOY_LOCK, mode $MODE)." >&2
+    else
+        echo "ERROR: could not open the deploy lock ($GENESIS_DEPLOY_LOCK, mode $MODE)." >&2
+    fi
     exit "$rc"
 fi
 
-SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+SHA=""
+if [ "$RECEIPT" -eq 1 ]; then
+    # Read the SHA only when a receipt will use it. Computed unconditionally, a
+    # `set -e` abort here would kill a plain `-- make test` run over a value that
+    # would never have been read (Kimi P3, 2026-09-06).
+    SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+fi
 cmd_rc=0
-"$@" || cmd_rc=$?
+# Run the command WITHOUT the lock fd. The hold does not depend on inheritance —
+# this process keeps its own copy open for the whole wait — but inheritance is a
+# LEAK CHANNEL: a wrapped command that leaves a background process behind (an E2E
+# suite orphaning a helper is the ordinary case) hands that orphan a duplicate of
+# the fd, and flock is released only when the LAST copy closes. The orphan then
+# holds the lock after this script exits, so every later deploy queues its full
+# --wait and fails with a message naming no holder, until someone finds the stray
+# pid by hand. MEASURED 2026-09-06: an inherited copy does keep the lock after the
+# acquirer exits, and closing it in the child releases it as expected.
+# update.sh:784 already carries this exact guard for its nohup fallback, pinned by
+# test_nohup_fallback_closes_lock_fd — this is that known class, not a new theory.
+"$@" {_DEPLOY_LOCK_FD}>&- || cmd_rc=$?
 if [ "$RECEIPT" -eq 1 ] && [ "$cmd_rc" -eq 0 ]; then
     append_deploy_receipt "validated" "$SHA" "validation"
 fi

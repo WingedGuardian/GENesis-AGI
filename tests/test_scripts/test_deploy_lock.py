@@ -19,6 +19,7 @@ The #1699 acceptance criteria covered here:
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -129,6 +130,33 @@ def _hold_lock(env, mode: str, seconds: float) -> subprocess.Popen:
     return p
 
 
+def _alive(pid: int) -> bool:
+    """Is `pid` still running? Used to prove a leak test is not vacuous — an
+    orphan that has already exited releases the lock, so an assertion made after
+    it dies proves nothing about the fix under test.
+
+    Refuses pid <= 1: signal 0 to pid 1 is a live-process probe of init, and the
+    NEGATIVE forms are catastrophic in a container (kill(-1) hits every process
+    this user owns). A pid that small means the fixture failed to record a real
+    one, which is a test bug to surface, not to signal.
+    """
+    if pid <= 1:
+        raise AssertionError(f"refusing to probe implausible pid {pid}")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _kill(pid: int) -> None:
+    """Teardown kill with the same pid-sanity floor as _alive."""
+    if pid <= 1:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, 9)
+
+
 def _receipts(env) -> list[dict]:
     p = Path(env["GENESIS_DEPLOY_RECEIPTS"])
     if not p.exists():
@@ -226,7 +254,6 @@ class TestCodeOnlyWrapper:
         )
         # …and cleaned on exit, with the advisory window marker
         assert not (station["home"] / ".genesis" / "update_state.json").exists()
-        assert not (station["home"] / ".genesis" / "deploy_window.json").exists()
 
     def test_health_fail_alerts_and_holds(self, station):
         env, sha, shims = station["env"], station["sha"], station["shims"]
@@ -266,7 +293,6 @@ class TestCodeOnlyWrapper:
             )
             assert r.returncode == LOCK_HELD_RC
             assert not (station["home"] / ".genesis" / "update_state.json").exists()
-            assert not (station["home"] / ".genesis" / "deploy_window.json").exists()
             assert _receipts(env) == []
         finally:
             holder.wait()
@@ -293,7 +319,6 @@ class TestCodeOnlyWrapper:
         p.terminate()
         p.wait(timeout=15)
         assert not state.exists(), "SIGTERM must run the cleanup trap"
-        assert not (station["home"] / ".genesis" / "deploy_window.json").exists()
 
     def test_refuses_foreign_unfinished_state(self, station):
         """REFUSE-DON'T-CLOBBER (architect SF1): update.sh's crash/conflict
@@ -549,3 +574,218 @@ class TestReceipts:
             ("validated", "sha1"),
         ], "receipts must append in order — the ledger's ordering IS the claim"
         assert all(r["ts"] for r in rows)
+
+
+class TestLockFdIsNotLeakedToChildren:
+    """The lock is released when the LAST copy of the fd closes — so any process
+    that outlives its parent holding an inherited copy keeps the whole station
+    blocked, with no lock file to clean up and no holder named in the error.
+
+    This is not theory: MEASURED 2026-09-06, a backgrounded grandchild held the
+    flock after the acquiring script exited and a fresh acquirer was refused.
+    update.sh already guards its own nohup fallback for exactly this reason
+    (test_update_mutex.test_nohup_fallback_closes_lock_fd) — these are the two
+    remaining places that hand the fd to something that can outlive them.
+    """
+
+    def test_wrapped_command_child_cannot_hold_the_lock_after_exit(self, station):
+        """A validation whose command leaks a background process (an E2E suite
+        orphaning a helper is the ordinary case) must not block every later
+        deploy until someone hunts down the stray pid.
+
+        NOTE FOR ANYONE EDITING THIS: the orphan's stdout/stderr MUST be
+        redirected away from the pipe, and the assertion MUST happen while the
+        orphan is still alive. The first version of this test did neither, so
+        ``subprocess.run(capture_output=True)`` blocked until the orphan closed
+        the inherited pipe — i.e. it slept out the entire leak and then asserted
+        on a lock that had just been released. It passed against the UNFIXED
+        wrapper. Only running the mutation exposed it.
+        """
+        env = station["env"]
+        pidfile = station["tmp"] / "orphan.pid"
+        r = subprocess.run(
+            [
+                "bash",
+                str(_RUN_UNDER),
+                "--shared",
+                "--wait",
+                "5",
+                "--",
+                # The leak: a grandchild that outlives the wrapped command. Its
+                # std fds go to /dev/null so the ONLY thing it can still hold is
+                # the lock fd — which is the whole subject of the test.
+                "bash",
+                "-c",
+                f'( sleep 60 ) >/dev/null 2>&1 & echo $! > "{pidfile}"',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        orphan = int(pidfile.read_text().strip())
+        try:
+            assert _alive(orphan), (
+                "the orphan died before the assertion — this test would pass "
+                "vacuously; see the note in the docstring"
+            )
+            acq = subprocess.run(
+                ["bash", "-c", f'source "{_LIB}"; acquire_deploy_lock_ex 0'],
+                env=env,
+            )
+            assert acq.returncode == 0, (
+                "an orphaned grandchild of the wrapped command is still holding "
+                "the deploy lock — every later deploy would queue its full "
+                "--wait and fail naming no holder"
+            )
+        finally:
+            _kill(orphan)
+
+    def test_guardian_renewer_does_not_hold_the_lock(self, station):
+        """A SIGKILLed deploy leaves its guardian renewer running (bounded at
+        RENEW_MAX x TTL/2 ~ 10 min). If that orphan inherited the EXCLUSIVE lock
+        fd, a retry on the default 600s wait can time out against a deploy that
+        is already dead.
+
+        This drives the REAL ``_guardian_pause`` — an inline stand-in for how it
+        backgrounds the renewer would grade bash, not this repo's code.
+        """
+        env, home, root, shims = (
+            station["env"],
+            station["home"],
+            station["root"],
+            station["shims"],
+        )
+        key = home / "fake_key"
+        key.write_text("k")
+        (home / ".genesis" / "guardian_remote.yaml").write_text(
+            f"host_ip: 127.0.0.1\nhost_user: tester\nssh_key: {key}\n"
+        )
+        _write_exec(
+            root / ".venv" / "bin" / "python",
+            "#!/bin/bash\n"
+            'case "$2" in\n'
+            "  *host_ip*) echo 127.0.0.1 ;;\n"
+            "  *host_user*) echo tester ;;\n"
+            f"  *ssh_key*) echo {key} ;;\n"
+            "esac\n",
+        )
+        _write_exec(shims / "ssh", "#!/bin/bash\nexit 0\n")
+        lib_g = _SCRIPTS / "lib" / "guardian_pause.sh"
+        pidfile = station["tmp"] / "renew.pid"
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'VENV_DIR="{root}/.venv"; GENESIS_ROOT="{root}"; '
+                f'source "{_LIB}"; source "{lib_g}"; '
+                "acquire_deploy_lock_ex 5 || exit 9; "
+                "GUARDIAN_PAUSE_TTL=300; _guardian_pause; "
+                f'echo "$_GUARDIAN_RENEW_PID" > "{pidfile}"',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout} stderr={r.stderr}"
+        raw = pidfile.read_text().strip()
+        assert raw, "no renewer was started — this test would prove nothing"
+        renewer = int(raw)
+        try:
+            assert _alive(renewer), "the renewer exited before the assertion — vacuous otherwise"
+            acq = subprocess.run(
+                ["bash", "-c", f'source "{_LIB}"; acquire_deploy_lock_ex 0'],
+                env=env,
+            )
+            assert acq.returncode == 0, (
+                "the orphaned guardian renewer is holding the exclusive lock after its deploy died"
+            )
+        finally:
+            _kill(renewer)
+
+
+class TestLockErrorsAreReportedHonestly:
+    def test_only_a_timeout_reports_as_contention(self, station):
+        """`flock` exits 1 on timeout and something else on a setup failure
+        (64 for a usage error, measured). Mapping every failure to
+        DEPLOY_LOCK_HELD_RC sends an operator hunting for a holder that does not
+        exist."""
+        env = station["env"]
+        held = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; _acquire_deploy_lock -x 0'],
+            env=env,
+        )
+        assert held.returncode == 0, "uncontended: should acquire"
+        broken = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; _acquire_deploy_lock --not-a-mode 0'],
+            env=env,
+            capture_output=True,
+        )
+        assert broken.returncode != LOCK_HELD_RC, (
+            "a flock usage error must not be reported as 'the lock is held'"
+        )
+        assert broken.returncode == 1
+
+
+class TestReceiptsPrune:
+    def test_prunes_to_the_cap_keeping_the_newest(self, station):
+        env = station["env"]
+        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
+        keep = int(
+            subprocess.run(
+                ["bash", "-c", f'source "{_LIB}"; echo "$_DEPLOY_RECEIPTS_KEEP"'],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        )
+        receipts.write_text("".join(f'{{"n": {i}}}\n' for i in range(keep + 5)))
+        r = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        rows = [json.loads(x) for x in receipts.read_text().splitlines() if x.strip()]
+        assert len(rows) == keep
+        assert rows[-1]["n"] == keep + 4, "the NEWEST receipts are the ones kept"
+        assert not (receipts.parent / f"{receipts.name}.tmp").exists()
+
+    def test_under_the_cap_is_left_alone(self, station):
+        env = station["env"]
+        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
+        receipts.write_text('{"n": 0}\n{"n": 1}\n')
+        subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
+            env=env,
+            check=True,
+        )
+        assert receipts.read_text() == '{"n": 0}\n{"n": 1}\n'
+
+    def test_busy_station_skips_rather_than_queues(self, station):
+        """A daily groom must never queue behind a 2h validation hold."""
+        env = station["env"]
+        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
+        receipts.write_text('{"n": 0}\n')
+        holder = _hold_lock(env, "sh", 1.5)
+        try:
+            r = subprocess.run(
+                ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
+                env=env,
+            )
+            assert r.returncode == 2, "busy station must report skip, not success"
+        finally:
+            holder.wait()
+
+    def test_disk_hygiene_calls_the_lib_not_its_own_copy(self):
+        """The prune moved into the lib so it could be tested; the groom must
+        CALL it rather than keep a second implementation (replica drift)."""
+        text = (_SCRIPTS / "disk_hygiene.sh").read_text()
+        assert "prune_deploy_receipts" in text
+        assert "_DEPLOY_RECEIPTS_KEEP" not in text, (
+            "the cap belongs to the lib; a copy here would drift"
+        )

@@ -15,7 +15,6 @@
 #   validation runs' shared holds — scripts/lib/deploy_lock.sh)
 #   → update_state.json (env.update_in_progress() → watchdog stands down;
 #     PID-liveness + 4h staleness make it self-healing if we crash)
-#   → advisory deploy-window marker (~/.genesis/deploy_window.json)
 #   → guardian gateway pause, short TTL, bounded renewer (lib/guardian_pause.sh)
 #   → git pull --ff-only (skip with --no-pull) → pip install -e . → restart
 #   → health verify (endpoint + unit) → deployed-SHA receipt.
@@ -57,7 +56,14 @@ fi
 GENESIS_ROOT="${GENESIS_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STATE_FILE="$HOME/.genesis/update_state.json"
-WINDOW_FILE="$HOME/.genesis/deploy_window.json"
+# NOTE: an earlier revision also wrote ~/.genesis/deploy_window.json. It was
+# removed rather than wired: nothing anywhere read it, and every field it carried
+# (active/started_at/pid) is already in STATE_FILE — which additionally carries
+# `phase` and `path` and IS read, by env.update_in_progress(). Two markers
+# holding the same fact, one of them unread, is the replica-drift shape this
+# repo keeps paying for; and on SIGKILL the unread one leaked `{"active": true}`
+# with nothing to reconcile it, so a future reader could have taken a dead run
+# for a live deploy window (Kimi P3, 2026-09-06).
 HEALTH_URL="http://localhost:5000/api/genesis/health"
 
 # Same refusal update.sh makes, same reason: pip install -e from a worktree
@@ -85,6 +91,10 @@ source "$_SELF_DIR/lib/deploy_lock.sh"
 # Short pause window: this path's server-DOWN span is one restart (seconds),
 # not update.sh's stop→merge→bootstrap span. Renewer bound unchanged (~10min
 # worst-case silence if we are SIGKILLed; host expires_at is the hard TTL).
+# shellcheck disable=SC2034  # consumed by lib/guardian_pause.sh's `:=` default,
+# which is sourced on the NEXT line — shellcheck cannot follow that and reports
+# it unused. Silenced explicitly so a real unused-variable warning here is not
+# lost in known noise.
 GUARDIAN_PAUSE_TTL=300
 # shellcheck source=lib/guardian_pause.sh
 source "$_SELF_DIR/lib/guardian_pause.sh"
@@ -134,7 +144,7 @@ _cleanup() {
             "code-only" "failed at $_PHASE"
     fi
     _guardian_resume
-    rm -f "$STATE_FILE" "$WINDOW_FILE" 2>/dev/null || true
+    rm -f "$STATE_FILE" 2>/dev/null || true
 }
 
 echo ""
@@ -175,10 +185,24 @@ trap _cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 _write_state "code-only"
-printf '{"active": true, "started_at": "%s", "pid": %s}\n' "$(date -Iseconds)" "$$" > "$WINDOW_FILE"
 _guardian_pause
 
 if [ "$DO_PULL" -eq 1 ]; then
+    # `git pull --ff-only` advances whatever branch is CHECKED OUT, but every
+    # artifact around it — this log line, the receipt, the SKILL contract, and
+    # the operator's belief — says "main". If the serving checkout was left on
+    # another branch (a manual rollback, an interrupted intervention), the old
+    # code deployed and receipted THAT branch while reporting main: a false
+    # entry in the ledger built to make deploy claims trustworthy. Refuse
+    # instead of guessing; --no-pull remains the deliberate escape for a
+    # deploy of an already-checked-out tree (Kimi P3, 2026-09-06).
+    _BRANCH="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || echo "")"
+    if [ "$_BRANCH" != "main" ]; then
+        echo "ERROR: refusing to pull — $GENESIS_ROOT is on '${_BRANCH:-a detached HEAD}', not main." >&2
+        echo "       A pull here would advance and receipt that branch while reporting main." >&2
+        echo "       Check main out, or re-run with --no-pull to deploy the tree as it stands." >&2
+        exit 1
+    fi
     echo "  Pulling main (ff-only)…"
     git -C "$GENESIS_ROOT" pull --ff-only
     _PHASE="pulled"

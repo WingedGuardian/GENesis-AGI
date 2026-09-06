@@ -154,30 +154,19 @@ main() {
 
     echo "--- deploy receipts retention prune (newest lines kept) ---"
     # ~/.genesis/deploy_receipts.jsonl (lib/deploy_lock.sh) grows one line per
-    # deploy/validation. Every APPEND happens under the deploy-station lock
-    # (update.sh + deploy_code_only.sh hold it exclusive, validation holds hold
-    # it shared), so holding it EXCLUSIVE here makes the tail+mv rewrite
-    # race-free. Nonblocking on purpose: a busy station skips today's prune —
-    # bounded growth resumes tomorrow; queueing a daily groom behind a 2h
-    # validation hold would be backwards.
+    # deploy/validation. The prune itself lives in that lib, beside the append it
+    # bounds and where tests can reach it; this is the daily call site. Subshell:
+    # the lib is sourced for this block only, and its lock fd dies with it.
     (
         # shellcheck source=lib/deploy_lock.sh
         source "$REPO_DIR/scripts/lib/deploy_lock.sh"
-        # The lib's env-derived path is the one source of truth — an outer
-        # $HOME-literal guard would diverge under an override.
-        [ -f "$GENESIS_DEPLOY_RECEIPTS" ] || exit 0
-        if acquire_deploy_lock_ex 0; then
-            # A .tmp orphaned by a prior kill between tail and mv would sit
-            # forever; clear it before (re)writing.
-            rm -f "$GENESIS_DEPLOY_RECEIPTS.tmp"
-            if [ "$(wc -l < "$GENESIS_DEPLOY_RECEIPTS" 2>/dev/null || echo 0)" -gt "$_DEPLOY_RECEIPTS_KEEP" ]; then
-                tail -n "$_DEPLOY_RECEIPTS_KEEP" "$GENESIS_DEPLOY_RECEIPTS" > "$GENESIS_DEPLOY_RECEIPTS.tmp" \
-                    && mv "$GENESIS_DEPLOY_RECEIPTS.tmp" "$GENESIS_DEPLOY_RECEIPTS"
-            fi
-        else
-            echo "deploy receipts prune skipped (deploy station busy)"
-        fi
-    ) || echo "deploy receipts prune exited $?"
+        prune_deploy_receipts
+        case $? in
+            0) ;;
+            2) echo "deploy receipts prune skipped (deploy station busy)" ;;
+            *) echo "deploy receipts prune exited $?" ;;
+        esac
+    ) || echo "deploy receipts prune subshell exited $?"
 
     echo "--- contributor work-log terminal-row prune (>30d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \
