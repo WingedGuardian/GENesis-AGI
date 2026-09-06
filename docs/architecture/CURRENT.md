@@ -268,9 +268,34 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51f9a358 2026-09-05
+verified: f24c15e9e 2026-09-05
 ```
 
+- **The slot door heals a bare slot — by CONSENT, never silently**
+  (`scripts/cc-slot.sh`, the block above every latch; probe:
+  `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —
+  never `#{pane_current_command}`, which reports `bash` for the canonical
+  launch WHILE claude runs). A slot existing as a bare shell made
+  `new-session -A` silently attach and discard the launch command — the
+  operator landed at a prompt, every time, for weeks. The door now probes,
+  DISCLOSES what it found (a no-tty entry gets the report and the manual
+  route, nothing more), and on an explicit `[y/N]`-default-no at a real
+  terminal kills the session BY ID so the untouched create path rebuilds it.
+  Safety is three MEASURED tmux-3.4 properties: within one server, session
+  ids are never reused (kill-by-id is a compare-and-swap; a stale id is a
+  refused no-op); across server GENERATIONS the id counter RESTARTS at $0 —
+  measured by falsifying the naive design — which is why the server-PID
+  compare is load-bearing; and one `list-panes -s` call is one consistent
+  state, so the human wait sits between two snapshots, never between a read
+  and the kill. Consent binds to the DISCLOSED state: server pid, session id,
+  the attachment+pane-command projection, and a fresh POISONED verdict must
+  all re-derive identically after the yes, or the door stands down and `-A`
+  absorbs the interleaving. Every failure direction lands on ATTACH. The
+  block sits ABOVE `existing`/`_SESSION_EXISTS`/the capacity and OAuth gates
+  so each reads post-kill reality on its only read — the staleness class that
+  took the predecessor design through 7 review rounds is retired by
+  construction. Forbidden mechanisms are test-pinned (no send-keys /
+  respawn-pane / set-environment; exactly one new-session invocation).
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
   recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
   admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
