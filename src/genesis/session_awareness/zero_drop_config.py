@@ -73,6 +73,14 @@ DEFAULTS: dict[str, Any] = {
     # n == limit records a loud 'limit_hit' and FREEZES the branch classes
     # rather than guessing at the tail.
     "max_prs": 2000,
+    # Local ancestry probes per sweep, testing a branch tip against the head
+    # SHA its merged/closed PR recorded. Each is one local `merge-base` on two
+    # resolved commits. MEASURED 2026-09-06: 4 needed on this install (217
+    # refs / 1665 PRs), so 40 is ~10x headroom. Exceeding the cap can only ADD
+    # findings — an untested pair reads as unconfirmable and FLAGS — so a
+    # repository that needs more says so on the board rather than silently
+    # under-reporting.
+    "max_ancestry_probes": 40,
     "max_listed": 10,  # findings named inline in the alert observation
     "alert_priority": "medium",
 }
@@ -83,6 +91,7 @@ _INT_KNOBS = (
     "worktree_min_age_hours",
     "escalation_k",
     "max_prs",
+    "max_ancestry_probes",
     "max_listed",
 )
 

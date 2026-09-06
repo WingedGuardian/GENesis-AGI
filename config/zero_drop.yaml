@@ -65,6 +65,14 @@ escalation_k: 3
 # FREEZES the branch classes for that run rather than guessing at the tail.
 max_prs: 2000
 
+# Local ancestry probes per sweep. Each tests one branch tip against the head
+# SHA a merged/closed PR recorded, to answer "did that PR actually contain
+# these commits?" without trusting the branch NAME. One local merge-base each,
+# no network. MEASURED 2026-09-06: 4 needed on this install (217 refs / 1665
+# PRs). Going over the cap can only ADD findings — an untested pair reads as
+# unconfirmable and is flagged — so the cap never hides work.
+max_ancestry_probes: 40
+
 # Findings named inline in the alert observation (the full count is always
 # stated alongside, so the cap is a display selection, never the denominator).
 max_listed: 10

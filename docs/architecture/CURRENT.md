@@ -1497,7 +1497,12 @@ verified: 29a382e7 2026-09-03
   reconciler behind the zero-drop rule: "what work has fallen through the
   cracks?" is answered by ENUMERATION, never by a session that remembers.
   Spawned beside the repo-pulse worker at SessionStart boundaries (never
-  clear; `GENESIS_ZERO_DROP_DISABLED=1` kill switch) and once a day by
+  clear; `GENESIS_ZERO_DROP_DISABLED=1` suppresses THAT spawn only — a
+  per-process variable cannot be a system-wide off switch, and one honoured on
+  every trigger would stop the heartbeat while the health manifest, unable to
+  read another process's env, went on expecting it: a permanent false overdue
+  alarm. Config `enabled: false` / `mode: off` is the real kill switch, and it
+  is what `_subsystem_enabled` reads) and once a day by
   `disk_hygiene.sh` as the wall-clock floor, `scripts/zero_drop_worker.py`
   detaches into `session_awareness/zero_drop_worker.py`: GLOBAL flock + 60-min
   silent debounce under `~/.genesis/zero_drop/`. It is a SIBLING of the pulse
@@ -1515,17 +1520,32 @@ verified: 29a382e7 2026-09-03
   work). MEASURED 2026-09-05: 209 refs + 1651 PRs + 161 worktrees in ~14s.
   Classification (`zero_drop.py`, pure): this repo squash-merges, so every
   merged branch reads permanently ahead — a naive ahead-count query was ~12%
-  precise (145 candidates, ~18 real). Precision comes from a head-ref-name PR
-  join: an OPEN PR covers the branch; a MERGED PR covers it ONLY if the merge
-  POSTDATES the local tip (head-ref names are reused — 35 of 1586 — and commits
-  land after a merge; the guard cost 1 of 115 suppressions and that one was a
-  TRUE positive); a CLOSED-unmerged PR is suppressed but COUNTED. No prefix
-  denylists by design — a backup branch is ACKED with a reason instead, leaving
-  a record rather than an invisible rule. Age gates: 12h on the branch tip, 6h
-  on the newest DIRTY FILE (not the tip — an old tip with a fresh edit is
-  somebody typing). Classes: `unpushed_branch` | `pushed_no_pr` |
-  `dirty_worktree` (a detached worktree keys on `@detached:<path>`, which no
-  ref name can collide with).
+  precise (145 candidates, ~18 real). A head-ref-NAME PR join is what recovers
+  precision, but it is evidence about the PIPELINE, never proof the work
+  landed: verdicts are ordered by EVIDENCE STRENGTH, and a name never outranks
+  a SHA. (1) `headRefOid == tip` — the PR merged exactly this commit, MEASURED
+  2026-09-06 for 119 of 123 merged-covered branches. (2) ancestry — the tip is
+  reachable from the merged head (`is_ancestor`, local, three-valued: a missing
+  object is UNANSWERABLE, never False). (3) push state from `ls-remote`'s SHA —
+  tip == remote tip means nothing here is local-only, whatever the PRs say;
+  tip diverged (and not merely behind, merges excluded) means local-only
+  commits are PROVEN and NO PR on that ref can cover them. (4) the `mergedAt` /
+  `closedAt` time guards, demoted to confirming a tip already known pushed.
+  (5) the name join itself — indexing only, scoped to head refs in THIS repo so
+  a fork PR cannot cover a same-named local branch. Unresolvable coverage is
+  FLAGGED with the resolving command (`refs/pull/<n>/head`), never suppressed;
+  an unresolvable PUSH state is HELD (neither flagged nor resolved). MEASURED
+  2026-09-06 on 217 refs: the older name-join-as-proof suppressed 5 branches
+  holding commits that exist on no remote — 4 behind CLOSED PRs, 1 behind an
+  OPEN one. No prefix denylists by design — a backup branch is ACKED with a
+  reason instead, leaving a record rather than an invisible rule. Age gates:
+  12h on the branch tip, 6h on the newest DIRTY FILE (not the tip — an old tip
+  with a fresh edit is somebody typing). Classes follow the COMMITS, not the
+  name: `unpushed_branch` (commits on no remote) | `pushed_no_pr` (safe, but in
+  no pipeline) | `dirty_worktree` (a detached worktree keys on
+  `@detached:<path>`, which no ref name can collide with; an identity carrying
+  a control character is quarantined and counted, never stored, because the
+  identity is the ack key and a key must round-trip unsanitised).
   Store: `zero_drop_findings` (migration 20260905215957, mirrored in
   `_tables.py`; CRUD `db/crud/zero_drop.py`). Identity is `UNIQUE(class,
   branch)` — never the SHA, which would fork the row on every commit and

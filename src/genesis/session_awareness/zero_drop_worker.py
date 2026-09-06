@@ -41,7 +41,6 @@ import fcntl
 import json
 import logging
 import os
-import re
 import tempfile
 import time
 import uuid
@@ -55,9 +54,18 @@ from genesis.session_awareness.zero_drop import (
     CLASS_DIRTY,
     CLASS_PUSHED_NO_PR,
     CLASS_UNPUSHED,
+    PUSH_ABSENT,
+    PUSH_BEHIND,
+    PUSH_DIVERGED,
+    PUSH_EXACT,
+    PUSH_UNKNOWN,
     classify_branches,
     classify_worktrees,
+    index_prs_by_head,
     worktree_identity,
+)
+from genesis.session_awareness.zero_drop import (
+    neutralise as _neutralise,
 )
 from genesis.session_awareness.zero_drop_config import (
     alert_priority,
@@ -66,8 +74,10 @@ from genesis.session_awareness.zero_drop_config import (
     load_config,
 )
 from genesis.session_awareness.zero_drop_git import (
+    count_non_merge_commits,
+    is_ancestor,
     list_local_branches,
-    list_remote_branch_names,
+    list_remote_heads,
     list_worktrees,
     worktree_status,
 )
@@ -82,14 +92,6 @@ HEARTBEAT_SUBSYSTEM = "zero_drop"
 BRANCH_CLASSES = (CLASS_UNPUSHED, CLASS_PUSHED_NO_PR)
 ALL_CLASSES = (*BRANCH_CLASSES, CLASS_DIRTY)
 
-# The alert prose owns these characters: `|` separates rendered rows, `·`
-# separates fields within one, and `[ ]` wraps the row list. A branch name may
-# legally contain any of them (git forbids space, `~^:?*[\`, and control
-# characters — but not `|` or `·`), and a branch name is content this process
-# did not author. Substituted rather than deleted so the text stays readable.
-_ALERT_GRAMMAR_CHARS = str.maketrans({"|": "/", "·": "-", "[": "(", "]": ")"})
-_WHITESPACE_RUN = re.compile(r"\s+")
-
 # Display bound for one rendered identity. MEASURED on this install 2026-09-05:
 # 211 local branches, longest name 45 chars (p95 36); longest worktree path 114,
 # so the longest possible `@detached:<path>` identity is ~124. 160 clears every
@@ -100,23 +102,6 @@ _WHITESPACE_RUN = re.compile(r"\s+")
 _RENDER_LIMIT = 160
 
 
-def _neutralise(value: str) -> str:
-    """Flatten untrusted text and defuse the alert's row grammar. NO bound.
-
-    Branch names, worktree paths and the diagnostic blobs built from them reach
-    a MODEL through the observations this module writes. Flattening newlines and
-    substituting the grammar characters stops chosen text from forging an extra
-    row — or an extra field inside one — that a reader would attribute to the
-    detector itself.
-
-    Deliberately separate from the bound: the two renderers here budget
-    differently (one identity vs a diagnostic blob), and folding the bound in
-    meant the second caller either reused a limit written for something else or
-    skipped the sanitising entirely. It skipped it.
-    """
-    return _WHITESPACE_RUN.sub(" ", (value or "").translate(_ALERT_GRAMMAR_CHARS)).strip()
-
-
 def _bounded(text: str, limit: int) -> str:
     """Bound a DISPLAY string, announcing the omission rather than cutting mute."""
     if len(text) <= limit:
@@ -124,9 +109,10 @@ def _bounded(text: str, limit: int) -> str:
     return f"{text[:limit]}<+{len(text) - limit} chars omitted>"
 
 
-def _render_identity(value: str) -> str:
+def _render_identity(value: str | None) -> str:
     """One untrusted identity, safe to splice into the alert's prose."""
-    return _bounded(_neutralise(value), _RENDER_LIMIT)
+    return _bounded(_neutralise(value) or "", _RENDER_LIMIT)
+
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +246,131 @@ def _worktree_budget_s(cfg: dict) -> float:
     return knob_int(cfg, "min_interval_minutes") * 60 / 4
 
 
+def _assert_sums(leg: dict, denominator: str, degraded: dict, leg_name: str) -> None:
+    """Every item must land in exactly ONE terminal stage. Checked where it is
+    PUBLISHED, not only where it is computed.
+
+    The invariant was asserted in the classifier's unit tests and nowhere near
+    the record that reaches ``last_run.json`` and ``zero_drop_status`` — so a
+    caller that broke it (by folding metadata into the same dict, say) would
+    leave every test green while the published arithmetic stopped adding up.
+    An audit you cannot add up is exactly what this subsystem refuses to
+    publish, and the check belongs on the artifact, not on an intermediate.
+
+    A mismatch DEGRADES the leg rather than raising: the findings are real
+    either way, and losing the whole sweep over a bookkeeping error would trade
+    a wrong denominator for no board at all.
+    """
+    terminal = leg.get("terminal") or {}
+    total = terminal.get(denominator)
+    counted = sum(v for k, v in terminal.items() if k != denominator and isinstance(v, int))
+    if total is not None and counted != total:
+        degraded[f"{leg_name}_accounting"] = (
+            f"stage counts do not sum to {denominator}: {counted} counted vs {total} — "
+            "the suppression audit for this leg is not trustworthy"
+        )
+        logger.error(
+            "zero_drop %s stages do not sum: %s counted vs %s %s",
+            leg_name,
+            counted,
+            total,
+            denominator,
+        )
+
+
+async def _resolve_push_states(
+    repo_path: str, branches: list[dict], heads: dict, budget: int
+) -> dict:
+    """Classify each local branch against the remote ref of the same name.
+
+    Returns ``{"push_states": {branch: PUSH_*}, "local_only": {branch: n}}``.
+    Pure SHA comparison for the common cases, so the git calls below run ONLY
+    for a branch whose tip differs from its remote tip — MEASURED 2026-09-06:
+    6 of 221 refs on this install, at most 2 calls each.
+
+    A differing tip is not yet evidence of stranded work. The local branch may
+    simply be BEHIND one that someone else pushed, which is why ancestry is
+    tested rather than assumed, and why a branch whose only local-only commits
+    are merges is treated as behind: merges of the base branch carry no work
+    that exists nowhere else, and flagging them would bury the real signal.
+
+    ``budget`` caps the probing for the same reason its sibling
+    ``_resolve_merge_ancestry`` does, and its absence here was an inconsistency
+    a security review caught: the sweep holds a GLOBAL flock, so an unbounded
+    loop of 30-second-timeout git calls would starve every later sweep — the
+    exact failure the per-call timeouts are written to prevent, reintroduced at
+    the loop level. A branch past the cap is ``PUSH_UNKNOWN``, which the
+    classifier HOLDS: neither reported nor resolved, and counted in
+    ``push_unknown`` so the ceiling is visible rather than silent.
+    """
+    push_states: dict[str, str] = {}
+    local_only: dict[str, int] = {}
+    probes = 0
+    for row in branches:
+        branch, tip = row.get("branch"), row.get("tip_sha")
+        remote_tip = heads.get(branch)
+        if remote_tip is None:
+            push_states[branch] = PUSH_ABSENT
+            continue
+        if remote_tip == tip:
+            push_states[branch] = PUSH_EXACT
+            continue
+        if probes >= budget:
+            push_states[branch] = PUSH_UNKNOWN
+            continue
+        probes += 1
+        if await is_ancestor(repo_path, tip, remote_tip) is True:
+            # Every local commit is reachable from the remote tip: nothing here
+            # exists only on this machine, even though the SHAs differ.
+            push_states[branch] = PUSH_BEHIND
+            continue
+        count = await count_non_merge_commits(repo_path, remote_tip, tip)
+        if count is None:
+            push_states[branch] = PUSH_UNKNOWN
+        elif count == 0:
+            push_states[branch] = PUSH_BEHIND
+        else:
+            push_states[branch] = PUSH_DIVERGED
+            local_only[branch] = count
+    return {"push_states": push_states, "local_only": local_only}
+
+
+async def _resolve_merge_ancestry(
+    repo_path: str, branches: list[dict], index: dict, budget: int
+) -> dict:
+    """Test each local tip against the head SHA its merged/closed PRs recorded.
+
+    Returns ``{"<tip>..<head>": True|False|None}``. Only pairs where the two
+    SHAs actually DIFFER are tested — an equal pair is proof on its own and the
+    classifier short-circuits it without any I/O.
+
+    ``budget`` caps the number of pairs so a repository with a long tail of
+    unfetched merge heads cannot turn a ~15s sweep into a long one. Pairs past
+    the cap are simply absent from the map, which the classifier reads as
+    unanswerable and FLAGS — the cap can therefore add findings, never remove
+    them, so exceeding it is loud rather than silent. MEASURED 2026-09-06: 4
+    pairs needed on this install against a default cap of 40.
+    """
+    ancestry: dict[str, bool | None] = {}
+    for row in branches:
+        tip = row.get("tip_sha")
+        if not tip:
+            continue
+        for pr in index.get(row.get("branch"), []):
+            if (pr.get("state") or "").upper() not in ("MERGED", "CLOSED"):
+                continue
+            head = pr.get("headRefOid")
+            if not head or head == tip:
+                continue
+            key = f"{tip}..{head}"
+            if key in ancestry:
+                continue
+            if len(ancestry) >= budget:
+                return ancestry
+            ancestry[key] = await is_ancestor(repo_path, tip, head)
+    return ancestry
+
+
 async def _resolve_base_ref(root: str, runner=None) -> str | None:
     """The ref every branch's ahead-count is measured against, or None.
 
@@ -367,6 +478,14 @@ async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None =
         "held": held,
         "prunable": prunable,
         "unvisited": unvisited,
+        # The REAL denominator. `len(observations)` is not it: three cases
+        # `continue` before a worktree is ever appended (prunable, over-budget,
+        # unreadable), so a count derived downstream from the observations
+        # silently excludes exactly the worktrees a blindness report is about.
+        # A wrong denominator on the alarm that says "I could not see
+        # everything" is the one place this subsystem's every-count-with-its-
+        # denominator discipline must not fail.
+        "total": len(listing["worktrees"]),
     }
 
 
@@ -398,9 +517,7 @@ async def _emit_heartbeat(db, *, detail: str) -> None:
         logger.warning("zero_drop heartbeat write failed", exc_info=True)
 
 
-async def _maintain_alert(
-    db, *, cfg: dict, findings: list[dict], total: int, coverage: str
-) -> str:
+async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, coverage: str) -> str:
     """Keep exactly ONE observation describing the current board (or none).
 
     Clone of the follow-up watchdog's alert shape: an offender-set content hash
@@ -440,7 +557,6 @@ async def _maintain_alert(
         return "resolved"
 
     offender_key = ",".join(sorted(f"{f['class']}:{f['branch']}" for f in findings))
-    content_hash = hashlib.sha256(f"zero_drop:{offender_key}".encode()).hexdigest()
     try:
         max_listed = knob_int(cfg, "max_listed")
         listed = findings[:max_listed]
@@ -456,9 +572,22 @@ async def _maintain_alert(
             f"past the recurrence threshold): work that exists but is in no pipeline. "
             f"Disposition each one — land it, or acknowledge it with a reason via "
             f"zero_drop_ack (the ack expires the moment the branch moves). A PR comment "
-            f"or a plan-file bullet is not a disposition. [{rows}"
+            f"or a plan-file bullet is not a disposition. Pass the EXACT branch value "
+            f"from zero_drop_status: the names below are display-bounded and had the "
+            f"row grammar defused, so they are not always the key. [{rows}"
             + (f" | (+{more} more of {total})]" if more else "]")
         )
+        # Hash the TEXT, plus the full offender key. The hash existed to make a
+        # changed board supersede the standing alert instead of deduping
+        # against it, but it covered only the offender SET while the text also
+        # carries the escalated count, each row's ahead count and the coverage
+        # string — so escalation could advance, and the alert would still read
+        # "0 escalated" until the 3-day TTL happened to re-mint it. Hashing the
+        # rendered content closes that by construction: the two can no longer
+        # drift, because there is nothing left to keep in sync. The offender
+        # key is folded in as well because `max_listed` bounds what the text
+        # names, and a change confined to the unlisted tail must still refresh.
+        content_hash = hashlib.sha256(f"zero_drop:{content}\n{offender_key}".encode()).hexdigest()
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
@@ -582,7 +711,23 @@ async def run_zero_drop_worker(
 
 
 async def _run(*, trigger: str, force: bool, db_path: Path | str, repo_path: str) -> dict:
-    if os.environ.get("GENESIS_ZERO_DROP_DISABLED") == "1":
+    # The env variable suppresses the SESSION-BOUNDARY spawn only, which is
+    # what it is for: "don't sweep from this session". It deliberately does NOT
+    # stop the daily hygiene run, and that scoping is a fix, not an oversight.
+    #
+    # Honouring it on every trigger looked stricter and was worse. The variable
+    # is per-process, so `_subsystem_enabled` in the health manifest — running
+    # in the server, which cannot read another process's environment — goes on
+    # reporting the detector enabled while its pulse has stopped, and the
+    # overdue alarm fires forever. That is precisely the permanent false alarm
+    # that branch of `_subsystem_enabled` exists to prevent, bought by using
+    # the documented kill switch in the documented way.
+    #
+    # Real disablement is the CONFIG (`enabled: false` / `mode: off`), checked
+    # immediately below: it is durable, cross-process readable, and it is what
+    # the health manifest already consults, so disabling the detector there
+    # silences the pulse and the alarm together.
+    if trigger == "session_start" and os.environ.get("GENESIS_ZERO_DROP_DISABLED") == "1":
         return {"status": "skipped_disabled"}
     mode = effective_mode()
     if mode == "off":
@@ -641,7 +786,7 @@ async def _run_locked(
     branch_findings: dict[str, list[dict]] | None = None
     branch_held: set[str] = set()
     local = await list_local_branches(repo_path, base=base_ref)
-    remote = await list_remote_branch_names(repo_path)
+    remote = await list_remote_heads(repo_path)
     # The PR listing MUST resolve its slug from the same repository the branches
     # came from. gh's default runner pins cwd to genesis.env.repo_root(), so a
     # --repo-path pointing anywhere else would join this repo's branches against
@@ -659,20 +804,51 @@ async def _run_locked(
         # finding, so the classes FREEZE rather than run on a partial join.
         degraded["branches"] = f"pr history capped at {knob_int(cfg, 'max_prs')} (limit_hit)"
     else:
+        # SHA evidence, gathered before classification because the classifier
+        # is pure. `repo` is the LIVE-resolved slug the PR listing actually
+        # queried, so the fork filter and the PR history can never disagree
+        # about which repository is "ours".
+        owner = (prs.get("repo") or "").split("/")[0] or None
+        pushed = await _resolve_push_states(
+            repo_path, local["branches"], remote["heads"], knob_int(cfg, "max_ancestry_probes")
+        )
+        for row in local["branches"]:
+            count = pushed["local_only"].get(row["branch"])
+            if count:
+                row["local_only"] = count
+        index, _ = index_prs_by_head(prs["prs"], owner=owner)
+        ancestry = await _resolve_merge_ancestry(
+            repo_path, local["branches"], index, knob_int(cfg, "max_ancestry_probes")
+        )
         classified = classify_branches(
             local["branches"],
-            remote_names=remote["names"],
+            push_states=pushed["push_states"],
             prs=prs["prs"],
             now=now_dt,
             min_age_hours=knob_int(cfg, "branch_min_age_hours"),
+            repo_owner=owner,
+            ancestry=ancestry,
         )
         branch_findings = classified["findings"]
         branch_held = classified["held"]
+        if owner is None:
+            notes.append("repo_owner_unresolved_fork_prs_not_excluded")
+        # TERMINAL and META are separate keys, not one flat dict with a comment
+        # telling readers which is which. Flattened, the sum-to-refs_total
+        # invariant — the thing that makes suppression auditable — is broken on
+        # the record actually PUBLISHED while still holding on the intermediate
+        # value the tests check, so the guarantee reads as kept and is not.
+        # A structural boundary cannot be misread by a consumer.
         stages["branches"] = {
-            **classified["stages"],
-            "prs_scanned": len(prs["prs"]),
-            "held_by_age_gate": len(branch_held),
+            "terminal": classified["stages"],
+            "meta": {
+                "prs_scanned": len(prs["prs"]),
+                "fork_prs_ignored": classified["ignored_forks"],
+                "ancestry_probes": len(ancestry),
+                "held_total": len(branch_held),
+            },
         }
+        _assert_sums(stages["branches"], "refs_total", degraded, "branches")
 
     # ── Worktree leg: independent of the branch legs ─────────────────────────
     dirty_findings: list[dict] | None = None
@@ -693,12 +869,20 @@ async def _run_locked(
         # reconciles what it read, and neither kind can resolve a finding.
         dirty_held = classified_wt["held"] | observed["held"]
         stages["worktrees"] = {
-            **classified_wt["stages"],
-            "prunable_skipped": observed["prunable"],
-            "unreadable": len(observed["errors"]),
-            "unvisited_over_budget": observed["unvisited"],
-            "held_total": len(dirty_held),
+            "terminal": classified_wt["stages"],
+            "meta": {
+                "prunable_skipped": observed["prunable"],
+                "unreadable": len(observed["errors"]),
+                "unvisited_over_budget": observed["unvisited"],
+                "held_total": len(dirty_held),
+                # `worktrees_total` in `terminal` counts what was OBSERVED; this
+                # counts what was REGISTERED. They differ by exactly the three
+                # skip cases, and publishing both lets a reader SEE the gap
+                # instead of inferring it.
+                "worktrees_registered": observed["total"],
+            },
         }
+        _assert_sums(stages["worktrees"], "worktrees_total", degraded, "worktrees")
         if observed["unvisited"]:
             degraded["worktrees_budget"] = (
                 f"{observed['unvisited']} worktree(s) never visited — the leg ran out of "
@@ -706,8 +890,7 @@ async def _run_locked(
             )
         if observed["errors"]:
             degraded["worktrees"] = (
-                f"{len(observed['errors'])} of "
-                f"{stages['worktrees']['worktrees_total'] + len(observed['errors'])} "
+                f"{len(observed['errors'])} of {observed['total']} "
                 f"worktrees unreadable (their findings are held, the rest reconciled): "
                 + "; ".join(observed["errors"])[:200]
             )
@@ -715,7 +898,6 @@ async def _run_locked(
     # ── Reconcile only the classes whose sweep COMPLETED ─────────────────────
     escalation_k = knob_int(cfg, "escalation_k")
     applied: dict[str, dict] = {}
-    open_rows: list[dict] = []
     counts: dict[str, int] = {}
     alert_state = "skipped"
     blind_state = "skipped"

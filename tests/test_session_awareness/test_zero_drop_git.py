@@ -18,7 +18,7 @@ import pytest
 
 from genesis.session_awareness.zero_drop_git import (
     list_local_branches,
-    list_remote_branch_names,
+    list_remote_heads,
     list_worktrees,
     parse_status_z,
     worktree_status,
@@ -209,7 +209,7 @@ async def test_detached_worktree_has_no_branch(repo, tmp_path):
 async def test_ls_remote_without_a_remote_is_an_error_not_an_empty_set(repo):
     """An empty set would classify every pushed branch as never-pushed. The
     worker freezes both branch classes on this error instead."""
-    out = await list_remote_branch_names(str(repo))
+    out = await list_remote_heads(str(repo))
     assert "error" in out
 
 
@@ -219,8 +219,12 @@ async def test_ls_remote_reads_the_live_remote(repo, tmp_path):
     _git(repo, "remote", "add", "origin", str(origin))
     _git(repo, "push", "-q", "origin", "main")
 
-    out = await list_remote_branch_names(str(repo))
-    assert out["names"] == {"main"}
+    out = await list_remote_heads(str(repo))
+    assert set(out["heads"]) == {"main"}
+    # The SHA is the point of this atom: local-tip vs remote-tip is the
+    # direct test for commits that exist nowhere but this machine.
+    head = _git(repo, "rev-parse", "main").stdout.strip()
+    assert out["heads"]["main"] == head
 
 
 async def test_a_successful_ls_remote_that_parses_to_NOTHING_is_an_error(repo):
@@ -234,12 +238,12 @@ async def test_a_successful_ls_remote_that_parses_to_NOTHING_is_an_error(repo):
     async def _empty(argv, timeout):
         return 0, "", ""
 
-    assert "error" in await g.list_remote_branch_names(str(repo), runner=_empty)
+    assert "error" in await g.list_remote_heads(str(repo), runner=_empty)
 
     async def _unexpected_shape(argv, timeout):
         return 0, "deadbeef\trefs/tags/v1\n", ""
 
-    assert "error" in await g.list_remote_branch_names(str(repo), runner=_unexpected_shape)
+    assert "error" in await g.list_remote_heads(str(repo), runner=_unexpected_shape)
 
 
 @pytest.mark.parametrize(
@@ -323,3 +327,212 @@ async def test_base_ref_resolution_returns_None_when_there_is_no_origin_HEAD(rep
 
     _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
     assert await _resolve_base_ref(str(repo)) == "origin/trunk"
+
+
+# ── is_ancestor / count_non_merge_commits: the SHA-evidence atoms ────────────
+#
+# These exist because "a PR with this name merged" is a heuristic while "this
+# commit is reachable from that one" is a fact. Both are THREE-valued: the
+# unanswerable case is what stops a missing object from being read as proof.
+
+
+async def test_is_ancestor_answers_yes_no_and_UNANSWERABLE(repo):
+    """rc 0/1 are answers; rc 128 (object not in this repo) is NOT.
+
+    Folding the missing-object case into False would turn "I cannot see that
+    commit" into "those commits are stranded" — a confident finding built on
+    absent evidence, which is the class of defect this module exists to avoid.
+    """
+    from genesis.session_awareness.zero_drop_git import is_ancestor
+
+    first = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "later.txt").write_text("later\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-q", "-m", "later")
+    second = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert await is_ancestor(str(repo), first, second) is True
+    assert await is_ancestor(str(repo), second, first) is False
+    # A well-formed SHA this repository has never heard of.
+    assert await is_ancestor(str(repo), "0" * 40, second) is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "--upload-pack=touch /tmp/x",
+        "HEAD",
+        "main",
+        "abc123",
+        "",
+        "0" * 39,
+        "0" * 41,
+        "G" * 40,
+        # A wrong TYPE, not just a wrong value. `headRefOid` is JSON from gh and
+        # a tip_sha is parsed from git output, so null is a shape either can
+        # take. A validator that raises on it is worse than one that rejects
+        # it: the exception escapes the classifier and kills the WHOLE sweep,
+        # which is the one outcome a detector cannot afford.
+        None,
+        123,
+        ["a" * 40],
+    ],
+)
+async def test_is_ancestor_REFUSES_anything_that_is_not_a_full_sha(repo, bad):
+    """Both arguments reach subprocess argv, and both arrive from OUTSIDE this
+    repository — `headRefOid` from gh's JSON, remote tips from ls-remote. A
+    refused argument returns the unanswerable None, never an answer, and never
+    an exception."""
+    from genesis.session_awareness.zero_drop_git import count_non_merge_commits, is_ancestor
+
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert await is_ancestor(str(repo), bad, head) is None
+    assert await is_ancestor(str(repo), head, bad) is None
+    assert await count_non_merge_commits(str(repo), bad, head) is None
+    assert await count_non_merge_commits(str(repo), head, bad) is None
+
+
+async def test_count_non_merge_commits_ignores_merges(repo):
+    """A branch whose only local-only commit is a MERGE holds no unique work.
+
+    Counting it would flag a branch that has merged the base in but has nothing
+    of its own — noise sitting on top of the real signal, in the one class
+    where a false positive costs an acknowledgement.
+    """
+    from genesis.session_awareness.zero_drop_git import count_non_merge_commits
+
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text("side\n")
+    _git(repo, "add", "side.txt")
+    _git(repo, "commit", "-q", "-m", "side work")
+    side = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "checkout", "-q", "-")
+    (repo / "trunk.txt").write_text("trunk\n")
+    _git(repo, "add", "trunk.txt")
+    _git(repo, "commit", "-q", "-m", "trunk work")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merged = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # One real commit on the side branch, not reachable from base.
+    assert await count_non_merge_commits(str(repo), base, side) == 1
+    # From the merge commit's side: the merge itself carries no unique work.
+    assert await count_non_merge_commits(str(repo), side, merged) == 1  # trunk work only
+    assert await count_non_merge_commits(str(repo), merged, merged) == 0
+    assert await count_non_merge_commits(str(repo), "0" * 40, merged) is None
+    assert await count_non_merge_commits(str(repo), "not-a-sha", merged) is None
+
+
+# ── rc=0 with nothing parsed is a FAILURE, on every enumerator ───────────────
+
+
+@pytest.mark.parametrize(
+    "fn_name,kind",
+    [
+        ("list_local_branches", "for-each-ref"),
+        ("list_remote_heads", "ls-remote"),
+        ("list_worktrees", "worktree list"),
+    ],
+)
+@pytest.mark.parametrize("payload", ["", "not a record at all\n", "   \n\n"])
+async def test_rc0_with_nothing_parsed_freezes_the_class(repo, fn_name, kind, payload):
+    """An empty result does not fail neutrally — it RESOLVES the whole class.
+
+    Each of these feeds a class that reconciles, so whatever is not returned is
+    treated as gone. rc=0-and-empty therefore clears every open and acknowledged
+    finding in that class at once: silent, confident, complete. And empty cannot
+    be a true observation — a repository always has at least one local branch,
+    at least one branch on its remote, and at least one worktree.
+
+    The guard used to exist on ls-remote ONLY. `worktree list` accepted
+    unparseable garbage as a clean empty set.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _runner(argv, timeout):
+        return 0, payload, ""
+
+    out = await getattr(g, fn_name)(str(repo), runner=_runner)
+    assert "error" in out, f"{kind} accepted an empty parse as success"
+    # Either refusal is correct — an unreadable line and a result that parsed
+    # to nothing both mean "the output was not what we think it is", and both
+    # freeze the class. What must never happen is a clean empty success.
+    assert any(m in out["error"] for m in ("empty set", "unrecognised", "unparseable"))
+
+
+async def test_a_real_worktree_listing_still_parses(repo, tmp_path):
+    """The guard-the-guard: a refusal that also refuses valid input is worse
+    than no refusal, because it freezes the class permanently."""
+    from genesis.session_awareness.zero_drop_git import list_worktrees
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out
+    assert len(out["worktrees"]) >= 1
+
+
+async def test_every_git_argv_declines_optional_locks(repo, monkeypatch, tmp_path):
+    """READ-ONLY is a stated REQUIREMENT of this module, and it was not true.
+
+    MEASURED on git 2.43: a plain `git status --porcelain` rewrites .git/index
+    whenever a tracked file's mtime has moved — it refreshes the stat cache and
+    takes index.lock to do it. Across ~161 worktrees that is 161 lock
+    acquisitions per sweep contending with whatever else is running.
+
+    Asserted over EVERY atom rather than the one that was caught, because the
+    obligation is the kind a call site forgets one instance of.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    seen: list[list[str]] = []
+
+    async def _spy(argv, timeout):
+        seen.append(argv)
+        return 1, "", "stopped"
+
+    await g.list_local_branches(str(repo), runner=_spy)
+    await g.list_remote_heads(str(repo), runner=_spy)
+    await g.list_worktrees(str(repo), runner=_spy)
+    await g.worktree_status(str(repo), runner=_spy)
+    await g.is_ancestor(str(repo), "a" * 40, "b" * 40, runner=_spy)
+    await g.count_non_merge_commits(str(repo), "a" * 40, "b" * 40, runner=_spy)
+
+    assert len(seen) == 6, "every atom must have issued exactly one command"
+    for argv in seen:
+        assert argv[0] == "git"
+        assert "--no-optional-locks" in argv, f"writes to the repo it reads: {argv}"
+
+
+async def test_the_push_probe_is_BUDGETED_like_its_sibling(monkeypatch):
+    """An unbounded probe loop under a GLOBAL flock starves every later sweep.
+
+    Per-call timeouts do not bound a loop: N diverged branches x 2 calls x 30s
+    is an unbounded wall-clock, and the sweep holds `detector.lock` throughout.
+    A security review caught that the ancestry probe was capped and this one was
+    not. Over-budget branches read as UNKNOWN, which the classifier HOLDS —
+    never reported, never resolved — so the ceiling costs findings, not truth.
+    """
+    from genesis.session_awareness import zero_drop_worker as w
+
+    calls = 0
+
+    async def _counting(root, a, b, runner=None):
+        nonlocal calls
+        calls += 1
+        return False  # never an ancestor, so each branch takes the second call too
+
+    async def _count_zero(root, a, b, runner=None):
+        return 5
+
+    monkeypatch.setattr(w, "is_ancestor", _counting)
+    monkeypatch.setattr(w, "count_non_merge_commits", _count_zero)
+
+    branches = [{"branch": f"b{i}", "tip_sha": f"{i:040x}"} for i in range(50)]
+    heads = {f"b{i}": "f" * 40 for i in range(50)}
+
+    out = await w._resolve_push_states("/repo", branches, heads, budget=5)
+    assert calls == 5, "the probe must stop at the budget, not run once per branch"
+    states = out["push_states"]
+    assert sum(1 for v in states.values() if v == "diverged") == 5
+    assert sum(1 for v in states.values() if v == "unknown") == 45
+    assert len(states) == 50, "every branch still gets a state — none is silently dropped"

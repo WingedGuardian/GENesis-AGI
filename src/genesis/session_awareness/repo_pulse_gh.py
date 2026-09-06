@@ -243,10 +243,22 @@ async def list_open_prs(
 
 
 # Full-history fields for the zero-drop branch join (session-awareness
-# zero_drop). Deliberately NOT PR_FIELDS: the join reads only the head-ref
-# name, the state, and the merge time — never title or body, so no PR prose
-# can reach a model prompt through this path.
-ALL_PR_FIELDS = "number,headRefName,state,mergedAt,url"
+# zero_drop). Deliberately NOT PR_FIELDS: the join reads identity, state and
+# timing only — never title or body, so no PR prose can reach a model prompt
+# through this path.
+#
+# `headRefOid` is the load-bearing one and it costs nothing extra: it is the
+# head SHA as of the merge or close, so `headRefOid == local tip` is PROOF the
+# PR contained exactly this commit, where the head-ref NAME is only a
+# heuristic. MEASURED 2026-09-06 on this repo (1665 PRs): every PR carries it,
+# and it is a SNAPSHOT rather than a live pointer — 4 of 4 PRs whose branch
+# moved after merge/close still report the old SHA, 0 counterexamples in the 28
+# cases where the head branch still exists. That snapshot property is what
+# makes it evidence about the merge instead of evidence about the branch now.
+# `closedAt` gives the CLOSED verdict the same time guard `mergedAt` gives the
+# merged one, and `headRepositoryOwner` scopes the join to this repo so a fork
+# PR cannot cover a local branch that merely shares its name.
+ALL_PR_FIELDS = "number,headRefName,headRefOid,state,mergedAt,closedAt,url,headRepositoryOwner"
 
 
 async def list_all_prs(
@@ -298,12 +310,25 @@ async def list_all_prs(
         return {"error": f"all pr list returned invalid JSON: {exc}"}
     if not isinstance(raw, list):
         return {"error": "all pr list returned a non-list payload"}
-    prs = [
-        pr
-        for pr in raw
-        if isinstance(pr, dict)
-        and isinstance(pr.get("number"), int)
-        and isinstance(pr.get("headRefName"), str)
-        and pr["headRefName"]
-    ]
+    prs = []
+    for pr in raw:
+        if not (
+            isinstance(pr, dict)
+            and isinstance(pr.get("number"), int)
+            and isinstance(pr.get("headRefName"), str)
+            and pr["headRefName"]
+        ):
+            continue
+        # Flatten the owner to its LOGIN and drop the rest of the object. gh
+        # returns `{id, name, login}` and `name` is the account holder's real
+        # name — which would otherwise ride into the findings store, the logs
+        # and an MCP response read by a model, for a join that only ever needs
+        # to answer "is this head ref in our own repo?". Narrowing it here
+        # keeps that value out of everything downstream by construction rather
+        # than by every consumer remembering not to read it.
+        owner = pr.get("headRepositoryOwner")
+        login = owner.get("login") if isinstance(owner, dict) else None
+        pr = {k: v for k, v in pr.items() if k != "headRepositoryOwner"}
+        pr["headRepositoryOwnerLogin"] = login if isinstance(login, str) else None
+        prs.append(pr)
     return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}

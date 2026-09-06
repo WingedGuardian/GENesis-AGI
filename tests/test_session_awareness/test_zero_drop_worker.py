@@ -57,7 +57,7 @@ def env(tmp_path, monkeypatch):
 
     legs = {
         "local": {"branches": [BRANCH]},
-        "remote": {"names": set()},
+        "remote": {"heads": {}},
         "prs": {"repo": "o/r", "prs": [], "limit_hit": False},
         "worktrees": {
             "observations": [],
@@ -65,6 +65,11 @@ def env(tmp_path, monkeypatch):
             "held": set(),
             "prunable": 0,
             "unvisited": 0,
+            # The REGISTERED total, which is the denominator the blindness
+            # report must use: three cases skip a worktree before it becomes an
+            # observation, so `len(observations)` excludes exactly the ones a
+            # blindness message is about.
+            "total": 0,
         },
         "base_ref": "origin/main",
     }
@@ -85,7 +90,7 @@ def env(tmp_path, monkeypatch):
         return legs["base_ref"]
 
     monkeypatch.setattr(w, "list_local_branches", _local)
-    monkeypatch.setattr(w, "list_remote_branch_names", _remote)
+    monkeypatch.setattr(w, "list_remote_heads", _remote)
     monkeypatch.setattr(w, "list_all_prs", _prs)
     monkeypatch.setattr(w, "_observe_worktrees", _observe)
     monkeypatch.setattr(w, "_resolve_base_ref", _base)
@@ -182,8 +187,14 @@ async def test_happy_path_records_findings_and_a_run_record(env, db_path):
     # Namespaced per leg: the two legs share key names (both have a
     # `too_young`), so a flat merge would silently overwrite one count with
     # the other and the audit would stop summing to its denominator.
-    assert record["stages"]["branches"]["refs_total"] == 1
-    assert record["stages"]["branches"]["flagged_no_pr"] == 1
+    assert record["stages"]["branches"]["terminal"]["refs_total"] == 1
+    assert record["stages"]["branches"]["terminal"]["flagged_no_pr"] == 1
+    # TERMINAL and META are structurally separate: the sum-to-denominator
+    # invariant is only meaningful if a consumer can tell which is which
+    # WITHOUT reading a comment.
+    assert set(record["stages"]["branches"]) == {"terminal", "meta"}
+    terminal = record["stages"]["branches"]["terminal"]
+    assert sum(v for k, v in terminal.items() if k != "refs_total") == terminal["refs_total"]
     assert set(record["stages"]) == {"branches", "worktrees"}
     assert record["counts_by_status"]["open"] == 1
     assert record["degraded"] == {}
@@ -232,6 +243,7 @@ async def test_a_degraded_worktree_leg_does_not_blind_the_branch_legs(env, db_pa
         "held": None,
         "prunable": 0,
         "unvisited": 0,
+        "total": 0,  # the enumeration itself failed
     }
 
     out = await _run(db_path)
@@ -263,19 +275,45 @@ async def test_debounce_blocks_a_second_sweep_and_writes_nothing(env, db_path):
     assert w.last_run_path().read_text() == before
 
 
-@pytest.mark.parametrize(
-    "setup,expected",
-    [("kill_switch", "skipped_disabled"), ("mode_off", "skipped_off")],
-)
-async def test_levers_stop_the_sweep_before_any_work(env, db_path, monkeypatch, setup, expected):
-    if setup == "kill_switch":
-        monkeypatch.setenv("GENESIS_ZERO_DROP_DISABLED", "1")
-    else:
-        monkeypatch.setattr(w, "effective_mode", lambda: "off")
-
+async def test_the_config_lever_stops_the_sweep_before_any_work(env, db_path, monkeypatch):
+    """`mode: off` is the REAL kill switch: durable, and readable by another
+    process — which is what lets the health manifest stop expecting a pulse."""
+    monkeypatch.setattr(w, "effective_mode", lambda: "off")
     out = await _run(db_path)
-    assert out["status"] == expected
+    assert out["status"] == "skipped_off"
     assert not w.last_run_path().exists()
+
+
+async def test_the_env_switch_suppresses_a_SESSION_sweep(env, db_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_ZERO_DROP_DISABLED", "1")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=True, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "skipped_disabled"
+    assert not w.last_run_path().exists()
+
+
+@pytest.mark.parametrize("trigger", ["hygiene", "manual", "precompact"])
+async def test_the_env_switch_does_NOT_stop_the_pulse_on_other_triggers(
+    env, db_path, monkeypatch, trigger
+):
+    """The scoping that keeps `_subsystem_enabled` honest.
+
+    An env variable is per-PROCESS. The health manifest runs in the server and
+    cannot read another process's environment, so if this variable stopped the
+    daily hygiene sweep too, the heartbeat would cease while the manifest went
+    on reporting the detector enabled — and the overdue alarm would fire
+    forever. That is the exact permanent false alarm `_subsystem_enabled`
+    exists to prevent, bought by using the documented kill switch in the
+    documented way. Config is the system-wide off switch; this one means
+    "don't sweep from this session".
+    """
+    monkeypatch.setenv("GENESIS_ZERO_DROP_DISABLED", "1")
+    out = await w.run_zero_drop_worker(
+        trigger=trigger, force=True, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "ok"
+    assert w.last_run_path().exists()
 
 
 async def test_sweep_emits_a_durable_heartbeat(env, db_path):
@@ -470,6 +508,7 @@ async def test_one_unreadable_worktree_does_not_blind_the_whole_class(env, db_pa
         "held": {"feat/stranded"},
         "prunable": 0,
         "unvisited": 0,
+        "total": 2,  # one observed + one unreadable
     }
 
     out = await _run(db_path)
@@ -490,12 +529,16 @@ async def test_a_prunable_worktree_is_counted_not_treated_as_an_error(env, db_pa
         "held": set(),
         "prunable": 3,
         "unvisited": 0,
+        "total": 3,
     }
     out = await _run(db_path)
     assert out["status"] == "ok", "a gone worktree is absent, not unreadable"
-    assert json.loads(w.last_run_path().read_text())["stages"]["worktrees"][
-        "prunable_skipped"
-    ] == 3
+    assert (
+        json.loads(w.last_run_path().read_text())["stages"]["worktrees"]["meta"][
+            "prunable_skipped"
+        ]
+        == 3
+    )
 
 
 async def test_a_class_that_fails_to_reconcile_degrades_only_itself(env, db_path, monkeypatch):
@@ -678,3 +721,178 @@ async def test_a_failed_store_read_degrades_instead_of_losing_the_run(env, db_pa
     assert "store read exploded" in out["degraded"]["store_read"]
     assert w.last_run_path().exists(), "the run record must still land"
     assert len(await _open_observations(db_path, w.BLIND_SOURCE)) == 1
+
+
+# ── The alert must refresh when what it SAYS changes ─────────────────────────
+#
+# The hash used to cover the offender SET only, while the rendered text also
+# carries the escalated count, each row's ahead count and the coverage string.
+# `skip_if_duplicate` keys on that hash, so escalation could advance while the
+# standing alert went on reading "0 escalated" until the 3-day TTL happened to
+# re-mint it — a board contradicting its own rows. Hashing the rendered content
+# closes it by construction: there is nothing left for the two to drift on.
+
+
+@pytest.fixture
+def captured_alert(monkeypatch):
+    """Capture what `_maintain_alert` would write, without a database."""
+    import genesis.db.crud as crud_pkg
+
+    seen: dict = {}
+
+    class _FakeObservations:
+        @staticmethod
+        async def create(db, **kw):
+            seen.update(kw)
+            return True
+
+        @staticmethod
+        async def resolve_by_source_and_type(db, **kw):
+            return 0
+
+        @staticmethod
+        async def supersede_others(db, **kw):
+            return 0
+
+    monkeypatch.setattr(crud_pkg, "observations", _FakeObservations)
+    return seen
+
+
+async def _alert(captured, findings, *, coverage="all classes swept", max_listed=10):
+    await w._maintain_alert(
+        None,
+        cfg={"max_listed": max_listed, "alert_priority": "medium"},
+        findings=findings,
+        total=len(findings),
+        coverage=coverage,
+    )
+    return captured["content_hash"], captured["content"]
+
+
+def _finding(branch="feat/a", *, escalated=False, ahead=2):
+    return {
+        "class": "unpushed_branch",
+        "branch": branch,
+        "ahead_count": ahead,
+        "escalated": escalated,
+    }
+
+
+async def test_the_alert_hash_moves_when_the_ESCALATED_COUNT_moves(captured_alert):
+    quiet, quiet_text = await _alert(captured_alert, [_finding()])
+    loud, loud_text = await _alert(captured_alert, [_finding(escalated=True)])
+    assert "0 escalated" in quiet_text
+    assert "1 escalated" in loud_text
+    assert quiet != loud
+
+
+async def test_the_alert_hash_moves_when_an_AHEAD_COUNT_moves(captured_alert):
+    a, _ = await _alert(captured_alert, [_finding(ahead=2)])
+    b, _ = await _alert(captured_alert, [_finding(ahead=9)])
+    assert a != b
+
+
+async def test_the_alert_hash_moves_when_COVERAGE_changes(captured_alert):
+    """A count measured while a class was frozen is a different claim from the
+    same count measured across every class."""
+    full, _ = await _alert(captured_alert, [_finding()], coverage="all classes swept")
+    partial, _ = await _alert(captured_alert, [_finding()], coverage="worktrees frozen")
+    assert full != partial
+
+
+async def test_the_alert_hash_moves_when_only_the_UNLISTED_TAIL_changes(captured_alert):
+    """`max_listed` bounds what the text NAMES, so hashing the rendered content
+    alone would miss a change confined to the rows past the cap. The full
+    offender key is folded in for exactly that case."""
+    a, a_text = await _alert(captured_alert, [_finding("feat/a"), _finding("feat/b")], max_listed=1)
+    b, b_text = await _alert(captured_alert, [_finding("feat/a"), _finding("feat/c")], max_listed=1)
+    assert a_text == b_text  # the visible half is identical...
+    assert a != b  # ...and the hash still moves
+
+
+async def test_an_UNCHANGED_board_keeps_the_SAME_hash(captured_alert):
+    """Refresh-on-change, not churn-every-run: the dedupe must still work."""
+    a, _ = await _alert(captured_alert, [_finding()])
+    b, _ = await _alert(captured_alert, [_finding()])
+    assert a == b
+
+
+async def test_the_blindness_denominator_counts_REGISTERED_worktrees(env, db_path):
+    """"N of M unreadable" must use the M the sweep set out to read.
+
+    Three cases skip a worktree BEFORE it becomes an observation — prunable,
+    over-budget, unreadable — so a denominator derived from the observations
+    excludes exactly the worktrees a blindness message is about. This
+    subsystem's whole discipline is every count with its denominator; the one
+    place it must not fail is the alarm that says "I could not see everything".
+    """
+    env["worktrees"] = {
+        "observations": [],
+        "errors": ["/w/a: status failed", "/w/b: status failed"],
+        "held": {"feat/a", "feat/b"},
+        "prunable": 3,
+        "unvisited": 4,
+        "total": 12,  # registered: 3 observed + 2 unreadable + 3 prunable + 4 unvisited
+    }
+    await _run(db_path)
+    record = json.loads(w.last_run_path().read_text())
+    assert "2 of 12 worktrees unreadable" in record["degraded"]["worktrees"]
+    assert record["stages"]["worktrees"]["meta"]["worktrees_registered"] == 12
+
+
+async def test_a_broken_stage_sum_degrades_the_leg_rather_than_passing_silently(
+    env, db_path, monkeypatch
+):
+    """The audit invariant is checked on the record that is PUBLISHED.
+
+    It used to be asserted only in the classifier's own tests, so a caller that
+    broke it — by folding metadata into the terminal dict, say — left every
+    test green while the published arithmetic stopped adding up. An audit you
+    cannot add up is the thing this subsystem refuses to publish, so the check
+    belongs on the artifact, and a mismatch degrades the leg rather than
+    raising: the findings are real either way.
+    """
+    real = w.classify_branches
+
+    def _miscount(*a, **kw):
+        out = real(*a, **kw)
+        out["stages"]["refs_total"] += 7  # a denominator nothing accounts for
+        return out
+
+    monkeypatch.setattr(w, "classify_branches", _miscount)
+    out = await _run(db_path)
+    assert "branches_accounting" in out["degraded"]
+    assert "do not sum" in out["degraded"]["branches_accounting"]
+
+
+async def test_the_observer_reports_the_REGISTERED_total_not_the_observed_one(monkeypatch):
+    """Pins the producer, not just the consumer.
+
+    The blindness denominator is computed in `_observe_worktrees`, and a test
+    that injects the number cannot notice the producer regressing. Three cases
+    `continue` before a worktree becomes an observation, so `len(observations)`
+    is exactly the wrong denominator for a message about what could not be read.
+    """
+
+    async def _listing(root, runner=None):
+        return {
+            "worktrees": [
+                {"path": "/w/ok", "branch": "feat/ok", "detached": False, "prunable": None},
+                {"path": "/w/gone", "branch": None, "detached": False, "prunable": "gitdir gone"},
+                {"path": "/w/broken", "branch": "feat/b", "detached": False, "prunable": None},
+            ]
+        }
+
+    async def _status(path, runner=None):
+        if path == "/w/broken":
+            return {"error": "status failed"}
+        return {"entries": [], "unparsed": 0}
+
+    monkeypatch.setattr(w, "list_worktrees", _listing)
+    monkeypatch.setattr(w, "worktree_status", _status)
+
+    out = await w._observe_worktrees("/repo", budget_s=60)
+    assert len(out["observations"]) == 1, "one readable, one prunable, one unreadable"
+    assert out["prunable"] == 1
+    assert len(out["errors"]) == 1
+    assert out["total"] == 3, "the denominator counts every REGISTERED worktree"

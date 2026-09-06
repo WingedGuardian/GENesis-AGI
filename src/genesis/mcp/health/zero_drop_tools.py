@@ -74,7 +74,26 @@ def _freshness(last_run: dict, *, now: datetime) -> dict:
 
 
 async def _impl_zero_drop_status(db, *, now: datetime, limit: int | None = None) -> dict:
+    """Assemble the board. Untrusted repository text reaches a model here.
+
+    Two kinds of field, treated differently on purpose:
+
+    - ``branch`` is the ACK KEY. Callers pass it straight back to
+      ``zero_drop_ack``, so it must round-trip byte for byte — neutralising it
+      would merge two identities onto one key, which is a correctness bug worse
+      than the problem it addresses. It is safe to leave verbatim for a
+      structural reason rather than a hopeful one: git refuses to create a ref
+      name containing an ASCII control character, a space, or any of ``~^:?*[``
+      (check-ref-format), so a branch name cannot carry a newline or an escape
+      sequence. The detached-worktree identity (``@detached:<path>``) is the
+      exception the quarantine in ``classify_worktrees`` exists for — a path
+      with a control character never becomes an identity in the first place.
+    - ``worktree_path`` and the ``degraded`` blob are DISPLAY, not keys.
+      Nothing passes them back, and a filesystem path (unlike a ref name) may
+      contain anything at all, so both are neutralised here.
+    """
     from genesis.db.crud import zero_drop as zd
+    from genesis.session_awareness.zero_drop import neutralise as _neutralise
     from genesis.session_awareness.zero_drop_worker import read_last_run
 
     counts = await zd.counts_by_status(db)
@@ -96,7 +115,7 @@ async def _impl_zero_drop_status(db, *, now: datetime, limit: int | None = None)
             **_freshness(last_run, now=now),
             "coverage": last_run.get("coverage"),
             "frozen_classes": last_run.get("frozen_classes") or [],
-            "degraded": degraded,
+            "degraded": {k: _neutralise(str(v)) for k, v in degraded.items()},
             "blind": bool(degraded),
             "mode": last_run.get("mode"),
             "duration_s": last_run.get("duration_s"),
@@ -109,7 +128,7 @@ async def _impl_zero_drop_status(db, *, now: datetime, limit: int | None = None)
                 "status": r["status"],
                 "tip_sha": r["tip_sha"],
                 "ahead_count": r["ahead_count"],
-                "worktree_path": r["worktree_path"],
+                "worktree_path": _neutralise(r["worktree_path"]),
                 "consecutive_runs": r["consecutive_runs"],
                 "escalated": bool(r["escalated_at"]),
                 "first_seen_at": r["first_seen_at"],

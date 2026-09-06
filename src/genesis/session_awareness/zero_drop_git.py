@@ -5,6 +5,12 @@ prunes: it observes the repository and writes only to its own findings store.
 That is a requirement, not an implementation detail — a detector that mutates
 the thing it measures cannot be trusted to report on it.
 
+Read-only is enforced by CONSTRUCTION, not by choosing read-only verbs: every
+argv is built by ``_git()``, which adds ``--no-optional-locks``. Without it
+even ``git status`` writes — it refreshes the stat cache and takes
+``index.lock`` — so the claim above was false for the busiest call in the
+sweep until it was measured. See that helper for the measurement.
+
 All commands run through a single injectable ``Runner`` (the hermetic tests
 drive real fixture repos through the default runner and a fake one through the
 seam), and every command is addressed with ``git -C <path>`` rather than a
@@ -41,6 +47,61 @@ Runner = Callable[[list[str], float], Awaitable[tuple[int, str, str]]]
 REF_SWEEP_TIMEOUT_S = 60.0
 LS_REMOTE_TIMEOUT_S = 30.0
 STATUS_TIMEOUT_S = 30.0
+# Ancestry/rev-list are pure local object-store reads on two commits that are
+# already resolved — no walk of the whole history, no network. They run only
+# for branches whose tip differs from the evidence being tested (MEASURED
+# 2026-09-06: 10 of 217 refs on this install), so the budget is per-call and
+# small; the failure mode is the same locked/corrupt object store as the ref
+# sweep, and a hang here would sit on the detector flock.
+ANCESTRY_TIMEOUT_S = 30.0
+
+# A git object name as git itself prints it. Used to validate every SHA that
+# reaches argv from OUTSIDE this repository (gh JSON, ls-remote output) — see
+# is_ancestor. Deliberately full-length: an abbreviated SHA is ambiguous, and
+# ambiguity in an identity comparison is how two commits become one.
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _is_sha(value: object) -> bool:
+    """True iff *value* is a full hex object name, checking TYPE before shape.
+
+    The type half is not defensive padding. These values arrive as gh JSON
+    (`headRefOid` is nullable) and as fields parsed out of git output, so
+    ``None`` — or any non-string — is a shape the input can genuinely take, and
+    handing one to ``re.match`` raises TypeError rather than returning False.
+    That exception would escape the classifier and abort the WHOLE sweep, which
+    is strictly worse than the wrong answer it was guarding against: a refused
+    value degrades one branch to "unanswerable", while a crash degrades every
+    branch to "not looked at". Reject the value; never raise on it.
+    """
+    return isinstance(value, str) and bool(_FULL_SHA.match(value))
+
+
+def _refuse_empty(kind: str, records) -> dict | None:
+    """Refuse an rc=0 result that parsed to NOTHING. Shared by all enumerators.
+
+    An empty set does NOT fail neutrally, which is what makes this a
+    correctness guard rather than tidiness. Each enumerator feeds a class that
+    RECONCILES: whatever it does not return is treated as gone, so an empty
+    result resolves every open and acknowledged finding in that class at once —
+    silently, confidently, completely. That is the false clean board this
+    subsystem exists to prevent, arriving through the one door that looks like
+    success.
+
+    And empty cannot be a true observation for any of them: a repository always
+    has at least one local branch, at least one branch on its remote, and at
+    least one worktree. "rc=0 and nothing parsed" therefore means the output was
+    not what we think it is — a format change, a wrong path, a truncated read —
+    and the honest response is to freeze the class.
+
+    MEASURED 2026-09-06 before this existed: the guard was on ls-remote ONLY.
+    ``for-each-ref`` and ``worktree list`` both returned a clean empty set from
+    rc=0, and ``worktree list`` did so even for unparseable garbage.
+    """
+    if not records:
+        return {"error": f"{kind} returned no records (rc=0) — refusing an empty set"}
+    return None
+
 
 # TAB-separated so a branch name containing a space survives the split; git ref
 # names cannot contain a TAB (check-ref-format forbids control characters).
@@ -59,6 +120,28 @@ _SAFE_BASE_REF = re.compile(r"^[A-Za-z0-9._/@+-]{1,255}$")
 def is_safe_base_ref(base: str | None) -> bool:
     """True iff *base* can be spliced into a git format string unambiguously."""
     return bool(base) and bool(_SAFE_BASE_REF.match(base))
+
+
+def _git(root: str, *args: str) -> list[str]:
+    """Build a git argv that CANNOT write to the repository it is reading.
+
+    ``--no-optional-locks`` is the load-bearing part, and the module docstring
+    above was simply wrong without it. MEASURED on git 2.43: a plain
+    ``git status --porcelain`` REWRITES ``.git/index`` whenever a tracked
+    file's mtime has moved — it refreshes the stat cache and takes
+    ``index.lock`` to do it — while the same command with this flag does not.
+    Across ~161 worktrees per sweep, on a box where other sessions are running
+    their own git, that is 161 lock acquisitions contending with live work, to
+    answer a question that changes nothing.
+    (Git added the flag in 2.15 for exactly this caller: a poller that wants to
+    observe a repository without touching it.)
+
+    A helper rather than a flag repeated at six call sites, for the reason this
+    subsystem keeps rediscovering: an obligation every call site must REMEMBER
+    is a convention, and a convention is what a reviewer finds one missing
+    instance of. Routed through here, forgetting is not expressible.
+    """
+    return ["git", "--no-optional-locks", "-C", root, *args]
 
 
 async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
@@ -102,15 +185,7 @@ async def list_local_branches(
         return {"error": f"unsafe base ref for a git format string: {base[:80]!r}"}
     run = runner or default_runner
     rc, out, err = await run(
-        [
-            "git",
-            "-C",
-            root,
-            "for-each-ref",
-            "refs/heads",
-            "--format",
-            _REF_FORMAT.format(base=base),
-        ],
+        _git(root, "for-each-ref", "refs/heads", "--format", _REF_FORMAT.format(base=base)),
         REF_SWEEP_TIMEOUT_S,
     )
     if rc != 0:
@@ -146,39 +221,111 @@ async def list_local_branches(
         # COMPLETE candidate set, and a quietly-short one resolves findings for
         # branches that were simply never listed.
         return {"error": f"for-each-ref: {unparsed} unparseable ref line(s)"}
+    if err := _refuse_empty("for-each-ref", branches):
+        return err
     return {"branches": branches}
 
 
-async def list_remote_branch_names(
+async def list_remote_heads(
     root: str, *, remote: str = "origin", runner: Runner | None = None
 ) -> dict:
-    """Branch names that exist on the remote RIGHT NOW (live ls-remote).
+    """Branch name -> tip SHA on the remote RIGHT NOW (live ls-remote).
 
     Deliberately not ``refs/remotes/<remote>``: that mirror is only as fresh
     as the last fetch, so a branch pushed by another session would read as
     never-pushed and land in the wrong class — and class is part of a
     finding's identity, so a misclassification creates a duplicate row rather
     than a corrected one.
+
+    The SHA is the point, and an earlier version of this function threw it
+    away. ``ls-remote`` answers with ``<sha>\\t refs/heads/<name>``; keeping
+    only the name reduces the strongest evidence available — *is this exact
+    commit on the server* — to the weakest, *does something with this name
+    exist there*. Local-tip != remote-tip is a direct, clock-free, name-free
+    test for commits that exist nowhere but this machine, which is the
+    condition this whole detector was built to find.
+
+    Returns ``{"heads": {name: sha}}``.
     """
     run = runner or default_runner
-    rc, out, err = await run(
-        ["git", "-C", root, "ls-remote", "--heads", remote], LS_REMOTE_TIMEOUT_S
-    )
+    rc, out, err = await run(_git(root, "ls-remote", "--heads", remote), LS_REMOTE_TIMEOUT_S)
     if rc != 0:
         return {"error": f"ls-remote failed (rc={rc}): {err.strip()[:300]}"}
-    names = set()
+    heads: dict[str, str] = {}
     for line in out.splitlines():
-        _, _, ref = line.partition("\t")
-        if ref.startswith("refs/heads/"):
-            names.add(ref[len("refs/heads/") :])
-    if not names:
-        # rc=0 with nothing parsed. A repo genuinely has at least its default
-        # branch on the remote, so an empty set here means the output was not
-        # what we think it is — and an empty set does not fail neutrally: it
-        # reclassifies EVERY branch as never-pushed, and class is part of a
-        # finding's identity, so it forks rows instead of correcting them.
-        return {"error": "ls-remote returned no branch refs (rc=0) — refusing an empty set"}
-    return {"names": names}
+        sha, _, ref = line.partition("\t")
+        if ref.startswith("refs/heads/") and _FULL_SHA.match(sha):
+            heads[ref[len("refs/heads/") :]] = sha
+    # On top of the class-wide resolve that `_refuse_empty` describes, an empty
+    # set fails a second way here: it reclassifies EVERY branch as never-pushed,
+    # and class is part of a finding's identity, so it forks rows instead of
+    # correcting them.
+    if err := _refuse_empty("ls-remote", heads):
+        return err
+    return {"heads": heads}
+
+
+async def is_ancestor(
+    root: str, ancestor: str, descendant: str, *, runner: Runner | None = None
+) -> bool | None:
+    """Is *ancestor* reachable from *descendant*? ``None`` when unanswerable.
+
+    Three-valued on purpose. ``git merge-base --is-ancestor`` exits 0 for yes
+    and 1 for no, but 128 when an object is simply not in this repository —
+    which happens routinely here, because a merged PR's head SHA may have been
+    pushed from another machine and never fetched. Folding that into False
+    would turn "I cannot see that commit" into "those commits are stranded",
+    which is a confident answer built on absent evidence. The caller
+    distinguishes the three and HOLDS on ``None``.
+
+    Both arguments are validated as full hex SHAs before reaching argv. They
+    come from ``gh`` JSON and from ``ls-remote`` output — neither is ours to
+    trust — and a value like ``--upload-pack=…`` reaching a subprocess is a
+    different class of problem than a wrong verdict. Same reasoning as
+    ``is_safe_base_ref``, one boundary over.
+    """
+    if not (_is_sha(ancestor) and _is_sha(descendant)):
+        logger.warning("zero_drop is_ancestor refused a non-SHA argument")
+        return None
+    run = runner or default_runner
+    rc, _, err = await run(
+        _git(root, "merge-base", "--is-ancestor", ancestor, descendant),
+        ANCESTRY_TIMEOUT_S,
+    )
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    logger.debug("zero_drop is_ancestor unanswerable (rc=%s): %s", rc, err.strip()[:200])
+    return None
+
+
+async def count_non_merge_commits(
+    root: str, exclude: str, include: str, *, runner: Runner | None = None
+) -> int | None:
+    """Commits in *include* but not *exclude*, ignoring merges. None if unknown.
+
+    The merge commits are excluded because they carry no unique work: a branch
+    whose only local-only commits are merges of the base branch has diverged by
+    ancestry while holding nothing that exists nowhere else, and flagging it
+    would be noise sitting on top of a real signal. A count of 0 therefore
+    means "diverged, but every distinct commit is already on the remote".
+    """
+    if not (_is_sha(exclude) and _is_sha(include)):
+        logger.warning("zero_drop count_non_merge_commits refused a non-SHA argument")
+        return None
+    run = runner or default_runner
+    rc, out, err = await run(
+        _git(root, "rev-list", "--count", "--no-merges", f"{exclude}..{include}"),
+        ANCESTRY_TIMEOUT_S,
+    )
+    if rc != 0:
+        logger.debug("zero_drop rev-list failed (rc=%s): %s", rc, err.strip()[:200])
+        return None
+    try:
+        return int(out.strip())
+    except ValueError:
+        return None
 
 
 async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
@@ -197,13 +344,12 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
     holds no uncommitted work; the caller skips it and counts it.
     """
     run = runner or default_runner
-    rc, out, err = await run(
-        ["git", "-C", root, "worktree", "list", "--porcelain"], REF_SWEEP_TIMEOUT_S
-    )
+    rc, out, err = await run(_git(root, "worktree", "list", "--porcelain"), REF_SWEEP_TIMEOUT_S)
     if rc != 0:
         return {"error": f"worktree list failed (rc={rc}): {err.strip()[:300]}"}
     worktrees: list[dict] = []
     current: dict = {}
+    unparsed = 0
     for line in out.splitlines():
         if line.startswith("worktree "):
             if current.get("path"):
@@ -220,8 +366,20 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
             current["detached"] = True
         elif line.startswith("prunable"):
             current["prunable"] = line[len("prunable") :].strip() or "prunable"
+        elif line.strip() and not line.startswith(("HEAD ", "bare", "locked", "branch ")):
+            # A record shape we do not recognise. The two sibling enumerators
+            # have counted these from the start and this one did not, so a
+            # format change here would have SHRUNK the listing rather than
+            # failing it — and a shorter listing resolves the worktrees it
+            # silently dropped. Known-but-unused keys are named above rather
+            # than swept into this counter, so the check stays honest.
+            unparsed += 1
     if current.get("path"):
         worktrees.append(current)
+    if unparsed:
+        return {"error": f"worktree list: {unparsed} unrecognised record line(s)"}
+    if err := _refuse_empty("worktree list", worktrees):
+        return err
     return {"worktrees": worktrees}
 
 
@@ -270,7 +428,7 @@ async def worktree_status(path: str, *, runner: Runner | None = None) -> dict:
     its build/temp output, so the noise floor is low.
     """
     run = runner or default_runner
-    rc, out, err = await run(["git", "-C", path, "status", "--porcelain", "-z"], STATUS_TIMEOUT_S)
+    rc, out, err = await run(_git(path, "status", "--porcelain", "-z"), STATUS_TIMEOUT_S)
     if rc != 0:
         return {"error": f"status failed (rc={rc}): {err.strip()[:200]}"}
     entries, unparsed = parse_status_z(out)
