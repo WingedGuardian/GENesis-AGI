@@ -31,12 +31,22 @@ Measurement-integrity notes (why the numbers are honest):
   lane's apparent marginal effect.
 
 Merge-following: resolution matches against the ACTIVE norm_name set
-(``list_norm_names``), which is post-merge survivors. A query naming a
-merged-away surface form is missed (``get_by_norm_name`` would follow the
-merge). With the adjudication drainer in ``propose_only`` this set is ~empty,
-so the bias is a safe-direction undercount — acceptable for a probe. PR-2's
-live resolver should follow merges; do NOT copy the active-set shortcut
-forward as-is.
+(``list_norm_names``, post-merge survivors) UNIONED with the merged-away
+surface forms redirected to their survivors (``merged_norm_redirects``). A
+query naming a merged-away form therefore resolves to the survivor rather than
+missing — the active-set shortcut this module shipped with is gone, and the
+paragraph describing that shortcut as a "safe-direction undercount" described
+behaviour this module no longer has.
+
+Note the redirect rides ALONGSIDE any active row owning the same norm rather
+than replacing it: ``UNIQUE(norm_name, entity_type)`` makes a shared norm legal
+across types, and suppressing the redirect would make the merged entity
+unfindable by its old name. The map is list-valued and dedups.
+
+Wiring, so this is not read as shipped behaviour: this module's only consumer
+is the shadow probe below, gated by ``entity_lane.mode`` (``"off"`` as shipped).
+The user-visible "a merged-away name finds the survivor" property is carried
+today by the session-awareness rail, which resolves via ``get_by_norm_name``.
 """
 
 from __future__ import annotations
@@ -144,7 +154,9 @@ async def resolve_query_entities(
 
     ``normalize_content`` (alias-expand) → lowercase → whitespace n-grams
     (1..``_MAX_NGRAM``) → O(1) membership against the ACTIVE norm_name set
-    (``list_norm_names``). Whitespace splitting preserves single tokens like
+    (``list_norm_names``) unioned with merged-away forms redirected to their
+    survivors (``merged_norm_redirects``), so a query naming a merged-away name
+    resolves rather than missing. Whitespace splitting preserves single tokens like
     ``pr#1089``; multi-word norm_names (``concurrent workstream``) resolve via
     the bi/tri-gram. Read-only: no writes, no entity creation, no LLM.
     Returns ``{entity_id: 1.0}`` capped at *max_entities*.

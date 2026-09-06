@@ -44,7 +44,14 @@ _COLS = (
 #: older/absent stamp were judged under different rules, and settled_pair_keys
 #: uses that to re-open pre-policy 'distinct' verdicts (MW-3 PR-2b — the
 #: Option-1 same-referent policy superseded the sub-item-vs-parent rule that
-#: had settled ~400 containment-class pairs as distinct).
+#: had settled the containment-class pairs as distinct).
+#:
+#: SIZE OF THE RE-OPEN, because an earlier note said "~400" and that is not
+#: what the predicate does: it unsettles EVERY 'distinct' row with a NULL or
+#: older policy, not only the containment class. MEASURED on a live store
+#: (2026-09-06): 3,180 'distinct' rows and no policy column yet, so all 3,180
+#: enter the re-openable class the moment the migration lands. That is the
+#: number to size the sweep's budget and the drainer's cost against.
 POLICY_VERSION = "mw3-option1"
 
 
