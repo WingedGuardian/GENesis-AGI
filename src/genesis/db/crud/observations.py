@@ -228,6 +228,11 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # POINT EVENT, so the marker must permanently suppress a re-nudge across a full
     # search cycle — long enough that a company sitting in one stage for months never
     # re-fires. Checked with unresolved_only=False (a point event never re-emits).
+    # This TTL bounds the MARKER, not the guarantee: past 365d the row ages out, but the
+    # relay then re-derives it from the UNWINDOWED `outreach_history` delivered-topic
+    # lookup (`outreach.delivered_topic_exists`), which has no retention prune. So the
+    # at-most-once contract outlives this window by design — the TTL only keeps the
+    # observations table from carrying a marker it no longer needs to answer from.
     "career_bite": timedelta(days=365),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),

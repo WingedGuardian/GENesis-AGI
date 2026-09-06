@@ -73,6 +73,7 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from genesis.db.crud import observations
+from genesis.db.crud import outreach as outreach_history
 from genesis.recon import career_outreach_config as cfg
 from genesis.security.sanitizer import strip_control_chars
 
@@ -146,6 +147,13 @@ def _now_z() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _tick_ordinal() -> int:
+    """Monotonic day index for the DAILY tick — the bite-relay's rotation cursor for an
+    oversized pipeline response. A named function, not an inline clock read, so a test
+    can pin it and assert the rotation instead of asserting against a wall clock."""
+    return datetime.now(UTC).toordinal()
+
+
 def _nudge_hash(company: str) -> str:
     """Content-hash namespace for the per-company 'owner already nudged' marker."""
     return hashlib.sha256(f"career_nudged:{company.strip().lower()}".encode()).hexdigest()[:32]
@@ -163,6 +171,60 @@ BITE_STAGES = ("in_conversation", "interviewing", "offer")
 # of the per-tick nudge cap (which bounds owner MESSAGES only). Generous: a single
 # person's real engaged pipeline is tiny — this only bites on an anomalous response.
 _MAX_BITE_CANDIDATES_PER_TICK = 500
+
+
+# The ONLY id types accepted for a company. Everything else is malformed:
+#   * a dict / list / tuple has no stable scalar identity — `str()` of a container is a
+#     Python repr whose ordering can change between otherwise-identical responses (a new
+#     hash → a repeat notification), and it can collide with a literal string spelling
+#     the same repr.
+#   * `bool` is excluded explicitly because it is an `int` subclass, and `True`/`False`
+#     are not identifiers.
+#   * `float` is excluded for the SAME stability reason, which is easy to miss: `9` and
+#     `9.0` hash differently, so a serializer change from int to float would silently
+#     re-key every marker and re-nudge the whole engaged pipeline. `json.loads` also
+#     accepts bare `NaN`/`Infinity` by default, and every NaN id would collapse to the
+#     single key `'nan'` — one marker suppressing unrelated companies. A float is not an
+#     identifier; rejecting one is LOUD (malformed → errors), never a silent drop.
+_BITE_ID_TYPES = (str, int)
+
+# The outreach `signal_type` for a bite nudge. One constant, because it is BOTH the send's
+# governance key and the permanent delivered-already lookup key.
+_BITE_SIGNAL_TYPE = "career_bite"
+
+
+def _bite_entry_id(entry: object) -> str | None:
+    """The SINGLE validation choke point for one external pipeline entry.
+
+    Returns the normalized (stripped) company id, or ``None`` when the entry is
+    MALFORMED in any way — not a dict, no ``id`` key, a null/blank/whitespace-only id,
+    or an id whose type is not in ``_BITE_ID_TYPES``. Callers count a ``None`` as
+    malformed (a job-health failure) and
+    skip the entry, so a schema drift that renames ``id``, emits a blank placeholder, or
+    switches to an object id can never masquerade as "no new advances".
+
+    Every malformed-entry shape is rejected HERE rather than at the call site: these
+    checks accumulated one reviewer round at a time, and a per-site check leaves the
+    next shape for the next round.
+
+    Normalization matches ``_bite_hash`` (which strips + lowercases), so routing an id
+    through this helper never changes an existing marker's dedup identity.
+    """
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("id")
+    if isinstance(raw, bool) or not isinstance(raw, _BITE_ID_TYPES):
+        return None
+    return str(raw).strip() or None
+
+
+def _bite_topic(dedup_key: str) -> str:
+    """The outreach ``topic`` for one bite nudge — the PERMANENT delivery-history key.
+
+    One definition shared by the send (``_bite_nudge``) and the delivered-already
+    recovery lookup, so the two can never drift apart.
+    """
+    return f"Career bite: {dedup_key}"
 
 
 def _bite_hash(company_key: object, stage: str) -> str:
@@ -371,6 +433,13 @@ class CareerOutreachResult:
     bites: int = 0  # pipeline advances relayed to the owner this tick
     errors: int = 0  # unsuccessful operations (→ job-health FAILURE)
     details: list[str] = field(default_factory=list)
+    # A sub-capability fault caught by ``_guarded`` so the SIBLING capability could still
+    # run. Carried out to the runner because isolating the raise removed it from the
+    # runner's own ``except``, which was the ONLY emitter of the ERROR-severity
+    # ``career_outreach_monitor.failed`` bus event (with the traceback). Without this the
+    # crash would survive as a job-health counter and a log line only — invisible in the
+    # ERROR event stream the dashboard and ``health_errors`` read.
+    raised: BaseException | None = None
 
 
 class CareerOutreachMonitor:
@@ -440,9 +509,50 @@ class CareerOutreachMonitor:
             )
             return CareerOutreachResult(mode=mode, bite_mode=bite_mode, errors=1)
 
-        auto = await self._run_autorun(mode, conf, reg) if mode != "off" else None
-        bite = await self._run_bite_relay(bite_mode, conf, reg) if bite_mode != "off" else None
+        # Each branch is ISOLATED: an exception escaping one must not cancel the other.
+        # The two sub-capabilities are independent by design, and the auto-run's body
+        # carries unguarded DB reads/writes (an aiosqlite failure after a draft was
+        # staged raises), so an unrelated auto-run fault would otherwise skip the whole
+        # pipeline read for the day — an advance can leave the engaged stage before the
+        # next daily tick. A raise becomes THAT branch's errors=1 result and the other
+        # branch still runs. Isolating it also takes it out of the runner's own `except`,
+        # which was the only emitter of the ERROR-severity `career_outreach_monitor.failed`
+        # bus event — so the exception rides out on `CareerOutreachResult.raised` and the
+        # runner re-emits it. Job-health accounting is unchanged (errors → record_failure).
+        auto = (
+            await self._guarded("auto-run", self._run_autorun(mode, conf, reg), mode=mode)
+            if mode != "off"
+            else None
+        )
+        bite = (
+            await self._guarded(
+                "bite-relay", self._run_bite_relay(bite_mode, conf, reg), bite_mode=bite_mode
+            )
+            if bite_mode != "off"
+            else None
+        )
         return self._merge_results(mode, bite_mode, auto, bite)
+
+    @staticmethod
+    async def _guarded(label: str, coro, **result_kwargs) -> CareerOutreachResult:
+        """Await one sub-capability, converting a raise into that branch's error result
+        so the sibling capability still runs (see ``gather``).
+
+        ``except Exception`` deliberately does NOT catch ``asyncio.CancelledError`` —
+        since 3.8 it derives from ``BaseException`` (MEASURED on this install's 3.12), so
+        a shutdown/timeout cancellation still propagates and is never mistaken for a
+        sub-capability fault. ``health_ok`` is left alone: ``errors`` is what the runner
+        reads for job health, and a raise says nothing about the remote's reachability."""
+        try:
+            return await coro
+        except Exception as exc:
+            logger.exception("career outreach: %s raised — isolating from the other lever", label)
+            return CareerOutreachResult(
+                **result_kwargs,
+                errors=1,
+                raised=exc,
+                details=[f"{label} raised: {str(exc)[:120]}"],
+            )
 
     @staticmethod
     def _merge_results(
@@ -467,6 +577,9 @@ class CareerOutreachMonitor:
             bites=b.bites,
             errors=a.errors + b.errors,
             details=[*a.details, *b.details],
+            # Either branch may have raised; the runner emits ONE ERROR event per tick, so
+            # the auto-run's fault wins the slot when both raised (its details carry both).
+            raised=a.raised or b.raised,
         )
 
     async def _run_autorun(self, mode: str, conf: dict, reg) -> CareerOutreachResult:
@@ -573,6 +686,16 @@ class CareerOutreachMonitor:
                 bite_mode=bite_mode, details=["bite-relay: data module unreachable — skipped"]
             )
 
+        # SECOND pause recheck — the health probe above is itself an awaited EXTERNAL
+        # call, so a /pause arriving while it was in flight would otherwise still be
+        # followed by the pipeline read. The module contract is "pause is rechecked
+        # BETWEEN external actions"; health-probe → read is such a boundary. Clean skip.
+        if self._is_paused():
+            return CareerOutreachResult(
+                bite_mode=bite_mode,
+                details=["bite-relay: paused after health check — skipped before read"],
+            )
+
         try:
             result = await mod.execute_operation("pipeline")
         except Exception as exc:
@@ -614,7 +737,10 @@ class CareerOutreachMonitor:
         # PRESENT-but-wrong-type bucket (a partial schema change the top-level dict check
         # can't catch): the latter is surfaced via `malformed` → errors, never silently
         # dropped, so a jerbs schema drift can't masquerade as "no new advances" forever.
-        candidates: list[tuple[str, dict]] = []
+        # `object`, not `dict`: a present-but-wrong-type ENTRY is deliberately left in the
+        # list and rejected downstream by `_bite_entry_id`, so that it is COUNTED as
+        # malformed rather than dropped here. Annotating `dict` would be a lie.
+        candidates: list[tuple[str, object]] = []
         malformed = 0
         for stage in BITE_STAGES:
             bucket = pipeline_by_stage.get(stage)
@@ -636,43 +762,57 @@ class CareerOutreachMonitor:
         if len(candidates) > _MAX_BITE_CANDIDATES_PER_TICK:
             # Hard scan ceiling — bounds the per-tick DB work (a read/write per candidate)
             # against a buggy/oversized data_module response, independent of the
-            # message-only nudge cap. NOTE: this is a WORK-bound, not a fair scheduler —
-            # entries beyond the ceiling that PERSIST in the pipeline (e.g. a company that
-            # stays in an engaged stage) keep occupying the truncated prefix, so a
-            # pathological >ceiling-engaged response could starve the tail indefinitely.
-            # Accepted: a real personal pipeline never has hundreds of simultaneously
-            # engaged companies, and under the buggy/compromised response this defends
-            # against, tail liveness is not a requirement (bounding work is). Applying the
-            # ceiling AFTER the seen-filter would reintroduce the unbounded exists_by_hash
-            # reads it exists to bound, so the prefix-cap is deliberate.
+            # message-only nudge cap. Applying the ceiling AFTER the seen-filter would
+            # reintroduce the unbounded exists_by_hash reads it exists to bound, so the
+            # cap stays on the raw candidate list.
+            #
+            # The WINDOW ROTATES so the ceiling bounds work without starving the tail. A
+            # fixed prefix slice is not merely unfair: entries that PERSIST in an engaged
+            # stage keep re-occupying the same prefix every tick, so entry ceiling+1 would
+            # never be scanned at all — a permanent, silent drop rather than a delay.
+            #
+            # What the rotation DOES guarantee, stated exactly: consecutive windows are
+            # CONTIGUOUS (window d spans [d·C, (d+1)·C) around the circle), so a stable
+            # list is fully covered by ceil(len / ceiling) CONSECUTIVE tick-days. Two things
+            # weaken that and neither is a drop:
+            #   * the cursor is the tick DAY, not a count of ticks that ran. A missed tick
+            #     (restart across the cron hour, a misfire past the grace window, a paused
+            #     day) skips one whole window for that cycle; coverage still completes on a
+            #     later cycle because the offsets walk every multiple of gcd(ceiling, len).
+            #   * in `live` the loop also breaks at the nudge cap, so only ~cap un-marked
+            #     entries are PROCESSED per window. Those are never marked, so they are
+            #     never dropped — they wait for their window to come round again.
+            # A tick-COUNTING cursor would make the bound exact, but it needs persistent
+            # state (a new store) for a regime that only exists under a buggy/oversized
+            # response. The day cursor is the proportionate call; `_tick_ordinal` is a
+            # function so tests can pin it — never a wall-clock assertion.
+            offset = (_tick_ordinal() * _MAX_BITE_CANDIDATES_PER_TICK) % len(candidates)
             logger.warning(
-                "career outreach bite-relay: %d engaged-stage entries returned — truncating "
-                "scan to %d (buggy/oversized data_module response?)",
+                "career outreach bite-relay: %d engaged-stage entries returned — scanning a "
+                "rotating window of %d from offset %d (buggy/oversized data_module response?)",
                 len(candidates),
                 _MAX_BITE_CANDIDATES_PER_TICK,
+                offset,
             )
-            candidates = candidates[:_MAX_BITE_CANDIDATES_PER_TICK]
+            candidates = (candidates[offset:] + candidates[:offset])[:_MAX_BITE_CANDIDATES_PER_TICK]
 
         nudge_cap = cfg.knob_int(conf, "max_bite_nudges_per_tick")
         bites = 0
         errors = 0
         attempts = 0  # live nudge attempts this tick (the cap bounds owner messages)
+        recovered = 0  # markers rebuilt from permanent delivery history (nothing sent)
         details: list[str] = []
         for stage, entry in candidates:
             if self._is_paused():
                 details.append("paused — halting bite-relay")
                 break
-            if not isinstance(entry, dict):
-                malformed += 1  # present-but-wrong-type entry → surface, never silent-drop
-                continue
-            company_id = entry.get("id")
-            if company_id is None or str(company_id).strip() == "":
-                # No stable key → cannot dedup/deliver safely. Also catch a WHITESPACE-only
-                # id: _bite_hash .strip()s the key, so " "/"\t"/etc. all collapse to the SAME
-                # empty-key hash for a stage → the first marker would suppress every later
-                # whitespace-id advance. Surface as MALFORMED (a schema drift that renamed/
-                # removed `id`, or emits a blank placeholder, would otherwise drop EVERY
-                # advance while job-health stays green), then skip this entry (fail-safe).
+            company_id = _bite_entry_id(entry)
+            if company_id is None:
+                # Every malformed shape (non-dict entry, missing/null/blank/whitespace-only
+                # id, non-scalar id) is decided by the one helper — see `_bite_entry_id`.
+                # Surface as MALFORMED (→ errors, so a schema drift can't read as "no new
+                # advances" forever), then skip this entry (fail-safe: never dedup or
+                # deliver on an unstable key).
                 malformed += 1
                 continue
             # Bound + sanitize the external name. strip_control_chars collapses the
@@ -706,8 +846,45 @@ class CareerOutreachMonitor:
                 # advanced when observe started.
                 await self._record_bite(h, company_name, stage)
                 continue
+            # PERMANENT delivery recovery. The marker is absent but this exact point event
+            # may already have been DELIVERED by an earlier tick that crashed before
+            # `_record_bite` committed. `outreach_history` records every delivery forever
+            # (no retention prune — only an id-scoped delete), so an exact
+            # (signal_type, topic) hit is durable proof the owner already got this advance.
+            # This REPLACES the 24h-window reasoning as the primary recovery: the pipeline's
+            # own dedup window (career_bite falls through to _DEFAULT_DEDUP_HOURS = 24h) is
+            # NOT longer than this job's retry interval (a daily 08:00 cron), so the
+            # REJECTED branch below cannot be relied on to catch the crash window at all.
+            # NOT airtight, and the residue is worth naming rather than over-trusting:
+            # `pipeline._deliver` writes the history row and then sets `delivered_at` in a
+            # SECOND committed statement, so a crash strictly between the two leaves a
+            # delivered message this lookup cannot see → one re-nudge. That window is far
+            # narrower than the one closed here, and closing it needs a single-transaction
+            # write inside the outreach pipeline (not this module's to make).
+            # Runs BEFORE the nudge cap so a recovery is never blocked by it, and consumes
+            # no `attempts` (nothing is sent). Bounded by the same scan ceiling as the
+            # marker read above.
+            if await outreach_history.delivered_topic_exists(
+                self._db, signal_type=_BITE_SIGNAL_TYPE, topic=_bite_topic(h)
+            ):
+                await self._record_bite(h, company_name, stage)
+                # COUNT here, one summary line after the loop — do NOT append per entry.
+                # This branch is deliberately outside the nudge cap, so a mass marker loss
+                # could append one line per candidate (up to the scan ceiling, each name
+                # 200 chars); `details` is joined into job_health's `last_error`, which
+                # applies no length bound of its own. The per-company detail is not lost —
+                # it goes to the log, which is where a 500-entry recovery belongs.
+                logger.info(
+                    "career outreach bite-relay: marker recovered from delivery history — %s → %s",
+                    company_name,
+                    stage,
+                )
+                recovered += 1
+                continue
             # live: bound the per-tick owner-message burst. Un-nudged advances are NOT
-            # marked, so they surface on a later tick (loud-truncation, never dropped).
+            # marked, so they surface on a later tick (loud-truncation, never dropped) —
+            # the NEXT tick normally, but up to a full rotation cycle when the response is
+            # oversized enough for the rotating window above to be in play.
             if attempts >= nudge_cap:
                 details.append(
                     f"bite-relay: per-tick nudge cap ({nudge_cap}) reached — "
@@ -723,12 +900,13 @@ class CareerOutreachMonitor:
             elif status == OutreachStatus.REJECTED:
                 # Pipeline dedup: submit_raw found an identical recent (company, stage)
                 # nudge (the topic is unique per (company, stage)), so the owner ALREADY
-                # received this exact advance. Treat it as relayed and WRITE THE MARKER —
-                # this closes the crash-window where a prior tick delivered the nudge but
-                # crashed before _record_bite committed (marker absent): without marking
-                # here, the next daily tick (after the pipeline's 24h dedup expires) would
-                # re-deliver the same point-event, violating the one-time contract. Not a
-                # failure; not counted as a fresh bite (no new delivery this tick).
+                # received this exact advance. Treat it as relayed and WRITE THE MARKER.
+                # This is now BELT-AND-SUSPENDERS, not the crash-window recovery: the
+                # pipeline's window (24h) is not longer than this job's retry interval, so
+                # the permanent delivered-topic check above is what actually closes that
+                # window. Kept because it also covers a delivery this process made through
+                # some other path within the window. Not a failure; not counted as a fresh
+                # bite (no new delivery this tick).
                 await self._record_bite(h, company_name, stage)
                 details.append(f"bite nudge deduped (marked relayed) — {company_name} → {stage}")
             else:
@@ -737,6 +915,12 @@ class CareerOutreachMonitor:
                 details.append(
                     f"bite nudge not delivered (status={status}) — {company_name} → {stage}"
                 )
+        if recovered:
+            # ONE line whatever the count — the per-company detail is in the log above.
+            details.append(
+                f"bite-relay: {recovered} marker(s) recovered from permanent delivery "
+                "history (already relayed, not re-sent)"
+            )
         if malformed:
             # Present-but-wrong-type buckets/entries → job-health failure, so a partial
             # jerbs schema change surfaces instead of silently reading nothing.
@@ -1043,9 +1227,12 @@ class CareerOutreachMonitor:
             # delivered message is the `text` arg (submit_raw ignores request.context for
             # delivery — it feeds only the dedup hash), so this sets dedup identity only,
             # not what the owner sees.
-            topic=f"Career bite: {dedup_key}",
+            # `_bite_topic` is the SHARED definition — the permanent delivered-already
+            # recovery lookup in `_run_bite_relay` reads the same key, so the send and the
+            # recovery can never drift apart.
+            topic=_bite_topic(dedup_key),
             context=f"{dedup_key}\n{text}",
-            signal_type="career_bite",
+            signal_type=_BITE_SIGNAL_TYPE,
             salience_score=0.85,
             verbatim=True,
         )

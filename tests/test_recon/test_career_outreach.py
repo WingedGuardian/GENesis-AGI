@@ -1851,3 +1851,346 @@ def test_parse_json_handles_json_verdict_and_nested_objects():
         {"company": "A"},
         {"company": "B"},
     ]
+
+
+# ── PR #1590 round-4 findings: lever isolation, pause boundary, id typing, scan
+# ── rotation, and permanent delivery recovery ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_autorun_raise_does_not_disable_bite_relay(db, monkeypatch):
+    # Codex #1590: the two sub-capabilities are INDEPENDENT, but an exception escaping
+    # _run_autorun used to skip the relay for the whole daily tick (the runner caught it
+    # one level up, so the pipeline was never read at all).
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data, reasoning_module=_FakeModule())
+
+    async def _boom(*a, **k):
+        raise RuntimeError("autorun exploded")
+
+    mon._run_autorun = _boom
+    result = await mon.gather()
+    assert result.bites == 1  # the relay still ran and relayed
+    assert data.ops == ["pipeline"]  # the pipeline WAS read
+    assert result.errors == 1  # ...and the auto-run raise is a job-health failure
+    assert any("auto-run raised" in d for d in result.details)
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_raise_does_not_discard_autorun(db, monkeypatch):
+    # The mirror direction: a raise escaping _run_bite_relay must not discard the
+    # independently-computed auto-run result.
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    reasoning = _FakeModule(autoruns=[{"company": "A", "contact": "a", "draft_summary": "s"}])
+    data = _FakeDataModule(pipeline={})
+    mon, _pipe = _mon_bite(db, data, reasoning_module=reasoning)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("relay exploded")
+
+    mon._run_bite_relay = _boom
+    result = await mon.gather()
+    assert result.auto_runs == 1  # the auto-run result survived
+    assert result.errors == 1
+    assert any("bite-relay raised" in d for d in result.details)
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_rechecks_pause_after_health_before_read(db, monkeypatch):
+    # Codex #1590: the health probe is ITSELF an awaited external call. A /pause landing
+    # while it is in flight must stop the pipeline read — "pause is rechecked BETWEEN
+    # external actions" and health-probe -> read is such a boundary.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+
+    state = {"paused": False}
+
+    async def _health_then_pause():
+        state["paused"] = True  # /pause arrives DURING the health await
+        return True
+
+    data.check_health_cached = _health_then_pause
+    mon._is_paused = lambda: state["paused"]
+
+    result = await mon.gather()
+    assert data.ops == []  # the external read never started
+    assert result.bites == 0 and result.errors == 0 and pipe.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [{"a": 1}, [1, 2], (1, 2), True, False, 1.5, 9.0, float("nan")])
+async def test_bite_relay_rejects_non_scalar_id(db, monkeypatch, bad_id):
+    # Codex #1590 + review: an id must be a STABLE scalar. A container's str() is a repr
+    # whose ordering can change between identical responses (a new hash -> a repeat
+    # nudge); bool is not an identifier; a float is not either — `9` and `9.0` hash
+    # differently, so an int->float serializer change would re-key every marker, and
+    # every NaN id collapses to the single key 'nan'. All malformed: surfaced, never
+    # dedup'd, never sent.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(
+        pipeline={"offer": [{"id": bad_id, "name": "Weird"}, _entry(9, "Hooli")]}
+    )
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors >= 1  # surfaced, not silently dropped
+    assert result.bites == 1 and len(pipe.sent) == 1  # the valid sibling still relays
+    assert await _bite_count(db) == 1  # no marker written for the malformed entry
+
+
+@pytest.mark.asyncio
+async def test_bite_entry_id_normalizes_without_changing_dedup_identity(db):
+    # The choke point must not alter an ACCEPTED id's marker identity — a change would
+    # silently re-nudge every already-relayed advance on the first tick after deploy.
+    from genesis.recon.career_outreach import _bite_entry_id
+
+    for raw in ("acme", "Acme", " acme ", "\tACME\n", 7, 0, -3):
+        key = _bite_entry_id({"id": raw})
+        assert key is not None
+        assert _bite_hash(key, "offer") == _bite_hash(raw, "offer")
+    # ...and every malformed shape resolves to None through the ONE helper.
+    assert _bite_entry_id("not-a-dict") is None
+    assert _bite_entry_id({}) is None
+    assert _bite_entry_id({"id": None}) is None
+    assert _bite_entry_id({"id": ""}) is None
+    assert _bite_entry_id({"id": "   "}) is None
+    assert _bite_entry_id({"id": {"x": 1}}) is None
+    assert _bite_entry_id({"id": [1]}) is None
+    assert _bite_entry_id({"id": True}) is None
+    assert _bite_entry_id({"id": 9.0}) is None  # a float is not an identifier
+    assert _bite_entry_id({"id": float("nan")}) is None
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_scan_window_rotates_so_the_tail_progresses(db, monkeypatch):
+    # Codex #1590: a FIXED prefix slice permanently excludes everything past the ceiling
+    # when the same entries persist in an engaged stage — entry ceiling+1 is never
+    # scanned at all. The window rotates one whole ceiling per daily tick instead.
+    from genesis.recon import career_outreach as co
+
+    monkeypatch.setattr(co, "_MAX_BITE_CANDIDATES_PER_TICK", 2, raising=False)
+    _cfg(monkeypatch, mode="off", bite_mode="observe")
+    entries = [_entry(i, f"C{i}") for i in range(1, 6)]  # 5 entries, ceiling 2
+
+    day = {"n": 0}
+    monkeypatch.setattr(co, "_tick_ordinal", lambda: day["n"], raising=False)
+
+    seen: set[str] = set()
+    for tick in range(3):  # ceil(5/2) = 3 ticks covers the whole list
+        day["n"] = tick
+        data = _FakeDataModule(pipeline={"in_conversation": list(entries)})
+        mon, _ = _mon_bite(db, data)
+        await mon.gather()
+        rows = await (
+            await db.execute("SELECT content FROM observations WHERE type = 'career_bite'")
+        ).fetchall()
+        seen = {r[0] for r in rows}
+        assert len(seen) <= 2 * (tick + 1)  # never more than the ceiling per tick
+
+    # Every entry was reached — a fixed prefix would have left C3/C4/C5 unseen forever.
+    assert seen == {f"bite:C{i}:in_conversation" for i in range(1, 6)}
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_recovers_marker_from_permanent_delivery_history(db, monkeypatch):
+    # Codex #1590: the crash window (delivered, then died before _record_bite) was only
+    # covered by the outreach pipeline's 24h dedup — a window NOT longer than this job's
+    # daily retry interval, so it could lapse and re-deliver the point event. The
+    # permanent outreach_history record closes it regardless of elapsed time.
+    from genesis.db.crud import outreach as outreach_history
+    from genesis.recon.career_outreach import _bite_topic
+
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    h = _bite_hash(9, "offer")
+    await outreach_history.create(
+        db,
+        id="prior-send",
+        signal_type="career_bite",
+        topic=_bite_topic(h),
+        category="notification",
+        salience_score=0.85,
+        channel="telegram",
+        message_content="🎯 Career: Hooli advanced to offer",
+        created_at="2020-01-01T00:00:00",  # long outside ANY dedup window
+    )
+    await outreach_history.record_delivery(db, "prior-send", delivered_at="2020-01-01T00:00:00")
+
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+
+    assert pipe.sent == []  # NOT re-sent — the point event was already delivered
+    assert result.bites == 0 and result.errors == 0
+    assert await _bite_count(db) == 1  # the missing marker was recovered
+    assert any("1 marker(s) recovered from permanent delivery history" in d for d in result.details)
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_delivery_recovery_is_not_blocked_by_the_nudge_cap(db, monkeypatch):
+    # Recovery sends nothing, so it must not consume a nudge-cap slot — otherwise a
+    # backlog of already-delivered advances would starve the recovery indefinitely.
+    from genesis.db.crud import outreach as outreach_history
+    from genesis.recon.career_outreach import _bite_topic
+
+    _cfg(monkeypatch, mode="off", bite_mode="live", bite_cap=1)
+    for cid in (1, 2):
+        h = _bite_hash(cid, "offer")
+        await outreach_history.create(
+            db,
+            id=f"prior-{cid}",
+            signal_type="career_bite",
+            topic=_bite_topic(h),
+            category="notification",
+            salience_score=0.85,
+            channel="telegram",
+            message_content="x",
+            created_at="2020-01-01T00:00:00",
+        )
+        await outreach_history.record_delivery(
+            db, f"prior-{cid}", delivered_at="2020-01-01T00:00:00"
+        )
+
+    data = _FakeDataModule(pipeline={"offer": [_entry(1, "A"), _entry(2, "B"), _entry(3, "C")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+
+    assert await _bite_count(db) == 3  # 2 recovered + 1 freshly relayed
+    assert result.bites == 1 and len(pipe.sent) == 1  # only the un-delivered one was sent
+
+
+@pytest.mark.asyncio
+async def test_runner_reemits_error_event_for_an_isolated_sub_capability_raise(monkeypatch):
+    # Review SHOULD-FIX: isolating a raise inside gather() takes it out of the runner's
+    # own `except`, which was the ONLY emitter of the ERROR-severity
+    # `career_outreach_monitor.failed` event (with the traceback). Without the re-emit an
+    # isolated crash survives as a job-health counter + a log line and vanishes from the
+    # ERROR stream the dashboard and health_errors read.
+    from genesis.observability.events import Severity
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+
+    boom = RuntimeError("autorun exploded")
+
+    class _Bus:
+        def __init__(self):
+            self.emitted = []
+
+        async def emit(self, subsystem, severity, event, message, **kw):
+            self.emitted.append((severity, event, kw))
+
+    bus = _Bus()
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(
+                mode="live", bite_mode="live", bites=1, errors=1,
+                raised=boom, details=["auto-run raised: autorun exploded"],
+            )
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = bus
+
+    await runners.run_career_outreach_monitor(_Sched())
+
+    assert calls["fail"] == ["career_outreach_monitor"] and not calls["success"]
+    errors = [e for e in bus.emitted if e[0] == Severity.ERROR]
+    assert len(errors) == 1
+    assert errors[0][1] == "career_outreach_monitor.failed"
+    # the traceback must ride along — that is the whole point of the event
+    assert errors[0][2]  # failure_details(exc=...) produced payload
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_emit_error_event_for_a_plain_dispatch_error(monkeypatch):
+    # The control: an ordinary errors=1 with NO raise (an adapter error dict) must keep
+    # its pre-existing behaviour — record_failure only, no ERROR event.
+    from genesis.observability.events import Severity
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+
+    class _Bus:
+        def __init__(self):
+            self.emitted = []
+
+        async def emit(self, subsystem, severity, event, message, **kw):
+            self.emitted.append((severity, event, kw))
+
+    bus = _Bus()
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(
+                mode="live", bite_mode="off", errors=1, details=["dispatch failed"]
+            )
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = bus
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["fail"] == ["career_outreach_monitor"]
+    assert [e for e in bus.emitted if e[0] == Severity.ERROR] == []
+
+
+@pytest.mark.asyncio
+async def test_guarded_raise_carries_the_exception_out_to_the_result(db, monkeypatch):
+    # The plumbing half: gather() must put the caught exception on `.raised` (and
+    # _merge_results must carry it through) or the runner has nothing to re-emit.
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    data = _FakeDataModule(pipeline={})
+    mon, _ = _mon_bite(db, data, reasoning_module=_FakeModule())
+    boom = RuntimeError("autorun exploded")
+
+    async def _raise(*a, **k):
+        raise boom
+
+    mon._run_autorun = _raise
+    result = await mon.gather()
+    assert result.raised is boom
+    assert result.errors == 1
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_recovery_details_are_one_line_whatever_the_count(db, monkeypatch):
+    # Review NOTE: the recovery branch sits OUTSIDE the nudge cap, so a per-entry detail
+    # line could append once per candidate (up to the scan ceiling, 200 chars of name
+    # each) into `details` — which the runner joins into job_health's unbounded
+    # `last_error`. It must emit ONE summary line carrying the count instead.
+    from genesis.db.crud import outreach as outreach_history
+    from genesis.recon.career_outreach import _bite_topic
+
+    _cfg(monkeypatch, mode="off", bite_mode="live", bite_cap=1)
+    entries = [_entry(i, f"C{i}") for i in range(1, 8)]
+    for e in entries:
+        h = _bite_hash(e["id"], "offer")
+        await outreach_history.create(
+            db,
+            id=f"prior-{e['id']}",
+            signal_type="career_bite",
+            topic=_bite_topic(h),
+            category="notification",
+            salience_score=0.85,
+            channel="telegram",
+            message_content="x",
+            created_at="2020-01-01T00:00:00",
+        )
+        await outreach_history.record_delivery(
+            db, f"prior-{e['id']}", delivered_at="2020-01-01T00:00:00"
+        )
+
+    data = _FakeDataModule(pipeline={"offer": entries})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+
+    assert await _bite_count(db) == 7 and pipe.sent == []  # all 7 recovered, none re-sent
+    recovery_lines = [d for d in result.details if "recovered" in d]
+    assert len(recovery_lines) == 1  # ONE line, not seven
+    assert "7 marker(s) recovered from permanent delivery history" in recovery_lines[0]

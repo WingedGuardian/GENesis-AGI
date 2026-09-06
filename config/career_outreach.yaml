@@ -44,6 +44,11 @@ autorun_note: ""
 bite_relay_mode: off
 # data_module: name of the external DATA module (a structured HTTP read exposing a
 # `pipeline` op — distinct from reasoning_module's SSH dispatch). Ships EMPTY; set the
-# install's module name in the gitignored career_outreach.local.yaml. Empty/absent →
-# the bite-relay no-ops cleanly.
+# install's module name in the gitignored career_outreach.local.yaml.
+#   While bite_relay_mode is `off` (the shipped default) an empty/absent data_module is a
+#   clean no-op — the relay never runs, and job health stays untouched.
+#   Once bite_relay_mode is `observe` or `live`, a data_module that is empty or does not
+#   resolve to a loaded module is a MISCONFIG: an enabled relay that can deliver nothing
+#   records a job-health FAILURE rather than a green no-op. Set data_module in the SAME
+#   step as enabling the lever.
 data_module: ""

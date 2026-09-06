@@ -196,6 +196,19 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         # a dispatch errored; an unhealthy remote (health_ok=False, errors=0) is a
         # clean skip and records success.
         if result.errors:
+            # A sub-capability that RAISED was caught inside gather() so the sibling
+            # capability could still run — which also means it never reaches the `except`
+            # below, the only emitter of the ERROR-severity `career_outreach_monitor.failed`
+            # event carrying the traceback. Re-emit it here so an isolated crash is still
+            # visible in the ERROR stream (dashboard / health_errors), not just in
+            # job-health's last_error and the log.
+            if result.raised is not None and sched._event_bus:
+                await sched._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "career_outreach_monitor.failed",
+                    "Career outreach sub-capability raised (isolated from its sibling)",
+                    **failure_details(exc=result.raised),
+                )
             record_failure(
                 "career_outreach_monitor", "; ".join(result.details) or "dispatch error"
             )
