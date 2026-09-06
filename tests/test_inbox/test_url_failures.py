@@ -106,10 +106,30 @@ class TestUncoveredUrls:
         )
         assert _uncovered_urls(response, content) == []
 
-    def test_single_url_covered_by_platform_alias(self):
-        # A lone linkedin.com URL discussed as "the LinkedIn post" is covered.
+    def test_platform_name_is_not_evidence_for_a_path_bearing_url(self):
+        """A platform name identifies the SITE, never WHICH item on it.
+
+        Deliberate contract change (2026-09-06, CodeRabbit finding on #1820):
+        an earlier revision accepted "the LinkedIn post" as coverage for a
+        lone linkedin.com URL. MEASURED by probe: that let a response which
+        fetched nothing and named only the platform baseline its URL — the
+        exact silent-drop class this gate exists to catch. Domain-level
+        evidence now counts only when the domain IS the identity (no path).
+        """
         content = "https://www.linkedin.com/posts/someone_zx9qv84k"
         response = "# Inbox Evaluation\nThe LinkedIn post argues that agents..."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_platform_name_is_not_evidence_for_a_repo_url(self):
+        content = "https://github.com/OpenBMB/VoxCPM"
+        response = "# Inbox Evaluation\nA GitHub project worth noting."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_bare_domain_url_is_covered_by_domain_evidence(self):
+        """When the URL carries no path the domain IS the identity, so
+        domain/stem evidence is genuine evidence — not a platform gesture."""
+        content = "https://voxcpm.ai"
+        response = "# Inbox Evaluation\nvoxcpm is a tokenizer-free TTS model."
         assert _uncovered_urls(response, content) == []
 
     def test_domain_alias_cannot_vouch_for_two_urls_on_same_domain(self):

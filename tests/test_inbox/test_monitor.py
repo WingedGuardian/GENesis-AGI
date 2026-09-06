@@ -29,10 +29,21 @@ class _FakeClock:
 
 
 def _success_output(
-    # Default fake response names the fixture domains so single-URL fixtures
-    # pass the per-URL coverage gate (dispatch/lifecycle mechanics are under
-    # test here; coverage-gate behavior has its own dedicated tests).
-    text: str = "evaluation result for example.com / linkedin content",
+    # Default fake response echoes this file's fixture URLs the way the
+    # evaluation prompt now requires (**Source:** lines), so dispatch and
+    # lifecycle tests pass the per-URL coverage gate. A platform name alone
+    # is deliberately NOT coverage for a path-bearing URL — that rule has its
+    # own dedicated tests in test_url_failures.py.
+    text: str = (
+        "evaluation result\n"
+        "**Source:** https://example.com/article\n"
+        "**Source:** https://example.com/article-1\n"
+        "**Source:** https://example.com/article-2\n"
+        "**Source:** https://example.com/article-3\n"
+        "**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n"
+        "**Source:** https://www.linkedin.com/posts/foo-share-123-1G81/\n"
+    ),
 ) -> CCOutput:
     return CCOutput(
         session_id="cc-sess-1",
@@ -2167,10 +2178,13 @@ async def test_baseline_guard_survives_file_clear(
         "https://example.com/article-2\n"
     )
 
+    # One canned response serves BOTH evaluations in this test, so it must
+    # cover the second drop's URL (article-3) as well.
     mock_invoker.run.return_value = _success_output(
         "# Inbox Evaluation\n\n## 1. Numenta\nGood stuff.\n\n"
         "## 2. example.com/article-1\nInteresting.\n\n"
-        "## 3. example.com/article-2\nNoted.\n" + "x" * 300
+        "## 3. example.com/article-2\nNoted.\n\n"
+        "## 4. example.com/article-3\nAlso noted.\n" + "x" * 300
     )
 
     # Write file and do first evaluation

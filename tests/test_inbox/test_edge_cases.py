@@ -243,10 +243,16 @@ async def test_get_all_known_recent_processing_not_expired(db):
 
 
 def _success_output(
-    # Default fake response names the fixture domains so single-URL fixtures
-    # pass the per-URL coverage gate (lifecycle mechanics are under test here;
-    # coverage-gate behavior has its own dedicated tests).
-    text: str = "evaluation result for example.com / linkedin content",
+    # Default fake response echoes this file's fixture URLs the way the
+    # evaluation prompt now requires (**Source:** lines), so lifecycle tests
+    # pass the per-URL coverage gate. Coverage-gate behavior itself is pinned
+    # in test_url_failures.py.
+    text: str = (
+        "evaluation result\n"
+        "**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n"
+        "**Source:** https://example.com/article\n"
+    ),
 ) -> CCOutput:
     return CCOutput(
         session_id="cc-sess-1", text=text, model_used="sonnet",

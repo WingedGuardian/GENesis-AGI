@@ -206,11 +206,14 @@ def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
        len >= 6, or len >= 4 containing a digit (video ids, short slugs),
        excluding :data:`_GENERIC_URL_TOKENS`.
     3. Domain-level evidence (bare domain, platform alias from
-       :data:`_DOMAIN_TO_NAMES`, or the domain stem) — accepted ONLY when
-       this item carries a single URL on that domain, because "the LinkedIn
-       post" cannot vouch for two different LinkedIn URLs; aliases and stems
-       that are common English words (:data:`_GENERIC_STEM_TOKENS`) never
-       count, because "medium confidence" is not evidence about medium.com.
+       :data:`_DOMAIN_TO_NAMES`, or the domain stem) — accepted ONLY for a
+       URL with NO path, where the domain IS the identity, and only when the
+       item carries a single URL on that domain. A platform name never
+       vouches for a path-bearing URL: "the LinkedIn post" identifies the
+       site, not which post, so accepting it would pass a response that
+       fetched nothing. Aliases and stems that are common English words
+       (:data:`_GENERIC_STEM_TOKENS`) never count either — "medium
+       confidence" is not evidence about medium.com.
 
     A miss is deliberately cheap: the caller re-queues the item through the
     existing partial-failure retry path (max_retries-capped) — it never
@@ -252,7 +255,12 @@ def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
                 for t in tokens
             ):
                 continue
-        if domain_counts[domain] == 1:
+        elif domain_counts[domain] == 1:
+            # Rung 3 runs ONLY for a URL with no path (the `elif`): there the
+            # domain IS the item's identity. When a path exists it carries the
+            # identity, and a platform name ("the LinkedIn post", "a GitHub
+            # project") says nothing about WHICH item — accepting it let a
+            # response that fetched nothing baseline its URL.
             if domain in lower:
                 continue
             if any(
