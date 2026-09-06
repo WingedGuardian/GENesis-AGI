@@ -59,6 +59,12 @@ Two of these produce artifacts that look completely normal. A 3 KB PNG opens
 fine and is simply black. An empty UI Automation tree is indistinguishable from
 a genuinely featureless application.
 
+One more empty result that is not evidence: the **Task Scheduler Operational
+log is disabled by default**, so `Get-WinEvent` returns zero task-launch events
+on a machine where tasks are firing constantly. Check
+`(Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational').IsEnabled`
+before reading anything into an empty history.
+
 Session 0 also reports a **phantom display**: `Screen.PrimaryScreen.Bounds`
 returned `1024x768` where the real desktop was `1536x864`. So even the metadata
 lies, plausibly.
@@ -116,6 +122,46 @@ Four details, each of which costs a debugging cycle if missed:
   task's `LastTaskResult` *and* wait on the output file. Have the script write
   its own evidence — session id, the rect it saw, a content check — and read
   that back rather than trusting an exit code.
+
+## Every scheduled task shows a console window
+
+A PowerShell helper launched by Task Scheduler **gets a visible console**, and
+`-WindowStyle Hidden` on the task action does not suppress it. How bad that is
+scales with how often the helper runs:
+
+| helper shape | what the operator sees |
+|---|---|
+| one-shot (a capture) | a brief flash |
+| resident (a watcher) | a black window that never goes away |
+| once per action (an actuator) | **a window popping up every few seconds** |
+
+The third is not a cosmetic issue. It makes the machine unusable while the
+tool is working, which was discovered by doing it to a real operator.
+
+Hide the console from inside the script, in the **shared preamble** rather
+than per-script:
+
+```powershell
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class GenesisWin {
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+  [DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr h, int cmd);
+}
+'@
+$c = [GenesisWin]::GetConsoleWindow()
+if ($c -ne [IntPtr]::Zero) { [void][GenesisWin]::ShowWindow($c, 0) }  # SW_HIDE
+```
+
+The console exists for a few milliseconds before this runs, so there is a
+brief flash at launch. A `wscript.exe` shim avoids even that, at the cost of an
+extra deployed file.
+
+**Put it in the same place as DPI awareness, and for the same reason.** Both
+are preconditions every helper needs and both fail in ways nobody notices
+until they are already a problem. Applying either to one script and not its
+sibling is the failure mode: a precondition that fails silently must have
+exactly one home.
 
 ## Elevation is a separate wall
 
