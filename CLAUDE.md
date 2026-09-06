@@ -356,6 +356,18 @@ reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
+**PR-body convention — `E2E:` (required, merge-gated):** every PR body declares
+the POST-MERGE end-to-end verification its change needs, on its own line:
+`E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
+The merge gate blocks a PR that declares neither — and a `none` carrying no real
+reason (a bare `none`, a placeholder, or a refusal word like TBD). Merge time
+only, never on push. PRs created before the convention are exempt; if the PR's
+creation date cannot be READ, the gate blocks rather than assuming the
+exemption. `none` is a fine answer for a docs PR; what is refused is leaving the
+decision unmade. It does NOT release
+the validator, which assumes every merged PR has an E2E and hunts for one anyway
+— the line is its first lead, not a boundary.
+
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
 the repo-pulse worker auto-absorbs the row with PR evidence at the next

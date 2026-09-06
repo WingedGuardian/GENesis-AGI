@@ -4797,6 +4797,198 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+#: MIRROR of e2e_declaration.E2E_CUTOFF_ISO, for the degraded path only. Without it
+#: the cutoff exemption was gated on the parser importing, so a PRE-CUTOFF PR was
+#: BLOCKED whenever the module could not load — a false block on a gate with no
+#: override, against the one population the cutoff exists to protect (CodeRabbit
+#: Minor, 2026-09-06; an earlier comment here claimed a reorder had fixed this, when
+#: the reorder only removed a wasted round-trip). Duplicating a constant invites
+#: drift, so `test_the_degraded_cutoff_mirror_matches_the_parser` locks the two
+#: together and fails the moment either moves.
+_E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
+
+#: Last-resort matcher for the E2E declaration, used ONLY when
+#: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
+#: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
+#: addition: the value must contain NO `<…>` placeholder span, because this path
+#: cannot strip HTML comments and the shipped template's guidance lives in one.
+#: An earlier version used `(?!<)`, which only guards the FIRST character — so the
+#: template's own `E2E: none — <reason there is no runtime surface to verify>` line
+#: matched, and every straight-from-template PR would have satisfied the degraded
+#: gate while the comment right here claimed it could not (Kimi P2, 2026-09-06,
+#: reproduced). A real one-line declaration does not carry an angle-bracketed span;
+#: a template line always does. Kept adjacent to the loader so the two are read
+#: together; the real pattern remains the parser's.
+_E2E_FALLBACK_RE = re.compile(
+    r"^[^\S\n]*(?:[-*+>][^\S\n]*)*(?:\[[ xX]\][^\S\n]*)?"
+    r"[*_`]{0,2}E2E[*_`]{0,2}[^\S\n]*:[^\S\n]*(?![^\n]*<[^<>\n]*>)(\S[^\n]*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _load_e2e_declaration():
+    """Import scripts/e2e_declaration.py, or None if unavailable.
+
+    Same lazy, failure-tolerant shape as ``_load_pin_receipt_checker``: a sibling
+    script rather than a package, and a hook that cannot import it must not stop
+    being a merge gate for everything else."""
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "e2e_declaration.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_e2e_declaration", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec (dataclasses resolve their module from sys.modules),
+        # and popped on failure so a half-initialised entry cannot poison a later
+        # import — the same hygiene the sibling loader in e2e_declaration.py argues
+        # for. The two loaders disagreeing about it is how one of them ends up wrong.
+        sys.modules["_e2e_declaration"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("_e2e_declaration", None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
+    """The PR's creation timestamp (ISO-8601), or None if unreadable.
+
+    Mirrors ``_pr_body_text``: ``None`` is UNREADABLE, which the caller treats as
+    "not exempt" — the pre-cutoff population is finite and shrinking, so a parse
+    failure must not become a permanent exemption."""
+    raw = os.environ.get("_TEST_GH_PR_CREATED_AT")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "view", pr_num, *_repo_args(repo),
+                "--json", "createdAt", "--jq", ".createdAt",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a merge whose PR body never DECIDED about a post-merge E2E (§8.12).
+
+    Returns (should_block, message). The obligation is one line in the PR body —
+    either a plan or an explicit reasoned ``none`` (see scripts/e2e_declaration.py
+    for the full convention and why its parsing is what it is).
+
+    GUARD AXIOMS, stated because every gate change owes them:
+      * VERDICT: block, at MERGE time only. The push arm never calls this — a
+        body is written and revised while a PR is open, so demanding it at push
+        would gate the wrong moment.
+      * AUDIENCE: the agent. The message names both valid forms verbatim.
+      * BACKGROUND: none. Background sessions cannot merge PRs by design, so this
+        cannot impede one.
+
+    Fail directions, each chosen rather than inherited:
+      * body UNREADABLE → BLOCK. This gate guards EVERY merge, so an unreadable
+        body is an unanswered question, not a pass. (The pin gate fails open on
+        the same read because it guards only the rare pin-bump path — the
+        divergence is deliberate, not an oversight.)
+      * createdAt UNREADABLE → BLOCK, naming the cause. Treating it as "old"
+        would turn the transition window into a permanent hole.
+      * parser module MISSING → the body is still scanned for a bare ``E2E:``
+        line and a NOTE says the comment/fence stripping was unavailable. Losing
+        the invisibility defence must not lose the whole gate.
+
+    NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
+    escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
+    """
+    # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
+    # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
+    # module was missing — a false block, on a gate with no override, against the one
+    # population the exemption exists to protect. Degraded mode compares the mirror
+    # constant lexicographically: both values are ISO-8601 UTC of the same shape, so
+    # that ordering is exact without a parser.
+    mod = _load_e2e_declaration()
+    created_at = _pr_created_at(pr_num, repo=repo)
+    if created_at is None:
+        if mod is None:
+            # Neither the parser NOR the timestamp: nothing can be established, and
+            # the presence scan below still runs. Fail toward asking for a line.
+            print(
+                f"NOTE: PR #{pr_num} — createdAt unreadable AND the E2E parser could "
+                f"not load; the pre-convention exemption could not be checked.",
+                file=sys.stderr,
+            )
+        else:
+            return True, (
+                f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
+                f"pre-convention exemption cannot be established. Re-run; if it "
+                f"persists, the gh read is failing."
+            )
+    else:
+        if mod is not None:
+            exempt = mod.is_pre_cutoff(created_at)
+        else:
+            exempt = created_at.strip() < _E2E_CUTOFF_FALLBACK
+        if exempt:
+            return False, f"n/a (PR created {created_at}, before the convention)"
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return True, (
+            f"E2E obligation: PR #{pr_num}'s body is unreadable, so the declaration "
+            f"cannot be confirmed. This gate guards every merge — an unread body is "
+            f"an unanswered question, not a pass."
+        )
+
+    if mod is None:
+        # Degraded: no comment/fence stripping. A hand-written second matcher here
+        # DIVERGED from the parser in BOTH directions (architect SHOULD-FIX,
+        # 2026-09-06, measured): it accepted the shipped PR template's guidance line
+        # — which lives inside an HTML comment, so every straight-from-template PR
+        # would have passed — while REJECTING `- E2E: …`, `* E2E: …`, `> E2E: …` and
+        # checkbox forms, the exact markdown tolerance the real pattern exists for.
+        # Two matchers for one rule, selected by an exception handler, is the defect;
+        # this one is derived from the same shape and refuses any value carrying a
+        # `<…>` span, so no template line can satisfy it. (The narrower `(?!<)` this
+        # comment used to name was itself the bug — it guarded only the first
+        # character; see the pattern's own docstring.)
+        found = _E2E_FALLBACK_RE.search(body)
+        if found:
+            print(
+                f"NOTE: PR #{pr_num} — e2e_declaration.py could not be loaded; the "
+                f"E2E: line was matched WITHOUT comment/fence stripping, so a "
+                f"declaration hidden in an HTML comment would not be caught.",
+                file=sys.stderr,
+            )
+            return False, "ok (degraded: parser unavailable)"
+        return True, (
+            f"E2E obligation: no E2E: line found in PR #{pr_num}'s body (parser "
+            f"unavailable, presence-only scan)."
+        )
+
+    result = mod.parse_e2e(body)
+    kind = result.get("kind")
+    if kind in ("plan", "none"):
+        label = "plan" if kind == "plan" else "none"
+        print(
+            f"NOTE: PR #{pr_num} — E2E obligation declared ({label}): "
+            f"{result.get('text', '')[:200]}",
+            file=sys.stderr,
+        )
+        return False, f"ok ({label})"
+
+    detail = result.get("detail") or "no E2E: line in the PR body"
+    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{mod.GUIDANCE}"
+
+
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
     """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
 
@@ -6477,14 +6669,36 @@ def main() -> int:
                     )
                     print(receipts_msg, file=sys.stderr)
                     return 2
-                elif receipts_msg.startswith("NOTE:"):
+                if receipts_msg.startswith("NOTE:"):
                     # A NOTE means the gate did NOT verify the receipts and is allowing the
                     # merge anyway. That is the fail-open direction, so it has to be VISIBLE
                     # at the moment of merging — every other fail-open gate on this path
                     # prints its note, and this one silently discarded seven of them, which
                     # made "the residue is narrow and named" false at the only surface a
                     # human reads.
+                    #
+                    # A plain `if`, NOT an `elif`: this NOTE belongs to the PIN gate
+                    # above. When the E2E block below was first inserted between the
+                    # two, this clause re-bound to IT, so a merge blocked for a missing
+                    # E2E line silently swallowed the pin gate's fail-open note —
+                    # reintroducing, in miniature, the exact suppression the paragraph
+                    # above records as measured (architect SHOULD-FIX, 2026-09-06).
                     print(receipts_msg, file=sys.stderr)
+
+                # E2E obligation (§8.12). Sits beside the pin gate because it is
+                # the same KIND of check — a merge-time read of the PR body, which
+                # stays mutable after any CI run — and because both are cheap
+                # reads that should fail before the expensive finding scans.
+                # Like the pin gate it carries NO override sigil: `E2E: none —
+                # <reason>` is the escape hatch, and it costs one honest sentence.
+                should_block, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — no post-merge E2E decision in the PR body.",
+                        file=sys.stderr,
+                    )
+                    print(e2e_msg, file=sys.stderr)
+                    return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6766,6 +6980,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     print(
         f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
     )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
+    failures += 1 if blocked else 0
+    # E2E obligation (§8.12), same tier and same reason as pin-receipts: a
+    # merge-time read of a mutable body, so CI could never be its authority.
+    blocked, msg = _check_e2e_plan(pr_num, repo=repo)
+    print(f"e2e-plan       : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
     if blocked:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")

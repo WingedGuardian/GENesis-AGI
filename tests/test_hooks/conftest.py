@@ -25,6 +25,25 @@ def _pin_required_ci_workflows(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_e2e_declaration(monkeypatch):
+    """Give EVERY hook test a PR body that satisfies the E2E-obligation gate (§8.12).
+
+    That gate fails CLOSED on an unreadable body and on an unreadable ``createdAt``
+    — deliberately, since it guards every merge — so without this pin each test
+    that drives the merge gate or its report would make a LIVE ``gh pr view`` call:
+    green on a dev box with gh authenticated and PR "1" answering, red in CI, and
+    in both cases testing the network rather than the thing under test.
+
+    This is the hermetic DEFAULT, not a waiver. The gate's own behaviour — every
+    verdict, both fail directions, the cutoff, and the degraded path — is exercised
+    in tests/test_hooks/test_e2e_plan_gate.py, which overrides these per case; a
+    later ``monkeypatch.setenv`` in any test wins over this one."""
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "E2E: none — hermetic default for hook tests\n")
+    monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
+    yield
+
+
 def _load_settings() -> dict:
     """Load .claude/settings.json from the repo root."""
     here = Path(__file__).resolve()
