@@ -1395,22 +1395,63 @@ verified: 29a382e7 2026-09-03
   prompt, fail-closed parse, verbatim-quote verification), matches against
   the live ledger (exact hash + SequenceMatcher ≥0.85 — the precision
   signal) and prior shadow events (`duplicate_of`), and records rows to
-  `session_ledger_shadow_runs`/`_events` (migration 0059) — **the live
-  `session_ledger` is NEVER written until the data-gated flip PR**. Shared
-  subprocess core with the arbiter: `session_awareness/headless.py`;
+  `session_ledger_shadow_runs`/`_events` (migration 0059). **The live write
+  path is BUILT and SHIPPED OFF: the shipped config is `mode: shadow`, so
+  the live `session_ledger` is never written until an operator flips it.**
+  Shared subprocess core with the arbiter: `session_awareness/headless.py`;
   canonical typed-prompt filter `session_awareness/transcript.py` (the
   PreCompact hook keeps a parity-tested stdlib duplicate; honors
   `promptSource` typed/queued, excludes bare slash-commands + markers).
-  Levers: settings domain `session_ledger_shadow` (off|shadow; `live`
-  reserved, coerced+warn) read at worker startup;
-  `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level kill. Per-session flock;
-  `--backfill` replays historical transcripts in typed-turn windows
-  (`trigger='backfill'`, cursor untouched). Measurement:
-  `scripts/ledger_shadow_report.py` (recomputed precision, FP adjudication,
-  FN windowing, leak invariant); retention 45d via
-  `scripts/prune_ledger_shadow.py` (disk-hygiene step 8). Telemetry:
-  `call_site_last_run` row `ambient_ledger_extractor` (deliberately not a
-  critical site).
+  In `live`, qualifying proposals promote into the real ledger stamped
+  `added_by='ambient_ledger_extractor'` (migration 0090 widens the CHECK;
+  distinct from `ambient`, which any dispatched CC session already uses, so
+  the leak invariant can still tell them apart). Promotion is a SWEEP over
+  the shadow store, not over one run's in-memory events — the shadow row is
+  the retry state, so a failed live write costs only time and the cursor is
+  never coupled to promotion outcome (`promoted_item_id` marks a completed
+  one). **Idempotency is the novelty recheck inside a `BEGIN IMMEDIATE`
+  transaction and only that** — a foreground `session_ledger_add` landing
+  mid-flight is detected and the proposal disqualified rather than
+  duplicated; every SQL clause in the sweep is an efficiency filter, not a
+  safety property (mutation-verified), which is why `duplicate_of` is
+  deliberately NOT among them: it suppressed re-proposals whose chain root
+  was ineligible, permanently and silently. The sweep is scoped to
+  `mode='live'` (the flip is not retroactive — proposals gathered under the
+  shadow promise are never drained on it) and to the CURRENT
+  `prompt_version` (a bump never ships the old generation's backlog). The
+  gate is re-read immediately before the write, so a mid-run rollback to
+  `shadow` takes effect. INTERIM cap of 5 rows/run, logged when it bites;
+  qualifying / promoted / disqualified / failed counts all reach the run's
+  telemetry line, so a sweep that failed on every row is distinguishable
+  from one that found nothing. The sweep also runs on live-mode EMPTY-DELTA
+  invocations (a quiet session must not strand a failed promotion), asks the
+  duplicate GROUP's own promotion state before writing — observed-before-
+  closure disqualifies, observed-after is a renewal and promotes — and
+  requires the event-link UPDATE to touch exactly one row, rolling the whole
+  promotion back if the candidate was pruned mid-sweep.
+  Levers: settings domain `session_ledger_shadow` (off|shadow|live) read
+  live per call — **`live` requires BOTH `mode: live` and
+  `live_opt_in: true`**, a renewed opt-in that legacy overlays (which could
+  persist `live` while it was reserved) cannot satisfy; a non-boolean
+  `enabled` reads as off, and every other malformed value degrades to
+  shadow, never to live. `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level
+  kill. Per-session flock; `--backfill` replays historical transcripts in
+  typed-turn windows (`trigger='backfill'`, cursor untouched, never
+  promotes). Measurement: `scripts/ledger_shadow_report.py` (recomputed
+  precision, FP adjudication, FN windowing, leak invariant) — note its
+  automated precision CANNOT gate the flip: promotion requires
+  `match_kind='none'` and the report classifies exactly that set as its
+  false positives, so the metric measures the complement of what would
+  ship. The flip gate is hand adjudication of what would have been written
+  (v1: 17/40 wanted = 43%, 2026-08-29 — the reason prompt v2 exists).
+  Retention 45d via `scripts/prune_ledger_shadow.py` (disk-hygiene step 8) —
+  EXCEPT promoted events + their runs, which are the leak invariant's
+  attribution record and survive retention unbounded (owner decision
+  2026-09-05; bounded in practice by live-mode-only promotion at
+  PROMOTION_CAP per compaction). Promotion inserts the ledger row and stamps
+  the claiming event in ONE transaction, so a crash leaves both or neither.
+  Telemetry: `call_site_last_run` row `ambient_ledger_extractor`
+  (deliberately not a critical site).
 - **Repo-pulse annotator** (session-manager stage 4) — **LIVE (exact tier)**.
   At SessionStart boundaries (startup/resume/compact, never clear; foreground
   only) `genesis_session_context.py` fire-and-forgets
@@ -1649,10 +1690,10 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: df6605eda 2026-09-05
+verified: ee9ebf85c 2026-09-05
 ```
 
-- **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
+- **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
@@ -1674,11 +1715,19 @@ verified: df6605eda 2026-09-05
   The same review pass closed the CLASS: QUOTA_EXHAUSTED now fails fast too. The
   old split was inverted — RATE_LIMITED, the one 4xx that genuinely might clear
   inside a backoff, already failed fast, while a spent allowance (a billing
-  state, and usually account-global: one OpenRouter key limit covers all 13
-  openrouter chain entries) was retried. MEASURED 2026-09-05 before the fix:
+  state, and usually account-global: one OpenRouter key limit covers every
+  openrouter entry in a chain at once) was retried. MEASURED 2026-09-05 before the fix:
   ~11.9s avg per entitlement exposure (n=15), 4.1-6.8s per quota exposure
-  (n=22), against a 180-600s aggregate `max_total_s`. The two categories stay
-  DISTINCT on every reporting surface; only the retry behaviour is shared.
+  (n=22), against a 180-600s aggregate `max_total_s`. The two categories are
+  distinct in the ROUTER; the operator-facing surfaces have NOT caught up.
+  Three of them still branch on the literal `quota_exhausted`, so a
+  NOT_ENTITLED breaker falls through to the generic outage arm and an
+  entitlement gap is reported as a provider being down — the exact
+  misreading this classification exists to end, moved from the router to
+  the alert layer: `observability/snapshots/api_keys.py` renders "down
+  (circuit breaker open)", the dashboard overview renders "API down",
+  and `routing/escalation.py` raises `provider_failure` with no category
+  filter at all. A deliberate scope boundary, not an oversight.
   The probe heal deliberately does NOT fire `on_recovery`
   (which resolves the `provider_failure` observation and clears `first_trip_at`),
   so a listing can no longer erase an outage clock. This does not hold a provider
@@ -1726,6 +1775,30 @@ verified: df6605eda 2026-09-05
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **Exhaustion is now readable.** `attempts` alone never was: a provider skipped
+  for an open breaker, a missing API key or an exceeded budget costs no attempt,
+  so "attempts: 2" on a seven-provider chain is indistinguishable from a
+  two-provider chain fully tried. The `all_exhausted` event carries
+  `failed_providers` and `chain_size` alongside `attempts`; the log MESSAGE
+  additionally keeps called-and-failed providers (`failed:`) apart from
+  never-called ones (`skipped:` with the reason), while the payload's
+  `failed_providers` keeps the combined meaning its consumers predate. The exhaustion
+  `RoutingResult` returns `failed_providers` — which the SUCCESS path had always
+  returned while the failure path accumulated the same list and dropped it.
+  `chain_size` is the WALKABLE chain (post-`_filter_chain`), not the one written
+  in `model_routing.yaml`: a `never_pays` site never walks its paid entries, so
+  counting them would make every such exhaustion look like it stopped early. The
+  two genuinely differ — MEASURED 2026-09-03, three of this install's nine
+  `never_pays` sites (`4_light_reflection`, `12_surplus_brainstorm`,
+  `45_intelligence_intake`) drop one provider apiece since Mistral Large moved
+  off the free tier. One
+  exit stays deliberately silent and the chain size is what exposes it: the
+  aggregate-deadline `break` abandons the walk without recording anything, so a
+  short `failed_providers` against a longer `chain_size` reads as "walked 3 of 7",
+  not as "the chain was 3 long". NOTE the payload is deliberately NOT wired into
+  `recent_provider_fallback_counts`, whose SQL filters `event_type =
+  'provider.fallback'`; widening that filter would silently change what an
+  existing metric counts.
 - **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
   observation at 5 trips (~10 min), carrying `first_trip_at` — the only
   per-provider "failing since" timestamp. Once the outage passes
@@ -1772,7 +1845,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 50b79ffb 2026-09-01
+verified: f24c15e9 2026-09-05
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
