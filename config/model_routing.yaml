@@ -56,7 +56,15 @@ providers:
     # completion lands and its recorded cost is checked. If it turns out
     # metered, never_pays sites walking this rung is the exposure to fix.
     # rpm matches Large's conservative 4 until real traffic says otherwise.
-    free: true
+    #
+    # SHIPS `free: false` BY USER DECISION 2026-09-06. never_pays is a fail-CLOSED
+    # cost-safety invariant and it must not rest on a fail-OPEN presumption: a 429
+    # proves the model is reachable on this tier, not that it costs $0. Flip to
+    # true once a completion's BILLED cost has actually been read. Until then the
+    # three never_pays sites carrying this rung simply skip it — the rung still
+    # earns its place in paid-position chains, where it sits below Large and above
+    # the paid Kimi leg.
+    free: false
     rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:

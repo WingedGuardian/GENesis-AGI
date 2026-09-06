@@ -221,12 +221,21 @@ profiles:
     best_for: [memory_consolidation, fact_extraction, triage, outreach_draft]
     avoid_for: [creative_writing, long_context_work]
     free_tier:
-      # PRESUMPTIVE (user decision 2026-09-05): assume free-tier access to the
-      # Mistral family returns on all tiers. Medium is listed by /v1/models on
-      # a free-tier account, but its entitlement is UNVERIFIED — every live
-      # probe hit the account-wide rate limit (429) before an entitlement
-      # answer. If it turns out 403 tier_not_allowed like Large, the router's
-      # NOT_ENTITLED fail-fast makes that one cheap refusal per breaker window.
+      # ENTITLEMENT VERIFIED 2026-09-06; PRICING STILL PRESUMED (user decision
+      # 2026-09-05). A live probe of all three tiers on one free-tier account,
+      # same request shape, same minute:
+      #     mistral-large-latest  -> 403 tier_not_allowed
+      #     mistral-medium-latest -> 429 rate_limited
+      #     mistral-small-latest  -> 429 rate_limited
+      # A tier check precedes rate limiting, so Large is refused by entitlement
+      # while Medium is only throttled — Medium IS reachable on a tier that
+      # refuses Large. What the 429 does NOT establish is $0: it proves
+      # reachable, not free. `available: true` therefore remains an
+      # account-tier COST assumption until a completion's billed cost is read.
+      # Keep this comment and the one on `mistral-medium-free` in
+      # config/model_routing.yaml in agreement — they were briefly contradictory
+      # (one VERIFIED, one UNVERIFIED) after the entitlement probe landed in only
+      # one of them.
       available: true
       provider: mistral
       note: "Presumed free-tier; entitlement unverified as of 2026-09-05."
