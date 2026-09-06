@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # ``Path.home()``. Matches the pattern used in ``update_history.py``.
 _DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
 
+
 def _parse_ts_utc(raw: str) -> datetime:
     """Parse an ISO timestamp, coercing to timezone-aware UTC.
 
@@ -52,8 +53,7 @@ def _annotate_staleness(jobs: dict) -> dict:
         if last_run and last_ok:
             try:
                 gap = round(
-                    (_parse_ts_utc(last_run) - _parse_ts_utc(last_ok)).total_seconds()
-                    / 86400,
+                    (_parse_ts_utc(last_run) - _parse_ts_utc(last_ok)).total_seconds() / 86400,
                     1,
                 )
             except (ValueError, TypeError):
@@ -156,7 +156,7 @@ async def _impl_bootstrap_manifest() -> dict:
 # ``expected_interval_s`` is currently informational; ``overdue_s`` drives the
 # verdict.
 HEARTBEAT_EXPECTED = {
-    "awareness": (300, 360),      # 5 min tick, error at 6 min
+    "awareness": (300, 360),  # 5 min tick, error at 6 min
     # surplus's event-HB emits at loop-END (surplus/scheduler.py), so a healthy single
     # dispatch_once (15-30 min) legitimately gaps it — a tight 600s overdue false-fired
     # "surplus heartbeat overdue" in the morning report / subsystem_heartbeats display.
@@ -164,7 +164,7 @@ HEARTBEAT_EXPECTED = {
     # (observability/liveness.stall_threshold_minutes(5) = 180 min), so display and tile
     # agree; genuine total cessation is caught far sooner (900s) by the zombie-scheduler
     # watchdog, which reads job_health (refreshed every dispatch), not this event-HB.
-    "surplus": (300, 10800),      # 5-min loop; overdue at 3h (loop-END HB is load-fragile)
+    "surplus": (300, 10800),  # 5-min loop; overdue at 3h (loop-END HB is load-fragile)
     # inbox checks every 30 min (inbox/types.py check_interval_seconds=1800).
     # overdue=4× (7200s) so one slow/skipped check doesn't false-fire; a 2×
     # (3600s) threshold was too tight. (Assumes the default interval; a custom
@@ -176,9 +176,20 @@ HEARTBEAT_EXPECTED = {
     # A real reflection outage surfaces faster via the awareness heartbeat
     # (6 min), the cc resilience axis, and the deferred-work backlog.
     "reflection": (600, 14400),
-    "outreach": (120, 600),       # 60s daemon-thread pulse (outreach/heartbeat.py); overdue at 10×
-    "dashboard": (120, 600),      # 60s daemon-thread pulse; overdue at 10× (was 4×)
-    "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+    "outreach": (120, 600),  # 60s daemon-thread pulse (outreach/heartbeat.py); overdue at 10×
+    "dashboard": (120, 600),  # 60s daemon-thread pulse; overdue at 10× (was 4×)
+    "ego": (300, 14400),  # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+    # The zero-drop detector is a DETACHED worker, not a loop: it pulses once
+    # per completed sweep, spawned at session boundaries under a 60-min debounce
+    # with a DAILY disk-hygiene run as the wall-clock floor. So the expected
+    # cadence is hourly on an active box but only daily on an idle one, and
+    # overdue is set at 48h = two consecutive missed daily floors. Anything
+    # tighter would fire on a quiet weekend and teach everyone to ignore it.
+    # A dead detector is the failure mode with no natural symptom — it keeps
+    # answering "what fell through the cracks?" with a stale, confident zero —
+    # which is why it has a heartbeat at all. The tighter per-surface check is
+    # the view's own last-run age, rendered beside every count.
+    "zero_drop": (3600, 172800),
 }
 
 # Subsystems whose heartbeat is emitted only AFTER their loop's
@@ -305,7 +316,9 @@ def _outreach_enabled() -> bool:
         # CLOSED → False for EVERY error, so nothing bubbles to _subsystem_enabled's
         # default-True). The token itself never reaches here (build_bridge_config
         # returns None cleanly on a missing/placeholder token, no raise).
-        logger.debug("outreach-enabled read failed (%s); treating as not-enabled", type(exc).__name__)
+        logger.debug(
+            "outreach-enabled read failed (%s); treating as not-enabled", type(exc).__name__
+        )
         return False
 
 
@@ -315,9 +328,9 @@ def _subsystem_enabled(name: str) -> bool:
     A subsystem DISABLED (or unconfigured) must not raise a cessation/never-started
     alert: a disabled subsystem's stopped or absent pulse is intentional, not a death.
     Covers ego (``ego`` config ``.enabled``), inbox (``inbox_monitor.yaml`` present +
-    ``.enabled``), and outreach (a messaging channel / Telegram configured); every other
-    name defaults True (fail toward surfacing — only subsystems with a real disable
-    switch are checked)."""
+    ``.enabled``), outreach (a messaging channel / Telegram configured), and zero_drop
+    (its mode lever); every other name defaults True (fail toward surfacing — only
+    subsystems with a real disable switch are checked)."""
     try:
         if name == "ego":
             from genesis.ego.config import load_ego_config
@@ -327,6 +340,32 @@ def _subsystem_enabled(name: str) -> bool:
             return _inbox_enabled()
         if name == "outreach":
             return _outreach_enabled()
+        if name == "zero_drop":
+            # Three first-class levers stop the detector (`enabled: false`,
+            # `mode: off`, and the env kill switch), and `effective_mode`
+            # collapses the first two. Without this branch a deliberately-
+            # disabled detector goes silent and then reads overdue at 48h,
+            # forever — the permanent false alarm this function exists to
+            # prevent.
+            #
+            # The config is the whole story, and that is now true by
+            # construction rather than by hope. GENESIS_ZERO_DROP_DISABLED is
+            # scoped to the session-boundary spawn — `zero_drop_worker._run()`
+            # tests it only for `trigger == "session_start"` — so it suppresses
+            # one session's sweep and leaves the daily hygiene run, and with it
+            # the heartbeat, alive.
+            #
+            # That scoping is what lets this branch be correct. An env variable
+            # honoured on every trigger would stop the pulse, while this
+            # function, running in the server and unable to read another
+            # process's environment, went on reporting the subsystem enabled —
+            # the permanent false alarm this branch exists to prevent, bought
+            # by using the documented kill switch in the documented way.
+            # A per-process variable cannot be a system-wide off switch; the
+            # durable config is.
+            from genesis.session_awareness.zero_drop_config import effective_mode
+
+            return effective_mode() != "off"
     except Exception:
         logger.debug("subsystem-enabled read failed for %s", name, exc_info=True)
     return True
@@ -394,7 +433,11 @@ async def _post_resume_grace_active(db, *, name: str, now: datetime, interval_s:
 # until then. Use the overdue threshold (not interval+60) as the never_started grace
 # for these to avoid a boot-time flap. ego/awareness/surplus emit a start pulse at
 # bootstrap, so the tighter interval+60 grace is safe for them.
-_NO_BOOT_PULSE_SUBSYSTEMS = frozenset({"inbox"})
+# zero_drop joins inbox here for a stronger reason than a long first interval:
+# it is a DETACHED worker with no bootstrap participation at all, so it can
+# never emit a start pulse. Without this membership every fresh boot would
+# false-flag it never_started until its first sweep lands.
+_NO_BOOT_PULSE_SUBSYSTEMS = frozenset({"inbox", "zero_drop"})
 
 
 def _never_started_grace_s(name: str) -> float:
@@ -409,9 +452,7 @@ def _never_started_grace_s(name: str) -> float:
     return float(interval_s + 60)
 
 
-def _never_started_verdict(
-    name: str, *, now: datetime, paused: bool | None = None
-) -> dict:
+def _never_started_verdict(name: str, *, now: datetime, paused: bool | None = None) -> dict:
     """No usable pulse exists for *name*: decide fresh-install empty-state (benign
     ``no_heartbeat``) vs a genuine failed / never-pulsed start (``never_started``),
     using the persisted bootstrap manifest (``_read_persisted_manifest``).
@@ -550,9 +591,7 @@ async def compute_heartbeat_staleness(
             # instead of a spurious healthy tile; the display/alert callers
             # degrade to no_heartbeat (absence, logged). Unexpected exception
             # types still bubble on purpose (FastMCP is_error over a silent drop).
-            logger.error(
-                "Heartbeat timestamp query failed for subsystem %s", name, exc_info=True
-            )
+            logger.error("Heartbeat timestamp query failed for subsystem %s", name, exc_info=True)
             if raise_on_error:
                 raise
 
@@ -562,9 +601,7 @@ async def compute_heartbeat_staleness(
     if _event_bus is not None and hasattr(_event_bus, "_ring"):
         for event in reversed(_event_bus._ring):
             sub_val = (
-                event.subsystem.value
-                if hasattr(event.subsystem, "value")
-                else str(event.subsystem)
+                event.subsystem.value if hasattr(event.subsystem, "value") else str(event.subsystem)
             )
             if sub_val == name and event.event_type == "heartbeat":
                 ring_candidates.append(event.timestamp)
@@ -615,9 +652,7 @@ async def compute_heartbeat_staleness(
 
 
 async def _impl_subsystem_heartbeats() -> dict:
-    return {
-        name: await compute_heartbeat_staleness(name) for name in HEARTBEAT_EXPECTED
-    }
+    return {name: await compute_heartbeat_staleness(name) for name in HEARTBEAT_EXPECTED}
 
 
 async def _impl_job_health() -> dict:
@@ -655,10 +690,7 @@ async def _impl_job_health() -> dict:
     if not _DB_PATH.exists():
         return {
             "jobs": {},
-            "note": (
-                f"Genesis database not found at {_DB_PATH}; "
-                "no job health data available."
-            ),
+            "note": (f"Genesis database not found at {_DB_PATH}; no job health data available."),
             "source": "missing_db",
         }
 
@@ -689,7 +721,8 @@ async def _impl_job_health() -> dict:
         # jobs" from "check failed".
         logger.error(
             "job_health sqlite fallback failed at %s",
-            _DB_PATH, exc_info=True,
+            _DB_PATH,
+            exc_info=True,
         )
         return {
             "jobs": {},

@@ -1,4 +1,10 @@
-"""Merged-PR enumeration for the repo-pulse worker (gh CLI, injectable).
+"""PR enumeration over the gh CLI (injectable runner).
+
+Home of three listings: merged PRs (the repo-pulse cursor lane), open PRs (the
+age-stale SessionStart surface), and — for the zero-drop detector's head-ref
+history join — the full ``--state all`` listing. All three share the live slug
+resolution, the timeout and the loud-cap discipline below. The import is
+one-way (``zero_drop`` reads this module; nothing here knows about it).
 
 Clone of the ``pr_review_harvest`` gh pattern with two pulse-specific
 hardenings, both live-verified during PR-4 due diligence:
@@ -233,4 +239,96 @@ async def list_open_prs(
     if not isinstance(raw, list):
         return {"error": "open pr list returned a non-list payload"}
     prs = [pr for pr in raw if isinstance(pr, dict) and isinstance(pr.get("number"), int)]
+    return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
+
+
+# Full-history fields for the zero-drop branch join (session-awareness
+# zero_drop). Deliberately NOT PR_FIELDS: the join reads identity, state and
+# timing only — never title or body, so no PR prose can reach a model prompt
+# through this path.
+#
+# `headRefOid` is the load-bearing one and it costs nothing extra: it is the
+# head SHA as of the merge or close, so `headRefOid == local tip` is PROOF the
+# PR contained exactly this commit, where the head-ref NAME is only a
+# heuristic. MEASURED 2026-09-06 on this repo (1665 PRs): every PR carries it,
+# and it is a SNAPSHOT rather than a live pointer — 4 of 4 PRs whose branch
+# moved after merge/close still report the old SHA, 0 counterexamples in the 28
+# cases where the head branch still exists. That snapshot property is what
+# makes it evidence about the merge instead of evidence about the branch now.
+# `closedAt` gives the CLOSED verdict the same time guard `mergedAt` gives the
+# merged one, and `headRepositoryOwner` scopes the join to this repo so a fork
+# PR cannot cover a local branch that merely shares its name.
+ALL_PR_FIELDS = "number,headRefName,headRefOid,state,mergedAt,closedAt,url,headRepositoryOwner"
+
+
+async def list_all_prs(
+    *,
+    limit: int = 2000,
+    repo: str | None = None,
+    runner: Runner | None = None,
+) -> dict:
+    """Enumerate PRs in EVERY state for a head-ref-name history join.
+
+    Returns ``{"repo", "prs", "limit_hit"}`` or ``{"error": ...}`` without
+    raising. Rows missing an int ``number`` or a string ``headRefName`` are
+    dropped (gh contract violation, not a crash). Slug resolves LIVE, the same
+    stale-config hardening as the merged/open enumerations.
+
+    The whole history is the point: the consumer classifies a local branch by
+    what EVER happened to its name, so a windowed fetch would silently
+    reclassify old branches as never-PR'd. ``limit_hit`` is therefore not a
+    nicety — the consumer must FREEZE (skip its branch classes for that run)
+    when the window caps, because a truncated history turns a merged branch
+    into a false "stranded" finding. MEASURED 2026-09-05: 1651 PRs in one
+    ~6s call at the default limit.
+    """
+    run = runner or _default_runner
+    if repo is None:
+        repo = await resolve_repo(run)
+        if repo is None:
+            return {"error": "repo slug resolve failed"}
+    rc, out, err = await run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--json",
+            ALL_PR_FIELDS,
+            "--limit",
+            str(limit),
+        ]
+    )
+    if rc != 0:
+        return {"error": f"all pr list failed (rc={rc}): {err.strip()[:400]}"}
+    try:
+        raw = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return {"error": f"all pr list returned invalid JSON: {exc}"}
+    if not isinstance(raw, list):
+        return {"error": "all pr list returned a non-list payload"}
+    prs = []
+    for pr in raw:
+        if not (
+            isinstance(pr, dict)
+            and isinstance(pr.get("number"), int)
+            and isinstance(pr.get("headRefName"), str)
+            and pr["headRefName"]
+        ):
+            continue
+        # Flatten the owner to its LOGIN and drop the rest of the object. gh
+        # returns `{id, name, login}` and `name` is the account holder's real
+        # name — which would otherwise ride into the findings store, the logs
+        # and an MCP response read by a model, for a join that only ever needs
+        # to answer "is this head ref in our own repo?". Narrowing it here
+        # keeps that value out of everything downstream by construction rather
+        # than by every consumer remembering not to read it.
+        owner = pr.get("headRepositoryOwner")
+        login = owner.get("login") if isinstance(owner, dict) else None
+        pr = {k: v for k, v in pr.items() if k != "headRepositoryOwner"}
+        pr["headRepositoryOwnerLogin"] = login if isinstance(login, str) else None
+        prs.append(pr)
     return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}

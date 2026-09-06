@@ -169,6 +169,7 @@ async def test_no_unexpected_tables(db):
         "memory_consistency_reports",
         "recall_probe_runs",  # memory integrity Phase 0 ("make silence loud")
         "memory_reconcile_runs",  # memory integrity Phase 1 (repair lane audit)
+        "zero_drop_findings",  # stranded-work detector (one row per standing condition)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

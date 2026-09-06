@@ -1,7 +1,13 @@
 """Smoke tests requiring real services or long runtime.
 
-Marked @pytest.mark.slow — skipped in normal CI runs.
-Run with: pytest -v -m slow tests/integration/test_smoke_e2e.py
+Marked ``@pytest.mark.slow`` — which currently selects nothing. This docstring
+used to claim these were "skipped in normal CI runs"; they are not. CI passes
+no ``-m "not slow"`` (see the `test` job in .github/workflows/ci.yml) and the
+marker is not registered in pyproject's ``[tool.pytest.ini_options]``, so it is
+an inert label and these tests run with every other. The mark is kept because
+``pytest -v -m slow tests/integration/test_smoke_e2e.py`` still selects them
+locally, and because deselecting them in CI would be a coverage decision, not a
+docstring fix.
 """
 
 from datetime import UTC, datetime, timedelta
