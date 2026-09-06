@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import sqlite3
 
 import aiosqlite
 import pytest
@@ -361,6 +362,155 @@ async def test_transaction_is_not_reentrant(sconn):
         async with sconn.transaction():
             async with sconn.transaction():
                 pass
+
+
+async def test_transaction_waits_out_concurrent_implicit_txn(sconn):
+    """Repro (Codex P1, PR #1576): ordinary CRUD does execute();commit() as TWO
+    lock acquisitions, so the connection sits inside an IMPLICIT transaction
+    (legacy isolation mode) between them with the lock released. A peer's
+    transaction() entering that window used to raise 'cannot start a transaction
+    within a transaction' (an error _retry_locked does not retry — it retries
+    lock errors only). transaction() must instead wait the implicit transaction
+    out and then proceed."""
+    # open an implicit transaction the way every CRUD helper does (no commit yet)
+    await sconn.execute("INSERT INTO t VALUES (1, 'implicit')")
+    assert sconn.in_transaction
+
+    async def peer_txn():
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (2, 'txn')")
+
+    tb = asyncio.create_task(peer_txn())
+    await asyncio.sleep(0.05)
+    # not failed — waiting for the implicit transaction to resolve
+    assert not tb.done()
+    await sconn.commit()  # the CRUD pair's second half lands
+    await asyncio.wait_for(tb, timeout=5.0)  # transaction() proceeds and commits
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 2
+
+
+async def test_transaction_raises_loud_when_implicit_txn_never_resolves(sconn, monkeypatch):
+    """Bounded, not infinite: an implicit transaction a peer opened and never
+    commits (errored between execute and commit) can only be closed by a later
+    commit/rollback — transaction() gives up LOUDLY once the stall budget is
+    spent, instead of blocking every caller forever. The error must name the
+    WEDGE hypothesis, which is the true one here (no op completes)."""
+    from genesis.db import connection as conn_mod
+
+    slept: list[float] = []
+
+    async def fast_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", fast_sleep)
+    await sconn.execute("INSERT INTO t VALUES (1, 'wedged')")  # never committed
+    with pytest.raises(sqlite3.OperationalError, match="never committed/rolled back"):
+        async with sconn.transaction():
+            pass  # pragma: no cover — must not be reached
+    # spent exactly the stall budget (N checks → N-1 backoffs), no more
+    assert len(slept) == len(conn_mod._WRITE_RETRY_DELAYS)
+    # the lock is RELEASED on the exhaustion path — a leak here would surface as
+    # a HANG in a later test rather than a failure, so assert it explicitly
+    assert not sconn._lock.locked()
+    # the connection is not wedged further: resolving the implicit txn works
+    await sconn.commit()
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (2, 'after')")
+
+
+async def test_transaction_wait_is_progress_aware_not_blind(sconn, monkeypatch):
+    """A CONTENDED connection is not a wedged one. While peers keep completing
+    ops, the stall budget must RESET rather than burn down — a progress-blind
+    bound fails transaction() entries while nothing is actually wrong. Here a
+    peer holds an implicit transaction open across far more checks than the
+    stall budget, but keeps executing, so entry keeps waiting; when the peer
+    finally commits, the transaction proceeds."""
+    from genesis.db import connection as conn_mod
+
+    ticks = 0
+
+    async def peer_progresses_then_commits(d):
+        # Stand in for the backoff sleep: each time the waiter backs off, the
+        # peer completes another op (progress), until it finally commits.
+        nonlocal ticks
+        ticks += 1
+        if ticks <= 3 * (len(conn_mod._WRITE_RETRY_DELAYS) + 1):
+            await sconn.execute(f"INSERT INTO t VALUES ({100 + ticks}, 'peer')")
+        else:
+            await sconn.commit()
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", peer_progresses_then_commits)
+    await sconn.execute("INSERT INTO t VALUES (1, 'peer-open')")  # implicit txn open
+    async with sconn.transaction():  # must NOT raise despite many busy checks
+        await sconn.execute("INSERT INTO t VALUES (2, 'mine')")
+    # waited out far more checks than a progress-blind budget would have allowed
+    assert ticks > len(conn_mod._WRITE_RETRY_DELAYS) + 1
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t WHERE val = 'mine'")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_transaction_contention_bound_is_the_busy_timeout(sconn, monkeypatch):
+    """Contention still has an outer bound (a permanently-saturated connection
+    must not starve the waiter forever), and it is the connection's configured
+    busy_timeout — not an invented number. When peers keep progressing past
+    that budget, the error names CONTENTION, not a wedge."""
+    from genesis.db import connection as conn_mod
+
+    clock = {"t": 0.0}
+
+    async def progress_and_advance_clock(d):
+        # peer completes an op every backoff (so the stall budget never fires)
+        await sconn.execute("INSERT INTO t VALUES (NULL, 'peer')")
+        clock["t"] += 10.0  # blow past any plausible busy_timeout budget
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", progress_and_advance_clock)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: clock["t"])
+    await sconn.execute("INSERT INTO t VALUES (1, 'peer-open')")  # implicit txn open
+    with pytest.raises(sqlite3.OperationalError, match="contention, not a wedge"):
+        async with sconn.transaction():
+            pass  # pragma: no cover — must not be reached
+    assert not sconn._lock.locked()  # released on this exhaustion path too
+
+
+async def test_txn_control_sql_refused_inside_transaction(sconn):
+    """Raw transaction-control SQL through execute()/executemany() inside an
+    owned transaction() block bypassed _refuse_inside_txn — an early COMMIT
+    breaks the all-or-nothing unit (a later exception can't roll back what was
+    already committed), and a raw ROLLBACK discards the unit while the context
+    manager still reports success. Refuse the verbs, same as commit()/rollback()."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'x')")
+        for bad in (
+            "COMMIT",
+            "commit",
+            "  ROLLBACK",
+            "BEGIN IMMEDIATE",
+            "END",
+            "-- sneaky\nCOMMIT",
+            "/* c */ COMMIT",
+            "SAVEPOINT sp1",
+            "RELEASE sp1",
+        ):
+            with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+                await sconn.execute(bad)
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await sconn.executemany("COMMIT", [()])
+    # the refused statements didn't break the unit — it committed intact
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_txn_control_sql_allowed_outside_transaction(sconn):
+    """Control: OUTSIDE a transaction() block the refusal must not fire — the
+    migration runner and precompact legitimately issue BEGIN IMMEDIATE/COMMIT/
+    ROLLBACK through execute() on connections with no owned transaction."""
+    await sconn.execute("BEGIN IMMEDIATE")
+    await sconn.execute("INSERT INTO t VALUES (1, 'manual')")
+    await sconn.execute("COMMIT")
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
 
 
 async def test_commit_rollback_close_refused_inside_transaction(sconn):
