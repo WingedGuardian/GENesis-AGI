@@ -369,6 +369,23 @@ async def run_adjudication_drain(
     return counts
 
 
+def _is_rejudgable(prior: dict | None) -> bool:
+    """Single-row mirror of ``settled_pair_keys``' NOT-settled predicate.
+
+    A pair may be (re-)judged when it was never judged, its verdict is
+    ``stale`` (identity drifted), or it carries a pre-policy ``distinct``
+    (policy IS NULL — the class the PR-2b policy re-open deliberately
+    unsettles). Every dedup that guards judgment work must use THIS, so the
+    sweep's nomination predicate and the processors' skip predicates cannot
+    drift apart (the drift is exactly what made the re-open inert once).
+    """
+    return (
+        prior is None
+        or prior["verdict"] == "stale"
+        or (prior["verdict"] == "distinct" and prior["policy"] is None)
+    )
+
+
 async def _process_row(
     db: aiosqlite.Connection,
     router: Router,
@@ -405,9 +422,13 @@ async def _process_row(
         counts["noop"] += 1
         return
 
-    # Already judged this pair (non-stale verdict) → don't re-spend an LLM call.
+    # Already judged this pair (settled verdict) → don't re-spend an LLM call.
+    # The predicate MUST mirror settled_pair_keys' (via _is_rejudgable) —
+    # otherwise the sweep re-nominates a re-opened pair every run while this
+    # no-op swallows it, and the reopen mechanism is inert. The re-judgment's
+    # record_verdict upsert stamps the current policy, which closes the loop.
     existing = await adj_crud.get_by_pair(db, ent_a["entity_id"], ent_b["entity_id"])
-    if existing is not None and existing["verdict"] != "stale":
+    if not _is_rejudgable(existing):
         await dw_crud.update_status(db, item_id, status="completed", completed_at=_now())
         counts["noop"] += 1
         return
@@ -464,7 +485,12 @@ async def _process_row(
         return
 
     # verdict == merge
-    if mode == "live":
+    # Live auto-merge covers only NEVER-judged pairs. A RE-judgment — the prior
+    # verdict is `stale` (a norm drift just invalidated whatever human approval
+    # existed) or a reopened pre-policy `distinct` — must land as proposed_merge
+    # behind the approval gate regardless of mode: mark_stale cleared the
+    # approval precisely because the identities changed under it.
+    if mode == "live" and existing is None:
         # Extraction-race guard: profile-building + two LLM calls opened an await
         # gap since we resolved these. Re-resolve immediately before the
         # irreversible merge; if either side moved (merged/renamed/gone) or they
@@ -619,14 +645,18 @@ async def _apply_one_proposal(
                             prior = await adj_crud.get_by_pair(
                                 own, ent_a["entity_id"], ent_b["entity_id"]
                             )
-                            if prior is None or prior["verdict"] == "stale":
-                                await entities_crud.enqueue_adjudication(
+                            if _is_rejudgable(prior):
+                                inserted = await entities_crud.enqueue_adjudication(
                                     own,
                                     entity_id=ent_a["entity_id"],
                                     similar_entity_id=ent_b["entity_id"],
                                     _commit=False,
                                 )
-                                counts["reenqueued"] = counts.get("reenqueued", 0) + 1
+                                # Count only rows that actually landed — the
+                                # helper is a silent no-op behind its kill
+                                # switch and on pending-row dedup.
+                                if inserted:
+                                    counts["reenqueued"] = counts.get("reenqueued", 0) + 1
                         await own.commit()
                         if marked:
                             counts["stale"] += 1
@@ -1076,8 +1106,11 @@ async def run_reconcile_sweep(
 
     enqueued = 0
     for eid, cand_id in pairs:
-        await entities_crud.enqueue_adjudication(db, entity_id=eid, similar_entity_id=cand_id)
-        enqueued += 1
+        # Count only rows that actually landed — enqueue_adjudication is a
+        # silent no-op behind its kill switch and on pending-row dedup, and
+        # this count feeds the sweep observation.
+        if await entities_crud.enqueue_adjudication(db, entity_id=eid, similar_entity_id=cand_id):
+            enqueued += 1
 
     # A slice can hold more matches than enqueue_cap; the overflow surfaces on
     # the NEXT full weekly pass (already-settled/pending pairs are excluded, so

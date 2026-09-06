@@ -1228,6 +1228,9 @@ async def test_stale_reenqueue_respects_the_enqueue_gate(file_db, monkeypatch):
         "WHERE work_type='entity_adjudication' AND status='pending'"
     )
     assert not rows, "the enqueue gate stopped governing the stale re-enqueue"
+    # Counter truth (Codex P2, round 1): a gate-suppressed enqueue must not
+    # be reported as a re-enqueue.
+    assert counts.get("reenqueued", 0) == 0, "reenqueued counted a suppressed insert"
 
 
 @pytest.mark.asyncio
@@ -1296,3 +1299,71 @@ async def test_human_reject_of_a_pre_policy_row_stays_settled(db):
     assert key in await adj_crud.settled_pair_keys(db), (
         "a human-rejected pair re-entered the re-open lane"
     )
+
+
+# ── PR #1729 review round 1: re-judgment + counter-truth rails ───────────────
+
+
+@pytest.mark.asyncio
+async def test_reopened_prepolicy_distinct_is_rejudged_and_stamped(db):
+    """A pre-policy ``distinct`` row (policy IS NULL) is the exact class
+    ``settled_pair_keys`` re-opens (MW-3 PR-2b). The processor's dedup must
+    honor the SAME predicate: re-judge the pair and stamp the current policy —
+    otherwise the sweep re-nominates it every run while the processor no-ops
+    it, and the reopen mechanism is inert (Codex P1, PR #1729 round 1)."""
+    a = await _mk_entity(db, "beta svc", "beta svc")
+    b = await _mk_entity(db, "beta service", "beta service")
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=b, verdict="distinct")
+    # Simulate a verdict written before the policy column existed.
+    await db.execute("UPDATE entity_adjudications SET policy = NULL")
+    await db.commit()
+    await _enqueue(db, a, b)
+    router = _router({})  # scripted: both models say distinct
+
+    counts = await adj.run_adjudication_drain(db, router, mode="propose_only", budget=10)
+
+    assert counts.get("noop", 0) == 0, "reopened row was no-opped, not re-judged"
+    assert counts["distinct"] == 1
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "distinct"
+    assert row["policy"] == adj_crud.POLICY_VERSION  # stamped → self-limiting
+
+
+@pytest.mark.asyncio
+async def test_live_rejudgment_of_stale_pair_lands_as_proposal(db):
+    """Live mode auto-merges only NEVER-judged pairs. A re-judgment — the
+    prior verdict is ``stale`` (norm drift invalidated whatever approval
+    existed) or a reopened pre-policy ``distinct`` — must land as
+    ``proposed_merge`` behind the human gate, never as a direct
+    ``merge_entity`` (Codex P1, PR #1729 round 1: a norm drift must not turn
+    an invalidated proposal into an unapproved destructive merge)."""
+    a = await _mk_entity(db, "gamma db", "gamma db")
+    b = await _mk_entity(db, "gamma database", "gamma database")
+    await adj_crud.record_verdict(db, entity_a=a, entity_b=b, verdict="stale")
+    await _enqueue(db, a, b)
+    router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
+
+    counts = await adj.run_adjudication_drain(db, router, mode="live", budget=10)
+
+    assert counts["proposed"] == 1 and counts["merged"] == 0
+    assert await _status(db, a) == "active" and await _status(db, b) == "active"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge"
+    assert row["approved_at"] is None  # waits for the human gate
+
+
+@pytest.mark.asyncio
+async def test_sweep_enqueued_counter_counts_only_real_insertions(db, monkeypatch):
+    """``enqueue_adjudication`` is a silent no-op behind its kill switch (and
+    on dedup); the sweep's ``enqueued`` count must report rows actually
+    inserted, not attempts (Codex P2, PR #1729 round 1 — same class as the
+    stale-branch ``reenqueued`` counter)."""
+    monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", False)
+    await _mk_entity(db, "neural monitor", "neural monitor")
+    await _mk_entity(db, "neural-monitor", "neural-monitor")
+
+    result = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=50)
+
+    pending = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE, limit=100)
+    assert len(pending) == 0
+    assert result["enqueued"] == 0, "sweep reported an enqueue the gate suppressed"

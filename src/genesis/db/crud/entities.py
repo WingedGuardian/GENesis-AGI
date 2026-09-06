@@ -690,8 +690,11 @@ async def merged_norm_redirects(db: aiosqlite.Connection) -> dict[str, list[str]
     merge applies, every loser's surface form goes dark — a user asking by the
     OLD name gets nothing (the gap entity_query's docstring recorded from day
     one; MW-3 PR-2b closes it). Chains are resolved in-process over one scan;
-    dead-ended chains (gone / no target / cycle) are dropped, and a norm that
-    ALSO exists as an active row is skipped — the live row already owns it.
+    dead-ended chains (gone / no target / cycle) are dropped. A norm ALSO
+    owned by an active row (legal across types under UNIQUE(norm_name,
+    entity_type)) still gets its redirect — the survivor rides ALONGSIDE the
+    live row, because suppressing it makes the merged entity unfindable by
+    its old surface form; the consumer's map is list-valued and dedups.
     LIST-valued because UNIQUE(norm_name, entity_type) allows one norm on two
     merged rows of different types with different survivors — a single pick
     from an unordered scan would be nondeterministic; both are carried and the
@@ -700,18 +703,13 @@ async def merged_norm_redirects(db: aiosqlite.Connection) -> dict[str, list[str]
         "SELECT entity_id, norm_name, status, merged_into FROM entities"
     )
     by_id: dict[str, tuple[str, str | None]] = {}
-    active_norms: set[str] = set()
     merged: list[tuple[str, str]] = []  # (norm_name, merged_into)
     for entity_id, norm_name, status, merged_into in rows:
         by_id[entity_id] = (status, merged_into)
-        if status == "active":
-            active_norms.add(norm_name)
-        elif status == "merged" and merged_into:
+        if status == "merged" and merged_into:
             merged.append((norm_name, merged_into))
     out: dict[str, list[str]] = {}
     for norm_name, target in merged:
-        if norm_name in active_norms:
-            continue
         seen: set[str] = set()
         current: str | None = target
         while current and current not in seen:
@@ -735,8 +733,12 @@ async def enqueue_adjudication(
     entity_id: str,
     similar_entity_id: str,
     _commit: bool = True,
-) -> None:
+) -> bool:
     """Queue a fuzzy-match pair for the entity_adjudication drainer.
+
+    Returns True iff a queue row was actually inserted — False on the two
+    silent no-op paths (kill switch off, pending-row dedup) so callers can
+    count real enqueues instead of attempts.
 
     Inline INSERT rather than ``deferred_work.create`` — that helper
     commits unconditionally, which would break callers batching under
@@ -749,11 +751,11 @@ async def enqueue_adjudication(
     The caller's entity create + AMBIGUOUS status are unaffected.
     """
     if not _ADJUDICATION_ENQUEUE_ENABLED:
-        return
+        return False
     now = datetime.now(UTC).isoformat()
     payload_fwd = json.dumps({"entity_id": entity_id, "similar_entity_id": similar_entity_id})
     payload_rev = json.dumps({"entity_id": similar_entity_id, "similar_entity_id": entity_id})
-    await db.execute(
+    cursor = await db.execute(
         """INSERT INTO deferred_work_queue
            (id, work_type, call_site_id, priority, payload_json, deferred_at,
             deferred_reason, created_at)
@@ -773,8 +775,10 @@ async def enqueue_adjudication(
             payload_rev,
         ),
     )
+    inserted = cursor.rowcount > 0
     if _commit:
         await db.commit()
+    return inserted
 
 
 def _row_to_dict(db: aiosqlite.Connection, row) -> dict:

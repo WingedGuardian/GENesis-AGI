@@ -149,7 +149,10 @@ async def test_merged_norm_redirects_chase_chains_and_drop_dead_ends(db):
     assert redirects.get("old name") == [c]
     assert redirects.get("mid name") == [c]
     assert "dead" not in redirects
-    assert "new name" not in redirects  # active norms are never redirect keys
+    # No MERGED row bears "new name" (it is only the survivor's own active
+    # norm), so it is never a redirect key. (An active norm that a merged row
+    # ALSO bears DOES redirect now — see the same-norm test below.)
+    assert "new name" not in redirects
 
 
 @pytest.mark.asyncio
@@ -240,3 +243,39 @@ async def test_policy_migration_adds_column_and_is_idempotent(tmp_path):
         await db.commit()
     finally:
         await db.close()
+
+
+# ── PR #1729 review round 1: redirect preservation + enqueue truth ───────
+
+
+@pytest.mark.asyncio
+async def test_redirects_survive_a_same_norm_active_entity_of_another_type(db):
+    """``UNIQUE(norm_name, entity_type)`` means a merged-away concept's norm
+    can still be owned by an ACTIVE entity of another type. The redirect must
+    be preserved ALONGSIDE that active row — suppressing it makes the merged
+    entity unfindable by its old surface form, while the query map is
+    list-valued and dedups on union anyway (Codex P2, PR #1729 round 1)."""
+    await _mk(db, "Atlas", "atlas", etype="person")
+    concept = await _mk(db, "Atlas", "atlas", etype="concept")
+    device = await _mk(db, "Atlas device", "atlas device", etype="device")
+    await _tombstone(db, concept, device)
+
+    redirects = await entities_crud.merged_norm_redirects(db)
+    assert redirects.get("atlas") == [device]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_adjudication_reports_whether_it_inserted(db, monkeypatch):
+    """The enqueue helper must tell callers whether a row actually landed:
+    both silent no-op paths (pending-row dedup, kill switch) previously
+    returned None, letting callers count phantom enqueues (Codex P2,
+    PR #1729 round 1)."""
+    a = await _mk(db, "eps one", "eps one")
+    b = await _mk(db, "eps onee", "eps onee")
+    assert await entities_crud.enqueue_adjudication(db, entity_id=a, similar_entity_id=b) is True
+    # Same pair, reversed orientation → deduped, nothing inserted.
+    assert await entities_crud.enqueue_adjudication(db, entity_id=b, similar_entity_id=a) is False
+    # Kill switch → suppressed, nothing inserted.
+    monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", False)
+    c = await _mk(db, "eps other", "eps other")
+    assert await entities_crud.enqueue_adjudication(db, entity_id=a, similar_entity_id=c) is False
