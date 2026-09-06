@@ -92,29 +92,48 @@ class InstrumentationMiddleware(Middleware):
             success = True
             return result
         finally:
-            if self._db is not None:
+            # Nested try/finally so a BaseException raised by the DB step cannot
+            # skip the tracker record below it. Cancellation is the reachable
+            # case: `except Exception` does not catch `asyncio.CancelledError`,
+            # so before this nesting a cancellation landing in the commit await
+            # left the call unrecorded — the tool ran, and the activity tracker
+            # never heard about it.
+            #
+            # What that cancellation does NOT do is lose the write, which is
+            # worth stating because the obvious remedy (roll back on cancel) is
+            # built on the opposite assumption. aiosqlite QUEUES the operation
+            # to its worker thread BEFORE awaiting — `_execute` does
+            # `self._tx.put_nowait((future, function))` and only then
+            # `await future` — so cancelling the await cancels the WAIT, not the
+            # commit. MEASURED against aiosqlite 0.21: a row inserted before a
+            # cancelled `commit()` is durable afterwards. Issuing a rollback
+            # here would either be a no-op behind the commit already in the
+            # queue, or would discard a successful tool call's writes.
+            try:
+                if self._db is not None:
+                    try:
+                        if success:
+                            await self._db.commit()
+                        else:
+                            await self._db.rollback()
+                    except Exception:
+                        logger.warning(
+                            "DB %s after %s failed",
+                            "commit" if success else "rollback",
+                            provider, exc_info=True,
+                        )
+            finally:
                 try:
-                    if success:
-                        await self._db.commit()
-                    else:
-                        await self._db.rollback()
+                    self._tracker.record(
+                        provider,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                        success=success,
+                    )
                 except Exception:
                     logger.warning(
-                        "DB %s after %s failed",
-                        "commit" if success else "rollback",
+                        "Activity tracker record failed for %s",
                         provider, exc_info=True,
                     )
-            try:
-                self._tracker.record(
-                    provider,
-                    latency_ms=(time.monotonic() - t0) * 1000,
-                    success=success,
-                )
-            except Exception:
-                logger.warning(
-                    "Activity tracker record failed for %s",
-                    provider, exc_info=True,
-                )
 
     async def _enforce_freshness(self, tool_name: str) -> None:
         """Block a guarded tool when this subprocess is running stale code.

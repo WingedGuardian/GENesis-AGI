@@ -197,3 +197,42 @@ class TestMiddlewareUnitOfWork:
 
         db.rollback.assert_awaited_once()
         db.commit.assert_not_awaited()
+
+    async def test_cancellation_inside_commit_still_records_the_call(self):
+        """A cancellation landing IN the commit await must not swallow the record.
+
+        `except Exception` does not catch `asyncio.CancelledError`, so before the
+        DB step and the tracker record were nested in their own try/finally, a
+        cancellation here left this finally early: the tool had run and the
+        activity tracker never heard about it.
+
+        Deliberately NOT asserting a rollback. CodeRabbit's finding proposed one,
+        and the premise it rests on does not hold for this driver: aiosqlite
+        queues the operation to its worker thread BEFORE awaiting
+        (`_tx.put_nowait(...)` then `await future`), so cancelling the await
+        cancels the WAIT, not the commit. MEASURED against aiosqlite 0.21 — a row
+        inserted before a cancelled `commit()` is durable afterwards. A rollback
+        issued here would either sit behind the queued commit as a no-op, or
+        discard a successful tool call's writes.
+        """
+        tracker = ProviderActivityTracker()
+        db = AsyncMock()
+
+        async def _commit_that_gets_cancelled():
+            raise asyncio.CancelledError()
+
+        db.commit = AsyncMock(side_effect=_commit_that_gets_cancelled)
+        mw = InstrumentationMiddleware(tracker, "memory", db=db)
+        context = MagicMock()
+        context.message.name = "memory_store"
+        call_next = AsyncMock(return_value={"result": "ok"})
+
+        with pytest.raises(asyncio.CancelledError):
+            await mw.on_call_tool(context, call_next)
+
+        # The cancellation propagated (above) AND the call was still recorded.
+        summary = tracker.summary("mcp.memory.memory_store")
+        assert summary["calls"] == 1, (
+            "a cancellation inside commit() must not cost the tracker record"
+        )
+        assert summary["errors"] == 0, "the TOOL succeeded; only the commit wait was cut"
