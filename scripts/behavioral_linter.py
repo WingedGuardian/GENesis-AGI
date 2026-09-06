@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
-"""Behavioral linter — enforces anti-pattern rules on Write/Edit operations.
+"""Behavioral linter — enforces anti-pattern rules on Write/Edit and Bash.
 
 Called by CC CLI via .claude/settings.json PreToolUse hook.
 Reads the CC hook payload from stdin (via hook_input), loads all rule YAML files from
 config/behavioral_rules/, and checks the content being written.
+
+**Bash is checked too, but only by rules that opt in** (``check_bash: true``).
+
+Why the surface had to widen: a rule wired to Write|Edit sees the file-writing
+tools and nothing else, so the same forbidden code slips through unchanged as
+``cat > x.py <<EOF`` or ``python3 -c "..."``. That is not a hypothetical shape —
+it is precisely the shape the no-raw-provider-calls incident took (2026-09-06),
+where the offending script never passed through Write at all.
+
+Why opt-in rather than blanket: a rule's patterns are written against SOURCE, and
+shell text is a different language. Applying every rule to every command trades a
+known hole for an unknown false-positive surface. A rule declares ``check_bash``
+after its author has measured the fire rate on real commands, and that
+measurement belongs in the rule file next to the flag.
+
+Declared residual: a Bash payload carries no ``file_path``, so a rule's
+``excludes`` path globs cannot apply to it. A heredoc writing INTO an excluded
+path (say the routing layer itself) is therefore checked where the equivalent
+Write would have been skipped. Resolving a redirect target out of shell text is
+the hand-rolled-parser tar pit; the escape-hatch comment covers the rare case.
 
 Exit codes:
   0 — allow (no rule violations, or only warnings)
@@ -17,6 +37,7 @@ Emits SteerMessage for unified enforcement feedback.
 """
 
 import json
+import os
 import re
 import sys
 from fnmatch import fnmatch
@@ -89,8 +110,67 @@ def _applies_to(rule: dict, file_path: str) -> bool:
     return _glob_match(file_path, globs)
 
 
+#: Commands that can only READ. Searching a codebase for a provider endpoint is
+#: indistinguishable, by regex, from calling one — `rg -n '<endpoint>' src/` and
+#: `git log -S'<endpoint>'` both carry the literal. That lands hardest on the
+#: audit and review sessions which most need to grep for provider usage, and a
+#: `severity: block` rule there obstructs the work rather than the violation.
+#:
+#: SEARCH verbs only. `cat`/`head`/`tail`/`ls` were in this set for one revision
+#: and it broke the acceptance bar immediately: `cat > probe.py <<'EOF' … EOF` is
+#: the origin incident's literal shape and starts with `cat`. A verb that writes
+#: when you point it at a redirect is not a read-only verb, and the lesson
+#: generalises — the exemption is for the small set of commands that cannot
+#: produce a network call, not for commands that usually don't.
+_READ_ONLY_VERBS = frozenset({"rg", "grep", "egrep", "fgrep", "ag", "ack", "find", "fd"})
+
+#: Anything that could turn a search into something else. The exemption applies
+#: ONLY to a command with none of these: `rg foo && curl bar` is not a search,
+#: a redirect makes the command WRITE, and a heredoc feeds it content.
+_CHAINS = re.compile(r"(&&|\|\||[;|`>]|<<|\$\()")
+
+
+def _is_read_only_command(command: str) -> bool:
+    """A single search/inspect invocation with nothing chained onto it.
+
+    Deliberately narrow: first token in the allow-list AND no shell operator that
+    could smuggle a call in. `git` is admitted only as `git log`/`git grep`/
+    `git show`, never bare, because `git` also has subcommands that write.
+    """
+    if _CHAINS.search(command):
+        return False
+    parts = command.strip().split()
+    if not parts:
+        return False
+    verb = os.path.basename(parts[0])
+    if verb in _READ_ONLY_VERBS:
+        return True
+    return verb == "git" and len(parts) > 1 and parts[1] in {"log", "grep", "show", "diff", "blame"}
+
+
+def _escaped(content: str, rule_name: str, *, bash_mode: bool) -> bool:
+    """Whether the opt-out comment disarms ``rule_name`` for this content.
+
+    On the Write path ``content`` is one file's body, so a bare substring test is
+    right: the token is a comment the author put in that file.
+
+    On the Bash path ``content`` is a whole compound command, and a substring test
+    is a BYPASS — any mention anywhere disarms the rule for everything else on the
+    line. MEASURED: ``git commit -m 'doc the behavioral-lint: ignore
+    no-raw-provider-calls hatch' && curl -X POST <provider>/chat/completions``
+    exits 0 against a ``severity: block`` rule, and that is a plausible accident
+    rather than an attack — documenting the hatch silently switches it on.
+    So a command must carry the token as a TRAILING comment, which is the form
+    the emitted ``suppress_key`` already advertises.
+    """
+    token = f"behavioral-lint: ignore {rule_name}"
+    if not bash_mode:
+        return token in content
+    return re.search(rf"#\s*{re.escape(token)}\s*$", content.strip()) is not None
+
+
 def _check_content(
-    content: str, rules: list[dict], file_path: str = ""
+    content: str, rules: list[dict], file_path: str = "", *, bash_mode: bool = False
 ) -> list[tuple[dict, dict, str]]:
     """Check content against all rules.
 
@@ -106,8 +186,7 @@ def _check_content(
             continue
 
         # Escape hatch: an explicit opt-out comment turns off the whole rule.
-        escape = f"behavioral-lint: ignore {rule_name}"
-        if escape in content:
+        if _escaped(content, rule_name, bash_mode=bash_mode):
             continue
 
         best: tuple[dict, dict, str] | None = None
@@ -156,7 +235,9 @@ def _plain_stderr(rule: dict, pattern_def: dict, severity: str, name: str, file_
     return "\n".join(lines) + "\n"
 
 
-def _emit(violations: list[tuple[dict, dict, str]], file_path: str) -> int:
+def _emit(
+    violations: list[tuple[dict, dict, str]], file_path: str, tool_name: str = "Write"
+) -> int:
     """Print each violation to stderr; return the max exit code (2 = block).
 
     Prefers SteerMessage formatting, but if the genesis package isn't importable
@@ -188,7 +269,7 @@ def _emit(violations: list[tuple[dict, dict, str]], file_path: str) -> int:
                 context=pattern_def.get("context", ""),
                 suggestion=rule.get("description", "")
                 + ("\n  " + rule.get("suggestion", "") if rule.get("suggestion") else ""),
-                tool_name="Write",
+                tool_name=tool_name,
                 file_path=file_path,
                 can_suppress=True,
                 suppress_key=f"# behavioral-lint: ignore {name}",
@@ -227,10 +308,29 @@ def _emit(violations: list[tuple[dict, dict, str]], file_path: str) -> int:
 def main() -> int:
     payload = read_payload()
 
-    # Extract the content being written
+    tool_name = payload.get("tool_name") if isinstance(payload, dict) else ""
+    tool_name = tool_name if isinstance(tool_name, str) else ""
+
+    # What is being checked, and under which contract.
+    #
+    # Write/Edit  -> the file content. Every rule applies (the historical path).
+    # Bash        -> the command text. ONLY rules that opted in via
+    #                ``check_bash: true`` apply — see the module docstring.
+    #
+    # Decided by the FIELD present, not by tool_name alone: the legacy env-var
+    # payload contract carries no tool_name at all, and a hook that went silent
+    # under one of the two contracts is the exact failure hook_input exists to
+    # prevent. tool_name is used only to label the message.
     content = field(payload, "content") or field(payload, "new_string")
+    bash_mode = False
     if not content:
-        return 0  # No content to check (e.g., delete operation)
+        content = field(payload, "command")
+        bash_mode = bool(content)
+    if not content:
+        return 0  # Nothing to check (e.g. a delete operation).
+
+    if not tool_name:
+        tool_name = "Bash" if bash_mode else "Write"
 
     file_path = field(payload, "file_path")
 
@@ -249,14 +349,18 @@ def main() -> int:
             pass
 
     rules = _load_rules()
+    if bash_mode:
+        if _is_read_only_command(content):
+            return 0
+        rules = [r for r in rules if r.get("check_bash") is True]
     if not rules:
         return 0
 
-    violations = _check_content(content, rules, file_path)
+    violations = _check_content(content, rules, file_path, bash_mode=bash_mode)
     if not violations:
         return 0
 
-    return _emit(violations, file_path)
+    return _emit(violations, file_path, tool_name)
 
 
 if __name__ == "__main__":
