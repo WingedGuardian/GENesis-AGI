@@ -1,4 +1,10 @@
-"""Merged-PR enumeration for the repo-pulse worker (gh CLI, injectable).
+"""PR enumeration over the gh CLI (injectable runner).
+
+Home of three listings: merged PRs (the repo-pulse cursor lane), open PRs (the
+age-stale SessionStart surface), and — for the zero-drop detector's head-ref
+history join — the full ``--state all`` listing. All three share the live slug
+resolution, the timeout and the loud-cap discipline below. The import is
+one-way (``zero_drop`` reads this module; nothing here knows about it).
 
 Clone of the ``pr_review_harvest`` gh pattern with two pulse-specific
 hardenings, both live-verified during PR-4 due diligence:
@@ -233,4 +239,71 @@ async def list_open_prs(
     if not isinstance(raw, list):
         return {"error": "open pr list returned a non-list payload"}
     prs = [pr for pr in raw if isinstance(pr, dict) and isinstance(pr.get("number"), int)]
+    return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
+
+
+# Full-history fields for the zero-drop branch join (session-awareness
+# zero_drop). Deliberately NOT PR_FIELDS: the join reads only the head-ref
+# name, the state, and the merge time — never title or body, so no PR prose
+# can reach a model prompt through this path.
+ALL_PR_FIELDS = "number,headRefName,state,mergedAt,url"
+
+
+async def list_all_prs(
+    *,
+    limit: int = 2000,
+    repo: str | None = None,
+    runner: Runner | None = None,
+) -> dict:
+    """Enumerate PRs in EVERY state for a head-ref-name history join.
+
+    Returns ``{"repo", "prs", "limit_hit"}`` or ``{"error": ...}`` without
+    raising. Rows missing an int ``number`` or a string ``headRefName`` are
+    dropped (gh contract violation, not a crash). Slug resolves LIVE, the same
+    stale-config hardening as the merged/open enumerations.
+
+    The whole history is the point: the consumer classifies a local branch by
+    what EVER happened to its name, so a windowed fetch would silently
+    reclassify old branches as never-PR'd. ``limit_hit`` is therefore not a
+    nicety — the consumer must FREEZE (skip its branch classes for that run)
+    when the window caps, because a truncated history turns a merged branch
+    into a false "stranded" finding. MEASURED 2026-09-05: 1651 PRs in one
+    ~6s call at the default limit.
+    """
+    run = runner or _default_runner
+    if repo is None:
+        repo = await resolve_repo(run)
+        if repo is None:
+            return {"error": "repo slug resolve failed"}
+    rc, out, err = await run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--json",
+            ALL_PR_FIELDS,
+            "--limit",
+            str(limit),
+        ]
+    )
+    if rc != 0:
+        return {"error": f"all pr list failed (rc={rc}): {err.strip()[:400]}"}
+    try:
+        raw = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return {"error": f"all pr list returned invalid JSON: {exc}"}
+    if not isinstance(raw, list):
+        return {"error": "all pr list returned a non-list payload"}
+    prs = [
+        pr
+        for pr in raw
+        if isinstance(pr, dict)
+        and isinstance(pr.get("number"), int)
+        and isinstance(pr.get("headRefName"), str)
+        and pr["headRefName"]
+    ]
     return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}

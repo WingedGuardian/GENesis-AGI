@@ -32,6 +32,55 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now enumerates its own stranded work instead of trying to remember
+  it.** Finished code sitting on a branch nobody pushed, a pushed branch with no
+  pull request, edits left uncommitted in a worktree — all of it was invisible
+  unless somebody happened to think of it. A detector now sweeps the repository
+  on a schedule and keeps one row per standing condition, so the question "what
+  fell through the cracks?" has an answer that was counted rather than recalled.
+
+  Getting that count right is the whole problem. Because this project
+  squash-merges, a branch that landed weeks ago still looks like it is ahead of
+  the main line forever, so simply asking git turned up 145 candidates of which
+  roughly 18 were real. The detector instead joins each branch against the
+  project's full pull-request history by branch name, and applies a time guard
+  that turned out to matter: a merge only accounts for the branch if it happened
+  AFTER the newest commit there. Branch names get reused, and commits land after
+  a merge — measured against this project's history, that guard changed one
+  verdict out of 115, and the one it changed was a genuine piece of stranded
+  work. Closed-but-unmerged pull requests are treated as a deliberate
+  abandonment: suppressed, but still counted, because a suppression you cannot
+  add up is one you cannot audit. Every run publishes its full arithmetic.
+
+  There is no list of branch-name prefixes to ignore. A branch that is meant to
+  sit there — a backup, a scratch experiment — is acknowledged with a written
+  reason, which leaves a record a person can read instead of a rule nobody can
+  see. The acknowledgement is tied to the exact commit it was granted against,
+  so it lapses by itself the moment new work lands on that branch — and only
+  then. An earlier version let ordinary typing revoke one: editing a file
+  inside an acknowledged working copy briefly pushed it under an age filter,
+  and the reconciler read "not reported this time" as "gone". Not reporting
+  something and it having gone away are now different things, which is also
+  what stops a recurring finding from silently restarting its count.
+
+  Three failure modes shaped the rest. A sweep that cannot see everything says
+  so and changes nothing, rather than reporting the branches it failed to look
+  at as resolved — a detector that manufactures a clean board is worse than no
+  detector. A detector that quietly dies would go on answering "nothing"
+  forever, so it reports its own liveness. And the subtler one: a detector that
+  is alive but half-blind — say its access token expired — would keep its
+  liveness green, keep its numbers, and never notice anything new again. That
+  now raises its own alarm, separately from whatever it found, and every count
+  it publishes says which parts of the picture the last look actually covered.
+
+  Read the board with `zero_drop_status`, which reports how long ago it was
+  compiled, because a stale zero is not a clean one. Off, quiet, or noisy is a
+  setting (`zero_drop`: `off`, `observe`, `alert`). It ships on `observe`: the
+  board fills and is readable, while the summary-alert lane waits on a
+  refinement to how such alerts expire. A damaged setting falls back to
+  `observe` rather than to `off`, on the principle that a silent detector is
+  the more dangerous of the two.
+
 - **A `tmux kill-server` with no socket binding now draws an advisory.** tmux
   resolves its target server from the inherited `$TMUX` variable before
   `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address

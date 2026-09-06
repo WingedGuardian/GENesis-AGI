@@ -1028,6 +1028,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # start. Charter part (it feeds the charter's proposal sub-block).
         if _in("charter"):
             _spawn_repo_pulse_worker(_hook_source)
+            _spawn_zero_drop_worker(_hook_source)
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
@@ -1660,6 +1661,51 @@ def _spawn_repo_pulse_worker(source: str) -> None:
             )
     except Exception:
         pass  # fail-open: pulse is advisory, session start is not
+
+
+def _spawn_zero_drop_worker(source: str) -> None:
+    """Fire-and-forget the detached zero-drop stranded-work detector.
+
+    GLOBAL, not per-session: the sweep enumerates every branch and worktree of
+    the install, so one run serves all sessions; its 60-minute debounce makes
+    redundant spawns exit in ~100ms (the repo-pulse spawn posture, one Popen of
+    cost to this hook). Never on clear (/clear is a fresh start), and fail-open
+    end-to-end — a detector cannot be allowed to block session start. The sweep
+    itself (a gh round-trip plus ~160 worktree stats, MEASURED ~19s) is orders
+    of magnitude past this hook's 5s budget, which is why it is detached rather
+    than inline.
+    """
+    import subprocess
+
+    try:
+        if os.environ.get("GENESIS_ZERO_DROP_DISABLED") == "1":
+            return
+        if source == "clear":
+            return
+        script = Path(__file__).resolve().parent / "zero_drop_worker.py"
+        err_log = Path.home() / ".genesis" / "session_awareness" / "zero_drop_err.log"
+        err_log.parent.mkdir(parents=True, exist_ok=True)
+        with err_log.open("ab") as err_fh:
+            subprocess.Popen(  # noqa: S603 — fixed argv, sys.executable
+                [
+                    sys.executable,
+                    str(script),
+                    "--trigger",
+                    "session_start",
+                    # Same home-anchored resolution as the pulse spawn: a
+                    # worktree session's worker must not fall back to
+                    # genesis.env's repo-anchored default (worktree/data/ is a
+                    # void — silent no-op coverage loss).
+                    "--db-path",
+                    str(_charter_db_path()),
+                ],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_fh,
+            )
+    except Exception:
+        pass  # fail-open: the detector is advisory, session start is not
 
 
 def _pulse_floor() -> float:

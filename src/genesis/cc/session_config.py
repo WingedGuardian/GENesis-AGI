@@ -55,6 +55,7 @@ _REFLECTION_READ_MCP: frozenset[str] = frozenset({
     "ego_goal_list", "experiment_status", "health_alerts", "health_errors", "health_status",
     "immunity_status", "inbox_digest", "infrastructure_profile", "j9_eval_status", "job_health",
     "loop_closure_status", "module_list", "provider_activity", "reflex_status",
+    "zero_drop_status",
     "session_charter", "settings_get", "settings_list",
     "subsystem_heartbeats", "task_detail", "task_list", "update_history_recent",
     "follow_up_list", "web_fetch", "web_search",

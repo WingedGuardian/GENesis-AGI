@@ -1452,6 +1452,87 @@ verified: 29a382e7 2026-09-03
   propose_only). Retention 45d via `scripts/prune_repo_pulse.py`
   (disk-hygiene). Telemetry: `call_site_last_run` row `repo_pulse` (not a
   critical site — failed runs self-heal by re-covering their window).
+- **Zero-drop stranded-work detector** — **LIVE (findings store + sweep)**. The
+  reconciler behind the zero-drop rule: "what work has fallen through the
+  cracks?" is answered by ENUMERATION, never by a session that remembers.
+  Spawned beside the repo-pulse worker at SessionStart boundaries (never
+  clear; `GENESIS_ZERO_DROP_DISABLED=1` kill switch) and once a day by
+  `disk_hygiene.sh` as the wall-clock floor, `scripts/zero_drop_worker.py`
+  detaches into `session_awareness/zero_drop_worker.py`: GLOBAL flock + 60-min
+  silent debounce under `~/.genesis/zero_drop/`. It is a SIBLING of the pulse
+  worker, deliberately not a lane inside it — the pulse holds ledger-absorb
+  authority, and a detector must not live in a process that can rewrite what it
+  observes. Its never-do list is a requirement: no push, fetch, PR open/close,
+  branch delete, unclaim, or write to ledger/follow-ups/tasks.
+  Sweep (`zero_drop_git.py`, read-only, injectable runner): ONE `for-each-ref`
+  with `%(ahead-behind:<base>)` (base read locally from
+  `refs/remotes/origin/HEAD`, fallback recorded not silent), live `ls-remote`
+  for remote presence (never the fetch-stale remote mirror — class is part of
+  identity), the full `--state all` PR history (`repo_pulse_gh.list_all_prs`),
+  and `git status --porcelain -z` per worktree (`-z` because the default
+  porcelain C-quotes exactly the paths most likely to be somebody's untracked
+  work). MEASURED 2026-09-05: 209 refs + 1651 PRs + 161 worktrees in ~14s.
+  Classification (`zero_drop.py`, pure): this repo squash-merges, so every
+  merged branch reads permanently ahead — a naive ahead-count query was ~12%
+  precise (145 candidates, ~18 real). Precision comes from a head-ref-name PR
+  join: an OPEN PR covers the branch; a MERGED PR covers it ONLY if the merge
+  POSTDATES the local tip (head-ref names are reused — 35 of 1586 — and commits
+  land after a merge; the guard cost 1 of 115 suppressions and that one was a
+  TRUE positive); a CLOSED-unmerged PR is suppressed but COUNTED. No prefix
+  denylists by design — a backup branch is ACKED with a reason instead, leaving
+  a record rather than an invisible rule. Age gates: 12h on the branch tip, 6h
+  on the newest DIRTY FILE (not the tip — an old tip with a fresh edit is
+  somebody typing). Classes: `unpushed_branch` | `pushed_no_pr` |
+  `dirty_worktree` (a detached worktree keys on `@detached:<path>`, which no
+  ref name can collide with).
+  Store: `zero_drop_findings` (migration 20260905215957, mirrored in
+  `_tables.py`; CRUD `db/crud/zero_drop.py`). Identity is `UNIQUE(class,
+  branch)` — never the SHA, which would fork the row on every commit and
+  disarm escalation. Lifecycle: present ⇒ `consecutive_runs`++ and escalate
+  ONCE at `escalation_k` (visibility only); absent ⇒ resolved; re-present ⇒ a
+  NEW episode (count restarts, `reopen_count`++). An ack is SHA-keyed
+  (`acked_tip_sha`) and expires the moment the branch moves.
+  Absence from a sweep means THREE different things and only one of them is
+  "gone": an age gate filtered it, a PR verdict covered it, or it genuinely
+  went away. The first is HELD — neither present nor absent, left exactly as
+  it is — because conflating them destroyed real state (MEASURED: one edit
+  inside an acknowledged worktree pushed it under the 6h gate for a single
+  sweep, resolving the row and discarding an acknowledgement the branch had
+  never invalidated). Unreadable worktrees are held the same way, per ITEM:
+  one bad worktree must not blind all 161.
+  **A degraded leg FREEZES its classes** — a failed/capped listing skips
+  reconciliation for that class entirely rather than resolving branches it
+  never looked at, and a degraded run is not a counted run. Per-leg stage
+  counts (namespaced — the legs share key names) go to `last_run.json` so
+  every suppression adds up to its denominator, and every published count
+  carries the coverage line naming which classes that run actually swept.
+  Surfaces: `zero_drop_status` (read-only, in the reflection allowlist —
+  findings + counts + the detector's own freshness, because a stale board's
+  zero is unverified rather than clean) and `zero_drop_ack(class_, branch,
+  reason)`. The ack is the ONLY suppression path by design — there are no
+  prefix denylists — so it ships with the detector rather than after it.
+  Levers: settings domain `zero_drop` (off|observe|alert, default OBSERVE;
+  invalid degrades to observe, never a silent off — a dead detector answers
+  with a stale, confident zero). `alert` maintains ONE superseding observation
+  (follow-up-watchdog shape, created BEFORE the supersede so a failed write
+  cannot leave the board empty), auto-resolved when it comes clean; it is not
+  the default yet because `infrastructure_alert`'s 3-day TTL re-mints a stable
+  board's alert until episode-scoped dedup lands.
+  **Blindness has its own alarm, raised in every running mode**: a dead
+  detector is caught by the heartbeat, but a LIVE one with a permanently
+  failing leg (an expired `gh` token) keeps pulsing and keeps the board
+  frozen, so every health surface reads green while nothing new is ever
+  detected. That is the same stale, confident zero reached through the door
+  nobody guards.
+  Retention 45d RESOLVED-ONLY via `scripts/prune_zero_drop.py`
+  (disk-hygiene) — pruning an acked row would silently un-suppress it.
+  Telemetry: durable `events` heartbeat, subsystem `zero_drop`, registered in
+  `HEARTBEAT_EXPECTED` (3600s/48h — hourly on an active box, daily floor on an
+  idle one), in `_NO_BOOT_PULSE_SUBSYSTEMS` (a detached worker emits no
+  bootstrap pulse), in the `subsystem_stale` watch tuple (which is hardcoded,
+  NOT derived from `HEARTBEAT_EXPECTED` — registering only the former gives a
+  display row and no alarm) and in `_subsystem_enabled` (so turning the
+  detector off does not buy a permanent alarm).
 
 ## 10. Learning & evaluation
 

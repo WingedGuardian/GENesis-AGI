@@ -1,0 +1,265 @@
+"""Git atoms for the zero-drop detector — one injectable subprocess seam.
+
+Every call is READ-ONLY. The detector never fetches, pushes, checks out or
+prunes: it observes the repository and writes only to its own findings store.
+That is a requirement, not an implementation detail — a detector that mutates
+the thing it measures cannot be trusted to report on it.
+
+All commands run through a single injectable ``Runner`` (the hermetic tests
+drive real fixture repos through the default runner and a fake one through the
+seam), and every command is addressed with ``git -C <path>`` rather than a
+process cwd — the repo's cwd drifts, and a lost cd would silently point the
+sweep at a different worktree.
+
+Each function returns data or ``{"error": ...}``; nothing raises. A failed leg
+must degrade the CLASS it feeds (the caller skips that class entirely), never
+half-apply: a partial sweep that resolved the branches it never looked at
+would manufacture a clean board.
+
+Timeouts (the raw-subprocess-with-no-external-watchdog carve-out in the
+timeout policy — a hung git here sits on the detector flock and starves every
+later sweep until process death, with nothing attached to notice):
+
+- ref sweep 60s — MEASURED 84ms over 209 refs on this install (2026-09-05),
+  so ~700x headroom; the failure mode is a locked/corrupt object store.
+- ls-remote 30s — one network round-trip, MEASURED 0.39s.
+- per-worktree status 30s — local, but a worktree under a dead network mount
+  would hang; 161 worktrees means one hang must not eat the whole sweep.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+
+logger = logging.getLogger(__name__)
+
+Runner = Callable[[list[str], float], Awaitable[tuple[int, str, str]]]
+
+REF_SWEEP_TIMEOUT_S = 60.0
+LS_REMOTE_TIMEOUT_S = 30.0
+STATUS_TIMEOUT_S = 30.0
+
+# TAB-separated so a branch name containing a space survives the split; git ref
+# names cannot contain a TAB (check-ref-format forbids control characters).
+_REF_FORMAT = "%(refname:short)\t%(objectname)\t%(ahead-behind:{base})\t%(committerdate:iso-strict)"
+
+
+async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
+    """Run a git command, returning (rc, stdout, stderr). Never raises."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:  # git missing / not executable
+        return 127, "", f"git spawn failed: {exc}"
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 124, "", f"git call timed out after {timeout}s"
+    return (
+        proc.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+async def list_local_branches(
+    root: str, *, base: str = "origin/main", runner: Runner | None = None
+) -> dict:
+    """Every local branch with its tip, ahead/behind vs ``base``, and tip date.
+
+    ONE ``for-each-ref`` gives the whole candidate set — no per-branch
+    ``rev-list``. ``%(ahead-behind:)`` needs git >= 2.41 (verified on the
+    2.43 shipped here); on an older git the field expands empty and the
+    branch is reported with ``ahead=None``, which the classifier treats as
+    unknown (never as zero — an unknown ahead-count must not read as "this
+    branch has nothing on it").
+
+    Returns ``{"branches": [{branch, tip_sha, ahead, behind, tip_date}]}``.
+    """
+    run = runner or default_runner
+    rc, out, err = await run(
+        [
+            "git",
+            "-C",
+            root,
+            "for-each-ref",
+            "refs/heads",
+            "--format",
+            _REF_FORMAT.format(base=base),
+        ],
+        REF_SWEEP_TIMEOUT_S,
+    )
+    if rc != 0:
+        return {"error": f"for-each-ref failed (rc={rc}): {err.strip()[:300]}"}
+    branches = []
+    unparsed = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4 or not parts[0]:
+            unparsed += 1
+            continue
+        name, tip, ahead_behind, tip_date = parts
+        ahead: int | None = None
+        behind: int | None = None
+        bits = ahead_behind.split()
+        if len(bits) == 2:
+            try:
+                ahead, behind = int(bits[0]), int(bits[1])
+            except ValueError:
+                ahead = behind = None
+        branches.append(
+            {
+                "branch": name,
+                "tip_sha": tip,
+                "ahead": ahead,
+                "behind": behind,
+                "tip_date": tip_date or None,
+            }
+        )
+    if unparsed:
+        # A ref we could not read is a ref we did not enumerate. Failing the
+        # whole leg is correct here: the branch classes reconcile against a
+        # COMPLETE candidate set, and a quietly-short one resolves findings for
+        # branches that were simply never listed.
+        return {"error": f"for-each-ref: {unparsed} unparseable ref line(s)"}
+    return {"branches": branches}
+
+
+async def list_remote_branch_names(
+    root: str, *, remote: str = "origin", runner: Runner | None = None
+) -> dict:
+    """Branch names that exist on the remote RIGHT NOW (live ls-remote).
+
+    Deliberately not ``refs/remotes/<remote>``: that mirror is only as fresh
+    as the last fetch, so a branch pushed by another session would read as
+    never-pushed and land in the wrong class — and class is part of a
+    finding's identity, so a misclassification creates a duplicate row rather
+    than a corrected one.
+    """
+    run = runner or default_runner
+    rc, out, err = await run(
+        ["git", "-C", root, "ls-remote", "--heads", remote], LS_REMOTE_TIMEOUT_S
+    )
+    if rc != 0:
+        return {"error": f"ls-remote failed (rc={rc}): {err.strip()[:300]}"}
+    names = set()
+    for line in out.splitlines():
+        _, _, ref = line.partition("\t")
+        if ref.startswith("refs/heads/"):
+            names.add(ref[len("refs/heads/") :])
+    if not names:
+        # rc=0 with nothing parsed. A repo genuinely has at least its default
+        # branch on the remote, so an empty set here means the output was not
+        # what we think it is — and an empty set does not fail neutrally: it
+        # reclassifies EVERY branch as never-pushed, and class is part of a
+        # finding's identity, so it forks rows instead of correcting them.
+        return {"error": "ls-remote returned no branch refs (rc=0) — refusing an empty set"}
+    return {"names": names}
+
+
+async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
+    """Every worktree of this repo as ``{path, branch, detached, prunable}``.
+
+    ``--porcelain`` records are blank-line separated; a detached worktree has
+    no ``branch`` line.
+
+    ``prunable`` matters more than it looks. MEASURED on git 2.43: when a
+    worktree's directory is deleted, the registration survives and the listing
+    carries ``prunable gitdir file points to non-existent location``, while
+    ``git -C <that path> status`` fails rc=128. Reading that failure as "I
+    could not look" would freeze the whole dirty class on every sweep from then
+    on — one stale registration blinding a class permanently. A prunable
+    worktree is not unreadable, it is GONE, and a directory that does not exist
+    holds no uncommitted work; the caller skips it and counts it.
+    """
+    run = runner or default_runner
+    rc, out, err = await run(
+        ["git", "-C", root, "worktree", "list", "--porcelain"], REF_SWEEP_TIMEOUT_S
+    )
+    if rc != 0:
+        return {"error": f"worktree list failed (rc={rc}): {err.strip()[:300]}"}
+    worktrees: list[dict] = []
+    current: dict = {}
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            if current.get("path"):
+                worktrees.append(current)
+            current = {
+                "path": line[len("worktree ") :],
+                "branch": None,
+                "detached": False,
+                "prunable": None,
+            }
+        elif line.startswith("branch refs/heads/"):
+            current["branch"] = line[len("branch refs/heads/") :]
+        elif line.strip() == "detached":
+            current["detached"] = True
+        elif line.startswith("prunable"):
+            current["prunable"] = line[len("prunable") :].strip() or "prunable"
+    if current.get("path"):
+        worktrees.append(current)
+    return {"worktrees": worktrees}
+
+
+def parse_status_z(payload: str) -> tuple[list[tuple[str, str]], int]:
+    """Parse ``git status --porcelain -z`` into ``([(xy, path), ...], unparsed)``.
+
+    ``-z`` rather than the newline form on purpose: the default porcelain
+    output C-quotes any path with a space, a quote or a non-ASCII byte, so a
+    line-based parse silently mangles exactly the paths most likely to be
+    somebody's untracked work. With ``-z`` the path is emitted RAW.
+
+    A rename/copy entry (``R``/``C``) is followed by its ORIGIN path as a
+    second NUL-terminated field with no status prefix; that field is consumed
+    here and dropped — the destination is the path that exists on disk, which
+    is what the age gate stats.
+    """
+    fields = [f for f in payload.split("\0") if f]
+    entries: list[tuple[str, str]] = []
+    unparsed = 0
+    skip_next = False
+    for field in fields:
+        if skip_next:
+            skip_next = False
+            continue
+        if len(field) < 4 or field[2] != " ":
+            # Not an entry header. Never guessed at — and never SILENTLY
+            # dropped either: an unreadable record is "I could not see this",
+            # which for a detector must degrade the class, not shrink to a
+            # clean worktree. The count is what lets the caller tell the two
+            # apart; discarding it made a garbled status indistinguishable
+            # from no changes at all.
+            unparsed += 1
+            continue
+        xy, path = field[:2], field[3:]
+        entries.append((xy, path))
+        if xy[0] in ("R", "C") or xy[1] in ("R", "C"):
+            skip_next = True
+    return entries, unparsed
+
+
+async def worktree_status(path: str, *, runner: Runner | None = None) -> dict:
+    """Uncommitted state of one worktree as ``{"entries": [(xy, path), ...]}``.
+
+    Untracked files count. An untracked source file IS stranded work — the
+    exact shape of "I wrote it and never added it" — and this repo gitignores
+    its build/temp output, so the noise floor is low.
+    """
+    run = runner or default_runner
+    rc, out, err = await run(["git", "-C", path, "status", "--porcelain", "-z"], STATUS_TIMEOUT_S)
+    if rc != 0:
+        return {"error": f"status failed (rc={rc}): {err.strip()[:200]}"}
+    entries, unparsed = parse_status_z(out)
+    if unparsed:
+        # A successful CALL with unreadable OUTPUT is still a failed read. The
+        # rc check above only catches the former; without this, a garbled
+        # porcelain stream reported a CLEAN worktree.
+        return {"error": f"status: {unparsed} unparseable porcelain record(s)"}
+    return {"entries": entries}

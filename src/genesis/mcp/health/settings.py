@@ -132,6 +132,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "zero_drop": SettingsDomain(
+        name="zero_drop",
+        description=(
+            "Zero-drop stranded-work detector — master `enabled` + `mode` "
+            "off/observe/alert plus the age gates, the recurrence threshold "
+            "and the PR-history limit. Observe (default) fills the board, read "
+            "via the `zero_drop_status` MCP tool; alert additionally maintains "
+            "ONE superseding observation naming the open findings. Blindness "
+            "is reported in both. Invalid mode degrades to observe — less "
+            "egress, never a silent off (a silently-off detector answers "
+            "'what fell through the cracks?' with a stale, confident zero). "
+            "Read at worker startup — takes effect at the next sweep."
+        ),
+        config_filename="zero_drop.yaml",
+        readonly=False,
+        needs_restart=False,  # each sweep is a fresh process
+    ),
     "contributor_worklog": SettingsDomain(
         name="contributor_worklog",
         description=(
@@ -1367,6 +1384,32 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_zero_drop(changes: dict) -> list[str]:
+    """Validate zero-drop detector lever changes (see
+    genesis.session_awareness.zero_drop_config)."""
+    from genesis.session_awareness.zero_drop_config import _INT_KNOBS, _PRIORITIES, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "alert_priority", *_INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "alert_priority":
+            if value not in _PRIORITIES:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_PRIORITIES)}; got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_contributor_worklog(changes: dict) -> list[str]:
     """Validate Contributor Work-Log lever changes (see
     genesis.autonomy.contributor_worklog_config)."""
@@ -1793,6 +1836,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
+    "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,
     "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,

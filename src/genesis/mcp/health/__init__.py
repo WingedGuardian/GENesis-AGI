@@ -95,6 +95,7 @@ from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
 from genesis.mcp.health import web_tools as _web_tools  # noqa: E402, F401
+from genesis.mcp.health import zero_drop_tools as _zero_drop_tools  # noqa: E402, F401
 
 campaign_tools = _campaign_tools
 codebase = _codebase
@@ -147,6 +148,8 @@ _impl_follow_up_list = _follow_up_tools._impl_follow_up_list
 _impl_inbox_digest = _inbox_digest._impl_inbox_digest
 _impl_ego_focus_reset = _ego_tools._impl_ego_focus_reset
 _impl_reflex_signal_resolve = _reflex_resolve._impl_reflex_signal_resolve
+_impl_zero_drop_status = _zero_drop_tools._impl_zero_drop_status
+_impl_zero_drop_ack = _zero_drop_tools._impl_zero_drop_ack
 
 # direct_session_tools wired here
 direct_session_tools = _direct_session_tools
@@ -219,6 +222,9 @@ __all__ = [
     "_impl_ego_focus_reset",
     "_reflex_resolve",
     "_impl_reflex_signal_resolve",
+    "_zero_drop_tools",
+    "_impl_zero_drop_status",
+    "_impl_zero_drop_ack",
     "direct_session_tools",
     "_impl_direct_session_run",
     "_impl_direct_session_status",

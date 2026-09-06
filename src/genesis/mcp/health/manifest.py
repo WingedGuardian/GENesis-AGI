@@ -179,6 +179,17 @@ HEARTBEAT_EXPECTED = {
     "outreach": (120, 600),       # 60s daemon-thread pulse (outreach/heartbeat.py); overdue at 10×
     "dashboard": (120, 600),      # 60s daemon-thread pulse; overdue at 10× (was 4×)
     "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+    # The zero-drop detector is a DETACHED worker, not a loop: it pulses once
+    # per completed sweep, spawned at session boundaries under a 60-min debounce
+    # with a DAILY disk-hygiene run as the wall-clock floor. So the expected
+    # cadence is hourly on an active box but only daily on an idle one, and
+    # overdue is set at 48h = two consecutive missed daily floors. Anything
+    # tighter would fire on a quiet weekend and teach everyone to ignore it.
+    # A dead detector is the failure mode with no natural symptom — it keeps
+    # answering "what fell through the cracks?" with a stale, confident zero —
+    # which is why it has a heartbeat at all. The tighter per-surface check is
+    # the view's own last-run age, rendered beside every count.
+    "zero_drop": (3600, 172800),
 }
 
 # Subsystems whose heartbeat is emitted only AFTER their loop's
@@ -315,9 +326,9 @@ def _subsystem_enabled(name: str) -> bool:
     A subsystem DISABLED (or unconfigured) must not raise a cessation/never-started
     alert: a disabled subsystem's stopped or absent pulse is intentional, not a death.
     Covers ego (``ego`` config ``.enabled``), inbox (``inbox_monitor.yaml`` present +
-    ``.enabled``), and outreach (a messaging channel / Telegram configured); every other
-    name defaults True (fail toward surfacing — only subsystems with a real disable
-    switch are checked)."""
+    ``.enabled``), outreach (a messaging channel / Telegram configured), and zero_drop
+    (its mode lever); every other name defaults True (fail toward surfacing — only
+    subsystems with a real disable switch are checked)."""
     try:
         if name == "ego":
             from genesis.ego.config import load_ego_config
@@ -327,6 +338,18 @@ def _subsystem_enabled(name: str) -> bool:
             return _inbox_enabled()
         if name == "outreach":
             return _outreach_enabled()
+        if name == "zero_drop":
+            # Three first-class levers stop the detector (`enabled: false`,
+            # `mode: off`, and the env kill switch), and `effective_mode`
+            # collapses the first two. Without this branch a deliberately-
+            # disabled detector goes silent and then reads overdue at 48h,
+            # forever — the permanent false alarm this function exists to
+            # prevent. The env kill switch is per-process on the hook side and
+            # not visible from here; it only stops the SessionStart spawn, so
+            # the daily disk-hygiene sweep keeps the pulse alive anyway.
+            from genesis.session_awareness.zero_drop_config import effective_mode
+
+            return effective_mode() != "off"
     except Exception:
         logger.debug("subsystem-enabled read failed for %s", name, exc_info=True)
     return True
@@ -394,7 +417,11 @@ async def _post_resume_grace_active(db, *, name: str, now: datetime, interval_s:
 # until then. Use the overdue threshold (not interval+60) as the never_started grace
 # for these to avoid a boot-time flap. ego/awareness/surplus emit a start pulse at
 # bootstrap, so the tighter interval+60 grace is safe for them.
-_NO_BOOT_PULSE_SUBSYSTEMS = frozenset({"inbox"})
+# zero_drop joins inbox here for a stronger reason than a long first interval:
+# it is a DETACHED worker with no bootstrap participation at all, so it can
+# never emit a start pulse. Without this membership every fresh boot would
+# false-flag it never_started until its first sweep lands.
+_NO_BOOT_PULSE_SUBSYSTEMS = frozenset({"inbox", "zero_drop"})
 
 
 def _never_started_grace_s(name: str) -> float:
