@@ -413,7 +413,7 @@ async def test_inbound_append_forces_external_untrusted_origin(db):
     )
     row = await fed.get_message(db, "i1")
     assert row["origin_class"] == "external_untrusted"
-    # an explicit value is respected; outbound is left untouched (owner-authored)
+    # outbound is left untouched (owner-authored)
     await fed.append_message(
         db,
         msg_id="o1",
@@ -426,6 +426,42 @@ async def test_inbound_append_forces_external_untrusted_origin(db):
         hitl_state="held",
     )
     assert (await fed.get_message(db, "o1"))["origin_class"] is None
+
+
+@pytest.mark.asyncio
+async def test_inbound_append_overrides_explicit_trusted_origin(db):
+    """The quarantine is UNCONDITIONAL for direction='in': an explicit
+    origin_class — including a peer-influenced caller passing 'first_party' —
+    must NOT pass through. Peer-sourced content is untrusted by construction;
+    only forcing every inbound row keeps the injection boundary intact."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="i1",
+        contact_id="c1",
+        direction="in",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        origin_class="first_party",  # must be overridden, not respected
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="received",
+    )
+    assert (await fed.get_message(db, "i1"))["origin_class"] == "external_untrusted"
+    # outbound explicit values still pass through (owner-authored side)
+    await fed.append_message(
+        db,
+        msg_id="o1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="ho",
+        origin_class="first_party",
+        created_at="2026-08-31T00:00:01Z",
+        hitl_state="held",
+    )
+    assert (await fed.get_message(db, "o1"))["origin_class"] == "first_party"
 
 
 def test_inbound_origin_class_matches_provenance_constant():

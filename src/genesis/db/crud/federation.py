@@ -25,12 +25,15 @@ back as ``bytes``.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import aiosqlite
 
 if TYPE_CHECKING:
     from genesis.db.connection import SerializedConnection
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # contacts
@@ -245,12 +248,30 @@ async def append_message(
     an in-flight worker's append wins the race — and it subsumes the
     unknown-contact check (no matching row → 0 rows), uniformly regardless of
     ``PRAGMA foreign_keys``.
+
+    ``origin_class`` is caller-controlled for OUTBOUND rows only: on
+    ``direction="in"`` it is unconditionally overridden to the quarantine
+    provenance (``external_untrusted``), whatever the caller passed.
     """
     _require_direction(direction)
-    # inbound peer content is untrusted — force the quarantine provenance when the
-    # caller omits it, so a later memory write is wrapped as external rather than
-    # falling through derive_origin_class() to first_party (losing the boundary).
-    if direction == "in" and origin_class is None:
+    # Inbound peer content is untrusted — force the quarantine provenance
+    # UNCONDITIONALLY (not just when the caller omits it): peer-sourced content
+    # must never be stored as trusted, so an explicit origin_class on an inbound
+    # append — including 'first_party' — is overridden, not respected. Without
+    # this, a later memory write would resolve to first_party and lose the
+    # injection boundary. Outbound (owner-authored) values pass through.
+    if direction == "in":
+        if origin_class not in (None, _INBOUND_ORIGIN_CLASS):
+            # Surface the confused/influenced caller this override defends
+            # against — the row is still quarantined either way.
+            logger.warning(
+                "append_message: inbound origin_class %r overridden to %r "
+                "(contact %s, msg %s) — inbound provenance is not caller-controlled",
+                origin_class,
+                _INBOUND_ORIGIN_CLASS,
+                contact_id,
+                msg_id,
+            )
         origin_class = _INBOUND_ORIGIN_CLASS
     col_seq = "last_seq_sent" if direction == "out" else "last_seq_recv"
     col_head = "send_chain_head" if direction == "out" else "recv_chain_head"
