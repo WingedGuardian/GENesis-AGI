@@ -2225,6 +2225,60 @@ verified: 4cc75d50 2026-08-05
   is now live (manual dismissals, PR-2c); its diagnose/fix/promotion verdict
   points remain groundwork.
 
+## 15. Federation — private cross-owner relay
+
+The private, human-in-the-loop Genesis↔Genesis channel: a turn-gated, cross-OWNER,
+cross-install link between two DIFFERENT users' installs (knowledge exchange +
+coordination + delegation). Requires no SSH and no access to sensitive data on
+the peer. A **standalone subsystem, NOT a channel adapter** — the counterparty is
+an UNTRUSTED peer, inverting every other channel's owner-trusted model, and the
+outreach pipeline's HITL hold is email-hardcoded. Secure-by-design,
+least-privilege, HITL: the agent PROPOSES, only the human COMMITS; the user's
+approval always trumps a peer's urgency.
+
+```yaml subsystem-map
+entry: federation
+modules: [federation]
+verified: 1d75bc21 2026-08-31
+```
+
+- **STATUS (v1 PR1 — FOUNDATION, dark):** the data + crypto + transport layers
+  exist and are tested; the subsystem is NOT yet wired into the runtime and ships
+  `mode: off` by default. Pairing / inbound / outbound / HITL-hold / lifecycle
+  land in PR2.
+- **crypto.py**: PyNaCl only. Ed25519 detached signatures, **domain-separated**
+  with LENGTH-PREFIXED framing (`DOMAIN | len(context):2 | context | message`) so
+  a `pairing` signature can't be replayed as a `msg` and no byte inside `context`
+  can shift the boundary; X25519 `Box` encryption with a DISTINCT key (never reuse the signing
+  key); `SecretBox` at-rest sealing; a FROZEN canonical payload encoder; the
+  transcript hash chain (`payload_hash = H(prev_hash || canonical(payload))`); and
+  the SAS fingerprint for the out-of-band MITM check at pairing. v1 uses static
+  Box keys (no forward secrecy — documented, acceptable for a low-volume HITL
+  channel; the envelope reserves a version/ephemeral slot for a later ratchet).
+- **keystore.py**: the local identity — Ed25519 + a distinct X25519 key in a
+  `0600` keyfile under `~/.genesis/federation/identity.key` (GENESIS_HOME-aware),
+  created LAZILY on first pairing (empty-state clean). DB write-caps are
+  additionally `SecretBox`-sealed with a key DERIVED from the identity seed (no
+  extra `secrets.env` bootstrap secret).
+- **transport.py**: the swappable store-and-forward interface (`send`/`poll`/`ack`,
+  at-least-once + `envelope_id` idempotency; the RECEIVER is the dedup/ordering
+  authority via the hash chain). `MockTransport` (in-process loopback) proves the
+  boundary in tests; `RelayTransport` is a GROUNDWORK stub for the PyNaCl-relay
+  client (lands with the relay server). The transport is DUMB — it moves opaque
+  ciphertext envelopes and never inspects the payload.
+- **config.py** (+ `config/federation.yaml`): the live-read `off | propose_only |
+  live` lever. OPT-IN — default `off`; an invalid/broken config degrades to `off`
+  (least authority, never a silent receive/send); `GENESIS_FEDERATION_DISABLED=1`
+  is the background-safe kill switch. `propose_only` = the safe operational mode
+  (inbound queued, outbound held); `live` is reserved for v2 per-contact
+  earned-trust automation.
+- **data**: `federation_contacts` (one per paired peer — pinned keys, mailbox
+  coordinates, sealed write-cap, per-direction chain heads) + `federation_messages`
+  (the per-contact hash-chained transcript; bodies prunable, chain skeleton kept
+  forever). Migration 0090; CRUD `db/crud/federation.py` (`append_message`
+  advances the chain head atomically). Retention: transcript bodies pruned after
+  `retention_days` (disk-hygiene path).
+
 ---
 
 *Maintenance: run `python scripts/check_subsystem_map.py` from the repo root;

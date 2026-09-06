@@ -811,6 +811,58 @@ TABLES = {
             created_at          TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
+    # Federation relay (v1) — one row per paired peer install. Pinned Ed25519
+    # identity + X25519 encryption keys, relay mailbox coordinates, a
+    # SecretBox-sealed write-cap (never plaintext), and per-direction chain
+    # heads. Migration 0090. Mirrors the private cross-owner HITL channel.
+    "federation_contacts": """
+        CREATE TABLE IF NOT EXISTS federation_contacts (
+            contact_id          TEXT PRIMARY KEY,
+            display_name        TEXT NOT NULL,
+            peer_ed25519_pub    BLOB NOT NULL,
+            peer_x25519_pub     BLOB NOT NULL,
+            local_mailbox_id    TEXT NOT NULL,
+            peer_mailbox_id     TEXT NOT NULL,
+            relay_url           TEXT NOT NULL,
+            peer_write_cap_enc  BLOB,
+            state               TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK (state IN ('pending', 'active', 'revoked')),
+            paired_at           TEXT NOT NULL,
+            revoked_at          TEXT,
+            last_seq_sent       INTEGER NOT NULL DEFAULT 0,
+            last_seq_recv       INTEGER NOT NULL DEFAULT 0,
+            send_chain_head     TEXT,
+            recv_chain_head     TEXT
+        )
+    """,
+    # Federation relay (v1) — per-contact, per-direction hash-chained transcript.
+    # Bodies (plaintext/ciphertext) are prunable; the chain skeleton
+    # (seq/prev_hash/payload_hash) is never deleted so a pruned log still
+    # verifies. Outbound holds link an approval_requests row (email-gate shape);
+    # inbound rows carry origin_class='external_untrusted'. Migration 0090.
+    "federation_messages": """
+        CREATE TABLE IF NOT EXISTS federation_messages (
+            msg_id          TEXT PRIMARY KEY,
+            contact_id      TEXT NOT NULL,
+            direction       TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+            seq             INTEGER NOT NULL,
+            prev_hash       TEXT,
+            payload_hash    TEXT NOT NULL,
+            nonce           BLOB,
+            ciphertext      BLOB,
+            plaintext       TEXT,
+            origin_class    TEXT,
+            source_pipeline TEXT,
+            hitl_state      TEXT NOT NULL DEFAULT 'proposed'
+                                CHECK (hitl_state IN ('proposed', 'held', 'approved',
+                                                      'sent', 'rejected', 'quarantined', 'received')),
+            approval_id     TEXT UNIQUE,
+            created_at      TEXT NOT NULL,
+            delivered_at    TEXT,
+            UNIQUE (contact_id, direction, seq),
+            FOREIGN KEY (contact_id) REFERENCES federation_contacts (contact_id)
+        )
+    """,
     "task_states": """
         CREATE TABLE IF NOT EXISTS task_states (
             task_id          TEXT PRIMARY KEY,
@@ -2450,6 +2502,11 @@ INDEXES = [
     # WS-8 email gate hold store (drain queries WHERE status='held')
     "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
     "CREATE INDEX IF NOT EXISTS idx_pending_issue_posts_status ON pending_issue_posts(status)",
+    # Federation relay (v1) — per-contact chain scan + outbound-hold drain + active contacts
+    "CREATE INDEX IF NOT EXISTS idx_federation_messages_chain "
+    "ON federation_messages(contact_id, direction, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_federation_messages_hitl ON federation_messages(hitl_state)",
+    "CREATE INDEX IF NOT EXISTS idx_federation_contacts_state ON federation_contacts(state)",
     # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",

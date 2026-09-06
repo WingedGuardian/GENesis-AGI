@@ -96,6 +96,20 @@ DEFAULT_TARGETS: tuple[CredTarget, ...] = (
                "creds/ssh/id_ed25519.gpg", "ssh_key", file_mode=0o600),
 )
 
+# DELIBERATE EXCLUSIONS from DEFAULT_TARGETS — files backup.sh §8 protects that
+# self-heal must NOT auto-restore (the inventory is a subset of §8 by design;
+# release-fingerprints.txt is the existing precedent):
+#
+# - .genesis/federation/identity.key (creds/federation_identity.key.gpg). The
+#   federation identity is created LAZILY on first pairing and its ABSENCE is a
+#   meaningful state: an install that never federated, or one the owner
+#   deliberately un-paired. "missing" is a RESTORABLE_STATUS, so a target here
+#   would resurrect a retired identity from backup — re-arming peer
+#   relationships the owner revoked. Loss is still covered (backup §8 stores it;
+#   restore.sh stages it for manual placement), which is the correct human-in-
+#   the-loop shape for an identity. Revisit only once un-pair semantics are
+#   defined (PR2) so "missing" can be told apart from "retired".
+
 # Statuses that mean "corrupt and safe to restore from backup". "unreadable"
 # is deliberately excluded — a permission/IO error is ambiguous, not proven
 # corruption, so it alerts but never triggers a destructive overwrite.
