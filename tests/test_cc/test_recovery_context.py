@@ -178,3 +178,57 @@ def test_conversation_identity_block_thread_scoped_suggestion():
         "555000111", "telegram", None,
     )
     assert "chat_id=555000111, limit=50" in dm_block
+
+
+# --- Session self-knowledge: model/effort + how to change them --------------
+# MEASURED 2026-09-02: a Telegram DM session was asked to "switch to Opus,
+# medium effort" and replied it could not change its own model. It could —
+# session_config existed, its docstring names that exact request, and
+# GENESIS_SESSION_ID was in its env (it had run `env` and seen the variable 31
+# seconds earlier). Nothing was missing but the session's belief about itself.
+
+
+class TestSessionControlBlock:
+    @staticmethod
+    def _block(model="sonnet", effort="high", session_id="sess-abc123"):
+        from genesis.cc.conversation import _session_control_block
+        from genesis.cc.types import ChannelType
+
+        return _session_control_block(ChannelType.TELEGRAM, model, effort, session_id)
+
+    def test_states_the_current_model_and_effort(self):
+        """A resumed turn sends no system prompt, so values stated only at
+        session start go stale the moment /model or /effort is used."""
+        block = self._block(model="opus", effort="medium")
+        assert "model=opus" in block
+        assert "effort=medium" in block
+
+    def test_names_the_tool_and_embeds_the_REAL_id(self):
+        """The id is interpolated, not sourced from GENESIS_SESSION_ID. That env
+        var is STALE on the stale-resume rebuild path — _recover_stale_resume
+        creates a new session row and never updates the ContextVar — so a switch
+        would write to the FAILED row, succeed, and report a change that did not
+        happen."""
+        block = self._block(session_id="sess-real-42")
+        assert "session_config" in block
+        assert 'session_id="sess-real-42"' in block
+        assert "GENESIS_SESSION_ID" not in block
+
+    def test_warns_off_the_visible_but_wrong_id(self):
+        """The [Clock | Session: x] tag holds the CC transcript id, truncated to
+        8 chars — a different id that could never match."""
+        block = self._block()
+        assert "Clock" in block
+
+    def test_asserts_the_capability_without_forbidding_honest_errors(self):
+        """The measured failure was a FALSE BELIEF, so the block corrects that —
+        but an absolute "never say you cannot" is itself false on the contingency
+        path (a tool-less router LLM) and on a tool error, where it would compel
+        a fabricated success."""
+        block = self._block()
+        assert "You DO have this capability" in block
+        assert "report that error verbatim" in block
+
+    def test_block_is_bounded(self):
+        """It rides every turn, so it must not crowd out real context."""
+        assert len(self._block()) < 700, len(self._block())
