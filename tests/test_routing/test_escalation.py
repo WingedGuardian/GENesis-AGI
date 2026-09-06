@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -810,15 +812,18 @@ class TestDeadProviderNotification:
 
         await self._seed_failure_obs(escalation, empty_db, "prov-race", "pf-race", age_s=7200)
 
-        real_query = obs_crud.query
+        # Patch the outage-clock read seam the notify path actually uses
+        # (the hash-scoped unresolved_by_hash — NOT the generic query(),
+        # which this path deliberately no longer calls).
+        real_read = obs_crud.unresolved_by_hash
 
-        async def racing_query(*args, **kwargs):
-            rows = await real_query(*args, **kwargs)
+        async def racing_read(*args, **kwargs):
+            rows = await real_read(*args, **kwargs)
             # Recovery lands HERE: after the read, before the write.
             await escalation._resolve_observation("prov-race")
             return rows
 
-        monkeypatch.setattr(obs_crud, "query", racing_query)
+        monkeypatch.setattr(obs_crud, "unresolved_by_hash", racing_read)
         await escalation._maybe_notify("prov-race")
 
         rows = await self._criticals(empty_db, "prov-race", escalation)
@@ -826,4 +831,149 @@ class TestDeadProviderNotification:
         assert unresolved == [], (
             "a provider that recovered mid-check was still reported dead — "
             f"{len(unresolved)} unresolved critical row(s) written after recovery"
+        )
+
+
+class TestSilenceIsNotRecovery:
+    """A gap in trips is OBSERVED, never acted on.
+
+    This class replaces `TestTripWindowReanchor`, whose tests pinned the
+    opposite contract: a >24h gap zeroed `trip_count` and cleared the anchor.
+    That was the wrong diagnosis of a real symptom. MEASURED against it: a
+    provider failing once a week and never recovering sat at trip_count=1 for
+    8 consecutive weeks, so it could never reach `_TRIP_THRESHOLD` and the user
+    was never told it was dead (Codex P1, #1632).
+
+    Elapsed silence is not recovery evidence — the breaker can sit OPEN through
+    an idle stretch, and only `record_recovery` (which needs actual successful
+    calls) ends an incident. The symptom that motivated the reset was real but
+    lives in the REPORTING, and is pinned by `TestEvidenceWording` below.
+    """
+
+    async def test_a_sparse_outage_still_reaches_the_threshold(self, empty_db, event_bus):
+        """The case the old reset made undetectable: dead, but low-traffic."""
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        for _ in range(_TRIP_THRESHOLD):
+            await esc._on_event(_make_event("prov-sparse"))
+            t["now"] += timedelta(days=7)  # once a week, never recovering
+        assert esc._state["prov-sparse"]["trip_count"] == _TRIP_THRESHOLD, (
+            "weekly trips must accumulate — zeroing them on elapsed time is what "
+            "made a genuinely dead low-traffic provider invisible"
+        )
+
+    async def test_a_gap_preserves_the_anchor(self, empty_db, event_bus):
+        """`first_trip_at` is the true first trip and nothing here may move it."""
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        await esc._on_event(_make_event("prov-anchor"))
+        anchor = esc._state["prov-anchor"]["first_trip_at"]
+        t["now"] += timedelta(hours=25)
+        await esc._on_event(_make_event("prov-anchor"))
+        assert esc._state["prov-anchor"]["first_trip_at"] == anchor
+        assert esc._state["prov-anchor"]["trip_count"] == 2
+
+    async def test_only_recovery_clears_the_incident(self, empty_db, event_bus):
+        """The one signal that DOES end an incident, kept as the control.
+
+        Without this the class only asserts that nothing resets, which a
+        permanently-stuck counter would also satisfy.
+        """
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        for _ in range(3):
+            await esc._on_event(_make_event("prov-rec"))
+            t["now"] += timedelta(days=2)
+        assert esc._state["prov-rec"]["trip_count"] == 3
+        esc.record_recovery("prov-rec")
+        assert "prov-rec" not in esc._state, "recovery must clear the incident"
+
+
+class TestEvidenceWording:
+    """The messages must state what was OBSERVED, not infer a continuous outage.
+
+    This is where the original bug actually lived. Between two trips a week
+    apart nothing observes the provider at all, so "has been failing every call
+    for 3 days" was an inference the evidence never supported — and discarding
+    state to make that sentence true is what broke sparse-outage detection.
+    """
+
+    async def test_the_escalation_row_names_both_ends_of_the_evidence(self, empty_db, event_bus):
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        for _ in range(_TRIP_THRESHOLD):
+            await esc._on_event(_make_event("prov-words"))
+            t["now"] += timedelta(days=3)
+        await asyncio.gather(
+            *(x for x in asyncio.all_tasks() if x.get_name() == "escalation-obs-prov-words"),
+            return_exceptions=True,
+        )
+        cur = await empty_db.execute(
+            "SELECT content FROM observations WHERE type = 'provider_failure'"
+        )
+        row = await cur.fetchone()
+        assert row, "the escalation row was not written"
+        msg = json.loads(row[0])["message"]
+        assert "no recovery has been observed" in msg, msg
+        assert "every call" not in msg, (
+            "the row must not claim continuous total failure — sparse trips never evidenced it"
+        )
+        assert "between" in msg, "both ends of the evidence must be named"
+
+    def test_the_reported_span_is_bounded_by_the_observation_ttl(self):
+        """Past the row's own TTL nothing a reader can look up corroborates the
+        figure, so the wording degrades instead of quoting a precise total."""
+        from genesis.db.crud.observations import _DEFAULT_TTL
+        from genesis.routing.escalation import _EVIDENCE_SPAN_CAP_S
+
+        assert _DEFAULT_TTL.total_seconds() == _EVIDENCE_SPAN_CAP_S, (
+            "the cap is DERIVED from the observations TTL, not chosen — if that "
+            "TTL moves, this must move with it rather than drift into a "
+            "number nobody can justify"
+        )
+
+
+class TestHashScopedOutageClock:
+    async def test_a_crowded_unresolved_table_cannot_starve_the_clock(self, empty_db):
+        """ACCEPTANCE REPLAY of the truncated-read defect: with >100 unrelated
+        unresolved routing rows, the old query(limit=100)+Python-filter shape
+        dropped the target provider's row out of the fetch window and read the
+        outage clock as ABSENT — no notification, indistinguishable from
+        healthy. The hash-scoped read must find it regardless of crowd size."""
+        from genesis.db.crud import observations as obs_crud
+        from genesis.routing.escalation import notify_provider_if_due
+
+        started = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        target_hash = ProviderEscalation._provider_content_hash("prov-crowded")
+        await obs_crud.create(
+            empty_db,
+            id="target-row",
+            person_id=None,
+            type="provider_failure",
+            content=json.dumps({"provider": "prov-crowded", "first_trip_at": started}),
+            source="routing",
+            priority="high",
+            content_hash=target_hash,
+            created_at=started,
+        )
+        # 120 NEWER unrelated unresolved rows — under a newest-first
+        # limit-100 global read, the target falls outside the window.
+        for i in range(120):
+            await obs_crud.create(
+                empty_db,
+                id=f"crowd-{i}",
+                person_id=None,
+                type="provider_failure",
+                content=json.dumps({"provider": f"crowd-{i}"}),
+                source="routing",
+                priority="high",
+                content_hash=f"crowdhash-{i}",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        notified = await notify_provider_if_due(
+            empty_db, "prov-crowded",
+            provider_still_failing=lambda p: True,
+        )
+        assert notified is True, (
+            "the outage clock was starved by unrelated unresolved rows"
         )
