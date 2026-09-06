@@ -115,9 +115,22 @@ def carried_more_than_the_refused_step(command: str) -> bool:
     control caught before this shipped: ``analyze`` also yields the ``bash -c``
     WRAPPER, so ``bash -c 'git reset --hard'`` counts 2 and gets a note for
     collateral that does not exist. The wrapper is not a step the refusal
-    discarded; it is the thing that was refused. So nested steps are counted at
-    ``depth > 0``, where the wrapper does not appear, and the top-level count still
-    covers the ordinary compound. MEASURED across both shapes and their controls.
+    discarded; it is the thing that was refused.
+
+    The two NESTING KINDS therefore count differently, by ``Segment.via``:
+
+    * More than one nested step, of either kind, is collateral — the original
+      rule, unchanged.
+    * A LONE ``"substitution"`` (``$(…)``, backticks — including one inside a
+      redirect target) is collateral too, PROVIDED the top level carries a real
+      host command: the substituted command runs IN ADDITION to the host, so
+      ``git push --force "$(cp a b)"`` refused loses the ``cp`` — and a plain
+      nested-count>1 said nothing. The host check is what keeps the bare
+      ``$(git push)`` control silent: there the top-level "command" is the
+      substitution expression itself (exe starts with ``$(`` or a backtick),
+      the nested push IS the refused step, and nothing else was lost.
+    * A lone ``"script"`` step (``bash -c 'git …'``) stays silent — the wrapper
+      is not a step, so the script's one command is the whole call.
 
     ONE step means the refused step IS the whole call and there is nothing to
     report. Never raises — an unreadable command yields False, which is silence.
@@ -137,9 +150,16 @@ def carried_more_than_the_refused_step(command: str) -> bool:
         signal.setitimer(signal.ITIMER_REAL, _BUDGET_SECONDS)
         try:
             segments = analyze(command)
+            nested = [s for s in segments if s.depth > 0]
+            real_host = any(
+                s.exe and not s.exe.startswith(("$(", "`"))
+                for s in segments
+                if s.depth == 0
+            )
             return (
-                len([s for s in segments if s.depth > 0]) > 1
-                or len(split_segments(command)) > 1
+                len(split_segments(command)) > 1
+                or len(nested) > 1
+                or (real_host and any(s.via == "substitution" for s in nested))
             )
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)

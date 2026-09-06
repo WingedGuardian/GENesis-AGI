@@ -115,6 +115,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 from shell_parse import analyze, has_trailing_override  # noqa: E402
 
+try:  # A refusal discards the WHOLE Bash call, not just the clean step.
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort
+        this module's load — and CC reads a non-2 exit as a NON-blocking error,
+        so the command this hook exists to refuse would RUN. A missing note must
+        never become a missing block.
+        """
+
+
 # Substrings that gate the parse path; absent all of them the command cannot be
 # a worktree-overwriting git op, so we return instantly. `clean` is included
 # because it is the ONE verb this guard still BLOCKS (see _clean_violation). The
@@ -544,6 +558,7 @@ def main() -> int:
             # and, on the direct wiring, downgrade exit 1 to non-blocking).
             with contextlib.suppress(OSError):
                 print(block_msg, file=sys.stderr)
+            _warn_discarded(cmd)
             return 2
 
     # Phase 1b — submodule-RECURSIVE overwrite is UNRECOVERABLE by the superproject
@@ -560,6 +575,7 @@ def main() -> int:
             if sub_msg:
                 with contextlib.suppress(OSError):
                     print(sub_msg, file=sys.stderr)
+                _warn_discarded(cmd)
                 return 2
 
     # Phase 2 — the snapshot recovery net (ADVISORY → fail OPEN).

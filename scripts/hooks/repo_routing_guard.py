@@ -52,6 +52,20 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 
+try:  # A refusal discards the WHOLE Bash call, not just the wrong-repo step.
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort
+        this module's load — and CC reads a non-2 exit as a NON-blocking error,
+        so the command this hook exists to refuse would RUN. A missing note must
+        never become a missing block.
+        """
+
+
 _OVERRIDE_RE = re.compile(r"#\s*repo-routing-override\b")
 
 
@@ -436,6 +450,7 @@ def main() -> int:
                 f"'# repo-routing-override' to proceed if this is intentional.",
                 file=sys.stderr,
             )
+            _warn_discarded(cmd)
             return 2
 
         if weak:

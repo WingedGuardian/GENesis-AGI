@@ -426,3 +426,75 @@ def test_cli_is_silent_and_zero_for_a_single_step_command():
     )
     assert proc.returncode == 0
     assert proc.stderr == ""
+_FORCE = "--" + "force"  # split so substring-matching safety hooks don't trip on fixtures
+_LONE_SUBSTITUTION = [
+    f'git push {_FORCE} "$(cp a b)"',
+    f'git push {_FORCE} "`cp a b`"',
+    'git commit -m x > "$(mktemp)"',
+    "bash -c 'git push \"$(cp a b)\"'",
+]
+
+
+@pytest.mark.parametrize("cmd", _LONE_SUBSTITUTION)
+def test_a_lone_substitution_beside_a_real_command_is_collateral(cmd):
+    """One nested command CAN be collateral — when it rides a real host.
+
+    A substitution's command runs in addition to the host command carrying it,
+    so refusing a force-push whose argument is `"$(cp a b)"` also loses the
+    `cp` — and the plain nested-count>1 rule said nothing, because the
+    substitution contributes exactly one depth-positive segment. Backticks and
+    an expansion inside a redirect target are the same class.
+    """
+    assert dw.note(cmd) is not None, cmd
+
+
+def test_a_bare_substitution_is_still_the_refused_step_itself():
+    """The control bounding the rule above, kept from the wrapper lesson.
+
+    In `$(git push)` the top level is the substitution expression itself, the
+    nested push IS the thing refused, and nothing else was lost — same logic
+    as the `bash -c` wrapper, reached through the other nesting kind.
+    """
+    assert dw.note("$(git push)") is None
+
+
+def test_every_configured_bash_blocker_is_wired_for_the_note():
+    """The coverage set is the CONFIGURATION, not the importers.
+
+    The sibling wiring tests walk modules that already import this helper —
+    structurally blind to a blocker that was never wired at all, which is how
+    two configured exit-2 sites (git_discard_guard, and the inline blocker in
+    .claude/settings.json) shipped noteless. This test derives the set from
+    .claude/settings.json's PreToolUse Bash hooks: every referenced script
+    that can return a blocking verdict must import the helper, and an inline
+    command that can `exit 2` must invoke the CLI. A blocker added tomorrow is
+    covered the day its hook is configured.
+    """
+    import json
+    import re
+
+    repo = _HOOKS.parents[1]
+    settings = json.loads((repo / ".claude" / "settings.json").read_text())
+    checked_scripts, checked_inline = 0, 0
+    for entry in settings["hooks"]["PreToolUse"]:
+        if entry.get("matcher") != "Bash":
+            continue
+        for h in entry["hooks"]:
+            cmd = h["command"]
+            m = re.search(r"genesis-hook\s+(\S+\.py)", cmd)
+            if m:
+                script = repo / "scripts" / m.group(1)
+                src = script.read_text()
+                if re.search(r"return 2|sys\.exit\(2\)", src):
+                    checked_scripts += 1
+                    assert "from discarded_write import" in src, (
+                        f"{script.name}: configured Bash blocker never wires "
+                        "the discarded-command note"
+                    )
+            elif "exit 2" in cmd:
+                checked_inline += 1
+                assert "discarded_write.py" in cmd, (
+                    "inline settings.json Bash blocker never invokes the note CLI"
+                )
+    assert checked_scripts >= 8, f"blocker walk went blind: {checked_scripts}"
+    assert checked_inline >= 1, "the inline settings.json blocker was not seen"
