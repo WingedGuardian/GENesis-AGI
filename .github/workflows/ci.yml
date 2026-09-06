@@ -584,4 +584,10 @@ jobs:
         # would kill pytest mid-suite, leave no report, and the step would
         # refuse with a cause that is not the cause.
         if: ${{ !cancelled() }}
-        run: python scripts/check_skip_ceiling.py junit.xml
+        # Baseline MEASURED on this PR's own green run (job 101515129147, head
+        # bbd11ad1): "95 skipped of 23164 collected". Exact-fit on both axes, not
+        # a padded guess — headroom would be a number nobody measured, and the
+        # whole point of shipping report-only first was to avoid inventing one.
+        # Raising either bound is a deliberate act that belongs in the same commit
+        # as the change that moves it; both failure messages say so.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 95 --min-collected 23164
