@@ -33,6 +33,8 @@
 #      → scripts/prune_contributor_issue_posts.py (Contributor Work-Log hold
 #      store; held rows never pruned)
 #  12. Retention prune of entity_merge_journal (>180d) → scripts/prune_entity_merge_journal.py
+#  13. Retention prune of ~/.genesis/deploy_receipts.jsonl (newest lines kept,
+#      under the deploy-station lock — see lib/deploy_lock.sh)
 #      (reversibility snapshot store; generous window so unmerge_entity outlives
 #      the mis-merge discovery horizon)
 #
@@ -149,6 +151,33 @@ main() {
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
+
+    echo "--- deploy receipts retention prune (newest lines kept) ---"
+    # ~/.genesis/deploy_receipts.jsonl (lib/deploy_lock.sh) grows one line per
+    # deploy/validation. Every APPEND happens under the deploy-station lock
+    # (update.sh + deploy_code_only.sh hold it exclusive, validation holds hold
+    # it shared), so holding it EXCLUSIVE here makes the tail+mv rewrite
+    # race-free. Nonblocking on purpose: a busy station skips today's prune —
+    # bounded growth resumes tomorrow; queueing a daily groom behind a 2h
+    # validation hold would be backwards.
+    (
+        # shellcheck source=lib/deploy_lock.sh
+        source "$REPO_DIR/scripts/lib/deploy_lock.sh"
+        # The lib's env-derived path is the one source of truth — an outer
+        # $HOME-literal guard would diverge under an override.
+        [ -f "$GENESIS_DEPLOY_RECEIPTS" ] || exit 0
+        if acquire_deploy_lock_ex 0; then
+            # A .tmp orphaned by a prior kill between tail and mv would sit
+            # forever; clear it before (re)writing.
+            rm -f "$GENESIS_DEPLOY_RECEIPTS.tmp"
+            if [ "$(wc -l < "$GENESIS_DEPLOY_RECEIPTS" 2>/dev/null || echo 0)" -gt "$_DEPLOY_RECEIPTS_KEEP" ]; then
+                tail -n "$_DEPLOY_RECEIPTS_KEEP" "$GENESIS_DEPLOY_RECEIPTS" > "$GENESIS_DEPLOY_RECEIPTS.tmp" \
+                    && mv "$GENESIS_DEPLOY_RECEIPTS.tmp" "$GENESIS_DEPLOY_RECEIPTS"
+            fi
+        else
+            echo "deploy receipts prune skipped (deploy station busy)"
+        fi
+    ) || echo "deploy receipts prune exited $?"
 
     echo "--- contributor work-log terminal-row prune (>30d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \

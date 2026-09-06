@@ -1,0 +1,78 @@
+#!/bin/bash
+# run_under_deploy_lock.sh — hold the deploy-station lock around a command
+# (issue #1699's reader side).
+#
+# A validation/E2E run against the live server takes the lock SHARED: shared
+# holders coexist with each other, while a deploy (exclusive) waits for them
+# and they wait for a deploy — so a restart can never land mid-measurement and
+# a measurement can never be attributed to a tree that was swapped under it.
+#
+# Usage: scripts/run_under_deploy_lock.sh [--shared|--exclusive] [--wait N]
+#                                         [--receipt] -- <command> [args…]
+#   --shared     (default) coexist with other validations; exclude deploys
+#   --exclusive  a writer hold, for a caller that mutates the runtime itself
+#   --wait N     seconds to queue (default 7200 — the project's 2h floor: a
+#                validation queued behind a long deploy should run, not flake)
+#   --receipt    on command success, append a {status: "validated", sha} line
+#                to the deploy receipts — the SHA is read from the main
+#                checkout UNDER the lock, so it IS the serving SHA for the
+#                whole run (the exclusive/shared exclusion is what makes that
+#                claim true rather than a race)
+#
+# Exit: the wrapped command's code; 200 (DEPLOY_LOCK_HELD_RC) on lock timeout.
+
+set -euo pipefail
+
+# GENESIS_DEPLOY_ROOT: test seam, same contract as deploy_code_only.sh.
+GENESIS_ROOT="${GENESIS_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/deploy_lock.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/deploy_lock.sh"
+
+MODE="sh"
+WAIT_S=7200
+RECEIPT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --shared) MODE="sh"; shift ;;
+        --exclusive) MODE="ex"; shift ;;
+        --wait) WAIT_S="${2:?--wait needs a value}"; shift 2 ;;
+        --receipt) RECEIPT=1; shift ;;
+        --) shift; break ;;
+        *) echo "ERROR: unknown argument before '--': $1" >&2; exit 1 ;;
+    esac
+done
+if [ $# -eq 0 ]; then
+    echo "ERROR: no command given (usage: run_under_deploy_lock.sh [opts] -- cmd…)" >&2
+    exit 1
+fi
+case "$WAIT_S" in
+    ''|*[!0-9]*) echo "ERROR: --wait must be a positive integer (got: $WAIT_S)" >&2; exit 1 ;;
+esac
+
+# A --receipt run's SHA claim is about the SERVING tree — the main checkout.
+# Sessions live in worktrees, and invoking a worktree's copy would record the
+# worktree branch's HEAD as "validated" while the server serves main (architect
+# SF4). Running FROM a worktree is fine; sourcing the SHA from one is not.
+if [ "$RECEIPT" -eq 1 ]; then
+    if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
+       [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
+        echo "ERROR: --receipt refused from a worktree copy — the recorded SHA must be" >&2
+        echo "       the serving tree's. Invoke the main checkout's copy of this script." >&2
+        exit 1
+    fi
+fi
+
+rc=0
+"acquire_deploy_lock_$MODE" "$WAIT_S" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "ERROR: deploy lock not acquired within ${WAIT_S}s ($GENESIS_DEPLOY_LOCK, mode $MODE)." >&2
+    exit "$rc"
+fi
+
+SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+cmd_rc=0
+"$@" || cmd_rc=$?
+if [ "$RECEIPT" -eq 1 ] && [ "$cmd_rc" -eq 0 ]; then
+    append_deploy_receipt "validated" "$SHA" "validation"
+fi
+exit "$cmd_rc"
