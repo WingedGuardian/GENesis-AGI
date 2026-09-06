@@ -78,6 +78,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A graph backend that cannot answer no longer erases the shield's memory.**
+  "The graph store is unreachable" and "no bridge memories exist" used to look
+  identical — an empty answer — so a missing library or unreachable backend
+  made the nightly centrality pass wipe its cache, and the importance shield
+  then protected nothing until the backend came back AND the pass re-ran.
+  Unavailability is now its own loud signal: the pass keeps the previous
+  bridge-node population standing and says why, while a genuinely empty graph
+  still supersedes stale rows. Two writers also stopped leaving the cached
+  graph stale: superseding a memory now tells the graph about the new
+  succession edge, and the integrity sweep that purges a dead memory's edges
+  now invalidates the cache it just made wrong.
 - **A schema rebuild no longer destroys columns a private fork added.** The
   ledger table rebuild (widening a constraint means rebuilding the table on
   SQLite) copied a hardcoded upstream column list and then dropped the old
