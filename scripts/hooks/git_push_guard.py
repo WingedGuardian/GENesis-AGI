@@ -1584,10 +1584,21 @@ def _check_inline_review_findings(
     Returns (should_block, message). Each unresolved finding contributes to a review
     score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
     >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
-    reply (engagement = consciously accepted) or its path is documentation
-    (``_is_doc_path``). The two exclusions differ in VISIBILITY by design: a doc-path
-    finding was auto-excluded by PATH (not engaged), so it is still SURFACED as a NOTE —
-    scored P2s print as a WARNING, doc-path P1s/P2s as a NOTE — nothing unaddressed is
+    reply (engagement = consciously accepted), its path is documentation
+    (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
+    merge of main stamps base-branch findings onto the PR; scoring them makes
+    the gate demand base-branch fixes as this PR's price — reconciliation must
+    stay gate-neutral). Off-diff findings are surfaced with their paths so real
+    ones can be routed to the base branch's tracker; a MISSING/null path always
+    scores (never silently discount a finding this check cannot place), and an
+    unreadable changed-file set scores everything (status quo) with a loud
+    NOTE. Scoping leans on the Codex FRESHNESS gate as its backstop: code moved
+    away from a reverted file re-enters the diff at the new head, where a current
+    review is separately required — weakening that gate widens this one.
+    The exclusions differ in VISIBILITY by design: doc-path and off-diff findings
+    were auto-excluded by PATH (not engaged), so both are still SURFACED as NOTEs —
+    scored P2s print as a WARNING, doc-path P1s/P2s and off-diff findings as NOTEs —
+    nothing unaddressed is
     dropped. A maintainer-replied finding was CONSCIOUSLY ENGAGED (the reply IS the
     acknowledgement), so it is excluded from the report too: the pre-merge report shows
     what still needs attention, not what a maintainer already handled (re-listing every
@@ -1633,6 +1644,40 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
+    cr_off_diff: list[tuple[str, str]] = []
+    off_diff_p1: list[tuple[str, str]] = []
+    off_diff_p2: list[tuple[str, str]] = []
+    # The PR's changed-file set, resolved LAZILY and at most once: only a PR
+    # that actually carries a candidate blocking finding pays for the read
+    # (one paginated `gh api pulls/N/files` under _gh_timeout(8), which clamps
+    # to the remaining merge deadline). [] = unresolved; [set] = resolved;
+    # [None] = resolution failed → every check answers "in diff" (scored),
+    # which re-creates the pre-scoping behavior, announced by a NOTE below.
+    _scope_cache: list[set[str] | None] = []
+
+    def _off_diff(path: str | None) -> bool:
+        """True only when the finding names a path PROVABLY outside the diff.
+
+        An EMPTY changed-file set is treated like an UNREADABLE one (score
+        everything + the loud NOTE), not like a resolved answer: over the API,
+        200-with-zero-rows cannot be told apart from a transiently-degraded
+        response, and "discount every finding on the whole PR" is the one
+        outcome this gate must never reach through an ambiguity (security
+        review HIGH, 2026-09-06). The cost is only that a genuinely empty PR
+        (head == base) scores its findings — the stricter direction, and such
+        a PR has no content to merge anyway. NOTE: `_hook_surface_override_check`
+        deliberately keeps the opposite reading of `[]` ("no hook files") —
+        that consumer fails CLOSED on `None` and an empty PR truly has no hook
+        files, so its contract is untouched.
+        """
+        if not path:
+            return False  # pathless/outdated comment — never silently discounted
+        if not _scope_cache:
+            files = _pr_changed_files(pr_num, repo=repo)
+            _scope_cache.append(set(files) if files else None)
+        changed = _scope_cache[0]
+        return changed is not None and path not in changed
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1679,6 +1724,14 @@ def _check_inline_review_findings(
                     else:
                         cr_advisory.append(title)
                     continue
+                if _off_diff(c.get("path")):
+                    # Checked BEFORE the doc-path lever: off-diff is the broader
+                    # exclusion (a base-branch finding is not this PR's to
+                    # answer whatever the file type), and unlike doc-skipping it
+                    # is not mode-gated — it enforces ratified policy (#1728),
+                    # not a per-install preference.
+                    cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
+                    continue
                 if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                     # Its OWN list, not the Codex `doc_skipped` one — landing a
                     # CodeRabbit finding there printed it as "[doc P1]" under a
@@ -1695,6 +1748,13 @@ def _check_inline_review_findings(
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
+            if _off_diff(c.get("path")):
+                # Same scoping the CodeRabbit branch gets above — the stale-
+                # anchor mechanism (#1728) is reviewer-agnostic, and enforcing
+                # it for one reviewer only would be an asymmetry with no
+                # stated reason (the #1677 class).
+                off_diff_p1.append((_inline_title(body), c.get("path") or ""))
+                continue
             if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
@@ -1706,6 +1766,9 @@ def _check_inline_review_findings(
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
+            if _off_diff(c.get("path")):
+                off_diff_p2.append((_inline_title(body), c.get("path") or ""))
+                continue
             if _is_doc_path(c.get("path") or "") and _doc_findings_mode() in ("skip", "p1_only"):
                 # A P2 on a doc path is not a code defect — excluded from the SCORE, but
                 # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
@@ -1738,6 +1801,38 @@ def _check_inline_review_findings(
         )
         for bot_login, title in unmatched_bot[:5]:
             print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+    if _scope_cache and _scope_cache[0] is None:
+        # Resolution was ATTEMPTED (a candidate finding consulted it) and
+        # failed — say so loudly, because from here the scan behaves exactly
+        # as it did before scoping existed: everything scores.
+        print(
+            f"NOTE: PR #{pr_num} — diff scoping unavailable (changed-file set "
+            f"unreadable or empty: gh error, a >3000-file PR, or a no-content "
+            f"PR). ALL findings scored, including any on base-branch content.",
+            file=sys.stderr,
+        )
+    if cr_off_diff:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_off_diff)} CodeRabbit Critical/Major "
+            f"finding(s) on files outside this PR's diff (base-branch content, "
+            f"typically stamped by a merge of main) — NOT scored. A real one "
+            f"belongs to the base branch's tracker, not this PR's gate:",
+            file=sys.stderr,
+        )
+        for title, fpath in cr_off_diff[:8]:
+            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+    if off_diff_p1 or off_diff_p2:
+        print(
+            f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
+            f"[P2] inline finding(s) on files outside this PR's diff — NOT "
+            f"scored (base-branch content; route real ones to the base "
+            f"branch's tracker):",
+            file=sys.stderr,
+        )
+        for title, fpath in off_diff_p1[:5]:
+            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+        for title, fpath in off_diff_p2[:5]:
+            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
     if cr_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
@@ -2615,9 +2710,14 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
                 ],
                 capture_output=True,
                 text=True,
-                # Merge-path timeout budget (see main()): this runs ONLY on the
-                # rare `# stale-review-override` path, so one paginated read
-                # stays inside the hook's wall-clock.
+                # Merge-path timeout budget (see main()): THREE consumers —
+                # the hook-surface override check (rare override path),
+                # _pin_blob_unchanged (rare pin path), and the inline-findings
+                # diff scoping (#1728), which is on the hot merge path but
+                # LAZY: it reads only when a candidate blocking finding exists,
+                # at most once per scan. _gh_timeout clamps this call to the
+                # remaining merge deadline, and a timeout degrades to None →
+                # the scoping caller scores everything (status quo) + a NOTE.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -4697,6 +4797,198 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+#: MIRROR of e2e_declaration.E2E_CUTOFF_ISO, for the degraded path only. Without it
+#: the cutoff exemption was gated on the parser importing, so a PRE-CUTOFF PR was
+#: BLOCKED whenever the module could not load — a false block on a gate with no
+#: override, against the one population the cutoff exists to protect (CodeRabbit
+#: Minor, 2026-09-06; an earlier comment here claimed a reorder had fixed this, when
+#: the reorder only removed a wasted round-trip). Duplicating a constant invites
+#: drift, so `test_the_degraded_cutoff_mirror_matches_the_parser` locks the two
+#: together and fails the moment either moves.
+_E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
+
+#: Last-resort matcher for the E2E declaration, used ONLY when
+#: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
+#: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
+#: addition: the value must contain NO `<…>` placeholder span, because this path
+#: cannot strip HTML comments and the shipped template's guidance lives in one.
+#: An earlier version used `(?!<)`, which only guards the FIRST character — so the
+#: template's own `E2E: none — <reason there is no runtime surface to verify>` line
+#: matched, and every straight-from-template PR would have satisfied the degraded
+#: gate while the comment right here claimed it could not (Kimi P2, 2026-09-06,
+#: reproduced). A real one-line declaration does not carry an angle-bracketed span;
+#: a template line always does. Kept adjacent to the loader so the two are read
+#: together; the real pattern remains the parser's.
+_E2E_FALLBACK_RE = re.compile(
+    r"^[^\S\n]*(?:[-*+>][^\S\n]*)*(?:\[[ xX]\][^\S\n]*)?"
+    r"[*_`]{0,2}E2E[*_`]{0,2}[^\S\n]*:[^\S\n]*(?![^\n]*<[^<>\n]*>)(\S[^\n]*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _load_e2e_declaration():
+    """Import scripts/e2e_declaration.py, or None if unavailable.
+
+    Same lazy, failure-tolerant shape as ``_load_pin_receipt_checker``: a sibling
+    script rather than a package, and a hook that cannot import it must not stop
+    being a merge gate for everything else."""
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "e2e_declaration.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_e2e_declaration", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec (dataclasses resolve their module from sys.modules),
+        # and popped on failure so a half-initialised entry cannot poison a later
+        # import — the same hygiene the sibling loader in e2e_declaration.py argues
+        # for. The two loaders disagreeing about it is how one of them ends up wrong.
+        sys.modules["_e2e_declaration"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("_e2e_declaration", None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
+    """The PR's creation timestamp (ISO-8601), or None if unreadable.
+
+    Mirrors ``_pr_body_text``: ``None`` is UNREADABLE, which the caller treats as
+    "not exempt" — the pre-cutoff population is finite and shrinking, so a parse
+    failure must not become a permanent exemption."""
+    raw = os.environ.get("_TEST_GH_PR_CREATED_AT")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "view", pr_num, *_repo_args(repo),
+                "--json", "createdAt", "--jq", ".createdAt",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a merge whose PR body never DECIDED about a post-merge E2E (§8.12).
+
+    Returns (should_block, message). The obligation is one line in the PR body —
+    either a plan or an explicit reasoned ``none`` (see scripts/e2e_declaration.py
+    for the full convention and why its parsing is what it is).
+
+    GUARD AXIOMS, stated because every gate change owes them:
+      * VERDICT: block, at MERGE time only. The push arm never calls this — a
+        body is written and revised while a PR is open, so demanding it at push
+        would gate the wrong moment.
+      * AUDIENCE: the agent. The message names both valid forms verbatim.
+      * BACKGROUND: none. Background sessions cannot merge PRs by design, so this
+        cannot impede one.
+
+    Fail directions, each chosen rather than inherited:
+      * body UNREADABLE → BLOCK. This gate guards EVERY merge, so an unreadable
+        body is an unanswered question, not a pass. (The pin gate fails open on
+        the same read because it guards only the rare pin-bump path — the
+        divergence is deliberate, not an oversight.)
+      * createdAt UNREADABLE → BLOCK, naming the cause. Treating it as "old"
+        would turn the transition window into a permanent hole.
+      * parser module MISSING → the body is still scanned for a bare ``E2E:``
+        line and a NOTE says the comment/fence stripping was unavailable. Losing
+        the invisibility defence must not lose the whole gate.
+
+    NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
+    escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
+    """
+    # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
+    # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
+    # module was missing — a false block, on a gate with no override, against the one
+    # population the exemption exists to protect. Degraded mode compares the mirror
+    # constant lexicographically: both values are ISO-8601 UTC of the same shape, so
+    # that ordering is exact without a parser.
+    mod = _load_e2e_declaration()
+    created_at = _pr_created_at(pr_num, repo=repo)
+    if created_at is None:
+        if mod is None:
+            # Neither the parser NOR the timestamp: nothing can be established, and
+            # the presence scan below still runs. Fail toward asking for a line.
+            print(
+                f"NOTE: PR #{pr_num} — createdAt unreadable AND the E2E parser could "
+                f"not load; the pre-convention exemption could not be checked.",
+                file=sys.stderr,
+            )
+        else:
+            return True, (
+                f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
+                f"pre-convention exemption cannot be established. Re-run; if it "
+                f"persists, the gh read is failing."
+            )
+    else:
+        if mod is not None:
+            exempt = mod.is_pre_cutoff(created_at)
+        else:
+            exempt = created_at.strip() < _E2E_CUTOFF_FALLBACK
+        if exempt:
+            return False, f"n/a (PR created {created_at}, before the convention)"
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return True, (
+            f"E2E obligation: PR #{pr_num}'s body is unreadable, so the declaration "
+            f"cannot be confirmed. This gate guards every merge — an unread body is "
+            f"an unanswered question, not a pass."
+        )
+
+    if mod is None:
+        # Degraded: no comment/fence stripping. A hand-written second matcher here
+        # DIVERGED from the parser in BOTH directions (architect SHOULD-FIX,
+        # 2026-09-06, measured): it accepted the shipped PR template's guidance line
+        # — which lives inside an HTML comment, so every straight-from-template PR
+        # would have passed — while REJECTING `- E2E: …`, `* E2E: …`, `> E2E: …` and
+        # checkbox forms, the exact markdown tolerance the real pattern exists for.
+        # Two matchers for one rule, selected by an exception handler, is the defect;
+        # this one is derived from the same shape and refuses any value carrying a
+        # `<…>` span, so no template line can satisfy it. (The narrower `(?!<)` this
+        # comment used to name was itself the bug — it guarded only the first
+        # character; see the pattern's own docstring.)
+        found = _E2E_FALLBACK_RE.search(body)
+        if found:
+            print(
+                f"NOTE: PR #{pr_num} — e2e_declaration.py could not be loaded; the "
+                f"E2E: line was matched WITHOUT comment/fence stripping, so a "
+                f"declaration hidden in an HTML comment would not be caught.",
+                file=sys.stderr,
+            )
+            return False, "ok (degraded: parser unavailable)"
+        return True, (
+            f"E2E obligation: no E2E: line found in PR #{pr_num}'s body (parser "
+            f"unavailable, presence-only scan)."
+        )
+
+    result = mod.parse_e2e(body)
+    kind = result.get("kind")
+    if kind in ("plan", "none"):
+        label = "plan" if kind == "plan" else "none"
+        print(
+            f"NOTE: PR #{pr_num} — E2E obligation declared ({label}): "
+            f"{result.get('text', '')[:200]}",
+            file=sys.stderr,
+        )
+        return False, f"ok ({label})"
+
+    detail = result.get("detail") or "no E2E: line in the PR body"
+    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{mod.GUIDANCE}"
+
+
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
     """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
 
@@ -6377,14 +6669,36 @@ def main() -> int:
                     )
                     print(receipts_msg, file=sys.stderr)
                     return 2
-                elif receipts_msg.startswith("NOTE:"):
+                if receipts_msg.startswith("NOTE:"):
                     # A NOTE means the gate did NOT verify the receipts and is allowing the
                     # merge anyway. That is the fail-open direction, so it has to be VISIBLE
                     # at the moment of merging — every other fail-open gate on this path
                     # prints its note, and this one silently discarded seven of them, which
                     # made "the residue is narrow and named" false at the only surface a
                     # human reads.
+                    #
+                    # A plain `if`, NOT an `elif`: this NOTE belongs to the PIN gate
+                    # above. When the E2E block below was first inserted between the
+                    # two, this clause re-bound to IT, so a merge blocked for a missing
+                    # E2E line silently swallowed the pin gate's fail-open note —
+                    # reintroducing, in miniature, the exact suppression the paragraph
+                    # above records as measured (architect SHOULD-FIX, 2026-09-06).
                     print(receipts_msg, file=sys.stderr)
+
+                # E2E obligation (§8.12). Sits beside the pin gate because it is
+                # the same KIND of check — a merge-time read of the PR body, which
+                # stays mutable after any CI run — and because both are cheap
+                # reads that should fail before the expensive finding scans.
+                # Like the pin gate it carries NO override sigil: `E2E: none —
+                # <reason>` is the escape hatch, and it costs one honest sentence.
+                should_block, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — no post-merge E2E decision in the PR body.",
+                        file=sys.stderr,
+                    )
+                    print(e2e_msg, file=sys.stderr)
+                    return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6666,6 +6980,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     print(
         f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
     )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
+    failures += 1 if blocked else 0
+    # E2E obligation (§8.12), same tier and same reason as pin-receipts: a
+    # merge-time read of a mutable body, so CI could never be its authority.
+    blocked, msg = _check_e2e_plan(pr_num, repo=repo)
+    print(f"e2e-plan       : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
     if blocked:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")

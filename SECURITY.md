@@ -43,23 +43,33 @@ layer described below exists because Genesis takes seriously the question:
 
 ### Earned Autonomy as Security Model
 
-Genesis implements a graduated autonomy framework with seven levels (L0-L6).
-New installations start at L0 (no autonomous action). Higher levels are
-unlocked through demonstrated competence, verified by the system and approved
-by the operator.
+Genesis implements a graduated autonomy framework. The **shipped** ladder is
+four levels, `L1`-`L4` (`genesis.autonomy.types.AutonomyLevel`); the design
+document describes an eventual `L5`-`L7`, which is **not built**. Higher levels
+are unlocked through demonstrated competence, verified by the system and
+approved by the operator.
 
 Each autonomy level gates specific capabilities:
 
-- **L0-L1**: Observe and notify only. No autonomous actions.
-- **L2**: Execute pre-approved, reversible actions.
-- **L3**: Handle routine decisions within established patterns.
-- **L4+**: Broader autonomous operation, unlocked per-category with explicit
-  operator approval.
+- **L1**: Simple tool use — fully autonomous.
+- **L2**: Known-pattern tasks — mostly autonomous.
+- **L3**: Novel tasks — propose and execute with a checkpoint.
+- **L4**: Proactive outreach — threshold-gated and governed.
 
-Autonomy permissions are stored per-category (six categories) and can be
-revoked instantly. The operator always has final authority. See
+Autonomy permissions are stored per-category and can be revoked instantly.
+There are **four** categories (`genesis.autonomy.types.AutonomyCategory`):
+`direct_session`, `background_cognitive`, `sub_agent`, `outreach`. The operator
+always has final authority. See
 `docs/architecture/genesis-v3-autonomous-behavior-design.md` for the full
-framework.
+framework, and read it as design intent rather than as a description of what
+currently ships.
+
+**The autonomous-CLI approval gate is the hard boundary underneath all of it.**
+Every autonomous background Claude Code session must be rooted in an explicit
+operator approval: `manual_approval_required` (`autonomy/cli_policy.py`)
+defaults to `True`, and `AutonomousCliApprovalGate` refuses to dispatch without
+one. No autonomy level unlocks past it, and it is not a tunable — a fork that
+defaults it off has removed the guarantee the rest of this section describes.
 
 ### Container Isolation
 
@@ -78,9 +88,26 @@ Recommendations:
 Genesis exposes a local dashboard over HTTP (and, optionally, a remote-desktop
 / noVNC console). So it can be reached through a reverse proxy or a private
 overlay network, the bundled service unit binds the dashboard to all interfaces
-(`0.0.0.0`) by default rather than to loopback. The dashboard's `/api` and
-`/v1` surfaces are intentionally **not** gated by the optional dashboard
-password — that password protects the web UI, not the programmatic API.
+(`0.0.0.0`) by default rather than to loopback. When a dashboard password is
+set, **state-changing** `/api` requests are gated: `check_api_mutation_auth`
+(`dashboard/auth.py`) runs as an app-level `before_request` and requires either
+the internal bearer token or an authenticated same-origin cookie, with CSRF
+checked from `Sec-Fetch-Site`/`Origin`/`Referer` and failing closed. `/v1`
+enforces its own separate bearer.
+
+Read the limits of that gate carefully, because they decide whether network
+isolation is still load-bearing for you — it is:
+
+- It covers **mutations only**. `GET`/`HEAD`/`OPTIONS` stay open by design, so
+  health probes and dashboard polling keep working. Anything readable through
+  the API is readable by anyone who can reach the port.
+- It is **inert when no dashboard password is set**, which is the default.
+- It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
+  not a fixed list, so any route added there in future is exempt by default.
+  Today that prefix holds only login, logout and an auth-status probe, none of
+  which mutate a credential.
+- It can be disabled outright with `GENESIS_DASHBOARD_API_AUTH=off`.
+- The built-in web terminal and the noVNC console are **not** covered by it.
 
 This is safe **only under the assumed deployment model: the host is not
 publicly exposed.** The dashboard is meant to be reachable through one of:
@@ -100,9 +127,11 @@ gateway in front of them.
   restrict the dashboard port to your overlay's address range (Tailscale uses
   the `100.64.0.0/10` CGNAT range) with `nftables`/`ufw`, or change the service
   unit to bind a specific private interface instead of `0.0.0.0`.
-- Treat the dashboard API (`/api`, `/v1`), the built-in web terminal, and the
-  noVNC console as **unauthenticated administrative access**: anyone who can
-  reach the port can drive Genesis. Network isolation is the control.
+- Treat the built-in web terminal and the noVNC console as **unauthenticated
+  administrative access**: anyone who can reach those ports can drive Genesis.
+  For the dashboard API, assume the same for reads and for any install with no
+  dashboard password set. Network isolation remains the primary control; the
+  mutation gate above is a second layer, not a replacement for it.
 
 Security audits should verify this network restriction (firewall / overlay)
 rather than re-flagging the `0.0.0.0` bind, which is intentional for the
@@ -115,15 +144,33 @@ runtime. These hooks fire on every tool invocation, including autonomous
 sessions, and cannot be bypassed by the agent.
 
 Examples of enforced policies:
-- Blocking shell commands that match dangerous patterns (e.g., `rm -rf /`,
-  `os.killpg` with unvalidated PGID)
+- Blocking shell commands that match dangerous patterns (e.g. `rm -rf /`)
+- Blocking destructive git operations, pushes and merges that have not met the
+  repository's review gates, and writes to protected paths
 - Blocking web fetches to known-problematic URLs
-- Preventing `pip install -e` to worktree paths (prevents system-wide
-  redirection of imports)
+- Blocking editable installs pointed at a worktree, which would redirect
+  system-wide imports
 
-Hooks are configured in `.claude/settings.json` and enforced by
-`scripts/behavioral_linter.py`. They are the inner guardrail -- the last
-line of defense when autonomy permissions have already been granted.
+Hooks are configured in `.claude/settings.json`, and **which hook fires is
+decided by the tool matcher** -- they are not one program:
+
+- `Bash` is matched by a family of dedicated guards under `scripts/hooks/`
+  (`destructive_command_guard.py`, `git_discard_guard.py`,
+  `protected_paths_guard.py`, `git_push_guard.py`, `worktree_cwd_guard.py`,
+  and others) plus a small inline matcher.
+- `WebFetch`/`WebSearch` is matched by `scripts/hooks/web_tools_gate.py`.
+- `Write`/`Edit` is matched by `scripts/behavioral_linter.py`, which lints file
+  **content** against `config/behavioral_rules/*.yaml`. It never sees a shell
+  command or a URL.
+
+They are the inner guardrail -- the last line of defense when autonomy
+permissions have already been granted.
+
+Not every safety mechanism is a hook, and the distinction is a real difference
+in guarantee. Process-group kill validation, for example, lives in
+`genesis.util.proc_kill` and hardens **Genesis's own** subprocess management at
+runtime; no hook inspects agent-authored code for it. A hook cannot be bypassed
+by the agent; a runtime helper only protects the call sites that use it.
 
 ### Secrets Management
 
@@ -157,6 +204,69 @@ The guard:
 - Blocks collection-level delete operations unless explicitly overridden.
 - Ensures test fixtures use isolated collections that do not collide with
   production data.
+
+### Untrusted Content & Write-Path Isolation
+
+Genesis ingests content it did not author -- fetched pages, mail, documents,
+third-party messages. The risk is not that this content is stored; it is that
+stored content is later *auto-consumed* into privileged state, where it becomes
+instruction rather than data.
+
+**Provenance stamping.** Every stored memory and observation carries an
+`origin_class` -- `owner`, `first_party`, or an external/untrusted class.
+
+**Two privileged-write paths are gated on it**, fail-closed on `NULL` or an
+unrecognised value (`genesis.security.immunity.is_trusted_for_privileged_write`):
+
+- the user model, which will only fold in deltas from trusted origins
+  (`memory/user_model.py`), and
+- the autonomy dispatcher, which will not pick up a `task_detected` observation
+  from an untrusted origin (`autonomy/dispatcher.py`).
+
+**Scope this claim precisely: those two paths are gated, not "all untrusted
+content is isolated."** External-origin content can still reach a model's
+context through ordinary recall and summarisation surfaces. What the gate
+prevents is untrusted content *auto-promoting itself* into the user model or
+into an autonomous dispatch without an operator in the loop.
+
+**Irreversible memory operations require approval.** Entity merges delete
+mentions and links and cannot be un-merged, so they are no longer applied on
+staleness alone: the applier consumes only approved proposals
+(`memory/entity_adjudication.py`), and a pre-delete snapshot is journaled so an
+applied merge can be reconstructed.
+
+**Session identifiers are validated before use as path components.** Session ids
+arrive from outside the process and several hooks interpolate them into
+filesystem paths. A shared validator (`is_safe_session_id` in
+`scripts/hooks/hook_input.py`) rejects traversal shapes, separators, null bytes,
+the empty string, and over-long values. It exists because hooks had each
+hand-rolled their own check and disagreed about what was unsafe; adoption is
+widespread but not yet complete, so a hook that has not moved over still carries
+a narrower check of its own.
+
+### External Egress
+
+Delivery **to the operator** -- Telegram, voice, mail addressed to you -- is
+never gated. You are the recipient; gating it would only obstruct you.
+
+Autonomous egress to the **outside world** is a different matter, and the honest
+current state is mixed:
+
+- **Enforcing:** mail sending passes a real gate that can hold a send
+  (`autonomy/email_gate.py`).
+- **Observe-only:** the capability gate at the Discord and GitHub-issue doors
+  (`autonomy/shadow_gate.py`) records what it *would* decide and does **not**
+  hold anything. Its own contract says so. Treat it as instrumentation ahead of
+  an enforcement stage, not as a control that is protecting you today.
+- **Build-time backstop:** `scripts/check_external_io.py` runs in CI and fails
+  the build when a new hardcoded external endpoint appears outside an allowlist.
+  It reasons about literal endpoints in source, so it cannot see egress routed
+  through a browser session or a third-party integration layer.
+
+If you are deciding whether to trust this system with an outbound channel, the
+first two bullets are the ones that matter: one channel enforces, the rest are
+watched.
+
 
 ### Dependency Security
 
