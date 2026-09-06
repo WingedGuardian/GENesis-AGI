@@ -55,7 +55,9 @@ SACRED_GROUND_MB=150
 # pages for the code-intel indexer dying at its own 2G cap, attributed to "the
 # container" and blamed on CC sessions, while `free` showed 17.8 GB available).
 # Space-separated unit-name prefixes; override in watchgod.conf or the env.
-OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel-}"
+# cbm-mcp- = the codebase-memory MCP wrapper (.claude/mcp/run-codebase-memory),
+# capped and NAMED for exactly this classification (issue #1792).
+OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp-}"
 
 # ── Load config ──────────────────────────────────────────────
 load_config() {

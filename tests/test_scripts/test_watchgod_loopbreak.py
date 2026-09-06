@@ -419,3 +419,25 @@ def test_oom_journal_query_uses_the_cursor_after_the_first_read(tmp_path):
     assert len(lines) == 2, lines
     assert " seconds" in lines[0] and "@" not in lines[0], lines[0]  # fallback window
     assert "@" in lines[1], lines[1]  # cursor used
+
+
+def test_oom_cbm_wrapper_kill_is_contained_by_default(tmp_path):
+    # Issue #1792: the codebase-memory MCP wrapper names its capped scope
+    # cbm-mcp-<pid> precisely so this classification can exist. Both default
+    # prefixes must classify — a second entry that silently broke the first
+    # (or vice versa) would reopen the false pages.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {
+            "OOM_EVENTS_FILE": str(oom),
+            "STUB_JOURNAL": "cbm-mcp-4107466.scope: Failed with result 'oom-kill'.",
+        },
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert not (home / ".genesis" / "alerts" / "calls.log").exists()
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "contained in [cbm-mcp-4107466.scope]" in wg_log, wg_log
