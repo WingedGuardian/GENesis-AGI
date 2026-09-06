@@ -1,0 +1,115 @@
+# Behavioral Rule: no direct provider API calls outside the routing layer
+#
+# Origin: 2026-09-06 — a session wrote an ad-hoc script that read
+# API_KEY_OPENROUTER out of secrets.env and POSTed straight to a provider's
+# chat/completions endpoint. No call site, so: no cost attribution, no budget
+# check, no circuit breaker, no rate gate, no provider-health accounting. The
+# spend was ~4x the system's entire recorded spend for that window and appears
+# in cost_events nowhere.
+#
+# The principle it violates is already in CLAUDE.md: "Cognitive architecture is
+# not a service" — Genesis's LLM call sites and routing chains serve its OWN
+# cognitive processes. secrets.env holds the credentials for that architecture,
+# not a general-purpose key drawer.
+#
+# PRECISION, measured before writing this rule (2026-09-06):
+#   - 60 files under src/ read API_KEY_* — matching on the credential alone
+#     would be a false-positive disaster, so this rule does NOT do that.
+#   - 9 files contain a direct provider host. ALL are the sanctioned provider /
+#     routing / health layer, and all are excluded by path below.
+# So the rule fires on a provider endpoint appearing OUTSIDE that layer, which
+# is the shape that has no legitimate instance.
+#
+# behavioral-lint: ignore no-raw-provider-calls
+# ^ This rule-definition file necessarily contains the literals it matches.
+#   (Structurally redundant — the linter skips config/behavioral_rules/ — but
+#   the token is the convention's audit trail, per no_unguarded_kill.yaml.)
+
+name: no-raw-provider-calls
+severity: block
+
+# Also check Bash COMMAND text, not just file writes (opt-in; see
+# scripts/behavioral_linter.py). A Write|Edit-only rule is trivially sidestepped
+# by `cat > x.py <<EOF` or `python3 -c "..."` — and that is not a hypothetical:
+# the origin incident's script never passed through Write at all.
+#
+# MEASURED before enabling (2026-09-06), so the flag carries its own evidence:
+#   corpus  5,526 real Bash commands, 60 most-recent CC transcripts on this install
+#   fired   12/5,526 = 0.217%
+#   triage  8 genuine ad-hoc provider calls that sourced secrets.env and POSTed
+#           straight to a provider (Mistral x3, OpenRouter x2, DeepInfra x4),
+#           spread across THREE different sessions — so the shape recurs and is
+#           not a single incident; 4 were this rule's own test harness, which the
+#           escape-hatch comment covers.
+# That is a fire rate made almost entirely of true positives, not a
+# false-positive rate. Re-derive by replaying the corpus against `patterns`.
+check_bash: true
+
+# Deny-list, not an allow-list: an allow-list on "*.py" silently misses the
+# extensionless script, the notebook and the heredoc — which is exactly the
+# shape the origin incident took (a file in /home/ubuntu/tmp/).
+excludes:
+  # Docs may quote an endpoint while discussing it.
+  - "*.md"
+  - "*.rst"
+  - "*.txt"
+  # The sanctioned layer — these files ARE the routing/provider implementation,
+  # so the endpoint is the legitimate content, not a bypass of it.
+  - "*/genesis/routing/*"
+  - "*/genesis/providers/*"
+  - "*/genesis/deliberation/backends/*"
+  - "*/genesis/observability/provider_health.py"
+  - "*/genesis/observability/snapshots/api_keys.py"
+  - "*/genesis/memory/embeddings.py"
+  - "*/genesis/channels/stt.py"
+  - "*/genesis/eval/longmemeval/*"
+  - "*/genesis/recon/model_intelligence.py"
+  - "*/genesis/cc/invoker.py"
+  # Config that legitimately declares provider base_urls.
+  - "*/config/*.yaml"
+  # Tests carry endpoint strings as FIXTURES and do not send them. Blocking an
+  # edit here obstructs real work; committed source is separately covered by
+  # CI (scripts/check_external_io.py), which is the layer that sees new endpoints.
+  - "tests/*"
+  - "*/tests/*"
+
+description: >
+  Never call an LLM provider's API directly from outside the routing layer.
+  Genesis's provider credentials belong to its cognitive architecture, and a
+  direct call bypasses every control attached to a call site: cost attribution,
+  the budget cap, circuit breakers, the rate gate, and provider-health tracking.
+  Spend made this way is invisible to Genesis's own accounting.
+
+suggestion: >
+  Route it through a Genesis call site so it is budgeted and tracked, or use an
+  approved out-of-band tool that does not spend Genesis credentials. If you
+  believe an ad-hoc provider call is genuinely required, STOP and ask the user
+  first — naming the SERVICE, not just the model, because a rule that names a
+  service is only cleared by permission that names it.
+
+patterns:
+  - regex: 'openrouter\.ai/api/v\d+/(chat/)?(completions|embeddings)'
+    context: "direct OpenRouter completion/embedding call — must go through a routing call site"
+  - regex: 'api\.mistral\.ai/v\d+/(chat/)?(completions|embeddings)'
+    context: "direct Mistral completion/embedding call — must go through a routing call site"
+  - regex: 'api\.groq\.com/\S*/(chat/)?completions'
+    context: "direct Groq completion call — must go through a routing call site"
+  - regex: 'api\.deepinfra\.com/v\d+/(openai/)?(chat/)?(completions|embeddings)'
+    context: "direct DeepInfra completion/embedding call — must go through a routing call site"
+  # Both Gemini and NVIDIA below require an API PATH, not a bare host. They were
+  # host-only at first, which is the one shape that cannot distinguish CALLING an
+  # endpoint from SEARCHING for one: `rg -n 'generativelanguage.googleapis.com'
+  # src/` and `grep -rn integrate.api.nvidia.com config/` both exited 2 against a
+  # severity=block rule. That lands hardest on exactly the audit/review sessions
+  # that need to grep for provider usage, and the 5,526-command corpus below did
+  # not contain that class — so its 0.217% understates the cost for those.
+  - regex: 'generativelanguage\.googleapis\.com/v\d+\S*:(streamGenerateContent|generateContent|embedContent)'
+    context: "direct Gemini API call — must go through a routing call site"
+  - regex: 'api\.anthropic\.com/v1/(messages|complete)'
+    context: "direct Anthropic API call — must go through a routing call site"
+  - regex: 'api\.openai\.com/v1/(chat/)?completions'
+    context: "direct OpenAI API call — must go through a routing call site"
+  - regex: 'api\.x\.ai/v1'
+    context: "direct xAI API call — must go through a routing call site"
+  - regex: 'integrate\.api\.nvidia\.com/v\d+/(chat/)?(completions|embeddings)'
+    context: "direct NVIDIA NIM API call — must go through a routing call site"
