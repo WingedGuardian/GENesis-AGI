@@ -122,6 +122,10 @@ _IDLE_TIMEOUT_S = 3600  # 1 hour
 
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
+#: Pointer readback tolerance. VNC positioning is not exact to the pixel, so a
+#: small delta is normal; a large one is the signature of a coordinate-space
+#: mismatch rather than jitter.
+_POINTER_DRIFT_TOLERANCE_PX = 3
 _VNC_PASSWORD = os.environ.get("GENESIS_VNC_PASSWORD", "genesis")
 # vncdotool server format: display-number notation (display 99 = port 5999).
 # "localhost::5999" causes Connection Lost due to IPv6 resolution.
@@ -1504,6 +1508,41 @@ async def _solve_with_playwright_captcha(page) -> bool:
         return False
 
 
+def vnc_click_target(
+    *,
+    win_x: int,
+    win_y: int,
+    page_left: float,
+    page_top: float,
+    chrome_h: int,
+    dpr: float,
+) -> tuple[int, int]:
+    """Map a CSS-pixel page coordinate to a PHYSICAL screen coordinate.
+
+    Two different spaces meet here, and mixing them is silent:
+
+    * ``win_x``/``win_y`` come from ``xdotool getwindowgeometry`` — PHYSICAL
+      screen pixels, the space VNC input is delivered in.
+    * ``page_left``/``page_top`` come from ``getBoundingClientRect()``, and
+      ``chrome_h`` from ``outerHeight - innerHeight`` — both CSS pixels.
+
+    Those are the same number only when ``devicePixelRatio == 1``. Anywhere
+    else the click lands short of the target by the scale factor, with no
+    error — at dpr 1.25 a control 800 CSS-px down the page is clicked 200
+    physical pixels high.
+
+    This is pure so the scaled cases can be tested: the display this runs on
+    is dpr 1.0, so the bug is dormant here and CANNOT be exercised end to end.
+    Note the caller already spoofs window metrics for anti-detection, and
+    ``devicePixelRatio`` is itself a common fingerprinting vector, so a dpr
+    other than 1.0 is not hypothetical.
+    """
+    scale = dpr if dpr and dpr > 0 else 1.0
+    click_x = win_x + int(page_left * scale)
+    click_y = win_y + int((chrome_h + page_top) * scale)
+    return click_x, click_y
+
+
 async def _vnc_click_turnstile(page) -> bool:
     """Click the Turnstile checkbox via VNC trusted input (fallback).
 
@@ -1603,10 +1642,14 @@ async def _vnc_click_turnstile(page) -> bool:
                 chrome_h = 34
         except Exception:
             chrome_h = 34
+            dpr = 1.0
             _ts_log.info("VNC: chrome_h measurement failed, using default 34")
 
-        click_x = win_x + int(page_coords["left"])
-        click_y = win_y + chrome_h + int(page_coords["top"])
+        click_x, click_y = vnc_click_target(
+            win_x=win_x, win_y=win_y,
+            page_left=page_coords["left"], page_top=page_coords["top"],
+            chrome_h=chrome_h, dpr=dpr,
+        )
 
         _ts_log.info(
             "VNC TARGETING: (%d, %d) matched='%s' "
@@ -1650,6 +1693,56 @@ async def _vnc_click_turnstile(page) -> bool:
             return False
 
         await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        # WHERE DID THE POINTER ACTUALLY GO? Read it back before clicking.
+        #
+        # Everything above is a COMPUTATION. It can be wrong for reasons the
+        # computation cannot see: a coordinate-space mismatch, a window that
+        # moved between measuring and acting, a VNC move that reported success
+        # and did nothing. Logging only the intended coordinate records what we
+        # meant, never what happened — and a click on the wrong thing is
+        # exactly the failure that needs a forensic trail afterwards.
+        #
+        # Best-effort: a readback failure must not block the click, but it IS
+        # reported rather than swallowed, so "unknown" never reads as "fine".
+        actual_x = actual_y = None
+        try:
+            probe = await asyncio.create_subprocess_exec(
+                "xdotool", "getmouselocation", "--shell",
+                env={**os.environ, "DISPLAY": _VNC_DISPLAY},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            probe_out, _ = await asyncio.wait_for(probe.communicate(), timeout=5)
+            probe_vals = dict(
+                line.split("=", 1)
+                for line in probe_out.decode().splitlines()
+                if "=" in line
+            )
+            actual_x = int(probe_vals["X"])
+            actual_y = int(probe_vals["Y"])
+        except (TimeoutError, KeyError, ValueError, OSError) as exc:
+            _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+
+        if actual_x is None:
+            _ts_log.info(
+                "VNC LANDED: unknown — pointer readback failed; "
+                "intended=(%d,%d)", click_x, click_y,
+            )
+        else:
+            drift = abs(actual_x - click_x) + abs(actual_y - click_y)
+            _ts_log.info(
+                "VNC LANDED: (%d,%d) intended=(%d,%d) drift=%d dpr=%.2f",
+                actual_x, actual_y, click_x, click_y, drift, dpr,
+            )
+            if drift > _POINTER_DRIFT_TOLERANCE_PX:
+                # Loud, because this is the signature of a coordinate-space
+                # bug and it would otherwise look like an ordinary miss.
+                logger.warning(
+                    "VNC pointer drift %dpx: intended=(%d,%d) actual=(%d,%d) "
+                    "dpr=%.2f — clicking anyway, but the target may be wrong",
+                    drift, click_x, click_y, actual_x, actual_y, dpr,
+                )
 
         # VNC click at current position
         click_proc = await asyncio.create_subprocess_exec(
