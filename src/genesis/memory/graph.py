@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.memory.graphstore import (
@@ -168,7 +169,15 @@ async def _traverse_cte(
     max_depth: int,
     min_strength: float,
 ) -> list[GraphNode]:
-    """Original recursive CTE traversal (fallback)."""
+    """Original recursive CTE traversal (fallback).
+
+    Carries the SAME visibility predicate as the graph stores — a degraded path
+    that showed the model memories the primary path hides would be worse than
+    the degradation itself. Expressed in SQL here (rather than reusing
+    ``invalid_memory_ids``) because the traversal is recursive; the cost is
+    bounded by the edges actually walked, not the whole table.
+    """
+    now = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         """
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
@@ -177,6 +186,21 @@ async def _traverse_cte(
             FROM memory_links
             WHERE source_id = ?
               AND strength >= ?
+              -- The ROOT is filtered too. The NX loader drops an edge when
+              -- EITHER endpoint is hidden, so a hidden memory has no edges at
+              -- all there; filtering only the target here would let the CTE
+              -- traverse FROM a hidden root and return a subtree the primary
+              -- path returns nothing for. MEASURED: 2,827 live memories are
+              -- hidden AND have out-edges, and the two forms otherwise
+              -- classify 6,503 edges (2.5% of the graph) differently.
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                              WHERE m.memory_id = memory_links.source_id
+                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
+                                  OR m.deprecated != 0))
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                              WHERE m.memory_id = memory_links.target_id
+                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
+                                  OR m.deprecated != 0))
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
                    c.path || ',' || ml.target_id
@@ -185,12 +209,16 @@ async def _traverse_cte(
             WHERE c.depth < ?
               AND ml.strength >= ?
               AND c.path NOT LIKE '%' || ml.target_id || '%'
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                              WHERE m.memory_id = ml.target_id
+                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
+                                  OR m.deprecated != 0))
         )
         SELECT DISTINCT target_id, link_type, depth, strength
         FROM connected
         ORDER BY depth, strength DESC
         """,
-        (root_id, min_strength, max_depth, min_strength),
+        (root_id, min_strength, now, now, max_depth, min_strength, now),
     )
     rows = await cursor.fetchall()
     return [

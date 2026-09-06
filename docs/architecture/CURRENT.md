@@ -226,6 +226,27 @@ projection that is missing a mid-load commit (MEASURED 2026-09-06). Prepared for
 the graph-DB adoption (issue #1641), where a server-backed engine becomes
 another `GraphStore` with no reader touched.
 
+Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
+`memory_links` writers, while the visibility predicate below reads
+`memory_metadata`. Deprecation is covered incidentally (its writers rewire
+links); TIME-DRIVEN expiry is not — a future `invalid_at` arrives with no write
+event, so a quiet process serves the memory until an unrelated rebuild
+(measured exposure: 114 memories, 4 with edges).
+
+**Traversal is visibility-filtered (2026-09-06)** — every graph backend, and the
+recursive-CTE fallback, apply the SAME predicate normal recall applies:
+bitemporally-expired (`invalid_at <= now`) or `deprecated != 0` memories are
+absent from the graph, root and neighbours alike. Previously `traverse()`
+applied neither, and its consumer (`mcp/memory/core.py`) emits raw memory_ids
+into `graph_neighbors` with no hydration — so the model was shown, as live
+context, memories `search_ranked` and `graph_expansion` deliberately hide.
+MEASURED on the live graph: 11.3% of edges, 23.8% of top-5 slices, and 6.5% of
+roots whose neighbours were ENTIRELY hidden memories. The predicate deliberately
+ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
+rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
+the graph `centrality_scores` runs on, hence the shield's bridge-node
+population.
+
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
 (`memory_links.copy_external_links`) so they don't dangle on the soft-deleted

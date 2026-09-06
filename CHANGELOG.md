@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Graph-enriched recall no longer surfaces memories that recall itself
+  hides.** When a memory was returned, Genesis also showed its graph
+  neighbours — but that traversal never applied the visibility filter the rest
+  of recall uses, so consolidated-away and expired memories were presented as
+  live context. They are now filtered out of the graph entirely. On this
+  install that changed the neighbour list for roughly a quarter of enriched
+  results, and 6.5% of them turned out to have had neighbours that were
+  *entirely* hidden memories.
+
 - **The session charter now lists every open ledger item, not just the oldest
   six.** The ledger is a curated list of one-line to-dos, and the old window
   meant a session with more than six open items never saw a newly added one in

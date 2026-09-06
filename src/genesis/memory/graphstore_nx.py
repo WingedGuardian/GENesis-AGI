@@ -27,7 +27,11 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING
 
-from genesis.memory.graphstore import GraphNode, GraphUnavailableError
+from genesis.memory.graphstore import (
+    GraphNode,
+    GraphUnavailableError,
+    invalid_memory_ids,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     import aiosqlite
@@ -235,10 +239,35 @@ class NetworkxGraphStore:
         # commit costs exactly one rebuild on the next read, and that rebuild is
         # CORRECT, not spurious.
         pre_load_version = await self._data_version(db)
+        # Visibility parity with normal recall: drop edges whose endpoints
+        # recall itself hides. Two queries + a set membership test rather than
+        # one SQL pass with NOT EXISTS — both were measured to produce the
+        # IDENTICAL set on the live graph (234,323 of 264,191 rows), but the
+        # SQL form costs +2.8s per cold build (a correlated subquery per edge)
+        # against +99ms for this one, and the staleness token makes rebuilds
+        # MORE frequent, not less.
+        # Two freshness caveats, both stated because the cache's staleness
+        # signal does not cover them:
+        #  - Every invalidate_graph_cache() site is a memory_links writer, but
+        #    this predicate reads memory_metadata. Deprecation is covered
+        #    incidentally (its writers rewire links); TIME-DRIVEN expiry is not
+        #    — an `invalid_at` in the future arrives with no write event at all,
+        #    so a quiet process keeps serving the memory until some unrelated
+        #    rebuild. MEASURED exposure: 114 memories carry a future invalid_at,
+        #    4 of them have any edge.
+        #  - These are two autocommit statements, hence two WAL read snapshots;
+        #    an edge committed between them is filtered against an invalid-set
+        #    read just before it. Self-healing — pre_load_version is stamped
+        #    ahead of BOTH, so the next read rebuilds.
+        invalid = await invalid_memory_ids(db)
         cursor = await db.execute(
             "SELECT source_id, target_id, link_type, strength FROM memory_links"
         )
-        rows = await cursor.fetchall()
+        rows = [
+            row
+            for row in await cursor.fetchall()
+            if row[0] not in invalid and row[1] not in invalid
+        ]
 
         # MultiDiGraph, not DiGraph: memory_links' primary key is
         # (source_id, target_id, link_type), so one pair may legitimately carry

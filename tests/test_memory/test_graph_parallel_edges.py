@@ -59,6 +59,12 @@ async def _make_db(links):
     db = await aiosqlite.connect(":memory:")
     db.row_factory = aiosqlite.Row
     await db.execute(_SCHEMA)
+    # The loader applies recall's visibility predicate; empty here, so the
+    # parallel-edge expectations below are unaffected.
+    await db.execute(
+        "CREATE TABLE memory_metadata ("
+        " memory_id TEXT PRIMARY KEY, invalid_at TEXT, deprecated INTEGER)"
+    )
     for src, tgt, link_type, strength in links:
         await db.execute(
             "INSERT INTO memory_links VALUES (?, ?, ?, ?, '2026-09-02')",

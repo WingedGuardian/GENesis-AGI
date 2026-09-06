@@ -36,6 +36,10 @@ async def _seed(path, links):
     db = await aiosqlite.connect(str(path))
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute(_SCHEMA)
+    await db.execute(
+        "CREATE TABLE memory_metadata ("
+        " memory_id TEXT PRIMARY KEY, invalid_at TEXT, deprecated INTEGER)"
+    )
     for src, tgt in links:
         await db.execute(
             "INSERT INTO memory_links VALUES (?, ?, 'supports', 0.9, '2026-09-06')",
@@ -210,5 +214,189 @@ async def test_a_commit_inside_the_load_window_is_not_lost(tmp_path, monkeypatch
             "a commit inside the load window was lost permanently — the token "
             "was stamped from a newer snapshot than the rows"
         )
+    finally:
+        await db.close()
+
+
+# ── visibility parity with normal recall ────────────────────────────────────
+
+
+async def _seed_with_metadata(path, links, meta):
+    """links: [(src, tgt)]; meta: {memory_id: (invalid_at, deprecated)}."""
+    db = await aiosqlite.connect(str(path))
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(_SCHEMA)
+    await db.execute(
+        """CREATE TABLE memory_metadata (
+               memory_id  TEXT PRIMARY KEY,
+               invalid_at TEXT,
+               deprecated INTEGER
+           )"""
+    )
+    for src, tgt in links:
+        await db.execute(
+            "INSERT INTO memory_links VALUES (?, ?, 'supports', 0.9, '2026-09-06')",
+            (src, tgt),
+        )
+    for mid, (invalid_at, deprecated) in meta.items():
+        await db.execute(
+            "INSERT INTO memory_metadata VALUES (?, ?, ?)", (mid, invalid_at, deprecated)
+        )
+    await db.commit()
+    await db.close()
+
+
+async def test_traverse_hides_what_recall_hides(tmp_path):
+    """THE PARITY LOCK — the assertion that did not exist before this change.
+
+    search_ranked hides bitemporally-expired and deprecated memories, and
+    graph_expansion repeats that filter citing "visibility parity with normal
+    recall". traverse did NEITHER, and its consumer (mcp/memory/core.py) emits
+    raw memory_ids into `graph_neighbors` with no hydration and no filter — so
+    the model was shown, as live context, memories recall itself deliberately
+    suppresses. MEASURED on the live graph before the fix: 11.3% of edges and
+    23.8% of top-5 slices involved such a memory.
+    """
+    path = tmp_path / "g.db"
+    await _seed_with_metadata(
+        path,
+        [("A", "live"), ("A", "expired"), ("A", "deprecated"), ("A", "unstamped")],
+        {
+            "live": (None, 0),
+            "expired": ("2020-01-01T00:00:00+00:00", 0),  # invalid_at in the past
+            "deprecated": (None, 1),
+            # 'unstamped' deliberately has NO metadata row — the dangling-link
+            # class, which this predicate leaves alone by design.
+        },
+    )
+    store = NetworkxGraphStore()
+    db = await aiosqlite.connect(str(path))
+    try:
+        reached = {
+            n.memory_id
+            for n in await store.traverse(db, "A", max_depth=1, min_strength=0.0)
+        }
+        assert "live" in reached
+        assert "expired" not in reached, "a bitemporally-expired memory reached the model"
+        assert "deprecated" not in reached, "a deprecated memory reached the model"
+        assert "unstamped" in reached, (
+            "a memory with no metadata row was dropped — that is the dangling-link "
+            "class, not this predicate's business"
+        )
+    finally:
+        await db.close()
+
+
+async def test_a_future_invalid_at_is_still_visible(tmp_path):
+    """CONTROL — the predicate is 'expired', not 'has an invalid_at'. A memory
+    whose validity window has not closed yet must still be reachable, or the
+    filter is simply deleting every bitemporal row."""
+    path = tmp_path / "g.db"
+    await _seed_with_metadata(
+        path,
+        [("A", "future"), ("A", "past")],
+        {
+            "future": ("2099-01-01T00:00:00+00:00", 0),
+            "past": ("2020-01-01T00:00:00+00:00", 0),
+        },
+    )
+    store = NetworkxGraphStore()
+    db = await aiosqlite.connect(str(path))
+    try:
+        reached = {
+            n.memory_id
+            for n in await store.traverse(db, "A", max_depth=1, min_strength=0.0)
+        }
+        assert reached == {"future"}, f"expected only the still-valid memory, got {reached}"
+    finally:
+        await db.close()
+
+
+async def test_the_cte_fallback_applies_the_same_predicate(tmp_path):
+    """The degraded path must not show what the primary path hides.
+
+    Drives the facade with NetworkX forced absent, so traverse routes to the
+    recursive CTE — the only path a NetworkX-less install ever takes.
+    """
+    from unittest.mock import patch
+
+    from genesis.memory import graph as graph_mod
+    from genesis.memory import graphstore_nx
+
+    path = tmp_path / "g.db"
+    await _seed_with_metadata(
+        path,
+        [("A", "live"), ("A", "expired"), ("A", "deprecated")],
+        {
+            "live": (None, 0),
+            "expired": ("2020-01-01T00:00:00+00:00", 0),
+            "deprecated": (None, 1),
+        },
+    )
+    db = await aiosqlite.connect(str(path))
+    try:
+        with patch.object(graphstore_nx, "_NX_AVAILABLE", False):
+            result = await graph_mod.traverse(db, "A", max_depth=1, min_strength=0.0)
+        reached = {n.memory_id for n in result.nodes}
+        assert reached == {"live"}, (
+            f"the CTE fallback disagreed with the primary path: {reached}"
+        )
+    finally:
+        await db.close()
+
+
+async def test_both_paths_refuse_to_traverse_from_a_hidden_root(tmp_path):
+    """The root is filtered too, on BOTH paths.
+
+    The NX loader drops an edge when EITHER endpoint is hidden, so a hidden
+    memory has no edges and traversing from it yields nothing. The CTE anchor
+    (`WHERE source_id = ?`) had no such check, so it returned the whole subtree
+    — the two paths disagreeing on identical input, which contradicts the
+    seam's own "which store answers can never change WHICH memories the model
+    is shown" invariant. Reachable: memory_expand's root is caller-supplied,
+    and 2,827 live memories are hidden AND have out-edges.
+    """
+    from unittest.mock import patch
+
+    from genesis.memory import graph as graph_mod
+    from genesis.memory import graphstore_nx
+
+    path = tmp_path / "g.db"
+    await _seed_with_metadata(
+        path,
+        [("hidden_root", "child"), ("live_root", "child")],
+        {
+            "hidden_root": (None, 1),  # deprecated
+            "live_root": (None, 0),
+            "child": (None, 0),
+        },
+    )
+    db = await aiosqlite.connect(str(path))
+    try:
+        nx_from_hidden = await NetworkxGraphStore().traverse(
+            db, "hidden_root", max_depth=1, min_strength=0.0
+        )
+        assert nx_from_hidden == [], "NX store traversed from a hidden root"
+
+        with patch.object(graphstore_nx, "_NX_AVAILABLE", False):
+            cte_from_hidden = await graph_mod.traverse(
+                db, "hidden_root", max_depth=1, min_strength=0.0
+            )
+        assert cte_from_hidden.nodes == [], (
+            "the CTE traversed FROM a hidden root where the NX store returned "
+            "nothing — the two paths disagree on identical input"
+        )
+
+        # CONTROL: a live root still reaches its child on both paths, so the
+        # assertions above are not passing because everything returns empty.
+        nx_live = await NetworkxGraphStore().traverse(
+            db, "live_root", max_depth=1, min_strength=0.0
+        )
+        with patch.object(graphstore_nx, "_NX_AVAILABLE", False):
+            cte_live = await graph_mod.traverse(
+                db, "live_root", max_depth=1, min_strength=0.0
+            )
+        assert {n.memory_id for n in nx_live} == {"child"}
+        assert {n.memory_id for n in cte_live.nodes} == {"child"}
     finally:
         await db.close()
