@@ -834,118 +834,103 @@ class TestDeadProviderNotification:
         )
 
 
-class TestTripWindowReanchor:
-    """A stale in-memory incident must not lend its anchor to a new one.
+class TestSilenceIsNotRecovery:
+    """A gap in trips is OBSERVED, never acted on.
 
-    The state entry dies only on FULL recovery (trip_count reaching 0, which
-    a flapping provider never does with success_threshold=2), so without the
-    24h trip window `first_trip_at` could be weeks old when a fresh incident
-    escalates — writing an observation that claims a weeks-long outage.
+    This class replaces `TestTripWindowReanchor`, whose tests pinned the
+    opposite contract: a >24h gap zeroed `trip_count` and cleared the anchor.
+    That was the wrong diagnosis of a real symptom. MEASURED against it: a
+    provider failing once a week and never recovering sat at trip_count=1 for
+    8 consecutive weeks, so it could never reach `_TRIP_THRESHOLD` and the user
+    was never told it was dead (Codex P1, #1632).
+
+    Elapsed silence is not recovery evidence — the breaker can sit OPEN through
+    an idle stretch, and only `record_recovery` (which needs actual successful
+    calls) ends an incident. The symptom that motivated the reset was real but
+    lives in the REPORTING, and is pinned by `TestEvidenceWording` below.
     """
 
-    async def test_a_daylong_gap_starts_a_fresh_incident(self, empty_db, event_bus):
-        from datetime import timedelta
-
-        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
-        esc = ProviderEscalation(
-            db=empty_db, event_bus=event_bus, clock=lambda: t["now"],
-        )
-        await esc._on_event(_make_event("prov-gap"))
-        first_anchor = esc._state["prov-gap"]["first_trip_at"]
-        t["now"] += timedelta(hours=25)
-        await esc._on_event(_make_event("prov-gap"))
-        state = esc._state["prov-gap"]
-        assert state["trip_count"] == 1, "the stale count must not carry over"
-        assert state["first_trip_at"] == t["now"].isoformat()
-        assert state["first_trip_at"] != first_anchor
-
-
-    async def test_a_gap_retires_the_previous_incidents_durable_clock(
-        self, empty_db, event_bus
-    ):
-        """The boundary must close the DURABLE clock too, not just the window.
-
-        Resetting only the in-memory counters left the boundary half-drawn: the
-        prior incident's unresolved `provider_failure` row survives the gap,
-        `skip_if_duplicate` then suppresses the new incident's row, and
-        `notify_provider_if_due` measures the outage from the OLD row's
-        `created_at` — reporting a duration spanning the very gap the re-anchor
-        just declared meaningless.
-
-        Recovery resolves that row unconditionally, so a row surviving the gap
-        means recovery was never observed. Hence "superseded", not "recovered":
-        the note must not let an operator infer the provider came back.
-        """
-        from datetime import timedelta
-
-        from genesis.db.crud import observations
-
+    async def test_a_sparse_outage_still_reaches_the_threshold(self, empty_db, event_bus):
+        """The case the old reset made undetectable: dead, but low-traffic."""
         t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
         esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
-
-        # Incident 1: escalate to a durable row.
         for _ in range(_TRIP_THRESHOLD):
-            await esc._on_event(_make_event("prov-boundary"))
-        await asyncio.sleep(0)  # let the deferred create land
-        rows = await observations.unresolved_by_hash(
-            empty_db,
-            source="routing",
-            content_hash=ProviderEscalation._provider_content_hash("prov-boundary"),
-            limit=10,
-        )
-        assert len(rows) == 1, f"incident 1 should leave one unresolved row: {rows}"
-
-        # A gap wide enough to be a NEW incident.
-        t["now"] += timedelta(hours=25)
-        await esc._on_event(_make_event("prov-boundary"))
-        # The supersede resolves TWO rows, so one tick is not enough — poll the
-        # condition with a bounded deadline rather than sleeping a guessed span.
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            if not await observations.unresolved_by_hash(
-                empty_db,
-                source="routing",
-                content_hash=ProviderEscalation._provider_content_hash("prov-boundary"),
-                limit=10,
-            ):
-                break
-
-        still_open = await observations.unresolved_by_hash(
-            empty_db,
-            source="routing",
-            content_hash=ProviderEscalation._provider_content_hash("prov-boundary"),
-            limit=10,
-        )
-        assert still_open == [], (
-            "the prior incident's clock must be retired, or the new incident "
-            f"reports a duration spanning the gap: {still_open}"
+            await esc._on_event(_make_event("prov-sparse"))
+            t["now"] += timedelta(days=7)  # once a week, never recovering
+        assert esc._state["prov-sparse"]["trip_count"] == _TRIP_THRESHOLD, (
+            "weekly trips must accumulate — zeroing them on elapsed time is what "
+            "made a genuinely dead low-traffic provider invisible"
         )
 
-        cur = await empty_db.execute(
-            "SELECT resolution_notes FROM observations WHERE type = 'provider_failure'"
-        )
-        notes = [r[0] for r in await cur.fetchall()]
-        assert notes and all("superseded" in (n or "") for n in notes), notes
-        assert not any("recovered" in (n or "") for n in notes), (
-            "nothing observed the provider recover — the note must not imply it"
-        )
-
-    async def test_backoff_scale_gaps_never_reanchor(self, empty_db, event_bus):
-        """Gaps a real continuing outage produces (backoff cap 30min/4h plus
-        idle-traffic stretches, widest measured ~12h) must accumulate — the
-        window exists for STALE incidents, not slow ones."""
-        from datetime import timedelta
-
+    async def test_a_gap_preserves_the_anchor(self, empty_db, event_bus):
+        """`first_trip_at` is the true first trip and nothing here may move it."""
         t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
-        esc = ProviderEscalation(
-            db=empty_db, event_bus=event_bus, clock=lambda: t["now"],
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        await esc._on_event(_make_event("prov-anchor"))
+        anchor = esc._state["prov-anchor"]["first_trip_at"]
+        t["now"] += timedelta(hours=25)
+        await esc._on_event(_make_event("prov-anchor"))
+        assert esc._state["prov-anchor"]["first_trip_at"] == anchor
+        assert esc._state["prov-anchor"]["trip_count"] == 2
+
+    async def test_only_recovery_clears_the_incident(self, empty_db, event_bus):
+        """The one signal that DOES end an incident, kept as the control.
+
+        Without this the class only asserts that nothing resets, which a
+        permanently-stuck counter would also satisfy.
+        """
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        for _ in range(3):
+            await esc._on_event(_make_event("prov-rec"))
+            t["now"] += timedelta(days=2)
+        assert esc._state["prov-rec"]["trip_count"] == 3
+        esc.record_recovery("prov-rec")
+        assert "prov-rec" not in esc._state, "recovery must clear the incident"
+
+
+class TestEvidenceWording:
+    """The messages must state what was OBSERVED, not infer a continuous outage.
+
+    This is where the original bug actually lived. Between two trips a week
+    apart nothing observes the provider at all, so "has been failing every call
+    for 3 days" was an inference the evidence never supported — and discarding
+    state to make that sentence true is what broke sparse-outage detection.
+    """
+
+    async def test_the_escalation_row_names_both_ends_of_the_evidence(self, empty_db, event_bus):
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(db=empty_db, event_bus=event_bus, clock=lambda: t["now"])
+        for _ in range(_TRIP_THRESHOLD):
+            await esc._on_event(_make_event("prov-words"))
+            t["now"] += timedelta(days=3)
+        await asyncio.gather(
+            *(x for x in asyncio.all_tasks() if x.get_name() == "escalation-obs-prov-words"),
+            return_exceptions=True,
         )
-        for _ in range(5):
-            await esc._on_event(_make_event("prov-slow"))
-            t["now"] += timedelta(hours=4)
-        state = esc._state["prov-slow"]
-        assert state["trip_count"] == 5
-        assert state["first_trip_at"] == "2026-09-01T12:00:00+00:00"
+        cur = await empty_db.execute(
+            "SELECT content FROM observations WHERE type = 'provider_failure'"
+        )
+        row = await cur.fetchone()
+        assert row, "the escalation row was not written"
+        msg = json.loads(row[0])["message"]
+        assert "no recovery has been observed" in msg, msg
+        assert "every call" not in msg, (
+            "the row must not claim continuous total failure — sparse trips never evidenced it"
+        )
+        assert "between" in msg, "both ends of the evidence must be named"
+
+    def test_the_reported_span_is_bounded_by_the_observation_ttl(self):
+        """Past the row's own TTL nothing a reader can look up corroborates the
+        figure, so the wording degrades instead of quoting a precise total."""
+        from genesis.db.crud.observations import _DEFAULT_TTL
+        from genesis.routing.escalation import _EVIDENCE_SPAN_CAP_S
+
+        assert _DEFAULT_TTL.total_seconds() == _EVIDENCE_SPAN_CAP_S, (
+            "the cap is DERIVED from the observations TTL, not chosen — if that "
+            "TTL moves, this must move with it rather than drift into a "
+            "number nobody can justify"
+        )
 
 
 class TestHashScopedOutageClock:
