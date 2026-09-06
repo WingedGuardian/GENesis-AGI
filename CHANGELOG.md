@@ -9,6 +9,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **SECURITY.md described a posture the code left behind two months ago.** The
+  security policy told operators to treat the dashboard API as
+  "unauthenticated administrative access" and said the dashboard password
+  "protects the web UI, not the programmatic API". Neither has been true since
+  the API mutation gate landed: with a password set, state-changing `/api`
+  requests require a bearer token or an authenticated same-origin cookie with a
+  CSRF check, and `/v1` enforces its own bearer. The doc now says so -- along
+  with the limits that decide whether you still need network isolation, because
+  you do: the gate covers mutations only, reads stay open, it is inert when no
+  password is set, and it has a documented kill switch.
+
+  Corrected in the same pass: the autonomy ladder was described as seven levels
+  (`L0`-`L6`) when four ship (`L1`-`L4`, the rest deferred), the per-category
+  permissions were described as six categories when there are four, and the
+  process-group-kill example was attributed to a PreToolUse hook when it is
+  runtime library hardening -- a different guarantee, since a hook cannot be
+  bypassed by the agent and a helper only protects its own call sites. The
+  guard section also named one linter as the enforcement mechanism for shell
+  and URL policy; that linter only ever sees file edits, and the shell and web
+  guards are separate programs chosen by tool matcher.
+
+  Newly documented rather than corrected: provenance stamping and the two
+  privileged-write paths gated on it, the approval requirement and journal now
+  standing in front of irreversible entity merges, session-id validation before
+  filesystem use, and an External Egress section that says plainly which
+  outbound channel actually enforces a gate today and which are only observed.
+
+
 ### Changed
 
 - **The session charter now lists every open ledger item, not just the oldest
