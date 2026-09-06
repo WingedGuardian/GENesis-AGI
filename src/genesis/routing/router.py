@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 
+from genesis.db.crud.events import MSG_GROUP_PREFIX_LEN
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import ProviderActivityTracker
@@ -35,6 +36,50 @@ logger = logging.getLogger(__name__)
 # between router and dead_letter — changing this string requires updating
 # dead_letter.redispatch() and the matching test.
 UNKNOWN_CALL_SITE_ERROR_PREFIX = "Unknown call site:"
+
+# How many provider names an exhaustion line names before it summarises. A
+# chain is single digits today, so this never trims in practice — it is here so
+# that a future long chain cannot turn one ERROR line into a paragraph in
+# `journalctl`, which is where this message is read. Applied per clause
+# (`failed:` and `skipped:` each), so the line stays bounded either way.
+_FAILED_NAMES_IN_MESSAGE = 8
+
+
+def _bounded_names(names: list[str]) -> str:
+    shown = names[:_FAILED_NAMES_IN_MESSAGE]
+    listed = ", ".join(shown)
+    if len(names) > len(shown):
+        listed += f", +{len(names) - len(shown)} more"
+    return listed
+
+
+def _exhaustion_clause(
+    called_failed: list[str], skipped: list[tuple[str, str]]
+) -> str:
+    """The `; failed: a, b; skipped: c (breaker open)` tail of an exhaustion
+    message, or '' when the walk recorded nothing.
+
+    `failed` lists only providers that were actually CALLED and returned a
+    failure. A provider passed over before any call is listed under `skipped`
+    with its reason — an open breaker, a missing API key, an exceeded budget —
+    because printing it as `failed` reads as an outage where there may be
+    none: partial API-key configuration is the NORMAL state of a fresh
+    install, and a budget gate is a decision, not a fault.
+
+    EMPTY IS A REAL STATE AND IT SAYS SOMETHING: only the aggregate deadline
+    abandons the walk while recording nothing, and `failed: ` or `skipped: `
+    with nothing after it would read as a formatting bug — the
+    `N attempted of M walkable` counts carry that case on their own; 0 of 7
+    is the whole story there.
+    """
+    parts = []
+    if called_failed:
+        parts.append(f"; failed: {_bounded_names(called_failed)}")
+    if skipped:
+        parts.append(
+            f"; skipped: {_bounded_names([f'{n} ({r})' for n, r in skipped])}"
+        )
+    return "".join(parts)
 
 
 class Router:
@@ -261,6 +306,13 @@ class Router:
         attempts = 0
         first_provider = chain[0]
         failed_providers: list[str] = []
+        # The exhaustion MESSAGE splits the combined list above: providers
+        # whose call actually failed vs providers passed over before any call.
+        # `failed_providers` itself keeps the combined meaning — it feeds
+        # `RoutingResult.failed_providers` and the event details, whose
+        # consumers predate the split.
+        called_failed: list[str] = []
+        skipped: list[tuple[str, str]] = []
 
         # Aggregate wall-clock deadline across the whole chain walk (retries x
         # chain length). A GATE only — checked between providers/attempts, never
@@ -286,12 +338,14 @@ class Router:
             # normal install state on freshly-installed systems.
             if not provider_cfg.has_api_key:
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "no API key"))
                 continue
 
             # Skip if circuit breaker is open
             cb = self.breakers.get(provider_name)
             if not cb.is_available():
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "breaker open"))
                 continue
 
             # Skip paid providers if budget exceeded (unless override)
@@ -301,6 +355,7 @@ class Router:
                 and budget_status == BudgetStatus.EXCEEDED
             ):
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "budget exceeded"))
                 continue
 
             # Rate gate — pace requests per provider RPM limit
@@ -395,6 +450,7 @@ class Router:
                 )
             else:
                 failed_providers.append(provider_name)
+                called_failed.append(provider_name)
                 category = classify_error(result.status_code, result.error or "")
                 # RATE_LIMITED (429) and BAD_REQUEST (400/422) are NOT provider-
                 # health signals: a 429 is expected backpressure (the rate gate
@@ -417,12 +473,47 @@ class Router:
 
         # All exhausted
         if self._event_bus:
+            # `attempts` alone is not readable. A provider skipped for an open
+            # breaker, a missing key or an exceeded budget costs no attempt, so
+            # "attempts: 2" on a seven-provider chain looks exactly like a
+            # two-provider chain that was fully tried. Carrying the names AND
+            # the chain length lets a reader reconcile the two — and makes the
+            # aggregate-deadline `break` above legible, which is the one exit
+            # that abandons the walk while recording nothing at all.
+            #
+            # THE NAMES GO IN THE MESSAGE, not only in the details. `emit()`
+            # logs `subsystem=… event=… msg=…` and nothing else
+            # (observability/events.py), so details reach the persisted event
+            # and the dashboard but never `journalctl` — and the runbook for
+            # this failure sends the reader to the systemd log. Details-only
+            # would have left that surface byte-identical to the behaviour this
+            # change exists to fix. The sibling `provider.fallback` event above
+            # already names its providers in the message; this one now matches.
+            # The Errors dashboard groups events by the first
+            # MSG_GROUP_PREFIX_LEN characters of the message and keys manual
+            # resolutions off that prefix — so the head (stable per call site)
+            # is padded past the grouping window before the per-occurrence
+            # diagnostics start. Without the pad, every breaker/key/budget
+            # permutation of ONE recurring outage becomes its own group, and
+            # a resolved group resurrects under a new key.
             await self._event_bus.emit(
                 Subsystem.ROUTING, Severity.ERROR,
                 "all_exhausted",
-                f"All providers exhausted for {call_site_id}",
+                f"All providers exhausted for {call_site_id} ".ljust(
+                    MSG_GROUP_PREFIX_LEN
+                )
+                + f"({attempts} attempted of {len(chain)} walkable"
+                f"{_exhaustion_clause(called_failed, skipped)})",
                 call_site=call_site_id,
                 attempts=attempts,
+                failed_providers=tuple(failed_providers),
+                # The WALKABLE chain: post-`_filter_chain`, so a `never_pays`
+                # site does not count paid entries it was never going to try.
+                # That is the only length `attempts` can be reconciled against
+                # — but it is NOT the length a reader counts in
+                # `model_routing.yaml`, and the two currently differ on three
+                # of this install's nine `never_pays` sites.
+                chain_size=len(chain),
             )
 
         # Record failure for neural monitor visibility
@@ -456,6 +547,11 @@ class Router:
             success=False,
             call_site_id=call_site_id,
             attempts=attempts,
+            # The success path has always returned this (see above); the
+            # exhaustion path accumulated the same list and then dropped it, so
+            # the one result whose reader most needs to know which providers
+            # were involved was the only one that said nothing.
+            failed_providers=tuple(failed_providers),
             error="All providers exhausted",
             dead_lettered=dead_lettered,
         )

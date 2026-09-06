@@ -75,7 +75,12 @@ def sample_config(sample_providers):
         call_sites={
             "test_mixed": CallSiteConfig(id="test_mixed", chain=["free-1", "free-2", "paid-1"]),
             "test_paid": CallSiteConfig(id="test_paid", chain=["paid-1", "paid-2"], default_paid=True),
-            "test_never_pays": CallSiteConfig(id="test_never_pays", chain=["free-1", "free-2"], never_pays=True),
+            # `paid-1` is here so `_filter_chain` actually DROPS something.
+            # Without it the filter is vacuous in every test: swapping the
+            # filtered chain for the configured one survived the whole file
+            # green, and `test_never_pays_skips_paid` asserted that a paid
+            # provider was not called on a chain that contained none.
+            "test_never_pays": CallSiteConfig(id="test_never_pays", chain=["free-1", "free-2", "paid-1"], never_pays=True),
         },
         retry_profiles={"default": RetryPolicy(max_retries=1, base_delay_ms=10, jitter_pct=0.0)},
     )
