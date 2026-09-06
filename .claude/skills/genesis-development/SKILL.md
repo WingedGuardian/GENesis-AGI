@@ -811,6 +811,17 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
 
+  **An instrument's stated invariant is its blind spot — and so is the one it
+  does not state.** Before trusting a harness's clean result, read what it
+  promises to hold fixed, then ask what ELSE it holds fixed without saying so.
+  READ, and EXTERNAL to this repo — a sibling toolkit's own release notes,
+  2026-09, not a Genesis measurement: a fuzzer whose mutators were all fixed
+  one-character strings had a whole mutant shape unreachable by construction,
+  and that writeup attributes its own long-lived bypass to exactly that. The
+  remedy generalises even if the number does not: vary what the instrument
+  never varies, rather than running it more times.
+  Method for the whole class: `references/high-stakes-verification.md`.
+
   **Three corollaries, each bought with a non-converging review loop.**
 
   **(a) NEVER normalize the command text before a blind-spot probe.** A probe
@@ -1319,6 +1330,23 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   file:line or be confidence-capped).
 
 ### Review-loop discipline
+
+- **A RELEASE review is scoped to what the release CHANGES; a whole-codebase
+  audit gates nothing.** Point a reviewer at "the repository" and it returns
+  findings that PRE-DATE the release — real, worth fixing, and not release
+  blockers. Treating them as blockers is how a release never ships. Scope the
+  gating pass to the diff between the previous RELEASE tag and HEAD (this repo
+  also carries non-release tags, so `git describe --tags` alone can land on the
+  wrong one); run the broader
+  audit separately, on its own clock, where its findings become ordinary work
+  rather than a stop. The distinction is not "which findings are real" but
+  "which findings this release is answerable for" — a defect that already
+  shipped in the last release is answerable by the next fix, not by this gate.
+  Release scope decides what BLOCKS, never whether an external round COUNTS: a
+  pre-dating finding is still a defect-bearing round on the escalation counter,
+  filed as ordinary work rather than held as a release blocker. "It pre-dates
+  the release" is otherwise just a new spelling of the rationalization that
+  counter exists to kill.
 
 - **A review's findings are a SAMPLE, not a to-do list.** This is the single
   highest-value habit in this section, and the one most often skipped. CLAUDE.md
@@ -2253,6 +2281,7 @@ references on every trigger.
 | Phase 6 contribution pipeline, sanitizer | `references/contribution.md` |
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
 | Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
+| Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,
