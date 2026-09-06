@@ -234,6 +234,65 @@ class TestBuildSummary:
         assert len(head.encode()) <= 12_000 and len(tail.encode()) <= 4_000
         assert len(head) < 12_000, "head was sliced by characters, not bytes"
 
+    def test_a_lone_surrogate_does_not_abort_the_whole_pipeline(self):
+        """An unpaired surrogate is a `str` Python accepts and UTF-8 cannot encode.
+
+        `json.loads('"\\ud800"')` produces one, so it arrives from any JSON
+        source — an inbound request, a decoded CC stream result. The valve
+        measures BYTES, so it encodes; before this, that raised
+        `UnicodeEncodeError` out of `build_summary` and killed retrospective
+        grading and every downstream learning write for that interaction. Note
+        the SHORT case: the valve never opened, and it still raised.
+        """
+        lone = "before \ud800 after"
+        s = build_summary(_make_output(text=lone), "s", lone, "terminal")
+        # Survives, and what survives is encodable — everything downstream (the
+        # rendered prompt, the router's JSON body) encodes this text again.
+        s.response_text.encode("utf-8")
+        s.user_text.encode("utf-8")
+        assert "before " in s.response_text and " after" in s.response_text
+        assert "before " in s.user_text and " after" in s.user_text
+        assert s.response_elided_chars == 0, "a short text must not be elided"
+
+    def test_a_surrogate_in_an_oversized_text_also_survives(self):
+        """The other side of the branch: the elision path encodes and slices."""
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        body = "H" * (_MAX_RESPONSE_TEXT + 5_000) + "\ud800" + "TAIL"
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        s.response_text.encode("utf-8")
+        assert s.response_elided_chars > 0
+        assert s.response_text.endswith("TAIL"), "the ENDING must survive"
+
+    def test_the_surrogate_is_rendered_visibly_rather_than_dropped(self):
+        """Not silently deleted: what was there is shown in its escaped form, so
+        a grader reading the text is not handed a gap it cannot see. The count
+        stays honest because normalization happens BEFORE anything is measured."""
+        s = build_summary(_make_output(text="x\ud800y"), "s", "hi", "terminal")
+        assert s.response_text == "x\\ud800y"
+
+    def test_a_runtime_tool_name_cannot_carry_an_unencodable_character(self):
+        """The gap `_fit` alone leaves: `tool_calls` never passes through it.
+
+        `tools_used` is read off CC's JSON stream and `json.loads` accepts
+        `"\\ud800"`, so an unencodable name would reach a grader prompt by a
+        path the valve does not cover — and the crash would surface at render
+        time, far from its cause. (The text-scrape fallback cannot do this: `\\w`
+        does not match a surrogate.)
+        """
+        from genesis.learning.response_context import tool_lines
+
+        s = build_summary(
+            _make_output(text="hi", tools_used=("Ba\ud800sh", "Read")),
+            "s",
+            "hi",
+            "terminal",
+        )
+        for name in s.tool_calls:
+            name.encode("utf-8")
+        assert s.tool_calls == ["Ba\\ud800sh", "Read"]
+        "\n".join(tool_lines(s)).encode("utf-8")
+
     def test_ascii_behaviour_is_unchanged_by_the_byte_valve(self):
         """The control: bytes == characters for ASCII, which is the
         overwhelming majority of real traffic, so switching units must move

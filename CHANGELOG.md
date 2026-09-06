@@ -63,6 +63,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   matched the request. On this install 15% of incoming messages were over that
   limit. Requests now reach the reviewer whole; a genuinely enormous one is
   shortened from the middle, keeps its ending, and says how much was removed.
+- **One malformed character no longer stops Genesis reviewing an interaction at
+  all.** Some text encodings allow a stray half-character that is technically
+  invalid on its own. JSON accepts it, so it can arrive in an incoming message or
+  in a reply, and the self-review pipeline measures text in bytes — so it stopped
+  with an error before grading began, and every lesson from that interaction was
+  lost. Text is now checked as it enters review, and anything unencodable is
+  shown in a visible escaped form rather than crashing the pass or being silently
+  dropped.
 - **SECURITY.md described a posture the code left behind two months ago.** The
   security policy told operators to treat the dashboard API as
   "unauthenticated administrative access" and said the dashboard password

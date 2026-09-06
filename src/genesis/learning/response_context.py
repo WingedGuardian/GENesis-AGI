@@ -12,7 +12,7 @@ Two rules encoded here, both learned from a real defect:
    reply had been cut off — a verdict that reached permanent memory as fact.
    The first attempt at a fix asserted the opposite ("COMPLETE — the model
    finished normally") from `bg_truncated`, which is a single stderr substring
-   match (`cc/invoker.py:123-128`) and whose own producer notes the match is
+   match (`cc/invoker.py` `_stderr_bg_truncated`) and whose own producer notes the match is
    version-drift tolerant. `False` there means "that substring was absent", not
    "the model finished normally", and a `CCOutput` built by hand (e.g.
    `mail/monitor.py`) simply defaults it. So a note is emitted ONLY when there

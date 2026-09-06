@@ -1501,7 +1501,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 57fc1958 2026-09-03
+verified: 788dd9a9 2026-09-06
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -1518,7 +1518,7 @@ verified: 57fc1958 2026-09-03
 - **A note about the response is emitted only on a POSITIVE signal.** The first
   fix here asserted the opposite of `CCOutput.bg_truncated` as fact
   ("COMPLETE — the model finished normally") and told the grader not to disagree.
-  That flag is one stderr substring match (`cc/invoker.py:123-128`) whose producer
+  That flag is one stderr substring match (`cc/invoker.py` `_stderr_bg_truncated`) whose producer
   documents the match as version-drift tolerant, and a hand-built `CCOutput`
   (e.g. `mail/monitor.py`) simply defaults it — so its `False` means "that
   substring was absent", never "the model finished normally". Restating it as a

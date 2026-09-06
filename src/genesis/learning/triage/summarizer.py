@@ -92,6 +92,40 @@ def _extract_tool_calls(text: str) -> list[str]:
     return result
 
 
+def _encodable(text: str) -> str:
+    """Return *text* with anything UTF-8 cannot encode rendered as an escape.
+
+    An unpaired surrogate is a `str` Python accepts and UTF-8 rejects:
+    `json.loads('"\\ud800"')` yields one, so it arrives from any JSON source —
+    an inbound request, a decoded CC stream result. Every measurement below is
+    in bytes, so the first `.encode()` raised `UnicodeEncodeError` straight out
+    of `build_summary`, killing retrospective grading and every downstream
+    learning write for that interaction. The SHORT path raised too: the valve
+    was never the trigger, encoding was.
+
+    `backslashreplace` rather than `replace`: the point of this pipeline is that
+    a grader is shown what actually happened, so a code point that cannot be
+    encoded is rendered as `\\ud800` — visible, still valid UTF-8 — instead of
+    being silently swapped for `?`. It runs BEFORE any measuring, so the byte
+    valve and the reported character count both describe the text the graders
+    are actually handed.
+
+    SCOPE, stated exactly, because the obvious stronger claim is false. This
+    covers the three FREE-TEXT fields a grader prompt renders: `user_text` and
+    `response_text` (via `_fit`) and the `tool_calls` names (in `build_summary`).
+    It does NOT cover `session_id`, which reaches the same prompts and has the
+    same CC-JSON-stream provenance — deliberately, because that field is an
+    IDENTIFIER used as a correlation key, `_encodable` is non-injective (a real
+    surrogate and a literally-typed `\\ud800` collapse together), and silently
+    rewriting a key to protect a render path is how two identities become one.
+    A session id that is not encodable is malformed rather than long, and the
+    honest handling is to reject it upstream where it is minted — not to mutate
+    it here. Residual, and named so the next reader does not have to rediscover
+    it: such an id would still raise at render time.
+    """
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _fit(text: str, cap: int) -> tuple[str, int]:
     """Return (text, characters removed) — whole, or head + marker + tail.
 
@@ -116,6 +150,7 @@ def _fit(text: str, cap: int) -> tuple[str, int]:
     fitted text is always valid and the reported count stays exact by being
     derived from what SURVIVED, never from the requested sizes.
     """
+    text = _encodable(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= cap:
         return text, 0
@@ -146,11 +181,21 @@ def build_summary(
         response_text=response_text,
         response_truncated=output.bg_truncated,
         response_elided_chars=elided_chars,
-        tool_calls=(
-            list(output.tools_used)
-            if output.tools_used is not None
-            else _extract_tool_calls(output.text)
-        ),
+        # `_encodable` here as well as in `_fit`, so the chokepoint claim covers
+        # the WHOLE summary rather than just its two long texts. The scrape
+        # cannot produce an unencodable name (`\w` does not match a surrogate —
+        # verified), but `tools_used` is read from CC's JSON stream, and
+        # `json.loads` accepts `"\ud800"`. That name would then reach a grader
+        # prompt OUTSIDE `_fit`, and the crash would land at render time with
+        # nothing pointing back here.
+        tool_calls=[
+            _encodable(name)
+            for name in (
+                list(output.tools_used)
+                if output.tools_used is not None
+                else _extract_tool_calls(output.text)
+            )
+        ],
         # None vs () is the whole distinction: no runtime REPORT, versus a
         # runtime report of zero tools. Collapsing them makes "Tools used: none"
         # an assertion on every non-streaming interaction, where the pipeline
