@@ -918,3 +918,37 @@ async def test_empty_listing_does_not_fabricate_availability(db):
         res = await follow_up_tools._impl_follow_up_list(status_filter="failed")
     assert res["follow_ups"] == []
     assert res["external_state"]["issues"] == "unavailable"
+
+
+async def test_a_busy_row_cannot_hide_another_rows_proposal(db):
+    """CodeRabbit's case, and the one the previous fix missed: filtering a CAPPED
+    listing by item id bounds WHICH rows are considered, not HOW MANY return. With
+    one follow-up holding far more than the cap in newer proposals, a second
+    follow-up's older proposal fell past the limit and its row came back
+    undecorated — while external_state still reported the source as read."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        busy = await _one_followup(db, content="the noisy row that crowds the query out")
+        quiet = await _one_followup(db, content="the row whose older proposal must survive")
+        # quiet's proposal is the OLDEST of all.
+        await _seed_proposal(db, item_id=quiet, pr_number=1)
+        await db.execute(
+            "UPDATE repo_pulse_annotations SET observed_at = '2020-01-01T00:00:00'"
+            " WHERE pr_number = 1"
+        )
+        # busy alone carries more than the 500 cap, all newer.
+        await db.executemany(
+            "INSERT INTO repo_pulse_annotations "
+            "(id, run_id, observed_at, tier, item_id, item_text, pr_number, pr_title,"
+            " confidence, rationale, status, target_kind) "
+            "VALUES (?, 'r1', '2026-06-01T00:00:00', 'exact', ?, 'txt', ?, 't',"
+            " 0.9, 'why', 'proposed', 'follow_up')",
+            [(f"ann-busy-{n}", busy, n) for n in range(2, 620)],
+        )
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_list(limit=50)
+    rows = {r["id"]: r for r in res["follow_ups"]}
+    assert rows[quiet].get("pulse_proposal", {}).get("pr_number") == 1, (
+        "a busy sibling must not push this row's proposal out of the result"
+    )
+    assert "pulse_proposal" in rows[busy]
+    assert res["external_state"]["proposals"] == "ok"

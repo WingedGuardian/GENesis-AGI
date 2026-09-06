@@ -274,6 +274,46 @@ async def list_runs(db: aiosqlite.Connection, *, limit: int = 200) -> list[dict]
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def latest_annotation_per_item(
+    db: aiosqlite.Connection,
+    item_ids: list[str],
+    *,
+    status: str,
+    target_kind: str,
+) -> dict[str, dict]:
+    """The NEWEST matching annotation for each of *item_ids*, keyed by item id.
+
+    Exists because :func:`list_annotations` cannot answer this without a row cap,
+    and a cap is the wrong shape for a per-row lookup. Filtering that function by
+    ``item_ids`` bounds WHICH rows are considered but not HOW MANY results return:
+    with one item holding 500 newer annotations, a second item's older one falls
+    past the limit and its row comes back undecorated — indistinguishable from a
+    row with nothing to report, while the caller still reports the source as read.
+    Here the result is at most one row per requested id BY CONSTRUCTION, so there
+    is no cap to exceed and no truncation to detect.
+
+    Relies on SQLite's documented bare-column behaviour: in a ``GROUP BY`` query
+    using ``MAX()``, the non-aggregated columns come from the row holding that
+    maximum. Ties (identical ``observed_at`` within one item) resolve arbitrarily
+    but consistently — acceptable, since either row is equally "the newest".
+    Requires ``db.row_factory = aiosqlite.Row``.
+    """
+    if status not in ANNOTATION_STATUSES:
+        raise ValueError(f"invalid annotation status: {status!r}")
+    if target_kind not in TARGET_KINDS:
+        raise ValueError(f"invalid target_kind: {target_kind!r}")
+    if not item_ids:
+        return {}
+    placeholders = ",".join("?" * len(item_ids))
+    cursor = await db.execute(
+        "SELECT *, MAX(observed_at) AS _newest FROM repo_pulse_annotations "  # noqa: S608
+        f"WHERE status = ? AND target_kind = ? AND item_id IN ({placeholders}) "
+        "GROUP BY item_id",
+        (status, target_kind, *(str(i) for i in item_ids)),
+    )
+    return {str(r["item_id"]): dict(r) for r in await cursor.fetchall()}
+
+
 async def list_annotations(
     db: aiosqlite.Connection,
     *,

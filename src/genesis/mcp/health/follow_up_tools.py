@@ -239,23 +239,19 @@ async def _enrich_external_state(db, items: list[dict]) -> dict[str, str]:
         from genesis.db.crud import repo_pulse
 
         if await repo_pulse.tables_available(db):
-            # Bounded by the rows being decorated, NOT by a row cap. Scanning the
-            # global proposed set under a default limit would make a result AT the
-            # cap indistinguishable from a complete one, and the rows past the cut
-            # would carry no key — reading as "nothing to report" while the map
-            # still said "ok". That is the exact collapse this map exists to stop,
-            # so the query is made incapable of truncating instead of watched for it.
-            anns = await repo_pulse.list_annotations(
-                db,
-                status="proposed",
-                target_kind="follow_up",
-                item_ids=list(by_id),
+            # At most ONE row per requested id, by construction — so there is no
+            # cap to exceed. Filtering a capped listing by item id is not enough:
+            # that bounds WHICH rows are considered, not HOW MANY return, so one
+            # busy item can push another item's proposal past the limit and that
+            # row comes back undecorated — indistinguishable from having nothing
+            # to report, while the map still says the source was read. The query
+            # is made incapable of truncating rather than watched for it.
+            latest = await repo_pulse.latest_annotation_per_item(
+                db, list(by_id), status="proposed", target_kind="follow_up"
             )
-            # Newest first from the query; keep the first per row so a row with
-            # several proposals shows the most recent rather than an arbitrary one.
-            for ann in anns:
-                row = by_id.get(str(ann.get("item_id")))
-                if row is not None and "pulse_proposal" not in row:
+            for item_id, ann in latest.items():
+                row = by_id.get(item_id)
+                if row is not None:
                     row["pulse_proposal"] = {
                         "annotation_id": ann.get("id"),
                         "pr_number": ann.get("pr_number"),
