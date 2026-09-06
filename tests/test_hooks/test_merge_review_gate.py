@@ -1207,6 +1207,65 @@ class TestCheckInlineReviewFindings:
     boilerplate — 173 findings passed the gate unseen before this
     (2026-07-10 audit)."""
 
+    # Every path this class anchors a finding on. Pinned as IN the PR's diff
+    # by the autouse fixture below.
+    _FINDING_PATHS = [
+        "src/benign.py",
+        "src/genesis/foo.py",
+        "src/genesis/a.py",
+        "src/genesis/router.py",
+        "CHANGELOG.md",
+        "README.md",
+        "NOTES.md",
+        "AGENTS.md",
+        "LICENSE",
+        "LICENSE.txt",
+        "README.txt",
+        "guide.rst",
+        "docs/CURRENT.md",
+        "docs/architecture/x.md",
+        "docs/conf.py",
+        "docs/conf.py\n",
+        "docs/build.rs",
+        "docs/config.yaml",
+        "docs/notebook.ipynb",
+        "docs/init.sql",
+        "docs/Script.java",
+        "docs/deploy.ps1",
+        "docs/Makefile",
+        "docs/requirements.txt",
+        "docs/constraints.txt",
+        "docs/CMakeLists.txt",
+        "docs/meson_options.txt",
+        "docs/guide.txt",
+        "docs/README.txt",
+        "docs/guide\x7f.md",
+        "docs/guide\x85.md",
+        "docs/guide\x9f.md",
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _findings_are_in_diff(self, monkeypatch):
+        """Pin this class's finding paths as IN the PR's changed-file set.
+
+        This class tests severity parsing, engagement, and the doc-path lever —
+        all semantics of findings on files the PR touches. Diff SCOPING is
+        ``TestDiffScopedInlineFindings``' subject (issue #1728); without this
+        fixture its arrival would divert these cases to the off-diff lane and
+        they would test nothing they name. A new test anchoring a finding on a
+        new path adds it to ``_FINDING_PATHS``. A miss fails loudly ONLY in a
+        test that asserts a block or a lane marker — the off-diff lane also
+        yields ``not block``, so a bare not-block assertion passes vacuously on
+        an unlisted path. That is why every not-block doc-path test below ALSO
+        asserts its doc-lane marker in stderr."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": p, "previous_filename": None})
+                for p in self._FINDING_PATHS
+            ),
+        )
+
     def _mock(self, guard_module, comments, rc=0):
         # gh api --paginate with a per-element jq filter emits one
         # compact JSON object per line across ALL result pages.
@@ -1853,7 +1912,7 @@ class TestCheckInlineReviewFindings:
         assert "[doc P1]" in capsys.readouterr().err, "surfaced, never silently dropped"
 
     def test_p1_only_mode_a_doc_p1_blocks_but_a_doc_p2_does_not(
-        self, guard_module, monkeypatch
+        self, guard_module, monkeypatch, capsys
     ):
         """The middle setting, so it can be dialled back without another PR."""
         monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "p1_only")
@@ -1861,9 +1920,10 @@ class TestCheckInlineReviewFindings:
             assert guard_module._check_inline_review_findings("100")[0] is True
         with self._mock(guard_module, [self._codex(2, _P2_BODY, path="AGENTS.md")]):
             assert guard_module._check_inline_review_findings("100")[0] is False
+        assert "[doc P2]" in capsys.readouterr().err  # the doc lane, not off-diff
 
     def test_stricter_modes_apply_to_coderabbit_doc_findings_too(
-        self, guard_module, monkeypatch
+        self, guard_module, monkeypatch, capsys
     ):
         """The mode lever must govern BOTH reviewers (Codex P2, PR #1677 round 4).
 
@@ -1881,6 +1941,7 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="AGENTS.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block, "the default must keep doc findings non-blocking"
+        assert "[doc CodeRabbit Critical/Major]" in capsys.readouterr().err
 
     def test_score_mode_restores_the_old_behaviour(self, guard_module, monkeypatch):
         """Two doc P2s = 1.0 → blocks, exactly as two code P2s would."""
@@ -2015,22 +2076,30 @@ class TestCheckInlineReviewFindings:
         assert not block
         assert "documentation" in capsys.readouterr().err.lower()
 
-    def test_inline_p1_on_readme_does_not_block(self, guard_module):
+    # Every not-block doc-path test asserts its DOC-LANE marker too: the
+    # off-diff lane (issue #1728) also returns not-block, so the verdict alone
+    # cannot tell "exempt as documentation" from "diverted by an unlisted
+    # path in _FINDING_PATHS" (architect SF, 2026-09-06).
+
+    def test_inline_p1_on_readme_does_not_block(self, guard_module, capsys):
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="README.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
-    def test_inline_p1_under_docs_dir_does_not_block(self, guard_module):
+    def test_inline_p1_under_docs_dir_does_not_block(self, guard_module, capsys):
         with self._mock(
             guard_module, [self._codex(1, _P1_BODY, path="docs/architecture/x.md")]
         ):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
-    def test_inline_p1_on_rst_does_not_block(self, guard_module):
+    def test_inline_p1_on_rst_does_not_block(self, guard_module, capsys):
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="guide.rst")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     def test_inline_p1_on_code_path_still_blocks(self, guard_module):
         with self._mock(
@@ -2040,7 +2109,7 @@ class TestCheckInlineReviewFindings:
         assert block
         assert "Make queue claim atomic" in msg
 
-    def test_inline_p1_on_a_markdown_file_no_longer_blocks(self, guard_module):
+    def test_inline_p1_on_a_markdown_file_no_longer_blocks(self, guard_module, capsys):
         """DELIBERATE REVERSAL (owner decision, 2026-09-04) of the old default.
 
         This test previously locked the opposite: a `*.md` outside `docs/` was NOT a
@@ -2061,6 +2130,7 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="NOTES.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     def test_inline_p1_on_code_under_docs_still_blocks(self, guard_module):
         # docs/conf.py is executable Python — a finding there must still block.
@@ -2124,10 +2194,11 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert block
 
-    def test_inline_p1_on_license_no_ext_does_not_block(self, guard_module):
+    def test_inline_p1_on_license_no_ext_does_not_block(self, guard_module, capsys):
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="LICENSE")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     @pytest.mark.parametrize(
         "path",
@@ -2149,11 +2220,12 @@ class TestCheckInlineReviewFindings:
         assert block, f"{path!r} is an ambiguous .txt — must block"
 
     @pytest.mark.parametrize("path", ["LICENSE.txt", "README.txt", "docs/README.txt"])
-    def test_inline_p1_known_stem_txt_does_not_block(self, guard_module, path):
+    def test_inline_p1_known_stem_txt_does_not_block(self, guard_module, path, capsys):
         # A doc-named STEM pins the file as prose, so .txt is safe there.
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     @pytest.mark.parametrize(
         "path",
@@ -2168,6 +2240,261 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert block
+
+
+# ── Diff-scoped inline findings (issue #1728) ─────────────────────────────
+#
+# Module-level comment factories for the class below. Same shapes as
+# TestCheckInlineReviewFindings' bound helpers (which carry no state);
+# duplicated as module functions rather than inherited, because subclassing
+# that class would re-run its entire suite under a second name.
+
+
+def _cr_c(cid, body, reply_to=None, path=None):
+    d = {
+        "id": cid,
+        "reply_to": reply_to,
+        "login": "coderabbitai[bot]",
+        "type": "Bot",
+        "body": body,
+    }
+    if path is not None:
+        d["path"] = path
+    return d
+
+
+def _codex_c(cid, body, reply_to=None, path=None):
+    d = {
+        "id": cid,
+        "reply_to": reply_to,
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot",
+        "body": body,
+    }
+    if path is not None:
+        d["path"] = path
+    return d
+
+
+def _mock_inline(guard_module, comments, rc=0):
+    return patch.object(
+        guard_module.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess(
+            args=[],
+            returncode=rc,
+            stdout="\n".join(json.dumps(c) for c in comments),
+            stderr="",
+        ),
+    )
+
+
+def _cr_major(title: str) -> str:
+    """A CodeRabbit Major body in the verbatim live header format, custom title."""
+    return f"_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_\n\n**{title}**\n\nDetails."
+
+
+class TestDiffScopedInlineFindings:
+    """A finding is SCORED only when its path is inside the PR's diff (issue #1728).
+
+    MEASURED on live PR #1541 (gate run 2026-09-05): the inline score reached 7.0
+    with 4 of 7 CodeRabbit Critical/Major findings anchored on files ABSENT from
+    the PR's diff — base-branch content stamped onto the PR by a merge of main.
+    The gate scored them at full weight because nothing compared a finding's
+    ``path`` to the PR's changed-file set.
+
+    The contract under test: off-diff findings are surfaced (labeled base-branch)
+    and excluded from the score; a missing/null path is always scored (a pathless
+    finding must never be silently discounted); an unreadable changed-file set
+    scores everything (status quo) and says so. The autouse ``_hermetic_pr_files``
+    fixture pins the changed-file set to ``src/benign.py``, the in-diff control.
+    """
+
+    def test_off_diff_coderabbit_major_not_scored(self, guard_module, capsys):
+        """RED before the fix: an off-diff Major blocked at full weight."""
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"off-diff CodeRabbit Major was scored: {msg}"
+        err = capsys.readouterr().err
+        assert "outside this PR's diff" in err
+        assert "src/other.py" in err
+
+    def test_in_diff_coderabbit_major_still_blocks(self, guard_module):
+        """The control: scoping must not blind the gate to in-diff findings."""
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/benign.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Track unresolved reparsing prefixes" in msg
+
+    def test_pathless_coderabbit_major_still_blocks(self, guard_module):
+        """No ``path`` key at all (file-level/outdated comment) → scored.
+
+        A pathless finding must never be silently discounted by a check that
+        needs a path to run.
+        """
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_null_path_coderabbit_major_still_blocks(self, guard_module):
+        """Explicit ``path: null`` (GitHub emits it on outdated comments) → scored."""
+        c = _cr_c(1, _CR_MAJOR_BODY)
+        c["path"] = None
+        with _mock_inline(guard_module, [c]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_unreadable_file_set_scores_everything_with_note(
+        self, guard_module, capsys, monkeypatch
+    ):
+        """Changed-file set unreadable → status quo (score all) + a loud NOTE.
+
+        Fail direction chosen deliberately: scoring everything is the STRICTER
+        direction, so an API failure can never let a real finding through —
+        it can only re-create the pre-fix behavior, announced.
+        """
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, "unreadable file set must keep the old scoring, not skip it"
+        assert "diff scoping unavailable" in capsys.readouterr().err
+
+    def test_off_diff_codex_p1_not_scored(self, guard_module, capsys):
+        """Codex findings get the same scoping — the mechanism is reviewer-agnostic."""
+        with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/other.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"off-diff Codex P1 was scored: {msg}"
+        assert "outside this PR's diff" in capsys.readouterr().err
+
+    def test_off_diff_codex_p2_pair_not_scored(self, guard_module):
+        """Two off-diff P2s would sum to the 1.0 threshold — neither may score."""
+        comments = [
+            _codex_c(1, _P2_BODY, path="src/other.py"),
+            _codex_c(2, _P2_BODY, path="src/third.py"),
+        ]
+        with _mock_inline(guard_module, comments):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"off-diff P2 pair reached the threshold: {msg}"
+
+    def test_maintainer_replied_off_diff_excluded_silently(self, guard_module, capsys):
+        """Engagement is checked FIRST: a replied off-diff finding is already
+        handled, so it must not be re-listed in the off-diff NOTE either."""
+        comments = [
+            _cr_c(1, _CR_MAJOR_BODY, path="src/other.py"),
+            {
+                "id": 2,
+                "reply_to": 1,
+                "login": "owner",
+                "type": "User",
+                "assoc": "OWNER",
+                "body": "acknowledged — tracked in the base-branch issue",
+            },
+        ]
+        with _mock_inline(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "outside this PR's diff" not in capsys.readouterr().err
+
+    def test_empty_changed_file_set_scores_everything_with_note(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """An EMPTY file set is treated as UNRESOLVABLE, not as an answer
+        (security review HIGH, 2026-09-06): a 200-with-zero-rows response is
+        indistinguishable from a transiently-degraded one, and the ambiguous
+        reading must never discount every finding on the PR. Scoped to this
+        check only — the hook-surface consumer keeps ``[]`` = "no hook files"
+        (an empty PR truly has none, and it fails closed on ``None``)."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "")
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, "empty file set must fail toward scoring, never discounting"
+        assert "diff scoping unavailable" in capsys.readouterr().err
+
+    def test_rename_source_counts_as_in_diff(self, guard_module, monkeypatch):
+        """A comment left on the pre-rename path still scores — the changed-file
+        set includes rename SOURCES via ``previous_filename``."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "src/new_name.py", "previous_filename": "src/old_name.py"}',
+        )
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/old_name.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    # ── Acceptance replay: PR #1541, the measured motivating case ──────────
+
+    # The PR's REAL changed-file list (gh api pulls/1541/files, 2026-09-06;
+    # 24 files, no renames) and the REAL paths of its 8 top-level CodeRabbit
+    # Major findings: 3 on files in the diff, 5 on base-branch files stamped
+    # by merges of main. Bodies use the verbatim live header format with
+    # synthetic titles — the load-bearing data here is the path set.
+    _PR1541_FILES = [
+        "CHANGELOG.md",
+        "config/model_routing.yaml",
+        "config/session_ledger_shadow.yaml",
+        "docs/architecture/CURRENT.md",
+        "scripts/genesis_precompact.py",
+        "scripts/ledger_shadow_report.py",
+        "src/genesis/db/crud/session_charters.py",
+        "src/genesis/db/crud/session_ledger_shadow.py",
+        "src/genesis/db/migrations/20260904231054_session_ledger_ambient_extractor.py",
+        "src/genesis/db/schema/_tables.py",
+        "src/genesis/mcp/health/session_charter_tools.py",
+        "src/genesis/mcp/health/settings.py",
+        "src/genesis/session_awareness/ledger_extractor.py",
+        "src/genesis/session_awareness/ledger_shadow_config.py",
+        "src/genesis/session_awareness/ledger_worker.py",
+        "src/genesis/session_awareness/repo_pulse_worker.py",
+        "src/genesis/session_charter.py",
+        "tests/test_db/test_migration_0059_session_ledger_shadow.py",
+        "tests/test_db/test_migration_ambient_extractor.py",
+        "tests/test_db/test_session_charters_crud.py",
+        "tests/test_scripts/test_ledger_shadow_report.py",
+        "tests/test_session_awareness/test_ledger_extractor.py",
+        "tests/test_session_awareness/test_ledger_shadow_config.py",
+        "tests/test_session_awareness/test_ledger_worker.py",
+    ]
+    _PR1541_IN_DIFF_MAJORS = [
+        "src/genesis/session_awareness/ledger_shadow_config.py",
+        "src/genesis/session_awareness/ledger_worker.py",
+        "src/genesis/session_awareness/ledger_worker.py",
+    ]
+    _PR1541_OFF_DIFF_MAJORS = [
+        ".github/workflows/ci.yml",
+        "scripts/genesis_session_context.py",
+        "src/genesis/db/crud/ego_intentions.py",
+        "src/genesis/db/migrations/0088_ego_intentions_origin.py",
+        "src/genesis/session_awareness/repo_pulse_gh.py",
+    ]
+
+    def test_acceptance_replay_pr1541(self, guard_module, capsys, monkeypatch):
+        """Replay #1728's measured defect: base-branch Majors drop from the
+        score, in-diff Majors still block.
+
+        With the full current comment set (8 Majors: 3 in-diff, 5 off-diff,
+        none replied) the pre-fix score is 8.0; scoped, it is 3.0 — still a
+        block, on exactly the findings that are this PR's to answer.
+        """
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": f, "previous_filename": None})
+                for f in self._PR1541_FILES
+            ),
+        )
+        comments = []
+        for i, path in enumerate(self._PR1541_IN_DIFF_MAJORS):
+            comments.append(_cr_c(100 + i, _cr_major(f"in-diff finding {i}"), path=path))
+        for i, path in enumerate(self._PR1541_OFF_DIFF_MAJORS):
+            comments.append(_cr_c(200 + i, _cr_major(f"base-branch finding {i}"), path=path))
+        with _mock_inline(guard_module, comments):
+            block, msg = guard_module._check_inline_review_findings("1541")
+        assert block, "the 3 in-diff Majors must still block"
+        assert "review score 3.0" in msg
+        assert "3 CodeRabbit" in msg
+        err = capsys.readouterr().err
+        assert "5 CodeRabbit" in err and "outside this PR's diff" in err
+        assert "0088_ego_intentions_origin" in err
 
 
 class TestResolvePrNumber:
