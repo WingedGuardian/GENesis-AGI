@@ -566,10 +566,77 @@ class TestLegacyReasonNormalisation:
 
     def test_a_malformed_history_entry_does_not_raise(self, tmp_path: Path):
         # The file is hand-editable and shared with the dashboard; a non-dict
-        # entry must not take the whole tick down on load.
-        self._write(tmp_path, {"restart_history": ["not-a-dict", None]})
+        # entry must not take the whole tick down.
+        #
+        # This assertion used to be `== ["not-a-dict", None]` — it proved LOAD
+        # survives, which was never where the crash was. Three sites filter the
+        # history with `h.get("reason")` and `now - h.get("ts", 0)`, so the
+        # entry took the watchdog down on the next DECISION instead. Assert
+        # through the decision path, not the load.
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": ["not-a-dict", None],
+        })
         checker = _make_checker(tmp_path, tmp_path / "status.json")
-        assert checker._load_state()["restart_history"] == ["not-a-dict", None]
+        state = checker._load_state()
+        assert state["restart_history"] == [], "unreadable entries must be dropped"
+        # The real crash site: this raised AttributeError before the fix.
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.RESTART
+        )
+
+    @pytest.mark.parametrize(
+        "bad_ts", ["yesterday", None, True, [1], {"t": 1}],
+        ids=["str", "none", "bool", "list", "dict"],
+    )
+    def test_a_non_numeric_timestamp_is_dropped(self, tmp_path: Path, bad_ts: object):
+        """`now - h.get("ts", 0)` raises TypeError on anything unsubtractable.
+
+        `True` is in the set deliberately: bool is a subclass of int, so a naive
+        `isinstance(ts, int)` check admits it, and a timestamp of True is not a
+        time even though the arithmetic happens to work.
+        """
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [{"ts": bad_ts, "reason": "x"}],
+        })
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        state = checker._load_state()
+        assert state["restart_history"] == []
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.RESTART
+        )
+
+    def test_a_malformed_neighbour_does_not_discard_real_history(
+        self, tmp_path: Path, stale_status: Path,
+    ):
+        """Dropping the whole list would silently reset flap damping.
+
+        A corrupt write next to three genuine entries must not hand a flapping
+        service `flap_threshold` more unrestrained restarts — which is the exact
+        failure this class's docstring says the normalisation exists to prevent.
+        """
+        now = time.time()
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": (
+                ["not-a-dict"]
+                + [{"ts": now - 5, "reason": "target_inactive"} for _ in range(3)]
+                + [{"ts": "bad", "reason": "target_inactive"}]
+            ),
+        })
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        state = checker._load_state()
+        assert len(state["restart_history"]) == 3, "the valid entries must survive"
+        assert (
+            checker._restart_if_allowed(state, reason="target_inactive")
+            is WatchdogAction.BACKOFF
+        ), "damping must still fire — the malformed neighbours must not reset it"
 
 
 class TestTargetActiveCheck:

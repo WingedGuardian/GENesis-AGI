@@ -622,10 +622,42 @@ class WatchdogChecker:
         the flap window matches by equality) and `last_reason` (which the
         dashboard's degraded card renders). Without the second, an operator keeps
         seeing the retired label until the next restart decision writes over it.
+
+        It also DROPS entries the rest of the class cannot read. Three separate
+        sites filter `restart_history` with ``h.get("reason")`` and
+        ``now - h.get("ts", 0)``, so a persisted entry that is not a dict, or
+        whose timestamp is not a number, takes the watchdog down with an
+        AttributeError or a TypeError — MEASURED on both shapes. Skipping such an
+        entry here (the previous behaviour) left it in the list for those three
+        readers to trip over.
+
+        Filtering at this ONE load path is deliberate: it is the only way state
+        enters the checker, so the three readers cannot each forget the guard.
+        The alternative — teaching every filter to skip malformed entries — is a
+        convention three call sites have to remember, and a fourth reader would
+        reintroduce the crash.
+
+        Valid unrelated entries are kept: a malformed neighbour must not discard
+        real flap history, or a corrupt write would silently reset the damping
+        that stops a restart loop.
         """
-        for entry in state.get("restart_history") or []:
-            if isinstance(entry, dict) and entry.get("reason") in _LEGACY_REASONS:
-                entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+        history = state.get("restart_history") or []
+        if isinstance(history, list):
+            kept = []
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                ts = entry.get("ts", 0)
+                # bool is a subclass of int; a True timestamp is not a time.
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                    continue
+                if entry.get("reason") in _LEGACY_REASONS:
+                    entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+                kept.append(entry)
+            state["restart_history"] = kept
+        else:
+            # Not even a list — the shape below it cannot be trusted either.
+            state["restart_history"] = []
         if state.get("last_reason") in _LEGACY_REASONS:
             state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
         return state
