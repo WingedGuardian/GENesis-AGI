@@ -1559,3 +1559,60 @@ def test_same_worktree_different_subdir_chain_allowed(repo: Path, home: Path) ->
         home,
     )
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ─── merge hint on the DEPTH denial ──────────────────────────────────────────
+#
+# _merge_note was appended to the cap / mode-switch / escalation-ack / audit-ack
+# denials but NOT to the depth denial, so a commit that was only a merge hit the
+# depth gate with no indication a merge was in flight and no route through it.
+# Observed live: a session pulling main into a PR branch aborted the merge rather
+# than use an ack whose stated purpose (a format mismatch) did not fit.
+
+
+def _begin_merge(repo: Path) -> None:
+    """Simulate a merge in flight the way git does — a sentinel in .git."""
+    (repo / ".git" / "MERGE_HEAD").write_text("0" * 40 + "\n")
+
+
+def test_depth_denial_carries_the_merge_hint(repo: Path, home: Path) -> None:
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2
+    assert "review depth" in res.stderr.lower()
+    assert "merge/rebase appears to be in progress" in res.stderr
+
+
+def test_depth_hint_describes_the_DEPTH_failure_not_the_round_counter(
+    repo: Path, home: Path
+) -> None:
+    """The two gates are misled by a merge differently — the counter sees another
+    round, the depth gate sees a large authored change. A reader handed the wrong
+    explanation goes looking for the wrong thing."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "classifies substantiality" in res.stderr
+    assert "already reviewed on its own PR" in res.stderr
+    assert "round counter" not in res.stderr, "that is the OTHER gate's explanation"
+
+
+def test_no_merge_hint_when_no_merge_in_flight(repo: Path, home: Path) -> None:
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    res = _run_hook('git commit -m "prompt"', repo, home)
+    assert res.returncode == 2
+    assert "merge/rebase appears to be in progress" not in res.stderr
+
+
+def test_merge_sentinel_does_not_become_an_exemption(repo: Path, home: Path) -> None:
+    """THE SECURITY PROPERTY. .git/MERGE_HEAD is unauthenticated — anyone with
+    shell access can `echo x > .git/MERGE_HEAD`. The hint tells the author what
+    the gate can see; it must never decide the verdict. A forged sentinel already
+    froze the round counter across three defect rounds once, which is why this is
+    advisory text only and why adding a second caller must not change that."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert res.returncode == 2, "a forged merge sentinel must NOT allow the commit"
+    assert "BLOCKED" in res.stderr
