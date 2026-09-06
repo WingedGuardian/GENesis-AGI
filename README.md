@@ -8,7 +8,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/LOC-150%2C000%2B-informational" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/LOC-298%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
@@ -95,7 +95,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 ## What this is
 
-Genesis is a cognitive architecture that makes the AGI claim explicitly—and backs it up with 150,000 lines of open-source code you can read, run, and challenge.
+Genesis is a cognitive architecture that makes the AGI claim explicitly—and backs it up with open-source code you can read, run, and challenge.
 
 Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.
 
@@ -129,7 +129,7 @@ Genesis is a full system, not a pip package. It runs best on a dedicated Linux m
 |---|---|---|---|
 | **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
 | **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. Service memory caps are percentage-based, so Genesis right-sizes itself to the box — scaling down on an 8 GB host and up on a 32 GB+ one. |
-| **Disk** | 10 GB | 40 GB+ | Fresh install ~400 MB. Memory, logs, and caches grow steadily with use. |
+| **Disk** | 15 GB | 40 GB+ | The installer's pre-flight check requires 15 GB free and stops below it. Fresh install ~400 MB; memory, logs, and caches grow steadily with use. |
 | **CPU** | 2 cores | 4-8 cores | Concurrent background tasks benefit from parallelism. |
 | **Network** | Internet access | Always-on | Cloud LLM APIs required. Offline not supported. |
 
@@ -139,7 +139,9 @@ These are the requirements for the **host VM**. Genesis runs inside a container 
 
 | What you need | Why | Where |
 |---|---|---|
-| **Claude account** | Claude Code powers all reasoning and agentic sessions | [claude.ai](https://claude.ai) |
+| **Claude account** | Powers the Claude Code agentic sessions — the reasoning Genesis does *as* an agent | [claude.ai](https://claude.ai) |
+| **At least one LLM provider key** | **Required.** Genesis's own cognitive layer — routing, reflection, triage, memory extraction — calls these directly and does *not* run on your Claude subscription. Several have free tiers | see `secrets.env.example` |
+| **Telegram bot token** (optional) | Only if you want the Telegram channel: proactive messages, approvals, voice | [@BotFather](https://t.me/botfather) |
 | **Tailscale** (free) | Remote dashboard access from any device — no port-forwarding | [tailscale.com](https://tailscale.com) |
 
 ### Install
@@ -152,13 +154,34 @@ cd ~/genesis-setup
 ./scripts/host-setup.sh
 ```
 
-**After install:**
+Genesis is installed **inside a container** the script creates — the clone on your
+host is only the installer. Everything below happens in the container.
+
+**Step 1 — go in:**
 
 ```bash
-genesis   # shortcut alias the installer adds
-cd ~/genesis
-claude    # start your first session
+genesis   # alias the installer adds; drops you into the container at ~/genesis
 ```
+
+If the alias isn't recognised yet, open a new terminal or `source ~/.bashrc`.
+
+**Step 2 — start your first session and let it set you up:**
+
+```bash
+claude    # onboarding collects your API keys, profile and channels
+```
+
+Onboarding is interactive and covers the credentials Genesis needs. If it doesn't
+start on its own, run `/setup`. You can also edit `~/genesis/secrets.env` directly
+inside the container — the installer creates it from the template but leaves it to
+you to fill in.
+
+**At minimum, set one LLM provider key.** Without it the cognitive layer — routing,
+reflection, triage, memory extraction — has nothing to call, and those are the parts
+described above. Telegram is optional and configured in the same file
+(`TELEGRAM_BOT_TOKEN` from [@BotFather](https://t.me/botfather), plus
+`TELEGRAM_ALLOWED_USERS` — message [@userinfobot](https://t.me/userinfobot) for your
+numeric id); leave both blank to run without that channel.
 
 **What you get:**
 
@@ -258,14 +281,19 @@ L1: Essential Knowledge (~300 tokens, injected at every session start)
     Content: active context, recent decisions, structural overview.
     → The forest view. Always available, even if everything else is down.
 
-L2: Proactive Recall (fires on every user message, <1.5s)
-    Surfaces the top 3 relevant memories automatically—before Genesis
-    even starts thinking about your question.
+L2: Proactive Recall (fires on every user message, ~4.5s budget)
+    Surfaces the most relevant memories automatically—before Genesis
+    even starts thinking about your question. How many depends on what
+    you asked: one for a bare command, three for general conversation,
+    six for a question or a decision (a configurable ceiling caps it at eight).
     Hybrid: FTS5 keyword + Qdrant vector + activation scoring → RRF fusion.
     → You never have to ask "do you remember?"—it already checked.
 
 L3: Deep Search (on-demand, ~1-2s)
-    Full pipeline: 4 ranked signals fused via Reciprocal Rank Fusion.
+    Full pipeline: two to five ranked signals fused via Reciprocal Rank
+    Fusion — vector, keyword and activation, plus intent and event
+    signals when they apply. Degrades to keyword+activation with no
+    embedding provider.
     Wing/room filtering, intent classification, graph traversal.
     → When you need everything Genesis knows about a topic.
 
@@ -283,15 +311,15 @@ Every prompt triggers L2 before Genesis starts reasoning about your question:
 
 1. Your message hits a pre-processing hook
 2. In parallel: FTS5 searches for exact keyword matches (~5ms), Qdrant searches for semantic similarity (1024-dim embeddings, ~400ms)
-3. Activation scoring weighs each candidate: `confidence × recency × (access_freq + connectivity) × class_weight`
+3. Activation scoring weighs each candidate: `confidence × recency × (base + w₁·access_freq + w₂·connectivity) × class_weight` — a weighted blend, not a bare sum. The base term is a floor (default 0.6) so a never-retrieved memory isn't buried by the cold-start problem; the weights are a tunable knob.
 4. Reciprocal Rank Fusion combines the ranked lists—memories appearing in multiple signals accumulate score
-5. Top 3 results inject into context with provenance metadata
+5. Results inject into context with provenance metadata, as many as the stance budget allows
 
-Total budget: under 1.5 seconds. If the embedding provider is down, vector search is skipped—FTS5 still works because it's compiled into SQLite with zero external dependencies. Memory degrades gracefully, never goes dark.
+If the embedding provider is down, vector search is skipped—FTS5 still works because it's compiled into SQLite with zero external dependencies. Memory degrades gracefully, never goes dark.
 
 **Not just documents in a vector space:**
 
-Memories aren't isolated documents—they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. After nearly four months of operation: 40,000+ memories, 42,000+ vectors across two Qdrant collections, and a knowledge graph with 130,000+ typed connections between them.
+Memories aren't isolated documents—they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. As of September 2026, on the install this was measured from: ~86,000 memories, of which ~81,000 are embedded into the episodic vector collection (a second collection holds ~3,900 knowledge-base entries), wired together by ~264,000 typed connections.
 
 An event calendar tracks time-anchored information—deadlines, scheduled tasks, recurring cycles—so Genesis knows not just *what* happened but *when*, and can anticipate what's coming. Procedural memory captures reusable multi-step workflows extracted from experience, each with a calibrated confidence score that promotes or demotes it based on outcomes.
 
@@ -306,23 +334,35 @@ Activation scoring ensures relevance isn't just cosine similarity—it's time-aw
 
 **Session extraction:** After conversations end, a pipeline extracts what mattered—entities, decisions, evaluations, action items, relationships—each tagged with provenance back to the source conversation and line range. The system doesn't just remember what you said. It identifies what's worth keeping.
 
-**Wing taxonomy:** Memory is classified into 15 structural domains (infrastructure, learning, channels, memory, dev_workflow, routing, autonomy, career, integrations, research, and more) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
+**Wing taxonomy:** Memory is classified into 12 structural domains (autonomy, career, channels, dev_workflow, employment, general, infrastructure, integrations, learning, memory, research, routing) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
 
-After nearly four months of operation, Genesis doesn't just have more memories—it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. 40,000+ memories. 11,000+ observations. 2,300+ knowledge base entries. Two vector collections. A knowledge graph with 130,000+ typed connections wiring it all together. That's what separates this from a chatbot with a vector database.
+Volume is the least interesting thing about this, and it is what a vector database with a lot of rows in it also has. The question worth asking is whether retrieval still works once the store is large — so Genesis grades its own recall weekly with an LLM judge and keeps the series:
 
 <p align="center">
-  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth — 40,000+ memories in under four months" width="760">
+  <img src="docs/images/memory-quality-chart.svg" alt="Weekly judged retrieval quality — hit rate and MRR holding steady as the memory store grows" width="760">
 </p>
 
 <details>
-<summary><i>Memory growth by the numbers (March–June 2026, through the 21st)</i></summary>
+<summary><i>How to read that chart — and what it doesn't say</i></summary>
 
-| Month | Memories stored | Observations | Cumulative total |
-|---|---|---|---|
-| March | 1,186 | 2,786 | 1,186 |
-| April | 8,659 | 2,866 | 9,845 |
-| May | 17,172 | 3,119 | 27,017 |
-| June (through 21st) | 13,726 | 2,453 | 40,743 |
+Weekly snapshots from `eval_snapshots`, 2026-05-10 to 2026-09-06, on a single
+install. An LLM judge scores each recall; **hit rate** is whether a relevant
+memory came back at all, **MRR** is how near the top it landed.
+
+- **Sample size varies a lot** between weeks — from single digits to several
+  hundred. The bars along the bottom are those counts. A high point on a thin
+  bar is noise, not a result.
+- **The first three weeks are blank** because no recalls were judged yet. They
+  render as a gap rather than as zeros.
+- **Store size is reconstructed**, by counting rows created on or before each
+  week. It cannot see deletions, so it is biased high on the older weeks.
+- **Precision is not plotted, and it is the metric that has slipped.** Proactive
+  recall returns a fixed *number* of memories rather than everything above a
+  relevance bar, so when fewer memories are genuinely relevant than the budget
+  asks for, the remaining slots get filled anyway. That caps precision by
+  construction. It is an open design question, tracked in the issue tracker.
+
+Regenerate with `python3 scripts/gen_memory_quality_chart.py`.
 
 </details>
 
@@ -355,11 +395,11 @@ Most AI systems log what happened. Genesis classifies *why* it happened, extract
 
 If you treat "I did it wrong" and "I can't do it yet" the same way, you learn the wrong lessons every time.
 
-**Causal attribution asks *why*:** Was it an external limitation? A gap in the user model? A misinterpretation of scope? Each of the 6 attribution types routes to a different subsystem—a user model gap triggers a high-priority observation; an external limitation routes to infrastructure awareness. The diagnosis determines the treatment.
+**Causal attribution asks *why*:** Was it an external limitation? A gap in the user model? A misinterpretation of scope? Each of the 6 attribution types is handled on its own branch—a user model gap raises a high-priority observation, a capability gap is recorded against the capability register rather than as an observation, and a scope the user simply revised is noted without raising anything. The diagnosis determines the treatment.
 
 **Procedure extraction builds reusable knowledge:**
 
-Extracted procedures start at DORMANT (recall-only, never auto-surfaced) and promote through tiers as they prove themselves. Each tier is an *additive* channel — it gets everything the lower tiers do, plus one more surface:
+Procedures enter at DORMANT or LIBRARY depending on which path found them, and promote through the tiers as they prove themselves. A DORMANT procedure is still surfaced on a matching prompt — but only above a stricter similarity bar (0.78 against 0.70 for proven tiers) and labelled an unproven draft, so promotion buys it a lower bar and an unqualified voice rather than visibility it never had. Each tier is an *additive* channel — it gets everything the lower tiers do, plus one more surface:
 
 ```
 DORMANT (new)      → Recall-only. Auto-extracted, unproven.
@@ -368,9 +408,9 @@ ADVISORY (reliable)→ + Tool-trigger advisories. Requires 5+ successes, ≥75% 
 CORE (core)        → + Injected at session start, trigger-cached. Requires 8+ successes, ≥85% confidence.
 ```
 
-Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at ~67% confidence—not zero, not certain. Evidence moves it. Three consecutive failures and `failure_count >= success_count + 3` triggers demotion. Confidence below 30% with enough samples quarantines the procedure entirely.
+Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at 50% confidence at most—the validation gate caps it—and one admitted by the novelty judge starts at zero. Evidence moves it. Demotion triggers when `failure_count >= success_count + 3` and the procedure has accumulated at least three failure-mode hits. Confidence below 30% with enough samples quarantines the procedure entirely.
 
-**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight—no single event overcorrects. Protected behaviors (honesty, transparency, pushback) cannot be eroded by weak signals regardless of volume.
+**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight—no single event overcorrects. A set of protected behaviors (honesty, transparency, pushback) is defined, with the rule that weak signals must not erode them — but that rule is groundwork: it is not yet wired into the drive-update path, so today it constrains nothing.
 
 This isn't "log what happened and hope the next session reads it." It's a closed loop: classify outcome → diagnose cause → extract principle → verify principle → promote or demote. The system gets measurably better at its job over time, and it can show you the receipts.
 
@@ -393,7 +433,7 @@ Under the hood, autonomy is tracked as a **capability-grant matrix**—a grant p
 
 Trust is granular, not binary. First failure in a category triggers demotion—Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
 
-The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate—one approval per request, no blanket passes, no stale reuse. The user sees what's proposed and decides what runs.
+The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate, and nothing bypasses it. Two things worth knowing about how it behaves in practice: pending requests can be approved as a batch when several have stacked up, and an approval that was granted but never consumed can be reused for a bounded window rather than re-asking. The user sees what's proposed and decides what runs.
 
 **Goal-driven behavior:** Genesis tracks your goals—milestones and ongoing objectives alike—and proactively reviews them when they go stale. Goals decompose into subgoals with tracked completion. When all subgoals of a milestone are achieved, Genesis surfaces it. Each goal can have its own review cadence, or fall back to a global default. You don't manage a task tracker—Genesis manages the goals and tells you when something needs your attention or when something is done.
 
@@ -409,7 +449,7 @@ Genesis manages its own infrastructure. When something breaks, it diagnoses and 
 
 Two independent systems monitor each other in a closed loop. The external watchdog—running on the host VM outside the container—spawns its own Claude Code session to diagnose and restore Genesis if the container goes unhealthy. The container-side counterpart has its own 6-state machine (healthy → investigating → remediating → escalated → awaiting approval), alarm classifier, and exponential backoff across four tiers before escalation. If the external watchdog goes silent, Genesis detects the stale heartbeat and restarts it over SSH. Neither one runs unprotected. Neither one is a single point of failure.
 
-The resilience layer tracks four independent failure axes—cloud availability, memory, embeddings, and Claude Code availability—each with its own degradation levels:
+The resilience layer tracks six independent failure axes—cloud availability, memory, embeddings, Claude Code availability, temp-space pressure, and network—each with its own degradation levels:
 
 | Axis | Healthy | Degraded | Down |
 |---|---|---|---|
@@ -417,8 +457,10 @@ The resilience layer tracks four independent failure axes—cloud availability, 
 | **Memory** | Qdrant + FTS5 operational | FTS5-only retrieval | Memory store unreachable |
 | **Embedding** | Provider responding | Writes queued for retry | Provider unavailable |
 | **CC** | Sessions dispatching normally | Deferred work queue active | All reflections deferred |
+| **Temp space** | Under half the configured budget | 50-90% used | Over 90%, or protected space breached |
+| **Network** | Connectivity confirmed | Reachable but impaired | No connectivity across probe anchors |
 
-When something breaks: work gets deferred with staleness policies, routing walks the fallback chain, circuit breakers automatically test recovery, and the recovery orchestrator coordinates across all four axes. Most systems have binary health: up or down. Genesis maps the entire space in-between.
+When something breaks: work gets deferred with staleness policies, routing walks the fallback chain, circuit breakers automatically test recovery, and the recovery orchestrator coordinates across the axes. Network is tracked separately and deliberately kept out of the legacy composite level, so it informs diagnosis without silently reclassifying everything else. Most systems have binary health: up or down. Genesis maps the entire space in-between.
 
 Genesis also routes LLM work across model tiers automatically—starting with the cheapest capable model, not the most expensive. Local free models handle extraction. Frontier models handle strategic reasoning. Circuit breakers and fallback chains mean the call site never fails—only individual providers do. Graceful degradation all the way down.
 
@@ -430,7 +472,7 @@ Genesis operates in the real world through always-on channels:
 
 **Email** — Two-layer AI triage: a fast model reads and scores every email, a capable model makes final keep/discard decisions on what survives. Relevant findings get stored as searchable intelligence. Your inbox processed by a paralegal and a judge.
 
-**Inbox** — Drop anything—a markdown file, a URL, a PDF, a voice memo—into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and sends you a summary via Telegram within minutes. Drop it in your notes. Walk away.
+**Inbox** — Drop anything—a markdown file, a URL, a PDF, a voice memo—into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and queues the result for your next session or digest. Drop it in your notes. Walk away.
 
 **Telegram** — Proactive notifications, morning digests, and conversational interaction. Genesis reaches out when it has something worth saying. Not a notification firehose—calibrated outreach based on measured engagement. Voice input works too: speech gets transcribed and routed through the same pipeline as text.
 
@@ -452,7 +494,7 @@ When Genesis runs a module, it doesn't just call it. It remembers the results. I
 
 The `/integrate-module` skill handles onboarding automatically—discovery, connection mapping, config generation, dashboard setup, verification, and documentation. You don't touch Genesis's code. You just ask.
 
-**Included:** content pipeline (drafting, publishing, analytics), crypto market monitoring, prediction market analysis.
+**Included:** content pipeline (drafting, publishing, analytics) ships enabled. Crypto market monitoring and prediction market analysis ship present but disabled — turn them on in `config/modules/` if you want them.
 
 ---
 
@@ -577,7 +619,7 @@ The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **
 
 Every change is proposed to the user first. Genesis backs itself up before self-modification, tests in isolation, and rolls back automatically if something breaks.
 
-Nobody else is attempting this. Most agent frameworks are still building prompt chains and calling it intelligence. Giving a system a framework and the capability to autonomously upgrade itself may end up being the pinnacle of an "AGI-like" system, or the downfall of the whole thing—we're bold enough to build it and find out which.
+Very few people are attempting this. Most agent frameworks are still building prompt chains and calling it intelligence. Giving a system a framework and the capability to autonomously upgrade itself may end up being the pinnacle of an "AGI-like" system, or the downfall of the whole thing—we're bold enough to build it and find out which.
 
 <p align="center">
   <img src="docs/images/data-acceptable.jpg" alt="That is acceptable." width="280">
@@ -617,7 +659,7 @@ The complete design lives in [`docs/`](docs/), indexed at [`docs/INDEX.md`](docs
 
 ## Primitives from the Genesis portfolio
 
-Standalone libraries extracted from Genesis, stabilized against production use:
+Standalone libraries extracted from Genesis. They are early — extracted from working code, but not independently versioned or actively maintained as separate projects:
 
 - [**genesis-router**](https://github.com/WingedGuardian/genesis-router) — LLM routing with circuit breakers, self-escalation, and failover chains.
 - [**genesis-memory**](https://github.com/WingedGuardian/genesis-memory) — Hybrid AI memory: Qdrant vectors + SQLite FTS5 + multi-factor scoring + MCP server.

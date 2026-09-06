@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" role="img" aria-label="Memory retrieval quality against store size, weekly">
+<defs>
+<linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+<stop offset="0%" style="stop-color:#0d1117"/>
+<stop offset="100%" style="stop-color:#161b22"/>
+</linearGradient>
+<linearGradient id="poolFill" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:#533483;stop-opacity:0.42"/><stop offset="100%" style="stop-color:#533483;stop-opacity:0.04"/></linearGradient>
+</defs>
+<rect width="1200" height="520" fill="url(#bg)"/>
+<text x="78" y="34" fill="#e6edf3" font-size="19" font-weight="600">Retrieval quality held while the store grew 3.1&#215;</text>
+<text x="78" y="56" fill="#8b949e" font-size="13">Weekly LLM-judged recall quality. Bars show how many recalls were judged that week &#8212; wider sample, more trustworthy point.</text>
+<line x1="78" y1="428.0" x2="1108" y2="428.0" stroke="#30363d" stroke-width="1"/>
+<text x="66" y="432.0" fill="#8b949e" font-size="12" text-anchor="end">0.00</text>
+<line x1="78" y1="339.5" x2="1108" y2="339.5" stroke="#30363d" stroke-width="1"/>
+<text x="66" y="343.5" fill="#8b949e" font-size="12" text-anchor="end">0.25</text>
+<line x1="78" y1="251.0" x2="1108" y2="251.0" stroke="#30363d" stroke-width="1"/>
+<text x="66" y="255.0" fill="#8b949e" font-size="12" text-anchor="end">0.50</text>
+<line x1="78" y1="162.5" x2="1108" y2="162.5" stroke="#30363d" stroke-width="1"/>
+<text x="66" y="166.5" fill="#8b949e" font-size="12" text-anchor="end">0.75</text>
+<line x1="78" y1="74.0" x2="1108" y2="74.0" stroke="#30363d" stroke-width="1"/>
+<text x="66" y="78.0" fill="#8b949e" font-size="12" text-anchor="end">1.00</text>
+<path d="M 78,428.0 L 78.0,361.5 L 135.2,343.3 L 192.4,332.0 L 249.7,314.3 L 306.9,300.2 L 364.1,289.1 L 421.3,282.5 L 478.6,257.5 L 535.8,244.0 L 593.0,227.9 L 650.2,204.9 L 707.4,181.1 L 764.7,166.9 L 821.9,153.7 L 879.1,136.1 L 936.3,122.3 L 993.6,110.7 L 1050.8,97.4 L 1108.0,74.0 L 1108,428.0 Z" fill="url(#poolFill)"/>
+<rect x="246.7" y="452.8" width="6" height="5.2" fill="#8b949e" opacity="0.55"/>
+<rect x="303.9" y="432.0" width="6" height="26.0" fill="#8b949e" opacity="0.55"/>
+<rect x="361.1" y="433.3" width="6" height="24.7" fill="#8b949e" opacity="0.55"/>
+<rect x="418.3" y="439.1" width="6" height="18.9" fill="#8b949e" opacity="0.55"/>
+<rect x="475.6" y="455.8" width="6" height="2.2" fill="#8b949e" opacity="0.55"/>
+<rect x="532.8" y="457.6" width="6" height="0.4" fill="#8b949e" opacity="0.55"/>
+<rect x="590.0" y="456.4" width="6" height="1.6" fill="#8b949e" opacity="0.55"/>
+<rect x="647.2" y="454.7" width="6" height="3.3" fill="#8b949e" opacity="0.55"/>
+<rect x="704.4" y="455.0" width="6" height="3.0" fill="#8b949e" opacity="0.55"/>
+<rect x="761.7" y="439.5" width="6" height="18.5" fill="#8b949e" opacity="0.55"/>
+<rect x="818.9" y="443.2" width="6" height="14.8" fill="#8b949e" opacity="0.55"/>
+<rect x="876.1" y="437.5" width="6" height="20.5" fill="#8b949e" opacity="0.55"/>
+<rect x="933.3" y="444.0" width="6" height="14.0" fill="#8b949e" opacity="0.55"/>
+<rect x="990.6" y="449.1" width="6" height="8.9" fill="#8b949e" opacity="0.55"/>
+<rect x="1047.8" y="437.4" width="6" height="20.6" fill="#8b949e" opacity="0.55"/>
+<rect x="1105.0" y="450.7" width="6" height="7.3" fill="#8b949e" opacity="0.55"/>
+<path d="M 249.7,149.1 L 306.9,180.3 L 364.1,197.8 L 421.3,205.2 L 478.6,160.3 L 535.8,124.6 L 593.0,156.6 L 650.2,130.2 L 707.4,130.9 L 764.7,139.6 L 821.9,117.0 L 879.1,136.1 L 936.3,153.9 L 993.6,159.9 L 1050.8,134.8 L 1108.0,130.0" fill="none" stroke="#3fb950" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="249.7" cy="149.1" r="3.2" fill="#3fb950"/>
+<circle cx="306.9" cy="180.3" r="3.2" fill="#3fb950"/>
+<circle cx="364.1" cy="197.8" r="3.2" fill="#3fb950"/>
+<circle cx="421.3" cy="205.2" r="3.2" fill="#3fb950"/>
+<circle cx="478.6" cy="160.3" r="3.2" fill="#3fb950"/>
+<circle cx="535.8" cy="124.6" r="3.2" fill="#3fb950"/>
+<circle cx="593.0" cy="156.6" r="3.2" fill="#3fb950"/>
+<circle cx="650.2" cy="130.2" r="3.2" fill="#3fb950"/>
+<circle cx="707.4" cy="130.9" r="3.2" fill="#3fb950"/>
+<circle cx="764.7" cy="139.6" r="3.2" fill="#3fb950"/>
+<circle cx="821.9" cy="117.0" r="3.2" fill="#3fb950"/>
+<circle cx="879.1" cy="136.1" r="3.2" fill="#3fb950"/>
+<circle cx="936.3" cy="153.9" r="3.2" fill="#3fb950"/>
+<circle cx="993.6" cy="159.9" r="3.2" fill="#3fb950"/>
+<circle cx="1050.8" cy="134.8" r="3.2" fill="#3fb950"/>
+<circle cx="1108.0" cy="130.0" r="3.2" fill="#3fb950"/>
+<path d="M 249.7,188.1 L 306.9,212.5 L 364.1,232.9 L 421.3,244.3 L 478.6,189.8 L 535.8,124.6 L 593.0,174.3 L 650.2,147.0 L 707.4,154.1 L 764.7,155.3 L 821.9,131.1 L 879.1,148.4 L 936.3,168.9 L 993.6,178.4 L 1050.8,161.9 L 1108.0,157.8" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="249.7" cy="188.1" r="3.2" fill="#58a6ff"/>
+<circle cx="306.9" cy="212.5" r="3.2" fill="#58a6ff"/>
+<circle cx="364.1" cy="232.9" r="3.2" fill="#58a6ff"/>
+<circle cx="421.3" cy="244.3" r="3.2" fill="#58a6ff"/>
+<circle cx="478.6" cy="189.8" r="3.2" fill="#58a6ff"/>
+<circle cx="535.8" cy="124.6" r="3.2" fill="#58a6ff"/>
+<circle cx="593.0" cy="174.3" r="3.2" fill="#58a6ff"/>
+<circle cx="650.2" cy="147.0" r="3.2" fill="#58a6ff"/>
+<circle cx="707.4" cy="154.1" r="3.2" fill="#58a6ff"/>
+<circle cx="764.7" cy="155.3" r="3.2" fill="#58a6ff"/>
+<circle cx="821.9" cy="131.1" r="3.2" fill="#58a6ff"/>
+<circle cx="879.1" cy="148.4" r="3.2" fill="#58a6ff"/>
+<circle cx="936.3" cy="168.9" r="3.2" fill="#58a6ff"/>
+<circle cx="993.6" cy="178.4" r="3.2" fill="#58a6ff"/>
+<circle cx="1050.8" cy="161.9" r="3.2" fill="#58a6ff"/>
+<circle cx="1108.0" cy="157.8" r="3.2" fill="#58a6ff"/>
+<text x="78.0" y="482" fill="#8b949e" font-size="11" text-anchor="middle">05-10</text>
+<text x="306.9" y="482" fill="#8b949e" font-size="11" text-anchor="middle">06-07</text>
+<text x="535.8" y="482" fill="#8b949e" font-size="11" text-anchor="middle">06-28</text>
+<text x="764.7" y="482" fill="#8b949e" font-size="11" text-anchor="middle">07-26</text>
+<text x="993.6" y="482" fill="#8b949e" font-size="11" text-anchor="middle">08-23</text>
+<text x="1108.0" y="482" fill="#8b949e" font-size="11" text-anchor="middle">09-06</text>
+<rect x="78" y="486" width="11" height="11" rx="2" fill="#3fb950"/>
+<text x="96" y="496" fill="#8b949e" font-size="12">hit rate  0.79 → 0.84</text>
+<rect x="242" y="486" width="11" height="11" rx="2" fill="#58a6ff"/>
+<text x="260" y="496" fill="#8b949e" font-size="12">MRR  0.68 → 0.76</text>
+<rect x="372" y="486" width="11" height="11" rx="2" fill="#533483"/>
+<text x="390" y="496" fill="#8b949e" font-size="12">store size  16,123 → 85,810 (reconstructed)</text>
+<text x="1108" y="496" fill="#8b949e" font-size="11" text-anchor="end">2026-05-10 – 2026-09-06 (judged from 2026-05-31)</text>
+</svg>
