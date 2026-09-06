@@ -156,3 +156,8 @@ scripts/cops_interop.sh
 
 # Personal skills (user-level data, lives at ~/.claude/skills/)
 .claude/skills/code-voice/
+
+# pytest junit report, written by CI's test job. Carries hostname and
+# absolute local paths, and a committed copy would let the skip-ceiling
+# checker read a stale report as a live measurement.
+junit.xml
