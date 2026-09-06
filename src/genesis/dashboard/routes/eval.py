@@ -22,6 +22,30 @@ _HEADLINE_DEFN_KEY = {
     "ego": "approval_rate_defn",
 }
 
+
+def detect_series_break(
+    snapshots: list[dict], defn_key: str | None,
+) -> str | None:
+    """period_end where a headline metric's DEFINITION changes, else None.
+
+    A redefined metric cannot be read as one trend line: the ego's
+    approval_rate denominator changed on 2026-09-06, which shrinks the
+    denominator and raises the rate, so an unmarked series would show a rise
+    caused by nothing but the redefinition. Points are kept and the break is
+    named, rather than dropping points and blanking the chart.
+
+    Snapshots must be in chronological order.
+    """
+    if not defn_key:
+        return None
+    prev_defn = None
+    for i, snap in enumerate(snapshots):
+        defn = (snap.get("metrics") or {}).get(defn_key)
+        if i > 0 and defn != prev_defn:
+            return snap.get("period_end")
+        prev_defn = defn
+    return None
+
 _HEADLINE_METRIC = {
     "memory": "precision_at_5",
     "system": "composite_score",
@@ -95,20 +119,14 @@ async def metrics_compounding():
         # per point and name where it breaks, rather than dropping points and
         # blanking the chart.
         defn_key = _HEADLINE_DEFN_KEY.get(dim)
-        series_break_at = None
-        prev_defn = None
+        series_break_at = detect_series_break(snapshots, defn_key)
         for snap in snapshots:
             metrics = snap.get("metrics", {})
-            defn = metrics.get(defn_key) if defn_key else None
-            if (defn_key and series_break_at is None and series
-                    and defn != prev_defn):
-                series_break_at = snap.get("period_end")
-            prev_defn = defn
             series.append({
                 "period_end": snap.get("period_end"),
                 "value": metrics.get(headline_key),
                 "sample_count": snap.get("sample_count", 0),
-                "definition": defn,
+                "definition": metrics.get(defn_key) if defn_key else None,
                 "metrics": metrics,
             })
 

@@ -1777,3 +1777,29 @@ async def test_withheld_grade_reason_reaches_the_dashboard_key(db):
     if info.get("reason") and "reason" not in grade_factors:
         grade_factors["reason"] = info["reason"]          # the persist chokepoint
     assert "judged" in grade_factors["reason"], grade_factors["reason"]
+
+
+async def test_a_failed_execution_still_counts_as_an_approval(db):
+    """`failed` is post-approval, so it belongs in the approval numerator.
+
+    ego_crud.execute_proposal only transitions rows that are already
+    'approved', and mark_proposal_verification_failed only transitions rows
+    that are already 'executed'. So a failed proposal is by definition one the
+    user approved; scoring it as an approval failure conflates execution with
+    approval — the same conflation the rest of this change removes. Its
+    failure is measured separately by execution_success_rate.
+    """
+    from genesis.eval.j9_aggregator import _compute_ego_quality
+
+    await _seed_window_proposals(
+        db,
+        [("approved", 0.8, True), ("executed", 0.8, True),
+         ("failed", 0.8, True), ("rejected", 0.8, True)],
+    )
+    metrics, _ = await _compute_ego_quality(
+        db, "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+    )
+    # 3 of 4 judged proposals were approved; only the rejection was not.
+    assert metrics["approval_rate"] == 0.75, metrics
+    # The failure is still counted, in the metric that measures execution.
+    assert metrics["execution_success_rate"] == 0.5, metrics

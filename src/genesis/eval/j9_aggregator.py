@@ -494,7 +494,14 @@ async def _compute_ego_quality(
     # bookkeeping (2026-09-06: one self-tabled row was the entire denominator).
     _NOT_A_JUDGMENT = ("pending", "expired", "tabled", "withdrawn")
     resolved = [p for p in proposals if p["status"] not in _NOT_A_JUDGMENT]
-    approved = [p for p in resolved if p["status"] in ("approved", "executed")]
+    # 'failed' belongs in the NUMERATOR: it is reachable only from 'approved'
+    # (execute_proposal) or from 'executed' (mark_proposal_verification_failed),
+    # so a failed proposal is by definition one the user approved. Counting it
+    # as an approval failure conflates execution with approval — the same
+    # conflation this whole change exists to remove. Its failure is already
+    # measured, separately and correctly, by execution_success_rate below.
+    _WAS_APPROVED = ("approved", "executed", "failed")
+    approved = [p for p in resolved if p["status"] in _WAS_APPROVED]
     approval_rate = round(len(approved) / len(resolved), 4) if resolved else None
 
     # Execution success rate
@@ -515,7 +522,7 @@ async def _compute_ego_quality(
                           else p["confidence"] < bucket_high)]
         if in_bucket:
             bucket_approved = [p for p in in_bucket
-                               if p["status"] in ("approved", "executed")]
+                               if p["status"] in _WAS_APPROVED]
             calibration[label] = {
                 "count": len(in_bucket),
                 "success_rate": round(len(bucket_approved) / len(in_bucket), 4),
@@ -532,11 +539,12 @@ async def _compute_ego_quality(
         "total_unjudged": total - len(resolved),
         # SERIES BREAK MARKER. approval_rate is the ego dimension's headline
         # metric — it drives the dashboard sparkline and _extract_trend_values
-        # -> ego_slope -> go_ready. v1 counted tabled/withdrawn as rejections;
-        # v2 (2026-09-06) excludes them, which shrinks the denominator and
-        # mechanically RAISES the rate. Without this marker the trend would
-        # read as improvement caused by nothing but the redefinition. Same
-        # discipline as judge_prompt_versions above.
+        # -> ego_slope -> go_ready. v2 (2026-09-06) changes it three ways
+        # against v1: tabled/withdrawn leave the denominator, `failed` joins
+        # the numerator, and the calibration buckets stop dropping a
+        # confidence of exactly 1.0. All three RAISE the rate. Without this
+        # marker the trend would read as improvement caused by nothing but the
+        # redefinition. Same discipline as judge_prompt_versions above.
         "approval_rate_defn": _EGO_APPROVAL_RATE_DEFN,
     }
     return metrics, total
