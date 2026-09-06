@@ -19,6 +19,23 @@ class CCProcessError(CCError):
     """CC CLI exited with non-zero status."""
 
 
+class CCStreamTruncatedError(CCProcessError):
+    """A stream line exceeded the reader limit and took the RESULT with it.
+
+    Separate from a bare ``CCProcessError`` because the RECOVERY differs, not
+    because the message does. This is an output-SIZE failure on a session that
+    is otherwise healthy: the CLI ran, tools executed, an answer was produced,
+    and only the transport lost it. Re-running the prompt from scratch would
+    therefore re-execute every tool call the first attempt already made — an
+    MCP write, an outreach send — with nothing downstream to dedupe them.
+
+    So conversation.py must re-raise this instead of routing it into
+    stale-resume recovery, which exists for a session that no longer resolves.
+    Subclasses ``CCProcessError`` so existing handlers keep catching it; the
+    distinction only has to be visible to the one place that retries.
+    """
+
+
 class CCParsingError(CCError):
     """Failed to parse CC output as structured JSON."""
 

@@ -18,6 +18,7 @@ from genesis.cc.exceptions import (
     CCNetworkOfflineError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCStreamTruncatedError,
     CCTimeoutError,
 )
 from genesis.cc.formatter import ResponseFormatter
@@ -898,11 +899,20 @@ class ConversationLoop:
             CCQuotaExhaustedError,
             CCTimeoutError,
             CCNetworkOfflineError,
+            CCStreamTruncatedError,
         ):
             # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
             # a timeout retry just burns a second full window (2026-06-30 DM). A
             # network-offline preflight (PR-3) likewise must NOT fail the live
             # session as a stale resume — the internet is down, not the session.
+            #
+            # CCStreamTruncatedError is here for a DIFFERENT reason, and the
+            # difference matters: retrying would work. It must not, because the
+            # first attempt already ran its tool calls — an MCP write, an
+            # outreach send — before the oversized line ate its answer, and a
+            # fresh run would repeat them with nothing downstream to dedupe.
+            # The session is healthy; only the transport failed. Losing one
+            # answer loudly beats performing its side effects twice.
             raise
         except CCError:
             if not was_resume:
@@ -1063,10 +1073,26 @@ class ConversationLoop:
             inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
         try:
             return await self._invoke_peer(inv, on_event)
-        except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError):
+        except (
+            CCRateLimitError,
+            CCQuotaExhaustedError,
+            CCNetworkOfflineError,
+            CCStreamTruncatedError,
+        ):
             # Offline joins the fast-re-raise (same class as CAVEAT A): a dead
             # network is not a stale peer resume — retrying fresh won't help and
             # must not mark the sticky peer session stale.
+            #
+            # CCStreamTruncatedError joins it because THIS handler is the second
+            # retry site, and the size failure defeats its own side-effect guard.
+            # The `streamed.get("text")` check below exists to stop a re-run once
+            # answer text has reached the user — but an oversized line eats the
+            # answer, so `text` is empty precisely when the re-run is least safe.
+            # The peer already ran its tool calls; replaying the prompt repeats
+            # them. Before this branch typed the failure it arrived as a bare
+            # ValueError and missed this handler entirely, so classifying it is
+            # what armed this path — the type has to be re-raised at BOTH sites
+            # or the fix moves the hazard instead of removing it.
             raise
         except CCError as exc:
             # Don't re-run: nothing to recover if already fresh, and never once

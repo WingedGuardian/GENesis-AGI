@@ -24,6 +24,7 @@ from genesis.cc.exceptions import (
     CCQuotaExhaustedError,
     CCRateLimitError,
     CCSessionError,
+    CCStreamTruncatedError,
     CCTimeoutError,
 )
 from genesis.cc.types import (
@@ -265,6 +266,13 @@ _BG_WAIT_HARD_MARGIN_MS = 60_000
 # before the group-kill escalation (reap_bounded waits only on the leader, so
 # without this a still-flushing MCP child gets zero grace of its own).
 _ESCALATION_GRACE_S = 2.0
+
+# Max bytes in ONE stream-json line. CC lines routinely exceed asyncio's
+# 64 KiB default (a tool result is one line), so the reader is given a
+# generous ceiling; a line ABOVE it is dropped rather than allowed to abort
+# the stream — see the read loop in run_streaming.
+_STREAM_LINE_LIMIT = 1_048_576  # 1 MiB
+
 # Stable prefix of the CLI's headless bg-ceiling message (the numeric duration
 # varies): "Background tasks still running after 600s; terminating." Matching the
 # prefix is version-drift-tolerant — a miss degrades to no truncation notice
@@ -1150,7 +1158,7 @@ class CCInvoker:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=1_048_576,  # 1MB — CC stream-json lines can exceed 64KB default
+                limit=_STREAM_LINE_LIMIT,
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
                 # Own session/group (setsid in the C helper — never preexec_fn:
@@ -1204,11 +1212,55 @@ class CCInvoker:
         timed_out = False
         terminated_after_result = False
         line_count = 0
+        oversized_dropped = 0
         multi_block_seen = False
 
         try:
             async with asyncio.timeout(invocation.timeout_s):
-                async for raw_line in proc.stdout:
+                # Deliberately NOT `async for raw_line in proc.stdout`. That
+                # protocol lets a single over-limit line abort the whole stream:
+                # StreamReader.__anext__ -> readline() raises ValueError when one
+                # line exceeds `limit` (1 MiB, set at spawn), and it propagated
+                # out of the loop and killed the session. MEASURED 2026-09-02:
+                # a browser session lost 104.4s of completed work to one
+                # oversized MCP tool result.
+                #
+                # Recovery is safe by construction, not by hope: CPython's
+                # StreamReader.readline() DELETES the consumed span (or clears
+                # the buffer outright) BEFORE it raises, so re-entering the loop
+                # cannot re-raise on the same bytes and cannot spin. Verified
+                # against the stdlib source on Python 3.12. Progress is
+                # guaranteed — each raising call consumes at least `limit`
+                # bytes. The enclosing asyncio.timeout is a backstop ONLY
+                # because the drop branch yields — see the sleep(0) below.
+                while True:
+                    try:
+                        raw_line = await proc.stdout.readline()
+                    except ValueError:
+                        # Over-limit line. It is unusable either way (no JSON
+                        # can be parsed from a truncated span), so the only
+                        # question is whether losing it costs the LINE or the
+                        # SESSION. Drop the line.
+                        oversized_dropped += 1
+                        # Yield explicitly: this branch has no other await, so
+                        # without it a readline() that raises WITHOUT consuming
+                        # would spin with the event loop locked out and
+                        # asyncio.timeout could never fire. Progress against a
+                        # real StreamReader is guaranteed by consumption, not by
+                        # this — but the timeout is only a backstop if we yield.
+                        await asyncio.sleep(0)
+                        if oversized_dropped <= 3 or oversized_dropped % 25 == 0:
+                            logger.warning(
+                                "CC stream line exceeded the %d-byte limit and was "
+                                "DROPPED (PID %s, dropped=%d) — a tool result was "
+                                "almost certainly too large; the session continues",
+                                _STREAM_LINE_LIMIT,
+                                proc.pid,
+                                oversized_dropped,
+                            )
+                        continue
+                    if not raw_line:
+                        break  # EOF
                     line = raw_line.decode(errors="replace").strip()
                     if not line:
                         continue
@@ -1362,15 +1414,27 @@ class CCInvoker:
             )
 
         logger.info(
-            "CC streaming finished (PID %s, exit=%s, lines=%d, has_result=%s, "
-            "terminated=%s, %.1fs)",
+            "CC streaming finished (PID %s, exit=%s, lines=%d, dropped_oversized=%d, "
+            "has_result=%s, terminated=%s, %.1fs)",
             proc.pid,
             proc.returncode,
             line_count,
+            oversized_dropped,
             result_data is not None,
             terminated_after_result,
             elapsed / 1000,
         )
+        if oversized_dropped:
+            # Loud at the boundary: a dropped line is invisible degradation, and
+            # a session that dropped lines AND produced no result deserves the
+            # cause named rather than a bare "empty output".
+            logger.warning(
+                "CC stream dropped %d over-limit line(s) (PID %s, limit=%d bytes)%s",
+                oversized_dropped,
+                proc.pid,
+                _STREAM_LINE_LIMIT,
+                "" if result_data is not None else " — and NO result event arrived",
+            )
         if event_types:
             logger.info("CC stream events: %s", " → ".join(event_types))
 
@@ -1424,15 +1488,81 @@ class CCInvoker:
                 await self._notify_status_change(err)
                 raise err
 
+            # A result arrived, but a dropped line left it with NO text — so the
+            # dropped line WAS the answer. `_parse_result_dict` already recovers
+            # an extended-thinking response from the collected text events just
+            # above, which is the only benign reason a result is textless; past
+            # that, empty-after-a-drop means the answer is gone.
+            #
+            # Both other options are wrong here. Returning it as success records
+            # a phantom completion (`success = not output.is_error` in
+            # cc/direct_session.py), and on the home model that calls
+            # note_home_recovery() — clearing an account-wide fallback on a run
+            # that produced nothing. Firing the empty-output callback instead
+            # forges the silent-subscription-cap signature that cc_relay.py
+            # escalates, naming a cause that is not the cause. Raise.
+            # NOT gated on `expect_output`. That flag defaults False and is set
+            # by 13 cognitive callers; `cc/direct_session.py` and
+            # `cc/conversation.py` — the two this comment names, and the path the
+            # motivating incident came from — never set it. Gating here made the
+            # guard inert on exactly the callers it was written for. The harm is
+            # not "the caller wanted output and got none", it is "an answer was
+            # produced and we lost it", which is a failure either way.
+            if oversized_dropped and not output.text.strip():
+                raise CCStreamTruncatedError(
+                    f"CC stream dropped {oversized_dropped} over-limit line(s) "
+                    f"(limit={_STREAM_LINE_LIMIT} bytes) and the result carried "
+                    "no text — the answer was almost certainly one of them"
+                )
+
             # Success — notify recovery if previously errored
             if self._last_was_error:
                 await self._notify_status_change(None)
             await self._fire_downgrade_callback(output)
             # Silent-cap detection: reaching here means is_error=False AND no
             # rate_limit_event (both handled above) — empty text is the signal.
-            if invocation.expect_output and not output.is_error and not output.text.strip():
+            if (
+                invocation.expect_output
+                and not output.is_error
+                and not output.text.strip()
+                # A dropped over-limit line is a KNOWN cause of thin output.
+                # Reporting it as the unexplained-empty signature would forge a
+                # silent-subscription-cap alert naming a cause that is not the
+                # cause (runtime/init/cc_relay.py aggregates these).
+                and not oversized_dropped
+            ):
                 await self._fire_empty_output_callback(invocation, output)
             return output
+
+        # A dropped line cost us the RESULT, not just a trace line. This must
+        # NEVER return as success: `success = not output.is_error`
+        # (cc/direct_session.py) would record a phantom completion, and on the
+        # home model that path calls note_home_recovery(), CLEARING an
+        # account-wide rate-limit fallback on the strength of a run that
+        # produced nothing. The empty-text shape also forges the silent
+        # subscription-cap signature that runtime/init/cc_relay.py turns into a
+        # CRITICAL infrastructure alert — an alert naming a cause that is not
+        # the cause. Before the drop-and-continue loop this case raised; keep it
+        # raising, because a loud wrong answer beats a quiet false one.
+        # ...UNLESS the missing result is already explained. A background run
+        # SIGKILLed at the CLI's wait ceiling legitimately produces no result
+        # event, and the no-result fallback below returns what it collected with
+        # bg_truncated=True — a supported shape with its own truncation notice.
+        # Inferring "the result line was dropped" when bg_truncated and real
+        # text both say otherwise throws away a usable partial deliverable.
+        # Only claim the drop ate the result when nothing else accounts for it.
+        # `collected_text` is a list of raw text blocks and a whitespace-only
+        # block is truthy, so testing the LIST would exempt a run whose only
+        # "deliverable" is blank — which then reaches the empty-text cap
+        # detector below and forges the very alert this PR is careful not to
+        # forge. Join and strip: the question is whether real text survived.
+        partial_text = "".join(collected_text).strip()
+        if oversized_dropped and result_data is None and not (bg_truncated and partial_text):
+            raise CCStreamTruncatedError(
+                f"CC stream dropped {oversized_dropped} over-limit line(s) "
+                f"(limit={_STREAM_LINE_LIMIT} bytes) and NO result event "
+                "arrived — the result line was almost certainly one of them"
+            )
 
         # No result event — treat collected text as response (success path)
         if self._last_was_error:
@@ -1460,6 +1590,13 @@ class CCInvoker:
             and not output.is_error
             and not output.text.strip()
             and "rate_limit_event" not in event_types
+            # A drop CAN reach here now: the bg-truncation exemption above lets a
+            # dropped run through when real partial text survived. That is why
+            # the exemption strips before testing — text that survives is text
+            # this branch will find, so it cannot be empty AND dropped. An
+            # earlier revision of this comment claimed drops were impossible
+            # here, which the exemption had just made false.
+            and not oversized_dropped
         ):
             await self._fire_empty_output_callback(invocation, output)
         return output
