@@ -2778,7 +2778,9 @@ async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
 
 
 @pytest.mark.asyncio
-async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(invoker):
+async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(
+    invoker, monkeypatch
+):
     """CLAUSE COVER for `oversized_dropped` in the result guard.
 
     Empty output with NO drop is the unexplained-empty shape the silent-cap
@@ -2786,11 +2788,16 @@ async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(invoker
     deleting that clause — so any empty result raises — passes the suite, and
     the cap detector goes permanently silent behind an exception.
     """
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
         _result_event(""),
     )
     proc = _streaming_proc(data)  # nothing dropped
+    proc.pid = 4242  # never leave pid to a mock default near killpg
     fired = []
 
     async def _spy(*a, **k):
@@ -2806,18 +2813,23 @@ async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(invoker
 
 
 @pytest.mark.asyncio
-async def test_no_result_and_no_drop_returns_the_collected_text(invoker):
+async def test_no_result_and_no_drop_returns_the_collected_text(invoker, monkeypatch):
     """CLAUSE COVER for `oversized_dropped` in the no-result guard.
 
     A stream that ends without a result event is an ordinary supported shape —
     the collected text IS the response. Deleting that clause turns every one of
     those into a raise, which this pins.
     """
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "answer"}]}},
     )
     proc = _streaming_proc(data)  # nothing dropped, no result event
+    proc.pid = 4242  # never leave pid to a mock default near killpg
 
     with patch("asyncio.create_subprocess_exec", return_value=proc):
         output = await invoker.run_streaming(CCInvocation(prompt="x"))
@@ -2826,7 +2838,9 @@ async def test_no_result_and_no_drop_returns_the_collected_text(invoker):
 
 
 @pytest.mark.asyncio
-async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(invoker):
+async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(
+    invoker, monkeypatch
+):
     """CLAUSE COVER for the `bg_truncated` conjunct of the exemption.
 
     Surviving partial text is NOT on its own a reason to forgive a missing
@@ -2834,6 +2848,10 @@ async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(inv
     ceiling, which is what makes the absence explainable. Drop the
     ``bg_truncated`` conjunct and any run with leftover text goes quiet.
     """
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "oversized"}]}},
