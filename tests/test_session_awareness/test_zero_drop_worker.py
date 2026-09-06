@@ -12,7 +12,10 @@ The legs are independent on purpose, so a gh outage cannot blind the worktree
 class and a broken worktree cannot blind the branch classes.
 """
 
+import asyncio
 import json
+import os
+import shutil
 
 import aiosqlite
 import pytest
@@ -89,18 +92,55 @@ def env(tmp_path, monkeypatch):
     return legs
 
 
-@pytest.fixture
-async def db_path(tmp_path):
-    from genesis.db.schema import create_all_tables
+# Building the full schema costs ~1.4s, and these tests each want a clean one.
+# MEASURED 2026-09-06: 28 tests x create_all_tables was ~40s of pure fixture
+# setup out of a 48s file, on a suite CI runs SERIALLY. Build it ONCE and copy
+# the file — a copy is milliseconds, and each test still gets its own untouched
+# database. (Not a timeout story: pytest-timeout's `timeout` is PER-TEST, and
+# ~1.4s per test was never near it. This is wall-clock cost, nothing else.)
+_TEMPLATE_DB: str | None = None
 
-    path = tmp_path / "zd.db"
-    conn = await aiosqlite.connect(str(path))
-    try:
-        await create_all_tables(conn)
-        await conn.commit()
-    finally:
-        await conn.close()
-    return str(path)
+
+def _template_db(tmp_path_factory) -> str:
+    global _TEMPLATE_DB
+    if _TEMPLATE_DB is None or not os.path.exists(_TEMPLATE_DB):
+        path = str(tmp_path_factory.mktemp("zd-template") / "template.db")
+
+        async def _build() -> None:
+            from genesis.db.schema import create_all_tables
+
+            conn = await aiosqlite.connect(path)
+            try:
+                await create_all_tables(conn)
+                await conn.commit()
+                # The copy below is ONE file, so the template must not keep any
+                # of its state in a sidecar. Rollback-journal mode is the
+                # sqlite default and nothing here sets WAL today — but the day
+                # someone adds `PRAGMA journal_mode=WAL` to the schema builder,
+                # a single-file copy would silently produce empty tables and
+                # send 28 red tests at the wrong file. Assert the mode instead
+                # of inheriting it. AFTER the commit: sqlite refuses a
+                # journal_mode change with a transaction in progress, which is
+                # exactly what create_all_tables leaves open.
+                await conn.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                await conn.close()
+
+        # Safe in a SYNC fixture: no event loop is running at fixture-setup
+        # time, and pytest-asyncio builds a fresh function-scoped loop per test
+        # (no `asyncio_default_fixture_loop_scope` is configured), so
+        # asyncio.run clearing the thread's current loop on exit affects
+        # nothing. If a session-scoped loop is ever configured, revisit this.
+        asyncio.run(_build())
+        _TEMPLATE_DB = path
+    return _TEMPLATE_DB
+
+
+@pytest.fixture
+def db_path(tmp_path, tmp_path_factory):
+    dst = tmp_path / "zd.db"
+    shutil.copy(_template_db(tmp_path_factory), dst)
+    return str(dst)
 
 
 async def _run(db_path, **kw):

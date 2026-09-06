@@ -1027,8 +1027,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # The helper is fail-open end-to-end; pulse must never block session
         # start. Charter part (it feeds the charter's proposal sub-block).
         if _in("charter"):
-            _spawn_repo_pulse_worker(_hook_source)
-            _spawn_zero_drop_worker(_hook_source)
+            _spawn_boundary_workers(_hook_source)
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
@@ -1661,6 +1660,38 @@ def _spawn_repo_pulse_worker(source: str) -> None:
             )
     except Exception:
         pass  # fail-open: pulse is advisory, session start is not
+
+
+def _spawn_boundary_workers(source: str) -> None:
+    """Every detached worker this session boundary starts — in ONE place.
+
+    A test that drives the emission path must neutralise these, or it forks
+    real background processes against the live repo. When each spawn was
+    called directly from that path, neutralising them was a CONVENTION every
+    such test had to remember for every spawn — and the second one broke it
+    immediately: `test_context_injection_budget` patched the repo-pulse spawn
+    (its comment even records why: "a side effect a budget test has no
+    business having, and one that only shows up as flakiness under load") and
+    then forked the zero-drop worker for real, which does a live `git
+    ls-remote` and a 2000-PR `gh pr list`.
+
+    Add new detached spawns HERE, never at the call site. That the emission
+    path calls this and nothing else is locked by
+    `test_session_context_zero_drop`, which asks the AST which `_spawn_*` names
+    `_emit_body` calls rather than checking a hardcoded list — so a third spawn
+    added at the call site fails that test without anyone updating it.
+
+    Not a guarantee, and worth saying so precisely: this makes ONE thing to
+    stub instead of N, for a test that drives the emission path IN-PROCESS. A
+    test that invokes this hook as a SUBPROCESS is not covered by any stub —
+    the durable answer there is a spawn-only kill switch, which does not exist
+    (`GENESIS_*_DISABLED` is overloaded: the workers read the same variables to
+    disable THEMSELVES, so arming them suite-wide breaks the worker tests —
+    MEASURED, 42 of them). Today the exposure is nil: only one test file drives
+    `main()`, and it stubs this function.
+    """
+    _spawn_repo_pulse_worker(source)
+    _spawn_zero_drop_worker(source)
 
 
 def _spawn_zero_drop_worker(source: str) -> None:

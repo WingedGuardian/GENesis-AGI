@@ -8,6 +8,7 @@ detector failure can never cost anybody a session start.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -64,12 +65,51 @@ def test_spawn_failure_never_raises(monkeypatch):
     _ctx._spawn_zero_drop_worker("startup")
 
 
-def test_the_charter_part_actually_calls_the_spawn(monkeypatch):
-    """Built != wired. The seam is only worth anything if the emission path
-    reaches it — a spawn helper nobody calls is the exact silent no-op this
-    subsystem exists to detect."""
-    source = (_SCRIPTS_DIR / "genesis_session_context.py").read_text()
-    assert source.count("_spawn_zero_drop_worker(") == 2, (
-        "expected exactly one definition and one call site"
+def test_the_emission_path_spawns_ONLY_through_the_chokepoint():
+    """Enumerate the emission path's spawns — never spot-check a known list.
+
+    The first version of this test iterated a hardcoded tuple of the two
+    helpers that existed when it was written, so the one mutant its own
+    docstring promised to catch — a THIRD spawn added at the call site — was
+    invisible by construction, along with an aliased call
+    (`_spawn_zero_drop_worker(src)`) and a commented-out call whose text still
+    matched. Asking the AST which `_spawn_*` names `_emit_body` actually calls
+    has no such blind spot: a new one shows up without this test being touched.
+    """
+    tree = ast.parse((_SCRIPTS_DIR / "genesis_session_context.py").read_text())
+    emit = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_emit_body"
     )
-    assert "_spawn_zero_drop_worker(_hook_source)" in source
+    spawned = {
+        n.func.id
+        for n in ast.walk(emit)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id.startswith("_spawn_")
+    }
+    assert spawned == {"_spawn_boundary_workers"}, (
+        f"the emission path spawns outside the chokepoint: {sorted(spawned)} — a test "
+        "that stubs the chokepoint would not neutralise those"
+    )
+
+
+def test_the_chokepoint_really_spawns_BOTH_workers(tmp_path, monkeypatch):
+    """RUNTIME coverage of the chokepoint, which had none.
+
+    Its predecessor stubbed `_spawn_boundary_workers` and then called it, so it
+    asserted that a no-op lambda spawns nothing — vacuously true, and equally
+    true if the chokepoint's body were `if False:` or if it spawned ten
+    workers. Drive the REAL function and name both workers it must reach.
+    """
+    calls: list = []
+    monkeypatch.setattr("subprocess.Popen", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(_ctx.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("GENESIS_ZERO_DROP_DISABLED", raising=False)
+    monkeypatch.delenv("GENESIS_REPO_PULSE_DISABLED", raising=False)
+
+    _ctx._spawn_boundary_workers("startup")
+
+    assert {Path(argv[1]).name for argv in calls} == {
+        "repo_pulse_worker.py",
+        "zero_drop_worker.py",
+    }, f"the chokepoint did not reach both workers: {calls}"

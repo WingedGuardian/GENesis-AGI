@@ -494,6 +494,26 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # reflection and perception. If a future change puts hook content back
         # in this observation, this source must LOSE its place in this list.
         "context_injection_monitor",
+        # Zero-drop stranded-work detector (session_awareness/zero_drop_worker.py)
+        # — Genesis observing its OWN repository: which local branches, pushed
+        # branches and worktrees hold work that is in no pipeline. Two sources
+        # because blindness is reported separately from findings: a DEAD
+        # detector is caught by its heartbeat, but a LIVE one with a failing leg
+        # keeps its board frozen while every health surface reads green, so that
+        # gets its own alarm rather than being folded into the findings alert.
+        #
+        # first_party is the honest classification, but it is NOT free here, and
+        # the reason is the same one context_injection_monitor states above: the
+        # observation embeds git-authored text — branch names and worktree paths
+        # — which Genesis did not write. That text is neutralised at the render
+        # boundary (`_render_identity` flattens newlines and substitutes the
+        # alert's row-grammar characters) precisely so these rows can carry it
+        # without smuggling a forged row past the trusted-only
+        # SAFE_SURFACING_ORIGINS filters. If a future change renders any
+        # untrusted repository content into these observations WITHOUT that
+        # neutralisation, these sources must LOSE their place in this list.
+        "zero_drop_detector",
+        "zero_drop_detector_blind",
     }
 )
 

@@ -548,6 +548,25 @@ jobs:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
+    #
+    # This job had NO timeout-minutes, so it inherited GitHub's 360-minute
+    # default. Two runs in this workflow have hit ~5.7h (33991793671,
+    # 33991913763, both failed) — consistent with that default killing them.
+    # WHICH job wedged is no longer recoverable (the per-job API returns an
+    # empty list for both now), so this cap is not attributed to `test`; it
+    # bounds `test` because that is the long job, not because it was proven
+    # guilty. The sibling jobs all still inherit 360.
+    #
+    # Derived, not guessed — MEASURED 2026-09-06 over the last 23 successful
+    # main runs, per JOB (`gh api .../runs/<id>/jobs`, name == "test"), NOT the
+    # workflow-run duration, which is ~20 min longer because it includes 12
+    # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
+    # The ceiling must exceed the worst LEGITIMATE case — that max plus one
+    # full per-test kill (pyproject `timeout = 3600`) = ~91 min — or this job
+    # would pre-empt the per-test timeout and make it dead code. 180 leaves
+    # ~89 min of growth headroom and still halves the default.
+    # Revisit as the suite grows — the --durations output below is the data.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -560,7 +579,15 @@ jobs:
       - name: Run tests
         run: |
           # Ignore preserved AZ-era test files that import removed modules
-          pytest -v \
+          #
+          # --durations: this suite's per-test cost has NEVER been measured.
+          # No --durations anywhere, no registered markers, and the sole
+          # pytest.mark.slow is an unregistered no-op whose own docstring
+          # claims those tests are "skipped in normal CI runs" — CI passes no
+          # -m "not slow", so they run. Every timeout in this repo has
+          # therefore been a guess. Print the 25 slowest so the next person
+          # inherits a number instead of one.
+          pytest -v --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/
