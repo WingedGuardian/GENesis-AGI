@@ -32,6 +32,35 @@ if [ -z "${HOME:-}" ]; then
 fi
 [ -n "${HOME:-}" ] || exit 0
 
+# Scrub filter for the pane tail. secret_scrub is stdlib-only by design, so ANY
+# python3 can run it — deliberately NOT the venv interpreter, which may be
+# absent or broken on the path a dying session takes. Resolved relative to this
+# script so a worktree checkout scrubs with its own copy.
+#
+# Returns non-zero (emitting nothing) when it cannot scrub, which the caller
+# turns into a withheld-tail marker. It must NEVER pass input through on error.
+_CC_HOOKS_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/hooks"
+
+_cc_scrub_stdin() {
+    [ -r "${_CC_HOOKS_DIR}/secret_scrub.py" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    # Read BYTES and decode leniently: the tail exists to capture a CRASHING
+    # session, which is exactly the kind that emits a stray non-UTF-8 byte, and
+    # a strict decode would discard the entire diagnostic over one of them.
+    #
+    # Wall-clock belt (fail-closed: timeout's 124 is non-zero, so the caller
+    # withholds the tail exactly as for any other scrub failure). 10s is >100x
+    # the measured full-matrix worst case; the failure mode it bounds is a
+    # future pattern edit going super-linear on a shape the perf matrix does
+    # not span — the one hang this path cannot otherwise exclude.
+    _to=""
+    command -v timeout >/dev/null 2>&1 && _to="timeout 10"
+    $_to python3 -c 'import sys
+sys.path.insert(0, sys.argv[1])
+from secret_scrub import scrub
+sys.stdout.write(scrub(sys.stdin.buffer.read().decode("utf-8", "replace")))' "$_CC_HOOKS_DIR"
+}
+
 log_dir="${HOME}/.genesis/logs"
 log="${log_dir}/cc_exit_${slot}.log"
 mkdir -p "$log_dir" 2>/dev/null || exit 0
@@ -54,7 +83,60 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
     # Guarded on TMUX_PANE so the script is harmless when run outside tmux.
     if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
         echo "  --- pane tail (last 200 lines) ---"
-        tmux capture-pane -p -t "$TMUX_PANE" -S -200 2>/dev/null | sed 's/^/  | /'
+        # The tail is RAW terminal output: whatever the session printed, a
+        # freshly-minted credential included. Scrub it through the same
+        # stdlib-only helper the capture hooks use (no venv needed — it imports
+        # nothing outside the standard library, so a broken venv cannot break
+        # this path). FAIL CLOSED: if the scrubber cannot run, WITHHOLD the tail
+        # rather than write it raw. secret_scrub.scrub() already withholds its
+        # own content on an internal error; this mirrors that choice one level
+        # up, for the case where python itself is unavailable. The exit-status
+        # lines above are always written either way, so the primary diagnostic
+        # (why did the session die) survives even with no tail at all.
+        # -J JOINS soft-wrapped rows back into the logical line the program
+        # actually printed. Without it the terminal's wrap is a REDACTION HOLE:
+        # a credential that starts near the right edge arrives as two separate
+        # rows, neither of which carries a matchable prefix, so the token is
+        # persisted in reconstructable form. MEASURED on tmux 3.4 at width 80:
+        # a 300-char token is three unmatched rows without -J and one intact
+        # line with it.
+        if _tail=$(tmux capture-pane -p -J -t "$TMUX_PANE" -S -200 2>/dev/null) \
+           && [ -n "$_tail" ]; then
+            # Deliberately if/else, not `A && B || C`: in the chain form a
+            # failure in the PRINT step (disk full, SIGPIPE) also fires C and
+            # appends a "withheld" marker after a half-written tail.
+            # 256KB cap on the filter input. -S -200 counts PHYSICAL rows either
+            # way, so joining changes where the newlines fall, not the byte
+            # total: a real tail stays height*width (~40KB) and the cap bites
+            # only a pathological geometry.
+            #
+            # When the cap DOES bite, keep the NEWEST bytes: the newest rows
+            # sit at the BOTTOM of the capture, and the dying words are the
+            # whole point of this log — a cap taken from the top kept the
+            # oldest scrollback and discarded them (while the marker claimed
+            # the opposite). The leading PARTIAL line is dropped rather than
+            # handed on: a byte cut lands anywhere, and several patterns need
+            # their whole value on one line — a URL credential is recognised
+            # by its scheme-then-user-then-password-then-host shape, so a line
+            # cut mid-URL could show a
+            # pattern half a value. Cutting on a line boundary means the
+            # over-long line is dropped whole, never half-shown.
+            _cap="${GENESIS_CC_TAIL_CAP:-262144}"
+            _feed=$(printf '%s\n' "$_tail")
+            if [ "$(printf '%s' "$_feed" | wc -c)" -gt "$_cap" ]; then
+                _feed=$(printf '%s' "$_feed" | tail -c "$_cap" | sed '1d')
+                _truncated=1
+            else
+                _truncated=0
+            fi
+            if _scrubbed=$(printf '%s\n' "$_feed" | _cc_scrub_stdin 2>/dev/null); then
+                printf '%s\n' "$_scrubbed" | sed 's/^/  | /'
+                [ "$_truncated" = "1" ] && \
+                    echo "  | [earlier output dropped: tail exceeded ${_cap} bytes]"
+            else
+                echo "  | [tail withheld: scrubber unavailable]"
+            fi
+        fi
     fi
     echo
 } >> "$log" 2>/dev/null || exit 0
