@@ -87,6 +87,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   not recognize from that column's own declaration, and copies its data; the
   one shape it cannot re-create (NOT NULL with no default) stops the
   migration with a clear message before anything is dropped.
+- **When every provider fails, the log now says which ones.** A routing failure
+  recorded only how many attempts were made — but a provider skipped because its
+  circuit breaker is open, its API key is missing, or the budget is spent costs
+  no attempt at all, so "2 attempts" on a seven-provider chain looked exactly
+  like a two-provider chain that was fully tried. The exhaustion event and result
+  now name every provider involved, alongside how many the chain had to offer —
+  and the log line keeps the two kinds apart: providers whose call actually
+  failed print under `failed:`, providers passed over before any call print
+  under `skipped:` with the reason (no API key, breaker open, budget exceeded),
+  because a never-called provider labelled "failed" reads as an outage where
+  there may be none. One-time cost of reshaping the message: the Errors
+  dashboard keys manual resolutions on the message prefix, so an exhaustion
+  group resolved before this change reappears once under its new key — resolve
+  it again and it stays resolved.
 - **The temp-space watchdog no longer severs cross-session messaging when it
   goes nuclear.** At its most aggressive cleanup tier the watchdog deleted every
   top-level directory of Claude Code's working temp — including the directory
