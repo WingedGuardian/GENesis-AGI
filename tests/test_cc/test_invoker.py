@@ -4,15 +4,17 @@ import asyncio
 import json
 import logging
 import signal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from genesis.cc.exceptions import CCProcessError, CCTimeoutError
+from genesis.cc.exceptions import CCProcessError, CCStreamTruncatedError, CCTimeoutError
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
+    ChannelType,
     EffortLevel,
     StreamEvent,
     clamp_effort,
@@ -2662,6 +2664,12 @@ async def test_dropping_the_result_line_raises_instead_of_faking_success(invoker
 
     Also the drop-then-EOF shape: nothing parseable follows, so a loop that
     failed to advance would spin instead of reaching EOF.
+
+    The TYPE is pinned, not just the raising. This asserted `CCProcessError`,
+    which `CCStreamTruncatedError` subclasses — so reverting to the generic
+    error left this test green while restoring the replay hazard it exists to
+    prevent (Codex P1, PR #1625 round 1). The subclass relationship is asserted
+    separately, since existing `except CCProcessError` handlers depend on it.
     """
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
@@ -2671,11 +2679,15 @@ async def test_dropping_the_result_line_raises_instead_of_faking_success(invoker
 
     with (
         patch("asyncio.create_subprocess_exec", return_value=proc),
-        pytest.raises(CCProcessError, match="NO result event"),
+        pytest.raises(CCStreamTruncatedError, match="NO result event"),
     ):
         await asyncio.wait_for(
             invoker.run_streaming(CCInvocation(prompt="x")), timeout=10
         )
+
+    assert issubclass(CCStreamTruncatedError, CCProcessError), (
+        "handlers catching CCProcessError must keep catching this"
+    )
 
     # Guard the guard: prove the injected fault was actually REACHED. The reader
     # breaks on a result event, so a fault placed after one is never read and
@@ -2692,6 +2704,14 @@ async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(inv
     The reachable shape is a result that DID arrive but is empty, alongside a
     drop. (Drop + NO result raises before reaching any detector, so a guard on
     that branch would be dead code — a mutation sweep caught exactly that.)
+
+    Not firing the detector was only HALF the answer, and the half this test
+    originally asserted — returning the empty output as a success — was the
+    other half done wrong (Codex P1, PR #1625 round 1). An empty result after a
+    drop is a LOST ANSWER: downstream `success = not output.is_error` records a
+    phantom completion, and on the home model that clears an account-wide
+    rate-limit fallback. So the run raises, and the assertion that matters here
+    is that it raises WITHOUT forging the cap signature on its way out.
     """
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
@@ -2706,14 +2726,233 @@ async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(inv
 
     invoker._fire_empty_output_callback = _spy
 
-    with patch("asyncio.create_subprocess_exec", return_value=proc):
-        output = await invoker.run_streaming(
-            CCInvocation(prompt="x", expect_output=True)
-        )
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
 
-    assert output.text == ""
     assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
     assert not fired, "a dropped-line run forged the silent-cap signature"
+
+
+@pytest.mark.asyncio
+async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
+    invoker, monkeypatch
+):
+    """A drop plus NO result normally raises — but not when something else
+    already accounts for the missing result.
+
+    A background run SIGKILLed at the CLI's wait ceiling legitimately emits no
+    result event, and the no-result fallback returns what it collected with
+    ``bg_truncated=True`` and its own truncation notice. Raising instead throws
+    away a usable partial deliverable and blames a cause that is not the cause
+    (Codex P2, PR #1625 round 1): the trace line was oversized, the ANSWER was
+    not — it is right there in the collected text.
+
+    Ordering is the whole finding. The raise sat ahead of the fallback, so the
+    two conditions could never be weighed against each other.
+    """
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "oversized"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "keep me"}]}},
+    )
+    # index 1 = the oversized tool-result trace; no result event ever arrives.
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.stderr = _make_mock_stderr(
+        b"Background tasks still running after 600s; terminating.\n"
+    )
+    proc.pid = 4242
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+    assert output.text == "keep me", "the partial deliverable was discarded"
+    assert output.bg_truncated is True, "the truncation notice was lost"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(invoker):
+    """CLAUSE COVER for `oversized_dropped` in the result guard.
+
+    Empty output with NO drop is the unexplained-empty shape the silent-cap
+    detector exists to aggregate. Only a DROP explains it away. Without this,
+    deleting that clause — so any empty result raises — passes the suite, and
+    the cap detector goes permanently silent behind an exception.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _result_event(""),
+    )
+    proc = _streaming_proc(data)  # nothing dropped
+    fired = []
+
+    async def _spy(*a, **k):
+        fired.append(a)
+
+    invoker._fire_empty_output_callback = _spy
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
+
+    assert output.text == ""
+    assert fired, "an unexplained empty result stopped reaching the cap detector"
+
+
+@pytest.mark.asyncio
+async def test_no_result_and_no_drop_returns_the_collected_text(invoker):
+    """CLAUSE COVER for `oversized_dropped` in the no-result guard.
+
+    A stream that ends without a result event is an ordinary supported shape —
+    the collected text IS the response. Deleting that clause turns every one of
+    those into a raise, which this pins.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "answer"}]}},
+    )
+    proc = _streaming_proc(data)  # nothing dropped, no result event
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(invoker):
+    """CLAUSE COVER for the `bg_truncated` conjunct of the exemption.
+
+    Surviving partial text is NOT on its own a reason to forgive a missing
+    result — the exemption exists for a background run killed at the wait
+    ceiling, which is what makes the absence explainable. Drop the
+    ``bg_truncated`` conjunct and any run with leftover text goes quiet.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "oversized"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "keep me"}]}},
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.pid = 4242  # never leave pid to a mock default near killpg
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="NO result event"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+
+@pytest.mark.asyncio
+async def test_bg_truncation_with_nothing_collected_still_raises(invoker, monkeypatch):
+    """CLAUSE COVER for the `partial_text` conjunct of the exemption.
+
+    Background truncation forgives a missing result only when there is a
+    deliverable to return instead. With the answer itself dropped there is
+    nothing to hand back, so this is the lost-answer case again and must raise.
+    Drop that conjunct and it returns an empty success — the phantom completion
+    the whole guard exists to prevent.
+    """
+    def _killpg_gone(*a):
+        raise ProcessLookupError
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "the answer"}]}},
+    )
+    proc = _streaming_proc(data, raise_on=(1,))  # the only text line is dropped
+    proc.stderr = _make_mock_stderr(
+        b"Background tasks still running after 600s; terminating.\n"
+    )
+    proc.pid = 4242
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="NO result event"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_result_never_retries_the_same_failover_peer():
+    """The SECOND retry site, which the first fix missed entirely.
+
+    `_run_failover_peer` re-runs the same prompt on the same peer when a sticky
+    resume fails. Its only side-effect guard is "answer text already streamed" —
+    and an oversized line eats the answer, so that guard reads empty exactly
+    when a re-run is least safe. Before the failure was typed it arrived as a
+    bare ValueError and missed this handler; typing it ARMED this path, so the
+    type has to be re-raised here too or the fix relocates the hazard.
+    """
+    from genesis.cc.conversation import ConversationLoop
+
+    loop = ConversationLoop.__new__(ConversationLoop)
+    calls = []
+
+    async def _invoke(inv, on_event):
+        calls.append(inv)
+        raise CCStreamTruncatedError("result line dropped")
+
+    loop._invoke_peer = _invoke
+
+    with pytest.raises(CCStreamTruncatedError):
+        await loop._run_failover_peer(
+            "peer-a",
+            CCInvocation(prompt="x"),
+            sticky={"roster_model": "peer-a", "cc_session_id": "sess-1"},
+            on_event=None,
+            streamed={"text": ""},  # the answer was lost, so nothing streamed
+        )
+
+    assert len(calls) == 1, f"the prompt was replayed on the same peer ({len(calls)}x)"
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_result_never_triggers_stale_resume_recovery():
+    """The error type is load-bearing, so pin it at the HANDLER, not the raise.
+
+    A resumed turn that raises a bare ``CCError`` lands in
+    ``_recover_stale_resume``, which fails the session and re-runs the prompt
+    from scratch — after the first attempt already executed its tool calls. An
+    MCP write or an outreach send would happen twice, with nothing downstream
+    to dedupe (Codex P1, PR #1625 round 1).
+
+    Asserting the raise alone would not catch this: the old code raised too,
+    just with a type the retry path swallowed. What must hold is that the
+    exception REACHES the caller on a resume.
+    """
+    from genesis.cc.conversation import ConversationLoop
+
+    loop = ConversationLoop.__new__(ConversationLoop)
+    loop._invoker = SimpleNamespace(
+        run_streaming=AsyncMock(side_effect=CCStreamTruncatedError("result line dropped"))
+    )
+
+    async def _must_not_run(*a, **k):  # pragma: no cover - the point is it never runs
+        raise AssertionError("stale-resume recovery replayed a size failure")
+
+    loop._recover_stale_resume = _must_not_run
+
+    with pytest.raises(CCStreamTruncatedError):
+        await loop._try_invoke_streaming(
+            CCInvocation(prompt="x"),
+            session={"session_id": "s1"},
+            was_resume=True,  # the dangerous case: a live session mid-conversation
+            prompt_text="x",
+            model=CCModel.SONNET,
+            effort=EffortLevel.MEDIUM,
+            user_id="u1",
+            channel=ChannelType.TELEGRAM,
+            thread_id=None,
+            on_event=None,
+        )
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from genesis.cc.exceptions import (
     CCQuotaExhaustedError,
     CCRateLimitError,
     CCSessionError,
+    CCStreamTruncatedError,
     CCTimeoutError,
 )
 from genesis.cc.types import (
@@ -1487,6 +1488,33 @@ class CCInvoker:
                 await self._notify_status_change(err)
                 raise err
 
+            # A result arrived, but a dropped line left it with NO text — so the
+            # dropped line WAS the answer. `_parse_result_dict` already recovers
+            # an extended-thinking response from the collected text events just
+            # above, which is the only benign reason a result is textless; past
+            # that, empty-after-a-drop means the answer is gone.
+            #
+            # Both other options are wrong here. Returning it as success records
+            # a phantom completion (`success = not output.is_error` in
+            # cc/direct_session.py), and on the home model that calls
+            # note_home_recovery() — clearing an account-wide fallback on a run
+            # that produced nothing. Firing the empty-output callback instead
+            # forges the silent-subscription-cap signature that cc_relay.py
+            # escalates, naming a cause that is not the cause. Raise.
+            # NOT gated on `expect_output`. That flag defaults False and is set
+            # by 13 cognitive callers; `cc/direct_session.py` and
+            # `cc/conversation.py` — the two this comment names, and the path the
+            # motivating incident came from — never set it. Gating here made the
+            # guard inert on exactly the callers it was written for. The harm is
+            # not "the caller wanted output and got none", it is "an answer was
+            # produced and we lost it", which is a failure either way.
+            if oversized_dropped and not output.text.strip():
+                raise CCStreamTruncatedError(
+                    f"CC stream dropped {oversized_dropped} over-limit line(s) "
+                    f"(limit={_STREAM_LINE_LIMIT} bytes) and the result carried "
+                    "no text — the answer was almost certainly one of them"
+                )
+
             # Success — notify recovery if previously errored
             if self._last_was_error:
                 await self._notify_status_change(None)
@@ -1516,8 +1544,21 @@ class CCInvoker:
         # CRITICAL infrastructure alert — an alert naming a cause that is not
         # the cause. Before the drop-and-continue loop this case raised; keep it
         # raising, because a loud wrong answer beats a quiet false one.
-        if oversized_dropped and result_data is None:
-            raise CCProcessError(
+        # ...UNLESS the missing result is already explained. A background run
+        # SIGKILLed at the CLI's wait ceiling legitimately produces no result
+        # event, and the no-result fallback below returns what it collected with
+        # bg_truncated=True — a supported shape with its own truncation notice.
+        # Inferring "the result line was dropped" when bg_truncated and real
+        # text both say otherwise throws away a usable partial deliverable.
+        # Only claim the drop ate the result when nothing else accounts for it.
+        # `collected_text` is a list of raw text blocks and a whitespace-only
+        # block is truthy, so testing the LIST would exempt a run whose only
+        # "deliverable" is blank — which then reaches the empty-text cap
+        # detector below and forges the very alert this PR is careful not to
+        # forge. Join and strip: the question is whether real text survived.
+        partial_text = "".join(collected_text).strip()
+        if oversized_dropped and result_data is None and not (bg_truncated and partial_text):
+            raise CCStreamTruncatedError(
                 f"CC stream dropped {oversized_dropped} over-limit line(s) "
                 f"(limit={_STREAM_LINE_LIMIT} bytes) and NO result event "
                 "arrived — the result line was almost certainly one of them"
@@ -1549,9 +1590,13 @@ class CCInvoker:
             and not output.is_error
             and not output.text.strip()
             and "rate_limit_event" not in event_types
-            # NB no oversized_dropped guard here: reaching this branch already
-            # implies there were no drops, because a drop with no result raises
-            # above. The guard belongs on the RESULT path — see there.
+            # A drop CAN reach here now: the bg-truncation exemption above lets a
+            # dropped run through when real partial text survived. That is why
+            # the exemption strips before testing — text that survives is text
+            # this branch will find, so it cannot be empty AND dropped. An
+            # earlier revision of this comment claimed drops were impossible
+            # here, which the exemption had just made false.
+            and not oversized_dropped
         ):
             await self._fire_empty_output_callback(invocation, output)
         return output
