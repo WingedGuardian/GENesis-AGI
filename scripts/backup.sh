@@ -610,6 +610,88 @@ if [ -d "$_EVAL_DIR" ]; then
     fi
 fi
 
+# --- 6d. Hook audit stores (Tier 1) ---
+# The merge gate's override records: which merges bypassed which gate, and on what
+# stated grounds. One small file per flush, own-user-only, and SELF-CONTAINED —
+# every field (sigil, waived gate, PR, repo, head sha) means the same thing on a
+# restored install, so the trail survives a rebuild intact. Plain copy, like the
+# infrastructure profile above: the backups repo is private, and the writer
+# refuses to persist command text, so these rows carry no credential material.
+#
+# The git-discard store is DELIBERATELY not here, and that is the whole reason this
+# block names one store instead of globbing ~/.genesis. Its recovery payload is a
+# `git stash create` sha that exists ONLY in the local repo's object store: such
+# objects are never pushed, git prunes unreachable ones (default two weeks), and
+# this script captures no object store at all. Restoring it onto a rebuilt
+# container yields a list of pointers to nothing — a trail that LOOKS recoverable
+# while every recovery attempt fails, which is worse than an absent one. At a live
+# install, of 76 recorded shas one was already unresolvable in the repo that wrote
+# it. Making it genuinely restorable means backing up the objects, not the records.
+# ASK the writer where the store is; do not assume the default. An install that
+# sets GENESIS_MERGE_OVERRIDE_DIR to a supported absolute path had its audit trail
+# silently excluded here and restored to the wrong place — the trail lost on
+# exactly the rebuild it exists for (Codex P2, PR #1609). One resolver, five
+# consumers: see audit_jsonl.resolve_store_dir.
+_OVERRIDE_STORE="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
+    || printf '%s' "$HOME/.genesis/merge_overrides")"
+if [ -d "$_OVERRIDE_STORE" ]; then
+    log "Backing up hook audit stores..."
+    mkdir -p audit/merge_overrides
+    _AUDIT_COUNT=0
+    _AUDIT_LIVE=""
+    while IFS= read -r -d '' _f; do
+        _base="$(basename "$_f")"
+        # The deletion set below is derived from THIS list — every name the live
+        # store holds — never from which copies happened to succeed. Deriving it
+        # from copy success meant a failed copy (a full backup filesystem is the
+        # realistic one) marked the record absent, so the mirror loop then deleted
+        # the last known-good copy of a record the local pruner may drop next
+        # (Codex P2, PR #1609). Copy failure must cost at most a stale mirror
+        # entry, never the entry.
+        _AUDIT_LIVE="$_AUDIT_LIVE$_base"$'\n'
+        # Stage and rename. A bare `cp` onto an existing destination TRUNCATES it
+        # before it can fail, so a mid-copy failure destroys the previous good
+        # mirror in place. rename(2) is atomic within the directory, so the
+        # destination is either the old copy or the new one — never a partial.
+        _tmp="audit/merge_overrides/.$_base.partial.$$"
+        # cp's own stderr is CAPTURED, not discarded: it carries the only statement
+        # of WHY (ENOSPC vs EACCES look identical without it), and the warning below
+        # otherwise names the mitigation and never the cause.
+        _AUDIT_ERR=""
+        if _AUDIT_ERR="$(cp "$_f" "$_tmp" 2>&1)" \
+            && _AUDIT_ERR="$(mv -f "$_tmp" "audit/merge_overrides/$_base" 2>&1)"; then
+            _AUDIT_COUNT=$(( _AUDIT_COUNT + 1 ))
+        else
+            rm -f "$_tmp" 2>/dev/null || true
+            log "WARNING: failed to copy $_base (${_AUDIT_ERR:-no error text}) — previous mirror copy, if any, left intact"
+        fi
+    done < <(find "$_OVERRIDE_STORE" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    # MIRROR the store, do not merely add to it. A copy-only loop left every
+    # record the daily pruner had deleted in the backup forever: the mirror grows
+    # past the 5 MB bound the store advertises, and a disaster restore
+    # REINTRODUCES every record retention removed (Codex P2, PR #1609). Deleting
+    # only names the live store no longer has keeps the backup a snapshot of the
+    # store rather than its union over time.
+    _AUDIT_DROPPED=0
+    while IFS= read -r -d '' _b; do
+        _bbase="$(basename "$_b")"
+        if ! printf '%s' "$_AUDIT_LIVE" | grep -qxF "$_bbase"; then
+            rm -f "$_b" && _AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))
+        fi
+    done < <(find audit/merge_overrides -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    # Sweep any staging scrap a KILLED EARLIER run left behind, so the mirror cannot
+    # grow a second, invisible store beside itself. Dot-prefixed, so the `*.jsonl`
+    # loop above never sees one and never mistakes one for a record.
+    #
+    # Scoped the way the write is scoped, plus an age floor. A manual run overlapping
+    # the 6h timer would otherwise delete the OTHER run's staged copy between its
+    # `cp` and its `mv`, turning a good copy into a spurious warning. Ours are
+    # already removed on the failure path above, so excluding `$$` costs nothing.
+    find audit/merge_overrides -maxdepth 1 -type f -name '.*.partial.*' \
+        ! -name "*.partial.$$" -mmin +60 -delete 2>/dev/null || true
+    log "Hook audit stores: $_AUDIT_COUNT file(s), $_AUDIT_DROPPED pruned from mirror"
+fi
+
 # --- 7. Secrets (encrypted with GPG symmetric) ---
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets
@@ -926,7 +1008,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/
+# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
 # Tier 2 (off-site): data/, transcripts/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'

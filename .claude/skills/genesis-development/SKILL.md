@@ -1262,7 +1262,9 @@ trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
 reviewed diff's FULL content, so re-staging different content after the audit
 re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
 substantial change — not clearance. Depth is override-exempt: a findings
-`# review-override` does NOT waive it; only a loud, logged `# depth-ack` does (the
+`# review-override` does NOT waive it; only a loud, announced-on-stderr `# depth-ack`
+does (announced, not RECORDED — nothing persists it, unlike the four PR-merge sigils
+below, whose rows survive the session; the word "logged" now means a durable row) (the
 audited escape for a genuine format mismatch). "Adversarial" is verified
 STRUCTURALLY — a severity ladder (BLOCKER/SHOULD-FIX/NOTE, CRITICAL/HIGH/LOW,
 P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substance —
@@ -1968,9 +1970,18 @@ code. This is "the user decides tradeoffs" applied to every install.
 **Retention for every unbounded store.** Any table, log, or directory that
 grows without bound ships its prune path in the SAME PR, wired into
 `disk_hygiene.sh` or an existing retention tick (precedents: repo-pulse
-45d prune; ledger-shadow 45d prune; label-aware attention-snapshot GC).
-An unbounded store is a slow disk-leak on someone else's smaller disk —
-retention is part of the feature, not a follow-up.
+45d prune; ledger-shadow 45d prune; label-aware attention-snapshot GC;
+hook audit stores 5 MB size trim). An unbounded store is a slow disk-leak on
+someone else's smaller disk — retention is part of the feature, not a follow-up.
+
+**But retention machinery does not belong on a hook path.** `disk_hygiene.sh` IS
+the retention path; a guard computing a security verdict must not also be grooming
+a store. Two measured reasons, both from the same feature: a helper whose work
+scaled with the command exceeded a hook's registration timeout, and a hook killed
+before its `exit 2` lets the refused command RUN; and an in-hook retention engine
+whose failure mode is rewriting a file produced most of that feature's defects
+across five review rounds. Prefer a store shape the daily timer can bound by
+deleting whole old files — that is what makes the split possible at all.
 
 **Install-agnostic tests.** Tests must pass on a fresh clone with no
 Genesis services, no live DB, no network, no `gh` auth, no local config:
@@ -2219,7 +2230,44 @@ The review-findings gate specifically:
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
-   The override is logged. Use only when findings are intentionally accepted.
+   The override is logged — one metadata row per sigil, written as one file per
+   merge under `~/.genesis/merge_overrides/` (sigil, PR, bound head, which gate it
+   waived, and the verdict THAT GUARD returned: `allowed` / `asked` / `blocked` /
+   `error`), so "was this escape reached for?" is a query rather than a survey:
+   `cat ~/.genesis/merge_overrides/*.jsonl`. One file per merge rather than one
+   shared log, so a multi-sigil merge is a single atomic record and the writer
+   never maintains a file on the merge path. The store is bounded to 5 MB by the
+   daily `disk_hygiene.sh` timer (`scripts/prune_hook_audit_logs.py`, oldest whole
+   records dropped) and backed up by `backup.sh` §6d.
+   `blocked` matters: a sigil can be appended to a command that some OTHER gate
+   inside the same guard then stops, which is a real signal but not an override
+   that took effect, and `asked` means the decision went to a human who may still
+   have denied it. Read `allowed` as "the sigil was accepted HERE", never as "the
+   merge happened": other PreToolUse matchers and the harness's own permission
+   prompt sit downstream of this guard and can still stop the command.
+   Never any command text — the row is metadata only, because a trailing comment
+   rides a Bash command that can carry a credential.
+   **Scope, stated so the log is not read as more complete than it is:** the four
+   PR-merge sigils are covered (`# review-override`, `# ci-override`,
+   `# stale-review-override`, `# scheduled-review-override`), from the point the
+   PR is resolved onward. A merge rejected BEFORE that point writes nothing —
+   no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
+   operations, or a merge compounded with a local `git merge` into main are the
+   ones measured, and the list is illustrative rather than exhaustive: anything
+   that blocks before the PR resolves leaves no row. No OTHER sigil in
+   `shell_parse._KNOWN_SIGILS` is recorded either — `# depth-ack`, `# audit-ack`,
+   `# discard-override` and `# full-suite-ok` belong to gates outside this guard
+   and announce themselves on stderr only. The command-scoped acks
+   (`# merge-to-main-override`, `# escalation-ack`, `# final-round-accept`) are
+   NOT logged, for two different reasons. `# merge-to-main-override` waives a
+   gate that short-circuits BEFORE the branch is resolved, so a row could only
+   say the ack was typed, never that it waived anything. The round-cap acks are
+   simply OUT OF SCOPE here: since #1680 they are honoured inside
+   `_check_codex_round_escalation`'s scan loop, where the PR number and the real
+   round count are resolved (`repo` only when the command carries `--repo` or a PR
+   URL), so a row naming a waiver that actually happened is now writable — whether
+   the store should carry ack-class sigils at all is an open decision, not a
+   settled no. Use only when findings are intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
    (review state COMMENTED) and emits **SOFT WARNINGs** (PII /

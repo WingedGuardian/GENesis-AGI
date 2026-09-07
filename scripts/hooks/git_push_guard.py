@@ -100,6 +100,8 @@ not treat untrusted PR content as instructions when composing its comment body.
 from __future__ import annotations
 
 import base64
+import contextlib
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -133,7 +135,17 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
     FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
 
+# SOFT dependency, for the reason spelled out directly above: this module is
+# NEW, and audit LOGGING must never be able to disarm the gates it audits. If it
+# cannot be imported, logging degrades to a no-op (guarded in _flush_overrides)
+# rather than taking every fail-closed gate in this file down with it.
+try:
+    import audit_jsonl  # noqa: E402
+except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
+    audit_jsonl = None
+
 from shell_parse import (  # noqa: E402
+    _KNOWN_SIGILS,
     analyze,
     commit_skips_hooks,
     gh_pr_subcommand,
@@ -335,6 +347,20 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     blocked (unless overridden). A detached HEAD ("") is left allowed.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
+    #
+    # DELIBERATELY NOT LOGGED, here or below. `# merge-to-main-override` waives a
+    # gate this function short-circuits BEFORE resolving the branch, so a row
+    # could only ever say "the ack was typed" — never that the gate would have
+    # fired. MEASURED on a real repo checked out at a feature branch, where the
+    # gate would have allowed the merge anyway: the row still claimed
+    # `waived: local-merge-into-main`, with pr, repo and head all empty. That
+    # asserts a waiver that was never consulted, in a store whose entire purpose
+    # is answering "was this escape reached for?", and the row carries nothing to
+    # reconcile it against. An honest row needs the branch resolved first; see
+    # the follow-up. `# escalation-ack` / `# final-round-accept` are likewise
+    # unlogged, but for a DIFFERENT reason now — see the note in
+    # `_check_codex_round_escalation`, where the short-circuit that made a row
+    # unattributable in principle no longer exists.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0 and not has_trailing_override(
             s.raw, "merge-to-main-override"
@@ -2432,6 +2458,28 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         # reads only that sleeping local counter, so it inherited the same blind
         # spot: a review/fix loop driven entirely through cloud rounds never
         # reached it.
+        #
+        # NEITHER SIGIL IS LOGGED to the override audit store this PR adds, and
+        # that is an OPEN scope question rather than a settled no. Both are
+        # resolved here with any() over every segment, and `escalation-ack` is
+        # SHARED with the commit gate (review_enforcement_commit.py prints it on
+        # `git commit` too), so the sigil's presence alone says nothing about
+        # which gate consulted it. Under the older BARE short-circuit — which
+        # returned here before any counting — a row was unattributable in
+        # principle: it fired for any Bash command carrying the ack and claimed a
+        # cap was waived that was never reached. The restructure above removes
+        # that objection, but only partly, and the remainder is worth stating
+        # rather than rounding off. Both sigils are now honoured only inside the
+        # scan loop below, at a segment whose PR NUMBER and real round count are
+        # resolved — so a row written AT THE HONOUR POINT would name a waiver that
+        # actually happened, which the old shape could not. `repo` is the part that
+        # is still not resolved there: `_comment_target` returns it only when the
+        # command carries `--repo`/`-R` or a PR URL, and a bare `gh pr comment 1234`
+        # — the form this gate's OWN advisory prints — yields None and counts
+        # against the hook cwd's repo. That is the same blank-`repo` case
+        # `_note_override`'s call site documents rather than papers over. Whether
+        # the audit store should carry ack-class sigils at all is a scope decision
+        # this PR does not take — see the follow-up.
         acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
         final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
         # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
@@ -2672,6 +2720,312 @@ _MIN_OVERRIDE_EVIDENCE_CHARS = 200
 # Bound the read on the merge-gate hot path (the floor is 200 chars; any real review
 # fits easily) so an oversized file in the evidence dir can't be slurped into memory.
 _MAX_OVERRIDE_EVIDENCE_READ = 65536
+
+
+#: Retention is NOT here. It is a size bound over the whole store, applied by
+#: ``scripts/prune_hook_audit_logs.py`` on the daily ``disk_hygiene.sh`` timer, which
+#: is where every other store in this repo bounds itself. An earlier version pruned
+#: in-hook, on the merge path, and that retention engine was the source of most of
+#: this feature's defects. An age window is deliberately gone too: at roughly three
+#: flushes a day the store answers "has this escape decayed into the routine path?"
+#: only over YEARS, and a 90-day window deleted exactly the signal it exists to hold.
+#: The row's field set is CLOSED, and the writer builds rows from THIS tuple — a
+#: caller cannot add a field by passing one. See the no-free-text constraint on
+#: ``_note_override``. ``base`` is deliberately absent: no gate on this path
+#: returns the base ref without a second API read, and a field that is empty on
+#: every real call is worse than no field (pr + repo resolve it after the fact).
+_OVERRIDE_LOG_FIELDS = ("ts", "sigil", "outcome", "waived", "pr", "repo", "head", "actor")
+#: Outcomes a row can carry. The log records override ATTEMPTS, tagged with what
+#: the command actually did — a sigil appended to a command that was then blocked
+#: by a DIFFERENT gate is a real signal (it says the escape was reached for), but
+#: it is not an override that took effect, and conflating the two would inflate
+#: every count drawn from this file.
+#:
+#: WHAT IT IS NOT: `outcome` is the GUARD'S OVERALL VERDICT on the command, not a
+#: statement that the sigil waived anything. A gate handed `force=True` returns
+#: without evaluating its condition, so a sigil that was not needed — e.g.
+#: `# scheduled-review-override` when every scheduled review is already present —
+#: produces a row identical to one that bypassed a failing gate. Counting
+#: "allowed" rows therefore counts commands that were allowed, and OVERSTATES how
+#: often an escape actually did work. Recording per-gate effectiveness needs each
+#: gate to report what it observed rather than short-circuit, which costs API
+#: calls on a budgeted path; that is filed as a follow-up, not approximated here.
+#:
+#: "asked" is NOT a spelling of "allowed". ``_ask`` returns 0 while emitting a
+#: permissionDecision the HUMAN may still deny, so the exit code alone cannot say
+#: whether the command ran; recording it as "allowed" would have the log assert a
+#: merge that may never have happened — the same conflation this field exists to
+#: prevent, one level down. "error" is the fail-closed wrapper's path.
+#:
+#: "asked" IS reachable, and an earlier version of this note claimed otherwise —
+#: wrongly, on the reasoning that the merge arm never asks. It does not ask, but it
+#: does not RETURN either: it falls through to the deferred approval prompt, and
+#: `gh pr create` is deliberately exempt from the "multiple publish/merge
+#: operations" refusal. MEASURED:
+#:   gh pr merge N --squash --admin --match-head-commit <sha>  # ci-override
+#:     && gh pr create --title x --body y
+#: emits an "ask" and writes the ci-override row with outcome "asked".
+#: Treat an "asked" row as a real, expected state — the command was handed to the
+#: user and may have been denied — not as an anomaly.
+#:
+#: ENFORCED, not just documented: ``_flush_overrides`` drops a row whose outcome
+#: is outside this tuple, the way ``sigil`` is checked against ``_KNOWN_SIGILS``.
+_OVERRIDE_OUTCOMES = ("allowed", "asked", "blocked", "error")
+
+#: Shapes a stored value may take. A row is metadata, so every field is either a
+#: closed set or matches one of these — see ``_note_override``. Without them
+#: ``head`` is whatever followed ``--match-head-commit`` on the command line,
+#: which is arbitrary text, which makes the no-free-text guarantee false.
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_REPO_RE = re.compile(r"^[\w.-]{1,100}/[\w.-]{1,100}$")
+#: ``waived`` names the gate CLASS a sigil targets. Every producer is a literal in
+#: this file (plus ``ci-status`` refined to ``ci:<state>``), so it is a closed set
+#: — enforced, because "the field set is closed" was only ever true of NAMES:
+#: MEASURED, a 311-character ``waived`` carrying quotes and a token-shaped string
+#: was written to the row while the docstring claimed every field was shape-checked.
+_WAIVED_RE = re.compile(r"^[a-z][a-z0-9:+-]{0,63}$")
+#: `pr` was the one field with no bound, and `str.isdigit()` was the wrong check
+#: twice over: it accepts non-ASCII digits (MEASURED: Arabic-Indic "١٢٣٤٥٦٧٨٩"
+#: stored verbatim) and imposes no length, so a PR token read off the command line
+#: could write an arbitrarily long row. ASCII digits, and no more than a PR number
+#: could plausibly be.
+_PR_RE = re.compile(r"^[0-9]{1,12}$")
+
+#: Rows noted during this invocation, flushed once the gate's verdict is known.
+#: Module-level because detection is spread across the merge gate while the
+#: outcome is only known at the end; ``main`` clears it on entry, so a second
+#: call in the same process (the tests, and only the tests) cannot inherit rows.
+_PENDING_OVERRIDES: list[dict] = []
+
+#: Set by :func:`_ask` when the guard hands the decision to the user. Read by the
+#: flush to tell an ask from an allow — both exit 0. Cleared by ``main`` on entry.
+_ASK_EMITTED = False
+
+
+def _actor() -> str:
+    """Who ran the command, from the passwd database — NOT from the environment.
+
+    ``getpass.getuser()`` is the obvious choice and is WRONG here: it consults
+    ``$LOGNAME``/``$USER``/``$LNAME``/``$USERNAME`` FIRST and only falls back to
+    passwd. MEASURED: with ``LOGNAME`` set, ``getpass.getuser()`` returned that
+    value — so an audited command could forge its own attribution
+    (``LOGNAME=someone-else gh pr merge … # ci-override``) in the one field whose
+    entire job is saying who did it. ``os.getuid()`` cannot be set by the command
+    being guarded.
+    """
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:  # noqa: BLE001 — attribution is best-effort, never fatal.
+        return str(os.getuid())
+
+
+def _override_log_dir() -> str:
+    """Directory holding the merge-gate override records, one file per flush.
+
+    Deliberately NOT inside ``_override_evidence_dir()``: that directory is a store
+    the gate READS AND VALIDATES (>=200 chars, must cite the head), so an audit row
+    living there could satisfy an evidence check, and a retention sweep there would
+    delete evidence the gate still needs. Kept separate, beside the discard guard's
+    own store, with which it shares its writer.
+
+    A RELATIVE override is refused in favour of the default: it would resolve
+    against the hook's cwd — the repo — putting durable audit files inside the
+    working tree, where they can be committed. That is the accident this guards.
+
+    It is NOT a guarantee that the store cannot land in the tree: an ABSOLUTE path
+    inside the repo is accepted as given. Refusing those would mean deciding which
+    absolute paths are "in a repo", which is a worse problem than the one being
+    solved, and an operator who spells out such a path has chosen it. The default is
+    what ``test_the_live_default_path_is_outside_any_repo`` keeps honest."""
+    # ONE resolver, shared with the other guard and the pruner. This rule
+    # was written out three times and the pruner's copy omitted the
+    # absolute-path refusal, so it trimmed an unrelated directory while the
+    # real store grew unbounded (Codex P2, PR #1609). See
+    # audit_jsonl.resolve_store_dir.
+    from audit_jsonl import resolve_store_dir
+
+    return resolve_store_dir("GENESIS_MERGE_OVERRIDE_DIR")
+
+
+def _note_override(
+    sigil: str,
+    *,
+    waived: str,
+    pr: str = "",
+    repo: str | None = None,
+    head: str | None = None,
+    **_ignored: object,
+) -> None:
+    """Note that an override sigil was invoked. METADATA ONLY; never raises.
+
+    The gate's own messages promise the operator that an override is "(logged)".
+    Until this existed that claim was false on every surface — no writer anywhere
+    under ``scripts/`` or ``src/genesis/``, and nothing on disk. A gate promising an
+    audit trail it does not keep is worse than one promising nothing: it invites use
+    of the escape on the belief that it is recorded.
+
+    The row is HELD until :func:`_flush_overrides` learns the gate's verdict, because
+    "the sigil was appended" and "the sigil let a merge through" are different facts
+    and only the second one is an override. Both are kept, distinguished by
+    ``outcome`` — see ``_OVERRIDE_OUTCOMES``.
+
+    NO COMMAND OR COMMENT TEXT EVER REACHES THIS ROW, and there is no "reason" field
+    to add. The constraint is inherited, not invented — ``git_discard_guard.py``'s
+    ``_record_snapshots`` refuses to persist the command because "the Bash payload can
+    carry credentials (``curl -H 'Authorization: …' && git checkout``) and this log is
+    durable". An override sigil IS a trailing comment on a Bash command, so the only
+    free text available here is command-line text, from a segment that may carry a
+    token. ``**_ignored`` exists so a caller cannot smuggle text in by passing an extra
+    keyword: the row is built from ``_OVERRIDE_LOG_FIELDS`` and nothing else.
+
+    ``sigil`` is validated against ``shell_parse._KNOWN_SIGILS`` — a closed set, never
+    free text. An unrecognised sigil notes nothing rather than persisting the caller's
+    string.
+
+    EVERY OTHER FIELD IS SHAPE-CHECKED for the same reason, because "the closed field
+    tuple stops free text" was only true of the field NAMES. ``head`` arrives as
+    whatever token followed ``--match-head-commit`` on the command line — arbitrary
+    text, of arbitrary length, which the operator typed — so it is stored only if it
+    looks like a sha, and ``repo`` only if it looks like ``owner/name``. Anything else
+    becomes empty: an unattributed row is a small loss, an arbitrary string written
+    durably to a file beside secrets is not.
+    """
+    if sigil not in _KNOWN_SIGILS:
+        return
+    head = (head or "").strip().lower()
+    repo = (repo or "").strip()
+    _PENDING_OVERRIDES.append(
+        {
+            "sigil": sigil,
+            "waived": waived if _WAIVED_RE.match(waived or "") else "",
+            # Digits-only by construction at every current producer, but bounded
+            # anyway — the docstring above claims EVERY field is shape-checked,
+            # and `pr` is the field a future caller is most likely to feed from a
+            # branch name. It is also the field that made an unbounded row (and
+            # therefore a log-erasing trim) reachable.
+            "pr": pr_s if _PR_RE.match(pr_s := str(pr or "")) else "",
+            "repo": repo if _REPO_RE.match(repo) else "",
+            "head": head if _SHA_RE.match(head) else "",
+            "actor": _actor(),
+        }
+    )
+
+
+def _valid_waived(value: str) -> str:
+    """``value`` if it matches the closed shape, else the empty string.
+
+    The single place `waived` is judged. Both writers of that field route through
+    the flush, so putting the check here means a future third writer cannot bypass
+    it the way `_amend_note` bypassed the check on `_note_override`.
+    """
+    return value if _WAIVED_RE.match(value or "") else ""
+
+
+def _amend_note(sigil: str, *, waived: str) -> None:
+    """Refine a noted row's ``waived`` once the gate knows more than the sigil did.
+
+    Sigils are noted BEFORE the gates run, so their ``waived`` starts as the gate
+    CLASS. A gate that then learns something specific (CI was red rather than
+    merely pending) says so here. If the command blocked before that gate ran,
+    the row simply keeps the class — which is the honest record, since the
+    specific fact was never established.
+    """
+    for row in _PENDING_OVERRIDES:
+        if row["sigil"] == sigil:
+            row["waived"] = waived
+
+
+def _flush_overrides(outcome: str) -> None:
+    """Write the noted rows with the verdict THIS GUARD returned.
+
+    Not "what the command actually got", which an earlier version of this line
+    claimed and the code does not deliver: ``outcome`` is derived solely from this
+    guard's own return, and several PreToolUse matchers are wired for Bash, plus
+    the harness's own permission prompt. Any of them can stop a command this guard
+    recorded as ``allowed``. So a row asserts "the sigil was accepted HERE", never
+    "the merge happened" — a distinction that matters precisely because this field
+    exists to separate overrides that took effect from overrides merely attempted,
+    and it only separates them within this guard's own chain.
+
+    Best-effort by contract: this runs on the merge path and a logging failure must
+    never break a merge, so nothing here propagates. It is NOT silent, though — the
+    shared writer reports failures on stderr. A logger that fails quietly is
+    indistinguishable from one that was never wired, which is the state this whole
+    change found the gate in.
+
+    NO OFF SWITCH, deliberately, and said out loud because the Generalizability
+    Gate asks every autonomous writer for an operator lever. This one ships a PATH
+    knob (``GENESIS_MERGE_OVERRIDE_DIR``) and no way to disable it: a gate whose
+    audit trail the same session can turn off records nothing an auditor can rely
+    on, and the write is a few hundred bytes on a path a human already chose to
+    take. The sibling discard store is the same by the same reasoning. Move the
+    store, or prune it harder; do not silence it.
+
+    Retention ships WITH the store (New-Store Gate) rather than as a follow-up —
+    which is how the existing unpruned stores under ``~/.genesis/`` got that way —
+    but it ships as a size bound on the daily timer
+    (``scripts/prune_hook_audit_logs.py``), NOT here. Pruning on the merge path was
+    the previous design, and its retention engine caused most of this feature's
+    defects; a verdict path should not also be doing file maintenance.
+    """
+    rows, _PENDING_OVERRIDES[:] = list(_PENDING_OVERRIDES), []
+    if not rows:
+        return
+    if audit_jsonl is None:
+        # Degraded, but NOT silent: the gate is still printing "(logged)" to the
+        # operator, and a quiet no-op here is indistinguishable from the
+        # never-wired state this whole change exists to end. Cannot use
+        # audit_jsonl.warn — that is the module we do not have.
+        #
+        # SUPPRESSED, and that matters: this runs in main()'s `finally`, so an
+        # unwritable stderr raising here escapes into run_guard, which fails
+        # CLOSED and converts it to exit 2 — turning an ALLOW into a BLOCK. The
+        # sibling guard wraps its own block print for exactly this reason.
+        with contextlib.suppress(Exception):
+            print(
+                f"[audit-log] audit_jsonl unavailable — {len(rows)} row(s) NOT recorded",
+                file=sys.stderr,
+            )
+        return
+    if outcome not in _OVERRIDE_OUTCOMES:
+        # The tuple is a contract, not a comment. A row whose verdict is outside
+        # it would be uncountable, and silently so.
+        audit_jsonl.warn(f"refusing {len(rows)} row(s) with unknown outcome {outcome!r}")
+        return
+    try:
+        ts = _dt.datetime.now(_dt.UTC).isoformat()
+        # ONE file for the whole flush, so a multi-sigil merge is one atomic record
+        # rather than N rows that a crash could split. Rows are built from the CLOSED
+        # field tuple, so an extra key on a noted row (or a future caller's stray
+        # kwarg) cannot reach disk.
+        #
+        # `waived` is re-validated HERE, at the chokepoint every row passes through,
+        # not only where it is first set. It has two writers — `_note_override` and
+        # `_amend_note` — and validating per call site is precisely the pattern that
+        # produced this feature's round-over-round defects: the shape check was added
+        # to the first writer and the second one silently bypassed it, so an
+        # unbounded string could still reach a durable row.
+        audit_jsonl.write_batch(
+            _override_log_dir(),
+            [
+                {
+                    k: _valid_waived(v) if k == "waived" else v
+                    for k, v in (
+                        (k, {"ts": ts, "outcome": outcome, **noted}.get(k, ""))
+                        for k in _OVERRIDE_LOG_FIELDS
+                    )
+                }
+                for noted in rows
+            ],
+            sort_keys=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — logging must never break a merge.
+        # Reported, not swallowed: audit_jsonl converts OSError, so anything
+        # reaching here is a bug in THIS function, and a silent one would look
+        # exactly like the no-writer state this change exists to end.
+        audit_jsonl.warn(f"override rows not written ({exc!r})")
 
 
 def _override_evidence_dir() -> str:
@@ -5937,7 +6291,12 @@ def _ask(reason: str) -> int:
     permission prompt and runs the tool only on explicit approval — a gate the
     agent cannot self-satisfy. Verified to render in a wrapped child session
     2026-07-27.
+
+    Records that the decision was DEFERRED, so the override log does not report a
+    still-undecided command as allowed — see ``_OVERRIDE_OUTCOMES``.
     """
+    global _ASK_EMITTED
+    _ASK_EMITTED = True
     print(
         json.dumps(
             {
@@ -6072,6 +6431,36 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
 
 
 def main() -> int:
+    """Run the guard, then record any override sigils with the verdict they got.
+
+    The override log's rows are written HERE rather than where each sigil is
+    detected, because "the sigil was appended" is known early and "what the
+    command actually did" is only known at the end. One flush point covers every
+    return above — including the fail-closed conversion in ``run_guard``, which
+    reaches this wrapper as an exception.
+
+    ONE path is not covered, and an audit store owes it a sentence rather than a
+    silence: the ~60s hook wall-clock. A SIGKILL runs no ``finally``, so every
+    pending row is lost with no notice anywhere — the same overrun the merge-path
+    budget note below is built to avoid, seen from the logging side. That is the
+    single hole in "every override attempt leaves a row", and it fails in the
+    direction of a MISSING record, never a false one.
+    """
+    global _ASK_EMITTED
+    _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
+    _ASK_EMITTED = False
+    outcome = "error"
+    try:
+        rc = _run_merge_and_push_gates()
+        # rc == 0 is THREE states, not two: allowed outright, or handed to the
+        # user as a permission prompt they may yet deny.
+        outcome = "blocked" if rc == 2 else ("asked" if _ASK_EMITTED else "allowed")
+        return rc
+    finally:
+        _flush_overrides(outcome)
+
+
+def _run_merge_and_push_gates() -> int:
     try:
         payload = read_payload()
         cmd = field(payload, "command")
@@ -6472,6 +6861,66 @@ def main() -> int:
                 )
                 return 2
             if pr_num:
+                # The head an override row is ABOUT. Read from the command's own
+                # `--match-head-commit` (the cluster-safe parser the TOCTOU binding
+                # uses) rather than an extra API call on a budgeted path: GitHub
+                # enforces that value server-side, so when the merge succeeds it IS
+                # the merged sha. Empty when the merge is unbound — which the gates
+                # below then refuse anyway, except under a sigil that waives the
+                # binding, and "unbound" is itself the honest record for that row.
+                merge_head = _merge_match_head(merge_seg.argv) or ""
+                # Note every sigil on the merge segment HERE — before the first
+                # gate that can `return 2`. Noting at each gate's own site
+                # recorded nothing when an EARLIER gate blocked, which silently
+                # dropped exactly the attempts the log exists to count (MEASURED:
+                # a CONFLICTING mergeable with three sigils appended wrote zero
+                # rows). The verdict is attached later, by the flush.
+                #
+                # The three `return 2`s ABOVE this point are deliberately not
+                # covered: they fire when the command has no --admin, or when the
+                # repo or PR cannot be resolved at all. Those are malformed
+                # commands rather than override events, and a row could not name
+                # which PR it was about.
+                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                stale_override = has_trailing_override(merge_seg.raw, "stale-review-override")
+                sched_override = has_trailing_override(
+                    merge_seg.raw, "scheduled-review-override"
+                )
+                # The FINDINGS waiver, read off the parsed segment rather than via
+                # has_trailing_override — which is why enumerating that helper's
+                # call sites missed the one sigil SKILL.md documents as logged.
+                force_override = merge_seg.override
+                for _sigil, _present, _waives in (
+                    ("ci-override", ci_override, "ci-status"),
+                    ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
+                    ("review-override", force_override, "review-body+inline-findings"),
+                    ("scheduled-review-override", sched_override, "scheduled-claude-review"),
+                ):
+                    if _present:
+                        # `repo` is BLANK on one path, deliberately: a legacy
+                        # payload with no cwd leaves merge_repo None (see the
+                        # resolution block above — there is nothing to derive
+                        # from), and the gates then ran against the HOOK's own
+                        # cwd repo. Filling it in would mean calling
+                        # _derive_repo_from_cwd, which shells out to `gh repo
+                        # view` — a NETWORK call on the very path whose budget
+                        # note below says an overrun SIGKILLs the hook mid-gate
+                        # and disengages every merge gate at once. Spending that
+                        # on an audit field would trade a fail-OPEN for a
+                        # log nicety. Deriving it locally from `origin` instead
+                        # is cheap but resolves differently from gh on a fork,
+                        # and a row naming the WRONG repo is worse than one
+                        # naming none. So it stays blank here and the ambiguity
+                        # is recorded rather than papered over. Follow-up: fill
+                        # it from a repo already resolved earlier in the run,
+                        # which costs nothing extra.
+                        _note_override(
+                            _sigil,
+                            waived=_waives,
+                            pr=pr_num,
+                            repo=merge_repo,
+                            head=merge_head,
+                        )
                 # ── Merge-path gh TIMEOUT BUDGET ──────────────────────────
                 # This hook runs under a 60s CC wall-clock (settings.json). A
                 # wall-clock overrun SIGKILLs the hook MID-GATE, which "fails
@@ -6542,7 +6991,11 @@ def main() -> int:
                 # or dropped pull_request trigger can't slip an un-CI'd merge through
                 # (handled just below).
                 ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
-                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                # ci_override was detected and noted above, before any gate could
+                # return — see the note block after merge_head. Now that the CI
+                # verdict is known, record WHICH state was waived.
+                if ci_override:
+                    _amend_note("ci-override", waived=f"ci:{ci_state}")
                 if ci_state in ("red", "pending") and not ci_override:
                     print(
                         f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
@@ -6616,15 +7069,15 @@ def main() -> int:
                         file=sys.stderr,
                     )
 
-                force_override = merge_seg.override
-                # The review-CONTEXT waiver (freshness + base gates) is a SEPARATE
-                # sigil from # review-override: the freshness gate is the
-                # high-traffic one (Codex never auto-re-reviews a push), and if its
-                # escape also waived the P1 finding scans, the path of least
-                # resistance would systematically disarm P1 enforcement (Codex P1 +
-                # architect SHOULD-FIX on #1366). One trailing comment may carry
-                # both sigils when both waivers are genuinely intended.
-                stale_override = has_trailing_override(merge_seg.raw, "stale-review-override")
+                # force_override / stale_override were detected and noted above,
+                # before any gate could return. The review-CONTEXT waiver
+                # (freshness + base gates) is a SEPARATE sigil from
+                # # review-override: the freshness gate is the high-traffic one
+                # (Codex never auto-re-reviews a push), and if its escape also
+                # waived the P1 finding scans, the path of least resistance would
+                # systematically disarm P1 enforcement (Codex P1 + architect
+                # SHOULD-FIX on #1366). One trailing comment may carry both
+                # sigils when both waivers are genuinely intended.
 
                 # Base-branch invariant: a PR retargeted AFTER Codex reviewed it
                 # keeps the SAME head oid, so head-freshness alone can't see the
@@ -6785,7 +7238,8 @@ def main() -> int:
                 # merge-gate deadline BLOCKS at whichever gate hits its 1s floor first —
                 # never a silent pass. Uses verified_head from the Codex gate (None under
                 # # stale-review-override → re-read).
-                sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
+                # sched_override was detected and noted above, before any gate
+                # could return.
                 # Provision-or-surface: the scheduled gate no-ops off the configured
                 # public repo (by design). A SILENT no-op would hide a drifted
                 # genesis.yaml (canonical != the real public repo) disarming the gate
