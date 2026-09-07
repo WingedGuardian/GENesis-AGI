@@ -106,9 +106,9 @@ def test_live_session_under_a_stale_project_survives(tmp_path):
     directory and ``rm -rf``s the live session with it.
     """
     home, cctmp, bind = _sandbox(tmp_path)
-    live = _session(cctmp, "-home-ubuntu-genesis", "live-uuid")
+    live = _session(cctmp, "-home-dev-workrepo", "live-uuid")
     (live / "scratchpad" / "notes.json").write_text("fresh work")
-    project = cctmp / "claude-1000" / "-home-ubuntu-genesis"
+    project = cctmp / "claude-1000" / "-home-dev-workrepo"
     _age(project, 10)  # no NEW session started here in 10 days
 
     proc = _run(home, bind, "clean_cc_yellow")
@@ -122,7 +122,7 @@ def test_live_session_under_a_stale_project_survives(tmp_path):
 def test_stale_session_is_reaped(tmp_path):
     """The feature still works: a session with nothing touched in 7 days goes."""
     home, cctmp, bind = _sandbox(tmp_path)
-    old = _session(cctmp, "-home-ubuntu-genesis", "old-uuid")
+    old = _session(cctmp, "-home-dev-workrepo", "old-uuid")
     (old / "scratchpad" / "junk.bin").write_bytes(b"x" * 1024)
     for p in (old / "scratchpad" / "junk.bin", old / "scratchpad", old):
         _age(p, 30)
@@ -137,13 +137,13 @@ def test_reap_is_per_session_not_per_project(tmp_path):
     goes, and the project survives. The pre-fix sweep had no way to express this —
     its unit of deletion was the whole project."""
     home, cctmp, bind = _sandbox(tmp_path)
-    fresh = _session(cctmp, "-home-ubuntu-genesis", "fresh-uuid")
+    fresh = _session(cctmp, "-home-dev-workrepo", "fresh-uuid")
     (fresh / "scratchpad" / "now.txt").write_text("active")
-    stale = _session(cctmp, "-home-ubuntu-genesis", "stale-uuid")
+    stale = _session(cctmp, "-home-dev-workrepo", "stale-uuid")
     (stale / "scratchpad" / "then.txt").write_text("done")
     for p in (stale / "scratchpad" / "then.txt", stale / "scratchpad", stale):
         _age(p, 20)
-    project = cctmp / "claude-1000" / "-home-ubuntu-genesis"
+    project = cctmp / "claude-1000" / "-home-dev-workrepo"
     _age(project, 20)
 
     proc = _run(home, bind, "clean_cc_yellow")
@@ -159,7 +159,7 @@ def test_deep_fresh_file_keeps_the_session(tmp_path):
     old. Directory mtimes alone cannot see this, which is the whole reason the
     old sweep was wrong."""
     home, cctmp, bind = _sandbox(tmp_path)
-    sdir = _session(cctmp, "-home-ubuntu-genesis", "deep-uuid")
+    sdir = _session(cctmp, "-home-dev-workrepo", "deep-uuid")
     deep = sdir / "scratchpad" / "a" / "b" / "c"
     deep.mkdir(parents=True)
     (deep / "just-written.log").write_text("recent")
@@ -171,7 +171,7 @@ def test_deep_fresh_file_keeps_the_session(tmp_path):
         deep.parent.parent,
         sdir / "scratchpad",
         sdir,
-        cctmp / "claude-1000" / "-home-ubuntu-genesis",
+        cctmp / "claude-1000" / "-home-dev-workrepo",
     ):
         _age(p, 40)
 
@@ -196,10 +196,10 @@ def test_emptied_project_dir_is_reclaimed_on_a_later_pass(tmp_path):
     the end state held there too, by deleting live data to get it.
     """
     home, cctmp, bind = _sandbox(tmp_path)
-    old = _session(cctmp, "-home-ubuntu-dead-project", "gone-uuid")
+    old = _session(cctmp, "-home-dev-retired", "gone-uuid")
     for p in (old / "scratchpad", old):
         _age(p, 30)
-    project = cctmp / "claude-1000" / "-home-ubuntu-dead-project"
+    project = cctmp / "claude-1000" / "-home-dev-retired"
     _age(project, 30)
 
     proc = _run(home, bind, "clean_cc_yellow")
@@ -226,14 +226,14 @@ def test_the_reap_spares_a_socket_like_every_other_sweep(tmp_path):
     stop that happening. Everything else in the directory is still reclaimed.
     """
     home, cctmp, bind = _sandbox(tmp_path)
-    sdir = _session(cctmp, "-home-ubuntu-genesis", "socket-uuid")
+    sdir = _session(cctmp, "-home-dev-workrepo", "socket-uuid")
     sock = sdir / "scratchpad" / "agent.sock"
     os.mknod(sock, stat.S_IFSOCK | 0o600)
     junk = sdir / "scratchpad" / "big.bin"
     junk.write_bytes(b"x" * 4096)
     for p in (sock, junk, sdir / "scratchpad", sdir):
         _age(p, 30)
-    _age(cctmp / "claude-1000" / "-home-ubuntu-genesis", 30)
+    _age(cctmp / "claude-1000" / "-home-dev-workrepo", 30)
 
     proc = _run(home, bind, "clean_cc_yellow")
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
@@ -245,7 +245,7 @@ def test_a_freshly_created_project_dir_is_never_reclaimed(tmp_path):
     """The race itself: a project directory CC created moments ago and is about
     to add a session to must survive a sweep landing in that window."""
     home, cctmp, bind = _sandbox(tmp_path)
-    project = cctmp / "claude-1000" / "-home-ubuntu-brand-new"
+    project = cctmp / "claude-1000" / "-home-dev-newrepo"
     project.mkdir(parents=True)  # mkdir <project>, session dir not yet created
 
     proc = _run(home, bind, "clean_cc_yellow")
@@ -270,7 +270,7 @@ def test_reap_fails_closed_when_the_cutoff_cannot_be_computed(tmp_path):
     """
     home, cctmp, bind = _sandbox(tmp_path)
     _make_exec(bind / "date", "#!/usr/bin/env bash\nexit 1\n")
-    ancient = _session(cctmp, "-home-ubuntu-genesis", "ancient-uuid")
+    ancient = _session(cctmp, "-home-dev-workrepo", "ancient-uuid")
     for p in (ancient / "scratchpad", ancient):
         _age(p, 400)
 
