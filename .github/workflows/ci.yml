@@ -379,6 +379,62 @@ jobs:
             python3 scripts/check_migration_prefixes.py
           fi
 
+  changelog-fragments:
+    # Every file in changelog.d/ is a legal fragment — the residue is a
+    # violation, for the same reason the migration-id check treats it that way:
+    # a fragment nobody recognises is a changelog entry that never ships, and
+    # nothing notices, because the release section still looks complete.
+    #
+    # Validated on every PR rather than at release, because collect_fragments is
+    # all-or-nothing: one malformed fragment from any merged PR blocks assembly
+    # of EVERY fragment, and discovering that on release day means discovering
+    # it from the wrong person at the wrong time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # --base asks git what the base branch ALREADY has, which is the one
+          # question the checked-out tree cannot answer. A shallow clone has no
+          # base commit, and the check treats an unreadable base as a violation
+          # rather than a pass.
+          fetch-depth: 0
+          # This job only READS the tree, so it has no use for a credential
+          # left behind in .git/config where every later step can reach it.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Validate changelog.d fragments
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is useless there — it IS the
+          # just-pushed checkout — but the push event's `before` SHA is the
+          # pre-push state, which is what lets the post-merge run see a fragment
+          # that vanished outside the PR check (a direct push, an admin merge, a
+          # PR whose base was unreadable). Same resolution the migration-id job
+          # uses, for the same reason. All-zero on branch creation.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE_SHA:-}"
+          if [ -z "$base" ] && [ -n "${PUSH_BEFORE_SHA:-}" ] \
+             && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          fi
+          if [ -n "$base" ]; then
+            # Deliberately NOT guarded by `git cat-file`: the deletion rule fails
+            # CLOSED on a base it cannot read, and swallowing that here would
+            # turn its refusal into a silent pass — the one outcome its own
+            # docstring says must never happen.
+            python scripts/assemble_changelog.py --check --base "$base"
+          else
+            # schedule/dispatch only. Say what is NOT being enforced rather than
+            # reporting a green that covers less than it appears to.
+            echo "note: no base ref on this event; the deletion rule is not enforced"
+            python scripts/assemble_changelog.py --check
+          fi
+
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress
     # (Discord REST/webhook, public social APIs) outside the reasoned allowlist.
