@@ -376,7 +376,15 @@ def run_case(
             current = None
         if current is None or current == wrote:
             # Gone, unreadable, or still exactly what we wrote -> put it back.
-            target.write_bytes(base_bytes)
+            # copy2 rather than write_bytes: when the child DELETED the target,
+            # write_bytes recreates it at the default creation mode and the
+            # original permission bits are gone. MEASURED 0o755 -> 0o644. The two
+            # guards in the shipped manifest happen to be 0644 so it would not
+            # bite today, but this is a general library and a hook script is
+            # normally executable -- restoring it unrunnable is a quieter kind of
+            # the same damage blocker 4 was about. `baseline` came from copy2, so
+            # it carries the mode.
+            shutil.copy2(baseline, target)
         else:
             # A peer edited it mid-run. PRESERVE their work -- and SAY SO, which
             # the previous version did not: CONFLICT was defined, rendered, and
@@ -448,11 +456,26 @@ def sweep(
         raise ValueError("a sweep with no cases proves nothing")
 
     if check_baseline:
-        problem = assert_green_baseline(
-            cases, cwd=cwd, python=python, env=env, timeout=timeout
-        )
-        if problem:
-            raise RuntimeError(problem)
+        # A case gated on state this run does not have CANNOT be baselined: its
+        # test fails without that state, the gate reads that as a RED baseline,
+        # and the RuntimeError kills the whole sweep -- so one unavailable
+        # resource silently prevents every OTHER case from running. That
+        # contradicts the per-case contract, which says such a case reports
+        # ABORTED and leaves the rest intact. `run_case` still aborts it, loudly.
+        #
+        # The test for requirement 5 could not catch this: it passes
+        # check_baseline=False, so it never exercised the interaction between the
+        # two mechanisms. Both are now asserted together.
+        baselineable = [
+            c for c in cases
+            if all(r in (available or set()) for r in c.requires)
+        ]
+        if baselineable:
+            problem = assert_green_baseline(
+                baselineable, cwd=cwd, python=python, env=env, timeout=timeout
+            )
+            if problem:
+                raise RuntimeError(problem)
 
     # `~/tmp` is a Genesis-container convention (CLAUDE.md "Temp files"), NOT a
     # property of hosts in general -- a CI runner's HOME has no `tmp`, and

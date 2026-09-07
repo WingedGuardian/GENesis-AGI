@@ -501,10 +501,19 @@ def test_a_child_that_DELETES_the_target_does_not_lose_it(project, monkeypatch):
         target.unlink()
         return real_run(*a, **k)
 
+    import os as _os
+    import stat as _stat
+    _os.chmod(target, 0o755)
+    mode_before = _stat.S_IMODE(target.stat().st_mode)
+
     monkeypatch.setattr(ms.subprocess, "run", delete_then_run)
     _sweep(project, [_case(project)])
     assert target.exists(), "the target was destroyed"
     assert target.read_bytes() == before
+    # AND its mode. `write_bytes` on a deleted file recreates it at the default
+    # creation mode -- MEASURED 0o755 -> 0o644 -- so a restored hook script would
+    # come back unrunnable. A quieter version of the same damage.
+    assert _stat.S_IMODE(target.stat().st_mode) == mode_before
 
 
 def test_baselines_are_PRESERVED_when_the_sweep_dies(project, monkeypatch, capsys):
@@ -558,3 +567,25 @@ def test_the_cli_can_declare_an_available_resource(project, tmp_path):
          "--available", "an-engine"],
         capture_output=True, text=True, timeout=180)
     assert "BIT" in with_res.stdout, with_res.stdout + with_res.stderr
+
+
+def test_a_gated_case_does_not_kill_the_whole_sweep(project):
+    """Requirement 5 and requirement 4, ASSERTED TOGETHER.
+
+    `assert_green_baseline` saw every case including ones gated on state this run
+    does not have. Such a case's test fails without that state, the gate read
+    that as a RED baseline, and the RuntimeError killed the sweep -- so one
+    unavailable resource silently prevented every OTHER case from running.
+
+    The existing requirement-5 test passes check_baseline=False and so could
+    never see this: each mechanism was correct alone and wrong together.
+    """
+    gated = _case(project, label="needs an engine", requires=("an-engine",),
+                  test="test_guard.py::test_missing_entirely")
+    ordinary = _case(project, label="ordinary")
+    result = ms.sweep([gated, ordinary], cwd=project, python=sys.executable,
+                      env={"PYTHONPATH": str(project)}, timeout=120,
+                      check_baseline=True, available=set())
+    outcomes = {r.case.label: r.outcome for r in result.results}
+    assert outcomes["needs an engine"] == ms.ABORTED
+    assert outcomes["ordinary"] == ms.BIT, "the ungated case must still have run"
