@@ -896,3 +896,163 @@ async def test_the_observer_reports_the_REGISTERED_total_not_the_observed_one(mo
     assert out["prunable"] == 1
     assert len(out["errors"]) == 1
     assert out["total"] == 3, "the denominator counts every REGISTERED worktree"
+
+
+# ── read_last_run: the record's FIELD shapes, not just its container ────────
+#
+# read_last_run already treated the file as untrusted — it caught unreadable
+# JSON and checked `isinstance(data, dict)` — and then handed every FIELD to
+# callers unchecked. Callers do not merely read those fields, they call methods
+# on them, so a wrong type is a crash rather than a smaller answer. Both
+# consumers were hit, and the worse one was not the reported one:
+#
+#   * zero_drop_tools calls `.items()` on `degraded`   -> AttributeError
+#   * _within_minutes catches only ValueError, but fromisoformat raises
+#     TypeError on a non-string, and it is the FIRST statement of _run_locked
+#     -> the whole sweep dies before doing any work
+#
+# MEASURED against the pre-fix file at 7800ae2d, all four cases below: a list
+# and a str `degraded` crashed the tool, an int `computed_at` crashed the
+# sweep, and an empty-but-wrong `degraded` silently reported blind=False. The
+# last is the dangerous one — no exception, just a detector that could not read
+# its own record advertising a clean board.
+
+
+@pytest.fixture
+def last_run_file(tmp_path, monkeypatch):
+    """Point read_last_run at a temp home and hand back a writer."""
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
+
+    def write(record):
+        path = w.last_run_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record))
+        return path
+
+    return write
+
+
+_GOOD_TS = "2026-09-07T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("degraded", ["a"]),
+        ("degraded", "boom"),
+        ("degraded", []),  # falsy AND wrong — the silent fail-open case
+        ("computed_at", 123),
+        ("stages", []),
+        ("frozen_classes", {}),
+        ("counts_by_status", []),
+        ("duration_s", True),  # bool is an int subclass; not a duration
+        ("open_findings", "3"),
+        ("coverage", 7),
+    ],
+)
+def test_a_wrong_shaped_field_reads_BLIND_rather_than_clean(last_run_file, field, value):
+    """A record we cannot read must never present as a clean board.
+
+    The fail direction is the assertion. Coercing to an empty default is what
+    produced the bug: `degraded = x or {}` turned an unreadable value into a
+    clean one, so `blind` computed False.
+    """
+    record = {"computed_at": _GOOD_TS, "degraded": {}}
+    record[field] = value
+
+    out = w.read_last_run()  # nothing written yet -> never-run
+    assert out == {}, "precondition: no record on disk reads as never-run"
+
+    last_run_file(record)
+    out = w.read_last_run()
+
+    degraded = out.get("degraded") or {}
+    assert isinstance(degraded, dict), "degraded must always be a mapping"
+    assert bool(degraded) is True, f"a wrong-shaped {field} must read BLIND"
+    assert w.MALFORMED_RECORD_KEY in degraded
+    assert field in degraded[w.MALFORMED_RECORD_KEY]
+    if field == "degraded":
+        # `degraded` is the one field that comes back, because it is the
+        # carrier of the violation report. What must not survive is its bad
+        # VALUE: it is replaced by a mapping, never merged with one.
+        assert out["degraded"] == {w.MALFORMED_RECORD_KEY: degraded[w.MALFORMED_RECORD_KEY]}
+        assert out["degraded"] != value
+    else:
+        assert field not in out, "an unreadable field is dropped, not repaired"
+
+
+def test_the_two_real_consumer_operations_survive_every_wrong_shape(last_run_file):
+    """Pin the crashes themselves, not just the blind flag.
+
+    `.items()` is what the status tool does; `_within_minutes` is what the
+    sweep's debounce does. Both raised on the pre-fix code.
+    """
+    for record in (
+        {"computed_at": _GOOD_TS, "degraded": ["a"]},
+        {"computed_at": _GOOD_TS, "degraded": "boom"},
+        {"computed_at": 123, "degraded": {}},
+        {"computed_at": [], "degraded": {}},
+        {"computed_at": {"a": 1}, "degraded": {}},
+    ):
+        last_run_file(record)
+        out = w.read_last_run()
+        dict(out.get("degraded") or {}).items()  # status tool: no AttributeError
+        w._within_minutes(out.get("computed_at"), 60)  # sweep: no TypeError
+
+
+def test_a_healthy_record_is_returned_UNCHANGED_and_not_blind(last_run_file):
+    """The guard must not manufacture blindness on a good record.
+
+    A validator scored only on what it rejects cannot be told apart from one
+    that rejects everything, so this is the other direction of the same claim.
+    """
+    record = {
+        "run_id": "abc",
+        "computed_at": _GOOD_TS,
+        "trigger": "session_start",
+        "mode": "observe",
+        "status": "ok",
+        "duration_s": 1.5,
+        "base_ref": "origin/main",
+        "repo_path": "/repo",
+        "stages": {"branches": {"not_ahead": 3}},
+        "degraded": {},
+        "notes": [],
+        "applied": {},
+        "counts_by_status": {"open": 2},
+        "open_findings": 2,
+        "coverage": "all classes swept",
+        "frozen_classes": [],
+        "alert": "skipped",
+        "blind_alert": "skipped",
+    }
+    last_run_file(record)
+    out = w.read_last_run()
+
+    assert out == record, "a valid record passes through untouched"
+    assert bool(out.get("degraded") or {}) is False, "a good record is not blind"
+
+
+def test_a_genuine_degradation_is_PRESERVED_beside_a_shape_violation(last_run_file):
+    """A real degradation must not be lost when another field is malformed.
+
+    Rebuilding `degraded` is necessary (it may itself be the bad field), but
+    rebuilding it as EMPTY would discard the sweep's own report of what it
+    could not see.
+    """
+    last_run_file({"computed_at": _GOOD_TS, "degraded": {"branches": "gh auth failed"}, "stages": []})
+    degraded = w.read_last_run()["degraded"]
+
+    assert degraded["branches"] == "gh auth failed", "the real degradation survives"
+    assert w.MALFORMED_RECORD_KEY in degraded, "and the shape violation is added beside it"
+
+
+def test_a_null_field_is_not_a_shape_violation(last_run_file):
+    """`None` means absent, which callers already handle; only a WRONG TYPE is
+    a violation. Treating null as malformed would make every optional field a
+    permanent blindness alarm."""
+    last_run_file({"computed_at": _GOOD_TS, "degraded": {}, "coverage": None})
+    out = w.read_last_run()
+
+    assert bool(out.get("degraded") or {}) is False, "a null field does not read blind"
+    assert out["coverage"] is None

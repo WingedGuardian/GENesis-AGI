@@ -155,17 +155,111 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
+# The shape the record WRITER emits (see the `record` dict at the end of
+# `_run_locked`). Validating the container alone is not enough: callers do not
+# just read these values, they call methods on them, so a field of the wrong
+# type is a crash rather than a smaller answer. Two measured instances, which is
+# why this is a table and not another `isinstance` at a use site:
+#
+#   * `zero_drop_tools.py` calls `.items()` on `degraded` — a list or a string
+#     raises AttributeError out of a read-only status tool.
+#   * `_within_minutes` catches only ValueError, but `fromisoformat` raises
+#     TypeError on every non-string, and it runs as the FIRST statement of
+#     `_run_locked` — so a malformed record kills the whole sweep before it does
+#     any work. A detector that goes silent is the exact failure this subsystem
+#     exists to prevent, so this one matters more than the crash that was
+#     reported.
+#
+# `duration_s` and `open_findings` deliberately exclude bool: `isinstance(True,
+# int)` is True, and a duration of `True` is not a duration.
+_LAST_RUN_SHAPE: dict[str, type | tuple[type, ...]] = {
+    "run_id": str,
+    "computed_at": str,
+    "trigger": str,
+    "mode": str,
+    "status": str,
+    "duration_s": (int, float),
+    "base_ref": str,
+    "repo_path": str,
+    "stages": dict,
+    "degraded": dict,
+    "notes": list,
+    "applied": dict,
+    "counts_by_status": dict,
+    "open_findings": int,
+    "coverage": str,
+    "frozen_classes": list,
+    "alert": str,
+    "blind_alert": str,
+}
+
+# Key under which a shape violation is recorded INTO `degraded`, so the board
+# reads blind rather than clean.
+MALFORMED_RECORD_KEY = "last_run_record"
+
+
+def _validate_last_run(data: dict) -> dict:
+    """Drop fields whose type is not the writer's, and declare that we did.
+
+    The fail direction is the whole point. Coercing a wrong-shaped value to a
+    clean empty — `degraded = x or {}` — is what produced the reported bug: an
+    empty-but-wrong `degraded` made `blind` read False, so a detector that
+    could not read its own run record advertised a clean board. Here a
+    violation ADDS to `degraded`, so every surface that asks "is this thing
+    blind?" gets True.
+
+    Dropping rather than repairing is deliberate: an absent field makes callers
+    take their existing never-ran path, which they already handle, whereas a
+    substituted value would be a number nobody measured.
+    """
+
+    def wrong(value: object, expected: type | tuple[type, ...]) -> bool:
+        # bool is a subclass of int, so `isinstance(True, int)` passes and a
+        # duration of `True` would be accepted as a number. No field here wants
+        # a bool, so reject it everywhere rather than special-casing the two
+        # numeric fields and having the next one added inherit the hole.
+        if isinstance(value, bool):
+            return True
+        return not isinstance(value, expected)
+
+    bad = sorted(
+        k
+        for k, expected in _LAST_RUN_SHAPE.items()
+        if k in data and data[k] is not None and wrong(data[k], expected)
+    )
+    if not bad:
+        return data
+    logger.warning(
+        "zero_drop last_run.json has %d field(s) of the wrong type: %s",
+        len(bad),
+        ", ".join(bad),
+    )
+    out = {k: v for k, v in data.items() if k not in bad}
+    # `degraded` may itself be the malformed field, so rebuild it rather than
+    # assuming the survivor is a mapping.
+    existing = out.get("degraded")
+    degraded = dict(existing) if isinstance(existing, dict) else {}
+    degraded[MALFORMED_RECORD_KEY] = f"unreadable field(s): {', '.join(bad)}"
+    out["degraded"] = degraded
+    return out
+
+
 def read_last_run() -> dict:
     """The previous run's stage accounting, or ``{}`` if there is none.
 
     The reader's contract is that an EMPTY result means "the detector has not
     run", never "nothing is stranded" — every surface must render the
     ``computed_at`` age beside any zero.
+
+    Field types are validated here rather than at each use site, because both
+    consumers — the status tool and the sweep's own debounce — were reading
+    fields they never checked, and a third caller would have had to remember
+    the same thing. See `_validate_last_run` for the fail direction.
     """
     try:
         data = json.loads(last_run_path().read_text())
         if isinstance(data, dict):
-            return data
+            return _validate_last_run(data)
     except FileNotFoundError:
         pass  # never run here — the honest empty state, not a fault
     except Exception:
