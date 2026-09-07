@@ -227,6 +227,47 @@ def test_a_failed_clock_read_holds_the_wait_instead_of_ending_it(text: str) -> N
     )
 
 
+def test_an_unreadable_baseline_does_not_skip_the_wait_entirely(text: str) -> None:
+    """A failed clock read is safe INSIDE the loop and catastrophic at the start.
+
+    Inside, 0 cannot reach the deadline, so the wait holds. At the baseline, 0
+    makes the deadline the window itself — the first comparison against a real
+    uptime fails, the loop runs ZERO times, and a working deploy is rolled back
+    without the health endpoint ever being asked. Same value, opposite
+    consequence, which is exactly why one guard does not cover both.
+
+    Same one-token substitution as the helper test: the path is pointed at a
+    file that does not exist so the failure branch is reachable.
+    """
+    helper = _extract(text, "    _health_now() {", "    }")
+    baseline = _extract(text, "    HEALTH_START=$(_health_now)", "    HEALTH_DEADLINE=")
+    # The scenario the guard exists for is NARROW and easy to miss: the picker
+    # SUCCEEDS (uptime was readable when the source was chosen) and the read
+    # then fails at the baseline. Breaking the picker as well would select the
+    # wall clock up front and never reach the guard at all — which is how an
+    # earlier version of this test passed with the guard deleted.
+    broken = helper.replace("/proc/uptime", "/proc/uptime-does-not-exist")
+    # The deadline line is part of the extracted block, so the window it adds
+    # has to exist or the arithmetic silently contributes zero.
+    broken = f"HEALTH_WINDOW_SECS=900\n_HEALTH_CLOCK=uptime\n{broken}\n{baseline}"
+    out = subprocess.run(
+        ["bash", "-c", f'{broken}\nprintf "%s %s" "$HEALTH_START" "$HEALTH_DEADLINE"'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    # The fallback prints an operator NOTE first, like the rest of the deploy
+    # progress; the values are the final line.
+    parts = out.stdout.strip().splitlines()[-1].split()
+    assert len(parts) == 2, f"unexpected output {out.stdout!r} ({out.stderr[:200]})"
+    start, deadline = int(parts[0]), int(parts[1])
+    assert start > 1_000_000_000, (
+        f"baseline resolved to {start} — a deadline built on that is unreachable "
+        "and the wait is skipped into an immediate rollback"
+    )
+    assert deadline > start, "the deadline must sit ahead of the baseline"
+
+
 def test_exactly_one_wait_loop_reads_the_same_clock_as_the_deadline(text: str) -> None:
     """The deadline and the loop condition must be in ONE clock domain.
 

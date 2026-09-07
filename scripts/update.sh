@@ -1888,6 +1888,18 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
         fi
     }
     HEALTH_START=$(_health_now)
+    # The BASELINE is the one reading where a 0 is not safe, and the asymmetry
+    # is easy to miss: inside the loop a 0 merely holds the wait, but here the
+    # deadline becomes the window itself (900), the first comparison against a
+    # real uptime (~4.4e6) fails, and the wait is skipped straight into a
+    # rollback with ZERO attempts — a working deploy discarded without ever
+    # asking the health endpoint. So a failed baseline switches the domain for
+    # the WHOLE wait rather than leaving a deadline nothing can satisfy.
+    if [ "$HEALTH_START" -eq 0 ] && [ "$_HEALTH_CLOCK" = uptime ]; then
+        echo "  NOTE: monotonic clock unreadable at start — falling back to the wall clock"
+        _HEALTH_CLOCK=wall
+        HEALTH_START=$(_health_now)
+    fi
     HEALTH_DEADLINE=$(( HEALTH_START + HEALTH_WINDOW_SECS ))
     # A clock-INDEPENDENT backstop, which the old fixed-attempt loop had for
     # free and a pure deadline gives up. Each iteration sleeps 15s, so this can
