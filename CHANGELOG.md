@@ -602,6 +602,94 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A crafted Bash command could run a safety guard past its timeout, and a timed-out
+  hook does not block — it permits.** The shared shell parser had no bound on the work
+  a single command could ask of it. Cost rises with the length of the command, with
+  its nesting depth, and (measured, 3.4x) with the shape of its padding, and Claude
+  Code's documented hook contract is explicit that a hook which reaches its timeout
+  "doesn't block the tool call". So a guard that ran out of clock did not refuse the
+  command — it allowed it.
+
+  Measured end to end against the real protected-paths guard, on a payload it
+  genuinely refuses, under its registered 10s timeout: refused in 0.48s unnested at
+  64 KB, but **killed at the timeout** at depth 48, at every depth once the command
+  reached 300 KB, and — with no nesting whatsoever — at 450 KB. Eleven of fifteen
+  measured cells failed open. Reaching this needs a command far larger than ordinary
+  work produces (the longest of 20,461 real commands is 14,682 characters), which for
+  a security guard is the threat model rather than a mitigation.
+
+  The limits are sized against the tightest path rather than the loosest, which is not
+  the one the individual guards are registered on: the shell safety hook is registered
+  at **5 seconds** and runs two of these guards sequentially over the same command, so
+  those parses share that budget — and there are FIVE of them, not two: the hook
+  delegates to three guards, one of which analysed the same command three times over.
+  Those duplicates are now parsed once. The two limits are chosen TOGETHER, because
+  the parser re-scans the remaining text at every level and the worst case is a
+  command at the size limit nested to the depth limit — cost is length times levels,
+  so neither number means anything alone. Measured end to end through the real hook,
+  the chosen pair costs about half the budget. The two directions are deliberately not treated as symmetric —
+  over the size limit a command is refused or prompted, while over the timeout it runs
+  unchecked, so margin is bought on the side that fails open.
+
+  Both axes are now bounded, because neither subsumes the other: a length cap alone
+  leaves nesting free to multiply the work, and a depth bound alone leaves the first
+  pass — which happens before any recursion — completely unbounded. Every one of the
+  same fifteen cells now refuses, in under 2.6s. Both limits are set from data rather
+  than taste: across 45,358 distinct real commands the deepest nesting seen is 3 and
+  the longest command is 43,480 characters, so the bounds sit twice the observed
+  nesting and a little beyond the longest command, and fire on none of them. Commands whose
+  top-level segments change: 0, which is what keeps the guards that match working
+  directories by exact string unaffected.
+
+  The size limit was first set against a corpus half that size, whose longest command
+  was 14,682 characters — and the resulting limit turned out to sit *below* three real
+  commands, all of them here-documents writing review prose, a shape this workflow
+  produces and that corpus had simply not accumulated yet. A limit is only as good as
+  the corpus it was measured against, and a corpus keeps growing after the
+  measurement. Raising it then pushed the pair over the hook's budget — measured at
+  6.12 seconds against a five-second registration, which is the very fail-open this
+  change exists to close — until the duplicate parses were removed and the nesting
+  limit came down to compensate. The same lesson from the other side: these are one
+  decision, not two, and the budget they are measured against has to be the real one.
+
+  Both limits carry the SAME verdict, and briefly they did not. A per-axis severity
+  flag let the size limit prompt where the nesting limit refused; it was wired into
+  guards whose only verdicts are block and allow, where not refusing is not a lighter
+  verdict but a silent permit, and a real unrecoverable discard padded past the size
+  limit went from refused to allowed through every layer. The flag's entire benefit
+  was hypothetical — the case it distinguished occurs in none of the forty-five
+  thousand real commands — so it is deleted. A distinction that no real input
+  exercises, that six call sites must each get right, and whose wrong answer is
+  silent, is a defect generator rather than a feature.
+
+  Bounding the work alone would have traded one fail-open for a worse one — a guard
+  that quietly stops seeing a buried command and allows it — so the bounds and the
+  signal ship together. `analyze_checked()` returns the segments AND whether the parse
+  could read the whole command, from one traversal, and every guard that fails closed
+  on an unreadable command now asks that single question. A test derives the consumer
+  set from the code and requires it, so a consumer added later cannot quietly go back
+  to the unchecked call; an over-length command yields no segments at all rather than
+  a parsed prefix, because truncating a command mid-string changes the meaning of
+  everything after the cut.
+
+  Refusal messages also stopped guessing at the cause. Each blind spot carries its own
+  explanation and its own way out, so a command that is merely too long or too deeply
+  nested no longer tells the reader to go fix quoting that was never the problem — and
+  the protected-paths fallback no longer describes an unresolved shell variable or an
+  unresolvable relative path as "an untokenizable command", which it had been doing
+  for two of its three callers.
+
+- **Clearing every review marker now also clears the legacy pre-upgrade one**, which
+  it could previously skip while reporting success. That legacy file authorizes a commit
+  entirely on its own — it needs no per-worktree marker directory to exist, or to be
+  readable — but it was removed at the very end of the routine, below a check that
+  returns early in exactly those two states. An install carrying only the legacy
+  marker, which is what an upgrade leaves behind, therefore got "cleared 0, no
+  failures" while a time-valid marker sat intact and could authorize an unreviewed
+  commit for its lifetime. It is now cleared before anything can return early, so the
+  ordering itself prevents this rather than a second check catching it; a marker
+  directory that cannot be read is still reported as the separate failure it is.
+
 - **Campaign names stored before the control-character fix are now cleaned at
   startup.** Names have been sanitized at the write boundary since the previous
   release, so nothing new lands malformed, but rows written earlier were never

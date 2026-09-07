@@ -530,6 +530,109 @@ def clear_marker(cwd: str | None = None) -> None:
             path.unlink(missing_ok=True)
 
 
+def clear_all_markers() -> tuple[int, list[str]]:
+    """Delete EVERY per-worktree review marker. Returns ``(cleared, failures)``.
+
+    A marker this cannot remove is REPORTED, never swallowed. Under-clearing is
+    precisely the bypass this function exists to close, so a silent failure would
+    leave the caller believing it had closed it. The caller surfaces ``failures``.
+
+    The last resort for the post-commit invalidator, for the one case where the
+    marker to clear cannot be IDENTIFIED: a command whose parse was stopped by a
+    shell_parse bound. The candidate-set over-clear cannot cover it, because a
+    repository named only by an explicit selector (``git -C <dir> commit``) is
+    discoverable solely from the parse — and a bounded parse returns nothing, by
+    design, since a partial one is a wrong answer rather than a weak one. Deriving
+    the selector from the raw string instead would be a second, hand-rolled shell
+    parser, which is the trap this module's guards were built to avoid.
+
+    So the choice is between clearing markers that were not involved and leaving a
+    marker whose commit already happened. This module's cost model settles it: an
+    extra clear costs some session a redundant re-review, while a survivor
+    authorizes an UNREVIEWED commit for the marker's TTL. MEASURED, this fires on
+    0 of 45,358 real commands, so the redundant-review cost is theoretical and the
+    bypass it closes is not.
+
+    Never raises: invalidation runs post-commit, and a crash here would leave the
+    stale marker this exists to remove.
+    """
+    cleared = 0
+    failures: list[str] = []
+
+    # THE LEGACY MARKER IS CLEARED FIRST, BEFORE ANY EARLY RETURN CAN SKIP IT.
+    # `_load_marker` reads `(_state_file(cwd), _LEGACY_STATE_FILE)` in that order, so
+    # the legacy file authorizes a commit entirely on its own — it does not need the
+    # per-worktree directory to exist, or to be readable, or to hold anything. It was
+    # cleared at the END of this function, below the `_MARKER_DIR` probe, which made
+    # it unreachable in exactly the two states where the probe returns early:
+    #
+    #     dir never created  -> `return 0, []`     — reported as a CLEAN success
+    #     dir unreadable     -> `return 0, [err]`  — a REAL failure, but not this one
+    #
+    # MEASURED at both, with a valid legacy marker present: it survived and
+    # `_load_marker()` returned it. The first is the dangerous one — an upgraded
+    # install that has only the legacy file gets "cleared 0, no failures", i.e. this
+    # function reporting that it closed the bypass while the bypass is intact.
+    #
+    # Ordering is the fix, not an extra branch: a cleanup placed after an early return
+    # is inert, so hoisting it above every return makes a future early return unable
+    # to reintroduce this. Counted only when it actually existed, because
+    # `missing_ok=True` succeeds on an absent file and "cleared 1" against nothing
+    # propagates into the operator-facing message.
+    if _LEGACY_STATE_FILE.exists():
+        try:
+            _LEGACY_STATE_FILE.unlink()
+        except OSError as exc:
+            failures.append(f"{_LEGACY_STATE_FILE}: {exc}")
+        else:
+            # The same re-read the per-worktree markers get below, applied here because
+            # hoisting this above the probe moved it OUT of that survivors glob — which
+            # scans `_MARKER_DIR` only. This file is the one deletion in this function
+            # that authorizes a commit ON ITS OWN, so it is the last one that should be
+            # counted on trust: an `unlink()` returning success against a file that is
+            # still there (a racing writer, an overlay that drops the write) is exactly
+            # the case the survivors check exists for, and `cleared` is printed to the
+            # operator verbatim.
+            if _LEGACY_STATE_FILE.exists():
+                failures.append(f"{_LEGACY_STATE_FILE}: still present after unlink")
+            else:
+                cleared += 1
+
+    # `Path.glob` does NOT raise on an unreadable directory — it SWALLOWS the
+    # PermissionError and yields nothing. MEASURED on 3.12: a marker dir at mode 000
+    # holding one marker globs to `[]` with no exception. So an `except OSError`
+    # around it is dead code, and an empty result is indistinguishable between "no
+    # markers exist" and "every marker survived and I could not see them". The second
+    # is the bypass this function exists to close, reported as a clean success.
+    #
+    # Probing readability explicitly is what tells them apart. Checked BEFORE the glob
+    # and treated as a hard failure, because "cleared 0, no failures" on an unreadable
+    # directory is the single most dangerous thing this function could return.
+    if not os.access(_MARKER_DIR, os.R_OK | os.X_OK):
+        if _MARKER_DIR.exists():
+            failures.append(f"{_MARKER_DIR}: unreadable, so surviving markers cannot be seen")
+        # Both branches land here, and they mean opposite things: unreadable → markers
+        # survive UNSEEN and the failure above says so; absent → nothing more to clear.
+        return cleared, failures
+
+    for path in _MARKER_DIR.glob("*.json"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+        else:
+            cleared += 1
+
+    # A marker still present after its unlink "succeeded" is the same silent
+    # under-clear in a different disguise (a racing writer, an overlay that drops the
+    # write). Cheap to check, and the only way this function can honestly claim the
+    # bypass is closed.
+    survivors = [str(p) for p in _MARKER_DIR.glob("*.json")]
+    if survivors:
+        failures.extend(f"{p}: still present after unlink" for p in survivors)
+    return cleared, failures
+
+
 # ── Review-round counter (escalation cap) ─────────────────────────────────────
 # Counts CONSECUTIVE defect-bearing review→fix→re-review rounds per change so the
 # commit gate can force a conscious stop after ESCALATION_ROUND_CAP rounds. Kept
