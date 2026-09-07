@@ -119,6 +119,15 @@ class TestNesting:
     def test_bash_lc_bundle(self):
         assert _commit_nv("bash -lc 'git commit -n -m wip'")
 
+    def test_bash_ce_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ce 'echo hello'"))
+
+    def test_bash_cl_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -cl 'echo hello'"))
+
+    def test_bash_ec_bundle_still_works(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ec 'echo hello'"))
+
     def test_command_substitution(self):
         assert _push_blocked('echo "$(git push origin main)"')
 
@@ -312,6 +321,24 @@ class TestCommandPositionStrip:
 
     def test_while_do_done(self):
         assert self._detects("while :; do git push --force origin main; done", "git", "push")
+
+    def test_case_pattern_command(self):
+        assert self._detects("case x in y) echo hello ;; esac", "echo")
+
+    def test_case_multiple_pattern_commands(self):
+        command = "case x in a) echo first ;; b) echo second ;; esac"
+        segments = sp.analyze(command)
+
+        assert sum(s.exe == "echo" for s in segments) == 2
+
+    def test_function_body_command(self):
+        assert self._detects("f() { echo hello; }", "echo")
+
+    def test_function_keyword_body_command(self):
+        assert self._detects("function f { echo hello; }", "echo")
+
+    def test_coproc_command(self):
+        assert self._detects("coproc echo hello", "echo")
 
     def test_glued_rm(self):
         assert self._detects("(rm -rf ~)", "rm")

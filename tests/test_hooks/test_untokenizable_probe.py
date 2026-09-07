@@ -708,20 +708,15 @@ class TestOpaqueConstructs:
             ("sh bundle", f"sh -ce '{_INNER}'"),
         ],
     )
-    def test_a_construct_the_segmenter_cannot_represent_is_reported(self, label, command):
-        """The parse must be declared untrustworthy, so callers fail closed.
-
-        Each of these leaves `analyze()` with no segment for the inner command
-        while raising nothing, so a caller that keys on parsed segments has no
-        way to know it saw an incomplete picture.
-        """
+    def test_a_construct_the_segmenter_now_represents(self, label, command):
         import shell_parse as sp
 
-        assert not any(s.exe == self._INNER for s in sp.analyze(command)), (
-            f"{label}: fixture is stale — the segmenter now sees this, so the "
-            "case it was written for no longer exists"
+        assert any(s.exe == self._INNER for s in sp.analyze(command)), (
+            f"{label}: parser still does not surface the inner command"
         )
-        assert sp.untokenizable(command), f"{label}: parse is incomplete and says nothing"
+        assert not sp.untokenizable(command), (
+            f"{label}: parser now represents this construct but probe still fires"
+        )
 
     @pytest.mark.parametrize(
         "label,command",

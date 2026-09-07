@@ -807,10 +807,10 @@ def untokenizable(command: str) -> bool:
     here with a message-hostile broadening.
     """
     try:
-        tokens = shlex.split(command)
+        shlex.split(command)
+        return False
     except ValueError:
         return True
-    return _has_opaque_construct(tokens)
 
 
 # Reserved words the segmenter does not model. CLOSED SET, and that is the whole
@@ -821,62 +821,6 @@ def untokenizable(command: str) -> bool:
 # without the inner command are here — `if`/`while`/`for`/`select` and the
 # grouping operators all resolve correctly and are deliberately absent, because
 # every entry costs a fallback to coarse matching.
-_OPAQUE_WORDS = frozenset({"coproc", "function"})
-
-# `name()` — a function definition, whose body the segmenter reads as operands.
-_FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
-
-# An option bundle carrying `c` somewhere other than the END. `-c` and `-ec`
-# resolve, because the script is the next argument either way; `-ce` and `-cl`
-# do not, because the letters after the `c` are read as the thing to run.
-_INTERPRETER_C_BUNDLE = re.compile(r"^-[A-Za-z]*c[A-Za-z]+$")
-_INTERPRETERS = frozenset({"bash", "sh", "zsh", "ksh", "dash"})
-
-
-def _has_opaque_construct(tokens: list[str]) -> bool:
-    """True when a TOKEN marks a construct `analyze()` cannot represent.
-
-    Tokens, never raw text, and that is what makes this quote-safe by
-    construction rather than by care: shlex keeps a quoted argument as ONE
-    token, so a reserved word inside `grep -r '...'` can never appear as a bare
-    token here. A raw-text scan would fire on every command that merely mentions
-    one, which is the false-positive class the parser exists to release.
-    """
-    # Shell operators are NOT token separators for shlex, so a reserved word
-    # adjacent to one arrives glued (`esac;`, `(git`, `done&&`). Comparing raw
-    # tokens therefore only ever matched a keyword that happened to sit at the
-    # end of the command — which is exactly the shape a hand-written fixture
-    # takes, and not the shape real commands take.
-    words = {t.strip(";&|()<>") for t in tokens}
-    # `case` is required to CLOSE. A real case statement always ends in `esac`,
-    # while prose that happens to contain the word does not — and prose reaches
-    # here routinely, because this probe reads heredoc bodies as ordinary text
-    # by design. MEASURED: requiring the pair removes a commit message whose
-    # body used "case" in an ordinary sentence, which had been enough on its own
-    # to divert a guard off its parsed path.
-    if "case" in words and "esac" in words:
-        return True
-    for i, token in enumerate(tokens):
-        bare = token.strip(";&|()<>")
-        if bare in _OPAQUE_WORDS:
-            return True
-        # `name()` alone is not enough. A shell function definition is
-        # `name() {` — the brace is part of the grammar. Without requiring it,
-        # MEASURED over 51,052 real commands, 574 fired on a zero-argument call
-        # inside a PYTHON HEREDOC body, which this probe reads as ordinary text
-        # by design. Every one of those would push a guard back to substring
-        # matching, which is the false-positive class the parser exists to
-        # reduce — so the probe would have undone at the parser layer what the
-        # guards gained.
-        # Against the RAW token, never the stripped one: `()` IS the shape here,
-        # so stripping the operator characters that matter for a reserved word
-        # erases the thing this pattern matches on.
-        if _FUNCTION_DEF.match(token) and i + 1 < len(tokens) and tokens[i + 1] == "{":
-            return True
-        if _INTERPRETER_C_BUNDLE.match(token) and i and _basename(tokens[i - 1]) in _INTERPRETERS:
-            return True
-    return False
-
 
 # WHY THIS MODULE HAS COST BOUNDS AT ALL
 #
@@ -1348,6 +1292,39 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 j -= 1
     return result
 
+_FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+_INTERPRETER_C_BUNDLE = re.compile(r"^-[A-Za-z]*c[A-Za-z]+$")
+
+
+def _embedded_commands(argv: list[str]) -> list[str]:
+    """Return command bodies embedded in shell constructs."""
+    if not argv:
+        return []
+
+    if argv[0] == "case":
+        for i, token in enumerate(argv[1:], 1):
+            if token.endswith(")") and i + 1 < len(argv):
+               return [shlex.join(argv[i + 1 :])]
+        return []
+
+    if argv[0].endswith(")") and len(argv) > 1:
+        return [shlex.join(argv[1:])]
+
+    if argv[0] == "function" and len(argv) > 3:
+        try:
+            start = argv.index("{") + 1
+        except ValueError:
+            return []
+        return [shlex.join(argv[start:])]
+
+    if _FUNCTION_DEF.match(argv[0]) and len(argv) > 2 and argv[1] == "{":
+        return [shlex.join(argv[2:])]
+
+    if argv[0] == "coproc" and len(argv) > 1:
+        return [shlex.join(argv[1:])]
+
+    return []
+
 
 def analyze(command: str) -> list[Segment]:
     """Parse a Bash command into executed Segments (nested scripts flattened).
@@ -1424,8 +1401,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
             script = _nested_script(argv)
             if script:
                 nested.append(script)
-        # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
-        # expansion redirect target, so a nested command stays visible to the guards.
+
+        nested.extend(_embedded_commands(argv))
         nested.extend(_substitutions(raw))
         if not nested:
             continue
@@ -1540,31 +1517,29 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str]) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
-    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
-    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
-
-    An earlier version read a bundle whose ``c`` was not last as an INLINE value
-    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
-    parser then reported a segment whose executable was ``e``, and a guard keyed
-    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
-
-    MEASURED 2026-09-06 against the real interpreters, both directions:
-    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
-    token, while the glued spelling that branch modelled is refused outright —
-    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
-    So the branch modelled a form none of these shells accepts and dropped one
-    they all do, and deleting it is strictly a widening.
+    Handles a bare ``-c`` (script is the next token), a combined short bundle
+    where ``c`` is last (``-lc 'script'`` → next token), an option bundle where
+    ``c`` is not last (``-ce 'script'`` → next token), and an inline value
+    (``-c'script'`` → the rest of the token after ``c``).
     """
     for i, tok in enumerate(argv[1:], 1):
         if not tok.startswith("-") or tok.startswith("--"):
             continue
         if "c" not in tok[1:]:
             continue
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    return ""
 
+        pos = tok.find("c")
+
+        if _INTERPRETER_C_BUNDLE.match(tok):
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        elif pos == len(tok) - 1:
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        else:
+            return tok[pos + 1 :]
+
+    return ""
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
