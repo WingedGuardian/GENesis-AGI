@@ -33,6 +33,10 @@ class SecretKeyDef:
     description: str
     signup_url: str
     is_sensitive: bool
+    #: True when the template ships this key COMMENTED — an OPTIONAL OVERRIDE whose
+    #: real source is genesis.yaml or a built-in default. Setting one here shadows
+    #: that source, so it must also be possible to UNSET it; see `_write_secrets`.
+    is_optional_override: bool = False
 
 
 _SECTION_RE = re.compile(r"^#\s*─{3,}\s*(.+?)\s*─+$")
@@ -40,6 +44,8 @@ _LABEL_RE = re.compile(r"^#\s*---\s*(.+?)\s*---")
 _USED_BY_RE = re.compile(r"^#\s*Used by:\s*(.+)", re.IGNORECASE)
 _SIGNUP_RE = re.compile(r"^#\s*Signup:\s*(.+)", re.IGNORECASE)
 _KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]+)=")
+# A key the template ships commented out — still registered, just unset.
+_COMMENTED_KEY_RE = re.compile(r"^#\s*([A-Z][A-Z0-9_]+)=")
 # Note: ``_PASS`` covers NAS/SMB passwords (GENESIS_BACKUP_NAS_PASS) and any
 # *_PASSWORD key; it also subsumes _PASSPHRASE but that is kept for clarity.
 _SENSITIVE_RE = re.compile(r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|_PASS|FIRECRAWL_API")
@@ -90,13 +96,25 @@ def _parse_example_file() -> list[SecretKeyDef]:
             signup_url = m.group(1).strip()
             continue
 
-        # Key definition: KEY_NAME=
+        # Key definition: KEY_NAME=  — or `# KEY_NAME=`, a key the template ships
+        # COMMENTED so its default is not force-assigned into secrets.env.
+        #
+        # A commented key is still a REAL, settable key and must stay in this
+        # registry: the PUT route rejects anything not in _KNOWN_KEYS, so dropping
+        # it makes the dashboard field vanish and an update 4xx. That bites hardest
+        # on exactly the keys the template comments ON PURPOSE — the local-inference
+        # URLs and the embedding priority lever are commented precisely so the
+        # genesis.yaml equivalents keep working, and the TTS tuning knobs and the
+        # dashboard auth toggle were already invisible here for the same reason.
+        # `_KEY_RE` anchors at the line start, so the comment form needs its own
+        # match rather than the (unreachable) startswith check this replaced.
         m = _KEY_RE.match(line_s)
+        commented = False
+        if not m:
+            m = _COMMENTED_KEY_RE.match(line_s)
+            commented = bool(m)
         if m:
             key_name = m.group(1)
-            # Skip commented-out keys
-            if line_s.startswith("#"):
-                continue
             keys.append(SecretKeyDef(
                 key=key_name,
                 group=group,
@@ -104,6 +122,7 @@ def _parse_example_file() -> list[SecretKeyDef]:
                 description=description,
                 signup_url=signup_url,
                 is_sensitive=bool(_SENSITIVE_RE.search(key_name)),
+                is_optional_override=commented,
             ))
             # Reset per-key metadata (label persists for multi-key providers)
             description = ""
@@ -131,6 +150,12 @@ except Exception:
     logger.error("Failed to parse secrets.env.example", exc_info=True)
     _KEY_REGISTRY = []
 _KNOWN_KEYS: frozenset[str] = frozenset(k.key for k in _KEY_REGISTRY)
+#: Keys the template ships COMMENTED — optional overrides whose real source is
+#: genesis.yaml or a built-in default. These, and only these, may be CLEARED back
+#: to unset through the editor.
+_OPTIONAL_OVERRIDE_KEYS: frozenset[str] = frozenset(
+    k.key for k in _KEY_REGISTRY if k.is_optional_override
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -172,7 +197,18 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
         m = _KEY_RE.match(line.strip())
         if m and m.group(1) in remaining:
             key = m.group(1)
-            new_lines.append(f"{key}={remaining.pop(key)}\n")
+            val = remaining.pop(key)
+            if val == "":
+                # UNSET: comment the assignment out rather than writing `KEY=`.
+                # An empty assignment is NOT the same as no assignment — the
+                # accessors read `os.environ.get(key) is not None`, so `KEY=`
+                # still shadows genesis.yaml, just with an empty string, which is
+                # worse than the value it replaced. Commenting preserves the line
+                # (and any inline note beside it) as documentation of what the
+                # key was, which is exactly how the template ships these.
+                new_lines.append(f"# {key}={line.strip().split('=', 1)[1]}\n")
+            else:
+                new_lines.append(f"{key}={val}\n")
         else:
             new_lines.append(line)
 
@@ -181,6 +217,8 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
         if new_lines and not new_lines[-1].endswith("\n"):
             new_lines.append("\n")
         for key, val in remaining.items():
+            if val == "":
+                continue  # unset stays unset — never append a shadowing `KEY=`
             new_lines.append(f"{key}={val}\n")
 
     # Atomic write
@@ -222,6 +260,10 @@ def secrets_list():
             "description": kdef.description,
             "signup_url": kdef.signup_url,
             "is_sensitive": kdef.is_sensitive,
+            # Tells the editor this key may be CLEARED back to unset. Without it the
+            # UI cannot distinguish an optional override from a required credential
+            # and has to reject every empty value, which is the one-way door.
+            "is_optional_override": kdef.is_optional_override,
         }
         groups.setdefault(kdef.group, []).append(entry)
 
@@ -243,8 +285,19 @@ def secrets_update():
         if key not in _KNOWN_KEYS:
             errors.append(f"Unknown key: {key}")
             continue
-        if not isinstance(val, str) or not val.strip():
-            errors.append(f"Value for {key} must be a non-empty string")
+        if not isinstance(val, str):
+            errors.append(f"Value for {key} must be a string")
+            continue
+        if not val.strip():
+            # EMPTY MEANS UNSET, and only for an optional override. Without this the
+            # editor is a one-way door: setting one of these writes an assignment
+            # into secrets.env, the environment then shadows genesis.yaml for good,
+            # and later yaml edits appear to do nothing — recoverable only by hand-
+            # editing the file the dashboard exists to avoid. A required credential
+            # still cannot be blanked; there is no "unset" state for those that is
+            # not simply a broken install.
+            if key not in _OPTIONAL_OVERRIDE_KEYS:
+                errors.append(f"Value for {key} must be a non-empty string")
             continue
         if len(val) > 500:
             errors.append(f"Value for {key} too long (max 500 chars)")
@@ -280,7 +333,15 @@ def secrets_update():
         # Update os.environ so the dashboard status refreshes immediately
         # (runtime still needs restart to pick up changes)
         for k, v in clean.items():
-            os.environ[k] = v
+            if v == "":
+                # POP, don't assign "". The accessors branch on
+                # `os.environ.get(key) is not None`, so an empty string still
+                # shadows genesis.yaml — the live process would keep ignoring the
+                # yaml even though the file on disk no longer assigns anything,
+                # and the dashboard would report a state the next restart contradicts.
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         logger.info("Secrets updated via dashboard: %s", list(clean.keys()))
         return jsonify({
             "status": "ok",

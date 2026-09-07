@@ -64,10 +64,18 @@ class TestSessionContextHook:
         assert result.returncode == 0
 
     def test_outputs_identity_when_enabled(self, flag_dir: Path) -> None:
-        """Flag present + no env var → outputs Genesis identity content."""
+        """Flag present + no env var → outputs Genesis identity content.
+
+        Runs with an explicit `--part all`: the injection is now four separately
+        budgeted hook entries, and a bare invocation deliberately fails CLOSED to
+        the charter part alone (a missing --part means the wiring is stale, and
+        emitting everything under one entry is the silent-filing bug this split
+        fixes). `all` is the manual/test path that keeps this test's original
+        whole-injection meaning.
+        """
         env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
         result = subprocess.run(
-            [_PYTHON, str(_CONTEXT_SCRIPT)],
+            [_PYTHON, str(_CONTEXT_SCRIPT), "--part", "all"],
             capture_output=True,
             text=True,
             env=env,

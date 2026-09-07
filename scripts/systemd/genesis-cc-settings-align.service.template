@@ -1,0 +1,50 @@
+[Unit]
+Description=Genesis CC settings alignment — re-assert Claude Code auto-updater suppression
+# CONTAINER-side, unlike genesis-cc-align (which is host-only via the guardian
+# gateway). It exists because cc_ensure_local re-asserts the two suppression keys
+# only on an install/bootstrap/update run, and a box can go weeks between those —
+# which is precisely when a drifted settings file stays silently unprotected.
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/cc_settings_align.sh
+# Bounded well above the work (a JSON read-modify-write plus up to 3 CAS retries,
+# milliseconds in practice). The cap exists only so a pathological filesystem
+# stall cannot leave a oneshot hanging indefinitely.
+# The project timeout floor (CLAUDE.md): a timeout needs a specific failure mode
+# and evidence for its value, and absent both the default is 2 hours. The old 60s
+# had neither — only "the normal case takes milliseconds", which is an argument
+# about the normal case, not about the one this bound governs.
+#
+# The failure it must not cause: a home filesystem stalling in stat / JSON I/O /
+# fsync for over a minute gets this oneshot KILLED before it can verify or
+# restore suppression, and the calendar timer does not retry until the next day.
+# That trades a slow run for a silently unprotected auto-updater — the exact
+# outcome this unit exists to prevent. A generous bound costs an idle process; a
+# tight one costs the protection.
+TimeoutStartSec=7200
+# Needs python3 (the reconciler's merge helper) and flock, both in /usr/bin. No
+# npm, no sudo, no ssh.
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# SANDBOX SCOPE IS LOAD-BEARING — read before tightening.
+# This unit WRITES the user-level Claude Code settings file (~/.claude/settings.json)
+# as well as its single-flight lock under ~/.genesis. ReadWritePaths=%h is what
+# permits the former; narrowing this to %h/.genesis would silently break the
+# reconcile, and a broken reconcile means the auto-updater is unguarded.
+# Known limitation: if settings.json is a symlink whose target lives OUTSIDE %h
+# (a dotfiles checkout under /opt, say), the reconciler follows the link and the
+# write is denied here. That surfaces as a failed unit rather than silent drift,
+# which is the intended direction.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
+
+# No [Install] section, deliberately: this oneshot is driven ONLY by its paired
+# timer. The install/bootstrap loops enable *.timer.template generically and
+# enable exactly one service by name (genesis-cc-tmp-align, which needs a
+# cold-start leg). A WantedBy=default.target here would never be enabled by
+# anything, while telling a reader the reconcile also runs at boot. Same shape as
+# genesis-cc-align.service.template, which likewise has none.
