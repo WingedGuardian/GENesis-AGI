@@ -236,6 +236,12 @@ def test_aborts_are_not_counted_as_clean(project):
     ("   ", False),
     ("1 deselected in 0.1s", False),
     ("1 passed, 1 deselected in 0.02s", True),
+    # A REAL OUTCOME beats a sibling deselection. MEASURED: the old rule read
+    # this as "no result", turning a genuinely-caught mutation into an ABORT.
+    # The table covered the `passed` variant and not the `failed` one, which is
+    # exactly how it survived.
+    ("1 failed, 1 deselected in 0.1s", True),
+    ("2 deselected in 0.1s", False),
     # A collection error. The exit-code check catches this first now, but the
     # string still must not read as a result on its own.
     ("1 error in 0.24s", True),
@@ -589,3 +595,45 @@ def test_a_gated_case_does_not_kill_the_whole_sweep(project):
     outcomes = {r.case.label: r.outcome for r in result.results}
     assert outcomes["needs an engine"] == ms.ABORTED
     assert outcomes["ordinary"] == ms.BIT, "the ungated case must still have run"
+
+
+def test_a_peer_edit_between_the_drift_check_and_the_write_is_not_clobbered(project, monkeypatch):
+    """TOCTOU. The drift check runs BEFORE the validator (and, for a `bash`
+    validator, before an out-of-process `bash -n`). A peer edit landing in that
+    window was overwritten by the mutation and then "restored" to the baseline --
+    silently destroying their work, which is the one thing guarantee (6) exists
+    to prevent. Re-checked immediately before the write."""
+    target = project / "guard.py"
+    real_validate = ms._validate
+
+    def edit_during_validation(case, text):
+        target.write_text("# a peer edited during validation\n", encoding="utf-8")
+        return real_validate(case, text)
+
+    monkeypatch.setattr(ms, "_validate", edit_during_validation)
+    result = _sweep(project, [_case(project)])
+    assert target.read_text(encoding="utf-8") == "# a peer edited during validation\n"
+    assert result.results[0].outcome == ms.CONFLICT
+    assert not result.clean
+
+
+def test_a_baseline_timeout_is_a_rendered_problem_not_a_traceback(project, monkeypatch):
+    """Every other outcome in this module is enumerated; this was the one path
+    that escaped the contract as a raw traceback."""
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="pytest", timeout=1)
+
+    monkeypatch.setattr(ms, "_baseline_run", boom)
+    with pytest.raises(RuntimeError, match="timed out"):
+        ms.sweep([_case(project)], cwd=project, python=sys.executable,
+                 env={"PYTHONPATH": str(project)}, timeout=1, check_baseline=True)
+
+
+def test_the_anti_deadlock_lever_survives_the_allowlist(monkeypatch):
+    """`GENESIS_PYTEST_LOCK_HELD` tells a nested pytest not to contend with its
+    own parent. Stripping it meant a sweep launched inside a locked session
+    queued behind itself and died at the per-case timeout."""
+    monkeypatch.delenv("GENESIS_PYTEST_LOCK_HELD", raising=False)
+    assert "GENESIS_PYTEST_LOCK_HELD" not in ms._child_env({})
+    monkeypatch.setenv("GENESIS_PYTEST_LOCK_HELD", "1")
+    assert ms._child_env({})["GENESIS_PYTEST_LOCK_HELD"] == "1"

@@ -217,6 +217,13 @@ def _child_env(extra: dict[str, str] | None) -> dict[str, str]:
         # Queue rather than fail when a peer session holds the test lock; a
         # lock collision would otherwise land as an ABORT on every case.
         "GENESIS_PYTEST_LOCK_WAIT": "1",
+        # The anti-deadlock lever, forwarded ONLY when the parent already holds
+        # the box lock. Its documented purpose is that a pytest spawned inside a
+        # locked run does not contend with its own parent; stripping it meant a
+        # sweep launched from inside a locked session queued behind itself and
+        # died at the per-case timeout, ~15 minutes per case.
+        **({"GENESIS_PYTEST_LOCK_HELD": os.environ["GENESIS_PYTEST_LOCK_HELD"]}
+           if os.environ.get("GENESIS_PYTEST_LOCK_HELD") else {}),
         # TMPDIR is a PATH, not a behaviour lever. Dropping it sends every child's
         # temp to /tmp, which this project forbids for anything large, and makes
         # tests/conftest.py take its no-op basetemp branch on a dev box.
@@ -241,9 +248,15 @@ def _has_result_line(stdout: str) -> bool:
     if not tail:
         return False
     for line in reversed(tail):
-        if "no tests ran" in line or (
-            "deselected" in line and "passed" not in line
-        ):
+        # A REAL OUTCOME beats a sibling deselection. "1 failed, 1 deselected"
+        # means the target ran and failed -- MEASURED, the previous rule read it
+        # as "no result" and turned a genuinely-caught mutation into an ABORT.
+        # Only a line with NO outcome at all ("2 deselected", "no tests ran")
+        # means nothing ran. The earlier test covered the `passed` variant and
+        # not the `failed` one, which is why this survived.
+        if "passed" in line or "failed" in line:
+            return True
+        if "no tests ran" in line or "deselected" in line:
             return False
         if "passed" in line or "failed" in line or "error" in line.lower():
             return True
@@ -322,6 +335,15 @@ def run_case(
     if err:
         return Result(case, ABORTED, err)
 
+    # TOCTOU: the drift check above happened before `compile()` (and, for a
+    # `bash` validator, before an out-of-process `bash -n`). A peer edit landing
+    # in that window would be clobbered by the write below and then "restored"
+    # to the baseline -- silently destroying their work, which is the one thing
+    # guarantee (6) exists to prevent. Re-check immediately before writing.
+    if target.read_bytes() != base_bytes:
+        return Result(case, CONFLICT,
+                      "the target changed between the drift check and the "
+                      "mutation write -- a peer's edit was left untouched")
     target.write_text(mutated, encoding="utf-8")
     wrote = _sha(target)
     verdict: Result | None = None
@@ -427,18 +449,30 @@ def assert_green_baseline(
     seen = {(c.test, c.python, c.pytest_args, tuple(sorted(c.env.items())))
             for c in cases}
     for test, py, extra, case_env in seen:
-        proc = subprocess.run(
-            [py or python, "-m", "pytest", test, "-q", "--no-header",
-             "-p", "no:cacheprovider", *extra],
-            cwd=str(cwd), capture_output=True, text=True,
-            env=_child_env({**(env or {}), **dict(case_env)}), timeout=timeout,
-        )
+        try:
+            proc = _baseline_run(test, py, extra, case_env, cwd, python, env, timeout)
+        except subprocess.TimeoutExpired:
+            # Every other outcome in this module is enumerated; a raw traceback
+            # here was the one path that escaped the contract. Nothing has been
+            # mutated at this point, so this is purely a reporting fix.
+            return (f"baseline run of {test} timed out after {timeout}s -- it "
+                    "cannot be established as green, so no mutation is trustworthy")
         if not _has_result_line(proc.stdout):
             return f"baseline run of {test} produced no result line"
         if proc.returncode != 0:
             return (f"baseline is RED: {test} already fails before any mutation, "
                     "so every 'BIT' from it would be meaningless")
     return None
+
+
+def _baseline_run(test, py, extra, case_env, cwd, python, env, timeout):
+    """One baseline invocation, factored out so the timeout has somewhere to land."""
+    return subprocess.run(
+        [py or python, "-m", "pytest", test, "-q", "--no-header",
+         "-p", "no:cacheprovider", *extra],
+        cwd=str(cwd), capture_output=True, text=True,
+        env=_child_env({**(env or {}), **dict(case_env)}), timeout=timeout,
+    )
 
 
 def sweep(
