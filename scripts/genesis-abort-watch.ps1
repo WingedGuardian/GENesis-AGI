@@ -60,13 +60,39 @@ function Stop-GenesisWatcher {
       .DESCRIPTION
         Stop-ScheduledTask cannot do this: the wscript launcher has already
         exited, so the task owns nothing. Signal politely via a stop file, then
-        confirm by PID and kill if the loop is wedged. Verifying rather than
-        assuming, because an orphaned poller is invisible in the task list.
+        confirm by PID AND START TIME and kill if the loop is wedged. Verifying
+        rather than assuming, because an orphaned poller is invisible in the
+        task list.
+
+        The identity check is the load-bearing part. Windows reuses PIDs, so a
+        recorded PID that outlived its process names whatever now holds that
+        number; force-terminating on the PID alone would kill an unrelated
+        process. Anything that cannot be proven to be this watcher is left
+        ALONE and the stale record discarded — a wedged watcher merely goes
+        stale, and genesis-act.ps1 already refuses to act on a stale heartbeat,
+        whereas killing the wrong process is unrecoverable.
     #>
     $stop = [System.IO.Path]::Combine($StateDir, "watcher.stop")
     $pidf = [System.IO.Path]::Combine($StateDir, "watcher.pid")
     if (-not (Test-Path $pidf)) { return "no watcher pid recorded" }
-    $wpid = [int]((Get-Content $pidf -Raw).Trim())
+
+    # "<pid>|<start-time ticks>". The ticks are what make this safe: Windows
+    # reuses PIDs, so a record that outlived its process names whatever now
+    # holds that number. Killing on the PID alone would terminate an unrelated
+    # process - the operator's editor, a build, anything.
+    $raw   = (Get-Content $pidf -Raw).Trim()
+    $parts = $raw -split '\|'
+    $wpid  = 0
+    if (-not [int]::TryParse($parts[0], [ref]$wpid) -or $wpid -le 0) {
+        Remove-Item $pidf -Force -ErrorAction Ignore
+        return "watcher pid record was unreadable ('$raw') - discarded, nothing killed"
+    }
+    $ticks = $null
+    if ($parts.Count -ge 2) {
+        $t = [long]0
+        if ([long]::TryParse($parts[1], [ref]$t)) { $ticks = $t }
+    }
+
     Set-Content -Path $stop -Value "stop" -Encoding utf8
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 250
@@ -75,9 +101,33 @@ function Stop-GenesisWatcher {
             return "stopped pid $wpid"
         }
     }
+
+    # The polite route was ignored. Before force-terminating, PROVE the process
+    # holding this PID is still the watcher we recorded.
+    $proc = Get-Process -Id $wpid -ErrorAction SilentlyContinue
+    if (-not $proc) {
+        Remove-Item $pidf, $stop -Force -ErrorAction Ignore
+        return "pid $wpid is gone - nothing to kill"
+    }
+    if ($null -eq $ticks) {
+        # A legacy record (bare PID) carries no identity, so this PID cannot be
+        # proven to be ours. Refusing is the safe failure: a wedged watcher goes
+        # stale and genesis-act.ps1 already refuses to act on a stale heartbeat,
+        # whereas killing the wrong process is unrecoverable. Restarting the
+        # watcher rewrites the record in the verifiable format.
+        Remove-Item $stop -Force -ErrorAction Ignore
+        return "pid $wpid has a legacy record with no start time - REFUSING to force-kill an unverifiable process; restart the watcher to re-record it"
+    }
+    if ($proc.StartTime.Ticks -ne $ticks) {
+        # Same number, different process: the watcher died and Windows handed
+        # its PID to someone else. Discard the stale record; kill nothing.
+        Remove-Item $pidf, $stop -Force -ErrorAction Ignore
+        return "pid $wpid now belongs to a DIFFERENT process (started $($proc.StartTime.ToString('o')), recorded $([DateTime]::new($ticks).ToString('o'))) - stale record discarded, nothing killed"
+    }
+
     Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue
     Remove-Item $pidf, $stop -Force -ErrorAction Ignore
-    return "pid $wpid ignored the stop file and was killed"
+    return "pid $wpid ignored the stop file and was killed (identity verified)"
 }
 
 if ($Stop) { Stop-GenesisWatcher; exit 0 }
@@ -125,9 +175,22 @@ $lastBeat = [DateTime]::MinValue
 $StopPath = [System.IO.Path]::Combine($StateDir, "watcher.stop")
 Remove-Item $StopPath -Force -ErrorAction Ignore
 
-# Own PID recorded so a stopper can fall back to killing us if the polite
+# Own IDENTITY recorded so a stopper can fall back to killing us if the polite
 # route is ignored (a wedged loop still needs to die).
-Set-Content -Path ([System.IO.Path]::Combine($StateDir, "watcher.pid")) -Value $PID -Encoding utf8
+#
+# PID AND START TIME, not the PID alone. Windows reuses PIDs, so a bare PID that
+# outlives its process names whatever now holds that number — and -Stop would
+# force-terminate an unrelated process. A PID is only unique WHILE its process
+# lives; (PID, start time) is unique for all time, because a reused PID
+# necessarily starts later. Written as one line, "<pid>|<ticks>", so a partial
+# write cannot look like a valid record.
+# A StartTime read can fail (rare, but it is a privileged property). Degrade to
+# a bare PID rather than refusing to start: -Stop then declines to force-kill an
+# unverifiable process, which is the safe direction, and the watcher still runs.
+$identity = "$PID"
+try   { $identity = "$PID|$((Get-Process -Id $PID -ErrorAction Stop).StartTime.Ticks)" }
+catch { $identity = "$PID" }
+Set-Content -Path ([System.IO.Path]::Combine($StateDir, "watcher.pid")) -Value $identity -Encoding utf8
 
 while ($true) {
     # Under the wscript shim, Task Scheduler does NOT own this process: the
