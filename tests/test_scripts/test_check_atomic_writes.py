@@ -589,3 +589,60 @@ def f(path):
         pass
 '''
     assert [r["verdict"] for r in chk.analyse_source(src, "s.py")] == ["LEAKS"]
+
+
+def test_a_wrapped_receiver_is_not_invisible():
+    """`Path(tmp).replace(dest)` produced NO ROW AT ALL.
+
+    The receiver kept its wrapper, so the temp expression was `Path(tmp_path)`;
+    `_born_in` looks up a bare NAME and that is not one, so the site was silently
+    DROPPED rather than judged. MEASURED: three real files in this repo use the
+    style -- ego/config.py:98, mcp/health/settings.py:706, outreach/config.py:231
+    -- and all three were invisible. They happen to clean up, so nothing was
+    hidden today, but the guard's whole claim is that a new one cannot arrive
+    silently, and in this house style it could.
+    """
+    leaks = '''
+import os, tempfile
+from pathlib import Path
+def f(path):
+    fd, tmp_path = tempfile.mkstemp()
+    try:
+        Path(tmp_path).replace(path)
+    except OSError:
+        pass
+'''
+    assert [r["verdict"] for r in chk.analyse_source(leaks, "s.py")] == ["LEAKS"]
+
+    cleans = '''
+import contextlib, os, tempfile
+from pathlib import Path
+def f(path):
+    fd, tmp_path = tempfile.mkstemp()
+    try:
+        Path(tmp_path).replace(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+'''
+    assert [r["verdict"] for r in chk.analyse_source(cleans, "s.py")] == ["CLEANS_UP"]
+
+
+def test_the_published_counts_match_the_tree():
+    """The README, the docstring and the CI comment all quote measured counts.
+
+    A number in permanent record that nobody re-derives is a claim wearing
+    measurement's grammar -- and one of them was already wrong (28 files vs 27),
+    caught by a cross-model reviewer rather than by me.
+    """
+    import json as _json
+
+    rows, errors = chk.scan(_REPO)
+    assert not errors
+    dirty = [r for r in rows if r["verdict"] in ("LEAKS", "NO_HANDLER")]
+    doc = _json.loads((_REPO / "config" / "atomic_write_baseline.json").read_text())
+    readme = " ".join(doc["_README"])
+    assert f"{len(rows)} atomic-write sites across {len({r['file'] for r in rows})}" in readme
+    assert f"{len(dirty)} across {len({r['file'] for r in dirty})} files are dirty" in readme
+    assert len(doc["known"]) == len(dirty)

@@ -9,8 +9,8 @@ both halves -- the leak happens, and nothing sweeps that directory
 (`disk_hygiene.sh` roots every find at a named SUBdirectory; `tmp_watchgod.sh`
 covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
 
-WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-07: 55 atomic-write sites across
-48 files, 31 of them dirty. Fixing 31 instances of a recurring pattern leaves
+WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-07: 58 atomic-write sites across
+51 files, 31 of them dirty. Fixing 31 instances of a recurring pattern leaves
 nothing to stop instance 32. This is the prose-to-gate move: the rule was "clean
 up your temp", carried by convention, and conventions are what reviewers find one
 instance of at a time.
@@ -28,7 +28,14 @@ user's file (dashboard/routes/files.py), pending telemetry on its restore path
 (guardian/alert/queue.py). A false row in a debt ledger is worse than noise.
 
 POLARITY IS ALLOWLIST. A site that is neither clean nor baselined FAILS. A new
-atomic write added next year is caught by construction. The baseline below is a
+atomic write added next year is caught by construction -- WITH ONE STATED
+EXCEPTION. The baseline key excludes the line number on purpose (line numbers
+churn on every unrelated edit above them), so a SECOND unprotected write added
+inside an already-baselined function, with the same temp name, collides with the
+existing row and passes silently. Verified: no duplicate dirty keys exist today,
+so the ledger is currently honest. But "instance 32 cannot arrive silently" is
+true only OUTSIDE the 31 functions already listed, and saying it unqualified was
+an overclaim. The baseline below is a
 DEBT LEDGER, not an exemption list: every entry is a known leak awaiting a fix,
 it is expected to shrink, and the guard reports entries that no longer match so
 a landed fix cannot leave a stale row behind.
@@ -387,7 +394,17 @@ def analyse_source(src: str, rel: str) -> list[dict]:
             continue
         # WHICH OPERAND IS THE TEMP depends on the form. Getting this wrong
         # silently checks the DESTINATION for cleanup instead of the temp.
-        temp = _unparse(node.args[0]) if owner in ("os", "shutil") else owner
+        # The receiver keeps its wrappers, and `Path(tmp).replace(dest)` is a
+        # common house style here -- MEASURED invisible at ego/config.py:98,
+        # mcp/health/settings.py:706 and outreach/config.py:231, which produced
+        # NO ROW at all. `_born_in` looks up a bare NAME, and `Path(tmp_path)` is
+        # not one, so the site was silently dropped rather than judged. Strip
+        # first, then take the temp.
+        temp = (
+            _unparse(_strip_wrappers(node.args[0]))
+            if owner in ("os", "shutil")
+            else _unparse(_strip_wrappers(node.func.value))
+        )
         func = _enclosing_func(tree, node.lineno)
         # THE OPERAND MUST BE A TEMP THIS FUNCTION CREATED. Anchoring on the verb
         # alone was wrong by a third: `rename`/`replace` also covers move-aside,
