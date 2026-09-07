@@ -507,6 +507,114 @@ async def test_a_hold_queues_nothing_resumable(db, live):
     assert (await ar.get_by_id(db, decision.request_id))["status"] == "pending"
 
 
+@pytest.mark.asyncio
+async def test_screen_text_cannot_forge_lines_in_the_approval_the_owner_reads(db, live):
+    """Window titles and element names come off a screen this threat model
+    treats as hostile, and they flow into the sentence a human reads before
+    deciding. Newlines could forge extra lines in a rendered card, bidi
+    overrides could reorder what is displayed away from what is approved, and
+    zero-width characters could conceal either."""
+    await _grant(db)
+    decision = await _gate(db).check(
+        session_id=_SESSION,
+        window_title="Mail\n\nAPPROVED: routine\u202egnihtemos esle",
+        element_name="Send\u200b\u200b",
+        control_type="Button",
+    )
+    row = await ar.get_by_id(db, decision.request_id)
+    desc = row["description"]
+    assert "\n" not in desc
+    assert "\u202e" not in desc and "\u200b" not in desc
+    assert "Send" in desc  # the legible content survives
+
+
+@pytest.mark.asyncio
+async def test_a_hostile_window_title_cannot_flood_the_approval_row(db, live):
+    """Bounded as a PREVIEW, not amputated: the full value stays verbatim in
+    the row's context, so nothing is lost."""
+    import json
+
+    await _grant(db)
+    huge = "A" * 5000
+    decision = await _gate(db).check(
+        session_id=_SESSION, window_title=huge, element_name="Send",
+        control_type="Button",
+    )
+    row = await ar.get_by_id(db, decision.request_id)
+    assert len(row["description"]) < 500
+    assert "more chars>" in row["description"]  # the cut is DECLARED
+    assert json.loads(row["context"])["window_title"] == huge  # nothing lost
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_context_row_does_not_break_the_grant_lookup(db, live):
+    """One hand-edited or corrupted `context` anywhere in the table made every
+    desktop grant lookup raise `malformed JSON` — MEASURED before the CASE/
+    json_valid guard. It failed closed, but a gate that crashes is a gate
+    nobody can use."""
+    await _grant(db)
+    for rid, atype in (("bad1", "autonomous_cli_fallback"), ("bad2", DESKTOP_GATE_ACTION_TYPE)):
+        await db.execute(
+            "INSERT INTO approval_requests (id, action_type, action_class, "
+            "description, context, status) VALUES (?, ?, 'reversible', 'x', "
+            "'{not json', 'approved')",
+            (rid, atype),
+        )
+    await db.commit()
+    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    assert decision.allow is True
+
+
+# ═════════════════════ classification, adversarially ══════════════════════
+
+
+@pytest.mark.asyncio
+async def test_a_typed_card_number_classifies_financial_by_SHAPE(db, live):
+    """"FINANCIAL also reads the typed text" was an empty promise while the
+    patterns were all label-shaped: a real card number typed into a field
+    labelled "Confirmation" matched nothing and passed as STANDARD."""
+    await _grant(db)
+    decision = await _gate(db).check(
+        session_id=_SESSION, window_title="Notepad", element_name="Confirmation",
+        control_type="Edit", text="4111 1111 1111 1111",
+    )
+    assert decision.allow is False
+    assert decision.cell == ("desktop", "control", "financial")
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_number_is_not_financial(db, live):
+    """The other direction: fail-closed must not mean every digit holds."""
+    await _grant(db)
+    decision = await _gate(db).check(
+        session_id=_SESSION, window_title="Notepad", element_name="Text Area",
+        control_type="Edit", text="the meeting is at 3pm in room 214",
+    )
+    assert decision.allow is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["OTP", "One-time code", "2FA code", "Security question", "Recovery key",
+     "Passkey", "PIN", "Social Security number"],
+)
+def test_the_secret_field_family_is_covered_not_just_the_word_password(name):
+    """For anything off this list the accessibility flag is the only backstop —
+    and the reason the list exists is that the flag is unreliable."""
+    from genesis.autonomy.classification import classify_desktop_action
+
+    c = classify_desktop_action(element_name=name, control_type="Edit")
+    assert c.is_password is True, name
+
+
+def test_ordinary_controls_are_not_treated_as_secret_fields():
+    """The positive control: a list that matches everything protects nothing."""
+    from genesis.autonomy.classification import classify_desktop_action
+
+    for name in ("Search", "Username", "Text Area", "Subject", "To"):
+        assert classify_desktop_action(element_name=name).is_password is False, name
+
+
 # ═══════════════════ the cell can deny, never grant ═══════════════════════
 
 

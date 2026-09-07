@@ -28,6 +28,10 @@ Four properties are load-bearing, each independently tested:
    any local process can reach with the internal token, and `user` is just a
    default. Neither proves a person acted, so neither can mint a grant here.
    A foreground CC conversation cannot mint one either — which is the point.
+   The bar closes the APP-LAYER path (a Genesis component using the sanctioned
+   approval APIs); it does not make a grant unforgeable by something with
+   same-uid write access to the database, which no SQL predicate could. See
+   :data:`DESKTOP_GRANT_RESOLVER_PREFIXES`.
 3. **A capability cell can DENY desktop control but can never GRANT it.** The
    promotion path is a closed set (PR #1838) that does not contain ``desktop``,
    so no amount of banked evidence turns session consent into standing
@@ -73,6 +77,7 @@ from genesis.autonomy.types import CellEvent, CellState, RiskClass
 from genesis.db.crud import approval_requests as ar
 from genesis.db.crud import capability_grants as cg
 from genesis.observability.types import Severity, Subsystem
+from genesis.security.sanitizer import strip_control_chars
 
 logger = logging.getLogger(__name__)
 
@@ -104,15 +109,64 @@ SESSION_GRANT_KIND = "desktop_session_grant"
 #: `ApprovalManager.resolve`'s default, i.e. "nobody recorded who". Neither is
 #: proof a person acted.
 #:
-#: What remains are channels whose messages ORIGINATE OUTSIDE this box: an
+#: What remains are channels whose MESSAGES originate outside this box: an
 #: inbound Telegram callback from the owner's own account, and the voice
-#: bridge's spoken resolution. A local process cannot forge either.
+#: bridge's spoken resolution.
+#:
+#: What this bar does NOT do, stated plainly because the obvious reading of the
+#: paragraph above is stronger than the truth: it does not make a grant
+#: unforgeable. `resolved_by` is a column, and `genesis.db` is a file owned by
+#: the uid every Genesis process runs as, so anything with same-uid code
+#: execution can INSERT a row satisfying every bar here — including this one,
+#: by simply typing an allowlisted prefix into it. That is a property of the
+#: whole approval substrate (the autonomous-CLI gate and the email gate rest on
+#: the same rows), not of this gate, and closing it needs provenance the SQL
+#: predicate cannot express — a signature only the real resolver can produce, or
+#: an OS-level identity split. What this allowlist DOES close is the app-layer
+#: path: a Genesis component calling the sanctioned approval APIs — the
+#: dashboard resolve route, an MCP tool, a background session — can no longer
+#: mint itself desktop authority. Do not read it as more than that, and do not
+#: let PR-3 wire a caller believing the predicate is a complete boundary.
+#:
+#: OPEN QUESTION for PR-3, not settled here: `voice:` is in this set because the
+#: owner ruled for a spoken challenge-response. The voice channel's resistance to
+#: ambient or replayed audio is unverified, so whether a spoken "yes" is strong
+#: enough to open a session-length grant deserves an explicit go/no-go before the
+#: consent path is built, rather than inheriting the answer from this line.
 #:
 #: Allowlist, not denylist — a resolver stays unable to grant desktop control
 #: until someone decides otherwise in code. Pinned as a subset of
 #: HUMAN_RESOLVER_PREFIXES by test, so the canonical mapping stays authoritative
 #: and this can only ever be narrower.
 DESKTOP_GRANT_RESOLVER_PREFIXES: tuple[str, ...] = ("telegram:", "voice:")
+
+
+#: Bound on screen-supplied text where it reaches a HUMAN-FACING string. Window
+#: titles and element names are conventionally short; a hostile page's are not,
+#: and this text ends up in an approval card the owner reads to decide. This is
+#: a SELECTION, not a loss — the full value is stored verbatim in the row's
+#: context, so nothing is discarded, only the preview is bounded.
+_DISPLAY_LIMIT = 120
+
+
+def _display(value: str) -> str:
+    """One-line, boundary-clean, bounded rendering of screen-supplied text.
+
+    ``window_title`` / ``element_name`` come off the operator's screen, which
+    this threat model treats as hostile. They flow into the approval row's
+    ``description`` — the sentence a human reads before deciding — and into
+    event-bus messages. Raw, they could carry newlines (forging extra lines in
+    a rendered card), bidi overrides (reordering what is displayed away from
+    what is approved) or zero-width concealment.
+
+    ``strip_control_chars`` is the repo's canonical fix for exactly that class,
+    derived from the Unicode database rather than hand-enumerated; the log
+    calls in this module already get the same protection from ``%r``.
+    """
+    cleaned = strip_control_chars(value or "")
+    if len(cleaned) <= _DISPLAY_LIMIT:
+        return cleaned
+    return f"{cleaned[:_DISPLAY_LIMIT]}… <{len(cleaned) - _DISPLAY_LIMIT} more chars>"
 
 
 def build_session_grant_context(
@@ -438,9 +492,9 @@ class DesktopTakeoverGate:
             action_class=str(classification.action_class),
             description=(
                 f"Desktop {classification.sub_class} action on "
-                f"'{element_name or 'an unnamed control'}' in '{window_title}' "
-                "— approving lets the session re-plan from a fresh capture; it "
-                "does not replay this action"
+                f"'{_display(element_name) or 'an unnamed control'}' in "
+                f"'{_display(window_title)}' — approving lets the session "
+                "re-plan from a fresh capture; it does not replay this action"
             ),
             context=context,
             # Wait for the owner — never auto-approve, never auto-drop. This
@@ -476,8 +530,8 @@ class DesktopTakeoverGate:
                 Subsystem.AUTONOMY,
                 Severity.INFO,
                 "autonomy.desktop_action_allowed",
-                f"Desktop gate allowed an action on '{element_name}' in "
-                f"'{window_title}' under session grant {request_id}",
+                f"Desktop gate allowed an action on '{_display(element_name)}' "
+                f"in '{_display(window_title)}' under session grant {request_id}",
             )
         except Exception:
             logger.error("Failed to emit autonomy.desktop_action_allowed", exc_info=True)
@@ -498,7 +552,7 @@ class DesktopTakeoverGate:
                 Severity.INFO,
                 "autonomy.gate_held",
                 f"Desktop gate held a {classification.sub_class} action on "
-                f"'{element_name}' in '{window_title}' "
+                f"'{_display(element_name)}' in '{_display(window_title)}' "
                 f"(cell {':'.join(classification.cell_key)})",
             )
         except Exception:

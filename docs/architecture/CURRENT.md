@@ -613,7 +613,16 @@ verified: 5808e7cd 2026-09-03
   stamped by a route any local process can reach with the internal token and
   `user` is merely a default; neither proves a person acted. Bounded both ways
   against a config TTL (a future-dated resolution would otherwise never
-  expire). Desktop rows are also withheld from the generic dashboard approvals
+  expire). SCOPE, stated because the obvious reading is stronger: that bar
+  closes the APP-LAYER path — no Genesis component using the sanctioned
+  approval APIs can mint itself desktop authority — but it does not make a
+  grant unforgeable, since `resolved_by` is a column and `genesis.db` is
+  writable by the uid every Genesis process runs as. That is a property of the
+  whole approval substrate, not of this gate, and closing it needs provenance
+  SQL cannot express. Screen-supplied text (window title, element name) is
+  passed through `strip_control_chars` and bounded before it reaches the
+  approval description a human reads, so a hostile window cannot forge lines or
+  reorder what is displayed away from what is approved. Desktop rows are also withheld from the generic dashboard approvals
   queue, which renders every row as a CLI-fallback card, and refused by
   `resolve_request` — the funnel for the per-item Approve button, Telegram
   `cli_approve`, and the `cli_approve_all` button's own trigger row, which

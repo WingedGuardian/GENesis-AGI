@@ -432,20 +432,40 @@ def classify_email_action(
 # "Delete account" is classified on what it resolved. Consent derived from a
 # model's self-report is the weakness this whole gate exists to avoid.
 #
-# Known limit, stated rather than discovered: a click at raw coordinates whose
-# tree metadata is uninformative carries no keywords and lands in STANDARD.
-# Observation beats self-report; it does not replace it.
+# KNOWN LIMIT, and larger than "a click with no metadata". IDENTITY and
+# FINANCIAL are keyword matchers over text the SCREEN supplies, and in this
+# threat model the screen is hostile: a malicious page controls its own window
+# title, element names and control types. It can label a destructive control
+# "Yes", "OK" or "Continue", use a synonym, use another language, or split a
+# matched phrase — and the action then classifies STANDARD and executes under a
+# live grant with no hold. So this classifier RAISES the bar on ordinary
+# software; it is NOT a boundary against adversarial UI. The boundaries that do
+# hold against that are the session grant itself (bounded, revocable, scoped to
+# one window) and the operator watching their own screen.
 
 DESKTOP_DOMAIN = "desktop"
 DESKTOP_VERB = "control"
 
 _FINANCIAL_DESKTOP_PATTERNS: list[re.Pattern[str]] = [
+    # Labels — what the control CALLS itself.
     re.compile(
-        r"\b(?:wire\s+transfer|bank|banking|payment|pay\s+now|checkout|"
-        r"card\s+number|cvv|iban|routing\s+number|invoice|remit|transfer\s+funds|"
-        r"place\s+order|confirm\s+purchase|billing)\b",
+        r"\b(?:wire[\s-]*transfer|bank|banking|payment|pay\s+now|checkout|"
+        r"card\s*number|cvv|cvc|iban|routing\s*number|account\s*number|invoice|"
+        r"remit|transfer\s+funds|place\s+order|confirm\s+purchase|billing)\b",
         re.IGNORECASE,
     ),
+    # SHAPES — what the CONTENT is. A label-only list made "FINANCIAL also reads
+    # the typed text" an empty promise: an actual card number typed into a field
+    # labelled "Confirmation" matched nothing and passed as STANDARD, so the
+    # claim and the code disagreed. These catch the value itself.
+    #   * 13-19 digits, optionally grouped (card / long account numbers)
+    #   * IBAN shape (2 letters, 2 check digits, 11-30 alphanumerics)
+    #   * US SSN shape
+    # Deliberately fail-CLOSED: a long digit run that is not a card number costs
+    # one hold, and a hold is the safe direction for money.
+    re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"),
+    re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
+    re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"),
 ]
 
 # Crossing the identity bar: the action speaks or acts AS the operator, or is
@@ -465,8 +485,20 @@ _IDENTITY_DESKTOP_PATTERNS: list[re.Pattern[str]] = [
 # window title: a window called "Sign in" must not make every action in it
 # unreachable, but an element called "Password" must be untouchable regardless
 # of whether the control exposed IsPassword. Custom controls routinely do not.
+# For anything NOT on this list the accessibility flag is the only backstop —
+# and the reason this list exists at all is that the flag is unreliable. So it
+# covers the secret-field FAMILY, not just the word "password": one-time codes
+# and security answers are lower-stakes than a standing password but are still
+# credentials, and an SSN is not lower-stakes at all.
 _PASSWORD_TARGET_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\b(?:password|passphrase|passcode|pin\s+code|secret\s+key)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:password|passphrase|passcode|passkey|pin(?:\s*code)?|otp|"
+        r"one[\s-]*time\s*(?:code|password)|2fa|mfa|"
+        r"(?:verification|security|auth(?:entication)?|recovery)\s*(?:code|key|"
+        r"question|answer)|secret\s*(?:key|answer)|seed\s*phrase|"
+        r"social\s*security|ssn)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 

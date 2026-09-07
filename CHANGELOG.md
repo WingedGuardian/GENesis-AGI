@@ -118,6 +118,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   trigger row, which resolves directly and so sidesteps the batch sweep's
   exclusion list.
 
+  What the resolver bar does NOT do is stated in the code, because the obvious
+  reading of it is stronger than the truth: `resolved_by` is a column and the
+  database is writable by the uid every Genesis process runs as, so the bar
+  closes the app-layer path rather than making a grant unforgeable. That is a
+  property of the whole approval substrate — the autonomous-CLI gate and the
+  email gate rest on the same rows — and closing it would need provenance a SQL
+  predicate cannot express. The classifier carries a matching correction: it
+  raises the bar on ordinary software, but a hostile page controls its own
+  window title and control names, so it is not a boundary against adversarial
+  UI. The boundaries that hold there are the bounded, revocable session grant
+  and the operator watching their own screen.
+
+  Screen-supplied text is treated as hostile where it reaches a person: window
+  titles and element names pass through the repo's canonical
+  `strip_control_chars` and a declared length bound before they reach the
+  approval description, so a malicious window cannot forge extra lines, reorder
+  the text with bidi overrides, or conceal part of it — while the full value is
+  kept verbatim in the row's context. FINANCIAL now also matches card, IBAN and
+  SSN *shapes*, not only labels: "reads the typed text" was an empty promise
+  while every pattern was label-shaped, so a real card number typed into a
+  field labelled "Confirmation" passed as ordinary input. And the secret-field
+  list covers the family — OTP, one-time and verification codes, 2FA, recovery
+  keys, passkeys, security questions, SSNs — because for anything off that list
+  the accessibility flag is the only backstop, and the reason the list exists is
+  that the flag is unreliable.
+
   Classification reads the target the actuator RESOLVED — element name, control
   type and `IsPassword` from the accessibility tree, plus the window title and
   any text to be typed. Not the acting model's prose about its own intent:

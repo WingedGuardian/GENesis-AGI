@@ -323,6 +323,16 @@ async def list_approved_unconsumed_for_session(
     the owner consents to one click and hands over the session. MEASURED
     before the fix; regression-tested after.
 
+    The ``json_extract`` calls are guarded by ``json_valid`` inside a CASE,
+    which SQLite evaluates lazily. A bare ``json_extract`` raises "malformed
+    JSON" on an invalid value, and a bare AND-chain does not promise to
+    short-circuit before reaching it — so ONE hand-edited or corrupted
+    ``context`` anywhere in the table (the module docstring above names
+    one-off manual DB fixes as a real occurrence) made every desktop grant
+    lookup raise. MEASURED: an unguarded query against two malformed rows
+    raised OperationalError. It failed closed, but a gate that crashes is a
+    gate nobody can use.
+
     Deliberately unbounded: the result is scoped to one action_type AND one
     session id, and a session holds one grant by construction (a fresh row per
     session, consumed at teardown), so the population is a handful of rows.
@@ -337,8 +347,10 @@ async def list_approved_unconsumed_for_session(
            WHERE status = 'approved'
              AND consumed_at IS NULL
              AND action_type = ?
-             AND json_extract(context, '$.kind') = ?
-             AND json_extract(context, '$.session_id') = ?
+             AND (CASE WHEN json_valid(context)
+                       THEN json_extract(context, '$.kind') END) = ?
+             AND (CASE WHEN json_valid(context)
+                       THEN json_extract(context, '$.session_id') END) = ?
            ORDER BY resolved_at DESC""",
         (action_type, kind, session_id),
     )
