@@ -2149,6 +2149,56 @@ verified: f24c15e9 2026-09-05
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
+- **`scripts/tmp_watchgod.sh`** (a standalone systemd user service, not a
+  `src/genesis` package — it must keep running when Genesis does not): dual-zone
+  temp protection, polling every 30s. Zone A is `~/.genesis/cc-tmp` against a
+  budget (GREEN <50% / YELLOW >50% / ORANGE >75% / RED >90% or free space under
+  the sacred-ground floor); Zone B is `/tmp` on time-based housekeeping. **Its
+  one job is stopping runaway temp usage from killing Claude Code — so the bar
+  for any sweep is that it must not damage correct functioning, even when it has
+  to fire.** Three edges follow from that and are easy to reintroduce:
+  * **Sockets are never deleted.** CC binds one unix socket per session for
+    cross-session messaging, at `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock` — falling
+    back to the temp dir when that variable is unset, which on a Genesis install
+    is cc-tmp itself. Deleting the PATH does not stop the listener: the process
+    keeps the inode, so `ss` still shows LISTEN and the session looks healthy
+    from the inside while every peer resolves by path and gets ENOENT. Nothing
+    re-binds after startup, so the session is unreachable for life and cannot
+    notice. Measured 2026-09-05, when a RED sweep deleted them: 3 of 4 sessions
+    severed here, 6 of 6 on a sibling install. Every Zone A sweep that removes a
+    directory now goes through `reap_dir_sparing_sockets` (object-level, never
+    `-type s`); Zone B's file sweeps spare `*.sock` by name, and its empty-dir
+    sweep spares the socket TREES — an empty directory inside a live socket tree
+    is a rendezvous point CC populates later, not garbage, and the exclusion by
+    name is what covers it (MEASURED 2026-09-07: that predicate matched
+    `/tmp/cc-socks` and a live daemon's `pty` directory). `check_control_plane`
+    reports severed listeners and stale socket files into the state file, paging
+    once on a confirmed rise. It is strictly READ-ONLY — reaping a stale socket
+    would put socket deletion back in the daemon that caused the outage — and it
+    watches the per-session `cc-socks/` plane ONLY. CC's separate daemon tree
+    (`/tmp/cc-daemon-<uid>/`: control, pty and rendezvous sockets for the
+    background-spare machinery) is protected from deletion but deliberately not
+    counted: what severance means there is unestablished, and a number derived
+    from unverified failure semantics is a guess wearing a measurement's clothes.
+  * **YELLOW reaps SESSIONS, never PROJECTS.** The layout is
+    `claude-<uid>/<project>/<session-uuid>/`, and a project directory's mtime
+    tracks only its direct children — so it goes stale as soon as no NEW session
+    starts under it, however busy the sessions inside are. Measured 2026-09-07:
+    the one actively-used project directory carried an mtime 2.1 days old while
+    its contents were seconds old, and held 54 live session workspaces. Staleness
+    is therefore judged on CONTENTS, recursively, per session directory, and the
+    probe fails CLOSED — an undeterminable directory is kept.
+  * **ORANGE does not kill sessions.** It used to reap unattached tmux sessions
+    idle over 2h; sessions are not what fills cc-tmp, so that freed ~nothing
+    while destroying a session's whole context. Removed 2026-09-07 (measured: 1
+    reach and 0 kills across the entire log history). RED remains the pressure
+    valve and still reaps.
+
+  Deliberately NOT done: relocating the sockets out of cc-tmp. That is the real
+  fix — the control plane should not live in a directory whose purpose is to be
+  reclaimed — but a mixed-era fleet cannot see itself during the cutover (one
+  resolver in the CC binary serves both bind and discovery), so it waits on the
+  deploy path that restarts resident daemons.
 
 ## 13. Modules, skills & self-extension
 

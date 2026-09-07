@@ -35,6 +35,18 @@ ALERT_DIR="$HOME/.genesis/alerts"
 OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
 OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 
+# The socket-listing tool for the control-plane check. Overridable for the same
+# reason OOM_EVENTS_FILE is: it is the only way to exercise the "tool absent"
+# branch without rebuilding PATH from scratch, and an operator on a box where
+# iproute2 lives elsewhere can point at it.
+SS_BIN="${SS_BIN:-ss}"
+
+# Zone B's target. A literal /tmp made this whole zone untestable — a test would
+# have had to sweep the real one — which is why its sweeps had no coverage at all
+# until the 2026-09-07 socket-tree finding. Overridable purely as a seam; nothing
+# in production sets it.
+SYS_TMP_DIR="${SYS_TMP_DIR:-/tmp}"
+
 # Durable alert queue (F.3) — emergency-tier events page Telegram via the
 # container drainer. Guarded: if the lib is ever not co-located, degrade to a
 # no-op so `set -e` can never take the service down over an alert.
@@ -76,10 +88,10 @@ dir_usage_mb() {
 }
 
 tmp_usage_pct() {
-    if df -T /tmp 2>/dev/null | grep -q tmpfs; then
+    if df -T "$SYS_TMP_DIR" 2>/dev/null | grep -q tmpfs; then
         # tmpfs: filesystem percentage is meaningful
         local result
-        result=$(df --output=pcent /tmp 2>/dev/null | tail -1 | tr -d ' %') || true
+        result=$(df --output=pcent "$SYS_TMP_DIR" 2>/dev/null | tail -1 | tr -d ' %') || true
         echo "${result:-0}"
     else
         # Not tmpfs (/tmp on root disk): use absolute free space thresholds.
@@ -87,7 +99,7 @@ tmp_usage_pct() {
         # each, sacred ground is 150MB.  Percentage-based thresholds are
         # meaningless when measuring the whole root filesystem.
         local free_mb
-        free_mb=$(df -BM --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' M') || true
+        free_mb=$(df -BM --output=avail "$SYS_TMP_DIR" 2>/dev/null | tail -1 | tr -d ' M') || true
         free_mb="${free_mb:-9999}"
         if (( free_mb > 2048 )); then echo 0       # >2GB free  → green
         elif (( free_mb > 1024 )); then echo 60     # 1-2GB free → yellow
@@ -127,10 +139,138 @@ reap_dir_sparing_sockets() {
     find "$1" -depth -not -type s -delete 2>/dev/null || true
 }
 
+# ── Control plane: severed CC messaging sockets ───────────────
+#
+# Claude Code binds ONE unix socket per session for cross-session messaging,
+# at `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock` — falling back to the process temp
+# dir when XDG_RUNTIME_DIR is unset, which on a Genesis install is cc-tmp: the
+# very directory this daemon reclaims.
+#
+# Deleting the socket PATH does not stop the listener. The process keeps the
+# inode, so `ss` still reports LISTEN and the session looks healthy from the
+# inside, while every peer resolves BY PATH and gets ENOENT. Nothing re-binds
+# after startup, so the session stays unreachable for the rest of its life and
+# cannot notice. Measured 2026-09-05: one sweep severed 3 of 4 sessions here and
+# 6 of 6 on a sibling install; the only survivor had started after the sweep.
+#
+# The sweeps learned to spare sockets, which prevents recurrence but cannot heal
+# a session that is already severed. This check makes the state VISIBLE: it
+# compares live listeners against what is on disk, so a severance is reported
+# instead of silent. Strictly READ-ONLY — a stale socket file is counted and
+# never deleted, because deleting sockets from this daemon is what caused the
+# outage in the first place.
+#
+# Path-agnostic on purpose: directories come from the live listeners, so this
+# keeps working unchanged if the sockets move out of cc-tmp later.
+#
+# SCOPE. This watches the per-session MESSAGING sockets under `cc-socks/` only.
+# CC also runs a separate daemon tree (`/tmp/cc-daemon-<uid>/…` — control, pty and
+# rendezvous sockets for the background-spare machinery), which is deliberately
+# NOT counted here: what severance MEANS there has not been established, and
+# reporting on a subsystem whose failure semantics you have not verified is a
+# guess wearing a number. Those sockets are protected from deletion all the same
+# (see the Zone B sweeps) — protect what you do not understand, report only what
+# you do.
+#
+# Echoes "<status>:<severed>:<stale>:<listeners>". status is one of:
+#   ok      — the probe ran and saw at least one socket, live or left behind.
+#   empty   — the probe ran and saw NOTHING. Usually true (no CC sessions), but
+#             it is also what a detector that has gone blind looks like (an `ss`
+#             output change, a netns move, sockets relocating out of cc-socks),
+#             so it is NOT reported as health.
+#   unknown — the probe could not run at all. Never a clean plane: "could not
+#             measure" and "measured, and it is fine" must not share a value.
+check_control_plane() {
+    command -v "$SS_BIN" >/dev/null 2>&1 || { echo "unknown:0:0:0"; return 0; }
+
+    local raw rc=0
+    raw=$("$SS_BIN" -xlpH state listening 2>/dev/null) || rc=$?
+    if (( rc != 0 )); then
+        echo "unknown:0:0:0"
+        return 0
+    fi
+
+    local listeners=0 severed=0 stale=0
+    local -A live=()
+    local -A dirs=()
+    # Always scan cc-tmp's own socket dir, even when no listener points there:
+    # on a fully-severed install every listener path is already gone from disk,
+    # and that is exactly when the leftovers still need counting. `%/` because
+    # watchgod.conf is re-sourced every poll and a trailing slash there would
+    # otherwise build keys that never match the ones `find` produces.
+    dirs["${CC_TMP_DIR%/}/cc-socks"]=1
+
+    local path
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        listeners=$(( listeners + 1 ))
+        live["$path"]=1
+        dirs["$(dirname "$path")"]=1
+        # -S is "exists AND is a socket": a path replaced by an ordinary file is
+        # no more reachable than a missing one, so it counts as severed too.
+        [[ -S "$path" ]] || severed=$(( severed + 1 ))
+        # NOTE: `ss -xlp` lists every user's sockets. On a shared box another
+        # user's cc-socks path would be counted here, and an unstattable one
+        # would read as severed. Genesis is single-user by design, so this is
+        # left as a known limitation rather than engineered around.
+    done < <(awk '$4 ~ /\/cc-socks\/.*\.sock$/ {print $4}' <<<"$raw" | sort -u)
+
+    local d f
+    for d in "${!dirs[@]}"; do
+        [[ -d "$d" ]] || continue
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            [[ -n "${live[$f]:-}" ]] || stale=$(( stale + 1 ))
+        done < <(find "$d" -maxdepth 1 -type s -name '*.sock' 2>/dev/null)
+    done
+
+    if (( listeners == 0 && stale == 0 )); then
+        echo "empty:0:0:0"
+        return 0
+    fi
+    echo "ok:${severed}:${stale}:${listeners}"
+}
+
+# Should this control-plane reading page, and at what level is the plane now
+# "reported"? Pure arithmetic, kept out of the poll loop so the two rules below
+# can be tested without running the daemon.
+#
+#   CONFIRMATION — the SAME elevated count must appear on two consecutive polls,
+#   which is stricter than "elevated twice": a count still climbing (1 -> 2 -> 3)
+#   stays silent until it settles, and one that oscillates never pages at all.
+#   Severance is permanent — nothing re-binds — so a real one always settles,
+#   usually within a poll or two. What this buys is the false positive: a session
+#   exiting between ss's snapshot and its own unlink reads as one severed listener
+#   for a single poll, and a monitor that cries wolf gets ignored.
+#
+#   HIGH WATER THAT FOLLOWS DOWN — `paged` is the level already reported, and it
+#   drops with the count. Without that, sessions being restarted (4 -> 0) would
+#   leave the bar at 4 and a later, smaller severance would never page.
+#
+# Args: <prev-count> <already-paged-level> <current-count>.
+# Echoes "<0|1 page>:<new already-paged level>".
+control_plane_page_decision() {
+    local prev="$1" paged="$2" severed="$3"
+    if (( severed < paged )); then
+        paged=$severed
+    fi
+    if (( severed > paged )) && (( severed == prev )); then
+        echo "1:${severed}"
+    else
+        echo "0:${paged}"
+    fi
+}
+
 write_state() {
     local cc_tier="$1" cc_used="$2" sys_tier="$3" sys_pct="$4"
+    # Control-plane tuple from check_control_plane, "status:severed:stale:listeners".
+    # Defaulted so a caller that predates this field (the existing tier tests)
+    # still writes a valid state file.
+    local cp="${5:-unknown:0:0:0}"
+    local cp_status cp_severed cp_stale cp_listeners
+    IFS=: read -r cp_status cp_severed cp_stale cp_listeners <<<"$cp"
     local is_tmpfs="false"
-    if df -T /tmp 2>/dev/null | grep -q tmpfs; then
+    if df -T "$SYS_TMP_DIR" 2>/dev/null | grep -q tmpfs; then
         is_tmpfs="true"
     fi
     # Filesystem headroom for cc-tmp's mount. Post-split these describe the
@@ -144,6 +284,7 @@ write_state() {
 {
   "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $CC_TMP_BUDGET_MB, "sacred_mb": $SACRED_GROUND_MB, "fs_free_mb": $cc_fs_free, "fs_total_mb": $cc_fs_total},
   "system_tmp": {"tier": "$sys_tier", "used_pct": $sys_pct, "is_tmpfs": $is_tmpfs},
+  "control_plane": {"status": "${cp_status:-unknown}", "severed_sockets": ${cp_severed:-0}, "stale_sockets": ${cp_stale:-0}, "listeners": ${cp_listeners:-0}},
   "poll_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -155,15 +296,68 @@ EOF
 # Tiers (% of budget):
 #   Green  : < 50%  — no action
 #   Yellow : > 50%  — clean stale session dirs + old temp files
-#   Orange : > 75%  — yellow + delete caches + kill idle sessions + alert
+#   Orange : > 75%  — yellow + delete caches + warn (never kills a session)
 #   Red    : > 90% OR fs free < sacred — nuclear cleanup + emergency alert
+
+# The 7-day session reap. Two things here are load-bearing, and both were wrong
+# before (measured on a live install, 2026-09-07):
+#
+#   DEPTH. The layout under cc-tmp is claude-<uid>/<project>/<session-uuid>/…,
+#   so depth 2 is the PROJECT directory, not a session. On this install one
+#   depth-2 directory held 54 session workspaces — every live session's
+#   scratchpad and its running background-task output. The intended target has
+#   always been the depth-3 per-SESSION directory.
+#
+#   STALENESS. A directory's mtime tracks only its DIRECT children, so a project
+#   directory goes stale the moment no NEW session starts under it, however busy
+#   the sessions inside are. Measured: the one actively-used project directory
+#   carried an mtime 2.1 days old while its contents had been written seconds
+#   earlier, and every dormant directory showed no divergence at all — the gap
+#   appears precisely on the directory that must not be deleted. Seven quiet days
+#   and a routine 50%-usage YELLOW would have reaped live workspaces at a tier
+#   that pages nobody. So staleness is tested against the CONTENTS, recursively.
+#
+# The freshness probe fails CLOSED: a directory whose freshness cannot be
+# determined counts as fresh and is kept. Deleting on an unreadable probe is how
+# one broken predicate turns a housekeeping sweep into total data loss.
+reap_stale_session_dirs() {
+    local cutoff
+    cutoff=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || cutoff=""
+    if [[ -z "$cutoff" ]]; then
+        log WARN "session reap skipped — could not compute the 7-day cutoff"
+        return 0
+    fi
+
+    local sdir probe rc
+    while IFS= read -r sdir; do
+        [[ -z "$sdir" ]] && continue
+        rc=0
+        probe=$(find "$sdir" -newermt "$cutoff" -print -quit 2>/dev/null) || rc=$?
+        if (( rc == 0 )) && [[ -z "$probe" ]]; then
+            # Socket-sparing, like every other sweep in this file. A socket's
+            # mtime is its BIND time, so a session that bound one here and then
+            # wrote nothing for seven days reads as stale — and a plain `rm -rf`
+            # would have this daemon sever a live session in the very sweep added
+            # to stop it doing that. The rmdir then succeeds only if nothing
+            # survived, which is exactly the intent.
+            reap_dir_sparing_sockets "$sdir"
+            rmdir "$sdir" 2>/dev/null || true
+        fi
+    done < <(find "$CC_TMP_DIR" -mindepth 3 -maxdepth 3 -type d -path "*/claude-*/*/*" 2>/dev/null)
+
+    # A project directory the reap emptied holds nothing, and without this they
+    # accumulate. `-mtime +7` is not about staleness here — an empty directory has
+    # nothing to be stale — it closes a race: CC creates <project>/ and then
+    # <session-uuid>/ as two steps, and an rmdir landing between them gives the
+    # starting session ENOENT. A directory created moments ago cannot match.
+    find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*/*" -empty \
+        -mtime +7 -delete 2>/dev/null || true
+}
 
 clean_cc_yellow() {
     log INFO "Zone A YELLOW — cleaning stale session dirs and temp files"
 
-    # Clean session dirs with mtime > 7 days
-    find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*/???*" \
-        -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+    reap_stale_session_dirs
 
     # Clean old temp files (*.tmp, *.env, *.yaml) > 1 hour old
     find "$CC_TMP_DIR" -type f \( -name "*.tmp" -o -name "*.env" -o -name "*.yaml" \) \
@@ -172,7 +366,7 @@ clean_cc_yellow() {
 
 clean_cc_orange() {
     clean_cc_yellow
-    log WARN "Zone A ORANGE — deleting caches, then re-measuring before any session kill"
+    log WARN "Zone A ORANGE — deleting caches, then re-measuring (ORANGE never kills a session)"
 
     # Delete claude-skills cache (~35MB, CC re-clones on demand)
     find "$CC_TMP_DIR" -type d -name "claude-skills" -exec rm -rf {} + 2>/dev/null || true
@@ -183,62 +377,36 @@ clean_cc_orange() {
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
 
-    # LOOP-BREAK: re-measure AFTER the cleanup above and kill idle sessions ONLY
-    # if we're still over the ORANGE line. This closes the runaway that killed no
-    # session but churned for ~4.5h on 2026-08-19: the tier that dispatched us
-    # here was measured BEFORE cleanup, so without a re-measure the daemon would
-    # re-enter ORANGE every poll and re-run the kill loop forever while the real
-    # filler (a pytest tree the cache-evict never touches) sat untouched. Killing
-    # an idle session cannot reduce cc-tmp anyway (sessions aren't the filler), so
-    # a kill here is at best useless and at worst reaps an innocent bystander.
-    # Use dir_usage_mb (du) — it drops immediately after rm; df can lag on
-    # held-open deleted fds.
+    # Re-measure AFTER the cleanup above. Use dir_usage_mb (du) — it drops
+    # immediately after rm, where df can lag on held-open deleted fds.
+    #
+    # ORANGE DOES NOT KILL SESSIONS. It used to reap unattached tmux sessions
+    # idle over 2h, and the loop-break comment that guarded it already made the
+    # case against itself: sessions are not what fills cc-tmp, so a kill here
+    # reclaims essentially nothing while destroying a session's entire context.
+    # That is the exact inversion this daemon must not make — it exists to stop
+    # runaway usage from killing CC, not to kill CC to tidy up. The measurement
+    # settles the cost of removing it: across the whole log history
+    # (2026-08-19 → 2026-09-07, 7,563 lines, 1,029 ORANGE polls) the kill loop
+    # was reached ONCE and killed ZERO sessions, so removal is behaviour-neutral
+    # on the record we have. RED remains the pressure valve and still reaps.
     local used_after threshold_orange
     used_after=$(dir_usage_mb "$CC_TMP_DIR")
     threshold_orange=$(( CC_TMP_BUDGET_MB * 75 / 100 ))
     if (( used_after <= threshold_orange )); then
-        log INFO "ORANGE resolved by cache cleanup (used=${used_after}MB <= ${threshold_orange}MB) — no session kills"
+        log INFO "ORANGE resolved by cache cleanup (used=${used_after}MB <= ${threshold_orange}MB)"
         rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
         return 0
     fi
 
-    log WARN "ORANGE persists after cleanup (used=${used_after}MB > ${threshold_orange}MB) — evaluating idle sessions"
-    # Kill idle CC tmux sessions (unattached, idle > 2h)
-    local killed_any=0
-    while IFS= read -r session; do
-        [[ -z "$session" ]] && continue
-        local sname
-        sname=$(echo "$session" | cut -d: -f1)
-        if [[ "$sname" =~ ^cc- ]]; then
-            local last_activity
-            last_activity=$(tmux display-message -t "$sname" -p '#{session_activity}' 2>/dev/null || echo 0)
-            local now
-            now=$(date +%s)
-            local idle_s=$(( now - last_activity ))
-            if (( idle_s > 7200 )); then
-                log WARN "Killing idle CC session: $sname (idle ${idle_s}s)"
-                # Count a reap only when tmux actually killed it — if the session
-                # vanished between listing and killing (or the kill fails), we
-                # reclaimed nothing, so killed_any must stay 0 and the stuck
-                # marker must still be recorded rather than silently skipped.
-                if tmux kill-session -t "$sname" 2>/dev/null; then
-                    killed_any=1
-                fi
-            fi
-        fi
-    done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null | grep ':0$' || true)
-
-    # Stuck-ORANGE: cleanup didn't resolve it AND nothing was killable → the
-    # daemon has nothing safe left to do. Per design D2 (ORANGE is dashboard/log
-    # only — only RED pages) this does NOT page; it records the stuck state ONCE
-    # (dedupe flag) in the log instead of silently re-polling forever, so the
-    # condition is discoverable. If cc-tmp keeps filling it escalates to RED,
-    # which DOES page. The flag is cleared (main loop) whenever cc-tmp LEAVES
-    # ORANGE (green/yellow/red) — never on a kill: reaping an idle session does
-    # not reduce cc-tmp, so a kill that leaves us ORANGE keeps cc_tier==orange and
-    # must not re-arm and re-log the same episode.
-    if (( killed_any == 0 )) && [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
-        log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): reclaim freed nothing and no idle (>2h) session is killable — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
+    # Stuck-ORANGE: the cleanup did not resolve it and there is nothing else safe
+    # to do. Per design D2 (ORANGE is dashboard/log only — only RED pages) this
+    # does NOT page; it records the stuck state ONCE (dedupe flag) so the
+    # condition is discoverable instead of silently re-polling forever. If cc-tmp
+    # keeps filling it escalates to RED, which DOES page. The flag is cleared in
+    # the main loop whenever cc-tmp LEAVES ORANGE.
+    if [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
+        log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): reclaim freed nothing — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
         touch "$ALERT_DIR/tmp_orange_stuck"
     fi
 }
@@ -371,16 +539,27 @@ check_cc_tmp() {
 
 clean_sys_yellow() {
     log INFO "Zone B YELLOW — cleaning /tmp files not accessed in 7+ days"
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
+    find "$SYS_TMP_DIR" -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +7 -delete 2>/dev/null || true
-    find /tmp -mindepth 1 -type d -empty -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" \
+    # The file sweeps above spare `*.sock`; this one must spare their DIRECTORIES,
+    # which the socket exclusion cannot cover. MEASURED 2026-09-07: this predicate
+    # matched `/tmp/cc-socks` and `/tmp/cc-daemon-1000/<id>/pty` — the latter an
+    # empty rendezvous directory inside a LIVE CC daemon's tree, created up front
+    # and populated later. An empty directory under a socket tree is a rendezvous
+    # point, not garbage, and deleting one is the same failure class as deleting
+    # the socket itself. (An earlier audit of this sweep called it safe "because
+    # socket-holding dirs are non-empty" — true of the directory holding the
+    # socket, false of its siblings.)
+    find "$SYS_TMP_DIR" -mindepth 1 -type d -empty \
+        -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" \
+        -not -path "*/cc-socks*" -not -path "*/cc-daemon-*" \
         -delete 2>/dev/null || true
 }
 
 clean_sys_orange() {
     clean_sys_yellow
     log WARN "Zone B ORANGE — cleaning /tmp files not accessed in 3+ days"
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
+    find "$SYS_TMP_DIR" -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +3 -delete 2>/dev/null || true
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
@@ -389,14 +568,14 @@ clean_sys_orange() {
 clean_sys_red() {
     log WARN "Zone B RED — aggressive /tmp cleanup"
     # Files not accessed in 1+ day
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
+    find "$SYS_TMP_DIR" -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +1 -delete 2>/dev/null || true
 
     # If still critical, remove all regular files except last 1h, sockets, tmux, pytest, claude
     local pct_after
     pct_after=$(tmp_usage_pct)
     if (( pct_after > 85 )); then
-        find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
+        find "$SYS_TMP_DIR" -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
             -mmin +60 -delete 2>/dev/null || true
     fi
 
@@ -498,19 +677,84 @@ main() {
         log INFO "OOM event capture armed (baseline oom_kill=${oom_baseline})"
     fi
 
+    # Control-plane paging state. `prev` is the previous poll's count and starts
+    # at -1 so no page can fire on the daemon's very first reading — an elevated
+    # count must be CONFIRMED by a second consecutive poll. Without that, a
+    # session exiting between ss's snapshot and its own unlink reads as one
+    # severed listener for a single poll and would page spuriously.
+    #
+    # `paged` is the level already reported. It survives a restart in a file, the
+    # way the RED tier's transition marker does: the unit is Restart=always, a
+    # severance is UNHEALABLE without restarting the sessions, and an in-memory
+    # level would therefore re-page the same unfixed condition after every deploy
+    # or crash-restart. It still follows the count DOWN, so once the sessions ARE
+    # restarted a later, smaller severance pages again.
+    local cp_prev_severed=-1 cp_last=""
+    local cp_paged_file="$ALERT_DIR/control_plane_paged"
+    local cp_paged_severed
+    cp_paged_severed=$(cat "$cp_paged_file" 2>/dev/null) || cp_paged_severed=""
+    [[ "$cp_paged_severed" =~ ^[0-9]+$ ]] || cp_paged_severed=0
+
     while true; do
         load_config
 
-        local cc_result sys_result
+        local cc_result sys_result cp_result
         cc_result=$(check_cc_tmp)
         sys_result=$(check_sys_tmp)
+        cp_result=$(check_control_plane)
 
         local cc_tier="${cc_result%%:*}"
         local cc_used="${cc_result##*:}"
         local sys_tier="${sys_result%%:*}"
         local sys_pct="${sys_result##*:}"
 
-        write_state "$cc_tier" "$cc_used" "$sys_tier" "$sys_pct"
+        write_state "$cc_tier" "$cc_used" "$sys_tier" "$sys_pct" "$cp_result"
+
+        local cp_status cp_severed cp_stale cp_listeners
+        IFS=: read -r cp_status cp_severed cp_stale cp_listeners <<<"$cp_result"
+
+        # Log only on CHANGE — this runs every poll and an unchanged plane has
+        # nothing to say.
+        if [[ "$cp_result" != "$cp_last" ]]; then
+            case "$cp_status" in
+                ok)
+                    log INFO "control plane: ${cp_listeners} listener(s), ${cp_severed} severed (socket path deleted under a live listener), ${cp_stale} stale socket file(s)" ;;
+                empty)
+                    log INFO "control plane: no CC sockets visible — either no session is running, or this check can no longer see them" ;;
+                *)
+                    log INFO "control plane: unknown (${SS_BIN} unavailable or failed) — severance cannot be detected on this box" ;;
+            esac
+            cp_last="$cp_result"
+        fi
+
+        if [[ "$cp_status" == "ok" ]]; then
+            local cp_decision cp_should_page
+            cp_decision=$(control_plane_page_decision \
+                "$cp_prev_severed" "$cp_paged_severed" "$cp_severed")
+            cp_should_page="${cp_decision%%:*}"
+            cp_paged_severed="${cp_decision##*:}"
+            printf '%s' "$cp_paged_severed" > "$cp_paged_file" 2>/dev/null || true
+            if [[ "$cp_should_page" == "1" ]]; then
+                log WARN "control plane SEVERED: ${cp_severed} of ${cp_listeners} session(s) unreachable"
+                # `warning` is the honest severity for the event, but note it does
+                # NOT buy a quieter delivery: the container drain submits every
+                # queued entry at one category and salience regardless of this
+                # argument, so this pages exactly like the RED emergency does.
+                # That is intended here (the owner asked to be paged on a NEW
+                # severance) — recorded so nobody infers a tier that does not exist.
+                queue_alert warning "watchgod:control-plane" \
+                    "CC control plane severed (${cp_severed} session(s) unreachable)" \
+                    "${cp_severed} of ${cp_listeners} live Claude Code session(s) are listening on a socket whose PATH no longer exists, so peers get ENOENT and cannot reach them. Nothing re-binds after startup — the only remedy is restarting those sessions. Check what deleted the paths under cc-socks." \
+                    "watchgod:control_plane:${cp_severed}"
+            fi
+            cp_prev_severed=$cp_severed
+        else
+            # Neither `unknown` nor `empty` is a recovery: forget the previous
+            # count so the next readable one needs its own confirmation, and leave
+            # the already-paged level alone so a blind spell cannot silently
+            # re-arm a page for a severance that was already reported.
+            cp_prev_severed=-1
+        fi
 
         # Durable OOM capture — snapshot + page on any NEW cgroup OOM kill.
         oom_baseline=$(check_oom_events "$oom_baseline")
