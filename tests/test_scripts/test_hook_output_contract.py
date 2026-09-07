@@ -206,9 +206,34 @@ def unbounded_stdout_offenders(src: str) -> list[str]:
     def _has_marker(lineno: int) -> bool:
         return 0 < lineno <= len(lines) and _EXEMPT_MARKER in lines[lineno - 1]
 
+    def _names_stdout(node: ast.AST) -> bool:
+        """Does this expression name the model-facing stream?
+
+        THE ENUMERATION, not another instance. Three spellings reach the same
+        channel and they were fixed ONE AT A TIME across three review rounds:
+        a bare `print()` (no kwarg), `file=None` (documented Python for "use
+        sys.stdout"), and `file=sys.stdout` -- which slipped through because the
+        predicate asked "is there a file kwarg" rather than "where does it go".
+        `sys.__stdout__` is here for the same reason, before someone finds it as
+        round four.
+
+        WHAT IT CANNOT SEE, stated rather than discovered later: an ALIASED
+        handle (`out = sys.stdout; print(x, file=out)`) is not resolved -- that
+        needs dataflow, and a predicate that flagged every opaque `file=` target
+        would refuse legitimate stderr writes through a variable. The routed
+        path is the defence there; this catches the spellings that NAME stdout.
+        """
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True  # documented Python for "use sys.stdout"
+        if isinstance(node, ast.Attribute) and node.attr in ("stdout", "__stdout__"):
+            base = node.value
+            return isinstance(base, ast.Name) and base.id == "sys"
+        return False
+
     def _real_file_kwarg(node: ast.Call) -> bool:
+        """True when `file=` sends output somewhere OTHER than the model."""
         return any(
-            kw.arg == "file" and not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+            kw.arg == "file" and not _names_stdout(kw.value)
             for kw in node.keywords
         )
 
@@ -293,6 +318,18 @@ def test_the_gate_can_itself_fail() -> None:
         "sys.stdout.write bypasses print entirely": "import sys\nsys.stdout.write('x')",
         "writelines is the same hole": "import sys\nsys.stdout.writelines(['a', 'b'])",
         "**kwargs cannot prove a file= is present": "print('x', **kw)",
+        # ROUND THREE of the same class, found by CodeRabbit on this PR. The
+        # predicate asked "is there a file kwarg" instead of "where does it go",
+        # so naming the model's own stream explicitly was the way past it. The
+        # class is now ENUMERATED rather than patched again: every spelling that
+        # NAMES stdout is flagged, and `sys.__stdout__` is pinned here before
+        # someone finds it as round four.
+        "file=sys.stdout names the model's own channel": (
+            "import sys\nprint('x', file=sys.stdout)"
+        ),
+        "file=sys.__stdout__ is the same stream": (
+            "import sys\nprint('x', file=sys.__stdout__)"
+        ),
     }
     for label, src in must_flag.items():
         assert unbounded_stdout_offenders(src), f"detector missed: {label}"
@@ -301,6 +338,13 @@ def test_the_gate_can_itself_fail() -> None:
         "stderr": "import sys\nprint('x', file=sys.stderr)",
         "explicit stream": "print('x', file=stream)",
         "stderr.write is not the model's channel": "import sys\nsys.stderr.write('x')",
+        # The other side of the enumeration: an OPAQUE handle stays unflagged.
+        # Resolving it needs dataflow, and flagging every unknown file= target
+        # would refuse legitimate stderr writes through a variable -- a false
+        # BLOCK, which is the worse direction for a contract gate.
+        "an aliased handle is not resolved, by design": (
+            "out = open('f')\nprint('x', file=out)"
+        ),
         "routed through the writer": (
             "from hook_output import BoundedStdout\n"
             "out = BoundedStdout(label='t')\n"
