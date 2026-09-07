@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: detect resume signals, giving-up, outcome verification, and unreviewed code.
+"""Stop hook: detect resume signals, giving-up, and unverified completion claims.
 
 Runs when Claude finishes responding (via .claude/settings.json Stop hook).
 
@@ -9,19 +9,53 @@ Runs when Claude finishes responding (via .claude/settings.json Stop hook).
 
 2. Checks the assistant's last message for giving-up patterns — phrases that
    delegate work back to the user instead of exhausting available tools.
-   If detected, outputs a nudge for the next turn.
 
 3. Checks the assistant's last message for completion claims without
-   verification evidence. If finishing language is present but no integration
-   or e2e proof, injects a reminder to verify outcomes before claiming done.
-
-4. Checks for unreviewed code changes. If found, outputs a reminder that
-   gets injected into context for the next turn.
+   verification evidence: finishing language with no integration or e2e proof.
 
 Reads hook input from stdin as JSON:
-  {"session_id": "...", "last_assistant_message": "...", ...}
+  {"session_id": "...", "last_assistant_message": "...", "stop_hook_active": ...}
 
 Skips background sessions (GENESIS_CC_SESSION=1).
+
+DELIVERY — and why it is a CONTINUATION, not a message
+------------------------------------------------------
+Checks 2 and 3 used to `print()`, and this docstring used to say each one
+"outputs a nudge for the next turn" and "gets injected into context". Both
+halves were wrong, and the second was wrong in a way worth spelling out,
+because the obvious repair is also wrong.
+
+Claude Code puts a hook's bare stdout in front of the model for three events
+only — SessionStart, UserPromptSubmit, UserPromptExpansion. On Stop it does
+not, so those prints went to the debug log and reached nobody.
+
+But Stop's JSON channel is not an inbox. READ from the 2.1.246 bundle: the
+Stop handler pushes `additionalContexts` into the array it returns as
+`blockingErrors`, and the agent loop reads a non-empty `blockingErrors` as
+"the hook refused to let this turn end" — it appends the text and CONTINUES,
+with transition reason `stop_hook_blocking`. So `additionalContext` here means
+"don't stop yet, and here is why", never "tell the model this next time".
+
+That is the right shape for these two nudges — handing work back to the user,
+or claiming completion without evidence, are both cases where not stopping is
+the point — but it is a behaviour change and not merely a delivery fix.
+
+It also has to be BOUNDED. The harness caps consecutive blocks at
+CLAUDE_CODE_STOP_HOOK_BLOCK_CAP (default 8) and then emits a user-visible
+override warning, and its own text names the guard: check `stop_hook_active`
+and stay quiet while it is true. `main` does exactly that, so a nudge costs at
+most one extra turn.
+
+A third check — unreviewed code changes — deliberately does NOT live here. It
+is state-based rather than message-based, so it would re-fire until a review
+marker appeared and run straight to that cap. It is also already delivered:
+`scripts/review_enforcement_prompt.py` runs the same `has_code_changes()` /
+`is_review_current()` predicate on UserPromptSubmit, whose stdout the model
+does receive.
+
+The two messages are emitted as ONE envelope. A hook's stdout must be a single
+JSON document, so printing one object per nudge would produce concatenated
+JSON that parses as nothing — the same silence by a different route.
 """
 
 from __future__ import annotations
@@ -37,6 +71,7 @@ from pathlib import Path
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import session_path  # noqa: E402
+from hook_output import print_json_bounded  # noqa: E402
 
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
@@ -60,6 +95,76 @@ _RESUME_PATTERNS = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+# A turn that ENDS by handing control to the user — a question, or an explicit
+# request for a decision. Both nudges below mean "don't stop yet", and this
+# channel enforces that by refusing to end the turn; but a turn that is asking
+# the user something is already stopping CORRECTLY, and refusing to end it makes
+# the model talk past the person it is waiting on.
+#
+# This mattered only once the nudges started blocking. MEASURED against the real
+# predicates: 3 of 6 sampled yielding turns fired one, including "Ready to merge.
+# Shall I open the PR?" — the repo's own approval moment. `_FINISHING_PATTERNS`
+# even contains a literal question alternative (`what would you like to do?`),
+# which is a yielding turn by construction. Harmless while the output went
+# nowhere; a wasted turn now.
+#
+# Fail direction is deliberate: a false SUPPRESS costs one advisory (the status
+# quo for years, and harmless), a false FIRE costs a model turn and talks over
+# the user. So this errs toward suppressing. The trailing clause is length-bound
+# so a question buried before a long closing paragraph does not qualify.
+_AWAITING_USER = re.compile(
+    r"(?:\?|\bshall I\b|\bwould you like\b|\bdo you want\b|\blet me know\b"
+    r"|\bawaiting your\b|\bplease (?:approve|confirm|advise|decide|provide)\b)"
+    r"[^.!?]{0,120}[?.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_awaiting_user(assistant_message: str) -> bool:
+    """Is this turn handing control back to the user?"""
+    if not assistant_message:
+        return False
+    return bool(_AWAITING_USER.search(assistant_message.rstrip()[-400:]))
+
+
+def _emit(notes: list[str | None]) -> None:
+    """Deliver the turn's nudges as ONE Stop `additionalContext` payload.
+
+    Silence when nothing fired: this channel CONTINUES the turn, so an empty
+    advisory would not merely be noise, it would cost a model turn.
+
+    Routed through ``print_json_bounded`` — its first production caller — as
+    chokepoint discipline rather than because this payload is near the cap. It
+    is not: MEASURED worst case is both nudges at 722 characters of text, 804
+    as the serialised payload `print_json_bounded` actually measures, against a
+    9,800 budget. The reason is that a hook writing model-facing
+    stdout outside the module that owns the cap constant is one CC version bump
+    from silent loss, and the envelope is what carries the decision. (An earlier
+    draft of this comment claimed the text was "unbounded by construction". It
+    is not — every message is a fixed literal.)
+
+    A ``False`` return means the payload went out oversize anyway. Noted to
+    stderr, not raised: a partially-delivered nudge beats the silence this
+    replaces, and an advisory must never cost the turn.
+    """
+    messages = [n for n in notes if n]
+    if not messages:
+        return
+    ok = print_json_bounded(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "Stop",
+                "additionalContext": "\n\n".join(messages),
+            }
+        },
+        text_keys=("hookSpecificOutput.additionalContext",),
+    )
+    if not ok:
+        # print_json_bounded already wrote a stderr warning naming the size, the
+        # budget and the reason; this only attributes it to a hook.
+        print("genesis_stop_hook: ^ that oversize advisory was this hook", file=sys.stderr)
 
 
 def main() -> None:
@@ -101,11 +206,18 @@ def main() -> None:
     # This runs regardless of whether user messages exist — it only
     # needs the assistant's last message from hook input.
     assistant_msg = hook_input.get("last_assistant_message", "")
-    _check_giving_up(assistant_msg)
-    _check_outcome_verification(assistant_msg)
-
-    # Check for unreviewed code changes
-    _check_review_state()
+    # `stop_hook_active` is true when the loop is ALREADY continuing because a
+    # Stop hook spoke last time. Emitting again from that state is what runs to
+    # CLAUDE_CODE_STOP_HOOK_BLOCK_CAP and ends in a user-visible override
+    # warning — so a nudge is emitted at most once per continuation chain,
+    # which is exactly what the harness's own warning text prescribes. Note the
+    # flag is set by ANY Stop hook blocking, so a sibling hook blocking first
+    # suppresses this one for that turn: a lost advisory, never a loop.
+    if not hook_input.get("stop_hook_active") and not _is_awaiting_user(assistant_msg):
+        _emit([
+            _check_giving_up(assistant_msg),
+            _check_outcome_verification(assistant_msg),
+        ])
 
     if not last_user_msg:
         return
@@ -180,15 +292,15 @@ _VERIFICATION_EVIDENCE = re.compile(
 )
 
 
-def _check_outcome_verification(assistant_message: str) -> None:
+def _check_outcome_verification(assistant_message: str) -> str | None:
     """Remind to verify actual outcomes before presenting completion options."""
     if not assistant_message:
-        return
+        return None
     if not _FINISHING_PATTERNS.search(assistant_message):
-        return
+        return None
     if _VERIFICATION_EVIDENCE.search(assistant_message):
-        return
-    print(
+        return None
+    return (
         "OUTCOME VERIFICATION REMINDER: You're presenting completion options "
         "but haven't mentioned integration or e2e verification beyond unit tests. "
         "Before the user decides: verify before completing (the `superpowers` plugin's "
@@ -198,16 +310,16 @@ def _check_outcome_verification(assistant_message: str) -> None:
     )
 
 
-def _check_giving_up(assistant_message: str) -> None:
+def _check_giving_up(assistant_message: str) -> str | None:
     """Nudge if the assistant appears to delegate a user-assigned task."""
     if not assistant_message:
-        return
+        return None
     # Giving-up phrases appear at the end of responses. Truncate to avoid
     # running complex regex over 50KB+ assistant messages.
     tail = assistant_message[-2000:] if len(assistant_message) > 2000 else assistant_message
     if not _GIVING_UP_PATTERNS.search(tail):
-        return
-    print(
+        return None
+    return (
         "SELF-CHECK: Your last response may be delegating work back to the user. "
         "Before giving up, verify: (1) Did you check reference_lookup and "
         "reference_network_topology.md? (2) Did you read proactive memory "
@@ -216,43 +328,6 @@ def _check_giving_up(assistant_message: str) -> None:
     )
 
 
-def _check_review_state() -> None:
-    """Output review reminder if unreviewed code changes exist."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, script_dir)
-
-    try:
-        from review_state import has_code_changes, is_review_current
-    except ImportError:
-        return  # review_state.py not available — skip silently
-
-    if not has_code_changes():
-        return
-
-    if is_review_current():
-        return
-
-    print(
-        "CODE REVIEW PENDING: code changes were made without a review marker. "
-        "Next turn MUST begin by reviewing the BRANCH CHANGESET (merge-base to "
-        "working tree — reviewing only the index leaves earlier commits uncovered) "
-        "and recording evidence: `/review` or `/code-review` or the `superpowers` "
-        "review skills where this install has them, else `/deep-review`, or by hand "
-        "`python3 scripts/review_state.py evidence-path` then `… mark --agent-output "
-        "<that file>`. A plain mark is an INTERNAL (same-model) review — it satisfies "
-        "this gate and never counts toward the escalation cap. ONLY a non-Anthropic "
-        "cross-model review (Codex/Kimi) is marked `--source external --defects|--clean` "
-        "(that outcome is what moves the cap). Run both from the "
-        "worktree the changes are in. The MARKER binds to what is STAGED at mark "
-        "time, so mark after staging. UNLESS the staged set is docs/config only — "
-        "that needs no review and no marker, and this check cannot tell the "
-        "difference because it hashes the staged diff without classifying paths. "
-        "That exemption does NOT apply when the commit itself stages (`git add` in "
-        "the chain, `-am`, a pathspec), at review round 2 or 3, or when the set "
-        "touches anything under a `.github/` directory or a prompt / agent / skill "
-        "surface even when `.md`. The full rules are in the per-prompt reminder; "
-        "this is the short form."
-    )
 
 
 if __name__ == "__main__":

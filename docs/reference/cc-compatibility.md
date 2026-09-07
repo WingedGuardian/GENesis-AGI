@@ -737,7 +737,7 @@ When a new CC version is released, run through this:
 | 2.1.133 | — | All hooks gain `effort.level` JSON field + `$CLAUDE_EFFORT` env var | Additive — Genesis hooks only read fields they need |
 | 2.1.138 | — | Running version before 2026-06-01 upgrade | Proven stable in production |
 | 2.1.139 | — | Hooks run WITHOUT terminal access — terminal I/O silently suppressed | Safe — Genesis hooks only use stderr for logging |
-| 2.1.143 | — | Stop hooks that block cap at 8 consecutive blocks | Safe — `genesis_stop_hook.py` never returns exit 2 |
+| 2.1.143 | — | Stop hooks that block cap at 8 consecutive blocks | **Applies — and the exit-code reasoning here was wrong.** `additionalContext` blocks WITHOUT exit 2: it is returned to the agent loop as `blockingErrors`. `genesis_stop_hook.py` emits it and guards with `stop_hook_active`, so it can consume at most one block. `hooks/deliverable_gate_guard.py` blocks via exit 2 with no such guard. See the delivery-channel section below. |
 | 2.1.150 | — | npm `stable` tag | Noted |
 | 2.1.152 | — | `cache_creation_input_tokens` reporting bug fixed (was silently 0) | Dashboard cost numbers will appear higher — this is a correctness fix, not a regression |
 | 2.1.153 | — | `/model` saves selection as default for new sessions | No background session impact (`--model` flag overrides) |
@@ -1100,6 +1100,47 @@ persistence path. Two consequences worth stating plainly: a Stop hook that
 an oversized JSON advisory can lose its *decision*, not merely its prose —
 which is why `scripts/hooks/hook_output.py` trims named free-text fields and
 never the envelope.
+
+The first of those was not hypothetical here. `scripts/genesis_stop_hook.py`
+printed its nudges on exit 0 while its own docstring said each reached the next
+turn. They reached nobody.
+
+**And the obvious repair is a trap, so record what Stop's JSON channel actually
+does.** It is NOT an inbox. READ from the 2.1.246 bundle: the Stop handler
+pushes `additionalContexts` into the array it returns as `blockingErrors`, and
+the agent loop reads a non-empty `blockingErrors` as *the hook refused to let
+this turn end* — appending the text and CONTINUING, with transition reason
+`stop_hook_blocking` and telemetry key `tengu_stop_hook_block_count`. So on
+Stop, `additionalContext` means "don't stop yet, and here is why", never "tell
+the model this next time".
+
+It is also capped. `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` (default 8) bounds
+consecutive blocks, after which the harness prints a **user-visible** warning
+that names its own required guard: *"For Stop/SubagentStop hooks, check
+`stop_hook_active` in the input and return success while it's true."* A Stop
+hook that emits unconditionally will hit that, and a hook whose trigger is
+STATE-based rather than message-based will hit it during ordinary work.
+
+Practical consequence for anything emitting here: check `stop_hook_active`, and
+only send advice whose meaning is "keep going". Anything meant for the user's
+next prompt belongs on UserPromptSubmit, whose stdout the model does receive.
+`genesis_stop_hook.py` now does both — two message-based nudges behind the
+guard, and the state-based review reminder left to
+`scripts/review_enforcement_prompt.py`, where it already worked.
+
+Corroborating the renderer read, CC documents the semantics itself. Its hook
+schema help for `"Stop" | "SubagentStop"` reads, verbatim:
+
+> string (optional) - Feedback for the model; the conversation continues so the
+> model can act on it
+
+"the conversation continues" is the whole finding. The 2.1.163 changelog entry
+above records Stop/SubagentStop gaining `additionalContext`.
+
+A note on method, because an earlier draft of this section cited a
+co-occurrence count as corroboration: that number was window-width dependent
+and not reproducible — the same binary yields 21, 87 or 5 depending on how you
+count. Quote the string; do not count around it.
 
 **Reading a filed payload back is safe and idempotent.** The Read tool's
 `maxResultSizeChars` is `Infinity` (it short-circuits the threshold resolver

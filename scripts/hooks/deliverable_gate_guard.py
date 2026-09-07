@@ -62,6 +62,17 @@ def _decide(data: dict, sessions_root: Path) -> int:
         if spec.get("session_id") != sid:
             return 0
         if spec.get("status") == _BLOCK_STATUS:
+            # A Stop block that REPEATS runs to CLAUDE_CODE_STOP_HOOK_BLOCK_CAP
+            # (default 8) and then surfaces "a hook blocked the turn from ending
+            # 9 consecutive times" to the USER — against the axiom that hooks are
+            # for the agent. `stop_hook_active` is true exactly when the loop is
+            # already continuing because a Stop hook blocked, so blocking again
+            # from that state is what builds the count. One block IS the gate;
+            # more is noise. (Exit 2 and `additionalContext` feed the SAME
+            # counter — this hook uses the former, `genesis_stop_hook.py` the
+            # latter, and both need this guard.)
+            if data.get("stop_hook_active"):
+                return 0
             # Staleness escape: an abandoned marker must not wedge Stop forever.
             try:
                 age = time.time() - marker.stat().st_mtime

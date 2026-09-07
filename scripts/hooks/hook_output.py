@@ -516,12 +516,13 @@ def print_json_bounded(
     # wrong direction for a size check, since it says "fine" about the one
     # outcome this module exists to prevent.
     #
-    # Latent rather than live today, stated plainly: this function has no
-    # caller outside its tests (grep across .claude/, scripts/, src/), and the
-    # default budget sits 200 chars under the cap, so the off-by-one only bites
-    # a caller passing budget=HOOK_STDOUT_CAP. Fixed now because the adopters
-    # this module was written for are the next PR, and an off-by-one in a size
-    # guarantee is not something to hand them.
+    # No longer latent: `scripts/genesis_stop_hook.py` is the first production
+    # caller, emitting the Stop event's `additionalContext`. (This comment said
+    # "no caller outside its tests" while that was true; it is recorded here
+    # because the off-by-one below was fixed BEFORE any adopter existed, which
+    # is the only reason the first one did not inherit it.) The default budget
+    # still sits 200 chars under the cap, so the off-by-one only ever bit a
+    # caller passing budget=HOOK_STDOUT_CAP.
     for _ in range(4 * max(1, len(text_keys))):
         blob = json.dumps(payload)
         if emit_cost(blob) <= budget:
