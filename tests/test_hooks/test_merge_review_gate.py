@@ -1242,6 +1242,13 @@ class TestCheckInlineReviewFindings:
         "docs/guide\x7f.md",
         "docs/guide\x85.md",
         "docs/guide\x9f.md",
+        # changelog.d/ — the fragment directory this branch introduces. Both are
+        # required here, and for different reasons: without the .md entry the
+        # not-block test passes through the OFF-DIFF lane and proves nothing about
+        # the documentation exemption it exists to pin, and without the .py entry
+        # the still-blocks test simply fails.
+        "changelog.d/20260904210000-fixed-thing.md",
+        "changelog.d/generate.py",
     ]
 
     @pytest.fixture(autouse=True)

@@ -601,7 +601,11 @@ def test_the_changelog_is_replaced_atomically_never_written_in_place(
         "not atomic, so a kill mid-write can leave it truncated"
     )
     assert len(list(d.iterdir())) == 1, "fragments deleted despite a failed write"
-    assert not (tmp_path / "CHANGELOG.md.tmp").exists(), "left a half-finished twin"
+    # Glob, not the literal: the staging file is `mkstemp`-named now, so
+    # `CHANGELOG.md.tmp` is a name the code can no longer produce and asserting on
+    # it passes unconditionally. Measured: with the literal here, deleting the
+    # cleanup `unlink` left the whole suite green.
+    assert not list(tmp_path.glob("CHANGELOG.md*.tmp")), "left a half-finished twin"
 
 
 # ── --check validates the TARGET, not just the inputs ────────────────────────
@@ -1274,17 +1278,17 @@ def test_a_non_regular_file_is_rejected_before_it_is_read(tmp_path: Path) -> Non
     A FIFO with a valid fragment name would hang the read forever; a socket
     corrupts it. Both must be classified before any read is attempted.
     """
-    import socket as _socket
-
+    # A FIFO rather than a unix socket, because AF_UNIX caps the bind path at 108
+    # bytes and pytest's tmp_path under this repo's own TMPDIR already exceeds it
+    # (measured 127) — so the socket form could not run at all here, and passed on
+    # CI only with about four bytes of headroom. `mkfifo` has no such limit, and
+    # `is_file()` is False for a FIFO, so collect_fragments still refuses it before
+    # any read is attempted — no hang.
     d = tmp_path / "changelog.d"
     d.mkdir()
-    sock = _socket.socket(_socket.AF_UNIX)
-    try:
-        sock.bind(str(d / "20260904210000-fixed-sock.md"))
-        with pytest.raises(ac.FragmentError, match="regular file"):
-            ac.collect_fragments(d)
-    finally:
-        sock.close()
+    os.mkfifo(d / "20260904210000-fixed-sock.md")
+    with pytest.raises(ac.FragmentError, match="regular file"):
+        ac.collect_fragments(d)
 
 
 def test_a_concurrent_changelog_edit_is_never_silently_discarded(
@@ -1319,4 +1323,6 @@ def test_a_concurrent_changelog_edit_is_never_silently_discarded(
     assert rc == 2
     assert list(d.iterdir())  # nothing was deleted; a rerun is correct
     # The refusal contract includes cleanup: no half-finished twin left behind.
-    assert not (tmp_path / "CHANGELOG.md.tmp").exists()
+    # Glob for the same reason as the sibling assertion above — the literal name
+    # is unreachable since `mkstemp`, so it could never fail.
+    assert not list(tmp_path.glob("CHANGELOG.md*.tmp"))

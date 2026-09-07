@@ -640,17 +640,27 @@ def main(argv: list[str] | None = None) -> int:
     # there is nothing to follow and no name to pre-place. It stays in
     # CHANGELOG.md's own directory because `replace` is only atomic within one
     # filesystem, which is the property the whole fold rests on.
-    fd, tmp_name = tempfile.mkstemp(
-        dir=CHANGELOG.parent, prefix=CHANGELOG.name + ".", suffix=".tmp"
-    )
-    os.close(fd)
-    tmp = Path(tmp_name)
-    # mkstemp creates 0600, and `replace` carries the SOURCE's mode onto the
-    # destination — so without this the release fold would silently make
-    # CHANGELOG.md owner-only. Carry the target's existing mode across instead
-    # of assuming a default; CHANGELOG.md is known to exist, having just been
-    # read into `original`.
-    os.chmod(tmp, stat.S_IMODE(CHANGELOG.stat().st_mode))
+    # Inside its own guard, not bare: creating the staging file is the FIRST
+    # thing that can fail on a read-only or full filesystem, and a bare call
+    # here raised OSError straight out of main() — a traceback and exit 1, not
+    # the `changelog.d: <message>` + exit 2 contract every other failure honours
+    # (including the target read one screen up). Nothing has been consumed at
+    # this point, so refusing is clean.
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=CHANGELOG.parent, prefix=CHANGELOG.name + ".", suffix=".tmp"
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        # mkstemp creates 0600, and `replace` carries the SOURCE's mode onto the
+        # destination — so without this the release fold would silently make
+        # CHANGELOG.md owner-only. Carry the target's existing mode across instead
+        # of assuming a default; CHANGELOG.md is known to exist, having just been
+        # read into `original`.
+        os.chmod(tmp, stat.S_IMODE(CHANGELOG.stat().st_mode))
+    except OSError as exc:
+        print(f"changelog.d: cannot create the staging file: {exc}", file=sys.stderr)
+        return 2
     removed: list[tuple[Path, str]] = []
     replaced = False
     try:
