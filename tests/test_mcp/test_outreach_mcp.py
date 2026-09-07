@@ -658,3 +658,39 @@ class TestDiscordSubChannelRouting:
         from genesis.outreach.types import DISCORD_CHANNELS
 
         assert _DISCORD_CHANNELS is DISCORD_CHANNELS
+
+    async def test_the_queued_path_keeps_the_raw_channel_name(self):
+        """THE second half, and the one a live send caught rather than a test.
+
+        When no pipeline is wired (standalone MCP), outreach_send ENQUEUES to
+        pending_outreach and genesis-server drains it later. The drain does its
+        own sub-channel mapping from the RAW name, so the row must keep
+        "announcements" — not the "discord" the live path uses. A first version
+        of this fix rewrote `channel` before the queued branch, which stored
+        "discord" and lost which channel was asked for: the same defect, one
+        code path over. MEASURED with a real release announcement that was
+        caught in the queue before it drained to dev-discussion.
+        """
+        old_pipe, old_db = mcp_mod._pipeline, mcp_mod._db
+        seen = {}
+
+        async def _enqueue(_db, **kw):
+            seen.update(kw)
+            return "pending-test"
+
+        try:
+            mcp_mod._pipeline = None
+            mcp_mod._db = MagicMock()
+            with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
+                 patch("genesis.db.crud.pending_outreach.enqueue", side_effect=_enqueue):
+                tools = await mcp.get_tools()
+                await tools["outreach_send"].fn(
+                    message="m", category="notification", channel="announcements",
+                )
+        finally:
+            mcp_mod._pipeline, mcp_mod._db = old_pipe, old_db
+
+        assert seen["channel"] == "announcements", (
+            "the queued row must keep the sub-channel name for the drain to map; "
+            f"got {seen['channel']!r}"
+        )
