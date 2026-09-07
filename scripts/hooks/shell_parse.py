@@ -796,9 +796,9 @@ class BlindSpot(NamedTuple):
     framing around both — what counts as gated is theirs to say, why the parse is
     blind is ours.
 
-    THE POLICY LIVES HERE, NOT IN THE CONSUMERS. Both remaining fields are decisions
-    this module has already made, so a guard obeys two booleans instead of
-    re-deriving a verdict from a string:
+    THE POLICY LIVES HERE, NOT IN THE CONSUMERS. The one remaining DECISION field (of
+    the three fields below) is a verdict this module has already made, so a guard obeys
+    a single boolean instead of re-deriving one from a string:
 
     ``bounds_induced`` — a BOUND stopped this parse, as opposed to the pre-existing
     ``untokenizable`` case. "Blind" is not one thing: every guard's behaviour for an
@@ -850,9 +850,14 @@ _BLIND_UNTOKENIZABLE = BlindSpot(
 
 #: Deliberately does NOT name the depth, because there is no single true number to
 #: name. The bound counts `Segment.depth`, and how many of those a level costs depends
-#: on the syntax: MEASURED at the current bound, `bash -c "$(…)"` first trips at 5
-#: nesting levels and a bare `$(…)` at 7. Any figure in this message would be wrong
-#: for one of them, and a reader can measure it. Describe the condition, not the count.
+#: on the syntax: MEASURED at the current bound, `bash -c "$(…)"` first trips at 4
+#: nesting levels and a bare `$(…)` at 6 — the same figures the MAX_SUBSTITUTION_DEPTH
+#: comment above records, which is the point of citing them in one place. (This said 5
+#: and 7 and was simply wrong: two comments quoting the same measurement disagreed, so
+#: a reader could not tell which was current. Re-measured through `analyze_checked` and
+#: `over_nested`, which agree.) Any figure in this message would still be wrong for one
+#: of the two shapes, and a reader can measure it — so describe the condition, not the
+#: count.
 _BLIND_OVER_NESTED = BlindSpot(
     bounds_induced=True,
     cause="nests scripts or command substitutions deeper than this parser follows",

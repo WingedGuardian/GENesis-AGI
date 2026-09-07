@@ -295,8 +295,12 @@ def test_the_worst_shape_at_the_cap_still_leaves_the_guard_its_clock():
     sp.analyze(worst)
     elapsed = time.monotonic() - started
     assert elapsed < 5.0, (
-        f"the worst command the cap admits took {elapsed:.2f}s; the guards are "
-        "registered at 10s and a hook killed at its timeout does not refuse"
+        f"the worst command the cap admits took {elapsed:.2f}s; these parses are "
+        "reached through the SHARED bash_safety_hook.sh registration that carries "
+        "five of them, not the per-guard registration one guard is listed at, and a "
+        "hook killed at its timeout does not refuse. The budget this is sized "
+        "against is recorded with MAX_COMMAND_CHARS in shell_parse — re-read it "
+        "there rather than trusting a number repeated here"
     )
 
 

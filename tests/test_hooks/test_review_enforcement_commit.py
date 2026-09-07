@@ -811,6 +811,110 @@ def test_clear_all_markers_does_not_count_an_absent_legacy_file(
     assert rs.clear_all_markers() == (0, [])
 
 
+def test_clear_all_markers_clears_legacy_when_the_marker_dir_was_never_created(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The legacy marker authorizes a commit ON ITS OWN, so an early return past it
+    is the bypass this function exists to close — reported as a clean success.
+
+    `_load_marker` reads `(_state_file(cwd), _LEGACY_STATE_FILE)` in that order, so
+    the legacy file needs no per-worktree directory to be honoured. This is the
+    upgraded-install shape: only `~/.genesis/review_state.json` exists and
+    `review_markers/` was never created. The `os.access` probe returned `(0, [])`
+    BEFORE the legacy unlink further down, so the caller was told the bypass was
+    closed while a time-valid marker sat there ready to authorize the next commit.
+
+    The two probe branches are separate clauses and get separate tests; this is the
+    one that reported no failure at all.
+    """
+    import review_state as rs
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"diff_hash": "abc"}')
+    monkeypatch.setattr(rs, "_MARKER_DIR", tmp_path / "never_created")
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", legacy)
+
+    cleared, failures = rs.clear_all_markers()
+    assert not legacy.exists(), "the legacy marker survived a clear_all_markers()"
+    assert cleared == 1, "the legacy marker it removed must be counted"
+    assert failures == [], "an absent marker dir is not a failure, just nothing to do"
+
+
+def test_clear_all_markers_clears_legacy_even_when_the_marker_dir_is_unreadable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The other early-return clause: the legacy marker is reachable even when the
+    per-worktree directory is not, so an unreadable directory must not shield it.
+
+    The unreadable-directory failure is still REPORTED — the point is that the two
+    are independent, not that one replaces the other. A directory this cannot read
+    is a real failure AND the legacy file is a real marker it can still remove.
+    """
+    import review_state as rs
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"diff_hash": "abc"}')
+    markers = tmp_path / "markers_unreadable"
+    markers.mkdir()
+    (markers / "a.json").write_text("{}")
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", legacy)
+
+    os.chmod(markers, 0o000)
+    try:
+        cleared, failures = rs.clear_all_markers()
+    finally:
+        os.chmod(markers, 0o700)  # always restore, or tmp_path cleanup fails
+
+    assert not legacy.exists(), "an unreadable marker dir must not shield the legacy one"
+    assert cleared == 1, "the legacy marker it removed must be counted"
+    assert any("unreadable" in f for f in failures), (
+        "the unreadable directory is still a REPORTED failure — clearing the legacy "
+        "marker does not make the markers it could not see go away"
+    )
+    assert (markers / "a.json").exists(), "fixture sanity: the unseen marker did survive"
+
+
+def test_clear_all_markers_reports_a_legacy_unlink_that_did_not_take(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A legacy `unlink()` that returns success against a file still on disk must be
+    REPORTED, not counted — the same re-read the per-worktree markers already get.
+
+    Clearing the legacy marker happens before the `_MARKER_DIR` probe (it has to, or
+    an early return skips it), which puts it OUTSIDE the survivors re-glob at the end
+    of the function — and that glob scans `_MARKER_DIR` only. This file is the one
+    deletion here that authorizes a commit on its own, so counting it on trust is the
+    same silent under-clear the survivors check exists to catch, one file over.
+
+    The lying `unlink` stands in for the real cases: a racing writer, or an overlay
+    filesystem that reports a delete it did not perform.
+    """
+    import review_state as rs
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"diff_hash": "abc"}')
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", legacy)
+
+    real_unlink = Path.unlink
+
+    def lying_unlink(self, *args, **kwargs):
+        if self == legacy:
+            return None  # "succeeds", removes nothing
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", lying_unlink)
+
+    cleared, failures = rs.clear_all_markers()
+    assert cleared == 0, "a deletion that did not happen must not be counted as one"
+    assert any("still present after unlink" in f for f in failures), (
+        f"a surviving legacy marker must be reported, got {failures}"
+    )
+
+
 def test_an_over_length_dash_C_commit_clears_the_marker_it_cannot_identify(
     repo: Path, home: Path, tmp_path: Path
 ) -> None:

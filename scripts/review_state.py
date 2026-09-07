@@ -540,6 +540,45 @@ def clear_all_markers() -> tuple[int, list[str]]:
     cleared = 0
     failures: list[str] = []
 
+    # THE LEGACY MARKER IS CLEARED FIRST, BEFORE ANY EARLY RETURN CAN SKIP IT.
+    # `_load_marker` reads `(_state_file(cwd), _LEGACY_STATE_FILE)` in that order, so
+    # the legacy file authorizes a commit entirely on its own — it does not need the
+    # per-worktree directory to exist, or to be readable, or to hold anything. It was
+    # cleared at the END of this function, below the `_MARKER_DIR` probe, which made
+    # it unreachable in exactly the two states where the probe returns early:
+    #
+    #     dir never created  -> `return 0, []`     — reported as a CLEAN success
+    #     dir unreadable     -> `return 0, [err]`  — a REAL failure, but not this one
+    #
+    # MEASURED at both, with a valid legacy marker present: it survived and
+    # `_load_marker()` returned it. The first is the dangerous one — an upgraded
+    # install that has only the legacy file gets "cleared 0, no failures", i.e. this
+    # function reporting that it closed the bypass while the bypass is intact.
+    #
+    # Ordering is the fix, not an extra branch: a cleanup placed after an early return
+    # is inert, so hoisting it above every return makes a future early return unable
+    # to reintroduce this. Counted only when it actually existed, because
+    # `missing_ok=True` succeeds on an absent file and "cleared 1" against nothing
+    # propagates into the operator-facing message.
+    if _LEGACY_STATE_FILE.exists():
+        try:
+            _LEGACY_STATE_FILE.unlink()
+        except OSError as exc:
+            failures.append(f"{_LEGACY_STATE_FILE}: {exc}")
+        else:
+            # The same re-read the per-worktree markers get below, applied here because
+            # hoisting this above the probe moved it OUT of that survivors glob — which
+            # scans `_MARKER_DIR` only. This file is the one deletion in this function
+            # that authorizes a commit ON ITS OWN, so it is the last one that should be
+            # counted on trust: an `unlink()` returning success against a file that is
+            # still there (a racing writer, an overlay that drops the write) is exactly
+            # the case the survivors check exists for, and `cleared` is printed to the
+            # operator verbatim.
+            if _LEGACY_STATE_FILE.exists():
+                failures.append(f"{_LEGACY_STATE_FILE}: still present after unlink")
+            else:
+                cleared += 1
+
     # `Path.glob` does NOT raise on an unreadable directory — it SWALLOWS the
     # PermissionError and yields nothing. MEASURED on 3.12: a marker dir at mode 000
     # holding one marker globs to `[]` with no exception. So an `except OSError`
@@ -552,26 +591,16 @@ def clear_all_markers() -> tuple[int, list[str]]:
     # directory is the single most dangerous thing this function could return.
     if not os.access(_MARKER_DIR, os.R_OK | os.X_OK):
         if _MARKER_DIR.exists():
-            return 0, [f"{_MARKER_DIR}: unreadable, so surviving markers cannot be seen"]
-        return 0, []  # never created: genuinely nothing to clear
+            failures.append(f"{_MARKER_DIR}: unreadable, so surviving markers cannot be seen")
+        # Both branches land here, and they mean opposite things: unreadable → markers
+        # survive UNSEEN and the failure above says so; absent → nothing more to clear.
+        return cleared, failures
 
     for path in _MARKER_DIR.glob("*.json"):
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
             failures.append(f"{path}: {exc}")
-        else:
-            cleared += 1
-
-    # Counted only when it actually existed: `missing_ok=True` succeeds on an absent
-    # file, so counting it unconditionally reported "cleared 1" against an empty — or
-    # entirely missing — marker directory, and the operator-facing message repeats
-    # that number.
-    if _LEGACY_STATE_FILE.exists():
-        try:
-            _LEGACY_STATE_FILE.unlink()
-        except OSError as exc:
-            failures.append(f"{_LEGACY_STATE_FILE}: {exc}")
         else:
             cleared += 1
 
