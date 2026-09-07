@@ -559,10 +559,35 @@ jobs:
           pip install -e ".[test]"
       - name: Run tests
         run: |
+          # Never measure a stale report: if pytest dies before writing
+          # one, the checker must find nothing rather than yesterday's.
+          rm -f junit.xml
           # Ignore preserved AZ-era test files that import removed modules
           pytest -v \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
-            --ignore=tests/test_ui/
+            --ignore=tests/test_ui/ \
+            --junit-xml=junit.xml
         env:
           GENESIS_TESTING: "1"
+      # A test that stops running is invisible: it makes the suite SMALLER,
+      # not red. Two axes, because dormancy moves both ways — a broken
+      # skipif RAISES the skip count, while a lost marker or a dropped
+      # directory LOWERS it and is only visible in the collected count.
+      # REPORT ONLY until both bounds, measured on these runners, are
+      # recorded here — a threshold invented rather than measured is one
+      # nobody trusts. The step still has teeth meanwhile: a missing or
+      # unreadable report exits 2.
+      - name: Suite dormancy guard
+        # NOT always(): that also fires on cancellation, and this workflow
+        # sets cancel-in-progress for every non-main ref — so a re-push
+        # would kill pytest mid-suite, leave no report, and the step would
+        # refuse with a cause that is not the cause.
+        if: ${{ !cancelled() }}
+        # Baseline MEASURED on this PR's own green run (job 101515129147, head
+        # bbd11ad1): "95 skipped of 23164 collected". Exact-fit on both axes, not
+        # a padded guess — headroom would be a number nobody measured, and the
+        # whole point of shipping report-only first was to avoid inventing one.
+        # Raising either bound is a deliberate act that belongs in the same commit
+        # as the change that moves it; both failure messages say so.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 95 --min-collected 23164
