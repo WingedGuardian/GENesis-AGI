@@ -372,12 +372,26 @@ def _build_alerts(providers: dict) -> list[dict]:
         seen_types.add(ptype)
 
         cb_reason = info.get("cb_reason")
+        cb_state = info.get("cb_state")
         chain_count = info.get("chain_count", 0)
 
-        if cb_reason in _CB_ALERT_BY_CATEGORY:
+        # `cb_state == "open"` is required, not incidental. `record_failure` sets
+        # `_last_failure_category` on EVERY failure, before the trip threshold is
+        # even checked (circuit_breaker.py:242), so a CLOSED breaker routinely
+        # carries a stale category from a failure that never tripped it. Keying on
+        # the category alone therefore announced "X is not included on this
+        # plan/tier" for a provider whose actual problem was a MISSING API KEY —
+        # the branch below that would have said so never got the chance.
+        #
+        # The old `cb_reason == "quota_exhausted"` arm had the same shape, so this
+        # is not a regression; it is the same latent bug, and this diff rewrote
+        # these exact lines, so leaving it would have been choosing not to fix it.
+        # Cross-model review flagged it at P3 for precisely that reason.
+        # `cb_label` above already gates on open — these two now agree.
+        if cb_state == "open" and cb_reason in _CB_ALERT_BY_CATEGORY:
             reason, prefix = cb_alert_for(cb_reason)
             message = f"{prefix.format(p=ptype.title())} — {chain_count} call site(s) affected"
-        elif info.get("cb_state") == "open":
+        elif cb_state == "open":
             reason, prefix = _CB_GENERIC_ALERT
             message = f"{prefix.format(p=ptype.title())} — {chain_count} call site(s) affected"
         elif info.get("status") == "missing":

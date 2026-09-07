@@ -360,3 +360,50 @@ def test_unknown_category_degrades_to_the_generic_outage():
 
     assert cb_alert_for("a_category_from_the_future") == _CB_GENERIC_ALERT
     assert cb_alert_for(None) == _CB_GENERIC_ALERT
+
+
+def test_a_stale_category_on_a_closed_breaker_does_not_hijack_the_alert():
+    """A missing KEY must say so, even when a stale category is sitting around.
+
+    `record_failure` sets `_last_failure_category` on every failure, BEFORE the
+    trip threshold is checked, so a CLOSED breaker routinely carries a category
+    from a failure that never tripped it. Keying the alert on the category alone
+    therefore announced "not included on this plan/tier" for a provider whose
+    real problem was an absent API key — the branch that would have said so was
+    unreachable. Found at P3 by cross-model review of PR #1733.
+    """
+    from genesis.observability.snapshots.api_keys import _build_alerts
+
+    alerts = _build_alerts({
+        "mistral-large-free": {
+            "alert_severity": "critical",
+            "provider_type": "mistral",
+            "status": "missing",       # the ACTUAL problem
+            "cb_state": "closed",      # never tripped
+            "cb_reason": "not_entitled",  # stale, from a non-tripping failure
+            "chain_count": 3,
+            "sole_sites": ["30_triage_calibration"],
+        }
+    })
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "missing_key", alerts
+    assert "API key missing" in alerts[0]["message"]
+
+
+def test_an_open_breaker_still_gets_its_category_label():
+    """The control: gating on cb_state must not blind the category labels."""
+    from genesis.observability.snapshots.api_keys import _build_alerts
+
+    alerts = _build_alerts({
+        "mistral-large-free": {
+            "alert_severity": "critical",
+            "provider_type": "mistral",
+            "status": "ok",
+            "cb_state": "open",
+            "cb_reason": "not_entitled",
+            "chain_count": 3,
+        }
+    })
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "not_entitled"
+    assert "down" not in alerts[0]["message"].lower()
