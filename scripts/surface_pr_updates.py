@@ -47,7 +47,11 @@ def main() -> None:
         now = datetime.now(UTC)
         lookback = pr_watch_config.knob_int(cfg, "lookback_days")
         resurface = pr_watch_config.knob_int(cfg, "resurface_days")
-        max_surface = pr_watch_config.knob_int(cfg, "max_surface")
+        # Clamped in CODE, not left to the config default: knob_int (pr_watch_config.py:84)
+        # has no upper bound and load_config merges a .local.yaml overlay, so the "5"
+        # in DEFAULTS is a default, not a structural bound. An exemption may only
+        # cite a bound configuration cannot change.
+        max_surface = min(pr_watch_config.knob_int(cfg, "max_surface"), 20)
 
         notifs = pr_watch.read_steward_notifications(pr_watch.db_path(), lookback, now)
         if not notifs:

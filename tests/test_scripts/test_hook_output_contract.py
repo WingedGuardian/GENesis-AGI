@@ -1,0 +1,340 @@
+"""Every model-facing hook is bounded, or is exempt for a stated reason.
+
+THE CLASS THIS LOCKS. Claude Code FILES a hook's stdout above a per-hook-entry
+size cap (10,000 characters on 2.1.246 — version-volatile) and shows the model a
+~2 KB preview. Nothing errors and the exit code is unchanged, so a hook that
+silently contributed nothing is indistinguishable from one that worked.
+
+MEASURED, by enumerating every filing the harness has made on this install
+(849/849 by content, not a sample): 842 were one emitter, fixed by #1556 when it
+moved that output behind ``scripts/hooks/hook_output.py``; 7 were a guard removed
+in #1106; and ZERO came from the eleven hooks (nine Python, two shell) wired
+today. So this test is not chasing a live incident — #1556 already closed the one
+that existed. It exists because nothing stops the NEXT hook being wired with
+unbounded model-facing output, and CLAUDE.md's instruction to "route any new
+model-facing stdout through it" is prose with no mechanism behind it.
+
+WHAT THIS GATE CANNOT SEE, stated so nobody reads it as total coverage. It
+enumerates ``.claude/settings.json`` only — the repo's wiring. A user-level
+``~/.claude/settings.json`` (which on this install wires further SessionStart
+entries) and ``.claude/settings.local.json`` are real CC layers outside the
+repo's control, and a hook wired there is invisible here. The detector also
+matches ``print`` and ``sys.stdout.write``/``writelines``; it does NOT catch
+``os.write(1, …)``, a print aliased to another name, or a subprocess that
+inherits stdout — nor output produced by a helper module the hook imports, since
+only the hook's own source is parsed.
+
+AND AN EXEMPTION SKIPS SCANNING ENTIRELY — measured by adding an unbounded
+``sys.stdout.write`` to an exempted hook and watching this suite stay green. That
+is the design, not an oversight: the gate's job is to force the claim to be MADE
+and STATED next to the code, not to re-verify it forever. It is also the
+weakness to know about, because it is how an exemption rots. Two consequences
+follow. A row here is only as good as its last read, so an exemption is a review
+surface, not a settled fact. And the table stays SMALL on purpose — every row is
+a place the gate stops looking, which is why routing a hook through the writer
+is always preferred over adding it here.
+
+SCOPE. Only ``SessionStart`` and ``UserPromptSubmit`` put a hook's BARE STDOUT in
+front of the model. Every other event reaches it through JSON
+``additionalContext``/``systemMessage``, which runs through the same persistence
+path but has a different failure mode — an oversized advisory must lose prose,
+never its ``permissionDecision``, which is what ``print_json_bounded`` protects.
+Those events are deliberately out of scope here rather than exempted in bulk: a
+36-entry exemption list on day one would be a rubber stamp.
+
+POLARITY IS ALLOWLIST, ON PURPOSE. A wired hook that is neither routed nor
+explicitly listed FAILS. Its sibling ``test_hook_input_contract.py`` is a
+denylist — it catches one known-bad spelling — and a denylist cannot notice a
+hook nobody thought about. That difference is the whole point of this file.
+
+Install-agnostic: synthetic payloads, no network, no live DB.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[2]
+_SETTINGS = _REPO / ".claude" / "settings.json"
+
+#: The two events whose hooks write bare stdout the model reads. Everything else
+#: reaches the model only through the JSON channel — see SCOPE above.
+_BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit")
+
+#: Hooks whose model-facing output CANNOT reach the cap by construction, so how
+#: they print does not matter.
+#:
+#: THE RULE, and it is the one this table got wrong first: an exemption may only
+#: cite a bound that CONFIGURATION CANNOT CHANGE. A default in a config module is
+#: not a bound — `knob_int` (pr_watch_config.py:84) has no upper clamp and
+#: `load_config` merges a `.local.yaml` overlay, so `max_surface: 5000` in either
+#: file would have produced ~410 KB of output through two rows of this table that
+#: read as verified. Adversarial review caught it. Cite a hardcoded slice or an
+#: in-code clamp, never a DEFAULTS entry.
+_STRUCTURALLY_BOUNDED = {
+    "scripts/surface_pr_updates.py": (
+        "min(..., 20) clamp in scripts/surface_pr_updates.py:54 — in CODE, so a "
+        "config overlay cannot raise it; clause bodies clipped [:71] by "
+        "render_clause; joined into ONE line at pr_watch.py:204"
+    ),
+    "scripts/surface_open_prs.py": (
+        "min(..., 20) clamp in scripts/surface_open_prs.py:83 — in CODE, not the "
+        "config default; each clause synthesised from ints (#1379 (12d, draft)); "
+        "joined into ONE line at pr_watch.py:204"
+    ),
+    ".claude/hooks/cbm-session-reminder.sh": (
+        "621 bytes TOTAL, a single quoted heredoc (cat << 'REMINDER') with zero "
+        "'$' anywhere in the file — the file size is its hard output ceiling"
+    ),
+    "scripts/hooks/skill_injection_hook.py": (
+        "_MAX_CATALOG_NUDGES = 2 (:31) applied at :278, plus at most 2 literal "
+        "process nudges from _check_process_discipline (:179-226); descriptions "
+        "sliced [:80]/[:60] at :284/:288/:293"
+    ),
+    "scripts/contribution_offer_hook.py": (
+        "one fixed f-string; sha[:12] and subject[:200] (:63) are its only "
+        "inputs, both sliced in code"
+    ),
+    "scripts/hooks/session_activity_touch.sh": (
+        "scripts/hooks/session_activity_touch.sh writes 0 bytes to fd 1 — it "
+        "touches a marker file and exits; its 2 `cat` calls are command "
+        "substitutions into variables, not stdout writes"
+    ),
+}
+
+#: NOT structurally bounded. Listed only because it has never been observed
+#: filing, with its routing tracked elsewhere. This category exists so that debt
+#: is VISIBLE rather than laundered into the table above, and it is meant to
+#: drain to empty. Every entry must name where its routing is tracked.
+_MEASURED_PENDING_ROUTING = {
+    "scripts/proactive_memory_hook.py": (
+        "7 model-facing print sites; get_active_sync (db/crud/session_heartbeats.py"
+        ":165-177) has no LIMIT, so the peer loop is unbounded. NEVER observed "
+        "filing (0 of 849 harness filings). Routing is tracked as its own PR "
+        "because this runs on every prompt in every session and its own comment "
+        "notes a broken read 'reads exactly like no concurrent sessions'."
+    ),
+}
+
+#: hook_output.py is the writer itself; it legitimately calls bare print() to
+#: emit what every other hook hands it. Same shape as test_hook_input_contract's
+#: _ALLOWED_ENV_READERS = {"hook_input.py"}.
+_SELF_EXEMPT = {"scripts/hooks/hook_output.py"}
+
+_HOOK_LAUNCHER = "genesis-hook"
+
+
+def _rel(path: Path) -> str:
+    """Repo-relative key. Basenames were the first design and were too loose: a
+    future hook merely SHARING a name would inherit an exemption written for a
+    different file."""
+    try:
+        return path.resolve().relative_to(_REPO).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _resolve(command: str) -> tuple[str, Path | None]:
+    """Return (display name, resolved path) for one wired hook command.
+
+    Two shapes exist in settings.json today and both are handled explicitly
+    rather than by a general parser: `<launcher> <script.py> [args]`, where the
+    script is relative to scripts/, and `bash <path>`, where the path is
+    absolute under ${CLAUDE_PROJECT_DIR}. A command matching neither returns
+    (command, None) so the caller FAILS on it instead of skipping it — an
+    unparseable hook is exactly the case an allowlist must not wave through.
+    """
+    tokens = command.split()
+    for i, tok in enumerate(tokens):
+        if tok.endswith(_HOOK_LAUNCHER) and i + 1 < len(tokens):
+            rel = tokens[i + 1]
+            path = _REPO / "scripts" / rel
+            return _rel(path), path
+    for tok in tokens:
+        if tok.endswith((".sh", ".py")):
+            path = tok.replace("${CLAUDE_PROJECT_DIR}", str(_REPO))
+            return _rel(Path(path)), Path(path)
+    return command, None
+
+
+def _wired() -> list[tuple[str, str, Path | None]]:
+    """(event, name, path) for every hook wired to a bare-stdout event."""
+    settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
+    out: list[tuple[str, str, Path | None]] = []
+    for event in _BARE_STDOUT_EVENTS:
+        for entry in settings["hooks"].get(event, []):
+            for hook in entry.get("hooks", []):
+                name, path = _resolve(hook["command"])
+                out.append((event, name, path))
+    return out
+
+
+#: An inline, per-line opt-out. Requires a reason after the colon, so a waiver is
+#: a visible statement in the source rather than an entry in a table nobody reads
+#: next to the code it excuses.
+_EXEMPT_MARKER = "hook-output-exempt:"
+
+
+def unbounded_stdout_offenders(src: str) -> list[str]:
+    """Calls that put unbounded text in front of the model.
+
+    A standalone function over a SOURCE STRING rather than a path, so the
+    positive control below can feed it synthetic sources. Without that, "no
+    offenders" and "no detector" are the same result.
+
+    TWO SHAPES, because covering only the first left a hole big enough to drive
+    the whole gate through: an adversarial review demonstrated that reverting a
+    routed hook to ``sys.stdout.write(REMINDER)`` passed every test in this PR.
+
+    1. ``print(...)`` with no `file=` — and `file=None` counts as no file=, since
+       that is documented Python for "use sys.stdout". Reading `file=` as present
+       regardless of its value was a straight correctness bug in the first
+       version of this detector.
+    2. ``sys.stdout.write`` / ``sys.stdout.writelines`` — the spelling that
+       bypasses `print` entirely. Matched on the ``.stdout`` attribute rather
+       than the ``sys`` binding, so ``from sys import stdout`` style aliases are
+       NOT caught; see the known-misses note in the gate's docstring.
+
+    ``print(x, **kw)`` is flagged: a `**kwargs` entry has ``arg is None``, so it
+    never satisfies the file= test. That direction fails CLOSED, which is right.
+    """
+    lines = src.splitlines()
+
+    def _has_marker(lineno: int) -> bool:
+        return 0 < lineno <= len(lines) and _EXEMPT_MARKER in lines[lineno - 1]
+
+    def _real_file_kwarg(node: ast.Call) -> bool:
+        return any(
+            kw.arg == "file" and not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+            for kw in node.keywords
+        )
+
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call) or _has_marker(node.lineno):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "print" and not _real_file_kwarg(node):
+            offenders.append(f"line {node.lineno}: bare print() reaches the model")
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr in {"write", "writelines"}
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "stdout"
+        ):
+            offenders.append(f"line {node.lineno}: sys.stdout.{func.attr}() reaches the model")
+    return offenders
+
+
+def test_every_model_facing_hook_is_bounded_or_exempt() -> None:
+    """The gate. A wired hook must route through the writer, or be listed."""
+    listed = set(_STRUCTURALLY_BOUNDED) | set(_MEASURED_PENDING_ROUTING) | _SELF_EXEMPT
+    failures: list[str] = []
+
+    for event, name, path in _wired():
+        if name in listed:
+            continue
+        if path is None:
+            failures.append(f"{event}: cannot resolve a script from {name!r}")
+            continue
+        if not path.exists():
+            failures.append(f"{event} {name}: wired but missing at {path}")
+            continue
+        if path.suffix != ".py":
+            failures.append(
+                f"{event} {name}: shell hook is neither exempt nor scannable — "
+                f"add it to _STRUCTURALLY_BOUNDED with a measured reason"
+            )
+            continue
+        offenders = unbounded_stdout_offenders(path.read_text(encoding="utf-8"))
+        if offenders:
+            # Deduped: a hook wired N times (genesis_session_context.py is wired
+            # four times, once per --part) would otherwise report every offender
+            # N times and bury the distinct ones.
+            entry = f"{event} {name}: " + "; ".join(offenders)
+            if entry not in failures:
+                failures.append(entry)
+
+    assert not failures, (
+        "Model-facing hooks that neither route through hook_output.py nor carry "
+        "an exemption:\n  "
+        + "\n  ".join(failures)
+        + "\n\nClaude Code FILES hook stdout above ~10,000 characters and shows the "
+        "model a ~2 KB preview, silently and with exit code unchanged. Either emit "
+        "through scripts/hooks/hook_output.py (BoundedStdout), or — if the output "
+        "cannot reach the cap by construction — add the hook to "
+        "_STRUCTURALLY_BOUNDED with the cap that proves it, quoting the file that "
+        "defines that cap."
+    )
+
+
+def test_the_gate_can_itself_fail() -> None:
+    """The detector must flag what it claims to, and must not flag what it does not.
+
+    Copied in shape from test_context_injection_budget.py's budget-lock control.
+    A gate whose detector silently matches nothing passes forever and reads
+    exactly like a clean repo.
+    """
+    must_flag = {
+        "plain": "print('hello')",
+        "fstring": "print(f'[{tag}] {detail}')",
+        "in a loop": "for x in items:\n    print(x)",
+        "one bare print among several routed ones": (
+            "import sys\nprint('a')\nprint('b', file=sys.stderr)"
+        ),
+        # Each of the four below passed the FIRST version of this detector. An
+        # adversarial review found them by running it rather than reading it,
+        # which is why they are pinned here as cases rather than described in
+        # prose: a miss nobody replays comes back.
+        "file=None is documented Python for sys.stdout": "print('x', file=None)",
+        "sys.stdout.write bypasses print entirely": "import sys\nsys.stdout.write('x')",
+        "writelines is the same hole": "import sys\nsys.stdout.writelines(['a', 'b'])",
+        "**kwargs cannot prove a file= is present": "print('x', **kw)",
+    }
+    for label, src in must_flag.items():
+        assert unbounded_stdout_offenders(src), f"detector missed: {label}"
+
+    must_not_flag = {
+        "stderr": "import sys\nprint('x', file=sys.stderr)",
+        "explicit stream": "print('x', file=stream)",
+        "stderr.write is not the model's channel": "import sys\nsys.stderr.write('x')",
+        "routed through the writer": (
+            "from hook_output import BoundedStdout\n"
+            "out = BoundedStdout(label='t')\n"
+            "out.emit('x', block='t')"
+        ),
+        "an explicit per-line waiver with a reason": (
+            "import sys\nsys.stdout.write('x')  # hook-output-exempt: it is the probe"
+        ),
+        "writing to a non-stdout object": "buf.write('x')",
+        "no output at all": "x = 1\n",
+    }
+    for label, src in must_not_flag.items():
+        assert not unbounded_stdout_offenders(src), f"detector false-fired on: {label}"
+
+
+def test_exemptions_name_hooks_that_are_actually_wired() -> None:
+    """An exemption for a hook nobody wires any more is dead weight that reads
+    as coverage. Drain the list when a hook goes away."""
+    wired_names = {name for _event, name, _path in _wired()}
+    stale = sorted((set(_STRUCTURALLY_BOUNDED) | set(_MEASURED_PENDING_ROUTING)) - wired_names)
+    assert not stale, (
+        f"Exemptions naming hooks not wired to {_BARE_STDOUT_EVENTS}: {stale}. "
+        "Remove them — a stale exemption still reads as a considered decision."
+    )
+
+
+def test_every_exemption_states_a_reason() -> None:
+    """A reason is the only thing separating an exemption from a rubber stamp."""
+    thin = sorted(
+        name
+        for name, reason in (_STRUCTURALLY_BOUNDED | _MEASURED_PENDING_ROUTING).items()
+        if len(reason.strip()) < 40 or not re.search(r"[:\d]", reason)
+    )
+    assert not thin, (
+        f"Exemptions without a substantive, specific reason: {thin}. State the cap "
+        "and the file that defines it."
+    )

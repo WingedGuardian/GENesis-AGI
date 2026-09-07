@@ -78,7 +78,9 @@ def main() -> None:
 
         stale_days = pulse_cfg.knob_int(cfg, "open_pr_stale_days")
         resurface = pulse_cfg.knob_int(cfg, "open_pr_resurface_days")
-        max_surface = pulse_cfg.knob_int(cfg, "open_pr_max_surface")
+        # Clamped in CODE — see the note in surface_pr_updates.py; knob_int has no
+        # upper bound and a .local.yaml overlay can raise the configured value.
+        max_surface = min(pulse_cfg.knob_int(cfg, "open_pr_max_surface"), 20)
 
         # Namespace the seen-map by the cache's live repo slug so a PR number from a
         # DIFFERENT repo (a re-pointed remote / fork) can't collide with an aged-out

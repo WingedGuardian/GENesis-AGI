@@ -442,12 +442,34 @@ because the preview reads as ordinary furniture at the top of a window.
 
 The size threshold is undocumented and **moves between CC versions** — treat
 the wrapper itself as the signal, never a byte count.
-`scripts/hooks/hook_output.py` is the single home of the measured cap and
-bounds the two hooks that carry the most to the model (the SessionStart
-injection and the per-prompt session-state tags); **route any new model-facing
-stdout through it** — the other hooks are not bounded yet. The hourly
-`context_injection_monitor` watches the harness's own filings independently of
-every emitter's arithmetic, so this class cannot go quiet again.
+`scripts/hooks/hook_output.py` is the single home of the measured cap;
+**route any new model-facing stdout through it.** That instruction is now
+ENFORCED rather than advisory: `tests/test_scripts/test_hook_output_contract.py`
+enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
+`UserPromptSubmit` — the two events whose bare stdout the model reads — and fails
+unless each one either routes through the writer or carries a stated, measured
+reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
+with unbounded output fails by construction, which a known-bad-pattern scan could
+not do. An exemption may only cite a bound **configuration cannot change** — a
+hardcoded slice or an in-code clamp, never a config DEFAULT, since a `.local.yaml`
+overlay can raise a default.
+
+Two limits, so it is not read as total coverage: hooks wired in a user-level
+`~/.claude/settings.json` or a `settings.local.json` are outside the repo and
+invisible to it, and the detector matches `print` and `sys.stdout.write` but not
+`os.write(1, …)`, an aliased print, or a subprocess inheriting stdout.
+
+Hooks on the OTHER events reach the model through JSON `additionalContext`, the
+same persistence path with a different failure mode — an oversized advisory must
+lose prose, never its `permissionDecision`, which is what `print_json_bounded`
+protects. They are out of the gate's scope today, deliberately, rather than
+exempted in bulk.
+
+The hourly `context_injection_monitor` watches the harness's own filings
+independently of every emitter's arithmetic, so this class cannot go quiet
+again — and its record is the evidence that the chokepoint works: of 849 filings
+on this install, 842 were one emitter that stopped filing the day #1556 moved it
+behind the writer, and 7 were a guard since removed.
 
 ## Traps
 
