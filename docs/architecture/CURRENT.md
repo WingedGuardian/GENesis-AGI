@@ -1078,7 +1078,8 @@ verified: 84c7259d 2026-08-31
 - **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
   by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
   container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
-  `status_writer_loop`) and RESTARTS the bridge/runtime on status-file staleness, or a
+  `status_writer_loop`) and RESTARTS its auto-detected target — genesis-server on any
+  install where that unit file exists, NOT the deprecated relay — on status-file staleness, or a
   specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
   `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
   case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
@@ -1506,6 +1507,35 @@ verified: 29a382e7 2026-09-03
   propose_only). Retention 45d via `scripts/prune_repo_pulse.py`
   (disk-hygiene). Telemetry: `call_site_last_run` row `repo_pulse` (not a
   critical site — failed runs self-heal by re-covering their window).
+- **Undisposed-ledger escalation (2026-09-06)**: repo-pulse above CLOSES a
+  ledger row whose work landed in a cited PR; this is the other half — the row
+  whose work never landed and whose session died. A `session_ledger` row is
+  rendered by its OWN session's injection and by nothing else, so a dead
+  session's open rows become unreachable by every process and person.
+  `session_awareness/ledger_escalation.py` (learning scheduler, hourly at :17 —
+  it MUTATES, so not the read-and-alert awareness band) escalates a row
+  untouched ≥ `stale_days` whose owning session has been quiet ≥ `quiet_days`
+  (`~/.genesis/sessions/<sid>/last_prompt_time`, content preferred over mtime so
+  a backup restore cannot make every dead session look live) into a
+  `user_input_needed` follow-up. BOTH thresholds are load-bearing: a stale row
+  in a LIVE session is that session's to dispose. Reverse sync completes the
+  follow-up once the row reaches a terminal status. The link is the follow-up's
+  `dedup_key` (`session_awareness/ledger_escalation_link.py`, whose formula the
+  two import-free hooks inline under a parity test) — this sweep is the WRITER
+  its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
+  `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
+  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  cannot ask the owner to dispose of something nobody committed to.
+  **Trap: it must never write `session_ledger`** — an evidence write would bump
+  `updated_at` and read as a disposition the owner never made, i.e. the sweep
+  answering its own question. **Do not touch blind: `ledger_escalation` is
+  deliberately ABSENT from the morning report.** Follow-up content reproduces
+  ledger row text verbatim, and real rows on a live install have carried
+  plaintext credentials a session pasted in; the morning report renders
+  `content[:200]` into Telegram. Wiring this source to any egress surface needs
+  a redaction pass first. Follow-ups ship `domain=None` (unclassified) because
+  the sweep cannot tell a dropped user errand from a stale internal dev item —
+  both shapes are really in the ledger.
 
 ## 10. Learning & evaluation
 
@@ -1703,21 +1733,45 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: f24c15e9 2026-09-05
+verified: ee9ebf85c 2026-09-05
 ```
 
 - **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
-  capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
-  failure; state persisted cross-process to
+  capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
+  NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
   a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
   HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
   opened by a real call failure (`_opened_by_call`) is closed only by a real
   `record_success`. A models-listing 200 evidences *reachable*, never *working* —
   it is what a 403-on-use, an exhausted quota or a truncated completion looks
-  like from outside. The probe heal deliberately does NOT fire `on_recovery`
+  like from outside. The 403-on-use half of that is now classified in its own
+  right: `NOT_ENTITLED` (`retry.py` `_ENTITLEMENT_MARKERS`, checked BEFORE
+  `_QUOTA_KEYWORDS` because an entitlement message names the plan/tier/
+  subscription it lacks, and two of those words are themselves quota keywords). It takes
+  one behaviour from each neighbour — fail-fast like PERMANENT, so a dead
+  provider cannot spend the chain's aggregate `max_total_s` before the walk
+  reaches a working one; the 4h cap like QUOTA_EXHAUSTED, since an entitlement
+  does not change in 30 minutes. Either neighbour alone gives up the other half.
+  The same review pass closed the CLASS: QUOTA_EXHAUSTED now fails fast too. The
+  old split was inverted — RATE_LIMITED, the one 4xx that genuinely might clear
+  inside a backoff, already failed fast, while a spent allowance (a billing
+  state, and usually account-global: one OpenRouter key limit covers every
+  openrouter entry in a chain at once) was retried. MEASURED 2026-09-05 before the fix:
+  ~11.9s avg per entitlement exposure (n=15), 4.1-6.8s per quota exposure
+  (n=22), against a 180-600s aggregate `max_total_s`. The two categories are
+  distinct in the ROUTER; the operator-facing surfaces have NOT caught up.
+  Three of them still branch on the literal `quota_exhausted`, so a
+  NOT_ENTITLED breaker falls through to the generic outage arm and an
+  entitlement gap is reported as a provider being down — the exact
+  misreading this classification exists to end, moved from the router to
+  the alert layer: `observability/snapshots/api_keys.py` renders "down
+  (circuit breaker open)", the dashboard overview renders "API down",
+  and `routing/escalation.py` raises `provider_failure` with no category
+  filter at all. A deliberate scope boundary, not an oversight.
+  The probe heal deliberately does NOT fire `on_recovery`
   (which resolves the `provider_failure` observation and clears `first_trip_at`),
   so a listing can no longer erase an outage clock. This does not hold a provider
   out of rotation: OPEN auto-transitions to HALF_OPEN on backoff, HALF_OPEN is

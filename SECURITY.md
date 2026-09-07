@@ -68,8 +68,15 @@ currently ships.
 Every autonomous background Claude Code session must be rooted in an explicit
 operator approval: `manual_approval_required` (`autonomy/cli_policy.py`)
 defaults to `True`, and `AutonomousCliApprovalGate` refuses to dispatch without
-one. No autonomy level unlocks past it, and it is not a tunable — a fork that
-defaults it off has removed the guarantee the rest of this section describes.
+one. No autonomy level unlocks past it.
+
+It is a SETTING, not a constant, and you should treat it as one worth checking.
+It is read from `config/autonomous_cli_policy.yaml` and can be overridden by the
+`GENESIS_AUTONOMOUS_CLI_APPROVAL_ENABLED` environment variable — so it can be
+turned off in an install without anyone forking anything. The project treats
+keeping it `True` as non-negotiable and ships it that way; what this document
+cannot tell you is whether it is still `True` in YOUR install. Verify it, and
+treat a `False` as the whole earned-autonomy model being switched off.
 
 ### Container Isolation
 
@@ -104,10 +111,15 @@ isolation is still load-bearing for you — it is:
 - It is **inert when no dashboard password is set**, which is the default.
 - It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
   not a fixed list, so any route added there in future is exempt by default.
-  Today that prefix holds only login, logout and an auth-status probe, none of
-  which mutate a credential.
+  Today that prefix holds login, logout and an auth-status probe. None of them
+  changes a credential — but login and logout do establish and tear down an
+  authenticated session, and they run ungated by design, because a login that
+  required prior authentication could never succeed.
 - It can be disabled outright with `GENESIS_DASHBOARD_API_AUTH=off`.
-- The built-in web terminal and the noVNC console are **not** covered by it.
+- It covers state-changing HTTP requests under the API prefixes, and nothing
+  else. The interactive terminal runs over a WebSocket and the noVNC console
+  over its own port; neither is behind this gate, so for those the control is
+  still network isolation and the dashboard password on the UI.
 
 This is safe **only under the assumed deployment model: the host is not
 publicly exposed.** The dashboard is meant to be reachable through one of:
