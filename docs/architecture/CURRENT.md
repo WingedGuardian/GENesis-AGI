@@ -655,11 +655,13 @@ verified: 5808e7cd 2026-09-03
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
   → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
-  capability-promotion path (`capability_grants.detect_promotable_cells` — no
-  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
-  successes + posterior ≥0.70). That path is scoped by
-  `is_promotable_cell` — two closed sets, an allowlisted DOMAIN
-  (`PROMOTABLE_DOMAINS`, `email` only today) and a risk class that is not
+  capability-promotion path (`capability_grants.detect_promotable_cells` →
+  `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
+  posterior ≥0.70). That path is scoped by
+  `is_promotable_cell` — two closed sets, an allowlisted (DOMAIN, VERB) pair
+  (`PROMOTABLE_CELLS`, `("email", "send")` only today — keyed on the pair, not
+  the domain, so a future verb under an allowlisted domain cannot inherit
+  eligibility) and a risk class that is not
   FINANCIAL — enforced in BOTH the candidate scan and `apply_event`, which
   raises `InvalidTransition` on an `APPROVE` that fails either bar. FINANCIAL
   is the bar `RiskClass` already claimed ("never trust-unlockable") and nothing
