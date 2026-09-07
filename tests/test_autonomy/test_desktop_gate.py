@@ -774,8 +774,11 @@ async def test_a_desktop_cell_can_never_be_promoted(db):
     assert ("email", "send") in candidates  # positive control: scan is live
     assert ("desktop", "control") not in candidates
 
-    assert cg.is_promotable_cell("desktop", "standard") is False
+    assert cg.is_promotable_cell("desktop", "control", "standard") is False
     assert "desktop" not in cg.PROMOTABLE_DOMAINS
+    # The allowlist is keyed on (domain, verb), so assert the PAIR is absent —
+    # a domain-only check would still pass if someone added ("desktop", <verb>).
+    assert not any(d == "desktop" for d, _ in cg.PROMOTABLE_CELLS)
 
     # And the backstop below the scan refuses the promotion outright.
     from genesis.autonomy.capabilities import InvalidTransition

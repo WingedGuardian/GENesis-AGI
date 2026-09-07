@@ -33,24 +33,38 @@ PROMOTE_THRESHOLD = 0.70
 #: closes the low-N trap (one lucky success is not earned trust).
 MIN_PROMOTE_N = 5
 
-#: Channel-domains whose cells may reach GRANTED (standing autonomy).  An
+#: (domain, verb) pairs whose cells may reach GRANTED (standing autonomy).  An
 #: ALLOWLIST on purpose: promotion is the one transition that converts
-#: per-action approval into a standing grant, so a domain stays non-promotable
-#: until someone DECIDES otherwise in code.  A denylist would grant that
-#: conversion to every future capability by default — i.e. by being forgotten.
-#: Cells outside this set stay at ASK for their whole life: they still classify,
-#: still accumulate evidence, and still gate every single action on the owner.
-#: Deliberately not config-driven — arming a capability for standing autonomy is
-#: a reviewed code change, never a YAML edit.
-PROMOTABLE_DOMAINS: frozenset[str] = frozenset({"email"})
+#: per-action approval into a standing grant, so a capability stays
+#: non-promotable until someone DECIDES otherwise in code.  A denylist would
+#: grant that conversion to every future capability by default — i.e. by being
+#: forgotten.  Cells outside this set stay at ASK for their whole life: they
+#: still classify, still accumulate evidence, and still gate every single action
+#: on the owner.  Deliberately not config-driven — arming a capability for
+#: standing autonomy is a reviewed code change, never a YAML edit.
+#:
+#: KEYED ON (domain, verb), NOT domain alone.  A cell's identity is
+#: (domain, verb, risk_class), so a domain-only allowlist is COARSER than the
+#: invariant stated above: a new verb under an allowlisted domain — an
+#: ``email:forward`` path, say — would inherit promotion eligibility the moment
+#: it accrued five owner-approved successes, with no edit here and no tripwire
+#: firing.  Inert when this was written (``send`` was email's only verb), which
+#: is exactly why it was worth closing before a second verb made it live.
+#: Found by cross-model review of PR #1838.
+PROMOTABLE_CELLS: frozenset[tuple[str, str]] = frozenset({("email", "send")})
+
+#: Domains appearing in :data:`PROMOTABLE_CELLS`, derived rather than declared
+#: so the two can never disagree.  Read-only convenience for callers that
+#: genuinely only have a domain; the PREDICATE is the supported entry point.
+PROMOTABLE_DOMAINS: frozenset[str] = frozenset(d for d, _ in PROMOTABLE_CELLS)
 
 
-def is_promotable_cell(domain: str, risk_class: str) -> bool:
+def is_promotable_cell(domain: str, verb: str, risk_class: str) -> bool:
     """Whether this cell may EVER hold standing autonomy (GRANTED).
 
     Two independent bars, both closed sets:
 
-    * the DOMAIN must be allowlisted (above); and
+    * the (DOMAIN, VERB) pair must be allowlisted (above); and
     * the RISK CLASS must not be FINANCIAL.  ``RiskClass``'s own docstring
       calls financial "hardline — never trust-unlockable", but nothing
       enforced that: financial cells stayed out of the matrix only because
@@ -59,9 +73,14 @@ def is_promotable_cell(domain: str, risk_class: str) -> bool:
       created by any other path would have been promotable.
 
     One predicate rather than two, deliberately: a second, weaker one is
-    what a future call site reaches for by accident.
+    what a future call site reaches for by accident.  The signature takes the
+    cell's full identity for the same reason — a caller that cannot supply a
+    verb is a caller that does not know which cell it is asking about.
     """
-    return domain in PROMOTABLE_DOMAINS and risk_class != RiskClass.FINANCIAL.value
+    return (
+        (domain, verb) in PROMOTABLE_CELLS
+        and risk_class != RiskClass.FINANCIAL.value
+    )
 
 
 #: Consequence weights by risk_class (WS-8 PR-D).  A correction's damage to a
@@ -219,9 +238,18 @@ async def apply_event(
 ) -> CellState:
     """Apply a state-machine event to the cell and persist the new state.
 
-    Raises :class:`genesis.autonomy.capabilities.InvalidTransition` if the
-    event is illegal from the current state.  Sets ``granted_at`` when the
-    cell first reaches GRANTED.
+    Raises :class:`genesis.autonomy.capabilities.InvalidTransition` in TWO
+    cases, and a caller that suppresses it swallows both: an illegal
+    state/event pair, AND an ``APPROVE`` for a cell that is not promotable
+    (:func:`is_promotable_cell`).  The second is a POLICY refusal, not a
+    state-machine one — do NOT copy ``email_gate.check``'s
+    ``contextlib.suppress(InvalidTransition)`` idiom to an APPROVE call site:
+    that idiom exists to tolerate a CLASSIFY on an already-advanced cell, and
+    on APPROVE it would silently discard the promotion bar.  Normalization of
+    an unrecognised ``event`` raises the same type, deliberately, so the error
+    contract this function already documented is unchanged.
+
+    Sets ``granted_at`` when the cell first reaches GRANTED.
 
     ``origin_class`` (REQUIRED — WS-3 gate-3) is the provenance of whatever
     prompted this state change: ``owner`` for owner decisions
@@ -256,7 +284,7 @@ async def apply_event(
         # state machine's default when no cell exists.
         row = await get_cell(db, domain, verb, risk_class)
         return CellState(row["state"]) if row else CellState.NOT_DETERMINED
-    if event == CellEvent.APPROVE and not is_promotable_cell(domain, risk_class):
+    if event == CellEvent.APPROVE and not is_promotable_cell(domain, verb, risk_class):
         # (ASK, APPROVE) is the ONLY edge into GRANTED, and this is the only
         # call of transition() that can carry it — so refusing HERE is the
         # mechanism, not a convention every promotion path has to remember.
@@ -454,7 +482,7 @@ async def detect_promotable_cells(
     out: list[dict] = []
     for r in await cursor.fetchall():
         row = dict(r)
-        if not is_promotable_cell(row["domain"], row["risk_class"]):
+        if not is_promotable_cell(row["domain"], row["verb"], row["risk_class"]):
             continue  # never propose what apply_event would refuse to grant
         if row["successes"] < min_successes:
             continue
