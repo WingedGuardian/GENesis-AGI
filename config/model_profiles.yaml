@@ -209,9 +209,28 @@ profiles:
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
-    cost_tier: cheap
-    cost_per_mtok_in: 0.40
-    cost_per_mtok_out: 2.00
+    # NOT "cheap", and these are litellm's numbers rather than the vendor page's.
+    #
+    # These figures shipped as 0.40/2.00 (the pricing page for Medium 3). But the
+    # ledger does not use this row when litellm can price the model: the delegate
+    # tries `litellm.completion_cost()` FIRST and only falls back to the profile in
+    # the `except` branch. litellm has `mistral/mistral-medium-latest` at 1.50/7.50,
+    # so every recorded call would have been written at 1.50/7.50 while this file
+    # documented 0.40/2.00 — 3.75x, with no reader able to tell which was real.
+    #
+    # That is the PR #1619 defect one model over: flipping a provider to
+    # `free: false` while leaving its profile at a stale rate. The guard written
+    # after #1619 was hardcoded to `mistral-large-3`, so it could not see this.
+    # `test_paid_profiles_agree_with_the_rate_litellm_will_record` now checks EVERY
+    # paid provider against the number the ledger will actually write.
+    #
+    # Also: at 1.50/7.50 Medium is DEARER than mistral-large-3 (0.50/1.50), which is
+    # the opposite of what `cost_tier: cheap` told a reader choosing between them.
+    # (litellm's `-latest` entry appears to track Medium 3.5; the vendor page prices
+    # Medium 3 at 0.40/2.00. Recorded spend follows litellm, so this row does too.)
+    cost_tier: standard
+    cost_per_mtok_in: 1.50
+    cost_per_mtok_out: 7.50
     latency: moderate
     strengths:
       - JSON instruction following
@@ -238,9 +257,20 @@ profiles:
       # one of them.
       available: true
       provider: mistral
-      note: "Presumed free-tier; entitlement unverified as of 2026-09-05."
-    last_reviewed: "2026-09-05"
-    review_source: provider_pricing_page
+      # Two SEPARATE claims, and the note used to blur them into one. The 429
+      # settles ENTITLEMENT (the account may call this model). It settles
+      # nothing about COST. Cross-model review, 2026-09-06: this field still
+      # read "entitlement unverified as of 2026-09-05" while the comment 15
+      # lines above recorded the 09-06 probe — a third contradiction inside the
+      # very block whose comment makes keeping the two files in agreement an
+      # explicit contract.
+      note: >-
+        Entitlement VERIFIED 2026-09-06 (429 rate_limited, not 403
+        tier_not_allowed). Pricing PRESUMED — no billed cost has been read, so
+        `free: false` in model_routing.yaml is the conservative assumption, not
+        a measurement.
+    last_reviewed: "2026-09-06"
+    review_source: provider_live_probe
 
   mistral-small:
     display_name: "Mistral Small (latest)"

@@ -454,9 +454,26 @@ call_sites:
   # to groq-free, so a groq-led challenge could self-approve under a DeepSeek
   # outage. This challenge leads with the MISTRAL family (disjoint from every
   # synthesis provider — deepseek-flash / groq): Large, then Medium as the free
-  # in-family rung, then paid Kimi as the deep fallback. Medium is what keeps a
-  # dead/entitlement-blocked Large from sending EVERY challenge to paid Kimi
-  # (measured live 2026-09-05 while Large returned 403 tier_not_allowed).
+  # in-family rung, then paid Kimi as the deep fallback.
+  #
+  # WHAT MEDIUM ACTUALLY BUYS HERE — stated carefully, because the first version
+  # of this comment claimed more than the code delivers. It said Medium "keeps a
+  # dead/entitlement-blocked Large from sending EVERY challenge to paid Kimi".
+  # Cross-model review (2026-09-06) ran this site under the install's OWN
+  # measured state — Large 403 tier_not_allowed, Medium 429 rate_limited — and
+  # the challenge was served by paid kimi-k2.5 anyway. A 429 is RATE_LIMITED,
+  # which deliberately does not trip a breaker, so Medium is re-attempted on
+  # every challenge while throttled at 4 RPM shared across every chain carrying
+  # it. Medium DOES intercept when it is not throttled, so the rung earns its
+  # place — but under the throttling actually observed, falling through to paid
+  # Kimi is the common case, not the outage case.
+  #
+  # PROVENANCE, because the distinction matters for anyone re-checking this:
+  # both runs above are the REVIEWER'S HARNESS (the real Router against the real
+  # config, with the network stubbed) — NOT production traffic. A follow-up audit
+  # found `cost_events` contains no mistral row of any kind, ever, so nothing here
+  # is corroborated by the live ledger. Treat as a faithful simulation of the
+  # routing logic, not as an observation of this install in flight.
   # NIM's free Kimi was retired 2026-08 (404-for-account). Locked by
   # test_config_invariants::test_adversarial_challenge_sites_are_model_independent.
   dream_cycle_synthesis_challenge:
