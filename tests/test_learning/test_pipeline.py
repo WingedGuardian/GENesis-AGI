@@ -511,10 +511,11 @@ class TestSteeringWriteOwnerGate:
     STEERING.md is a user-sovereign identity file every session reads, so a rule
     in it must be OWNER-authored. Procedure extraction also admits Genesis's own
     cognition (reflection, surplus) because a procedure from Genesis's own work
-    is legitimate; Genesis authoring the USER's identity file is not. That is
-    why the two gates share `_OWNER_CHANNELS` but are not the same predicate --
-    `test_steering_set_is_owner_only_and_narrower` pins the difference (it is
-    the one that fails if the two predicates are collapsed).
+    is legitimate; Genesis authoring the USER's identity file is not. So the
+    steering gate is a STRICT SUBSET of both `_OWNER_CHANNELS` and the
+    extraction set -- the two are derived independently, from different
+    predicates, and `test_steering_set_is_owner_attended_only_and_narrower`
+    pins the difference (it is the one that fails if they are collapsed).
     """
 
     DIRECTIVE = "never run that command without asking"
@@ -566,6 +567,26 @@ class TestSteeringWriteOwnerGate:
         loader.add_steering_rule.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_web_does_not_write_steering(self, db, monkeypatch):
+        """The live OpenClaw path, and the one this gate exists to stop.
+
+        `web` carries whatever the HTTP caller sent as user_text, and unlike
+        `voice` or `reflection` it is NOT in `_AUTONOMOUS_CHANNELS` — so the
+        §6.6 deny-list does not stop it and `_STEERING_CHANNELS` is the ONLY
+        thing between an HTTP caller and the user's identity file. Single-
+        guarded, which makes this the strongest test in the class: it fails
+        the moment the gate widens back to `_OWNER_CHANNELS`.
+
+        The second assertion pins the deliberate asymmetry — the same
+        interaction still reaches procedure extraction.
+        """
+        loader = MagicMock()
+        pipeline, called = self._build(db, loader, monkeypatch)
+        await pipeline(FakeCCOutput(), self.DIRECTIVE, "web")
+        loader.add_steering_rule.assert_not_called()
+        assert called["n"] == 1
+
+    @pytest.mark.asyncio
     async def test_unlisted_channel_does_not_write_steering(self, db, monkeypatch):
         """Fail-closed: a channel nobody enumerated cannot write the user's
         identity file. The old deny-list admitted every such channel."""
@@ -603,8 +624,9 @@ class TestSteeringWriteOwnerGate:
         test is double-guarded and would still pass if the two predicates were
         collapsed (MEASURED: setting
         `_STEERING_CHANNELS = _PROCEDURE_EXTRACTION_CHANNELS` leaves it green).
-        `test_steering_set_is_owner_only_and_narrower` is what catches that
-        collapse.
+        `test_web_does_not_write_steering` is the single-guarded twin, and
+        `test_steering_set_is_owner_attended_only_and_narrower` is what catches
+        the collapse.
         """
         loader = MagicMock()
         pipeline, called = self._build(db, loader, monkeypatch)
@@ -612,19 +634,59 @@ class TestSteeringWriteOwnerGate:
         loader.add_steering_rule.assert_not_called()
         assert called["n"] == 1
 
-    def test_steering_set_is_owner_only_and_narrower(self):
-        """Pinned literally, and pinned as a STRICT subset of the extraction set."""
+    def test_steering_set_is_owner_attended_only_and_narrower(self):
+        """Pinned literally, and pinned as a STRICT subset of the extraction set.
+
+        The steering gate derives from `cc.types.is_owner_attended_channel`
+        (terminal + telegram), NOT from `_CHANNEL_ORIGIN`'s owner map, which also
+        marks `web` and `whatsapp` owner. That gap is the point: every OpenClaw
+        HTTP completion arrives on `web` carrying caller-supplied user_text, and
+        that must not reach a user-sovereign identity file. The literal pin below
+        is what fails if someone widens this gate back to `_OWNER_CHANNELS`.
+        """
         from genesis.learning.pipeline import (
             _OWNER_CHANNELS,
             _PROCEDURE_EXTRACTION_CHANNELS,
             _STEERING_CHANNELS,
         )
 
-        assert _STEERING_CHANNELS == _OWNER_CHANNELS
-        assert frozenset({"terminal", "telegram", "whatsapp", "web"}) == _STEERING_CHANNELS
+        assert frozenset({"terminal", "telegram"}) == _STEERING_CHANNELS
         assert _STEERING_CHANNELS < _PROCEDURE_EXTRACTION_CHANNELS
+        assert _STEERING_CHANNELS < _OWNER_CHANNELS
+        # web/whatsapp reach procedure extraction but NOT the identity file.
+        for gateway in ("web", "whatsapp"):
+            assert gateway in _PROCEDURE_EXTRACTION_CHANNELS
+            assert gateway not in _STEERING_CHANNELS
         for excluded in ("voice", "reflection", "surplus", "inbox", "mail", "new_channel"):
             assert excluded not in _STEERING_CHANNELS
+        # NOT asserted here: `all(is_owner_attended_channel(c) for c in
+        # _STEERING_CHANNELS)`. Every member of the literal above satisfies the
+        # predicate BY CONSTRUCTION, so that loop passes identically against a
+        # hardcoded set — it reads like a derivation test and tests nothing.
+        # test_steering_set_tracks_the_predicate_not_a_copy is the real one.
+
+    def test_steering_set_tracks_the_predicate_not_a_copy(self, monkeypatch):
+        """Reload with the predicate NARROWED: a copied literal survives, a
+        derivation does not.
+
+        This is the assertion the design rests on — that the gate DERIVES from
+        `is_owner_attended_channel` rather than duplicating its membership — and
+        it is the one a literal-set pin cannot make.
+        """
+        import importlib
+
+        import genesis.cc.types as cc_types
+        import genesis.learning.pipeline as pipeline_mod
+
+        monkeypatch.setattr(
+            cc_types, "is_owner_attended_channel", lambda ch: str(ch or "") == "terminal"
+        )
+        try:
+            reloaded = importlib.reload(pipeline_mod)
+            assert frozenset({"terminal"}) == reloaded._STEERING_CHANNELS
+        finally:
+            monkeypatch.undo()
+            importlib.reload(pipeline_mod)
 
 
 class TestProcedureExtractionChannelAllowList:

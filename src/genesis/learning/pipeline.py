@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable, Coroutine
 from typing import Any
 
+from genesis.cc.types import is_owner_attended_channel
 from genesis.learning.classification.attribution import route_learning_signals
 from genesis.learning.classification.delta import DeltaAssessor
 from genesis.learning.classification.outcome import OutcomeClassifier
@@ -77,13 +78,43 @@ _OWNER_CHANNELS = frozenset(
 _PROCEDURE_EXTRACTION_CHANNELS = _OWNER_CHANNELS | _SELF_COGNITION_CHANNELS
 
 # Channels that may write a STEERING.md rule. DELIBERATELY NARROWER than
-# _PROCEDURE_EXTRACTION_CHANNELS, and the difference is the load-bearing part:
-# both gates share _OWNER_CHANNELS, but only extraction also admits Genesis's
-# own cognition. A procedure derived from Genesis's own work is legitimate;
-# Genesis authoring the USER's identity file is not -- STEERING.md is
-# user-sovereign and every session reads it. Do NOT "simplify" these into one
-# predicate: doing so grants Genesis exactly that authorship.
-_STEERING_CHANNELS = _OWNER_CHANNELS
+# _PROCEDURE_EXTRACTION_CHANNELS, and the difference is the load-bearing part.
+# Two independent reasons for the gap, and neither survives collapsing them:
+#
+#   * Extraction also admits Genesis's own cognition (reflection/surplus). A
+#     procedure derived from Genesis's own work is legitimate institutional
+#     knowledge; Genesis authoring the USER's identity file is not.
+#   * Extraction admits the whole `_CHANNEL_ORIGIN` owner map; this gate takes
+#     the STRICTER `cc.types.is_owner_attended_channel`, which counts only
+#     terminal + telegram. Its docstring calls itself "the one predicate for
+#     owner-vs-gateway trust at the conversation boundary", and both
+#     task_detected_origin and the CC `supervised` flag already derive from it
+#     -- so deriving here too is what stops a THIRD notion of owner-trust
+#     existing next to those two. The practical difference is `web`: every
+#     OpenClaw HTTP completion arrives on it and its user_text is whatever the
+#     caller sent, which is not a thing that may write the user's identity file.
+#
+# Derived by CALLING the predicate, never by copying its channel set -- but be
+# precise about what that buys, because the obvious stronger claim is false: the
+# gate tracks a NARROWING of the predicate automatically, and tracks a widening
+# only for channels `_CHANNEL_ORIGIN` already classifies. A predicate widened to
+# some channel nobody has classified does NOT reach here. That lag is safe by
+# direction (narrower, never wider), not automatic, and the literal pin in
+# test_steering_set_is_owner_attended_only_and_narrower is what makes drift in
+# EITHER direction fail loudly.
+#
+# The universe is `_CHANNEL_ORIGIN` -- every channel anyone has classified --
+# and deliberately NOT `_PROCEDURE_EXTRACTION_CHANNELS`. Deriving one gate from
+# the other reads a set whose stated purpose is a different question, and makes
+# "steering is a strict subset of extraction" true by construction (A ∩ B ⊂ B)
+# rather than a claim worth asserting. Two independent derivations, one real
+# assertion between them.
+#
+# Do NOT "simplify" the two gates into one: doing so either grants Genesis
+# authorship of STEERING.md or strips reflection/surplus of procedure extraction.
+_STEERING_CHANNELS = frozenset(
+    channel for channel in _CHANNEL_ORIGIN if is_owner_attended_channel(channel)
+)
 
 
 # A STEERING.md rule must READ as a terse imperative directive addressed to
@@ -403,8 +434,19 @@ def build_triage_pipeline(
             # shadow row below fires on a WRITE, and a refused attempt never
             # reaches one — so without this line a channel repeatedly trying to
             # author the user's identity file would be entirely invisible.
-            logger.warning(
-                "Steering write REFUSED: channel %r is not owner-authored "
+            #
+            # But SEVERITY is split, because the steady state matters more than
+            # the sentence above. `web` is live — every OpenClaw completion
+            # arrives on it — and the §6.6 deny-list does not stop it, so every
+            # OpenClaw approach_failure reaches this line BY DESIGN. Logging
+            # that at WARNING would make the warning routine, which is exactly
+            # how a signal written to read as an attack stops being read. A
+            # channel `_CHANNEL_ORIGIN` has classified is expected here; one
+            # nobody enumerated is the case this was written for.
+            expected = summary.channel in _CHANNEL_ORIGIN
+            logger.log(
+                logging.INFO if expected else logging.WARNING,
+                "Steering write refused: channel %r is not owner-attended "
                 "(_STEERING_CHANNELS). STEERING.md is user-sovereign.",
                 summary.channel,
             )
