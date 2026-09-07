@@ -27,6 +27,7 @@ from genesis.db.crud import capability_grants as cg
 from genesis.db.schema import create_all_tables
 
 _SESSION = "sess-abc"
+_WINDOW = "Notepad"
 _TS = "2026-06-21T00:00:00+00:00"
 
 
@@ -57,6 +58,18 @@ def shadow(monkeypatch):
     monkeypatch.setattr(dg, "action_ttl_seconds", lambda: 30)
 
 
+async def _check(db, **kw):
+    """``check()`` with the fixture's session and window filled in.
+
+    The grant is per WINDOW. A test that does not care which window it is
+    acting in must still act inside the GRANTED one — otherwise it silently
+    measures the window bar instead of the thing its name claims.
+    """
+    kw.setdefault("session_id", _SESSION)
+    kw.setdefault("window_title", _WINDOW)
+    return await _gate(db).check(**kw)
+
+
 def _gate(db):
     return DesktopTakeoverGate(db=db, approval_manager=ApprovalManager(db=db), event_bus=None)
 
@@ -66,7 +79,7 @@ async def _grant(
     *,
     session_id: str = _SESSION,
     resolved_by: str = "telegram:button:1",
-    window_title: str = "Notepad",
+    window_title: str = _WINDOW,
 ) -> str:
     """Create and resolve a session grant the way the PR-3 consent path will."""
     import json
@@ -95,7 +108,7 @@ async def test_standard_action_under_a_live_grant_is_allowed(db, live):
     """Without this, every refusal below could be a check with no live path
     to refuse — the failure mode this whole file is organised around."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Notepad",
         element_name="Text Area",
@@ -119,7 +132,7 @@ async def test_standard_action_under_a_live_grant_is_allowed(db, live):
 async def test_unarmed_refuses_and_queues_nothing(db, monkeypatch):
     monkeypatch.setattr(dg, "effective_mode", lambda: "off")
     await _grant(db)
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "not_armed"
     # An unarmed capability must not put work in front of the owner.
@@ -129,7 +142,7 @@ async def test_unarmed_refuses_and_queues_nothing(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_shadow_refuses_but_reports_what_live_would_do(db, shadow):
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Notepad",
         element_name="Text Area",
@@ -146,7 +159,7 @@ async def test_shadow_refuses_but_reports_what_live_would_do(db, shadow):
 async def test_shadow_still_records_the_cell(db, shadow):
     """The observation IS the cell — without it shadow mode watches nothing."""
     await _grant(db)
-    await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    await _check(db, session_id=_SESSION, element_name="Text Area")
     assert await cg.get_cell(db, "desktop", "control", "standard") is not None
 
 
@@ -156,7 +169,7 @@ async def test_shadow_observes_the_state_a_shadow_INSTALL_is_actually_in(db, sha
     for a capability that cannot act. An observer that only reports on sessions
     already holding a grant therefore observes nothing at all, which is the
     opposite of what config/desktop_takeover.yaml promises."""
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION, window_title="Notepad", element_name="Text Area"
     )
     assert decision.reason == "shadow"
@@ -172,7 +185,7 @@ async def test_shadow_observes_the_state_a_shadow_INSTALL_is_actually_in(db, sha
 async def test_no_grant_refuses_and_writes_nothing(db, live):
     """An unauthorized caller must not be able to make the gate record
     anything on its behalf — no cell, no approval row."""
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "no_session_grant"
     assert await cg.get_cell(db, "desktop", "control", "standard") is None
@@ -182,7 +195,7 @@ async def test_no_grant_refuses_and_writes_nothing(db, live):
 @pytest.mark.asyncio
 async def test_a_grant_for_another_session_does_not_authorise(db, live):
     await _grant(db, session_id="some-other-session")
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "no_session_grant"
 
@@ -192,7 +205,7 @@ async def test_genesis_self_approval_does_not_authorise(db, live):
     """`genesis:*` classifies as SYSTEM. Genesis approving itself into the
     operator's keyboard is the exact hole this bar exists to close."""
     await _grant(db, resolved_by="genesis:desktop-takeover")
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_not_human"
 
@@ -202,7 +215,7 @@ async def test_unknown_resolver_does_not_authorise(db, live):
     """An unrecognised resolved_by is `unknown`, not `human` — the safe read
     of a writer nobody registered is 'not proven to be a person'."""
     await _grant(db, resolved_by="mystery_channel")
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_not_human"
 
@@ -212,7 +225,7 @@ async def test_consumed_grant_does_not_authorise(db, live):
     """Consumption is how a session's grant is retired at teardown."""
     rid = await _grant(db)
     assert await ar.mark_consumed(db, rid, consumed_at=_TS) is True
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "no_session_grant"
 
@@ -225,7 +238,7 @@ async def test_expired_grant_does_not_authorise(db, live):
     stale = (datetime.now(UTC) - timedelta(minutes=31)).isoformat()
     await db.execute("UPDATE approval_requests SET resolved_at = ? WHERE id = ?", (stale, rid))
     await db.commit()
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_expired"
 
@@ -240,7 +253,7 @@ async def test_unageable_grant_does_not_authorise(db, live):
         (rid,),
     )
     await db.commit()
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_expired"
 
@@ -251,7 +264,7 @@ async def test_a_system_row_does_not_hide_a_valid_human_grant(db, live):
     system-resolved row cannot mask the owner's real approval underneath."""
     await _grant(db, resolved_by="telegram:button:1")
     await _grant(db, resolved_by="genesis:desktop-takeover")
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is True
 
 
@@ -261,8 +274,8 @@ async def test_approving_one_held_action_does_not_grant_the_session(db, live):
     so without the `kind` predicate an approved hold satisfies the grant
     lookup: the owner consents to one click and hands over the whole session,
     with a fresh TTL. MEASURED as allow=True before the fix."""
-    rid = await _grant(db)
-    held = await _gate(db).check(
+    rid = await _grant(db, window_title="Mail")
+    held = await _check(db,
         session_id=_SESSION,
         window_title="Mail",
         element_name="Send",
@@ -272,7 +285,8 @@ async def test_approving_one_held_action_does_not_grant_the_session(db, live):
 
     # Retire the real grant so the held row is the only candidate left.
     await ar.mark_consumed(db, rid, consumed_at=datetime.now(UTC).isoformat())
-    stranded = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    stranded = await _check(db, session_id=_SESSION, window_title="Mail",
+                            element_name="Text Area")
     assert stranded.reason == "no_session_grant"
 
     # The owner approves that ONE held action, through an allowlisted channel.
@@ -280,9 +294,9 @@ async def test_approving_one_held_action_does_not_grant_the_session(db, live):
         held.request_id, status="approved", resolved_by="telegram:button:2"
     )
 
-    after = await _gate(db).check(
+    after = await _check(db,
         session_id=_SESSION,
-        window_title="Notepad",
+        window_title="Mail",
         element_name="Text Area",
         control_type="Edit",
     )
@@ -297,7 +311,7 @@ async def test_a_dashboard_resolution_does_not_mint_a_grant(db, live):
     local process holding the internal bearer token, so it cannot tell the
     owner from Genesis."""
     await _grant(db, resolved_by="dashboard")
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_not_human"
 
@@ -307,7 +321,7 @@ async def test_the_default_user_resolver_does_not_mint_a_grant(db, live):
     """`ApprovalManager.resolve`'s default is `resolved_by="user"`, which
     classifies as human. One forgotten kwarg must not be a desktop grant."""
     await _grant(db, resolved_by="user")
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_not_human"
 
@@ -331,9 +345,67 @@ async def test_a_future_dated_grant_does_not_authorise(db, live):
         "UPDATE approval_requests SET resolved_at = ? WHERE id = ?", (ahead, rid)
     )
     await db.commit()
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "grant_expired"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_for_one_window_does_not_authorise_another(db, live):
+    """The grant NAMES a window and the consent card reads it back to the
+    operator, so an uncompared field would be a promise the card makes and the
+    code does not keep. Found by review: `window_title` was carried and
+    displayed but never compared, so a grant for a text editor authorised
+    actions in an unrelated chat or banking window."""
+    await _grant(db, window_title="Notepad")
+
+    same = await _check(db, window_title="Notepad", element_name="Text Area",
+                        control_type="Edit")
+    assert same.allow is True, "positive control: the granted window still works"
+
+    for other in ("Slack - #general", "Online Banking", "A Different App"):
+        d = await _check(db, window_title=other, element_name="Text Area",
+                         control_type="Edit")
+        assert d.allow is False, other
+        assert d.reason == "grant_window_mismatch", other
+
+
+@pytest.mark.asyncio
+async def test_window_matching_ignores_case_and_surrounding_whitespace(db, live):
+    """Normalisation, and nothing more. Two titles that differ only in case or
+    padding are the same window; anything else is not."""
+    await _grant(db, window_title="Notepad")
+    d = await _check(db, window_title="  notepad  ", element_name="Text Area",
+                     control_type="Edit")
+    assert d.allow is True
+
+
+@pytest.mark.asyncio
+async def test_an_empty_window_is_a_refusal_not_a_wildcard(db, live):
+    """The rule the device already applies to a target it cannot resolve: an
+    absent target is no grant, never every grant."""
+    await _grant(db, window_title="Notepad")
+    d = await _check(db, window_title="", element_name="Text Area")
+    assert d.allow is False
+    assert d.reason == "grant_window_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_naming_no_window_authorises_nothing(db, live):
+    """A grant with no window is not a narrower grant; it is an unbounded one.
+    Reachable via a hand-written row or an older wire format, so it is refused
+    rather than trusted."""
+    import json
+
+    rid = await _grant(db, window_title="Notepad")
+    await db.execute(
+        "UPDATE approval_requests SET context = ? WHERE id = ?",
+        (json.dumps({"kind": dg.SESSION_GRANT_KIND, "session_id": _SESSION}), rid),
+    )
+    await db.commit()
+    d = await _check(db, window_title="Notepad", element_name="Text Area")
+    assert d.allow is False
+    assert d.reason == "grant_window_mismatch"
 
 
 @pytest.mark.asyncio
@@ -353,7 +425,7 @@ async def test_a_pending_request_is_not_a_grant(db, live):
         ),
         timeout_seconds=None,
     )
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "no_session_grant"
 
@@ -366,7 +438,7 @@ async def test_password_field_refuses_rather_than_holds(db, live):
     """There is no approval that makes this acceptable, so the gate must not
     offer the owner a button that says otherwise."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Login",
         element_name="Pwd",
@@ -387,7 +459,7 @@ async def test_password_named_target_refuses_without_the_flag(db, live):
     """Custom controls routinely do not expose IsPassword. The name of the
     resolved target is a second, independent bar."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Bank",
         element_name="Passphrase",
@@ -408,8 +480,8 @@ async def test_a_password_word_in_the_window_title_is_not_a_password_target(db, 
     'Sign in to your account', where `sign` made the outcome a hold regardless —
     so it passed whether or not the matcher was scoped to the target, and could
     not fail for the invariant it named."""
-    await _grant(db)
-    decision = await _gate(db).check(
+    await _grant(db, window_title="Password Manager")
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Password Manager",
         element_name="Search",
@@ -425,7 +497,7 @@ async def test_typing_an_identity_word_is_not_an_identity_action(db, live):
     identity act; typing the word is not — and a gate that holds the most
     ordinary desktop action there is teaches people to wave it through."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Notepad",
         element_name="Text Area",
@@ -441,7 +513,7 @@ async def test_typed_card_details_still_classify_financial(db, live):
     """The exception that proves the rule above: money is dangerous as CONTENT,
     so FINANCIAL — and only FINANCIAL — still reads the typed text."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Notepad",
         element_name="Text Area",
@@ -459,8 +531,8 @@ async def test_typed_card_details_still_classify_financial(db, live):
 async def test_identity_action_holds_under_a_live_grant(db, live):
     """Session consent covers ordinary input. Acting in the operator's name is
     its own decision, every time."""
-    await _grant(db)
-    decision = await _gate(db).check(
+    await _grant(db, window_title="Mail")
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Mail",
         element_name="Send",
@@ -474,8 +546,8 @@ async def test_identity_action_holds_under_a_live_grant(db, live):
 
 @pytest.mark.asyncio
 async def test_financial_action_holds_under_a_live_grant(db, live):
-    await _grant(db)
-    decision = await _gate(db).check(
+    await _grant(db, window_title="Bank")
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Bank",
         element_name="Confirm payment",
@@ -490,8 +562,8 @@ async def test_financial_action_holds_under_a_live_grant(db, live):
 async def test_a_hold_queues_nothing_resumable(db, live):
     """No pending-action table and no drain: approving the row does not replay
     the action, because by then the screen it targeted has moved."""
-    await _grant(db)
-    decision = await _gate(db).check(
+    await _grant(db, window_title="Mail")
+    decision = await _check(db,
         session_id=_SESSION,
         window_title="Mail",
         element_name="Send",
@@ -514,10 +586,11 @@ async def test_screen_text_cannot_forge_lines_in_the_approval_the_owner_reads(db
     deciding. Newlines could forge extra lines in a rendered card, bidi
     overrides could reorder what is displayed away from what is approved, and
     zero-width characters could conceal either."""
-    await _grant(db)
-    decision = await _gate(db).check(
+    hostile = "Mail\n\nAPPROVED: routine\u202egnihtemos esle"
+    await _grant(db, window_title=hostile)
+    decision = await _check(db,
         session_id=_SESSION,
-        window_title="Mail\n\nAPPROVED: routine\u202egnihtemos esle",
+        window_title=hostile,
         element_name="Send\u200b\u200b",
         control_type="Button",
     )
@@ -534,9 +607,9 @@ async def test_a_hostile_window_title_cannot_flood_the_approval_row(db, live):
     the row's context, so nothing is lost."""
     import json
 
-    await _grant(db)
     huge = "A" * 5000
-    decision = await _gate(db).check(
+    await _grant(db, window_title=huge)
+    decision = await _check(db,
         session_id=_SESSION, window_title=huge, element_name="Send",
         control_type="Button",
     )
@@ -561,7 +634,7 @@ async def test_a_malformed_context_row_does_not_break_the_grant_lookup(db, live)
             (rid, atype),
         )
     await db.commit()
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is True
 
 
@@ -574,7 +647,7 @@ async def test_a_typed_card_number_classifies_financial_by_SHAPE(db, live):
     patterns were all label-shaped: a real card number typed into a field
     labelled "Confirmation" matched nothing and passed as STANDARD."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION, window_title="Notepad", element_name="Confirmation",
         control_type="Edit", text="4111 1111 1111 1111",
     )
@@ -586,11 +659,35 @@ async def test_a_typed_card_number_classifies_financial_by_SHAPE(db, live):
 async def test_an_ordinary_number_is_not_financial(db, live):
     """The other direction: fail-closed must not mean every digit holds."""
     await _grant(db)
-    decision = await _gate(db).check(
+    decision = await _check(db,
         session_id=_SESSION, window_title="Notepad", element_name="Text Area",
         control_type="Edit", text="the meeting is at 3pm in room 214",
     )
     assert decision.allow is True
+
+
+@pytest.mark.parametrize(
+    "name", ["Create account", "New account", "Sign up", "Register"]
+)
+def test_account_creation_crosses_the_identity_bar(name):
+    """Creating an account acts in the operator's name as much as sending does.
+    It was previously held only by accident — when the button happened to read
+    "Submit" or "Sign up" — which is exactly the region the classifier claims
+    to cover."""
+    from genesis.autonomy.classification import classify_desktop_action
+
+    c = classify_desktop_action(element_name=name, control_type="Button")
+    assert str(c.risk_class) == "identity", name
+
+
+@pytest.mark.parametrize("name", ["Create folder", "New document", "New tab"])
+def test_ordinary_create_actions_are_not_identity(name):
+    """The positive control: "create" alone must not cross the bar, or every
+    file operation holds and the gate teaches people to wave it through."""
+    from genesis.autonomy.classification import classify_desktop_action
+
+    c = classify_desktop_action(element_name=name, control_type="Button")
+    assert str(c.risk_class) == "standard", name
 
 
 @pytest.mark.parametrize(
@@ -641,7 +738,7 @@ async def test_denied_permanent_cell_outranks_a_live_grant(db, live):
         updated_at=now,
         origin_class="owner",
     )
-    decision = await _gate(db).check(session_id=_SESSION, element_name="Text Area")
+    decision = await _check(db, session_id=_SESSION, element_name="Text Area")
     assert decision.allow is False
     assert decision.reason == "denied_permanent"
 

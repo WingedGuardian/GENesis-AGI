@@ -241,9 +241,10 @@ class DesktopTakeoverGate:
         """Allow, hold or refuse one desktop input action.
 
         The order below is the design, not an accident. Cheap total refusals
-        come first; the first DB WRITE happens only after the session grant has
-        been verified, so an unauthorized caller cannot make the gate record
-        anything on its behalf. Classification is pure and therefore runs early,
+        come first; in LIVE mode the first DB WRITE happens only after the
+        session grant has been verified, so an unauthorized caller cannot make
+        the gate record anything on its behalf. Shadow deliberately writes the
+        cell either way — observing is its whole job, and it can never act. Classification is pure and therefore runs early,
         so a refusal names the real reason instead of the first tripwire.
         """
         now = datetime.now(UTC)
@@ -280,7 +281,9 @@ class DesktopTakeoverGate:
         # 4. Session consent. Looked up in BOTH modes: shadow's whole job is
         #    to report what live would have decided, and "would it have had a
         #    grant?" is most of that answer.
-        grant, grant_reason = await self._live_session_grant(session_id, now)
+        grant, grant_reason = await self._live_session_grant(
+            session_id, window_title, now
+        )
 
         # 5. Shadow observes and refuses. It records the cell and logs the full
         #    verdict — including a missing grant, which is the state a shadow
@@ -395,15 +398,27 @@ class DesktopTakeoverGate:
         cell = await cg.get_cell(self._db, domain, verb, risk)
         return CellState(cell["state"]) if cell else CellState.ASK
 
-    async def _live_session_grant(self, session_id: str, now: datetime) -> tuple[dict | None, str]:
-        """The owner's live grant for this session, or ``(None, reason)``.
+    async def _live_session_grant(
+        self, session_id: str, window_title: str, now: datetime
+    ) -> tuple[dict | None, str]:
+        """The owner's live grant for this session AND window, or ``(None, reason)``.
 
-        Four independent bars, each of which has to hold:
+        Six independent bars, each of which has to hold. Every one exists
+        because its absence was a defect found in review, not because it seemed
+        prudent:
 
+        - **this session** — the grant carries the session id and is filtered on
+          it in SQL, so one session's consent is never another's;
         - **a GRANT, not a hold** — both are rows of the same action_type, so
           ``kind`` is what separates "consented to this session" from "approved
-          one click". Without it, approving a single held action silently
-          becomes a full session grant;
+          one click". Without it, approving a single held action silently became
+          a full session grant with a fresh expiry;
+        - **this WINDOW** — the grant names the target window the owner was
+          shown, and the action must be in it. Carrying that name without
+          comparing it is worse than not carrying it: the consent card reads the
+          window back to the operator, so an uncompared field is a promise the
+          card makes and the code does not keep. MEASURED before this bar
+          existed — a grant for one window authorised actions in any other;
         - **approved and unconsumed** — consumption is how a session's grant is
           retired, so a consumed row is a finished session, not a live one;
         - **resolved through an allowlisted channel** —
@@ -415,6 +430,11 @@ class DesktopTakeoverGate:
           configured TTL and not in the future. A grant nobody remembers giving
           must lapse without needing a teardown to run, and a backwards clock
           step must not mint a permanent one.
+
+        The refusal reason names the FIRST bar that failed rather than a generic
+        denial, because the owner-facing difference between "you never granted
+        this" and "that grant was for a different window" is the whole point of
+        asking per window.
         """
         rows = await ar.list_approved_unconsumed_for_session(
             self._db,
@@ -429,12 +449,25 @@ class DesktopTakeoverGate:
             return None, "no_session_grant"
 
         ttl = timedelta(minutes=grant_ttl_minutes())
-        saw_human = False
+        target = _window_key(window_title)
+        saw_allowlisted = False
+        saw_this_window = False
+
         for row in rows:
             resolved_by = str(row.get("resolved_by") or "")
             if not resolved_by.startswith(DESKTOP_GRANT_RESOLVER_PREFIXES):
                 continue
-            saw_human = True
+            saw_allowlisted = True
+
+            granted = _window_key(_grant_window(row))
+            # An absent or empty window on EITHER side is a refusal, never a
+            # wildcard — the rule the device already applies to a target it
+            # cannot resolve. A grant naming no window is not a narrower grant;
+            # it is an unbounded one.
+            if not granted or not target or granted != target:
+                continue
+            saw_this_window = True
+
             resolved_at = _parse_ts(row.get("resolved_at"))
             if resolved_at is None:
                 # An approved row with an unreadable resolution time cannot be
@@ -445,13 +478,19 @@ class DesktopTakeoverGate:
                     row.get("resolved_at"),
                 )
                 continue
+
             age = now - resolved_at
             # Bounded on BOTH sides. A future-dated resolution gives a negative
             # age, which `age <= ttl` alone accepts forever — a backwards clock
             # step or a hand-edited row would mint a permanent grant.
             if timedelta(0) <= age <= ttl:
                 return row, "session_grant"
-        return None, "grant_expired" if saw_human else "grant_not_human"
+
+        if not saw_allowlisted:
+            return None, "grant_not_human"
+        if not saw_this_window:
+            return None, "grant_window_mismatch"
+        return None, "grant_expired"
 
     async def _hold(
         self,
@@ -557,6 +596,36 @@ class DesktopTakeoverGate:
             )
         except Exception:
             logger.error("Failed to emit autonomy.gate_held", exc_info=True)
+
+
+def _grant_window(row: dict) -> str:
+    """The window title a grant row was issued for, or "" if unreadable.
+
+    The SQL predicate already guards `json_valid`, but a row can be valid JSON
+    and still lack the key (a hand-written row, an older wire format), so an
+    unreadable window resolves to "" — which the caller treats as a refusal
+    rather than a wildcard.
+    """
+    try:
+        ctx = json.loads(row.get("context") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(ctx.get("window_title") or "") if isinstance(ctx, dict) else ""
+
+
+def _window_key(value: object) -> str:
+    """Comparison key for a window title.
+
+    Case- and whitespace-insensitive, and nothing more. Window titles are not
+    stable identifiers — a document name changes the title of the same window —
+    so this is a STRICT bar by choice: a title that drifts refuses, and the loop
+    re-asks against the window the operator can actually see named. The safe
+    direction for a boundary the classifier falls back on is to refuse and
+    re-ask, not to guess that two different titles mean the same window.
+    A stable window identity (a handle carried from the resolve step) is the
+    right long-term fix and belongs with the loop that resolves it.
+    """
+    return " ".join(str(value or "").split()).casefold()
 
 
 def _parse_ts(raw: object) -> datetime | None:

@@ -475,7 +475,12 @@ _IDENTITY_DESKTOP_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r"\b(?:send|post|publish|submit|reply|reply\s+all|forward|tweet|"
         r"delete|discard|purchase|buy|confirm|accept|sign|share|install|"
-        r"uninstall|format|shut\s*down|restart)\b",
+        r"uninstall|format|shut\s*down|restart|"
+        # Account creation acts in the operator's name as much as a send does,
+        # and was previously held only by accident — when the button happened
+        # to read "Submit" or "Sign up". "Create" alone is deliberately NOT
+        # here: it matches "Create folder"/"New document", which are ordinary.
+        r"create\s+account|new\s+account|sign\s*up|register)\b",
         re.IGNORECASE,
     ),
 ]
