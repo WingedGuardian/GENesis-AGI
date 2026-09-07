@@ -54,6 +54,13 @@ _nx_graph: object | None = None  # nx.MultiDiGraph when _NX_AVAILABLE
 _nx_dirty: bool = True
 
 
+class GraphUnavailableError(RuntimeError):
+    """The graph backend cannot answer AT ALL (missing library, unreachable
+    store) — as distinct from answering "empty". Decision-tier readers
+    (dream-centrality → the importance shield) treat these opposite ways:
+    empty supersedes their cache, unavailable must LEAVE it alone."""
+
+
 def invalidate_graph_cache() -> None:
     """Mark the in-memory graph as stale.
 
@@ -268,7 +275,8 @@ async def centrality_scores(
     """Return memories ranked by betweenness centrality.
 
     Identifies memories that are "bridges" between clusters of knowledge.
-    Requires NetworkX; returns empty list if unavailable.
+    Requires NetworkX; raises GraphUnavailableError if the backend cannot
+    answer (an EMPTY graph still returns [] — zero nodes means zero bridges).
 
     ``top_n`` caps the returned slice; ``top_n=None`` returns EVERY scored
     node (the full ranking). Betweenness is computed over all nodes regardless
@@ -276,7 +284,16 @@ async def centrality_scores(
     just a longer list.
     """
     if not _NX_AVAILABLE:
-        return []
+        # "The store is unreachable" and "no bridges exist" are DIFFERENT
+        # answers, and returning [] for both let the first masquerade as the
+        # second: the dream-centrality consumer reads an empty result as "no
+        # bridges", wipes centrality_cache, and the importance shield then
+        # computes no threshold — bridge-node protection silently disappears
+        # because a library failed to import. A decision-tier consumer must
+        # never degrade silently (issue #1641 / the graph-store seam contract),
+        # so unavailability RAISES; an empty graph still returns [] below,
+        # because zero nodes genuinely means zero bridges.
+        raise GraphUnavailableError("NetworkX is not importable — centrality cannot be computed")
 
     G = await _ensure_graph(db)
     if G.number_of_nodes() == 0:

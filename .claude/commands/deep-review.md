@@ -51,6 +51,20 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 > clear"; and **hand-rolled CLI / `gh` / bash / argv parsing** — flag that as an ARCHITECTURAL
 > defect and recommend atomic binding + fail-closed-on-unparseable, NOT case-by-case patches
 > (it is the root of the Codex review loop).
+>
+> ENUMERATE THE POPULATION BEFORE JUDGING IT. Name the call sites, consumers, states, branches
+> or axes the change touches, THEN say which you examined. Findings are a sample drawn from
+> that population; without it you cannot tell whether you sampled 3 of 3 or 3 of 9, and the
+> next round's "new" defect is usually the member nobody listed.
+>
+> REPORT WHERE YOU FOUND NOTHING, as explicitly as what you found. A bare findings list cannot
+> distinguish a CLEAN area from an UNEXAMINED one, so it silently reads as full coverage — and
+> the reader cannot audit a gap they cannot see. "I looked hard at X and found nothing" is a
+> first-class result; state it per area, not as a closing reassurance.
+>
+> Where a claim is load-bearing, RUN something rather than reasoning about it, and say what you
+> ran and observed. Prefer a reading over an argument — including about the review's own
+> instruments, whose output can be wrong in the flattering direction.
 
 ## 3. Triage → stage the class-level fix (don't commit yet)
 
@@ -59,6 +73,23 @@ When you fix, fix the mechanism/class — a per-instance patch is what spawns th
 round. `git add` the fix, but do NOT commit yet — the commit is the last step, after the marker.
 If you're on your 3rd EXTERNAL cross-model defect-bearing round, STOP at the escalation cap
 (see SKILL.md) — internal self/subagent audits like this one never count toward it.
+
+**A fix is not done until you have enumerated the CLASS'S OTHER MEMBERS and said what you
+found there.** The reviewer named the instance it happened to reach; the same defect usually
+sits at the sibling call sites nobody looked at, so patching only the named one leaves them
+for the next round and makes the loop look like bad luck rather than an unfinished fix. Write
+the enumeration down — "this shape appears at A, B and C; A was reported, B and C are fixed
+here / are not affected because …". A fix with no such list is a claim about one line.
+
+Two failure modes to watch for while fixing, both of which end the round *worse* than it
+started, and neither of which the findings list will tell you about:
+
+- **The fix that becomes the next finding.** When a round's defect was introduced by the
+  previous round's fix, stop patching and change the MECHANISM — the design is generating
+  them. Count findings by FILE across rounds; a file that keeps reappearing is the signal.
+- **Widening a check under cover of a regression fix.** Restoring what a change broke is not
+  the same as hardening a pre-existing case, and bundling them hides a new over-block inside
+  a "fix". Measure the pre-existing case's real rate before touching it, and say the number.
 
 ## 4. Record evidence, mark, THEN commit (satisfies the commit review-depth gate)
 
@@ -72,6 +103,14 @@ If you're on your 3rd EXTERNAL cross-model defect-bearing round, STOP at the esc
   (BLOCKER / SHOULD-FIX / CRITICAL / HIGH / MEDIUM / LOW / P1-P3 — a security-reviewer WARNING is
   NOT recognized by the validator, so render it as SHOULD-FIX in the text), at least one
   `file:line`, and ≥400 chars, or the gate rejects the evidence as non-adversarial.
+- **Carry the COVERAGE into the evidence, not just the findings.** The evidence is what a later
+  reader — a closing session, the next round, whoever inherits this branch — has instead of the
+  review. A findings-only file tells them what was wrong and NOTHING about what was checked, so
+  a gap and a clean bill look identical on disk. State the population §2 enumerated, which parts
+  were examined, and where you looked and found nothing. A `Scope Check:` heading is the
+  conventional place to put it — the validator recognises that phrase in place of a severity
+  ladder, though the `file:line` and length requirements above still apply on their own. It
+  costs one paragraph.
 - `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — this is an INTERNAL
   (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
   NEVER counts toward the cross-model escalation streak, whatever it found. No outcome flag is
