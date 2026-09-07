@@ -266,13 +266,17 @@ async def test_retry_respects_url_failure_storm_guard(
         db, id="done", file_path=str(fp), content_hash=h, status="completed",
         created_at=recent,
     )
-    for i in range(3):  # 3 == max_retries -> storm
+    # 3 rows that have EXHAUSTED their retries == persistent failure. (Rows at
+    # retry_count=1 are three FIRST misses, which is not persistence and must
+    # not park the file — see test_first_misses_on_distinct_urls_are_not_a_storm.)
+    for i in range(3):
         await inbox_items.create(
             db, id=f"puf{i}", file_path=str(fp), content_hash=h,
             status="pending", created_at=recent,
         )
         await inbox_items.update_status(
             db, f"puf{i}", status="failed", error_message="partial_url_failure",
+            retry_count=3,
         )
     r = await mon.check_once()
     assert r.items_modified == 0  # completed row keeps it known
@@ -317,11 +321,25 @@ async def test_modified_path_respects_url_failure_storm_guard(
     assert r.items_retried == 0, "rows at the retry cap are not retry candidates"
     assert r.batches_dispatched == 0, "storm guard must NOT dispatch a modified drop"
     assert mock_invoker.run.call_count == 0
-    # The guard advanced the known hash via a completing row (stops re-detection).
-    completed_new = await (await db.execute(
-        "SELECT id FROM inbox_items WHERE file_path=? AND status='completed' "
-        "AND content_hash=?", (str(fp), new_h))).fetchall()
-    assert len(completed_new) == 1, "a completing row at the new hash must be written"
+    # The guard advanced the known hash to stop re-detection — via a PARKED
+    # row, not a "completed" one. Nothing evaluated this content, so a
+    # completed row (which reads as success everywhere downstream, and carries
+    # no response_path) would be a lie; a retry-exhausted failed row blocks
+    # re-detection identically and says what actually happened.
+    parked = await (await db.execute(
+        "SELECT status, error_message, retry_count FROM inbox_items "
+        "WHERE file_path=? AND content_hash=?", (str(fp), new_h))).fetchall()
+    assert len(parked) == 1, "a parking row at the new hash must be written"
+    assert parked[0][0] == "failed"
+    assert parked[0][1] == "retry_storm_parked"
+    assert parked[0][2] >= max_r, "must be at the cap so it is not a retry candidate"
+    # NOT asserted here: that get_all_known now reports the new hash. It is
+    # last-row-wins ordered by created_at, and this fixture deliberately mixes
+    # clocks — the storm window needs REAL now for the seeded rows, while the
+    # monitor stamps the parking row from its fake clock — so the parking row
+    # sorts before them. That is a fixture artifact, not guard behaviour (in
+    # production both come from the same advancing clock); asserting it would
+    # pin the artifact.
     # No drop was queued.
     pending = await (await db.execute(
         "SELECT id FROM inbox_items WHERE file_path=? AND status IN "

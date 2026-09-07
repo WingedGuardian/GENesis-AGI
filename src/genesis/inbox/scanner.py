@@ -37,8 +37,12 @@ _TRACKING_PARAM_EXACT = frozenset({
 _URL_TRAILING_PUNCT = ".,;:!?)]}'\""
 
 
-def _strip_tracking_params(url: str) -> str:
-    """Remove tracking query params from a single URL; leave path/fragment intact."""
+def strip_tracking_params(url: str) -> str:
+    """Remove tracking query params from a single URL; leave path/fragment intact.
+
+    Public because the coverage check also needs it: a utm campaign word must
+    not count as evidence that a specific URL was evaluated.
+    """
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -71,7 +75,7 @@ def normalize_url_line(line: str) -> str:
         while raw and raw[-1] in _URL_TRAILING_PUNCT:
             trail = raw[-1] + trail
             raw = raw[:-1]
-        return _strip_tracking_params(raw) + trail
+        return strip_tracking_params(raw) + trail
 
     return _URL_IN_LINE_RE.sub(_repl, line)
 

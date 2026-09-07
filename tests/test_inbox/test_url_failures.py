@@ -125,6 +125,102 @@ class TestUncoveredUrls:
         response = "# Inbox Evaluation\nA GitHub project worth noting."
         assert _uncovered_urls(response, content) == [content]
 
+    def test_query_only_url_is_not_a_bare_domain(self):
+        """A query carries identity exactly as a path does.
+
+        The domain used to be split on "/" alone, so "example.com?v=abc" was
+        treated as the whole domain: the slug rung never ran and the domain
+        rung then passed on the stem "example". Same class as the platform-name
+        hole (CodeRabbit, #1820).
+        """
+        content = "https://example.com?v=abc123xyz"
+        response = "# Inbox Evaluation\nAn example of the pattern, discussed."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_fragment_only_url_is_not_a_bare_domain(self):
+        content = "https://example.com#deep-section-anchor"
+        response = "# Inbox Evaluation\nAn example worth noting."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_query_identity_counts_as_coverage(self):
+        """The flip side: a query value IS identity evidence when cited."""
+        content = "https://watch.tv?id=first-clip-9f2"
+        response = "# Inbox Evaluation\nThe first-clip-9f2 video is good."
+        assert _uncovered_urls(response, content) == []
+
+    def test_same_domain_guard_survives_query_only_urls(self):
+        """Two query-only URLs share a domain — one being discussed must not
+        vouch for the other (the count keyed on the query before the fix)."""
+        content = (
+            "https://watch.tv?id=first-clip-9f2 https://watch.tv?id=second-clip-3k8"
+        )
+        response = "# Inbox Evaluation\nThe first-clip-9f2 video is interesting."
+        assert _uncovered_urls(response, content) == [
+            "https://watch.tv?id=second-clip-3k8"
+        ]
+
+    def test_url_does_not_ride_a_siblings_coverage(self):
+        """Rung 1 is a substring test, so a URL that is a PREFIX of a sibling
+        used to pass on the sibling's quoted text — bypassing the same-domain
+        guard entirely (architect audit, measured 3/3)."""
+        content = "https://search.app/XYZ https://search.app/XYZW"
+        response = "# Inbox Evaluation\n**Source:** https://search.app/XYZW"
+        assert _uncovered_urls(response, content) == ["https://search.app/XYZ"]
+
+    def test_domain_only_url_does_not_ride_a_deeper_sibling(self):
+        content = "https://example.com https://example.com/deep/path-9f2"
+        response = "# Inbox Evaluation\nThe deep/path-9f2 piece is good."
+        assert _uncovered_urls(response, content) == ["https://example.com"]
+
+    @pytest.mark.parametrize(
+        "token",
+        ["news", "docs", "read", "share", "link", "open", "apps", "sites",
+         "mail", "medium"],
+    )
+    def test_generic_words_are_not_identity_as_path_segments(self, token):
+        """The stopword set must be the SAME on every rung — these words were
+        excluded as domain stems but still passed as path segments (10/10)."""
+        content = f"https://example.com/{token}"
+        response = f"# Inbox Evaluation\nA piece about {token} in general."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_tracking_param_is_not_identity(self):
+        """A utm campaign word must not vouch for the item, and must not make
+        the domain rung unreachable for a URL whose identity IS the domain."""
+        content = "https://example.com/?utm_source=newsletter"
+        response = "# Inbox Evaluation\nThis week's newsletter covers agents."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_bare_year_is_not_identity(self):
+        content = "https://example.com/2024/03/some-deep-article"
+        response = "# Inbox Evaluation\nA 2024 retrospective, broadly."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_slug_does_not_match_inside_a_longer_word(self):
+        content = "https://example.com/agent"
+        response = "# Inbox Evaluation\nAbout AI agents in general."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_malformed_ipv6_url_does_not_raise(self):
+        """urlsplit raises ValueError on a bracketed IPv6 literal; the scan
+        must not abort the whole inbox cycle (measured raise, no handler)."""
+        content = "check https://[fe80::1/report"
+        assert _uncovered_urls("# Inbox Evaluation\nnothing", content)
+
+    def test_schemeless_url_carrying_a_scheme_in_its_query(self):
+        """`"://" in u` is a substring test, not a scheme test — a scheme-less
+        URL whose QUERY contains :// folded its host into the remainder."""
+        content = "bit.ly/xk3?u=https://other.com/thing"
+        response = "# Inbox Evaluation\nThe xk3 link is a redirect."
+        assert _uncovered_urls(response, content) == []
+
+    def test_brace_wrapped_real_url_is_not_exempt(self):
+        """The {} placeholder exemption must not excuse a real URL that merely
+        got a trailing brace from the surrounding prose."""
+        content = "see {https://example.com/secret-slug-9f2}"
+        response = "# Inbox Evaluation\nI did nothing at all."
+        assert _uncovered_urls(response, content) != []
+
     def test_bare_domain_url_is_covered_by_domain_evidence(self):
         """When the URL carries no path the domain IS the identity, so
         domain/stem evidence is genuine evidence — not a platform gesture."""
@@ -204,6 +300,51 @@ class TestUncoveredUrls:
         response = (
             "# Inbox Evaluation\n## Some Article Title\n"
             "**Source:** https://lnkd.in/p/eYssnmfd\nGreat piece about agents."
+        )
+        assert _uncovered_urls(response, content) == []
+
+
+class TestRealEvaluatorOutputPasses:
+    """Regression guard from a LIVE compliance run (2026-09-06).
+
+    The gate's strictness is only safe if the evaluator actually complies with
+    the `**Source:** <url>` contract the prompt now states. Two faithful
+    reproductions were run against the REAL rendered prompt; all three URLs —
+    including the two hard cases, an opaque LinkedIn shortener needing a
+    redirect follow and a YouTube link needing yt-dlp — were quoted verbatim
+    and passed. These fixtures pin that: if a future change to the ladder
+    starts flagging compliant output, this fails.
+    """
+
+    def test_github_item_with_intent_annotation(self):
+        content = (
+            "Interesting because of the continuous-space synthesis architecture\n"
+            "https://github.com/OpenBMB/VoxCPM"
+        )
+        response = (
+            "# Inbox Evaluation\n## https://github.com/OpenBMB/VoxCPM\n"
+            "**Source:** https://github.com/OpenBMB/VoxCPM\n"
+            "**Classification:** Genesis-relevant | **Decision:** Research\n"
+            'Your note — "continuous-space synthesis architecture" — points at '
+            "the real contribution.\n"
+        )
+        assert _uncovered_urls(response, content) == []
+
+    def test_opaque_shortener_quoted_verbatim(self):
+        content = "https://lnkd.in/p/eYssnmfd"
+        response = (
+            "# Inbox Evaluation\n## Item 1 — Repowise (LinkedIn post)\n"
+            "**Source:** https://lnkd.in/p/eYssnmfd\n"
+            "**Resolved to:** https://www.linkedin.com/posts/ai-agents-ugcPost-749\n"
+        )
+        assert _uncovered_urls(response, content) == []
+
+    def test_youtube_item_fetched_via_ytdlp(self):
+        content = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        response = (
+            "# Inbox Evaluation\n## Item 2 — Rick Astley\n"
+            "**Source:** https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
+            "Fetched successfully via yt-dlp.\n"
         )
         assert _uncovered_urls(response, content) == []
 
@@ -361,6 +502,54 @@ class TestCountUrlFailures:
         from genesis.db.crud import inbox_items
         count = await inbox_items.count_url_failures(db, "/test/f.md")
         assert count == 0
+
+    async def test_first_misses_on_distinct_urls_are_not_a_storm(self, db):
+        """THE BLOCKER (architect audit 2026-09-06): the storm counter counts
+        ROWS per file, and one-item-per-evaluation makes one row per URL — so
+        three DIFFERENT URLs each missing coverage ONCE tripped a threshold
+        meant for three retries of the same content, parking the whole file
+        with its remaining URLs never evaluated. Only retry-EXHAUSTED rows
+        may count as persistent failure."""
+        from genesis.db.crud import inbox_items
+
+        now = datetime.now(UTC)
+        for i in range(3):
+            await inbox_items.create(
+                db, id=str(uuid.uuid4()), file_path="/test/drop.md",
+                content_hash=f"h{i}", status="failed",
+                created_at=now.isoformat(),
+            )
+            await db.execute(
+                "UPDATE inbox_items SET error_message = "
+                "'partial_url_failure: uncovered https://x.com/a', "
+                "retry_count = 1 WHERE content_hash = ?", (f"h{i}",),
+            )
+        await db.commit()
+
+        # Raw row count still sees three...
+        assert await inbox_items.count_url_failures(db, "/test/drop.md") == 3
+        # ...but none has exhausted its retries, so it is not a storm.
+        assert await inbox_items.count_url_failures(
+            db, "/test/drop.md", min_retry_count=3,
+        ) == 0
+
+    async def test_exhausted_rows_still_count_as_a_storm(self, db):
+        """The protection must survive the fix: genuinely persistent failure
+        (rows that used up their retries) still trips the threshold."""
+        from genesis.db.crud import inbox_items
+
+        now = datetime.now(UTC)
+        for i in range(3):
+            await inbox_items.create(
+                db, id=str(uuid.uuid4()), file_path="/test/drop.md",
+                content_hash=f"e{i}", status="failed",
+                created_at=now.isoformat(),
+                error_message="partial_url_failure", retry_count=3,
+            )
+        await db.commit()
+        assert await inbox_items.count_url_failures(
+            db, "/test/drop.md", min_retry_count=3,
+        ) == 3
 
     async def test_counts_coverage_variant_messages(self, db):
         """The storm guard must also count coverage-gate failures — their
