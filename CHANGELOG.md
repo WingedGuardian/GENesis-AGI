@@ -88,6 +88,71 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The desktop-takeover authorization gate, shipped before anything can call
+  it.** `autonomy/desktop_gate.py` is the deterministic check that would stand
+  between Genesis and the operator's own keyboard, mouse and screen. Nothing
+  calls it: the actuator is inert and the loop lands later. An actuator with a
+  caller and no gate *is* the ungated capability, so the gate goes first and
+  alone.
+
+  Authority is per SESSION rather than standing, and a grant has to clear four
+  bars. It must be a grant and not a hold — both are rows of the same
+  action_type, so a `kind` marker is what stops approving one held click from
+  handing over the whole session. It must be approved and unconsumed. It must
+  have been resolved through a channel whose messages originate outside this
+  box: Telegram or voice, deliberately narrower than `classify_resolver`'s
+  "human" class, because `dashboard` is stamped by a route any local process
+  can reach with the internal bearer token and `user` is merely
+  `ApprovalManager.resolve`'s default — neither is proof a person acted. And it
+  must be unexpired against a config TTL, bounded in both directions, so a
+  backwards clock step cannot mint a permanent grant.
+
+  Two more surfaces could reach a desktop row and no longer do. The generic
+  dashboard approvals queue renders every pending row as a CLI-fallback card —
+  it fills Fallback / Reason / API Route from context keys a desktop row does
+  not have, so the row would appear as `claude -p` / "CLI fallback requires
+  manual approval" and an owner tapping Approve would believe they cleared a
+  stuck dispatch. Desktop rows are withheld from that queue. And
+  `resolve_request` now refuses them: it is the funnel for the per-item Approve
+  button, Telegram `cli_approve`, and the `cli_approve_all` button's own
+  trigger row, which resolves directly and so sidesteps the batch sweep's
+  exclusion list.
+
+  Classification reads the target the actuator RESOLVED — element name, control
+  type and `IsPassword` from the accessibility tree, plus the window title and
+  any text to be typed. Not the acting model's prose about its own intent:
+  consent derived from a model's self-report is the weakness the gate exists to
+  avoid. Which input feeds which bar is a decision: IDENTITY reads the control,
+  because clicking "Send" is the identity act and typing the word is not — a
+  gate that holds ordinary typing teaches people to wave it through — while
+  FINANCIAL also reads the typed text, because a card number is dangerous as
+  content. A secret field is a REFUSAL with no approval path, and a target
+  merely *named* like a password box is refused too, because custom controls
+  routinely do not set the flag; that match is scoped to the target alone, so a
+  window called "Password Manager" does not make its controls unreachable.
+  Anything above STANDARD — acting in the operator's name, or touching money —
+  holds for its own decision even under a live grant. The allow path, the one
+  outcome that actually moves the mouse, is also the one that writes an audit
+  line and an event; in `shadow` the gate records the cell and logs the full
+  verdict including a missing grant, which is the state a shadow install is
+  actually in.
+
+  A hold queues nothing. There is no pending table and no drain, because a held
+  desktop action aims at a screen that has since moved; the loop re-captures and
+  re-plans. What that buys is worth stating plainly: every action executes
+  against an observation taken after the last approval.
+
+  The capability cell (`desktop:control:*`) can permanently DENY but can never
+  GRANT — `desktop` is absent from `PROMOTABLE_DOMAINS`, so no amount of banked
+  evidence converts session consent into standing autonomy. Arming needs both
+  `mode: live` and `live_opt_in: true` in `config/desktop_takeover.yaml`
+  (default `shadow`; env kill `GENESIS_DESKTOP_TAKEOVER_DISABLED`, checked
+  before any config read), and the domain is deliberately absent from the
+  settings MCP so arming is a conscious file edit rather than one unconfirmed
+  API call. Desktop rows are excluded from `approve_all_pending` and sit outside
+  `_VOICE_GATED_TYPES`: neither a batch "approve all" tap nor a bare spoken
+  "approve" aimed at something else can hand over the machine.
+
 - **A `tmux kill-server` with no socket binding now draws an advisory.** tmux
   resolves its target server from the inherited `$TMUX` variable before
   `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address

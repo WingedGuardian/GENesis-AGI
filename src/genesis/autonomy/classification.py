@@ -415,3 +415,132 @@ def classify_email_action(
         identity_bar=True,  # email always represents the user (REPRESENT_USER)
         action_class=classify_action(text),
     )
+
+
+# ---------------------------------------------------------------------------
+# Desktop action classification (desktop-takeover capability gate)
+# ---------------------------------------------------------------------------
+# Maps one desktop input action to its capability-cell key
+# (domain="desktop", verb="control", risk_class) plus the irreversibility class.
+# Like classify_email_action this is derived EXTERNALLY, in CODE — but the
+# inputs matter more here than anywhere else in the file.
+#
+# THE INPUTS ARE THE RESOLVED TARGET, NEVER THE ACTING MODEL'S PROSE ABOUT ITS
+# OWN INTENT. element_name / control_type / is_password come from the machine's
+# accessibility tree as the actuator resolved it, and window_title from the
+# window it resolved against. A loop that means to click "Save" and resolves
+# "Delete account" is classified on what it resolved. Consent derived from a
+# model's self-report is the weakness this whole gate exists to avoid.
+#
+# Known limit, stated rather than discovered: a click at raw coordinates whose
+# tree metadata is uninformative carries no keywords and lands in STANDARD.
+# Observation beats self-report; it does not replace it.
+
+DESKTOP_DOMAIN = "desktop"
+DESKTOP_VERB = "control"
+
+_FINANCIAL_DESKTOP_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:wire\s+transfer|bank|banking|payment|pay\s+now|checkout|"
+        r"card\s+number|cvv|iban|routing\s+number|invoice|remit|transfer\s+funds|"
+        r"place\s+order|confirm\s+purchase|billing)\b",
+        re.IGNORECASE,
+    ),
+]
+
+# Crossing the identity bar: the action speaks or acts AS the operator, or is
+# not undoable by a second click. Deliberately broader than the reversibility
+# keyword list — "reply" is reversible in no meaningful sense once it is sent.
+_IDENTITY_DESKTOP_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:send|post|publish|submit|reply|reply\s+all|forward|tweet|"
+        r"delete|discard|purchase|buy|confirm|accept|sign|share|install|"
+        r"uninstall|format|shut\s*down|restart)\b",
+        re.IGNORECASE,
+    ),
+]
+
+# Fail-closed password detection independent of the accessibility flag. Matched
+# against the RESOLVED TARGET only (element name + control type), never the
+# window title: a window called "Sign in" must not make every action in it
+# unreachable, but an element called "Password" must be untouchable regardless
+# of whether the control exposed IsPassword. Custom controls routinely do not.
+_PASSWORD_TARGET_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\b(?:password|passphrase|passcode|pin\s+code|secret\s+key)\b", re.IGNORECASE),
+]
+
+
+@dataclass(frozen=True)
+class DesktopActionClassification:
+    """Classification of one desktop input action for the takeover gate."""
+
+    domain: str                 # cell-key domain (always "desktop" here)
+    verb: str                   # cell verb (always "control" here)
+    risk_class: RiskClass       # cell risk axis
+    sub_class: str              # human label: input | identity | financial | password
+    is_password: bool           # target is a secret field — refused outright
+    identity_bar: bool          # True = acts in the operator's name
+    action_class: ActionClass   # reversibility (reused keyword classifier)
+
+    @property
+    def cell_key(self) -> tuple[str, str, str]:
+        """The (domain, verb, risk_class) tuple used to look up the cell."""
+        return (self.domain, self.verb, str(self.risk_class))
+
+
+def classify_desktop_action(
+    *,
+    window_title: str = "",
+    element_name: str = "",
+    control_type: str = "",
+    is_password: bool = False,
+    text: str = "",
+) -> DesktopActionClassification:
+    """Derive the capability-cell key for one desktop input action.
+
+    Risk gradient (low - high): manipulating an ordinary control (STANDARD) <
+    an action that acts in the operator's name or cannot be taken back
+    (IDENTITY) < anything monetary (FINANCIAL, hardline). A secret field is not
+    on that gradient at all: ``is_password`` is a REFUSAL flag with no approval
+    path, so it is reported separately and the gate never offers to ask.
+
+    Which input feeds which bar is a decision, not an oversight. IDENTITY reads
+    the CONTROL (window + element + control type) because that is what performs
+    the act; FINANCIAL additionally reads ``text``, because a card number is
+    dangerous as content and not only as a label; and ``is_password`` matches
+    the resolved TARGET alone, never the window, so a window called "Sign in"
+    does not make every control inside it unreachable.
+    """
+    target = f"{element_name}\n{control_type}"
+    # The CONTROL being operated, plus the window it lives in. Deliberately
+    # excludes `text`: what the operator is typing is not what the action DOES.
+    # Folding it in makes "please send me the file" typed into a plain editor
+    # classify IDENTITY, so the most ordinary desktop action there is would
+    # hold — a gate that stops the common case teaches people to wave it
+    # through. Clicking "Send" is the identity act; typing the word is not.
+    control = f"{window_title}\n{target}"
+    # Money is the exception, and it is the right one: a card number or an IBAN
+    # is dangerous as CONTENT, not only as a button label.
+    haystack = f"{control}\n{text}"
+
+    password = bool(is_password) or any(p.search(target) for p in _PASSWORD_TARGET_PATTERNS)
+
+    if any(p.search(haystack) for p in _FINANCIAL_DESKTOP_PATTERNS):
+        risk, sub = RiskClass.FINANCIAL, "financial"
+    elif any(p.search(control) for p in _IDENTITY_DESKTOP_PATTERNS):
+        risk, sub = RiskClass.IDENTITY, "identity"
+    else:
+        risk, sub = RiskClass.STANDARD, "input"
+
+    return DesktopActionClassification(
+        domain=DESKTOP_DOMAIN,
+        verb=DESKTOP_VERB,
+        risk_class=risk,
+        sub_class="password" if password else sub,
+        is_password=password,
+        # `!=`, never `is not`: RiskClass is a StrEnum, so identity comparison
+        # silently disagrees with equality the moment a raw string reaches here
+        # (the defect PR #1838 fixed one module over).
+        identity_bar=risk != RiskClass.STANDARD,
+        action_class=classify_action(haystack),
+    )

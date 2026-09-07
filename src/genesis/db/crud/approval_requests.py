@@ -210,10 +210,20 @@ async def resolve(
 async def update_context(
     db: aiosqlite.Connection, id: str, *, context: str,
 ) -> bool:
+    """Rewrite a PENDING request's context.
+
+    Restricted to pending rows on purpose: ``context`` is no longer only
+    display data — the desktop gate's authorization predicate reads
+    ``$.kind`` and ``$.session_id`` out of it, so an unrestricted update would
+    let a resolved grant's scope be rewritten after the owner approved it.
+    The sole caller (``approval_gate``, on its own request ids) only ever
+    updates pending rows, so this narrows nothing that was in use.
+    """
     cursor = await db.execute(
         """UPDATE approval_requests
            SET context = ?
-           WHERE id = ?""",
+           WHERE id = ?
+             AND status = 'pending'""",
         (context, id),
     )
     await db.commit()
@@ -288,3 +298,48 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def list_approved_unconsumed_for_session(
+    db: aiosqlite.Connection,
+    *,
+    action_type: str,
+    session_id: str,
+    kind: str,
+) -> list[dict]:
+    """Approved, unconsumed rows of *action_type* + *kind* for *session_id*.
+
+    The desktop-takeover gate's session-consent lookup. Returns every match,
+    newest resolution first, rather than the single newest row: the caller must
+    additionally require an allowlisted resolver and an unexpired grant, and a
+    ``LIMIT 1`` here would let one system-resolved row hide an older, valid
+    owner approval underneath it.
+
+    ``kind`` is NOT optional and NOT cosmetic. One action_type carries two
+    different kinds of row — a session GRANT and a per-action HOLD — because a
+    single action_type is what keeps every batch-approval exclusion to one
+    entry. Without this predicate the two are indistinguishable, and approving
+    one held action silently becomes a full session grant with a fresh TTL:
+    the owner consents to one click and hands over the session. MEASURED
+    before the fix; regression-tested after.
+
+    Deliberately unbounded: the result is scoped to one action_type AND one
+    session id, and a session holds one grant by construction (a fresh row per
+    session, consumed at teardown), so the population is a handful of rows.
+
+    Unlike :func:`find_approved_unconsumed` there is no ``resolved_at`` window
+    in SQL — the grant's lifetime is a config lever the caller owns, and
+    encoding a second, silently different expiry here would give the capability
+    two disagreeing clocks.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM approval_requests
+           WHERE status = 'approved'
+             AND consumed_at IS NULL
+             AND action_type = ?
+             AND json_extract(context, '$.kind') = ?
+             AND json_extract(context, '$.session_id') = ?
+           ORDER BY resolved_at DESC""",
+        (action_type, kind, session_id),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
