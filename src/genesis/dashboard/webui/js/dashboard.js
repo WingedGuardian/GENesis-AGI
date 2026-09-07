@@ -5,7 +5,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false, sessions: false, "zero-drop": false },
         // ── Calibration tab state ──
         calibrationCells: [],
         calibrationSummary: null,
@@ -354,6 +354,7 @@
           campaigns: { state: "idle", lastSuccess: null, error: null },
           watchlist: { state: "idle", lastSuccess: null, error: null },
           knowledgeRecent: { state: "idle", lastSuccess: null, error: null },
+          zeroDrop: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -373,9 +374,15 @@
         _tasksInterval: null,
         _workSessionsInterval: null,
         _observationsInterval: null,
+        _zeroDropInterval: null,
         _cockpitInterval: null,
         _commsInterval: null,
         _tracesInterval: null,
+
+        // Zero-drop accounting view — the whole five-part dict from one
+        // endpoint. `null` means NOT FETCHED, which the panel must render
+        // differently from a fetched-and-empty board.
+        zeroDropView: null,
 
         // Observations tab state
         observationsList: [],
@@ -434,6 +441,7 @@
           campaigns: ["_campaignsInterval"],
           backup:    [],
           sessions:  ["_ccSessionsTabInterval"],
+          "zero-drop": ["_zeroDropInterval"],
         },
 
         // ── Campaigns ──
@@ -516,7 +524,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions", "zero-drop"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -590,6 +598,10 @@
             case "follow-ups":
               if (first) { this.fetchCockpit(); this.fetchCockpitFilters(); }
               this._cockpitInterval = setInterval(() => this.fetchCockpit(), 30000);
+              break;
+            case "zero-drop":
+              if (first) { this.fetchZeroDrop(); }
+              this._zeroDropInterval = setInterval(() => this.fetchZeroDrop(), 60000);
               break;
             case "traces":
               if (first) { this.fetchSpansRecent(); }
@@ -1163,6 +1175,22 @@
         },
 
         // ── Observations tab fetches ─────────────────────────────
+        async fetchZeroDrop() {
+          this.startFetch("zeroDrop");
+          try {
+            const resp = await fetchApi("/api/genesis/zero-drop");
+            if (resp && resp.ok) {
+              this.zeroDropView = await resp.json();
+              this.finishFetch("zeroDrop");
+            } else {
+              this.failFetch("zeroDrop", "Zero-drop endpoint returned an error");
+            }
+          } catch (e) {
+            console.warn("Zero-drop fetch failed:", e);
+            this.failFetch("zeroDrop", "Failed to fetch the zero-drop view");
+          }
+        },
+
         async fetchObservations() {
           this.startFetch("observations");
           try {

@@ -99,6 +99,16 @@
               @click="location.hash = 'config'">Configuration</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'internals' }"
               @click="location.hash = 'internals'">Internals</button>
+      <!-- Deliberately NO count badge. The Observations badge beside it is fed
+           by a GLOBAL 15s poll, so it stays true on every tab; this view is
+           fetched only while its own tab is open and its poller stops on exit,
+           so a badge here would never appear until the tab was visited and
+           would then FREEZE at that value for the rest of the session. A bare,
+           silently-stale number on a surface visible from every tab is the
+           exact failure this whole board exists to prevent — the count lives
+           inside the panel, with its denominator and the detector's age. -->
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'zero-drop' }"
+              @click="location.hash = 'zero-drop'">Zero-Drop</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>

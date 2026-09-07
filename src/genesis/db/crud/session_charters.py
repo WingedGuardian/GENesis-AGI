@@ -459,3 +459,27 @@ async def ledger_counts(db: aiosqlite.Connection, session_id: str) -> dict[str, 
         (session_id,),
     )
     return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+async def ledger_counts_all(db: aiosqlite.Connection) -> dict[str, int]:
+    """Per-status row counts across EVERY session's ledger.
+
+    The cross-session sibling of :func:`ledger_counts`. It exists because a row
+    is rendered by its own session's injection and by nothing else, so once
+    that session dies its open rows are unreachable by every process and
+    person — and nothing anywhere counted them.
+
+    This is a SUPERSET of the population ``ledger_escalation`` acts on, not the
+    same set: :func:`ledger_stale_open` additionally filters by ``added_by``
+    provenance and by age. Said precisely because the loose version of this
+    sentence ("the population it acts on") would make the two numbers look
+    reconcilable when they are answering different questions — this one is
+    "how many rows is anyone still carrying?", which had no answer at all.
+
+    A COUNT rather than ``len(ledger_all(...))`` on purpose: the complete read
+    exists to state facts about individual rows and raises past a 200k
+    tripwire, which is the wrong instrument — and the wrong failure mode — for
+    a denominator.
+    """
+    cursor = await db.execute("SELECT status, COUNT(*) FROM session_ledger GROUP BY status")
+    return {row[0]: row[1] for row in await cursor.fetchall()}

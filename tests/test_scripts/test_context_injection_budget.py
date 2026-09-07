@@ -202,11 +202,14 @@ def _direct_part(monkeypatch, capsys, identity_dir: Path, part: str) -> str:
     monkeypatch.setattr(_ctx, "_mirror_path", lambda sid, part: identity_dir / f"{sid}-{part}.md")
     # A test must not rewrite the developer's / CI's real git hooks (F13c).
     monkeypatch.setattr(_ctx, "_sync_genesis_hooks", lambda: None)
-    # …nor spawn the repo-pulse worker. `main()` starts it for real on the
-    # charter path, so `--part all` forked a background subprocess against the
+    # …nor spawn the boundary workers. `main()` starts them for real on the
+    # charter path, so `--part all` forked background subprocesses against the
     # live repo on every run of this file — a side effect a budget test has no
     # business having, and one that only shows up as flakiness under load.
-    monkeypatch.setattr(_ctx, "_spawn_repo_pulse_worker", lambda *a, **k: None)
+    # Patching the ONE chokepoint covers every spawn: this line used to name
+    # the repo-pulse spawn specifically, and when a second detached worker was
+    # added beside it the patch silently stopped covering the path.
+    monkeypatch.setattr(_ctx, "_spawn_boundary_workers", lambda *a, **k: None)
     monkeypatch.setattr(_ctx.sys, "argv", ["x", "--part", part])
     monkeypatch.setattr(_ctx.sys, "stdin", __import__("io").StringIO("{}"))
     _ctx._OUT = None

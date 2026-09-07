@@ -516,6 +516,54 @@ class MorningReportGenerator:
         except Exception:
             logger.warning("Ground truth: observation count failed", exc_info=True)
 
+        try:
+            # Reads the SHARED assembler rather than re-deriving the counts, so
+            # this line and the Zero-Drop dashboard tab cannot answer the same
+            # question with two different numbers. An earlier version computed
+            # `tracked = open + acked` here independently, which is exactly the
+            # duplicate-denominator drift the shared assembler exists to stop.
+            #
+            # COUNTS ONLY — never a branch name or a ledger row's text. Every
+            # other line in this section emits integers, and that is what keeps
+            # the whole section free of the redaction concern that keeps
+            # `ledger_escalation` out of this report entirely: branch names are
+            # untrusted repository text and ledger rows on a live install have
+            # carried pasted credentials. A count cannot leak; a rendered row can.
+            #
+            # The freshness clause is not decoration. `read_last_run`'s reader
+            # contract is that an empty result means "the detector has not run",
+            # never "nothing is stranded" — so a zero here without its age is
+            # precisely the false-clean this subsystem exists to prevent.
+            from genesis.session_awareness.zero_drop_view import (
+                STATUS_UNAVAILABLE,
+                build_view,
+            )
+
+            view = await build_view(self._db, now=datetime.now(UTC), findings_limit=1)
+            stranded = view["items_by_store"].get("stranded_work", {})
+            gaps = view["gaps"]
+
+            if stranded.get("status") == STATUS_UNAVAILABLE or gaps.get("status") == STATUS_UNAVAILABLE:
+                # DELIBERATELY departs from this section's convention of dropping
+                # a line whose query failed. For every other line a missing line
+                # is merely missing; for this one, silence is the false-clean the
+                # whole subsystem exists to prevent — a reader who sees no
+                # stranded-work line concludes there is none.
+                reason = stranded.get("reason") or gaps.get("reason") or "unknown"
+                lines.append(
+                    f"- Stranded work (zero-drop): UNAVAILABLE ({reason}) — "
+                    f"this is not a zero, it is an unread board"
+                )
+            else:
+                verdict = gaps.get("detector", {}).get("verdict", "freshness unknown")
+                lines.append(
+                    f"- Stranded work (zero-drop): {stranded['open']} open of "
+                    f"{stranded['tracked']} tracked ({stranded['acked']} acked) "
+                    f"— detector {verdict}"
+                )
+        except Exception:
+            logger.warning("Ground truth: stranded-work count failed", exc_info=True)
+
         return "\n".join(lines)
 
     async def _emit_warning(self, section: str, message: str) -> None:

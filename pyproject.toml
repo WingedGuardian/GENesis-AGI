@@ -130,4 +130,24 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-timeout = 1800
+# PER-TEST ceiling (pytest-timeout), not a suite budget — a hung test is killed
+# and the suite carries on.
+#
+# This setting is CI-ONLY in practice. pytest-timeout is declared in the
+# [test] extra below, so a local `pip install -e .` venv does not have it and
+# pytest prints `PytestConfigWarning: Unknown config option: timeout` on every
+# local run (MEASURED 2026-09-06 on this box: `pip show pytest-timeout` ->
+# not found). Its origin commit (05c307e6) credits it with stopping six stuck
+# pytest processes burning ~450% CPU for 2+ hours on the shared, swapless box
+# this repo develops on — but with the plugin absent there, it never did.
+#
+# Raised 1800 -> 3600: 1800 was picked for that local incident and then
+# silently inherited by CI, and it sits BELOW this project's own documented
+# 7200s timeout floor. One hour is the deliberate midpoint — still under the
+# floor, still far above any legitimate test. The cost of raising it lands
+# only on GitHub runners: a genuinely hung test now burns 60 minutes instead
+# of 30 before being killed, and the job cap (180) bounds that at two such
+# kills. Nobody can pick a tighter number honestly yet — the suite has never
+# had its per-test durations measured, which is what the `--durations` flag
+# added to CI alongside this change fixes.
+timeout = 3600

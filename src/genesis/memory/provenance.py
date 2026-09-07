@@ -494,6 +494,37 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # reflection and perception. If a future change puts hook content back
         # in this observation, this source must LOSE its place in this list.
         "context_injection_monitor",
+        # Zero-drop stranded-work detector (session_awareness/zero_drop_worker.py)
+        # — Genesis observing its OWN repository: which local branches, pushed
+        # branches and worktrees hold work that is in no pipeline. Two sources
+        # because blindness is reported separately from findings: a DEAD
+        # detector is caught by its heartbeat, but a LIVE one with a failing leg
+        # keeps its board frozen while every health surface reads green, so that
+        # gets its own alarm rather than being folded into the findings alert.
+        #
+        # first_party is the honest classification, but it is NOT free here, and
+        # the reason is the same one context_injection_monitor states above: the
+        # observation embeds git-authored text — branch names and worktree paths
+        # — which Genesis did not write. That text is neutralised where THESE
+        # ROWS are built (`_render_identity` / `_neutralise` in
+        # zero_drop_worker flatten newlines and substitute the alert's
+        # row-grammar characters), which is what lets an observation carry it
+        # without smuggling a forged row past the trusted-only
+        # SAFE_SURFACING_ORIGINS filters. If a future change renders any
+        # untrusted repository content into these observations WITHOUT that
+        # neutralisation, these sources must LOSE their place in this list.
+        #
+        # Scope that claim precisely, because an earlier revision of it did not
+        # and was wrong: it covers the OBSERVATION path only. The sibling MCP
+        # read surface (`zero_drop_status`) returns `branch`, `worktree_path`
+        # and the `degraded` blob VERBATIM, and a filesystem path — unlike a git
+        # ref name — may contain newlines and escapes. That surface is not
+        # governed by this list (it is a tool result, not an observation), and
+        # its own neutralisation is outstanding: it cannot simply reuse
+        # `_render_identity`, because `branch` there is the KEY callers pass
+        # back to `zero_drop_ack` and mangling a key is worse than the problem.
+        "zero_drop_detector",
+        "zero_drop_detector_blind",
     }
 )
 

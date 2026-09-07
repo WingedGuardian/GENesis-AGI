@@ -1,0 +1,81 @@
+# Zero-drop stranded-work detector — writable + LIVE.
+#
+# The detached worker spawned at SessionStart boundaries (and daily by
+# disk-hygiene as a wall-clock floor) re-reads the merged config (this file +
+# ~/.genesis/config/zero_drop.local.yaml) at startup, so a
+# settings_update("zero_drop", {...}) or a hand edit takes effect at the next
+# sweep — no restart.
+#
+# What it does: enumerates local branches, pushed branches and worktrees, joins
+# them against full PR history, and records what is STRANDED — work that exists
+# but is in no pipeline. It is the sole writer of its own findings store and
+# never touches an authoritative work store: no auto-push, no auto-PR, no
+# ledger/follow-up writes, no branch deletion. Escalation is visibility only.
+#
+# Master switch: false stops the worker before any lock/git/gh/DB work.
+enabled: true
+
+# Mode: off | observe | alert
+#   off     — the worker exits immediately (no lock, no sweep, no rows)
+#   observe — (default) sweeps and records findings; read them with the
+#             `zero_drop_status` MCP tool. No findings alert is raised.
+#   alert   — findings additionally maintain ONE superseding observation,
+#             auto-resolved when the board comes clean
+#
+# Why `observe` ships as the default, one notch below the intent: an
+# `infrastructure_alert` observation carries a 3-day TTL while the dedupe gate
+# keys on unresolved rows, so a board that is stable for weeks — which a board
+# holding deliberate backup branches is — re-mints the same alert every three
+# days. Until that has episode-scoped dedup (the awareness loop's answer to the
+# same class), filling the board is worth more than a self-repeating alarm.
+# Switch with settings_update("zero_drop", {"mode": "alert"}).
+#
+# BLINDNESS is reported in every running mode, `observe` included: the lever
+# governs egress about findings, and a broken instrument is not a finding.
+#
+# An invalid value degrades to `observe` — less egress, never a silent `off`.
+# A silently-off detector answers "what fell through the cracks?" with a
+# confident, empty, wrong zero, which is the failure this subsystem exists to
+# prevent.
+#
+# Hook-level kill switch (separate lever): GENESIS_ZERO_DROP_DISABLED=1 stops
+# the SessionStart hook from spawning the worker at all.
+mode: observe
+
+# Global debounce between sweeps, in minutes. Every session boundary spawns a
+# worker; all but the first within the interval exit in ~100ms.
+min_interval_minutes: 60
+
+# Age gates — work in flight RIGHT NOW is not stranded work.
+#   branch_min_age_hours   — measured from the branch tip's commit date
+#   worktree_min_age_hours — measured from the newest modified/untracked file,
+#                            NOT the branch tip (an old tip with a fresh edit
+#                            is somebody typing)
+branch_min_age_hours: 12
+worktree_min_age_hours: 6
+
+# Consecutive COMPLETED sweeps a finding must survive before it is marked
+# escalated. A degraded sweep (a failed git leg, a capped PR listing) is not a
+# counted run and leaves findings untouched — a partial sweep must never
+# manufacture either an escalation or a clean board.
+escalation_k: 3
+
+# gh --limit for the PR-history join. MEASURED 2026-09-05: the whole repo
+# (1651 PRs) returned in one 6s call. n == limit records a loud limit_hit and
+# FREEZES the branch classes for that run rather than guessing at the tail.
+max_prs: 2000
+
+# Local ancestry probes per sweep. Each tests one branch tip against the head
+# SHA a merged/closed PR recorded, to answer "did that PR actually contain
+# these commits?" without trusting the branch NAME. One local merge-base each,
+# no network. MEASURED 2026-09-06: 4 needed on this install (217 refs / 1665
+# PRs). Going over the cap can only ADD findings — an untested pair reads as
+# unconfirmable and is flagged — so the cap never hides work.
+max_ancestry_probes: 40
+
+# Findings named inline in the alert observation (the full count is always
+# stated alongside, so the cap is a display selection, never the denominator).
+max_listed: 10
+
+# Alert observation priority: low | medium | high | critical
+alert_priority: medium

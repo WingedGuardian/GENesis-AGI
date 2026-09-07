@@ -981,3 +981,69 @@ async def test_negated_protection_never_tagged_protective(db, mock_health, mock_
     # ...and the alerts themselves still surface
     assert "not enforced" in context
     assert "zram is disabled" in context
+
+
+async def test_ground_truth_stranded_work_carries_its_denominator_and_freshness(
+    db, mock_health, mock_drafter, monkeypatch, tmp_path
+):
+    """The stranded-work line renders `open of tracked` AND the detector's age.
+
+    Both halves are load-bearing and neither is decoration. Without the
+    denominator the number cannot be sized; without the freshness verdict a
+    zero from a detector that has never run reads exactly like a clean board —
+    which `read_last_run`'s own reader contract says it must never do.
+    """
+    from genesis.db.crud import zero_drop as zd
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
+
+    present = [
+        {"branch": "feat/a", "tip_sha": "a" * 40, "ahead_count": 2, "worktree_path": None},
+        {"branch": "feat/b", "tip_sha": "b" * 40, "ahead_count": 1, "worktree_path": None},
+    ]
+    await zd.apply_sweep(db, class_="unpushed_branch", present=present, run_id="r1")
+    await zd.ack(db, class_="unpushed_branch", branch="feat/b", reason="kept on purpose")
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    context = await gen._assemble_context()
+
+    assert "Stranded work (zero-drop): 1 open of 2 tracked (1 acked)" in context
+    # The detector has not run in this temp home, so the line must SAY the zero
+    # is unverified rather than presenting the board as clean.
+    assert "detector NEVER RUN" in context
+
+
+async def test_ground_truth_stranded_work_line_emits_NO_branch_names(
+    db, mock_health, mock_drafter, monkeypatch, tmp_path
+):
+    """Counts only — never untrusted repository text.
+
+    Every other line in this section emits integers, and that is what keeps the
+    whole section clear of the redaction concern that keeps `ledger_escalation`
+    out of this report entirely. A branch name is attacker-influenced text on a
+    path that reaches Telegram; a count cannot leak.
+    """
+    from genesis.db.crud import zero_drop as zd
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
+
+    await zd.apply_sweep(
+        db,
+        class_="unpushed_branch",
+        present=[
+            {
+                "branch": "feat/SECRET-BRANCH-NAME",
+                "tip_sha": "c" * 40,
+                "ahead_count": 1,
+                "worktree_path": "/home/someone/private/path",
+            }
+        ],
+        run_id="r1",
+    )
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    ground_truth = await gen._ground_truth_section()
+
+    assert "Stranded work (zero-drop)" in ground_truth
+    assert "SECRET-BRANCH-NAME" not in ground_truth
+    assert "private/path" not in ground_truth

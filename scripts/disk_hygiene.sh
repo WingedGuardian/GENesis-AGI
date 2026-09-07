@@ -106,6 +106,19 @@ main() {
 
     echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
 
+    # BEFORE the reaper, deliberately. This is the wall-clock floor for the
+    # stranded-work sweep — the detector is normally spawned at session
+    # boundaries, so a box that starts no sessions for days would answer "what
+    # fell through the cracks?" from a stale board. But this run only happens at
+    # all on a box quiet enough that the 60-minute debounce did not already
+    # no-op it, which is exactly the idle box where the reaper below is most
+    # likely to be deleting stale worktrees — and its restore path does not
+    # reconstruct uncommitted state. Observing the world after the reaper had
+    # cleared it would mean the one daily look never saw what was lost.
+    echo "--- zero-drop stranded-work sweep ---"
+    "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
+        || echo "zero_drop_worker exited $?"
+
     echo "--- worktree reaping ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
 
@@ -149,6 +162,10 @@ main() {
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
+
+    echo "--- zero-drop findings retention prune (resolved only, >45d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_zero_drop.py" --days 45 \
+        || echo "prune_zero_drop exited $?"
 
     echo "--- contributor work-log terminal-row prune (>30d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \

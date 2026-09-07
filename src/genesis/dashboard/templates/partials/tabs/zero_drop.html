@@ -1,0 +1,225 @@
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Zero-Drop [Tab: zero-drop]
+
+         "What fell through the cracks?" — answered by enumeration.
+
+         THE RULE THIS PANEL EXISTS TO HONOUR: a ZERO is only meaningful beside
+         its denominator and its freshness, and a part that could not be READ
+         must never look like a part that measured NOTHING.
+
+         That rule is why every section below opens with the SAME status gate
+         instead of rendering its body directly. An earlier version branched on
+         status for two of the four parts and rendered the other two straight —
+         which turned an unavailable container into an empty list (reads as
+         "nothing here") and an unavailable leaf into the literal text
+         "undefined". Both are the false-clean this whole board exists to
+         prevent, reached through the very envelope written to prevent it. If
+         you add a part, give it the gate.
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'zero-drop'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">inventory</span>
+        Zero-Drop
+        <span class="panel-status" x-show="$store.genesisDashboard.zeroDropView?.gaps?.status === 'ok' && $store.genesisDashboard.zeroDropView?.gaps?.open > 0">
+          <span class="status-dot" style="background:#ffa726;"></span>
+          <span x-text="$store.genesisDashboard.zeroDropView.gaps.open + ' stranded'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+
+        <!-- ── Transport state ─────────────────────────────────────
+             Three states, not two. `error` is a fetch that has NEVER
+             succeeded; `stale` is one that succeeded before and is now
+             failing — and without its own banner the panel would keep
+             rendering the last good payload forever with nothing saying so.
+             The data layer withholds a stale PR count for exactly this
+             reason; the UI must not apply a weaker standard to its own
+             transport than the view applies to its sources. -->
+        <template x-if="$store.genesisDashboard.panelState('zeroDrop') === 'loading'">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            Loading…
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('zeroDrop') === 'error'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.75rem;">
+            Couldn't load the board — will keep retrying. This is NOT a clean board.
+          </div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('zeroDrop') === 'stale'">
+          <div style="padding:0.6rem; margin-bottom:0.75rem; border-radius:4px; background:rgba(240,173,78,0.12); color:#f0ad4e; font-size:0.72rem;">
+            Refresh is FAILING — everything below is the last board that loaded
+            <span x-show="$store.genesisDashboard.fetchState.zeroDrop.lastSuccess"
+                  x-text="'(' + Math.round((Date.now() - $store.genesisDashboard.fetchState.zeroDrop.lastSuccess) / 60000) + ' min ago)'"></span>,
+            not a current one.
+          </div>
+        </template>
+
+        <!-- ── The board itself, or the envelope saying why there isn't one ── -->
+        <template x-if="$store.genesisDashboard.zeroDropView?.status === 'unavailable'">
+          <div style="padding:1.5rem; text-align:center; color:#f0ad4e; font-size:0.8rem;">
+            Board unavailable — <span x-text="$store.genesisDashboard.zeroDropView.reason"></span>.
+            <div style="margin-top:0.35rem; color:var(--color-text-secondary); font-size:0.72rem;">
+              Nothing below is a measurement. This is NOT a clean board.
+            </div>
+          </div>
+        </template>
+
+        <template x-if="$store.genesisDashboard.zeroDropView
+                        && $store.genesisDashboard.zeroDropView.status !== 'unavailable'
+                        && !['loading','error'].includes($store.genesisDashboard.panelState('zeroDrop'))">
+          <div>
+
+            <!-- ── Gaps: stranded git state ────────────────────────── -->
+            <div style="margin-bottom:1.25rem;">
+              <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; color:var(--color-text-secondary); margin-bottom:0.4rem;">
+                Stranded work
+              </div>
+              <template x-if="$store.genesisDashboard.zeroDropView.gaps?.status !== 'ok'">
+                <div style="font-size:0.75rem; color:#f0ad4e;">
+                  Unavailable — <span x-text="$store.genesisDashboard.zeroDropView.gaps?.reason || 'unknown'"></span>
+                  <span style="color:var(--color-text-secondary);"> (not a zero)</span>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.zeroDropView.gaps?.status === 'ok'">
+                <div>
+                  <div style="font-size:0.9rem;">
+                    <strong x-text="$store.genesisDashboard.zeroDropView.gaps.open"></strong>
+                    open of
+                    <span x-text="$store.genesisDashboard.zeroDropView.gaps.listed_of"></span>
+                    tracked
+                    <span style="color:var(--color-text-secondary);"
+                          x-text="'(' + $store.genesisDashboard.zeroDropView.gaps.acked + ' acked)'"></span>
+                  </div>
+                  <!-- The freshness verdict is NOT decoration: a stale zero is
+                       not a clean board, and the verdict is what says so. -->
+                  <div style="font-size:0.7rem; margin-top:0.25rem;"
+                       :style="$store.genesisDashboard.zeroDropView.gaps.detector?.stale ? 'color:#f0ad4e;' : 'color:var(--color-text-secondary);'"
+                       x-text="'Detector: ' + ($store.genesisDashboard.zeroDropView.gaps.detector?.verdict || 'unknown')"></div>
+                  <div style="font-size:0.7rem; color:var(--color-text-secondary);"
+                       x-show="$store.genesisDashboard.zeroDropView.gaps.detector?.coverage"
+                       x-text="'Coverage: ' + $store.genesisDashboard.zeroDropView.gaps.detector?.coverage"></div>
+                  <div style="font-size:0.7rem; color:#f44336;"
+                       x-show="$store.genesisDashboard.zeroDropView.gaps.detector?.blind"
+                       x-text="'BLIND: ' + JSON.stringify($store.genesisDashboard.zeroDropView.gaps.detector?.degraded || {})"></div>
+
+                  <div class="activity-feed" style="margin-top:0.5rem;">
+                    <template x-for="f in ($store.genesisDashboard.zeroDropView.gaps.findings || [])" :key="f.class + '|' + f.branch">
+                      <div style="padding:0.35rem 0; border-bottom:1px solid var(--color-border); font-size:0.75rem;">
+                        <span style="font-size:0.6rem; padding:0.1rem 0.35rem; border-radius:3px; font-weight:600; text-transform:uppercase;"
+                              :style="{
+                                unpushed_branch: 'background:rgba(244,67,54,0.15); color:#f44336',
+                                pushed_no_pr:    'background:rgba(255,152,0,0.15); color:#ff9800',
+                                dirty_worktree:  'background:rgba(255,193,7,0.15); color:#ffc107'
+                              }[f.class] || ''"
+                              x-text="f.class"></span>
+                        <span style="margin-left:0.4rem; font-family:monospace;" x-text="f.branch"></span>
+                        <span style="color:var(--color-text-secondary);" x-text="' +' + f.ahead_count"></span>
+                        <span x-show="f.escalated" style="color:#f44336; font-weight:700;"> ESCALATED</span>
+                        <span x-show="f.status === 'acked'" style="color:var(--color-text-secondary);"
+                              x-text="' — acked: ' + (f.ack_reason || '')"></span>
+                      </div>
+                    </template>
+                  </div>
+                  <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-top:0.35rem;"
+                       x-show="$store.genesisDashboard.zeroDropView.gaps.listed < $store.genesisDashboard.zeroDropView.gaps.listed_of"
+                       x-text="'showing ' + $store.genesisDashboard.zeroDropView.gaps.listed + ' of ' + $store.genesisDashboard.zeroDropView.gaps.listed_of"></div>
+                </div>
+              </template>
+            </div>
+
+            <!-- ── PR pipeline ─────────────────────────────────────── -->
+            <div style="margin-bottom:1.25rem;">
+              <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; color:var(--color-text-secondary); margin-bottom:0.4rem;">
+                PR pipeline
+              </div>
+              <div style="font-size:0.85rem;"
+                   :style="$store.genesisDashboard.zeroDropView.pr_pipeline?.status !== 'ok' ? 'color:#f0ad4e;' : ''"
+                   x-text="$store.genesisDashboard.zeroDropView.pr_pipeline?.verdict || $store.genesisDashboard.zeroDropView.pr_pipeline?.reason || 'unknown'"></div>
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);"
+                   x-show="$store.genesisDashboard.zeroDropView.pr_pipeline?.age_seconds != null"
+                   x-text="'cache age: ' + Math.round($store.genesisDashboard.zeroDropView.pr_pipeline.age_seconds / 3600) + 'h'"></div>
+            </div>
+
+            <!-- ── Items by store ──────────────────────────────────── -->
+            <div style="margin-bottom:1.25rem;">
+              <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; color:var(--color-text-secondary); margin-bottom:0.4rem;">
+                Items by store
+              </div>
+              <!-- The CONTAINER may itself be unavailable; without this gate its
+                   {status, reason} envelope would be iterated as if it were a
+                   map of stores, rendering the reason string as a row label. -->
+              <template x-if="$store.genesisDashboard.zeroDropView.items_by_store?.status === 'unavailable'">
+                <div style="font-size:0.75rem; color:#f0ad4e;">
+                  Unavailable — <span x-text="$store.genesisDashboard.zeroDropView.items_by_store.reason"></span>
+                  <span style="color:var(--color-text-secondary);"> (not a zero)</span>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.zeroDropView.items_by_store?.status !== 'unavailable'">
+                <div>
+                  <template x-for="[name, part] in Object.entries($store.genesisDashboard.zeroDropView.items_by_store || {}).filter(([k, v]) => !['status','degraded_children','denominator_exempt'].includes(k) && v && typeof v === 'object')" :key="name">
+                    <div style="font-size:0.8rem; padding:0.15rem 0;">
+                      <span style="color:var(--color-text-secondary);" x-text="name.replace(/_/g, ' ') + ': '"></span>
+                      <template x-if="part.status === 'unavailable'">
+                        <span style="color:#f0ad4e;" x-text="'unavailable (' + part.reason + ') — not a zero'"></span>
+                      </template>
+                      <template x-if="part.status !== 'unavailable'">
+                        <span>
+                          <strong x-text="part.open ?? part.unresolved"></strong>
+                          <span x-text="' of ' + (part.tracked ?? part.total)"></span>
+                        </span>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+
+            <!-- ── Owner-pending ───────────────────────────────────── -->
+            <div style="margin-bottom:1.25rem;">
+              <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; color:var(--color-text-secondary); margin-bottom:0.4rem;">
+                Waiting on you
+              </div>
+              <template x-if="$store.genesisDashboard.zeroDropView.owner_pending?.status === 'unavailable'">
+                <div style="font-size:0.75rem; color:#f0ad4e;">
+                  Unavailable — <span x-text="$store.genesisDashboard.zeroDropView.owner_pending.reason"></span>
+                  <span style="color:var(--color-text-secondary);"> (not a zero)</span>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.zeroDropView.owner_pending?.status !== 'unavailable'">
+                <!-- Each leaf can fail on its own, so each gets its own gate —
+                     a failed leaf is a dict, and rendering it directly prints
+                     "[object Object] approval request(s)". -->
+                <div style="font-size:0.8rem;">
+                  <template x-if="typeof $store.genesisDashboard.zeroDropView.owner_pending?.approval_requests === 'number'">
+                    <span x-text="$store.genesisDashboard.zeroDropView.owner_pending.approval_requests + ' approval request(s)'"></span>
+                  </template>
+                  <template x-if="typeof $store.genesisDashboard.zeroDropView.owner_pending?.approval_requests !== 'number'">
+                    <span style="color:#f0ad4e;">approval requests unavailable</span>
+                  </template>
+                  <span>, </span>
+                  <template x-if="typeof $store.genesisDashboard.zeroDropView.owner_pending?.ego_proposals === 'number'">
+                    <span x-text="$store.genesisDashboard.zeroDropView.owner_pending.ego_proposals + ' ego proposal(s)'"></span>
+                  </template>
+                  <template x-if="typeof $store.genesisDashboard.zeroDropView.owner_pending?.ego_proposals !== 'number'">
+                    <span style="color:#f0ad4e;">ego proposals unavailable</span>
+                  </template>
+                </div>
+              </template>
+            </div>
+
+            <!-- ── Roadmap: what this board does NOT cover ─────────── -->
+            <div>
+              <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase; color:var(--color-text-secondary); margin-bottom:0.4rem;">
+                Not covered by this board
+              </div>
+              <template x-for="item in ($store.genesisDashboard.zeroDropView.roadmap?.not_covered || [])" :key="item">
+                <div style="font-size:0.7rem; color:var(--color-text-secondary); padding:0.1rem 0;" x-text="'— ' + item"></div>
+              </template>
+            </div>
+
+            <div style="font-size:0.65rem; color:var(--color-text-secondary); margin-top:1rem;"
+                 x-text="'computed ' + ($store.genesisDashboard.zeroDropView.computed_at || '')"></div>
+          </div>
+        </template>
+      </div>
+    </div>
