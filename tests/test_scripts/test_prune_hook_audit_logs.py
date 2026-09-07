@@ -209,7 +209,17 @@ def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env()
     body = _HYGIENE.read_text()
     for knob in ("GENESIS_MERGE_OVERRIDE_DIR", "GENESIS_DISCARD_SNAPSHOT_DIR"):
         assert knob in body, f"the groom never resolves {knob}"
-    loader = body.split("_load_store_knob() {", 1)[-1].split("\n    }", 1)[0]
-    assert "eval" not in loader and "source " not in loader and ". " not in loader, (
-        "the knob loader executes secrets.env content"
+    assert "_load_store_knob() {" in body, (
+        "the loader is gone, so the scan below would silently cover the whole file"
     )
+    loader = body.split("_load_store_knob() {", 1)[-1].split("\n    }", 1)[0]
+    # CODE lines only. Scanning prose too makes any comment containing ". " fail this,
+    # which trains the next person to delete the comment rather than keep the property.
+    code = [
+        ln.strip() for ln in loader.splitlines() if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    assert code, "the loader body is all comments — it cannot be doing the work"
+    for ln in code:
+        assert not ln.startswith(("eval ", "source ", ". ")) and " eval " not in f" {ln} ", (
+            f"the knob loader executes secrets.env content: {ln!r}"
+        )
