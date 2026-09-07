@@ -41,9 +41,23 @@ class ErrorCategory(StrEnum):
     #     (n=15) sleeping on a provider whose answer could not change, against
     #     a 180-600s aggregate `max_total_s` — i.e. a few percent of the walk's
     #     budget each time it is reached, not the whole of it.
-    #   - like QUOTA_EXHAUSTED, it must hold the breaker open on the LONG cap —
-    #     an entitlement does not change in 30 minutes, and re-probing on the
-    #     short cap costs a doomed attempt 8x more often.
+    #   - like QUOTA_EXHAUSTED, it takes the LONG breaker cap — an entitlement
+    #     does not change in 30 minutes.
+    #     BE PRECISE ABOUT WHAT THAT BUYS, because the obvious reading is wrong.
+    #     `_effective_open_duration()` is `min(open_duration_s * 2**(trip-1),
+    #     cap)`, and every provider in config/model_routing.yaml sets
+    #     `open_duration_s: 120`, so the two curves are:
+    #        long cap  [120, 240, 480, 960, 1920, 3840, 7680, 14400]
+    #        short cap [120, 240, 480, 960, 1800, 1800, 1800, 1800]
+    #     IDENTICAL for trips 1-4. They diverge at trip 5 and only reach the
+    #     nominal 8x at trip 8 — roughly 4.2h into a CONTINUOUS outage. And
+    #     `load_state` caps `trip_count` at 3 on restart (circuit_breaker.py),
+    #     so any deploy or crash resets the escalation to the shared part of the
+    #     curve. A freshly-tripping entitlement-dead provider is therefore held
+    #     out for exactly as long as a PERMANENT one; the long cap is a
+    #     saturation property, not a first-failure one.
+    #     (Cross-model review, 2026-09-06 — the earlier wording here claimed the
+    #     8x as though it applied from the first trip.)
     # Classifying it as either one alone gives up the other half. MEASURED:
     # `mistral-large-latest` returned this continuously from 2026-08-27 while
     # its "not available in your subscription tier" message matched

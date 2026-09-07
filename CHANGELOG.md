@@ -21,9 +21,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   time budget for nothing — measured at several seconds on each attempt.
 
   Entitlement refusals are now recognised on their own terms. The router gives up
-  on that provider immediately and moves to the next one in the chain, and the
-  provider is held out of rotation on the long window rather than being re-tried
-  every half hour.
+  on that provider immediately and moves to the next one in the chain, and a
+  provider that keeps refusing escalates onto the longer hold-out window instead
+  of levelling off at half an hour. To be exact about what that is worth: the
+  hold-out is identical to the existing one for the first four trips and only
+  pulls ahead during a sustained outage, so the gain is in not re-probing a
+  provider that has been dead for hours — not in the first few minutes.
 
   The same correction is applied to an exhausted allowance, which had the same
   problem for the same reason: a spent quota is a billing state, so waiting a
