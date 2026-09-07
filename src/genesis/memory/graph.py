@@ -148,9 +148,10 @@ async def centrality_scores(
 
     Identifies memories that are "bridges" between clusters of knowledge.
     Raises GraphUnavailableError if the backend cannot answer (an EMPTY graph
-    still returns [] — zero nodes means zero bridges). Deliberately does NOT
-    fall back: a decision-tier consumer must never be handed a silently
-    different metric.
+    still returns [] — zero nodes means zero bridges). The NetworkX store
+    additionally raises when the library itself is unimportable. Deliberately
+    does NOT fall back: a decision-tier consumer must never be handed a
+    silently different metric.
 
     ``top_n`` caps the returned slice; ``top_n=None`` returns EVERY scored
     node (the full ranking). Betweenness is computed over all nodes regardless

@@ -175,6 +175,27 @@ async def test_networkx_store_satisfies_the_seam():
     assert isinstance(store.name, str) and store.name
 
 
+async def test_the_facade_re_exports_the_seam_error_type_itself_not_a_copy():
+    """Identity, not just the name — the one contract member the check above misses.
+
+    `graph.py`'s store->CTE fallback catches this class, and `dream_centrality`
+    catches it across a module boundary, so a same-named LOCAL class would make
+    both `except` clauses silently dead while every name still resolved.
+
+    That is not hypothetical. Merging origin/main into this branch produced
+    exactly it: main defined the class in `graph.py` while the seam imports it
+    from `graphstore`, in a different region of the file, so git merged both
+    with NO conflict marker. The local definition shadowed the import, the
+    fallback stopped catching what the store raises, and the only symptom was
+    three unrelated-looking test failures naming the mechanism nowhere.
+    """
+    from genesis.memory import graph as graph_mod
+    from genesis.memory import graphstore, graphstore_nx
+
+    assert graph_mod.GraphUnavailableError is graphstore.GraphUnavailableError
+    assert graphstore_nx.GraphUnavailableError is graphstore.GraphUnavailableError
+
+
 async def test_a_commit_inside_the_load_window_is_not_lost(tmp_path, monkeypatch):
     """THE BLOCKER, locked: stamping the token AFTER the load pins a stale
     projection forever.

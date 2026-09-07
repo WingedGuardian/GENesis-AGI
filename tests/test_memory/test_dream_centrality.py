@@ -200,7 +200,9 @@ async def test_centrality_scores_raises_when_networkx_absent(db):
 
     # Patch where the flag LIVES (the NetworkX store), not where it used to.
     # graph.py deliberately does not re-export it: a patch aimed at the facade
-    # would silently no-op, which is worse than failing loudly.
+    # would silently no-op, which is worse than failing loudly. VERIFIED at
+    # merge time: graph.py has zero _NX_AVAILABLE references on this branch,
+    # so main's form would have patched nothing.
     with (
         patch.object(graphstore_nx, "_NX_AVAILABLE", False),
         pytest.raises(graph_mod.GraphUnavailableError),
