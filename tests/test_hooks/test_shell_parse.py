@@ -841,3 +841,293 @@ class TestSigilRunRegression:
         # token into _KNOWN_SIGILS left all 146 tests in this file passing.
         unqueried = sorted(set(sp._KNOWN_SIGILS) - set(queried))
         assert not unqueried, f"declared in _KNOWN_SIGILS but no guard queries it: {unqueried}"
+
+
+# ── unquoted backslash: the scanner's one remaining blind spot ──────────
+
+
+class TestUnquotedBackslash:
+    """An unquoted backslash escapes the next character; the scanner ignored it.
+
+    Backslash was handled in exactly ONE place — inside a double-quoted string —
+    so outside quotes it fell through to the default append and set no state. The
+    character after it was then dispatched as if it were bare, which is wrong for
+    every escapee and a GUARD BYPASS for the newline: bash REMOVES a
+    backslash-newline and joins the two halves into one word, while the scanner
+    split there and handed the protected-paths guard half a path.
+
+    These lock the whole class rather than the newline alone, because one missing
+    branch generates all of it — fixing only the measured member leaves the rest
+    for the next round to find.
+    """
+
+    def test_line_continuation_joins_the_word_as_bash_joins_it(self):
+        """THE defect: a continuation inside a path must not split the word."""
+        assert sp.split_segments("rm -rf /var/da\\\nta") == ["rm -rf /var/data"]
+
+    def test_continuation_at_a_word_boundary_still_joins(self):
+        """bash removes the pair unconditionally — it does not insert a space."""
+        assert sp.split_segments("echo one\\\ntwo") == ["echo onetwo"]
+
+    @pytest.mark.parametrize(
+        ("run_len", "expect_one_segment"),
+        [(1, True), (2, False), (3, True), (4, False), (5, True), (6, False)],
+    )
+    def test_odd_runs_continue_and_even_runs_separate(self, run_len, expect_one_segment):
+        """Parity, the lesson #1608 bought in the sibling guard.
+
+        Only an ODD-length backslash run is a continuation: in an EVEN run the
+        last backslash is itself escaped, so it is a literal and the newline
+        after it is a real command separator. Consuming each escaped PAIR makes
+        this fall out with no counting — the pair is eaten, so a newline that
+        follows an even run is seen fresh by the separator branch.
+        """
+        cmd = "echo a" + ("\\" * run_len) + "\necho b"
+        segs = sp.split_segments(cmd)
+        assert (len(segs) == 1) is expect_one_segment, f"{run_len} backslash(es) -> {segs!r}"
+
+    def test_escaped_separator_is_a_literal_not_a_split(self):
+        r"""`\;` is a literal semicolon to bash, so it must not end the segment."""
+        assert len(sp.split_segments("rm -rf /var/foo\\;bar")) == 1
+
+    def test_escaped_quote_does_not_open_a_quoted_run(self):
+        r"""`\"` is a literal quote; treating it as an opener swallowed the rest.
+
+        Under the old scanner the quote opened and ran to end-of-string, so the
+        `|` never split and a second executed command was invisible to every
+        consumer. Under-reading in this direction hides a command from a guard.
+        """
+        assert len(sp.split_segments('printf %s \\"foo | cat')) == 2
+
+    def test_ordinary_commands_are_untouched(self):
+        """The equivalence side: no backslash, no behaviour change."""
+        assert sp.split_segments("git status && git push") == ["git status", "git push"]
+        assert sp.split_segments("echo hi 2>/dev/null") == ["echo hi"]
+
+    def test_trailing_backslash_at_end_of_input_is_not_consumed(self):
+        """A dangling backslash has nothing to escape — keep it, do not crash."""
+        assert sp.split_segments("echo a\\") == ["echo a\\"]
+
+    def test_a_comment_ending_in_a_backslash_does_not_swallow_the_next_command(self):
+        """bash ends a comment at the newline and does NOT continue it.
+
+        Folding there would delete a real command separator, and the following
+        command would not merely move — it would VANISH from every consumer's
+        segment list. Verified against bash itself: a script whose comment line
+        ends in a backslash still executes the next line.
+        """
+        segs = sp.analyze("echo hi  # note a\\\nrm -rf /var/lib")
+        assert [s.exe for s in segs] == ["echo", "rm"]
+
+    # Every context a `#` can follow, and whether bash then treats it as a comment
+    # start. DERIVED FROM BASH, not reasoned: each prefix was run as
+    # `<prefix>#note \`⏎`touch <marker>` under `bash --norc --noprofile`, and the
+    # flag records whether the marker FILE appeared — i.e. whether bash executed
+    # line 2 as a command. Asserting on stdout instead would have been wrong: an
+    # `echo` payload prints the marker as an argument even when correctly joined,
+    # which is exactly how an earlier revision of this table reported two contexts
+    # as broken when the parser was right.
+    _COMMENT_START_CONTEXTS = [
+        ("start", "", True),
+        ("space", "echo a ", True),
+        ("tab", "echo a\t", True),
+        ("semicolon", "echo a;", True),
+        ("pipe", "true|", True),
+        ("amp", "true&", True),
+        ("and_and", "true&&", True),
+        ("open_paren", "(true)", True),
+        ("close_paren", "(true) ", True),
+        ("mid_word", "echo ab", False),
+        ("after_quote", "echo 'x'", False),
+        ("brace", "{ true;}", False),
+    ]
+
+    @pytest.mark.parametrize(
+        ("label", "prefix", "bash_runs_next"),
+        _COMMENT_START_CONTEXTS,
+        ids=[c[0] for c in _COMMENT_START_CONTEXTS],
+    )
+    def test_comment_start_matches_bash_across_every_context(self, label, prefix, bash_runs_next):
+        """Lock the comment-start RULE, not the one context that was found broken.
+
+        Round one scoped the fold to whitespace-preceded comments; a second pass
+        then found `)` — a metacharacter bash also opens a comment after, which
+        reaches the buffer as itself. Fixing that one context would have left the
+        next one for a third round, so this asserts the whole table: where bash
+        executes the following line, the parser must still SEE it.
+        """
+        cmd = f"{prefix}#note \\\nrm -rf /var/lib/xyz"
+        sees_second = any(s.exe == "rm" for s in sp.analyze(cmd))
+        if bash_runs_next:
+            assert sees_second, f"{label}: bash runs the next line but the parser folded it away"
+
+    def test_a_comment_cannot_absorb_an_override_sigil_from_the_next_line(self):
+        """The same fold would FORGE the human-in-the-loop acknowledgement.
+
+        Pulling the next line's first word into the comment makes an unrelated
+        token read as a deliberate override of the very gate being bypassed.
+        """
+        raws = sp.split_segments("git push --force #\\\nreview-override")
+        assert len(raws) == 2
+        assert not any(sp.has_trailing_override(r, "review-override") for r in raws)
+
+    @pytest.mark.parametrize("sigil", sorted(sp._KNOWN_SIGILS))
+    def test_no_sigil_can_be_forged_across_a_comment_continuation(self, sigil):
+        """Whole-class lock: every declared sigil, not just the one found first.
+
+        `_KNOWN_SIGILS` is the authoritative set and is itself kept exhaustive by
+        the guardrail test above, so this cannot silently miss a new sigil.
+        """
+        raws = sp.split_segments(f"git push --force #\\\n{sigil}")
+        assert not any(sp.has_trailing_override(r, sigil) for r in raws)
+
+    # EVERY context a backslash-newline can sit in, and whether bash treats it as a
+    # continuation. Same derivation as the comment table: each shape was run under
+    # `bash --norc --noprofile` with the second command being a `touch`, and the flag
+    # records whether the marker FILE appeared — execution, not output.
+    #
+    # This exists because three separate review findings turned out to be ONE
+    # mechanism: folding is a JOIN, and a join under an incomplete context model makes
+    # a real command vanish, where the old append-everything scanner could only ever
+    # over-split. Splitting too much costs an over-read; joining too much costs a miss.
+    # So the contexts are enumerated here rather than discovered one review round at a
+    # time.
+    _FOLD_CONTEXTS = [
+        ("single_quotes", "echo 'a\\\n{cmd}'", False),
+        ("double_quotes", 'echo "a\\\n{cmd}"', False),
+        ("comment", "echo a # note \\\n{cmd}", True),
+        ("comment_after_paren", "(true)#n \\\n{cmd}", True),
+        ("heredoc_unquoted_delim", "cat <<EOF\nline \\\n{cmd}\nEOF", False),
+        ("heredoc_quoted_delim", "cat <<'EOF'\nline \\\n{cmd}\nEOF", False),
+        ("heredoc_terminator", "cat <<EOF\nbody\nEOF\n{cmd}", True),
+        ("after_subshell", "(echo a) \\\n{cmd}", False),
+        ("inside_command_sub", "x=$(echo a \\\n)\n{cmd}", True),
+        ("backtick", "x=`echo a \\\n`\n{cmd}", True),
+    ]
+
+    @pytest.mark.parametrize(
+        ("label", "template", "bash_executes"),
+        _FOLD_CONTEXTS,
+        ids=[c[0] for c in _FOLD_CONTEXTS],
+    )
+    def test_folding_never_hides_a_command_bash_executes(self, label, template, bash_executes):
+        """The invariant that actually matters: a join must not lose a command.
+
+        Asserted one-directionally on purpose. Where bash EXECUTES the second
+        command the parser must still see it — that direction is a guard bypass.
+        The reverse (the parser reporting a command bash does not run) is an
+        over-read, which costs a rewrite and never a miss, so it is deliberately
+        not constrained here.
+        """
+        cmd = template.format(cmd="rm -rf /var/lib/xyz")
+        sees = any(s.exe == "rm" for s in sp.analyze(cmd))
+        if bash_executes:
+            assert sees, f"{label}: bash executes it, the parser folded it away"
+
+    def test_the_override_reader_never_outruns_the_scanner_on_comment_start(self):
+        """Lock the coupling that keeps sigil forgery closed.
+
+        Two independent comment-start rules exist: `parse_segments` uses one to
+        know where NOT to fold, and `_has_trailing_override` uses another to know
+        where a sigil may live. Nothing links them, and the forge needs BOTH to
+        line up — the scanner must fold a token in from the next line, and the
+        reader must then honour it as an acknowledgement.
+
+        So the invariant is an implication, not an equality: wherever the reader
+        would HONOUR a sigil, the scanner must already have declined to fold.
+        Scanner-stricter is safe and is the current state (it also recognises a
+        comment after `(`/`)`, which the reader does not) — writing this as
+        equality failed on exactly that pair while nothing was wrong. The
+        dangerous direction is the reverse, and that is what is asserted.
+        """
+        for prefix in ("", "echo a ", "echo a\t", "echo a;", "true|", "(true)", "echo ab"):
+            for sigil in sorted(sp._KNOWN_SIGILS):
+                text = f"{prefix}#{sigil}"
+                scanner_declines_to_fold = sp.split_segments(f"{text} \\\ntrue") == [
+                    f"{text} \\",
+                    "true",
+                ]
+                reader_honours = sp.has_trailing_override(text, sigil)
+                assert not (reader_honours and not scanner_declines_to_fold), (
+                    f"the override reader honours {sigil!r} after {prefix!r} where the "
+                    "scanner would still fold — that pair is a forged acknowledgement"
+                )
+
+    def test_continued_git_C_keeps_its_target_in_one_segment(self):
+        """The consequential case: a continued ``git -C`` must stay ONE command.
+
+        ``_effective_cwd`` reads ``-C`` off a SEGMENT's argv to decide which
+        worktree a git command runs in. Splitting a continued invocation left the
+        ``-C`` on the first fragment and the operands on later ones, so the walk
+        attributed the operation to the wrong directory — measured on real
+        history: ``git -C <worktree> rm \\``⏎``<paths>`` resolved to the main tree.
+        """
+        cmd = "git -C /wt rm \\\n  src/a.py \\\n  src/b.py"
+        segs = sp.analyze(cmd)
+        top = [s for s in segs if getattr(s, "depth", 0) == 0]
+        assert len(top) == 1, [s.raw for s in top]
+        assert top[0].argv[:3] == ["git", "-C", "/wt"]
+        assert "src/b.py" in top[0].argv
+
+
+class TestEvalReparsesItsInput:
+    """`eval` parses its input TWICE, so one segment list is not a full answer.
+
+    `help eval`: it concatenates its arguments with spaces and executes the
+    result as shell input. Characters the FIRST parse settled as literal data are
+    therefore syntax again on the SECOND — and a consumer holding only the first
+    parse's segments sees a command that bash will run as no command at all.
+
+    This is the general form of a P2 from PR #1615's review. The narrow reading
+    is "escaped operators": a backslash-escaped ';', '|' or '&' survives the
+    first parse as a literal and separates on the second. The wider one is the
+    quoted-string spelling,
+    which was open on every revision before this — same mechanism, no backslash
+    in sight.
+
+    Modelled by RE-ANALYZING the reconstruction, not by suppressing the escapes:
+    the first parse is CORRECT about the first parse, and un-consuming its
+    escapes would make it wrong about a command that is only parsed once.
+    """
+
+    def _inner(self, cmd: str) -> list[tuple[int, str]]:
+        return [(s.depth, s.exe) for s in sp.analyze(cmd)]
+
+    def test_an_escaped_separator_separates_on_the_second_parse(self):
+        found = self._inner(r"eval echo ok \; pytest tests/")
+        assert (1, "pytest") in found, f"the eval'd pytest run stayed hidden: {found}"
+
+    @pytest.mark.parametrize("op", [";", "|", "&"])
+    def test_every_escaped_operator_behaves_the_same_way(self, op):
+        """The class, not the one member the review happened to cite."""
+        found = self._inner(f"eval echo ok \\{op} pytest tests/")
+        assert (1, "pytest") in found, f"escaped {op!r} hid the second command: {found}"
+
+    def test_the_quoted_string_spelling_is_the_same_defect(self):
+        """No backslash anywhere, and it hid the command on every prior revision:
+        the whole script arrives as ONE argument and is parsed on the way out."""
+        found = self._inner('eval "echo ok; pytest tests/"')
+        assert (1, "pytest") in found, f"a quoted eval script stayed hidden: {found}"
+
+    def test_the_first_parse_is_still_reported(self):
+        """The reparse ADDS a reading, it does not replace one. A consumer that
+        keys on the first parse (the literal `;` really is one argv token to
+        `eval`) must still see what it saw."""
+        found = self._inner(r"eval echo ok \; pytest tests/")
+        assert (0, "echo") in found, f"the first parse was thrown away: {found}"
+
+    def test_eval_as_an_OPERAND_reparses_nothing(self):
+        """The over-read control. `eval` matters only at a command position —
+        searching for the word must not turn a grep into two commands."""
+        assert self._inner("grep eval /etc/profile") == [(0, "grep")]
+
+    def test_a_non_reparsing_prefix_is_not_reparsed(self):
+        """The other half of that control: `sudo` passes argv through unchanged,
+        so there is no second parse to model and no extra segment to invent."""
+        assert self._inner("sudo echo ok") == [(0, "echo")]
+
+    def test_a_chain_of_evals_terminates(self):
+        """Each reconstruction drops the `eval` token, so it is strictly shorter
+        and the recursion unwinds. Written as a test because a reparse that fed
+        itself would hang the hook rather than fail it."""
+        assert (0, "echo") in self._inner("eval eval eval echo hi")

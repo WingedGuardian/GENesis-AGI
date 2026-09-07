@@ -78,6 +78,28 @@ _WRAPPER_SPEC = {
     "time": ({"-o", "--output", "-f", "--format"}, 0),
     "command": (set(), 0),
     "exec": ({"-a"}, 0),
+    "builtin": (set(), 0),
+    # An entry here asserts that the trailing tokens ARE the command, which holds
+    # when the prefix passes its argv through unchanged. It does not hold when a
+    # prefix re-parses a single argument string, or takes a compound instead of a
+    # simple command: argv[0] is then not the executable and the command stays
+    # unresolved. Those shapes are held as fixture data in the protected-paths
+    # suite rather than described here.
+    #
+    # This table is a WHITELIST, so it says nothing about prefixes not in it —
+    # `setpriv`, `systemd-run`, `unshare`, `flock`, `runuser` and others pass a
+    # command through and are absent. A caller that must not certify an
+    # unresolved command therefore cannot rely on this table alone; see
+    # protected_paths_guard's own conservative check, which is what covers the
+    # complement.
+    #
+    # `chroot` is deliberately NOT here. It re-roots the filesystem, so every
+    # operand changes meaning — `chroot /nr rm -rf /x` deletes `/nr/x`, not `/x`.
+    # Resolving it would hand a path guard operands that mean something else,
+    # which is argv-to-effect modelling of exactly the kind this module's header
+    # disclaims.
+    "eval": (set(), 0),
+    "coproc": (set(), 0),
     "xargs": (
         {
             "-I",
@@ -281,12 +303,20 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
 
 
 def parse_segments(command: str) -> list[_ParsedSegment]:
-    """Split a command line into executed segments, returning per segment BOTH the raw
+    r"""Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
 
     Quote-aware: an operator inside a quoted string does not split. Splits on ``&&``,
     ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened outside quotes)
     runs to end-of-line and is retained in ``raw`` so override detection can see it.
+
+    Escape-aware: an UNQUOTED backslash escapes the next character, so the escapee is
+    never dispatched as an operator or a quote opener. A backslash-newline is a line
+    continuation and is REMOVED, joining the two halves into one word exactly as bash
+    joins them. Parity is handled by consuming each escaped pair rather than by
+    counting: only an ODD-length backslash run is a continuation, because in an EVEN
+    run the last backslash is itself escaped and the newline after it really does
+    separate two commands.
 
     Redirect-aware: a redirection (``2>/dev/null``, ``> out.log``, ``2>&1``, ``&>log``,
     ``>| f``, ``< in``, ``<<<here``) is consumed — operator AND target. A PLAIN-filename
@@ -298,8 +328,40 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
-    re-split; locked by a golden test over a broad corpus). ONE intentional difference
-    from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
+    re-split; locked by a golden test over a broad corpus). TWO intentional differences.
+
+    The first is the unquoted backslash above. Before it, a genuine line continuation
+    split a word bash joins, so ``rm -rf <protected>/da\``⏎``ta`` reached the
+    protected-paths guard as two segments, neither naming the real target, and was
+    ALLOWED while the shell removed the continuation and ran it on the whole path
+    (measured through the live hook entry: exit 0 against exit 2 for the joined
+    control). Escaped separators and escaped quotes were mis-read the same way, one
+    missing branch generating all three.
+
+    **The direction of that first difference is stated carefully, because an earlier
+    revision of this paragraph claimed it was SAFER everywhere and that was false.**
+    Folding a continuation joins segments, and joining can HIDE a command as easily as
+    it can reveal a path — which is exactly what it did inside a ``#`` comment, where
+    bash ends the comment at the newline and does not continue it: the fold deleted a
+    real separator, the following command vanished from every consumer, and both a
+    protected-path delete and a forged approval sigil went from blocked to allowed.
+    That is why the branch is scoped to ``not in_comment``, and why the comment-start
+    set was then ENUMERATED against bash rather than extended one context at a time —
+    the first scoping covered whitespace only, and a second pass found ``)``.
+
+    What can be claimed is narrower than "safer", and is measured rather than reasoned:
+    across 15,845 real commands 2.13% segment differently and NO guard verdict moves in
+    either direction; every context a ``#`` can follow is checked against bash for
+    whether it executes the following line, and where it does, the parser still sees it.
+    Two residuals stay open and are NOT closure claims. The comment-start predicate is
+    approximate on both edges — it can open a comment bash would not (after an escaped
+    space) and decline one bash would — but only ever by DECLINING to fold, which falls
+    back to the pre-existing split. And the heredoc body is unmodelled by this scanner
+    and its predecessor alike, so a body line ending in a backslash joins where it used
+    to split. Treat any new joining context as a fail-open candidate until it is
+    measured: joining hides a command as readily as it reveals a path.
+
+    The second, from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
     control operator (``;`` ``&&`` ``||`` ``|``) is now paren-balanced into ONE segment
     instead of mis-split on that operator — which CLOSES an additional fail-open (HEAD
     mis-split ``git 2>$(a; b) push`` into ``git  $(a`` + ``b) push`` so ``git_subcommand``
@@ -314,6 +376,13 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     redirs: list[str] = []
     i, n = 0, len(command)
     quote: str | None = None
+    # Whether an unquoted `#` comment is open. Tracked ONLY to scope the
+    # backslash branch below — a comment ends at the newline and bash does NOT
+    # honour a continuation inside one, so folding there would delete a real
+    # command separator and swallow the next line. Nothing else reads this, so
+    # comment handling is otherwise byte-identical to before (a separator inside
+    # a comment still splits, an over-read that costs a guard nothing).
+    in_comment = False
     while i < n:
         c = command[i]
         if quote:
@@ -383,7 +452,57 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
                 argv_buf.append(" ")
             i = j
             continue
+        # An unquoted `#` that starts a word opens a comment running to the newline.
+        # Read off the last emitted character rather than a parallel flag, so the two
+        # cannot drift.
+        #
+        # `(` and `)` are in the set because bash opens a comment after ANY unquoted
+        # metacharacter, and those two are the only metacharacters that survive into
+        # `raw_buf` as themselves — ENUMERATED against bash rather than guessed:
+        # `;` `|` `&` and newline hit the separator branch, which empties the buffer;
+        # `<` `>` are eaten by the redirect branch, which leaves a space; whitespace
+        # is covered directly. So this set is the whole class, not two more instances.
+        #
+        # Approximate in the harmless direction on both edges, deliberately: an
+        # escaped space (`echo a\ #b`) leaves a literal space here and opens a comment
+        # bash does not, and a `#` inside a word does not open one here either. Both
+        # only ever DECLINE to fold — falling back to the pre-existing split — so a
+        # wrong answer costs an over-read a guard already tolerated, never a join.
+        if (
+            c == "#"
+            and not in_comment
+            and (not raw_buf or raw_buf[-1].isspace() or raw_buf[-1] in "()")
+        ):
+            in_comment = True
+        if c == "\\" and i + 1 < n and not in_comment:
+            # An unquoted backslash escapes exactly one character. Handled AFTER the
+            # redirect branch on purpose: an escaped space inside a redirect TARGET
+            # (`git 2>err\ log push`) is consumed by `_redirect_target_end`, and the
+            # golden corpus locks that output — reaching it from here would change it.
+            # `not in_comment` is load-bearing: bash ends a comment at the newline and
+            # does NOT continue it, so folding there would delete a real separator and
+            # make the following command vanish from every consumer's segment list.
+            if command[i + 1] == "\n":
+                # A line continuation. bash REMOVES the pair and joins the halves into
+                # ONE word, so emitting nothing IS the join. Splitting here instead
+                # handed the protected-paths guard half a path and it allowed the
+                # command the shell then ran on the whole one.
+                i += 2
+                continue
+            # Any other escapee is a literal: consume the PAIR so it can never be
+            # dispatched as an operator or a quote opener. Consuming the pair is also
+            # what makes the odd/even parity fall out with no counting — `\\` is eaten
+            # here, so a newline after an EVEN run is seen fresh by the branch below
+            # and still separates, which is what bash does.
+            raw_buf.append(c)
+            raw_buf.append(command[i + 1])
+            argv_buf.append(c)
+            argv_buf.append(command[i + 1])
+            i += 2
+            continue
         if c in (";", "|", "&", "\n"):
+            if c == "\n":
+                in_comment = False  # a comment ends at the newline, never past it
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
@@ -417,14 +536,19 @@ def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bo
     so its ``|`` still counts. Used by the run_in_background guard: a piped background
     command's stdout is swallowed, so ONLY a genuine streamed pipe should block it.
 
-    Residual (accepted for a CONVENIENCE guard — friction, not a sandbox): the quote
-    model still mirrors ``split_segments``, so a quote that is backslash-escaped OUTSIDE
+    Residual (accepted for a CONVENIENCE guard — friction, not a sandbox): this scanner
+    has NO unquoted-backslash branch, so a quote that is backslash-escaped OUTSIDE
     quotes (``printf %s \\"foo | cat``), a stray quote char in a ``#`` comment or a
     ``<<EOF`` heredoc body, or a ``|`` in a ``case`` pattern can MISread — OVER-reading
     (``case`` ``|`` looks like a pipe) or UNDER-reading (a swallowed quote hides a later
     pipe). Never a security bypass either way (an over-read is a reworked command, an
     under-read re-exposes the empty-output footgun this guard usually prevents); closing
-    these fully is the unbounded quote-parsing tail shared with ``split_segments``.
+    these fully is the unbounded quote-parsing tail. It no longer MIRRORS
+    ``split_segments`` — that scanner learned the escape and this one deliberately did
+    not, since both consumers here are convenience guards where the accepted-residual
+    argument above already holds. Deliberately left divergent rather than changed for
+    symmetry: a second scanner edit would need its own measurement to earn the same
+    argument, and this one has nothing to gain from it.
 
     ``count_substitutions`` inverts the ``$( … )`` rule, and exists because the two
     consumers need OPPOSITE answers about the same syntax. The background-output guard
@@ -801,7 +925,8 @@ def analyze(command: str) -> list[Segment]:
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
-        argv = _strip_wrappers(_argv(seg.argv_src))
+        src_argv = _argv(seg.argv_src)
+        argv = _strip_wrappers(src_argv)
         exe = _basename(argv[0]) if argv else ""
         out.append(
             Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
@@ -811,6 +936,9 @@ def analyze(command: str) -> list[Segment]:
             script = _nested_script(argv)
             if script:
                 nested.append(script)
+        reparsed = _eval_input(src_argv, argv)
+        if reparsed:
+            nested.append(reparsed)
         # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
         # expansion redirect target, so a nested command stays visible to the guards.
         nested.extend(_substitutions(raw))
@@ -908,6 +1036,46 @@ def _substitutions(text: str) -> list[str]:
                 continue
         i += 1
     return subs
+
+
+def _eval_input(src_argv: list[str], argv: list[str]) -> str:
+    """The string ``eval`` re-parses as shell input, or '' when there is no eval.
+
+    ``help eval``: it CONCATENATES ITS ARGUMENTS WITH SPACES and executes the
+    result as shell input. So the second parse sees a string, and characters the
+    first parse settled as literal data become syntax again:
+
+        eval echo ok \\; pytest tests/    -> first parse: `\\;` is a literal ';'
+                                         -> second parse: ';' SEPARATES, and
+                                            `pytest tests/` runs
+        eval "echo ok; pytest tests/"    -> first parse: one quoted word
+                                         -> second parse: two commands
+
+    Both shapes hid an executed command from every consumer, because a segment
+    list built from the FIRST parse is a complete answer only for a command that
+    is parsed once. `\\|` and `\\&` behave identically (Codex P2, PR #1615).
+
+    THE SPACE-JOIN IS NOT AN APPROXIMATION — it is what bash does, including the
+    word-splitting people are surprised by: `eval rm "$HOME/my dir"` really does
+    re-split at the space and remove two paths. Reconstructing it any more
+    "carefully" would model a shell that does not exist.
+
+    Returns '' unless a leading prefix word was literally ``eval``, so nothing
+    else pays for this. Termination: the reconstruction drops the ``eval`` token,
+    so each recursion is strictly shorter and a chain (``eval eval eval x``)
+    unwinds rather than loops.
+    """
+    if not argv:
+        return ""
+    # `argv` is `src_argv` with prefix material stripped; find where it starts so
+    # the check is on words that really ARE prefixes, not on an `eval` sitting in
+    # an operand (`grep eval file` must not reparse anything).
+    start = len(src_argv) - len(argv)
+    if start <= 0 or src_argv[start:] != argv:
+        return ""
+    if not any(_basename(tok) == "eval" for tok in src_argv[:start]):
+        return ""
+    return " ".join(argv)
 
 
 def _nested_script(argv: list[str]) -> str:

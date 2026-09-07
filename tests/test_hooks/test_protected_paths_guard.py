@@ -326,3 +326,232 @@ class TestQuotedParenRedirectTargetRegression:
         assert r.returncode == 0, (
             f"benign command wrongly blocked: out={r.stdout!r} err={r.stderr!r}"
         )
+
+
+class TestExecutionPrefixesDoNotHideTheTarget:
+    """A deletion behind `eval`/`sudo`/… is not a command this guard has read.
+
+    ``analyze()`` reports the PREFIX as the segment's exe, so a protected
+    deletion behind one was skipped entirely — no `rm` segment, nothing to
+    check, allowed. That was masked for exactly one spelling: before the
+    continuation fold landed, a backslash-newline mis-split the command and the
+    real deletion fell into its own segment, where the guard did see it.
+    Folding correctly removed that accident, which is what exposed the gap.
+
+    The gap is older and wider than the accident. The JOINED spelling was never
+    covered at all, on this revision or its parent — so the fold does not create
+    a hole, it stops papering over two spellings of one that already existed.
+
+    Two mechanisms, because one is not enough and saying so is the point.
+
+    RESOLUTION handles the prefixes that pass argv through unchanged: they get an
+    entry in ``shell_parse._WRAPPER_SPEC``, ``analyze()`` reports the wrapped
+    executable, and the ordinary rm/rmdir branch sees the deletion. Exact, and it
+    improves every consumer of the parser rather than this guard alone. But a
+    table is a WHITELIST and therefore fails OPEN on its complement, which is
+    open-ended — ``setpriv``, ``systemd-run``, ``unshare``, ``flock``,
+    ``runuser`` and others run a command and are not in it.
+
+    So a CONSERVATIVE CHECK covers the complement: where a segment's executable
+    is itself a known prefix (nothing was unwrapped) or its leading word
+    re-parses its argument (no table can unwrap it), the guard declines to
+    certify and falls back to the whole-command check it already uses for an
+    untokenizable command. That only refuses when a protected path is actually
+    present, so an ordinary prefixed command is untouched.
+
+    The narrowness is load-bearing and was MEASURED, not assumed. An earlier
+    revision fired whenever the leading word was any prefix, and refused four
+    ordinary commands — searching a protected directory for a pattern, reading a
+    file in one, listing one. Firing on a prefix the parser ALREADY resolved buys
+    nothing: it tells us exactly what runs, and if that is not a deletion there is
+    nothing to be conservative about.
+    """
+
+    @pytest.mark.parametrize(
+        "prefix",
+        ["eval", "sudo", "env", "command", "exec", "timeout 5", "xargs", "nice"],
+    )
+    def test_a_protected_deletion_behind_a_prefix_is_refused(self, prefix, fake_home):
+        r = _run(f"{prefix} rm -rf {H}/genesis/data", fake_home)
+        assert r.returncode == 2, (
+            f"{prefix!r} hid a protected deletion: out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_the_continuation_spelling_is_refused_too(self, fake_home):
+        # The shape the cross-model review reported: the fold joins these, so the
+        # guard must not depend on the old mis-split to notice the target.
+        r = _run(f"eval \\\nrm -rf {H}/genesis/data", fake_home)
+        assert r.returncode == 2, f"out={r.stdout!r} err={r.stderr!r}"
+
+    def test_a_prefix_without_a_protected_path_is_still_allowed(self, fake_home):
+        # The over-block control, and it is the load-bearing one: without it,
+        # "refuse everything behind a prefix" would score green on every case
+        # above while making the guard useless.
+        r = _run("eval echo hello && sudo systemctl status a-service", fake_home)
+        assert r.returncode == 0, f"benign prefixed command blocked: err={r.stderr!r}"
+
+    def test_a_prefix_deleting_an_unprotected_path_is_still_allowed(self, fake_home):
+        r = _run(f"eval rm -rf {H}/scratch/build", fake_home)
+        assert r.returncode == 0, f"benign prefixed deletion blocked: err={r.stderr!r}"
+
+    @pytest.mark.parametrize(
+        "label,cmd_tpl",
+        [
+            # Shapes NO wrapper table can resolve: each arrives as one opaque
+            # token, or puts something other than the executable at argv[0].
+            ("reparsed-single-quoted", "eval '{RM} -rf {H}/genesis/data'"),
+            ("reparsed-double-quoted", 'eval "{RM} -rf {H}/genesis/data"'),
+            ("compound-body", "coproc NAME {{ {RM} -rf {H}/genesis/data; }}"),
+            # Prefixes absent from the table entirely — the open complement that a
+            # whitelist structurally cannot cover.
+            ("unlisted-setpriv", "setpriv --reuid 0 {RM} -rf {H}/genesis/data"),
+            ("unlisted-systemd-run", "systemd-run {RM} -rf {H}/genesis/data"),
+            ("unlisted-unshare", "unshare -m {RM} -rf {H}/genesis/data"),
+            # Deliberately NOT given a table entry: this one re-roots the
+            # filesystem, so resolving it would hand a path guard operands that
+            # mean something else. Refused rather than resolved.
+            ("reroots-the-filesystem", "chroot --skip-chdir /nr {RM} -rf {H}/genesis/data"),
+        ],
+        ids=[
+            "reparsed-single-quoted",
+            "reparsed-double-quoted",
+            "compound-body",
+            "unlisted-setpriv",
+            "unlisted-systemd-run",
+            "unlisted-unshare",
+            "reroots-the-filesystem",
+        ],
+    )
+    def test_an_unresolvable_prefix_is_refused_not_certified(self, label, cmd_tpl, fake_home):
+        """The complement of the wrapper table — where a whitelist fails open.
+
+        Every shape here runs a real deletion under bash and resolves to something
+        that is not ``rm``, so the ordinary branch skips it. Each was MEASURED as
+        allowed before this change. They are covered by the conservative check
+        rather than by resolution, which is the whole reason that check exists.
+
+        ``coproc NAME <simple command>`` is deliberately NOT in this table. An
+        earlier revision locked it as residue, on the belief that the name occupies
+        the command position. Bash does not do that — measured, that spelling
+        reports ``NAME: command not found`` and runs nothing, so it is a non-event
+        rather than a bypass and locking it asserted nothing at all. The compound
+        form above is the named spelling that actually executes.
+        """
+        cmd = cmd_tpl.format(RM="rm", H=H)
+        r = _run(cmd, fake_home)
+        assert r.returncode == 2, (
+            f"{label}: an unresolvable prefix must be refused, not certified. "
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "label,cmd_tpl",
+        [
+            ("search-a-protected-dir", "sudo grep -r '{RM} -rf' {H}/genesis/data"),
+            ("git-log-grep", "env git -C {H}/genesis/data log --grep='{RM} -rf'"),
+            ("read-a-file-there", "timeout 5 cat {H}/genesis/data/notes.md  # {RM} later"),
+            ("list-the-directory", "eval ls -la {H}/genesis/data"),
+            ("find-by-name", "nice find {H}/genesis/data -name '*.{RM}'"),
+        ],
+        ids=[
+            "search-a-protected-dir",
+            "git-log-grep",
+            "read-a-file-there",
+            "list-the-directory",
+            "find-by-name",
+        ],
+    )
+    def test_a_resolved_prefix_over_a_protected_path_is_still_allowed(
+        self, label, cmd_tpl, fake_home
+    ):
+        """A prefix the parser RESOLVED tells us what runs — do not second-guess it.
+
+        These decide whether the conservative check is narrow enough to ship. Each
+        contains BOTH a deletion word and a protected path behind a prefix, which
+        is exactly what the fallback keys on, while deleting nothing. The parser
+        resolves the prefix, the resolved executable is not a deletion, and so
+        there is nothing left to be conservative about.
+
+        MEASURED, and this is why the trigger is not simply "leading word is a
+        prefix": an earlier revision used that broader rule and refused four of
+        these five. Firing on a prefix the parser already resolved buys no
+        coverage and costs ordinary commands.
+        """
+        cmd = cmd_tpl.format(RM="rm", H=H)
+        r = _run(cmd, fake_home)
+        assert r.returncode == 0, f"{label}: a resolved prefix was over-blocked. err={r.stderr!r}"
+
+
+class TestTheConservativeCheckIsPerSegment:
+    """Three ways a WHOLE-COMMAND question let a real deletion through.
+
+    The conservative check landed asking its questions of the command line
+    rather than of each segment, and a cross-model review found one bypass per
+    question. They are one defect: a command is a LIST of things that run, and a
+    predicate over the list cannot answer "is THIS one safe".
+
+    Each test below pairs the bypass with the shape it must not start blocking,
+    because every one of these fixes widens a refusal.
+    """
+
+    def test_an_unrelated_deletion_earlier_on_the_line_does_not_excuse_a_later_one(
+        self, fake_home
+    ):
+        """"Does ANY segment resolve to rm?" — one harmless deletion in /tmp
+        answered yes and switched the fallback off for every other segment, so
+        the deletion behind the prefix was never examined."""
+        r = _run(f"rm /tmp/harmless; setpriv --no-new-privs rm -r {H}/genesis/data", fake_home)
+        assert r.returncode == 2, f"a resolved rm excused a hidden one: err={r.stderr!r}"
+
+    def test_the_prefixed_branch_sees_an_ANCESTOR_not_just_a_literal_alias(self, fake_home):
+        """A substring scan looks for the protected path's own spelling, so by
+        construction it cannot see the operand forms `_operand_blocks` exists
+        for. `$HOME` names no protected directory and removes all of them."""
+        r = _run(f"setpriv --no-new-privs rm -r {H}", fake_home)
+        assert r.returncode == 2, f"an ancestor deletion passed: err={r.stderr!r}"
+
+    def test_the_prefixed_branch_sees_a_GLOB_target(self, fake_home):
+        """The other operand form a substring scan cannot express."""
+        r = _run(f"setpriv --no-new-privs rm -rf {H}/genesis/da*", fake_home)
+        assert r.returncode == 2, f"a glob deletion passed: err={r.stderr!r}"
+
+    def test_a_prefixed_deletion_INSIDE_a_nested_script_is_seen(self, fake_home):
+        """"Top-level segments only" skipped exactly the segments `analyze()`
+        works to surface: `sh -c '…'` yields its inner command at depth 1."""
+        r = _run(f"bash -c 'setpriv --no-new-privs rm -r {H}/genesis/data'", fake_home)
+        assert r.returncode == 2, f"a nested prefixed deletion passed: err={r.stderr!r}"
+
+    def test_prose_in_a_heredoc_is_STILL_not_scanned(self, fake_home):
+        """THE reason the depth filter existed, and why it is kept on the
+        substring branch alone.
+
+        MEASURED when it was absent: a 40,925-character heredoc writing a plan
+        document was refused, because two lines deep inside the prose began with
+        a shell name. Reading the OPERANDS of a deletion that is really in the
+        argv is a different act from scanning text for a path — the first is now
+        allowed at any depth, the second still is not.
+        """
+        body = "\n".join(
+            [
+                "setpriv is one way to run a command under reduced privileges.",
+                f"Never point it at {H}/genesis/data.",
+                "eval is another, and is worse.",
+            ]
+        )
+        r = _run(f"cat > /tmp/plan.md <<'EOF'\n{body}\nEOF\nrm /tmp/scratch", fake_home)
+        assert r.returncode == 0, f"heredoc prose was scanned: err={r.stderr!r}"
+
+    def test_an_unmodeled_prefix_over_a_protected_path_with_no_deletion_is_allowed(
+        self, fake_home
+    ):
+        """The over-block control for the widened branch. `setpriv` is not in the
+        wrapper table, so nothing is resolved and the segment reaches the new
+        code — with no deletion word in it, nothing may be refused."""
+        r = _run(f"setpriv --no-new-privs grep -r needle {H}/genesis/data", fake_home)
+        assert r.returncode == 0, f"a read behind an unmodeled prefix blocked: err={r.stderr!r}"
+
+    def test_a_prefixed_deletion_of_an_UNPROTECTED_path_is_allowed(self, fake_home):
+        """The other half of the control: the new branch must decide on the
+        TARGET, not on the presence of a prefix plus a deletion."""
+        r = _run(f"setpriv --no-new-privs rm -rf {H}/scratch/build", fake_home)
+        assert r.returncode == 0, f"a benign prefixed deletion blocked: err={r.stderr!r}"
