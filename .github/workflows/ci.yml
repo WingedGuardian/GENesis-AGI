@@ -448,6 +448,22 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  atomic-write-check:
+    # An atomic write that orphans its temp on the exception path leaks a file
+    # into a directory nothing sweeps. MEASURED 2026-09-07: 55 sites, 31 dirty --
+    # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
+    # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 32
+    # cannot arrive silently while the existing 31 are fixed.
+    # See scripts/check_atomic_writes.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Atomic-write temp-file guard
+        run: python scripts/check_atomic_writes.py
+
   frozen-clock-check:
     # A test that captures a wall clock at IMPORT time gives the whole suite's
     # runtime to burn its safety margin, then fails on slow runners as an
