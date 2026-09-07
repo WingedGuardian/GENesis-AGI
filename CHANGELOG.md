@@ -41,6 +41,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **A capability can no longer earn standing autonomy just by existing.**
+  Genesis's per-capability trust cells can be promoted from "ask me every time"
+  to a standing grant once a capability accumulates approved successes. That
+  promotion path was scoped by evidence but not by capability: any future
+  capability whose cells recorded five approved successes would have been
+  offered to you for promotion, and approving it would have converted
+  per-action approval into standing authority. The same was true of anything
+  money-related: Genesis's own definition calls financial actions
+  "never trust-unlockable", but nothing actually stopped a financial capability
+  being promoted -- it was held back only by the order of two statements in the
+  email path. Promotion now requires passing two fixed bars: the capability must
+  be on a short allowlist (email only today) and must not be financial, checked
+  both where candidates are proposed and at the state change itself. Everything
+  else stays at ask-me-every-time for its whole life -- still learning, still
+  tracking evidence, but never converting that into a standing grant without a
+  deliberate code change. No behaviour change for ordinary email sends.
+
 - **The session charter now lists every open ledger item, not just the oldest
   six.** The ledger is a curated list of one-line to-dos, and the old window
   meant a session with more than six open items never saw a newly added one in

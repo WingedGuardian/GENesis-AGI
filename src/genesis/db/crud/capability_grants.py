@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import aiosqlite
 
-from genesis.autonomy.capabilities import transition
+from genesis.autonomy.capabilities import InvalidTransition, transition
 from genesis.autonomy.types import CellEvent, CellState, RiskClass
 
 #: Owner-approved-promotion bar (mirrors the legacy L-threshold): a cell is
@@ -32,6 +32,37 @@ PROMOTE_THRESHOLD = 0.70
 #: Minimum approved successes before a cell may be PROPOSED for promotion —
 #: closes the low-N trap (one lucky success is not earned trust).
 MIN_PROMOTE_N = 5
+
+#: Channel-domains whose cells may reach GRANTED (standing autonomy).  An
+#: ALLOWLIST on purpose: promotion is the one transition that converts
+#: per-action approval into a standing grant, so a domain stays non-promotable
+#: until someone DECIDES otherwise in code.  A denylist would grant that
+#: conversion to every future capability by default — i.e. by being forgotten.
+#: Cells outside this set stay at ASK for their whole life: they still classify,
+#: still accumulate evidence, and still gate every single action on the owner.
+#: Deliberately not config-driven — arming a capability for standing autonomy is
+#: a reviewed code change, never a YAML edit.
+PROMOTABLE_DOMAINS: frozenset[str] = frozenset({"email"})
+
+
+def is_promotable_cell(domain: str, risk_class: str) -> bool:
+    """Whether this cell may EVER hold standing autonomy (GRANTED).
+
+    Two independent bars, both closed sets:
+
+    * the DOMAIN must be allowlisted (above); and
+    * the RISK CLASS must not be FINANCIAL.  ``RiskClass``'s own docstring
+      calls financial "hardline — never trust-unlockable", but nothing
+      enforced that: financial cells stayed out of the matrix only because
+      ``email_gate.check`` holds them BEFORE the first CLASSIFY — one
+      caller's statement ordering, not a mechanism.  A financial cell
+      created by any other path would have been promotable.
+
+    One predicate rather than two, deliberately: a second, weaker one is
+    what a future call site reaches for by accident.
+    """
+    return domain in PROMOTABLE_DOMAINS and risk_class != RiskClass.FINANCIAL.value
+
 
 #: Consequence weights by risk_class (WS-8 PR-D).  A correction's damage to a
 #: cell's RE-earn posterior is severity-proportional.  GATE-DERIVED from the
@@ -212,6 +243,19 @@ async def apply_event(
         # state machine's default when no cell exists.
         row = await get_cell(db, domain, verb, risk_class)
         return CellState(row["state"]) if row else CellState.NOT_DETERMINED
+    if event is CellEvent.APPROVE and not is_promotable_cell(domain, risk_class):
+        # (ASK, APPROVE) is the ONLY edge into GRANTED, and this is the only
+        # call of transition() that can carry it — so refusing HERE is the
+        # mechanism, not a convention every promotion path has to remember.
+        # Raises rather than reporting the unchanged state: the sole caller
+        # (ego/cell_promotion) reads a swallowed refusal as a SUCCESSFUL
+        # promotion, and a gate that lies about what it did is worse than none.
+        # Refuse before ensure_cell so a refused promotion cannot seed a row.
+        raise InvalidTransition(
+            f"cell '{cell_id(domain, verb, risk_class)}' is not promotable — "
+            f"only allowlisted domains, and never FINANCIAL, reach GRANTED "
+            f"(per-action approval only)"
+        )
     row = await ensure_cell(
         db, domain=domain, verb=verb, risk_class=risk_class, updated_at=updated_at
     )
@@ -384,10 +428,12 @@ async def detect_promotable_cells(
 ) -> list[dict]:
     """ASK cells with enough evidence to PROPOSE for owner-approved promotion.
 
-    A cell qualifies when it has ≥ ``min_successes`` approved successes AND its
-    severity-weighted re-earn posterior is ≥ ``threshold``.  Recommend-only:
-    this never promotes — it surfaces candidates for the cadence to propose and
-    the owner to approve.  Each returned row carries a computed ``posterior``.
+    A cell qualifies when it is promotable at all (``is_promotable_cell`` —
+    allowlisted domain, not FINANCIAL), it has ≥ ``min_successes`` approved
+    successes, AND its severity-weighted
+    re-earn posterior is ≥ ``threshold``.  Recommend-only: this never promotes —
+    it surfaces candidates for the cadence to propose and the owner to approve.
+    Each returned row carries a computed ``posterior``.
     """
     cursor = await db.execute(
         "SELECT * FROM capability_grants WHERE state = ?", (CellState.ASK.value,)
@@ -395,6 +441,8 @@ async def detect_promotable_cells(
     out: list[dict] = []
     for r in await cursor.fetchall():
         row = dict(r)
+        if not is_promotable_cell(row["domain"], row["risk_class"]):
+            continue  # never propose what apply_event would refuse to grant
         if row["successes"] < min_successes:
             continue
         posterior = cell_posterior(

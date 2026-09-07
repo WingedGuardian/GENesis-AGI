@@ -98,6 +98,29 @@ async def handle_cell_promotion_resolution(
     domain, verb, risk = cell
     now = datetime.now(UTC).isoformat()
 
+    # Domain refusal comes FIRST and reports differently: the staleness guard
+    # below says "the evidence changed", which for a non-promotable domain is
+    # false and actively misleading — the evidence was never the reason, and no
+    # amount of new evidence will ever make this cell promotable. That string
+    # reaches the owner (dashboard routes/ego.py -> the proposal's "Response").
+    if not cg.is_promotable_cell(domain, risk):
+        logger.warning(
+            "cell_promotion for %s refused — the cell is not promotable "
+            "(domain not allowlisted, or FINANCIAL)",
+            cell_key,
+        )
+        with contextlib.suppress(Exception):
+            await ego_crud.execute_proposal(
+                db,
+                proposal["id"],
+                status="executed",
+                user_response=(
+                    f"cell promotion refused: {cell_key} cannot hold standing "
+                    f"autonomy — every action stays owner-approved"
+                ),
+            )
+        return False
+
     # Staleness guard: re-fetch THIS cell immediately before promoting (not a
     # batch scan taken moments earlier — that leaves a TOCTOU window for a
     # concurrent correction).  A correction landing between the proposal and the
@@ -130,7 +153,7 @@ async def handle_cell_promotion_resolution(
         return False
 
     try:
-        await cg.apply_event(
+        state = await cg.apply_event(
             db,
             domain=domain,
             verb=verb,
@@ -140,7 +163,11 @@ async def handle_cell_promotion_resolution(
             # WS-3 gate-3: executing an OWNER-approved promotion proposal.
             origin_class="owner",
         )
-        ok = True
+        # Never assume the call transitioned. apply_event also REFUSES without
+        # raising (the gate-3 immunity path returns the unchanged state), and a
+        # refusal reported as "promoted to GRANTED" is a gate lying about what
+        # it did. Read the outcome — that covers exits nobody has written yet.
+        ok = state == CellState.GRANTED
     except Exception:
         logger.warning(
             "cell_promotion apply_event failed for %s",
