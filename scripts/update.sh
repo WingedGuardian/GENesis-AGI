@@ -1801,15 +1801,102 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     # unit leaves the active/activating states the wait stops early - a dead
     # server never answers, and waiting out the window would only delay the
     # rollback it needs. Window is overridable for constrained installs.
-    HEALTH_WINDOW_SECS="${GENESIS_DEPLOY_HEALTH_WINDOW_SECS:-600}"
+    # HOW LONG the window may be is NOT a free choice, and the timeout policy's
+    # "justify a lower value with a specific failure mode" is satisfiable here
+    # with two MEASURED ceilings rather than a guess:
+    #
+    #   1. GUARDIAN COVER. _guardian_pause runs BEFORE the stop (see its call
+    #      site), and its lease covers GUARDIAN_PAUSE_TTL renewed
+    #      GUARDIAN_PAUSE_RENEW_MAX times at TTL/2 - so cover ENDS at
+    #      RENEW_MAX*(TTL/2) + TTL after the pause, and this wait does not even
+    #      START until the stop, merge, bootstrap, migrations and restart are
+    #      done. Outlive that and the host Guardian resumes to find a container
+    #      whose health API is silent: precisely the state this loop is
+    #      deliberately waiting through, and the outage the pause exists to
+    #      suppress (docs/architecture/CURRENT.md, guardian/config.py's
+    #      "set it >= the largest caller TTL").
+    #   2. The autonomy watchdog's own staleness cutoff, which will act on a
+    #      server it considers stale even while this deploy is mid-flight.
+    #
+    # So the ceiling is DERIVED from the guardian constants above rather than
+    # written down twice - raise the cover and this rises with it, which is the
+    # only way the two cannot drift apart. Anyone overriding past the cap is
+    # told what else has to move.
+    HEALTH_GUARDIAN_COVER=$(( GUARDIAN_PAUSE_RENEW_MAX * (GUARDIAN_PAUSE_TTL / 2) + GUARDIAN_PAUSE_TTL ))
+    # Half the cover, leaving the other half for the stop/merge/bootstrap/
+    # migration/restart phases that run before this wait begins.
+    HEALTH_WINDOW_MAX=$(( HEALTH_GUARDIAN_COVER / 2 ))
+    # 15 minutes: three times the slowest boot actually observed (5 min on a
+    # busy machine), and comfortably inside the cap above.
+    HEALTH_WINDOW_SECS="${GENESIS_DEPLOY_HEALTH_WINDOW_SECS:-900}"
     case "$HEALTH_WINDOW_SECS" in
-        ''|*[!0-9]*) HEALTH_WINDOW_SECS=600 ;;  # non-numeric -> default, never a broken gate
+        ''|*[!0-9]*) HEALTH_WINDOW_SECS=900 ;;  # non-numeric -> default, never a broken gate
     esac
+    # STRIP LEADING ZEROS FIRST. Doing the length bound before this judged a
+    # value by its PADDING rather than its magnitude, so a zero-padded 0000180
+    # became the cap - the operator asked for three minutes and got the ceiling.
+    HEALTH_WINDOW_SECS="${HEALTH_WINDOW_SECS#"${HEALTH_WINDOW_SECS%%[!0]*}"}"
+    [ -z "$HEALTH_WINDOW_SECS" ] && HEALTH_WINDOW_SECS=0   # the value was all zeros
+    # NOW bound the magnitude, before any arithmetic: past 2**63 bash wraps, and
+    # a wrap to zero or negative would land on the floor below - silently giving
+    # someone who asked for a huge window the old tight gate.
+    [ "${#HEALTH_WINDOW_SECS}" -gt 6 ] && HEALTH_WINDOW_SECS="$HEALTH_WINDOW_MAX"
+    # `10#` is REDUNDANT-BY-CONSTRUCTION given the strip above, and is kept as
+    # the second half of a pair rather than as an independent guard: the strip
+    # is what makes a padded value read correctly, and this is what still reads
+    # it correctly if a future edit removes the strip. Deleting either one alone
+    # leaves the other covering the octal case, so neither is separately
+    # pinnable - said here instead of asserted in a test that could not fail.
+    HEALTH_WINDOW_SECS=$((10#$HEALTH_WINDOW_SECS))
     [ "$HEALTH_WINDOW_SECS" -lt 180 ] && HEALTH_WINDOW_SECS=180  # never tighter than the old gate
-    HEALTH_DEADLINE=$(( $(date +%s) + HEALTH_WINDOW_SECS ))
+    if [ "$HEALTH_WINDOW_SECS" -gt "$HEALTH_WINDOW_MAX" ]; then
+        echo "  NOTE: health window capped at ${HEALTH_WINDOW_MAX}s — a longer wait outlives the"
+        echo "        host Guardian pause; raise GUARDIAN_PAUSE_RENEW_MAX to extend both."
+        HEALTH_WINDOW_SECS="$HEALTH_WINDOW_MAX"
+    fi
+    # MONOTONIC, not wall clock. `date +%s` is steppable: an NTP correction, a
+    # VM resume or an administrator adjusting the clock during the wait either
+    # stretches it far past the window or expires it early and rolls back a
+    # healthy slow boot.
+    #
+    # The source is chosen ONCE, here, and never re-decided inside the loop.
+    # Deciding per call mixes clock DOMAINS: /proc/uptime reads in the
+    # thousands while an epoch reads in the billions, so a single transient
+    # read failure mid-loop would compare an epoch against an uptime deadline
+    # and exit instantly — a false rollback — while the reverse ordering makes
+    # the wait unbounded.
+    #
+    # A failed read in the chosen domain prints 0, which can never reach the
+    # deadline, so the wait HOLDS rather than ending on a bad reading. It is
+    # deliberately not "the last good value": this runs inside `$(...)`, a
+    # subshell, so nothing it assigns survives the call — any state-carrying
+    # version of this helper would silently do nothing. The attempt cap below
+    # is what bounds the hold.
+    if read -r _ < /proc/uptime 2>/dev/null; then
+        _HEALTH_CLOCK=uptime
+    else
+        _HEALTH_CLOCK=wall
+    fi
+    _health_now() {
+        local _up
+        if [ "$_HEALTH_CLOCK" = wall ]; then
+            date +%s
+        elif read -r _up _ < /proc/uptime 2>/dev/null && [ -n "${_up%%.*}" ]; then
+            printf '%s' "${_up%%.*}"
+        else
+            printf '0'
+        fi
+    }
+    HEALTH_START=$(_health_now)
+    HEALTH_DEADLINE=$(( HEALTH_START + HEALTH_WINDOW_SECS ))
+    # A clock-INDEPENDENT backstop, which the old fixed-attempt loop had for
+    # free and a pure deadline gives up. Each iteration sleeps 15s, so this can
+    # only bind if the clock stops advancing — exactly the case the hold above
+    # creates on a broken /proc read.
+    HEALTH_MAX_ATTEMPTS=$(( HEALTH_WINDOW_SECS / 15 + 2 ))
     HEALTH_UNIT_STATE=""
     attempt=0
-    while [ "$(date +%s)" -lt "$HEALTH_DEADLINE" ]; do
+    while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ] && [ "$(_health_now)" -lt "$HEALTH_DEADLINE" ]; do
         attempt=$((attempt + 1))
         sleep 15
         # --max-time 20: bound a hung connection (server accepts but never
@@ -1822,10 +1909,25 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
             HEALTH_OK=true
             break
         fi
+        # `|| true` stays: `is-active` exits non-zero for inactive/failed while
+        # still PRINTING the state, so the substitution must keep its stdout and
+        # ignore the status. (Writing `VAR=$(...) || VAR=...` instead would fire
+        # the fallback on every failed unit and overwrite a REAL state with a
+        # stale one — the fix for this finding is the empty case below, not the
+        # assignment.) A systemd or user D-Bus hiccup prints nothing, and that
+        # empty result is what must not be read as death.
         HEALTH_UNIT_STATE=$(systemctl --user is-active genesis-server.service 2>/dev/null || true)
         case "$HEALTH_UNIT_STATE" in
             active|activating|reloading)
                 echo "  Attempt $attempt: health endpoint not responding (unit $HEALTH_UNIT_STATE - still booting, waiting)..."
+                ;;
+            '')
+                # Unreadable, not dead. `systemctl --help` documents is-active
+                # as "Check whether units are active" — it makes no claim about
+                # what an execution failure means, so this is not affirmative
+                # evidence and must not end the wait. The old attempt-count loop
+                # kept retrying here; keep that behaviour.
+                echo "  Attempt $attempt: unit state unreadable (systemd/D-Bus busy) - retrying, not concluding..."
                 ;;
             *)
                 echo "  Attempt $attempt: genesis-server unit is '$HEALTH_UNIT_STATE' - it will not come up on its own; stopping the wait."
@@ -1870,7 +1972,13 @@ except Exception:
     fi
 
     if [ "$HEALTH_OK" = "false" ]; then
-        _do_rollback "health endpoint did not respond within ${HEALTH_WINDOW_SECS}s ($attempt attempts, final unit state: ${HEALTH_UNIT_STATE:-unknown})"
+        # Report what the wait ACTUALLY spent, not the budget it was allowed.
+        # The unit-state branch breaks early, so quoting the budget after a 15s
+        # exit states a 900s wait that never happened — and this string is
+        # written to last_update_failure.json, which the recovery path reads.
+        HEALTH_ELAPSED=$(( $(_health_now) - HEALTH_START ))
+        [ "$HEALTH_ELAPSED" -lt 0 ] && HEALTH_ELAPSED=0   # clock read failed mid-wait
+        _do_rollback "health endpoint did not respond after ${HEALTH_ELAPSED}s of a ${HEALTH_WINDOW_SECS}s window ($attempt attempts, final unit state: ${HEALTH_UNIT_STATE:-unknown})"
         exit 1
     fi
     echo ""
