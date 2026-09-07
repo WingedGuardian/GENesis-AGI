@@ -53,6 +53,10 @@ the internals well enough to modify them.
   How learned procedures are stored, recalled, and applied.
 - [Capability Layer](architecture/genesis-v3-capability-layer-addendum.md) —
   Pluggable capability modules for domain-specific features.
+- [Desktop Takeover](architecture/desktop-takeover-design.md) — Authorization
+  design for driving the operator's own desktop. Session consent, classification
+  from observation rather than self-report, and what the gate does not
+  guarantee. The gate is built and has no caller; the loop is not built.
 
 **Resilience**
 
@@ -89,13 +93,10 @@ the internals well enough to modify them.
   Theory as cognitive framework. Meta-prompting, drive adaptation, strategic
   reflection, expanded outreach, research-driven features, procedural decay.
 
-Individual feature specs in `docs/plans/`:
-- [Meta-Prompting](plans/v4-meta-prompting-spec.md)
-- [Signal & Drive Weight Adaptation](plans/v4-signal-drive-weight-adaptation-spec.md)
-- [Strategic Reflection](plans/v4-strategic-reflection-spec.md)
-- [Expanded Outreach](plans/v4-expanded-outreach-spec.md)
-- [Research-Driven Features](plans/v4-research-driven-features-spec.md)
-- [Procedural Confidence Decay](plans/v4-procedural-confidence-decay-spec.md)
+Each of the six features above — meta-prompting, signal and drive-weight
+adaptation, strategic reflection, expanded outreach, research-driven features,
+procedural confidence decay — is specified inside the V4 architecture document.
+There are no separate per-feature spec files in this repository.
 
 ### V5 — Future
 
@@ -103,10 +104,9 @@ Individual feature specs in `docs/plans/`:
   within guardrails. L5-L7 autonomy progression, hybrid agent protocol,
   GWT maturation, safety invariants.
 
-Individual specs in `docs/plans/`:
-- [Autonomy Progression (L5-L7)](plans/v5-autonomy-progression-spec.md)
-- [Hybrid Agent Protocol](plans/v5-hybrid-agent-protocol.md)
-- [Post-V5 Horizon](plans/post-v5-horizon.md)
+Autonomy progression (L5-L7), the hybrid agent protocol and the post-V5 horizon
+are specified inside the V5 architecture document. There are no separate
+per-feature spec files in this repository.
 
 ---
 
