@@ -579,6 +579,372 @@ class TestSmartDeltaFreshness:
         assert "stale-review-override" in msg
 
 
+class TestContributionFetchLivePath:
+    """The PRODUCTION query, with the env seam DELETED.
+
+    Every other test in this file reaches `_pr_contribution` through
+    `_TEST_GH_CONTRIBUTION`, which short-circuits before `subprocess.run` — so
+    the jq filter, the returncode check, the empty-stdout refusal and the shape
+    guards had no coverage at all. That is the seam-hides-the-query shape: the
+    merge-base field these tests depend on is REQUESTED here and nowhere else,
+    and a wrong field name would leave every seamed test green while the feature
+    silently never fired.
+    """
+
+    def _run(self, monkeypatch, *, rc=0, stdout=""):
+        monkeypatch.delenv("_TEST_GH_CONTRIBUTION", raising=False)
+        calls = []
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+            return __import__("subprocess").CompletedProcess(cmd, rc, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake)
+        got = _mod._pr_contribution("b" * 40, "t" * 40, "o/r")
+        return got, calls
+
+    def test_the_query_requests_the_merge_base_and_blob_sha(self, monkeypatch):
+        payload = json.dumps(
+            {"mb": "m" * 40, "status": "ahead", "files": [{"filename": "a.py", "sha": "s"}]}
+        )
+        got, calls = self._run(monkeypatch, stdout=payload)
+        assert got == ("m" * 40, "ahead", [{"filename": "a.py", "sha": "s"}])
+        argv = " ".join(calls[0])
+        assert "compare/" + "b" * 40 + "..." + "t" * 40 in argv
+        for field in ("merge_base_commit.sha", ".status", "filename", "sha"):
+            assert field in argv, f"the production jq no longer requests {field!r}"
+
+    @pytest.mark.parametrize(
+        ("label", "rc", "stdout"),
+        [
+            ("non-zero returncode", 1, '{"mb": "m", "status": "ahead", "files": []}'),
+            ("empty stdout on exit 0", 0, ""),
+            ("whitespace-only stdout", 0, "   \n"),
+            ("valid JSON, wrong shape", 0, "[]"),
+            ("files not a list", 0, '{"mb": "m", "status": "ahead", "files": "oops"}'),
+            ("merge base missing", 0, '{"status": "ahead", "files": []}'),
+            ("merge base empty", 0, '{"mb": "", "status": "ahead", "files": []}'),
+            ("status missing", 0, '{"mb": "m", "files": []}'),
+            ("unparseable JSON", 0, "{not json"),
+        ],
+    )
+    def test_every_degraded_response_is_unreadable(self, monkeypatch, label, rc, stdout):
+        # An exit-0 with no payload is NOT an empty diff. Reading it as one would
+        # manufacture positive evidence of "unchanged" from a degraded response.
+        got, _calls = self._run(monkeypatch, rc=rc, stdout=stdout)
+        assert got is None, f"{label} must be unreadable, not an empty contribution"
+
+
+def _contrib(name, sha, *, additions=5, deletions=0, status="modified"):
+    return {
+        "filename": name,
+        "sha": sha,
+        "additions": additions,
+        "deletions": deletions,
+        "status": status,
+        "previous_filename": None,
+        "has_patch": True,
+    }
+
+
+class TestBaseAdvanceRefinement:
+    """A branch that merges its BASE to catch up acquires every commit the base
+    contributed. The raw ``reviewed...head`` compare cannot tell that from a
+    force-push and reports all of it as unreviewed — so the gate demanded a fresh
+    review of code already reviewed on its own PR.
+
+    MEASURED on live PR #1847: the raw range showed 28 files / 7 commits, of
+    which the branch's own contribution changed in 3. #1690 made catching up
+    MANDATORY for every branch carrying a changelog entry, so this went from
+    incidental to systematic — 15 PRs, 4 of them previously Codex-clean.
+
+    The refinement asks whether the PR's OWN contribution over its base changed,
+    comparing by blob sha. It NARROWS a gate, so every cell below that is not a
+    proven base-advance must still block."""
+
+    BASE = "ba5e" * 10
+
+    MB = "17b0" * 10  # merge base, IDENTICAL on both sides unless a case moves it
+
+    def _setup(self, monkeypatch, before, after, *, raw=None, mb_before=None, mb_after=None,
+               moved=None, moved_status="ahead"):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))
+        # Raw range reads SUBSTANTIAL unless a case says otherwise — that is the
+        # verdict the refinement exists to re-judge.
+        monkeypatch.setenv(
+            "_TEST_GH_COMPARE", raw if raw is not None else _compare_json("ahead", [_code_file()])
+        )
+        monkeypatch.setenv("_TEST_GH_BASE_OID", self.BASE)
+        mb_b = mb_before or self.MB
+        mb_a = mb_after or self.MB
+        seam = {
+            f"{self.BASE[:12]}..{STALE[:12]}": {"mb": mb_b, "status": "ahead", "files": before},
+            f"{self.BASE[:12]}..{HEAD[:12]}": {"mb": mb_a, "status": "ahead", "files": after},
+        }
+        if mb_b != mb_a:
+            # What the BASE itself changed across the move. Absent unless a case
+            # supplies it, so a moved base with no answer fails closed.
+            seam[f"{mb_b[:12]}..{mb_a[:12]}"] = {
+                "mb": mb_b,
+                "status": moved_status,
+                "files": moved or [],
+            }
+        monkeypatch.setenv("_TEST_GH_CONTRIBUTION", json.dumps(seam))
+
+    def test_pure_base_advance_allows_and_binds_head(self, monkeypatch, capsys):
+        same = [_contrib("src/genesis/a.py", "blob1"), _contrib("README.md", "blob2")]
+        self._setup(monkeypatch, same, list(same))
+        block, _msg, verified = _mod._check_codex_reviewed_head("5")
+        assert block is False
+        # TOCTOU: the claim is about exactly this head, so the merge still binds to it.
+        assert verified == HEAD
+        err = capsys.readouterr().err
+        assert "base-advance" in err, "the operator must be told WHY a stale review was allowed"
+
+    def test_a_real_branch_change_still_blocks(self, monkeypatch):
+        before = [_contrib("src/genesis/a.py", "blob1")]
+        after = [_contrib("src/genesis/a.py", "blob2", additions=200)]
+        self._setup(monkeypatch, before, after)
+        block, msg, verified = _mod._check_codex_reviewed_head("5")
+        assert block is True and verified is None
+        assert "SUBSTANTIAL" in msg
+
+    def test_hook_surface_in_the_changed_contribution_still_blocks(self, monkeypatch):
+        # Teeth rule 1: a delta touching the enforcement-hook surface is NEVER
+        # review-trivial, however small. The refinement routes through the SAME
+        # _classify_delta_files, so it cannot acquire a weaker rule than the raw path.
+        # Anchored on a NON-hook path on purpose. A hook path now declines the
+        # rescue outright, one layer earlier — so anchoring here would block for
+        # that reason and prove nothing about the classifier. Two substantial
+        # code files is what only `_classify_delta_files` can judge.
+        before = [
+            _contrib("src/genesis/a.py", "b1", additions=200),
+            _contrib("src/genesis/b.py", "b2", additions=200),
+        ]
+        after = [
+            _contrib("src/genesis/a.py", "b3", additions=200),
+            _contrib("src/genesis/b.py", "b4", additions=200),
+        ]
+        self._setup(monkeypatch, before, after)
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_a_file_dropped_from_the_contribution_counts_as_changed(self, monkeypatch):
+        # The PR used to touch this file and no longer does. It has no record on
+        # the `after` side; dropping it silently would let a removal read as
+        # "nothing changed".
+        before = [_contrib("src/genesis/a.py", "blob1", additions=200)]
+        self._setup(monkeypatch, before, [])
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_an_unreadable_contribution_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))
+        monkeypatch.setenv("_TEST_GH_COMPARE", _compare_json("ahead", [_code_file()]))
+        monkeypatch.setenv("_TEST_GH_BASE_OID", self.BASE)
+        monkeypatch.setenv("_TEST_GH_CONTRIBUTION", "{}")  # neither side resolves
+        block, msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+        assert "SUBSTANTIAL" in msg
+
+    def test_an_unclassifiable_raw_delta_is_NOT_rescued(self, monkeypatch):
+        # Only a DEFINITE "substantial" is re-judged. A None raw verdict is the
+        # fail-closed state — rescuing it with a second read that could itself be
+        # degraded would turn two unknowns into an allow.
+        same = [_contrib("README.md", "blob1")]
+        self._setup(monkeypatch, same, list(same), raw="null")
+        block, msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+        assert "could not be classified" in msg
+
+    def test_an_absent_base_sha_blocks(self, monkeypatch):
+        # Isolates the `if base_sha:` guard. The contribution seam is deliberately
+        # keyed for the EMPTY base too, and with identical content on both sides —
+        # so a build that proceeds without a base would find "nothing changed" and
+        # ALLOW. Without this seeding the downstream None catches it anyway and the
+        # guard's removal survives, which is how a sibling layer hides a missing test.
+        same = [_contrib("README.md", "blob1")]
+        self._setup(monkeypatch, same, list(same))
+        monkeypatch.setenv("_TEST_GH_BASE_OID", "")  # base tip unreadable
+        monkeypatch.setenv(
+            "_TEST_GH_CONTRIBUTION",
+            json.dumps({f"..{STALE[:12]}": same, f"..{HEAD[:12]}": list(same)}),
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "no base tip means no base-advance claim can be made"
+
+    @pytest.mark.parametrize(
+        ("label", "before", "after"),
+        [
+            ("sha absent on both sides", [{"filename": "src/a.py"}], [{"filename": "src/a.py"}]),
+            (
+                "sha null on both sides",
+                [{"filename": "src/a.py", "sha": None}],
+                [{"filename": "src/a.py", "sha": None}],
+            ),
+            (
+                "duplicate filename in one contribution",
+                [{"filename": "src/a.py", "sha": "x"}, {"filename": "src/a.py", "sha": "y"}],
+                [{"filename": "src/a.py", "sha": "x"}],
+            ),
+        ],
+    )
+    def test_an_unreadable_file_identity_withdraws_the_claim(
+        self, monkeypatch, label, before, after
+    ):
+        # MEASURED on this code before the identity check: two ABSENT shas compared
+        # EQUAL, so a genuinely modified file dropped out of the changed set and read
+        # as a base-advance — a stale review allowed on changed code, the one outcome
+        # this refinement must never produce. Triviality is an exception granted on
+        # POSITIVE evidence; an identity that cannot be read is not it.
+        self._setup(monkeypatch, before, after)
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, f"{label}: must not claim a base-advance on unreadable identity"
+
+    # ── The merge base MOVES when a branch catches up, and a blob sha is only
+    #    the RIGHT-hand side of the diff. These pin the left-hand side.
+
+    def test_a_base_change_to_a_file_the_branch_touches_blocks(self, monkeypatch):
+        """The `--ours` revert: identical tip blobs, genuinely different diff.
+
+        Branch edits F; base edits F; the catch-up merge resolves `--ours`,
+        discarding what the base contributed. Every tip blob is unchanged, so a
+        comparison of blobs alone reads it as a pure base-advance and ALLOWS a
+        stale review over a silent revert Codex never saw. Resolving a catch-up
+        conflict this way is routine, and #1690 made catch-up merges mandatory.
+        """
+        same = [_contrib("src/genesis/F.py", "blobX")]
+        self._setup(
+            monkeypatch, same, list(same),
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[_contrib("src/genesis/F.py", "base-side")],  # the base touched F too
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "a base change to a file the branch touches is not a base-advance"
+
+    def test_a_base_change_elsewhere_is_still_a_base_advance(self, monkeypatch):
+        # The control that keeps the feature meaningful: the base moving in files
+        # the branch does not touch is exactly what this refinement exists to allow.
+        same = [_contrib("src/genesis/F.py", "blobX")]
+        self._setup(
+            monkeypatch, same, list(same),
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[_contrib("docs/unrelated.md", "other")],
+        )
+        block, _msg, verified = _mod._check_codex_reviewed_head("5")
+        assert block is False and verified == HEAD
+
+    def test_a_moved_base_with_an_unreadable_move_blocks(self, monkeypatch):
+        same = [_contrib("src/genesis/F.py", "blobX")]
+        # No seam entry for the mb..mb range -> unreadable -> the claim is withdrawn.
+        self._setup(monkeypatch, same, list(same),
+                    mb_before="1111" * 10, mb_after="2222" * 10)
+        monkeypatch.setenv(
+            "_TEST_GH_CONTRIBUTION",
+            json.dumps({
+                f"{self.BASE[:12]}..{STALE[:12]}": {
+                    "mb": "1111" * 10, "status": "ahead", "files": same,
+                },
+                f"{self.BASE[:12]}..{HEAD[:12]}": {
+                    "mb": "2222" * 10, "status": "ahead", "files": list(same),
+                },
+            }),
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_a_hook_surface_path_is_never_rescued_even_when_unchanged(self, monkeypatch):
+        """Identical blob AND status on a guard file — still no rescue.
+
+        This refinement RECONSTRUCTS "what changed" from two base-relative
+        snapshots plus a synthetic identity, where the raw path diffs the two
+        commits directly. GitHub's compare record carries no MODE, so a
+        content-preserving `chmod +x` on a guard keeps its blob and status,
+        never enters `changed`, and never reaches the hook-surface teeth — which
+        the raw path WOULD have caught. That is a regression the refinement
+        introduces, so the enforcement surface is declined outright.
+        """
+        same = [_contrib("scripts/hooks/git_push_guard.py", "sameblob")]
+        self._setup(monkeypatch, same, list(same))
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_a_base_rename_of_a_file_the_branch_touches_blocks(self, monkeypatch):
+        # Rename SOURCES count. The base renamed F -> F2; the branch still
+        # contributes to F. Folding only `filename` would put F2 in moved_names
+        # and miss F entirely — the one place in this feature that did not fold
+        # `previous_filename`, where every sibling helper does.
+        same = [_contrib("src/genesis/F.py", "blobX")]
+        moved = [_contrib("src/genesis/F2.py", "renamed", status="renamed")]
+        moved[0]["previous_filename"] = "src/genesis/F.py"
+        self._setup(
+            monkeypatch, same, list(same),
+            mb_before="1111" * 10, mb_after="2222" * 10, moved=moved,
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_a_base_that_moved_BACKWARDS_is_not_an_advance(self, monkeypatch):
+        # MEASURED against live GitHub: a three-dot compare of a base that moved
+        # backwards reports status "behind" with ZERO files — so the overlap test
+        # finds nothing and would wave the claim through. "The base advanced" only
+        # means something if it actually advanced.
+        same = [_contrib("src/genesis/F.py", "blobX")]
+        self._setup(
+            monkeypatch, same, list(same),
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[], moved_status="behind",
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_two_empty_contributions_are_not_evidence_of_unchanged(self, monkeypatch):
+        # The sibling path already fails closed on an empty `files` (Codex P2,
+        # #1373). A narrowing built on the same shape must not read it the other way.
+        self._setup(monkeypatch, [], [])
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_a_truncated_contribution_blocks(self, monkeypatch):
+        # GitHub caps compare `files` at 300. The cap must be tested on the
+        # FETCHED list — a changed SUBSET is always under it, so checking there
+        # tests nothing while the invisible remainder could hold the real change.
+        wide = [_contrib(f"src/genesis/f{i}.py", "same") for i in range(300)]
+        self._setup(monkeypatch, wide, list(wide))
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_a_status_change_with_an_identical_blob_still_counts_as_changed(
+        self, monkeypatch
+    ):
+        """Blob sha encodes bytes, not mode — so identity folds in `status`.
+
+        Anchored on a SUBSTANTIAL non-hook change. A same-blob record whose
+        status differs must land in the CHANGED set, and a 200-line file is what
+        makes that observable as a block. A hook path would block one layer
+        earlier (the surface is never rescued), so it would pass with the
+        identity broken and prove nothing.
+        """
+        before = [_contrib("src/genesis/big.py", "sameblob", additions=200,
+                           status="modified")]
+        after = [_contrib("src/genesis/big.py", "sameblob", additions=200,
+                          status="changed")]
+        self._setup(monkeypatch, before, after)
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+    def test_identical_filenames_with_differing_blobs_are_changed(self, monkeypatch):
+        # The reason this compares blob SHAs and not additions/deletions: an edit
+        # preserving both counts would otherwise read as unchanged.
+        before = [_contrib("src/genesis/a.py", "blob1", additions=200, deletions=200)]
+        after = [_contrib("src/genesis/a.py", "blob2", additions=200, deletions=200)]
+        self._setup(monkeypatch, before, after)
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True
+
+
 class TestMainLevelIntegration:
     """main()-level wiring: TOCTOU binding enforcement + sigil decoupling.
 
