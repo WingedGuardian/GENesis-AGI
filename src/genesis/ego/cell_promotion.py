@@ -103,7 +103,7 @@ async def handle_cell_promotion_resolution(
     # false and actively misleading — the evidence was never the reason, and no
     # amount of new evidence will ever make this cell promotable. That string
     # reaches the owner (dashboard routes/ego.py -> the proposal's "Response").
-    if not cg.is_promotable_cell(domain, risk):
+    if not cg.is_promotable_cell(domain, verb, risk):
         logger.warning(
             "cell_promotion for %s refused — the cell is not promotable "
             "(domain not allowlisted, or FINANCIAL)",

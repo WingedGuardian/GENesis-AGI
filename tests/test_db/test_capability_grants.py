@@ -408,12 +408,46 @@ class TestPromotableDomains:
     async def test_allowlist_contents_are_pinned(self):
         # Adding a domain here hands it standing autonomy — that must be a
         # deliberate act with a test to change, never a quiet import.
-        assert sorted(cg.PROMOTABLE_DOMAINS) == ["email"]
-        assert cg.is_promotable_cell("email", "standard") is True
-        assert cg.is_promotable_cell("widget", "standard") is False
+        assert sorted(cg.PROMOTABLE_CELLS) == [("email", "send")]
+        assert sorted(cg.PROMOTABLE_DOMAINS) == ["email"]  # derived, never declared
+        assert cg.is_promotable_cell("email", "send", "standard") is True
+        assert cg.is_promotable_cell("widget", "poke", "standard") is False
         # FINANCIAL is hardline in an ALLOWLISTED domain too — RiskClass calls
         # it "never trust-unlockable", and this is what makes that true.
-        assert cg.is_promotable_cell("email", "financial") is False
+        assert cg.is_promotable_cell("email", "send", "financial") is False
+
+    async def test_a_new_verb_under_an_allowlisted_domain_is_not_promotable(self, db):
+        """The allowlist is keyed on (domain, verb), not domain alone.
+
+        A cell's identity is (domain, verb, risk_class), so a domain-only bar
+        would be COARSER than the invariant the constant states: a future
+        `email:forward` path would inherit promotion eligibility the moment it
+        banked five successes, with no edit to the allowlist and no tripwire
+        firing. Inert when written — `send` was email's only verb — which is
+        why it was worth closing before a second verb made it live.
+        Found by cross-model review of PR #1838.
+        """
+        assert cg.is_promotable_cell("email", "forward", "standard") is False
+        assert cg.is_promotable_cell("email", "send", "standard") is True  # control
+
+        now = "2026-06-21T00:00:00+00:00"
+        await cg.apply_event(
+            db, domain="email", verb="forward", risk_class="standard",
+            event=CellEvent.CLASSIFY, updated_at=now, origin_class="owner",
+        )
+        for _ in range(10):
+            await cg.record_success(
+                db, domain="email", verb="forward", risk_class="standard",
+                updated_at=now, origin_class="owner",
+            )
+        cands = {(c["domain"], c["verb"]) for c in await cg.detect_promotable_cells(db)}
+        assert ("email", "forward") not in cands
+
+        with pytest.raises(InvalidTransition):
+            await cg.apply_event(
+                db, domain="email", verb="forward", risk_class="standard",
+                event=CellEvent.APPROVE, updated_at=now, origin_class="owner",
+            )
 
     @pytest.mark.asyncio
     async def test_detect_promotable_excludes_non_promotable_domain(self, db):

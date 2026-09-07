@@ -542,6 +542,22 @@ class MemoryStore:
                     "Failed to create succeeded_by link %s → %s: %s",
                     old_id, new_id, link_exc,
                 )
+        else:
+            # The CRUD create does not invalidate (its callers do, by
+            # convention) — and this caller previously didn't either, so every
+            # supersede left the cached graph missing the succeeded_by edge
+            # until some unrelated write invalidated it. One of the two known
+            # invalidation gaps from the graph-store consumer map (issue #1641).
+            # Scope: this flips THIS process's projection (the MCP child, which
+            # hosts the traverse readers most affected); cross-process readers
+            # rebuild on their own invalidations — the DB-generation token that
+            # closes that fully is future seam work (#1641).
+            try:
+                from genesis.memory.graph import invalidate_graph_cache
+
+                invalidate_graph_cache()
+            except ImportError:
+                pass
 
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.

@@ -178,6 +178,16 @@ def api_key_health(
         cb_state, cb_reason = cb_by_type.get(ptype, ("closed", None))
         entry["cb_state"] = cb_state
         entry["cb_reason"] = cb_reason
+        # Short operator label, rendered by the dashboard instead of re-deriving
+        # the mapping in Alpine. The template previously carried its own
+        # `cb_reason === 'quota_exhausted' ? … : 'API down'` ternary — a second
+        # copy of this decision, which drifted the moment a category was added
+        # and which no Python test could ever catch.
+        entry["cb_label"] = (
+            _CB_SHORT_LABEL.get(cb_reason or "", _CB_SHORT_GENERIC)
+            if cb_state == "open"
+            else None
+        )
 
         entry["alert_severity"] = _compute_alert_severity(
             status=entry["status"],
@@ -297,6 +307,56 @@ def _key_health_color(status: str, cb_state: str) -> str:
     return "green"
 
 
+#: Operator wording per breaker category — the SINGLE source of truth, and
+#: EXHAUSTIVE over ``ErrorCategory`` by contract (locked by
+#: ``test_every_error_category_has_an_operator_label``).
+#:
+#: Why a table rather than the ``if cb_reason == "quota_exhausted"`` chain that
+#: was here: that chain named ONE category and sent every other one to the
+#: generic "down (circuit breaker open)". So the day ``NOT_ENTITLED`` was added,
+#: an account-tier fact the operator can fix in a minute began rendering as a
+#: provider outage they cannot — worse than the "credits depleted" the same 403
+#: produced BEFORE the category existed. Nothing failed; a new enum member just
+#: fell into the default arm, silently.
+#:
+#: A category that genuinely reads as an outage belongs in ``_CB_GENERIC``, not
+#: omitted. Absent from BOTH is a test failure, on purpose: adding a category is
+#: then a decision, not an accident.
+_CB_ALERT_BY_CATEGORY: dict[str, tuple[str, str]] = {
+    "quota_exhausted": ("credit_exhaustion", "{p} credits depleted"),
+    # Points at the ACCOUNT, which is the only place this is fixable. The plan
+    # or tier does not include the model; the provider itself is perfectly up.
+    "not_entitled": ("not_entitled", "{p} not included on this plan/tier"),
+}
+
+#: Categories that correctly read as "the provider is unwell". Listed rather
+#: than defaulted, so the set is auditable.
+_CB_GENERIC: frozenset[str] = frozenset(
+    {"transient", "degraded", "permanent", "timeout", "rate_limited", "bad_request"}
+)
+
+_CB_GENERIC_ALERT = ("provider_down", "{p} down (circuit breaker open)")
+
+#: The same decision in the compact form the provider list renders. Keyed by the
+#: same categories so the two cannot disagree; the enumeration test covers both.
+_CB_SHORT_LABEL: dict[str, str] = {
+    "quota_exhausted": "out of credits",
+    "not_entitled": "not on this plan",
+}
+_CB_SHORT_GENERIC = "API down"
+
+
+def cb_alert_for(cb_reason: str | None) -> tuple[str, str]:
+    """``(reason, message_prefix)`` for a breaker category. Never raises.
+
+    An UNKNOWN category (a rollback reading a value a newer build wrote, or one
+    added without updating the table) degrades to the generic outage wording —
+    the test is what stops that being the silent path for a category we ship.
+    """
+    mapped = _CB_ALERT_BY_CATEGORY.get(cb_reason or "")
+    return mapped if mapped else _CB_GENERIC_ALERT
+
+
 def _build_alerts(providers: dict) -> list[dict]:
     """Build attention-strip alerts from enriched provider entries."""
     alerts: list[dict] = []
@@ -312,14 +372,28 @@ def _build_alerts(providers: dict) -> list[dict]:
         seen_types.add(ptype)
 
         cb_reason = info.get("cb_reason")
+        cb_state = info.get("cb_state")
         chain_count = info.get("chain_count", 0)
 
-        if cb_reason == "quota_exhausted":
-            reason = "credit_exhaustion"
-            message = f"{ptype.title()} credits depleted — {chain_count} call site(s) affected"
-        elif info.get("cb_state") == "open":
-            reason = "provider_down"
-            message = f"{ptype.title()} down (circuit breaker open) — {chain_count} call site(s) affected"
+        # `cb_state == "open"` is required, not incidental. `record_failure` sets
+        # `_last_failure_category` on EVERY failure, before the trip threshold is
+        # even checked (circuit_breaker.py:242), so a CLOSED breaker routinely
+        # carries a stale category from a failure that never tripped it. Keying on
+        # the category alone therefore announced "X is not included on this
+        # plan/tier" for a provider whose actual problem was a MISSING API KEY —
+        # the branch below that would have said so never got the chance.
+        #
+        # The old `cb_reason == "quota_exhausted"` arm had the same shape, so this
+        # is not a regression; it is the same latent bug, and this diff rewrote
+        # these exact lines, so leaving it would have been choosing not to fix it.
+        # Cross-model review flagged it at P3 for precisely that reason.
+        # `cb_label` above already gates on open — these two now agree.
+        if cb_state == "open" and cb_reason in _CB_ALERT_BY_CATEGORY:
+            reason, prefix = cb_alert_for(cb_reason)
+            message = f"{prefix.format(p=ptype.title())} — {chain_count} call site(s) affected"
+        elif cb_state == "open":
+            reason, prefix = _CB_GENERIC_ALERT
+            message = f"{prefix.format(p=ptype.title())} — {chain_count} call site(s) affected"
         elif info.get("status") == "missing":
             sole = info.get("sole_sites", [])
             reason = "missing_key"
