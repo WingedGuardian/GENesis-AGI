@@ -281,3 +281,50 @@ async def test_ledger_text_is_normalised_to_one_line_on_both_write_paths(db):
     item = await crud.get_ledger_item(db, added)
     assert "\n" not in item["text"] and "\r" not in item["text"], item["text"]
     assert item["text"] == "another forged row"
+
+
+# ─── ledger_all completeness ─────────────────────────────────────────────────
+
+
+async def test_ledger_all_is_complete_across_page_boundaries(db, monkeypatch):
+    """The report's leak invariant convicts on absence, so a silently
+    truncated read turns "row not seen" into "row not written". ledger_all
+    keyset-paginates internally; a corpus larger than one page must come back
+    whole, in (created_at, id) order — the page is shrunk to 7 so 25 rows
+    genuinely cross several boundaries, including a boundary INSIDE a
+    created_at tie (ten rows per timestamp), where a naive created_at-only
+    keyset would skip or repeat."""
+    import genesis.db.crud.session_charters as mod
+
+    await crud.upsert_stub(db, SID)
+    for i in range(25):
+        await db.execute(
+            "INSERT INTO session_ledger "
+            "(id, session_id, text, status, added_by, created_at) "
+            "VALUES (?, ?, ?, 'open', 'foreground', ?)",
+            (f"id{i:03d}", SID, f"item {i}", f"2026-07-01T00:00:{i // 10:02d}+00:00"),
+        )
+    await db.commit()
+
+    monkeypatch.setattr(mod, "_LEDGER_ALL_PAGE", 7)
+    rows = await mod.ledger_all(db)
+    assert len(rows) == 25, "pagination dropped or duplicated rows"
+    assert len({r["id"] for r in rows}) == 25
+    keys = [(r["created_at"], r["id"]) for r in rows]
+    assert keys == sorted(keys), "keyset order broken"
+
+
+async def test_ledger_all_tripwire_raises_instead_of_truncating(db):
+    """Past the hard cap the only honest answers are ALL or an error — a
+    partial list wearing a complete list's shape is neither."""
+    await crud.upsert_stub(db, SID)
+    for i in range(12):
+        await db.execute(
+            "INSERT INTO session_ledger "
+            "(id, session_id, text, status, added_by, created_at) "
+            "VALUES (?, ?, ?, 'open', 'foreground', ?)",
+            (f"id{i:03d}", SID, f"item {i}", "2026-07-01T00:00:00+00:00"),
+        )
+    await db.commit()
+    with pytest.raises(RuntimeError, match="tripwire"):
+        await crud.ledger_all(db, hard_cap=10)
