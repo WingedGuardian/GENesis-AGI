@@ -68,17 +68,45 @@ FALKORDB_PROVISION_OPT_IN="${GENESIS_FALKORDB_PROVISION:-}"
 FALKORDB_PROVISION_DISABLED="${GENESIS_FALKORDB_PROVISION_DISABLED:-}"
 FALKORDB_LOCAL_CONFIG="${FALKORDB_LOCAL_CONFIG:-$HOME/.genesis/config/genesis.yaml}"
 
-# _falkordb_opted_in — env first, then a `provision: true` under a
-# `graph_engine:` key in the local config. Deliberately a narrow grep rather
-# than a YAML parse: this is a shell fragment with no parser available, and the
-# fail direction is correct — anything it cannot read plainly reads as "no".
+# _falkordb_opted_in — env first, then `provision: true` as a DIRECT child of a
+# TOP-LEVEL `graph_engine:` in the local config. Deliberately a narrow grep
+# rather than a YAML parse: this is a shell fragment with no parser available,
+# and the fail direction is correct — anything it cannot read plainly reads as
+# "no" (flow style, `graph_engine: {provision: true}`, is one such case).
+#
+# The KEY PATH is exact on purpose. This gate authorises adding a third-party
+# apt repo and installing a system package, so it must read consent only where
+# consent was written: `graph_engine:` must start at column 0, and `provision:`
+# must sit at the indentation of the block's first child. Accepting any nested
+# `provision: true` would let an unrelated sub-block — say a per-backend
+# setting — stand in for a system change the operator never agreed to.
 _falkordb_opted_in() {
     [ "$FALKORDB_PROVISION_OPT_IN" = "1" ] && return 0
     [ -r "$FALKORDB_LOCAL_CONFIG" ] || return 1
     awk '
-        /^[[:space:]]*graph_engine[[:space:]]*:/ { in_block = 1; next }
+        function indent_of(line) { match(line, /^[ \t]*/); return RLENGTH }
+        /^graph_engine[[:space:]]*:/ { in_block = 1; child_indent = -1; next }
+        # Any other column-0 key closes the block; graph_engine is top-level,
+        # so the parent indent is always 0 and needs no tracking.
         /^[^[:space:]#]/ { in_block = 0 }
-        in_block && /^[[:space:]]+provision[[:space:]]*:[[:space:]]*(true|yes|on)[[:space:]]*$/ { found = 1 }
+        # Skipped BEFORE the indent is captured: a comment must never define
+        # what "direct child" means, or `# provision: true` would set the depth
+        # that a deeper real key then matches.
+        in_block && /^[[:space:]]*($|#)/ { next }
+        in_block {
+            ci = indent_of($0)
+            if (child_indent < 0) child_indent = ci
+            if (ci == child_indent &&
+                # A trailing comment is still consent -- an operator who
+                # annotates their own config has not withdrawn it. The
+                # SPACE before `#` is required, not decoration. YAML only
+                # starts a comment after a space, so `true#x` is the STRING
+                # "true#x" and must not read as consent; and a TAB there makes
+                # the whole file unparseable to PyYAML (measured), so matching
+                # space-only leaves that case an under-read rather than
+                # granting consent off a config Genesis itself cannot load.
+                $0 ~ /^[[:space:]]*provision[[:space:]]*:[[:space:]]*(true|yes|on)( +#.*)?[[:space:]]*$/) found = 1
+        }
         END { exit(found ? 0 : 1) }
     ' "$FALKORDB_LOCAL_CONFIG" 2>/dev/null
 }
@@ -143,7 +171,7 @@ _falkordb_arch() {
 # actually run would be worse than admitting we have none.
 _falkordb_expected_sha() {
     case "$1/$2" in
-        4.20.4/x64) printf '81ea6b989dc2fd4c9ad905e246018b220b02f0e40c406255f9da4768c1684555' ;;
+        4.20.4/x64) printf '81ea6b989dc2fd4c9ad905e246018b220b02f0e40c406255f9da4768c1684555' ;;  # pragma: allowlist secret  (public release checksum, not a secret)
         *) printf '' ;;
     esac
 }

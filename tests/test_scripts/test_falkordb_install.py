@@ -219,6 +219,56 @@ def test_a_false_config_value_is_not_consent(tmp_path):
         assert not Path(env["FALKORDB_APT_LIST"]).exists(), f"provisioned on: {body!r}"
 
 
+def test_consent_is_read_only_at_the_documented_key_path(tmp_path):
+    """`provision: true` consents only as a DIRECT child of a TOP-LEVEL `graph_engine:`.
+
+    That is the one key path SETUP.md and the skip message name. This gate
+    authorises putting a third-party apt repo on someone's machine, so it must
+    read consent only where consent was written -- a matcher that accepts any
+    nested `provision: true` turns an unrelated sub-block into permission for a
+    system change the operator never agreed to.
+    """
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    not_consent = (
+        # Nested UNDER graph_engine -- `graph_engine.provision` is itself unset.
+        "graph_engine:\n  backends:\n    experimental:\n      provision: true\n",
+        # `graph_engine` nested under something else is a different key path.
+        "unrelated:\n  graph_engine:\n    provision: true\n",
+        # A commented-out value is a decision NOT taken.
+        "graph_engine:\n  # provision: true\n",
+    )
+    for body in not_consent:
+        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
+        result = _run("falkordb_redis_install", env)
+        assert result.returncode == 0, result.stderr
+        assert "opt-in" in result.stdout, f"treated as consent: {body!r}"
+        assert not Path(env["FALKORDB_APT_LIST"]).exists(), f"provisioned on: {body!r}"
+
+
+def test_consent_still_reads_when_it_is_not_the_first_key(tmp_path):
+    """The narrowing must not become an under-read.
+
+    An operator who writes other graph_engine settings -- including a nested
+    block -- before `provision:` has still consented. Without this the fix for
+    the over-read above could silently blind the gate instead of scoping it.
+    """
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(
+        "graph_engine:\n"
+        "  backends:\n"
+        "    experimental: true\n"
+        "  provision: true\n"
+        "memory:\n"
+        "  wing: x\n"
+    )
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert Path(env["FALKORDB_APT_LIST"]).exists(), result.stdout
+
+
 def test_the_module_half_needs_no_consent(tmp_path):
     """It writes one file under ~/.genesis and changes nothing about the system.
 
@@ -424,6 +474,10 @@ def _exec_argv(unit: str) -> str:
     deleting the actual argument left the assertion green (verified by
     mutation). Match the argv, not the prose about the argv.
     """
+    # Say which contract the template broke: without this an ExecStart that
+    # went missing surfaces as a bare IndexError from a slice, which reads as
+    # a broken test rather than a broken unit.
+    assert "ExecStart=" in unit, "unit template has no ExecStart directive"
     body = unit.split("ExecStart=", 1)[1]
     return body.split("\n[", 1)[0]
 
@@ -452,6 +506,7 @@ def test_start_limit_directives_are_in_the_unit_section():
     unit = UNIT_TEMPLATE.read_text()
     # Line-anchored: "[Service]" also appears inside the comment explaining
     # this very rule, so a bare split would cut in the wrong place.
+    assert "\n[Service]\n" in unit, "unit template has no [Service] section"
     unit_section, service_section = unit.split("\n[Service]\n", 1)
     for key in ("StartLimitBurst", "StartLimitIntervalSec"):
         assert key in unit_section, f"{key} must be in [Unit]"

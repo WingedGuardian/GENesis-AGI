@@ -28,6 +28,11 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.infra_profile.collectors._probe import (
+    ProbeFailed,
+    reap,
+    user_bus_present,
+)
 from genesis.infra_profile.types import SectionResult
 
 logger = logging.getLogger(__name__)
@@ -90,10 +95,36 @@ _SYSCTLS = (
 )
 
 
-async def _run_cmd(*argv: str, timeout: float = _CMD_TIMEOUT) -> str | None:
-    """Run a command, return stripped stdout, or None on any failure."""
+async def _run_cmd(
+    *argv: str, timeout: float = _CMD_TIMEOUT, strict: bool = False
+) -> str | None:
+    """Run a command, return stripped stdout, or None.
+
+    `strict=False` (the default, and every legacy caller) collapses "absent"
+    and "failed" into None. That is safe only where a None leaves the facts
+    dict UNCHANGED. Where a None would instead be written INTO a fact -- as a
+    false value or a dropped key -- pass `strict=True`, which raises
+    ProbeFailed for a command that exists but could not be run, and still
+    returns None when the command is simply absent.
+
+    Why it matters: facts are HASHED. Recording a failed probe's non-answer
+    moves the hash, which costs a drift observation plus an LLM annotation
+    regeneration -- once on the way out and again on the way back -- for a
+    hiccup that changed no configuration at all. `service._merge_section`
+    already keeps the prior facts and hash for a non-ok section ("no phantom
+    drift"), so propagating the failure is both cheaper and truer.
+
+    ONLY VALID WHERE A NONZERO EXIT MEANS FAILURE, NOT DATA. Several probes in
+    this file use the exit code to ANSWER: `systemd-detect-virt` exits 1 for
+    "nothing detected" and `systemctl is-enabled` exits 1 for "disabled".
+    Passing `strict=True` at either site would turn a healthy box into a
+    permanently errored section. Check the command's own exit semantics before
+    reaching for this; a probe that answers by exit code needs a tri-state, not
+    this flag.
+    """
     if shutil.which(argv[0]) is None:
         return None
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -102,17 +133,27 @@ async def _run_cmd(*argv: str, timeout: float = _CMD_TIMEOUT) -> str | None:
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+        await reap(proc)
         logger.warning("infra_profile command timed out: %s", " ".join(argv))
+        if strict:
+            raise ProbeFailed(f"{argv[0]} timed out after {timeout}s") from None
         return None
     except OSError as exc:
+        # The child may already exist here: create_subprocess_exec can succeed
+        # and communicate() still fail. Reaping was missing entirely, so every
+        # such failure leaked a process.
+        await reap(proc)
         logger.debug("infra_profile command failed to start (%s): %s", argv[0], exc)
+        if strict:
+            raise ProbeFailed(f"{argv[0]} failed to run: {exc}") from None
         return None
+    except BaseException:
+        # Includes CancelledError, which is not an Exception.
+        await reap(proc)
+        raise
     if proc.returncode != 0:
+        if strict:
+            raise ProbeFailed(f"{argv[0]} exited {proc.returncode}")
         return None
     return stdout.decode(errors="replace").strip()
 
@@ -702,18 +743,42 @@ async def collect_network(
 
 
 async def collect_systemd() -> SectionResult:
-    """genesis-* user units: the LIST + enablement are facts; states are metrics."""
+    """genesis-* user units: the LIST + enablement are facts; states are metrics.
+
+    `strict=True` on the unit LISTING, because its result is written into a
+    hashed fact unconditionally. Without it a failed `systemctl` wrote
+    `units: []` at status ok -- a fact asserting that every Genesis unit had
+    ceased to exist. That is not a quiet inaccuracy: it moves the section hash,
+    so it bills a drift observation plus an LLM annotation regeneration when
+    the units "vanish" and again when they "return", and the drift it reports
+    is the most alarming one this collector can produce.
+
+    A systemctl we cannot ASK is still not an error. Two shapes of that, and
+    the second is the common one: the binary may be absent (no systemd at all),
+    or it may be present with no user manager behind it -- a container built
+    from a systemd-bearing image, a CI runner, any non-login context. MEASURED:
+    `systemctl --user list-unit-files` exits 1 with "Failed to connect to bus"
+    there. Neither box will grow a user manager between refreshes, so `[]` is
+    the true answer for both and raising would error the section permanently.
+    Only a systemctl backed by a reachable bus, which then fails, raises.
+    """
     facts: dict = {}
     metrics: dict = {}
 
-    listing = await _run_cmd(
-        "systemctl",
-        "--user",
-        "list-unit-files",
-        "genesis-*",
-        "--no-legend",
-        "--plain",
-    )
+    try:
+        listing = await _run_cmd(
+            "systemctl",
+            "--user",
+            "list-unit-files",
+            "genesis-*",
+            "--no-legend",
+            "--plain",
+            strict=True,
+        )
+    except ProbeFailed:
+        if user_bus_present():
+            raise
+        listing = None
     units: list[dict] = []
     if listing:
         for line in listing.splitlines():

@@ -22,6 +22,11 @@ import logging
 import shutil
 from pathlib import Path
 
+from genesis.infra_profile.collectors._probe import (
+    ProbeFailed,
+    reap,
+    user_bus_present,
+)
 from genesis.infra_profile.types import SectionResult
 
 logger = logging.getLogger(__name__)
@@ -61,7 +66,21 @@ def _installed_versions(deps_root: Path) -> list[str]:
 
 
 async def _unit_states() -> tuple[str | None, str | None]:
-    """(ActiveState, UnitFileState) in ONE `systemctl show`, or (None, None).
+    """(ActiveState, UnitFileState) in ONE `systemctl show`.
+
+    Returns (None, None) ONLY when there is no systemctl to ask: a box without
+    systemd has no unit state, and that is an answer rather than a failure.
+    A systemctl that EXISTS and then fails RAISES instead, so
+    `collect_falkordb` degrades the whole section.
+
+    That routing is load-bearing, not tidiness. `unit_enabled` is a HASHED
+    fact, and `service._merge_section` keeps the prior facts and hash for a
+    non-ok section — its own comment calls that "no phantom drift". Answering
+    None on a transient failure would instead flip a hashed fact, billing a
+    drift observation plus an LLM annotation regeneration on the way out and
+    again on the way back, for a hiccup that changed no configuration at all.
+    It would also let the posture rule read an all-clear off a state nobody
+    could actually verify.
 
     Both properties come from a single spawn: `show -p A -p B --value` returns
     them newline-separated in request order. Two spawns would double this
@@ -70,26 +89,46 @@ async def _unit_states() -> tuple[str | None, str | None]:
     """
     if shutil.which("systemctl") is None:
         return (None, None)
-    proc = None
+
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "--user", "show", _UNIT,
+        "-p", "ActiveState", "-p", "UnitFileState", "--value",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "systemctl", "--user", "show", _UNIT,
-            "-p", "ActiveState", "-p", "UnitFileState", "--value",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_CMD_TIMEOUT)
     except TimeoutError:
-        if proc is not None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+        await reap(proc)
         logger.warning("infra_profile: systemctl show %s timed out", _UNIT)
-        return (None, None)
-    except Exception:
-        return (None, None)
+        raise ProbeFailed(
+            f"systemctl show {_UNIT} timed out after {_CMD_TIMEOUT}s"
+        ) from None
+    except BaseException:
+        # BaseException deliberately: a CANCELLED refresh still leaves a child,
+        # and CancelledError is not an Exception.
+        await reap(proc)
+        raise
+
+    if proc.returncode != 0:
+        # `systemctl show` exits 0 even for a unit that does not exist
+        # (measured), so a nonzero exit can never mean "absent" — the question
+        # could not be asked at all.
+        #
+        # Split by WHY, the same way `shutil.which` above splits absent from
+        # failed. A box with no user manager has no bus to reach, will not
+        # grow one on the next refresh, and answering "no unit state" for it
+        # is a fact. Erroring the section instead would be permanent, and
+        # would discard four facts we DID read off the filesystem
+        # (unit_present, module_installed, module_versions, socket_path)
+        # because one sub-probe of the same section was unanswerable.
+        if not user_bus_present():
+            return (None, None)
+        logger.warning(
+            "infra_profile: systemctl show %s exited %s", _UNIT, proc.returncode
+        )
+        raise ProbeFailed(f"systemctl show {_UNIT} exited {proc.returncode}")
+
     lines = stdout.decode(errors="replace").splitlines()
     active = lines[0].strip() if len(lines) > 0 else ""
     enabled = lines[1].strip() if len(lines) > 1 else ""

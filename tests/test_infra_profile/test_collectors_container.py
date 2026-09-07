@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import tempfile
+from pathlib import Path
 
 import pytest
 
 from genesis.infra_profile.collectors import container as _container
+from genesis.infra_profile.collectors._probe import ProbeFailed
 from genesis.infra_profile.collectors.container import (
     _keepconf_on_route_link,
     _networkd_manages_link,
@@ -17,6 +21,7 @@ from genesis.infra_profile.collectors.container import (
     collect_network,
     collect_os,
     collect_storage,
+    collect_systemd,
 )
 from genesis.infra_profile.types import STATUS_OK
 
@@ -604,3 +609,187 @@ def test_cc_tmp_marker_fresh_helper():
     assert _container._cc_tmp_marker_fresh(None) is False
     # a naive (tz-less) timestamp is treated as UTC, not crashed
     assert _container._cc_tmp_marker_fresh(now.replace(tzinfo=None).isoformat()) is True
+
+
+# ── _run_cmd: absent is an answer, failed is not ──────────────────────────
+
+
+class _StubProc:
+    """asyncio subprocess stand-in that records whether it was reaped."""
+
+    def __init__(self, *, communicate_error=None, stdout=b"", returncode=0):
+        self._communicate_error = communicate_error
+        self._stdout = stdout
+        self._final_rc = returncode
+        self.returncode = None
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self):
+        if self._communicate_error is not None:
+            raise self._communicate_error
+        self.returncode = self._final_rc
+        return (self._stdout, b"")
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        self.waited = True
+        self.returncode = -9
+        return self.returncode
+
+
+def _stub_cmd(monkeypatch, proc, *, present=True, bus=True, tmp_path=None):
+    """Pin every outside edge: the binary, the spawn, and the user bus.
+
+    `bus` is not optional decoration. `collect_systemd` asks
+    `user_bus_present()` before deciding a failure is real, and that reads
+    `XDG_RUNTIME_DIR` -- so a test that leaves it alone passes or fails
+    according to whether the developer happens to have a user session. That is
+    the same sandbox leak the spawn stub guards against, one layer down.
+    """
+    monkeypatch.setattr(
+        _container.shutil, "which", lambda _n: "/usr/bin/systemctl" if present else None
+    )
+
+    async def _spawn(*_a, **_k):
+        if proc is None:
+            raise AssertionError("test spawned a REAL command -- the sandbox leaked")
+        return proc
+
+    monkeypatch.setattr(_container.asyncio, "create_subprocess_exec", _spawn)
+
+    runtime_dir = (tmp_path or Path(tempfile.mkdtemp())) / "run"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    if bus:
+        (runtime_dir / "bus").touch()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    return proc
+
+
+async def test_run_cmd_strict_separates_an_absent_command_from_a_failed_one(monkeypatch):
+    """The distinction the whole fix turns on.
+
+    A box without `systemctl` genuinely has no units, so None is the true
+    answer and callers may record it. A `systemctl` that exists and then fails
+    tells us nothing, and recording nothing as a fact is what billed a
+    spurious drift plus an annotation regeneration.
+    """
+    _stub_cmd(monkeypatch, None, present=False)
+    assert await _container._run_cmd("systemctl", "--user", strict=True) is None
+
+    _stub_cmd(monkeypatch, _StubProc(returncode=1), present=True)
+    with pytest.raises(ProbeFailed):
+        await _container._run_cmd("systemctl", "--user", strict=True)
+
+
+async def test_run_cmd_stays_lenient_for_every_legacy_caller(monkeypatch):
+    """`strict` defaults off, so the five collectors not touched here are
+    byte-identical in behaviour -- the change is opt-in, not a sweep."""
+    _stub_cmd(monkeypatch, _StubProc(returncode=1), present=True)
+    assert await _container._run_cmd("systemctl", "--user") is None
+
+
+async def test_run_cmd_reaps_its_child_when_communicate_fails(monkeypatch):
+    """The OSError path returned without killing or waiting, so every such
+    failure leaked a process -- on a path that runs on every refresh."""
+    proc = _stub_cmd(monkeypatch, _StubProc(communicate_error=OSError("boom")))
+
+    assert await _container._run_cmd("systemctl", "--user") is None
+
+    assert proc.killed, "child was never killed"
+    assert proc.waited, "child was never reaped"
+
+
+async def test_a_failed_unit_listing_never_reports_zero_genesis_units(monkeypatch, tmp_path):
+    """The defect this fixes, stated as the thing that must not happen.
+
+    `facts["units"]` was assigned unconditionally, so a failed systemctl wrote
+    `[]` at status ok: a hashed fact asserting every Genesis unit had ceased to
+    exist. Raising instead lets `_merge_section` keep the prior facts and hash.
+    """
+    _stub_cmd(monkeypatch, _StubProc(returncode=1), bus=True, tmp_path=tmp_path)
+
+    with pytest.raises(ProbeFailed):
+        await collect_systemd()
+
+
+async def test_no_systemctl_at_all_still_reports_an_empty_unit_list(monkeypatch):
+    """The equivalence lock. Absence must stay an ordinary ok answer, or every
+    non-systemd install flips to a permanently errored section."""
+    _stub_cmd(monkeypatch, None, present=False)
+
+    result = await collect_systemd()
+
+    assert result.status == STATUS_OK
+    assert result.facts["units"] == []
+
+
+async def test_no_user_bus_reports_an_empty_unit_list_rather_than_erroring(
+    monkeypatch, tmp_path
+):
+    """A systemctl with no user manager behind it is unaskable, not broken.
+
+    MEASURED: `systemctl --user list-unit-files` exits 1 with "Failed to
+    connect to bus" in that context. A container from a systemd-bearing image,
+    or any non-login session, is in it -- and will still be on the next
+    refresh, so raising would error the section permanently and, with no prior
+    successful profile, `_merge_section` has no facts to fall back on.
+    """
+    _stub_cmd(monkeypatch, _StubProc(returncode=1), bus=False, tmp_path=tmp_path)
+
+    result = await collect_systemd()
+
+    assert result.status == STATUS_OK
+    assert result.facts["units"] == []
+
+
+async def test_run_cmd_survives_a_spawn_that_raises_before_there_is_a_process(
+    monkeypatch, tmp_path
+):
+    """`TimeoutError` is an `OSError` subclass, so a spawn-time ETIMEDOUT lands
+    in the timeout clause with no process to reap.
+
+    Reaping unguarded there raised AttributeError on None (measured) instead of
+    the intended ProbeFailed -- so the reason for the failure was replaced by a
+    different failure on the way out.
+    """
+    monkeypatch.setattr(_container.shutil, "which", lambda _n: "/usr/bin/systemctl")
+
+    async def _spawn(*_a, **_k):
+        raise TimeoutError("spawn timed out")
+
+    monkeypatch.setattr(_container.asyncio, "create_subprocess_exec", _spawn)
+
+    assert await _container._run_cmd("systemctl", "--user") is None
+    with pytest.raises(ProbeFailed):
+        await _container._run_cmd("systemctl", "--user", strict=True)
+
+
+async def test_run_cmd_reaps_and_reports_on_timeout(monkeypatch, tmp_path):
+    """The timeout branch had no test at all -- the same gap that made the
+    sibling collector's timeout test vacuous."""
+    proc = _stub_cmd(
+        monkeypatch, _StubProc(communicate_error=TimeoutError()), tmp_path=tmp_path
+    )
+
+    with pytest.raises(ProbeFailed, match="timed out"):
+        await _container._run_cmd("systemctl", "--user", strict=True)
+
+    assert proc.killed and proc.waited
+
+
+async def test_run_cmd_reaps_a_cancelled_probe(monkeypatch, tmp_path):
+    """CancelledError is not an Exception -- `except Exception` would leak the
+    child on every cancelled refresh."""
+    proc = _stub_cmd(
+        monkeypatch,
+        _StubProc(communicate_error=asyncio.CancelledError()),
+        tmp_path=tmp_path,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _container._run_cmd("systemctl", "--user")
+
+    assert proc.killed and proc.waited
