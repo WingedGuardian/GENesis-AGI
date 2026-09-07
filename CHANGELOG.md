@@ -49,8 +49,55 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   files; the `redis-server` package and the apt repo are deliberately left in
   place, since other software on the machine may rely on them.
 
+- **Work you agreed to in a session that has since ended no longer goes quiet.**
+  A session's ledger is its list of agreements, and it was only ever visible to
+  that session — so when a session ended with items still open, they stopped
+  being visible to anything. On the install this was built against, 15 items had
+  been sitting undisposed, the oldest for 52 days, and not all of them were
+  internal development work — some were user-facing requests, which is the class
+  most likely to be missed everywhere else.
+
+  An hourly sweep now turns such an item into a follow-up asking what should
+  happen to it — done, absorbed into other work, or no longer needed. It only
+  fires when BOTH the item has gone untouched for five days AND its session has
+  been quiet for five days, so an item you are still working on is never taken
+  out of your hands. Disposing of the item closes the follow-up automatically at
+  the next sweep. Escalations arrive up to five per hour rather than all at once,
+  and they appear in `follow_up_list` and the dashboard follow-ups tab under the
+  source `ledger_escalation` — deliberately not in the morning report, since
+  ledger text is free-form and has contained credentials.
+
+  They arrive unclassified rather than guessed at: the sweep genuinely cannot
+  tell one of your errands from an internal development item, so it asks.
+
+  Tune or disable it with the `ledger_escalation` settings domain (`stale_days`,
+  `quiet_days`, `max_per_run`, `priority`), or turn it off entirely with
+  `GENESIS_LEDGER_ESCALATION_DISABLED=1`.
 ### Fixed
 
+- **A model your account tier cannot use no longer stalls the fallback chain.**
+  When a provider refuses a call because the plan does not include that model,
+  the refusal arrives as an HTTP 403 whose message names the plan or subscription
+  you would need. Those are the same words a genuine "you have used up your
+  allowance" message uses, so the router read the refusal as an exhausted quota
+  and did what that calls for: waited, and tried the same provider again. Since
+  the answer can never change, that wait was spent against the chain's overall
+  time budget for nothing — measured at several seconds on each attempt.
+
+  Entitlement refusals are now recognised on their own terms. The router gives up
+  on that provider immediately and moves to the next one in the chain, and a
+  provider that keeps refusing escalates onto the longer hold-out window instead
+  of levelling off at half an hour. To be exact about what that is worth: the
+  hold-out is identical to the existing one for the first four trips and only
+  pulls ahead during a sustained outage, so the gain is in not re-probing a
+  provider that has been dead for hours — not in the first few minutes.
+
+  The same correction is applied to an exhausted allowance, which had the same
+  problem for the same reason: a spent quota is a billing state, so waiting a
+  few seconds cannot change it either, and the limit usually applies to the
+  whole account rather than one model — so a single walk could pay that wait
+  once per provider it tried. Both now behave the way a rate-limit already did,
+  which is to stop asking and move on.
 - **SECURITY.md described a posture the code left behind two months ago.** The
   security policy told operators to treat the dashboard API as
   "unauthenticated administrative access" and said the dashboard password
@@ -148,6 +195,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A graph backend that cannot answer no longer erases the shield's memory.**
+  "The graph store is unreachable" and "no bridge memories exist" used to look
+  identical — an empty answer — so a missing library or unreachable backend
+  made the nightly centrality pass wipe its cache, and the importance shield
+  then protected nothing until the backend came back AND the pass re-ran.
+  Unavailability is now its own loud signal: the pass keeps the previous
+  bridge-node population standing and says why, while a genuinely empty graph
+  still supersedes stale rows. Two writers also stopped leaving the cached
+  graph stale: superseding a memory now tells the graph about the new
+  succession edge, and the integrity sweep that purges a dead memory's edges
+  now invalidates the cache it just made wrong.
 - **A schema rebuild no longer destroys columns a private fork added.** The
   ledger table rebuild (widening a constraint means rebuilding the table on
   SQLite) copied a hardcoded upstream column list and then dropped the old

@@ -22,6 +22,12 @@ _STATE_FILE = Path.home() / ".genesis" / "circuit_breaker_state.json"
 
 _MAX_OPEN_S = 1800  # 30-minute cap on escalating backoff
 _MAX_QUOTA_OPEN_S = 14400  # 4-hour cap for quota/billing exhaustion
+# Categories that hold the breaker open on the LONG cap: neither an exhausted
+# allowance nor a missing entitlement resolves itself within the 30m default.
+_LONG_OPEN_CATEGORIES = frozenset({
+    ErrorCategory.QUOTA_EXHAUSTED,
+    ErrorCategory.NOT_ENTITLED,
+})
 
 
 
@@ -89,10 +95,17 @@ class CircuitBreaker:
         """Open duration with escalating backoff.
 
         First trip uses base duration; each subsequent trip doubles it.
-        Capped at _MAX_QUOTA_OPEN_S (4h) for quota exhaustion, _MAX_OPEN_S (30m) otherwise.
+        Capped at _MAX_QUOTA_OPEN_S (4h) for quota exhaustion and entitlement
+        denial, _MAX_OPEN_S (30m) otherwise. Both of those clear on a timescale
+        set by an account change, not by a passing outage, so re-probing them on
+        the short cap only buys a doomed attempt 8x more often.
         """
         exponent = max(0, self._trip_count - 1)
-        cap = _MAX_QUOTA_OPEN_S if self._last_failure_category == ErrorCategory.QUOTA_EXHAUSTED else _MAX_OPEN_S
+        cap = (
+            _MAX_QUOTA_OPEN_S
+            if self._last_failure_category in _LONG_OPEN_CATEGORIES
+            else _MAX_OPEN_S
+        )
         return min(self._open_duration_s * (2 ** exponent), cap)
 
     @property
