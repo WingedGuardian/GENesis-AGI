@@ -395,6 +395,63 @@ async def ledger_all(
         last = (batch[-1]["created_at"], batch[-1]["id"])
 
 
+# Resource tripwire for ledger_stale_open, sized from capacity rather than
+# history like ledger_all's: this subset (open/in_progress AND untouched past a
+# threshold) is strictly smaller than the whole table, and 50k of them is far
+# past any plausible ledger — the live table held 15 such rows on 2026-09-06.
+# It RAISES rather than truncating, because the escalation sweep reports how
+# many rows it DEFERRED, and a deferred count computed over a silently partial
+# read is a wrong number that looks right.
+_LEDGER_STALE_HARD_CAP = 50_000
+
+
+async def ledger_stale_open(
+    db: aiosqlite.Connection,
+    *,
+    untouched_before: str,
+    added_by: frozenset[str] | set[str] | tuple[str, ...],
+) -> list[dict]:
+    """Unresolved ledger rows last touched before *untouched_before*, oldest first.
+
+    "Unresolved" is open + in_progress: in_progress means someone started and
+    never finished, which is exactly the state worth escalating, not an
+    exemption from it. "Touched" is ``COALESCE(updated_at, created_at)``, so any
+    ``ledger_update`` restarts the clock — a row someone is actively working
+    never qualifies.
+
+    *added_by* is a provenance allow-list (see
+    ``session_awareness.ledger_escalation_config.escalate_added_by``). It is
+    REQUIRED rather than defaulted: the caller deciding which provenance may
+    create work for a human is a policy choice, and a default here would hide it.
+
+    Ordered oldest-first so a caller applying a per-run cap takes the longest-
+    undisposed rows rather than an arbitrary slice.
+    """
+    invalid = set(added_by) - VALID_ADDED_BY
+    if invalid:
+        raise ValueError(f"invalid added_by: {sorted(invalid)}")
+    if not added_by:
+        raise ValueError("added_by allow-list must be non-empty")
+    placeholders = ", ".join("?" for _ in added_by)
+    cursor = await db.execute(
+        "SELECT * FROM session_ledger "
+        "WHERE status IN ('open', 'in_progress') "
+        f"AND added_by IN ({placeholders}) "  # noqa: S608 — placeholders only
+        "AND COALESCE(updated_at, created_at) < ? "
+        "ORDER BY COALESCE(updated_at, created_at) ASC, id ASC "
+        "LIMIT ?",
+        (*sorted(added_by), untouched_before, _LEDGER_STALE_HARD_CAP + 1),
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+    if len(rows) > _LEDGER_STALE_HARD_CAP:
+        raise RuntimeError(
+            f"ledger_stale_open: more than {_LEDGER_STALE_HARD_CAP} unresolved "
+            "stale rows — refusing a partial read; raise the cap deliberately "
+            "if the ledger is legitimately this large"
+        )
+    return rows
+
+
 async def ledger_counts(db: aiosqlite.Connection, session_id: str) -> dict[str, int]:
     """Per-status row counts for a session's ledger (absent statuses omitted)."""
     cursor = await db.execute(
