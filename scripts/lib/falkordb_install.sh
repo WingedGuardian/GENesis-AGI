@@ -46,6 +46,42 @@ FALKORDB_KEY_URL="${FALKORDB_KEY_URL:-https://packages.redis.io/gpg}"
 FALKORDB_REPO_URL="${FALKORDB_REPO_URL:-https://packages.redis.io/deb}"
 FALKORDB_RELEASE_BASE="${FALKORDB_RELEASE_BASE:-https://github.com/FalkorDB/FalkorDB/releases/download}"
 FALKORDB_OS_RELEASE="${FALKORDB_OS_RELEASE:-/etc/os-release}"
+
+# CONSENT, as distinct from capability.
+#
+# Every other gate in this file asks "can we?" — sudo, apt, arch, codename.
+# This one asks "may we?", and it is a different question. The package half
+# adds a THIRD-PARTY APT REPO and installs a database daemon on someone's
+# machine. update.sh re-runs bootstrap.sh on every update, so without this an
+# operator who merely pulled Genesis would silently acquire a new apt trust
+# anchor for a feature that is inert until a later release wires a consumer.
+#
+# So the system half is OPT-IN: set GENESIS_FALKORDB_PROVISION=1 (or
+# graph_engine.provision: true in the local config) to allow it. The MODULE
+# half stays automatic — it writes one file under ~/.genesis/deps and changes
+# nothing about the system, so it costs an unwilling operator disk space and
+# nothing else, and it means arming the engine later is a one-command step.
+#
+# GENESIS_FALKORDB_PROVISION_DISABLED=1 turns the whole thing off, module
+# included, matching the kill-switch convention the other subsystems use.
+FALKORDB_PROVISION_OPT_IN="${GENESIS_FALKORDB_PROVISION:-}"
+FALKORDB_PROVISION_DISABLED="${GENESIS_FALKORDB_PROVISION_DISABLED:-}"
+FALKORDB_LOCAL_CONFIG="${FALKORDB_LOCAL_CONFIG:-$HOME/.genesis/config/genesis.yaml}"
+
+# _falkordb_opted_in — env first, then a `provision: true` under a
+# `graph_engine:` key in the local config. Deliberately a narrow grep rather
+# than a YAML parse: this is a shell fragment with no parser available, and the
+# fail direction is correct — anything it cannot read plainly reads as "no".
+_falkordb_opted_in() {
+    [ "$FALKORDB_PROVISION_OPT_IN" = "1" ] && return 0
+    [ -r "$FALKORDB_LOCAL_CONFIG" ] || return 1
+    awk '
+        /^[[:space:]]*graph_engine[[:space:]]*:/ { in_block = 1; next }
+        /^[^[:space:]#]/ { in_block = 0 }
+        in_block && /^[[:space:]]+provision[[:space:]]*:[[:space:]]*(true|yes|on)[[:space:]]*$/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$FALKORDB_LOCAL_CONFIG" 2>/dev/null
+}
 # Provenance marker. NOT the apt list file: SETUP.md tells operators with a
 # pre-existing redis to create exactly that path by hand, and upstream's own
 # install docs produce it too — so branching on it would have Genesis claim
@@ -203,6 +239,13 @@ falkordb_module_install() {
 # machine than declining to provision.
 falkordb_redis_install() {
     local codename rc keytmp
+    if ! _falkordb_opted_in; then
+        echo "  Skipped: graph-engine server not provisioned (opt-in)."
+        echo "           It adds the upstream redis apt repo and installs redis-server >= $FALKORDB_MIN_REDIS."
+        echo "           To allow it: GENESIS_FALKORDB_PROVISION=1 ./scripts/bootstrap.sh"
+        echo "           or set graph_engine.provision: true in ~/.genesis/config/genesis.yaml"
+        return 0
+    fi
     if ! command -v apt-get >/dev/null 2>&1; then
         echo "  Skipped: no apt-get — install redis-server >= $FALKORDB_MIN_REDIS by hand to use the graph engine."
         return 0
@@ -311,6 +354,10 @@ falkordb_redis_install() {
 
 # falkordb_provision — the single entry point bootstrap calls.
 falkordb_provision() {
+    if [ "$FALKORDB_PROVISION_DISABLED" = "1" ]; then
+        echo "  Skipped: GENESIS_FALKORDB_PROVISION_DISABLED=1."
+        return 0
+    fi
     mkdir -p "$FALKORDB_DATA_DIR" 2>/dev/null || true
     falkordb_redis_install
     falkordb_module_install

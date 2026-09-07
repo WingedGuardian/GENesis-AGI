@@ -101,6 +101,10 @@ def _stage(tmp_path: Path) -> dict:
         # installed — which it does, on any box that has run this provisioning.
         "FALKORDB_REDIS_BINARIES": "falkordb-test-absent-binary",
         "FALKORDB_PROVISION_MARKER": str(tmp_path / "provisioned.marker"),
+        # The system half is opt-in; tests that exercise it must say so, the
+        # same way an operator has to. The consent tests below override this.
+        "GENESIS_FALKORDB_PROVISION": "1",
+        "FALKORDB_LOCAL_CONFIG": str(tmp_path / "genesis.yaml"),
     }
 
 
@@ -163,6 +167,84 @@ def test_redis_we_provisioned_does_not_replay_the_operator_decision(tmp_path):
     assert "already provisioned" in result.stdout
     assert "your call" not in result.stdout
     assert "apt-get" not in _apt_log(env)
+
+
+def test_system_provisioning_is_opt_in(tmp_path):
+    """Merging this must not add an apt repo to anyone's machine.
+
+    update.sh re-runs bootstrap.sh on every update, so without a consent gate an
+    operator who merely pulled Genesis would silently acquire a third-party apt
+    trust anchor and a database daemon — for a feature that stays inert until a
+    later release wires a consumer. Every OTHER gate here asks "can we?"; this
+    one asks "may we?".
+    """
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "opt-in" in result.stdout
+    assert "GENESIS_FALKORDB_PROVISION=1" in result.stdout, "must teach the opt-in"
+    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "repo added without consent"
+    assert "apt-get" not in _apt_log(env), "apt invoked without consent"
+
+
+def test_local_config_can_grant_consent(tmp_path):
+    """An operator should not have to export an env var on every update."""
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(
+        "memory:\n  wing: x\ngraph_engine:\n  provision: true\n"
+    )
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert Path(env["FALKORDB_APT_LIST"]).exists(), result.stdout
+
+
+def test_a_false_config_value_is_not_consent(tmp_path):
+    """The fail direction: anything not plainly true reads as no."""
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    for body in (
+        "graph_engine:\n  provision: false\n",
+        "graph_engine:\n  other: true\n",
+        "other_block:\n  provision: true\n",   # provision, but not ours
+        "",
+    ):
+        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
+        result = _run("falkordb_redis_install", env)
+        assert result.returncode == 0, result.stderr
+        assert "opt-in" in result.stdout, f"treated as consent: {body!r}"
+        assert not Path(env["FALKORDB_APT_LIST"]).exists(), f"provisioned on: {body!r}"
+
+
+def test_the_module_half_needs_no_consent(tmp_path):
+    """It writes one file under ~/.genesis and changes nothing about the system.
+
+    Keeping it automatic means arming the engine later is one command rather
+    than a re-provision, and it costs an unwilling operator disk space only.
+    """
+    env = _stage(tmp_path)
+    del env["GENESIS_FALKORDB_PROVISION"]
+    env["FALKORDB_VERSION"] = "9.9.9"
+    (tmp_path / "release" / "v9.9.9").mkdir()
+    (tmp_path / "release" / "v9.9.9" / "falkordb-x64.so").write_bytes(b"x")
+
+    result = _run("falkordb_module_install", env)
+    assert result.returncode == 0, result.stderr
+    assert (Path(env["FALKORDB_DEPS_DIR"]) / "9.9.9" / "falkordb.so").is_file()
+
+
+def test_kill_switch_stops_everything_including_the_module(tmp_path):
+    env = _stage(tmp_path)
+    env["GENESIS_FALKORDB_PROVISION_DISABLED"] = "1"
+    result = _run("falkordb_provision", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "DISABLED" in result.stdout
+    assert not Path(env["FALKORDB_APT_LIST"]).exists()
+    assert not (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so").exists()
 
 
 def test_removed_but_not_purged_redis_does_not_block_provisioning(tmp_path):

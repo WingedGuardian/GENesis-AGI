@@ -74,11 +74,29 @@ and cloud embeddings.
 
 ### Graph engine (FalkorDB)
 
-`bootstrap.sh` provisions this automatically when it can, and skips with a note
-when it cannot. It is a Redis module, so it needs `redis-server` 8.0.0 or newer
-— Ubuntu/Debian stable ship 7.x, so bootstrap adds Redis's official upstream
-apt repo. The service it installs listens on **no TCP port**; readers reach it
-over a unix socket in `~/.genesis/falkordb`.
+**Opt-in.** It is a Redis module needing `redis-server` 8.0.0 or newer, and
+Ubuntu/Debian stable ship 7.x — so provisioning it means adding Redis's
+official upstream apt repo to your machine. Genesis will not do that to you
+uninvited, and since `update.sh` re-runs `bootstrap.sh` on every update, "once"
+would have meant "on every install that pulls". Ask for it:
+
+```bash
+GENESIS_FALKORDB_PROVISION=1 ./scripts/bootstrap.sh
+```
+
+or persistently, in `~/.genesis/config/genesis.yaml`:
+
+```yaml
+graph_engine:
+  provision: true
+```
+
+`GENESIS_FALKORDB_PROVISION_DISABLED=1` disables the whole thing, module
+included. The engine module itself is fetched either way — it is one file under
+`~/.genesis/deps` and changes nothing about your system.
+
+The service listens on **no TCP port**; readers reach it over a unix socket in
+`~/.genesis/falkordb`.
 
 The unit is written but **not enabled**. Nothing in Genesis reads the engine
 yet, so leaving it off costs you nothing. To arm it:
