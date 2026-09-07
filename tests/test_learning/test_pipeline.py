@@ -504,6 +504,129 @@ class TestSuccessExtractionChannelGate:
         assert called["n"] == 1
 
 
+class TestSteeringWriteOwnerGate:
+    """The STEERING.md write is OWNER-only, and deliberately narrower than the
+    procedure-extraction allow-list.
+
+    STEERING.md is a user-sovereign identity file every session reads, so a rule
+    in it must be OWNER-authored. Procedure extraction also admits Genesis's own
+    cognition (reflection, surplus) because a procedure from Genesis's own work
+    is legitimate; Genesis authoring the USER's identity file is not. That is
+    why the two gates share `_OWNER_CHANNELS` but are not the same predicate --
+    `test_steering_set_is_owner_only_and_narrower` pins the difference (it is
+    the one that fails if the two predicates are collapsed).
+    """
+
+    DIRECTIVE = "never run that command without asking"
+
+    @staticmethod
+    def _build(db, loader, monkeypatch):
+        called = {"n": 0}
+
+        async def fake_extract(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr("genesis.learning.pipeline.extract_procedure", fake_extract)
+        router = MagicMock()
+        router.route_call = AsyncMock()
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=MagicMock(write=AsyncMock(return_value="o")),
+            identity_loader=loader,
+            router=router,
+        )
+        return pipeline, called
+
+    def test_directive_fixture_would_otherwise_pass(self):
+        """Guard-the-guard: the fixture text really IS a writable directive.
+
+        Without this, every "does not write" assertion below could be passing
+        because `_looks_like_directive` rejected the text, not because the
+        channel gate fired.
+        """
+        from genesis.learning.pipeline import _looks_like_directive
+
+        assert _looks_like_directive(self.DIRECTIVE) is True
+
+    @pytest.mark.asyncio
+    async def test_voice_does_not_write_steering(self, db, monkeypatch):
+        """Ambient multi-speaker STT: the speaker may not be the owner.
+
+        `voice` is absent from `_CHANNEL_ORIGIN` for exactly this reason, and
+        the block's own shadow record classifies such a write external_untrusted
+        -- then let it through, because `record_would_block` only OBSERVES.
+        """
+        loader = MagicMock()
+        pipeline, _ = self._build(db, loader, monkeypatch)
+        await pipeline(FakeCCOutput(), self.DIRECTIVE, "voice")
+        loader.add_steering_rule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unlisted_channel_does_not_write_steering(self, db, monkeypatch):
+        """Fail-closed: a channel nobody enumerated cannot write the user's
+        identity file. The old deny-list admitted every such channel."""
+        loader = MagicMock()
+        pipeline, _ = self._build(db, loader, monkeypatch)
+        await pipeline(FakeCCOutput(), self.DIRECTIVE, "some_future_channel")
+        loader.add_steering_rule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_still_writes_steering(self, db, monkeypatch):
+        """Control: an owner channel still writes."""
+        loader = MagicMock()
+        pipeline, _ = self._build(db, loader, monkeypatch)
+        await pipeline(FakeCCOutput(), self.DIRECTIVE, "terminal")
+        loader.add_steering_rule.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_telegram_still_writes_steering(self, db, monkeypatch):
+        """Control: an owner channel still writes."""
+        loader = MagicMock()
+        pipeline, _ = self._build(db, loader, monkeypatch)
+        await pipeline(FakeCCOutput(), self.DIRECTIVE, "telegram")
+        loader.add_steering_rule.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reflection_extracts_but_does_not_steer(self, db, monkeypatch):
+        """The two gates differ on purpose; this shows the difference at runtime.
+
+        `reflection` is Genesis's own cognition: legitimate for a PROCEDURE,
+        never for the user's identity file. One interaction, both gates,
+        opposite answers.
+
+        Honest scope: reflection is ALSO in `_AUTONOMOUS_CHANNELS`, so the outer
+        deny-list at §6.6 blocks it before `_extract_steering_rule` runs. This
+        test is double-guarded and would still pass if the two predicates were
+        collapsed (MEASURED: setting
+        `_STEERING_CHANNELS = _PROCEDURE_EXTRACTION_CHANNELS` leaves it green).
+        `test_steering_set_is_owner_only_and_narrower` is what catches that
+        collapse.
+        """
+        loader = MagicMock()
+        pipeline, called = self._build(db, loader, monkeypatch)
+        await pipeline(FakeCCOutput(), self.DIRECTIVE, "reflection")
+        loader.add_steering_rule.assert_not_called()
+        assert called["n"] == 1
+
+    def test_steering_set_is_owner_only_and_narrower(self):
+        """Pinned literally, and pinned as a STRICT subset of the extraction set."""
+        from genesis.learning.pipeline import (
+            _OWNER_CHANNELS,
+            _PROCEDURE_EXTRACTION_CHANNELS,
+            _STEERING_CHANNELS,
+        )
+
+        assert _STEERING_CHANNELS == _OWNER_CHANNELS
+        assert frozenset({"terminal", "telegram", "whatsapp", "web"}) == _STEERING_CHANNELS
+        assert _STEERING_CHANNELS < _PROCEDURE_EXTRACTION_CHANNELS
+        for excluded in ("voice", "reflection", "surplus", "inbox", "mail", "new_channel"):
+            assert excluded not in _STEERING_CHANNELS
+
+
 class TestProcedureExtractionChannelAllowList:
     """Procedure extraction runs only on owner- or self-authored channels.
 
@@ -594,9 +717,10 @@ class TestProcedureExtractionChannelAllowList:
         """
         from genesis.learning.pipeline import _PROCEDURE_EXTRACTION_CHANNELS
 
-        assert frozenset(
-            {"terminal", "telegram", "whatsapp", "web", "reflection", "surplus"}
-        ) == _PROCEDURE_EXTRACTION_CHANNELS
+        assert (
+            frozenset({"terminal", "telegram", "whatsapp", "web", "reflection", "surplus"})
+            == _PROCEDURE_EXTRACTION_CHANNELS
+        )
 
     def test_owner_half_is_derived_from_channel_origin(self):
         """The owner half is DERIVED from _CHANNEL_ORIGIN, never retyped."""

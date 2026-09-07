@@ -130,8 +130,18 @@ async def test_gate1_judge_chain_end_to_end():
 @pytest.mark.asyncio
 async def test_gate2_steering_chain_end_to_end():
     """Real build_triage_pipeline → §6.6 → add_steering_rule → shadow row:
-    a non-owner channel (voice) records external_untrusted; an owner channel
-    (telegram) writes with NO row; a directive-filter reject is a non-event."""
+    a non-owner channel (voice) is BLOCKED at the write; an owner channel
+    (telegram) writes with NO row; a directive-filter reject is a non-event.
+
+    Expectation changed 2026-09-06. Step 1 previously asserted that `voice`
+    WROTE the rule and recorded an external_untrusted shadow row — i.e. it
+    encoded the fail-OPEN deny-list as an invariant, observing the bad write
+    instead of preventing it. `_extract_steering_rule` now applies a fail-closed
+    owner allow-list (`_STEERING_CHANNELS`) before writing, so a non-owner
+    channel never reaches the write and the shadow emit below it is never
+    reached either. The shadow row is no longer the mechanism protecting
+    STEERING.md; the allow-list is.
+    """
     from genesis.learning.pipeline import build_triage_pipeline
     from genesis.learning.types import OutcomeClass, TriageDepth
 
@@ -178,23 +188,24 @@ async def test_gate2_steering_chain_end_to_end():
             identity_loader=_Loader(),
         )
 
-        # 1. voice (NOT in the owner allow-map): write + external row.
+        # 1. voice (NOT in the owner allow-map): BLOCKED at the write, no row.
+        #    The refusal is logged, not recorded — the shadow emit sits below
+        #    the write and is never reached.
         await pipeline(_Out(), "never use the old parser", "voice")
-        rows = await crud.list_recent(db)
-        assert written, "steering rule was not written"
-        assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
-        assert rows[0]["gate"] == "identity"
-        assert rows[0]["origin_class"] == "external_untrusted"
-        assert rows[0]["source_ref"] == "learning/pipeline.py::_run_pipeline"
+        assert not written, "non-owner channel must not write a steering rule"
+        assert await crud.count(db) == 0, "blocked write must not emit a row"
 
         # 2. telegram (owner): write happens, NO row (never-block invariant).
         await pipeline(_Out(), "never use the old linter", "telegram")
-        assert len(written) == 2, "owner-channel steering write missing"
-        assert await crud.count(db) == 1, "owner channel must not add a row"
+        assert len(written) == 1, "owner-channel steering write missing"
+        assert await crud.count(db) == 0, "owner channel must not add a row"
 
-        # 3. Non-directive on voice: NO write, NO row (reject is a non-event).
-        await pipeline(_Out(), "well anyway it is never too late to try", "voice")
-        assert len(written) == 2, "non-directive must not write"
-        assert await crud.count(db) == 1, "directive reject must not emit"
+        # 3. Non-directive on an OWNER channel: NO write, NO row (the reject is
+        #    a non-event). This MUST be an owner channel: on voice the channel
+        #    gate would fire first, and the assertion would pass without ever
+        #    exercising the shape filter it exists to test.
+        await pipeline(_Out(), "well anyway it is never too late to try", "telegram")
+        assert len(written) == 1, "non-directive must not write"
+        assert await crud.count(db) == 0, "directive reject must not emit"
     finally:
         await db.close()

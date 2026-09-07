@@ -71,10 +71,19 @@ _CHANNEL_ORIGIN = {
 # a regression, but neither is owner-AUTHENTICATED either. Narrowing to
 # is_owner_attended_channel is a deliberate open question, not an oversight.
 _SELF_COGNITION_CHANNELS = frozenset({"reflection", "surplus"})
-_PROCEDURE_EXTRACTION_CHANNELS = frozenset(
-    {channel for channel, origin in _CHANNEL_ORIGIN.items() if origin == "owner"}
-    | _SELF_COGNITION_CHANNELS
+_OWNER_CHANNELS = frozenset(
+    channel for channel, origin in _CHANNEL_ORIGIN.items() if origin == "owner"
 )
+_PROCEDURE_EXTRACTION_CHANNELS = _OWNER_CHANNELS | _SELF_COGNITION_CHANNELS
+
+# Channels that may write a STEERING.md rule. DELIBERATELY NARROWER than
+# _PROCEDURE_EXTRACTION_CHANNELS, and the difference is the load-bearing part:
+# both gates share _OWNER_CHANNELS, but only extraction also admits Genesis's
+# own cognition. A procedure derived from Genesis's own work is legitimate;
+# Genesis authoring the USER's identity file is not -- STEERING.md is
+# user-sovereign and every session reads it. Do NOT "simplify" these into one
+# predicate: doing so grants Genesis exactly that authorship.
+_STEERING_CHANNELS = _OWNER_CHANNELS
 
 
 # A STEERING.md rule must READ as a terse imperative directive addressed to
@@ -292,6 +301,12 @@ def build_triage_pipeline(
         # 6.6. STEERING.md auto-population from user corrections
         # Only extract from foreground user sessions — autonomous pipelines
         # (inbox, mail, reflection) must never write to identity files.
+        # This deny-list is NOT what protects the identity file: it fails OPEN
+        # for `voice` and for any channel nobody listed. The steering WRITE
+        # carries its own fail-closed owner allow-list, applied inside
+        # _extract_steering_rule (_STEERING_CHANNELS). This condition is left as
+        # it was so it keeps scoping the BIS correction capture below, which is
+        # a different question with a different answer.
         if (
             outcome == OutcomeClass.APPROACH_FAILURE
             and identity_loader is not None
@@ -301,9 +316,18 @@ def build_triage_pipeline(
                 written_rule = _extract_steering_rule(summary, identity_loader)
                 if written_rule:
                     # WS-3 B1 gate-2 (identity): shadow-record the steering
-                    # write, classified by CHANNEL (allow-map; unknown/voice ->
-                    # external_untrusted, fail-closed) -- so a deny-list escape
-                    # is OBSERVED. Owner channels self-guard to no row.
+                    # write, classified by CHANNEL (allow-map, fail-closed to
+                    # external_untrusted).
+                    # This no longer OBSERVES a deny-list escape, and the old
+                    # comment saying it did is retired: the owner allow-list now
+                    # lives INSIDE _extract_steering_rule, so a written_rule
+                    # implies an owner channel, origin_class is always "owner",
+                    # and is_blockable() short-circuits this to zero rows BY
+                    # DESIGN. Kept as the structural emit point -- if a non-owner
+                    # path ever reaches a write again, this records it instead of
+                    # staying silent -- and the `.get` default stays fail-closed
+                    # for that reason, though it is unreachable today. The
+                    # REFUSAL is what carries the signal now, logged at the gate.
                     # Best-effort, never raises; counts only, never content.
                     from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
                     from genesis.security import immunity_shadow
@@ -354,17 +378,38 @@ def build_triage_pipeline(
     ) -> str | None:
         """Extract a steering rule from a user correction and add to STEERING.md.
 
-        Fires only on approach_failure (gated upstream). A rule is written ONLY
-        if the user's text reads as a terse imperative directive addressed to
-        Genesis — see :func:`_looks_like_directive`. This defends against a
-        mis-classified chatty status update becoming a "hard constraint" (the
-        2026-06-30 incident, where a benign Telegram DM containing "its never
-        too late" was captured verbatim as a rule).
+        Fires only on approach_failure (gated upstream). Two further layers, both
+        fail-CLOSED, both applied HERE so the write is gated at its own function
+        rather than relying on the caller:
+
+        1. CHANNEL — the rule's author must be the owner
+           (:data:`_STEERING_CHANNELS`). The enclosing block's deny-list did not
+           list `voice`, so an ambient multi-speaker STT session could write the
+           user's identity file while the block's own shadow record classified
+           that same write external_untrusted and let it through
+           (``record_would_block`` only OBSERVES).
+        2. SHAPE — the text must read as a terse imperative directive addressed
+           to Genesis; see :func:`_looks_like_directive`. This defends against a
+           mis-classified chatty status update becoming a "hard constraint" (the
+           2026-06-30 incident, where a benign Telegram DM containing "its never
+           too late" was captured verbatim as a rule).
 
         Note: add_steering_rule() does synchronous file I/O (read + write
         STEERING.md). Acceptable because the file is tiny (<2KB) and local, and
         this runs in a fire-and-forget background task.
         """
+        if summary.channel not in _STEERING_CHANNELS:
+            # Log the REFUSAL: it is the only signal this attempt produces. The
+            # shadow row below fires on a WRITE, and a refused attempt never
+            # reaches one — so without this line a channel repeatedly trying to
+            # author the user's identity file would be entirely invisible.
+            logger.warning(
+                "Steering write REFUSED: channel %r is not owner-authored "
+                "(_STEERING_CHANNELS). STEERING.md is user-sovereign.",
+                summary.channel,
+            )
+            return None
+
         user_text = (summary.user_text or "").strip()
         if not _looks_like_directive(user_text):
             return None
