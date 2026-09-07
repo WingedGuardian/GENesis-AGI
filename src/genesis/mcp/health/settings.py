@@ -223,6 +223,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per pass by skill_gate_config
     ),
+    "graphstore": SettingsDomain(
+        name="graphstore",
+        description=(
+            "Which backend answers memory-graph traversals — `enabled` plus "
+            "`mode` networkx/falkordb. networkx (default) is the in-process "
+            "projection and depends on nothing else; falkordb is a long-lived "
+            "server over a unix socket that needs the engine armed, the client "
+            "installed, and a projection built. Anything unreadable or "
+            "unrecognised degrades to networkx, and the facade falls back to it "
+            "at runtime rather than answering empty. Betweenness centrality "
+            "always stays on networkx — FalkorDB cannot compute it. Read live "
+            "on every traversal — takes effect immediately, no restart."
+        ),
+        config_filename="graphstore.yaml",
+        readonly=False,
+        needs_restart=False,  # load_config() is a fresh read per traversal
+    ),
     "entity_adjudication": SettingsDomain(
         name="entity_adjudication",
         description=(
@@ -1532,6 +1549,46 @@ def _validate_memory_recall(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_graphstore(changes: dict) -> list[str]:
+    """Validate graph-store lever changes (see genesis.memory.graphstore_config)."""
+    from genesis.memory.graphstore_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+
+    # Precondition, not just shape validation: moving the lever to falkordb when
+    # the engine is not armed points every memory-graph read at a store that
+    # cannot answer. The facade does degrade back to NetworkX, loudly — but a
+    # dashboard toggle whose real meaning is "log an error on every recall" is
+    # not a setting anyone intends to make, so refuse it where the operator can
+    # still see why.
+    #
+    # The socket is the SYNC-checkable half. An armed engine holding an EMPTY
+    # projection needs an async query to detect, and is caught one layer down:
+    # FalkorGraphStore.traverse raises rather than reporting every root as
+    # neighbourless.
+    if changes.get("mode") == "falkordb":
+        from genesis.env import falkordb_socket_path
+
+        socket_path = falkordb_socket_path()
+        if not Path(socket_path).exists():
+            errors.append(
+                "'mode' cannot be set to falkordb: the graph engine is not armed "
+                f"(no socket at {socket_path}). Start it with "
+                "`systemctl --user start genesis-falkordb`, build the projection with "
+                "`python -m genesis.memory.graphstore_project`, then set the mode."
+            )
+    return errors
+
+
 def _validate_entity_adjudication(changes: dict) -> list[str]:
     """Validate entity-adjudication lever changes (see
     genesis.memory.entity_adjudication_config)."""
@@ -1836,6 +1893,7 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
 
 
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "graphstore": _validate_graphstore,
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
     "ledger_escalation": _validate_ledger_escalation,

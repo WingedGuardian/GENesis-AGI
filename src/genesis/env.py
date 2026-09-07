@@ -201,6 +201,20 @@ def genesis_home() -> Path:
     return Path(value).expanduser() if value else Path.home() / ".genesis"
 
 
+def falkordb_socket_path() -> Path:
+    """Unix socket the graph engine listens on (``~/.genesis/falkordb/falkordb.sock``).
+
+    Composed from ``genesis_home()`` so it honors ``GENESIS_HOME``, which is what
+    lets a test point it at a tmp dir instead of the live engine. The path is a
+    convention shared with the systemd unit template, which renders the same
+    location — the unit is the writer, this is the reader, and they must agree.
+
+    Socket-only by design: the engine runs with ``--port 0``, so there is no TCP
+    URL accessor to pair with this one.
+    """
+    return genesis_home() / "falkordb" / "falkordb.sock"
+
+
 def alert_queue_root() -> Path:
     """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
 

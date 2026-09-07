@@ -72,7 +72,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: ef6eb541 2026-08-10
+verified: 8a5a469d 2026-09-07
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -222,9 +222,23 @@ committed by ANOTHER process is observed — previously the server served a
 projection predating any dream-job write until it happened to write a link
 itself. The token is stamped BEFORE the load on purpose: in WAL the read
 snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
-projection that is missing a mid-load commit (MEASURED 2026-09-06). Prepared for
-the graph-DB adoption (issue #1641), where a server-backed engine becomes
-another `GraphStore` with no reader touched.
+projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
+used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
+long-lived FalkorDB server reached over a unix socket, selected by
+`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
+the lever is inert until moved). It carries its own projection of
+`memory_links` and applies the SAME visibility predicate — but at QUERY time,
+over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
+future-`invalid_at` gap the NetworkX store states below. Traversal follows the
+lever and degrades falkordb → networkx → CTE; **centrality does NOT follow it**
+and is pinned to NetworkX, because FalkorDB cannot compute betweenness and
+`centrality_scores` has no fallback by design, so routing it through the lever
+would turn a mode flip into a silent shutdown of the importance shield.
+Three dialect facts were MEASURED against the live engine rather than read from
+docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
+engine has NO temporal types despite its own documentation listing them, and a
+loading engine answers `BusyLoadingError` — which is unavailable, never empty.
+Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
