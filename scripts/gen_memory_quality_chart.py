@@ -28,6 +28,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 W, H = 1200, 520
 PAD_L, PAD_R, PAD_T, PAD_B = 78, 92, 74, 92
@@ -72,7 +73,11 @@ def _db_path(explicit: str | None) -> Path:
 
 def load(db: Path) -> list[dict]:
     """Weekly memory-dimension snapshots, oldest first, with pool reconstruction."""
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    # quote() the path: in a `file:` URI an unescaped `?` or `#` in the path
+    # STARTS the query/fragment, so `--db /tmp/genesis?backup.db` silently opens
+    # a different (empty, auto-created) database rather than failing. Read-only
+    # mode would be dropped with it. `/` is safe to leave unescaped.
+    con = sqlite3.connect(f"file:{quote(str(db))}?mode=ro", uri=True)
     try:
         rows = con.execute(
             "SELECT period_end, metrics_json, sample_count FROM eval_snapshots "
