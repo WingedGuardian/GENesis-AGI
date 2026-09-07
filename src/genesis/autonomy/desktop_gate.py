@@ -128,11 +128,20 @@ SESSION_GRANT_KIND = "desktop_session_grant"
 #: mint itself desktop authority. Do not read it as more than that, and do not
 #: let PR-3 wire a caller believing the predicate is a complete boundary.
 #:
-#: OPEN QUESTION for PR-3, not settled here: `voice:` is in this set because the
-#: owner ruled for a spoken challenge-response. The voice channel's resistance to
-#: ambient or replayed audio is unverified, so whether a spoken "yes" is strong
-#: enough to open a session-length grant deserves an explicit go/no-go before the
-#: consent path is built, rather than inheriting the answer from this line.
+#: SETTLED 2026-09-07 by the owner, after a security review raised it: a spoken
+#: challenge-response MAY open a session-length grant. `voice:` stays. Do not
+#: re-raise it on ambient-audio or replay grounds.
+#:
+#: What that ruling does and does not cover. It settles the POLICY — voice is an
+#: accepted consent channel for this capability. It does not assert that the
+#: voice pipeline resists replayed or ambient audio, which is unverified and is
+#: an engineering property, not a decision. The design already leans on the
+#: right mitigation: the consent path NAMES the target window back to the
+#: operator and waits for a specific answer, which is materially harder to
+#: trigger by accident or replay than a bare "approve" — an attacker would need
+#: the window name, and the grant is bounded, revocable and scoped to that one
+#: window regardless. PR-3 should build the challenge-response as specified
+#: rather than treating a naked "yes" as sufficient.
 #:
 #: Allowlist, not denylist — a resolver stays unable to grant desktop control
 #: until someone decides otherwise in code. Pinned as a subset of
