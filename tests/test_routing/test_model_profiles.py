@@ -376,7 +376,16 @@ class TestPaidProviderProfilePricing:
         """
         pairs = self._paid_providers_with_profiles()
         assert len(pairs) >= 5, pairs
-        assert all(name and profile for name, profile in pairs), pairs
+        # Every discovered profile NAME must resolve in the registry. The
+        # previous line here was `all(name and profile for ...)`, which cannot
+        # fail: `pairs` is built with `if spec.get("profile")`, so `profile` is
+        # truthy by construction and `name` is a non-empty YAML key. It read as
+        # coverage while providing none — the exact defect this class of test
+        # exists to prevent, written into the guard-the-guard itself.
+        registry = ModelProfileRegistry(_repo_config_dir() / "model_profiles.yaml")
+        registry.load()
+        unresolved = [(n, p) for n, p in pairs if registry.get(p) is None]
+        assert not unresolved, f"routing names a profile that does not exist: {unresolved}"
 
     def test_every_paid_provider_profile_has_a_nonzero_rate(self):
         """A paid provider whose profile prices it at 0 records $0 spend on the

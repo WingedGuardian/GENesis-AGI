@@ -247,9 +247,14 @@ def test_load_full_yaml(monkeypatch):
     # every consumer reads it that way (litellm_delegate sets cost=0.0 on it,
     # router.py's budget gate, _filter_chain's never_pays filter). Mistral's tier
     # is $0 per call under its rate limits, and the 403 tier_not_allowed this
-    # account gets is an ENTITLEMENT refusal, which costs nothing precisely
-    # because the call never happens. Entitlement now lives in the profile's
-    # `entitlement:` block, where it can be stated without corrupting the budget.
+    # account gets is an ENTITLEMENT refusal, so it costs no MONEY — the call
+    # DOES happen and fails, on the three never_pays sites `free: true` re-admits
+    # Large to. (An earlier draft said "costs nothing precisely because the call
+    # never happens". That sentence was retracted in model_routing.yaml by this
+    # same change and left standing here — the copy outliving its correction,
+    # which is the instance-patching signature this PR is otherwise about.)
+    # Entitlement now lives in the profile's `entitlement:` block, where it can
+    # be stated without corrupting the budget.
     ml = cfg.providers["mistral-large-free"]
     assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"

@@ -42,8 +42,7 @@ providers:
     #
     # Which is why this is back to `true` (2026-09-07). Mistral's tier is $0 per
     # call under its rate limits; the 403 is an ENTITLEMENT refusal, not a billing
-    # event, and an entitlement refusal costs nothing precisely because the call
-    # never happens. Marking it `false` did not describe a price — it fabricated
+    # event, so it costs no MONEY. Marking it `false` did not describe a price — it fabricated
     # one, and MEASURED, the fabrication is not free: with `free: false` the
     # ledger records this family at litellm's paid rate against a default-seeded
     # $2/day budget, and once that trips, router.py:352 removes EVERY paid
@@ -54,6 +53,22 @@ providers:
     # local overlay. That direction is the safe one to get wrong: it over-records
     # spend for an install that is genuinely paying, rather than inventing spend
     # for one that is not.
+    #
+    # WHAT `free: true` COSTS HERE, stated because the first draft of this comment
+    # argued it away. `_filter_chain` keeps free providers on never_pays sites, so
+    # Large is now WALKED on all three of them (4_light_reflection,
+    # 12_surplus_brainstorm, 45_intelligence_intake) where `free: false` had
+    # filtered it out entirely. On an account whose 403 this file documents as
+    # durable, that is a doomed round-trip on every breaker-closed window: three
+    # failures trip it, it re-probes after open_duration_s, fails, trips again.
+    # No money — but latency and failure noise on exactly the sites the rung is
+    # meant to help. Cross-model review flagged this (2026-09-07) against an
+    # earlier wording here that said the refusal "costs nothing precisely because
+    # the call never happens". It costs no MONEY; the call does happen.
+    # Accepted, because the same flag is what admits Medium — which IS reachable —
+    # to those chains, and a fast 403 ahead of a working rung is a better trade
+    # than filtering both out. Revisit if Large's entitlement is ever restored,
+    # or if the wasted probe shows up in latency.
     free: true
     rpm_limit: 4
     open_duration_s: 120
@@ -88,7 +103,12 @@ providers:
     #     NOT the 0.40/2.00 the profile documented, because `completion_cost()`
     #     is tried before the profile fallback ever runs.
     #   * Of the 30 chains carrying this rung, 10 have NO free provider ahead of
-    #     it (13_morning_report, 21_session_observer, 31_outcome_classification,
+    #     it AS THE ROUTER LOADS THE CONFIG. Say which basis, because the two
+    #     counts differ and two reviewers reached different numbers from it: raw
+    #     YAML gives 9, and 30_triage_calibration joins once lmstudio-30b is
+    #     dropped at load for having no key. 10 is the number that describes
+    #     runtime, which is the one that matters here.
+    #     (13_morning_report, 21_session_observer, 31_outcome_classification,
     #     32_delta_assessment, dream_cycle_synthesis_challenge, …). With Large
     #     403-dead, Medium is the FIRST provider actually tried on those — on
     #     ordinary operation, not during an outage.

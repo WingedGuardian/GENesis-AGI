@@ -200,9 +200,17 @@ profiles:
     # a model does not start charging per call. Conflating those is what put a
     # fabricated price on a model nobody was being billed for.
     entitlement:
-      status: refused           # 403 tier_not_allowed, two independent free-tier accounts
-      requires: funded_account  # credits on the account unlock it; calls stay $0 under limits
-      verified: "2026-08-27"
+      status: refused           # MEASURED: 403 tier_not_allowed, two independent free-tier accounts
+      # HYPOTHESIS, NOT MEASURED — and the two fields differ in evidence, which is
+      # why this says so rather than letting `verified:` below cover both. `status`
+      # was probed. `requires` is the expected vendor shape (put credits on the
+      # account, previously-refused models unlock, calls stay $0 under the tier's
+      # rate limits) and NOBODY HAS TESTED IT on this install. Settling it needs
+      # someone to fund an account and re-probe. Until then this is a lead for
+      # whoever does, not a fact to route on.
+      requires: funded_account
+      requires_confidence: hypothesis   # measured | reported | hypothesis
+      verified: "2026-08-27"    # applies to `status` only
       method: live_probe
     last_reviewed: "2026-09-03"
     review_source: provider_pricing_page
@@ -232,14 +240,32 @@ profiles:
     # That is the PR #1619 defect one model over: flipping a provider to
     # `free: false` while leaving its profile at a stale rate. The guard written
     # after #1619 was hardcoded to `mistral-large-3`, so it could not see this.
-    # `test_paid_profiles_agree_with_the_rate_litellm_will_record` now checks EVERY
-    # paid provider against the number the ledger will actually write.
+    #
+    # WHAT GUARDS THIS TODAY: nothing, and saying so is the point. An earlier
+    # draft of this comment promised a
+    # `test_paid_profiles_agree_with_the_rate_litellm_will_record` that checks
+    # every paid provider — that test was written, then LIFTED OUT of this PR
+    # because it fails on ten pre-existing providers (openrouter-deepseek-v4
+    # declares 0.43/0.87 against a recorded 1.32/3.96, on the provider carrying
+    # the most spend), and correcting ten unrelated providers does not belong in
+    # a release-blocking config change. The comment was not updated with it, so
+    # it advertised a guard that does not exist — caught by cross-model review,
+    # 2026-09-07. It ships separately.
+    #
+    # Second half of the same gap: `_paid_providers_with_profiles()` selects on
+    # `not spec.get("free")`, so now that both mistral rungs are `free: true` the
+    # family is outside even the nonzero-rate check. That is harmless while
+    # `free: true` holds — the delegate short-circuits to `cost = 0.0` and never
+    # reads these figures, making them documentation — but it means a future flip
+    # back to `free: false` re-arms the exact PR #1619 trap with no test watching.
+    # Anyone making that flip must re-check this row against litellm by hand until
+    # the generalised guard lands.
     #
     # Also: at 1.50/7.50 Medium is DEARER than mistral-large-3 (0.50/1.50), which is
     # the opposite of what `cost_tier: cheap` told a reader choosing between them.
     # (litellm's `-latest` entry appears to track Medium 3.5; the vendor page prices
     # Medium 3 at 0.40/2.00. Recorded spend follows litellm, so this row does too.)
-    cost_tier: standard
+    cost_tier: expensive
     cost_per_mtok_in: 1.50
     cost_per_mtok_out: 7.50
     latency: moderate
@@ -295,6 +321,13 @@ profiles:
     entitlement:
       status: entitled          # entitled | refused | unknown
       requires: none            # none | funded_account | paid_plan | phone_verified
+      # MEASURED, unlike the sibling field on mistral-large-3: the 429 came from
+      # an UNFUNDED free-tier account, which is itself the evidence that no
+      # precondition is needed. `requires_confidence` is written on every
+      # entitlement block, always — an absent field would leave a reader guessing
+      # which half of the block was probed, and that guess is exactly what a
+      # confident-looking config invites.
+      requires_confidence: measured   # measured | reported | hypothesis
       verified: "2026-09-06"
       method: live_probe        # 429 rate_limited (throttled, therefore entitled)
     last_reviewed: "2026-09-06"

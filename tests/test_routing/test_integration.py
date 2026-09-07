@@ -87,12 +87,20 @@ async def test_surplus_never_pays(real_config, breakers, cost_tracker, degradati
     walks only providers flagged `free`.
 
     What catches a paid provider leaking through is the combination of
-    `MockDelegate`'s default SUCCESS stub and `assert result.success is False`
-    — an unfiltered walk reaches `mistral-large-free` (named `-free`, flagged
-    `free: false` since Mistral pulled Large from the free tier), which is not
-    in `responses`, so it succeeds and the assertion fires. The trailing loop
-    is a secondary, explicit check on WHICH providers were walked; it is not
-    reached in that failure mode.
+    `MockDelegate`'s default SUCCESS stub and `assert result.success is False`:
+    an unfiltered walk reaches a provider that is NOT in `responses` (because
+    `responses` is derived from the free chain), that provider returns the
+    default success, and the assertion fires.
+
+    Deliberately stated without naming a provider. This docstring used to cite
+    `mistral-large-free` as the concrete tripwire "flagged `free: false` since
+    Mistral pulled Large from the free tier" — and then the very commit that
+    reclassified both mistral rungs to `free: true` left the sentence standing,
+    so the example contradicted the config shipping beside it. Cross-model
+    review caught it (2026-09-07). The mechanism is what protects this test;
+    which provider happens to embody it is config that moves.
+    The trailing loop is a secondary, explicit check on WHICH providers were
+    walked; it is not reached in that failure mode.
     """
     site = real_config.call_sites["12_surplus_brainstorm"]
     free_chain = [p for p in site.chain if real_config.providers[p].is_free]
