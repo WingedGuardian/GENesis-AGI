@@ -553,3 +553,38 @@ class TestPromotableDomains:
                 db, origin_class="first_party", event=CellEvent.APPROVE, updated_at=_TS, **fin
             )
         assert (await cg.get_cell(db, **fin))["state"] == CellState.ASK.value
+
+    @pytest.mark.asyncio
+    async def test_raw_string_event_cannot_bypass_the_promotion_guard(self, db):
+        """CellEvent is a StrEnum: "approve" is NOT identical to
+        CellEvent.APPROVE but IS equal to it, and _TRANSITIONS is a dict keyed
+        on equality. An identity check here was skipped while transition() still
+        returned GRANTED — committing the promotion, then failing on
+        event.value AFTER the write. The guard must key on the VALUE.
+        """
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            event=CellEvent.CLASSIFY.value,  # raw string on the way in, too
+            updated_at=_TS,
+            **_WIDGET,
+        )
+        with pytest.raises(InvalidTransition, match="not promotable"):
+            await cg.apply_event(
+                db,
+                origin_class="first_party",
+                event=CellEvent.APPROVE.value,  # the bypass vector
+                updated_at=_TS,
+                **_WIDGET,
+            )
+        assert (await cg.get_cell(db, **_WIDGET))["state"] == CellState.ASK.value
+
+    @pytest.mark.asyncio
+    async def test_unknown_event_raises_invalid_transition(self, db):
+        """Normalizing the event must not change the error type this function
+        documents: an unrecognised event was already an InvalidTransition."""
+        with pytest.raises(InvalidTransition, match="unknown cell event"):
+            await cg.apply_event(
+                db, origin_class="first_party", event="not_an_event",
+                updated_at=_TS, **_WIDGET,
+            )

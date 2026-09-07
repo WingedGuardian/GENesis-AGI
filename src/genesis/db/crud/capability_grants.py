@@ -231,6 +231,19 @@ async def apply_event(
     inert gate. Under gate-3 ENFORCE a blockable origin is REFUSED (no
     transition; returns the CURRENT state) — the emit records the attempt.
     """
+    # Normalize BEFORE anything reads `event`. CellEvent is a StrEnum, so a
+    # caller passing the bare string "approve" is NOT identical to
+    # CellEvent.APPROVE but IS equal to it — and _TRANSITIONS is a dict, which
+    # matches on equality. An identity check on the promotion guard below would
+    # therefore be skipped while transition() still returned GRANTED, committing
+    # the promotion and only then failing on `event.value`. Coercing here closes
+    # that for every use in this function, not just the guard.
+    try:
+        event = CellEvent(event)
+    except ValueError:
+        # Keep the error type this function already documents; an unknown event
+        # was previously a KeyError inside transition() surfacing the same way.
+        raise InvalidTransition(f"unknown cell event {event!r}") from None
     if _autonomy_enforce_refuses(origin_class):
         await _emit_autonomy_gate(
             db, fn="apply_event", origin_class=origin_class,
@@ -243,7 +256,7 @@ async def apply_event(
         # state machine's default when no cell exists.
         row = await get_cell(db, domain, verb, risk_class)
         return CellState(row["state"]) if row else CellState.NOT_DETERMINED
-    if event is CellEvent.APPROVE and not is_promotable_cell(domain, risk_class):
+    if event == CellEvent.APPROVE and not is_promotable_cell(domain, risk_class):
         # (ASK, APPROVE) is the ONLY edge into GRANTED, and this is the only
         # call of transition() that can carry it — so refusing HERE is the
         # mechanism, not a convention every promotion path has to remember.
