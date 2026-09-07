@@ -27,6 +27,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   module itself (one file under `~/.genesis/deps`, no system change) is fetched
   either way, so arming the engine later is a single command.
 
+  When the engine IS armed, the unit now reports itself ready rather than
+  merely started: with the old `Type=simple`, systemd called it active as soon
+  as the process forked, and the socket was measurably not answering yet (3 of
+  3 restarts, 61-147ms). Anything checking "active" in that window saw a
+  running engine with no socket, which is exactly the shape the health check
+  treats as a fault. The interpreter path is also resolved when the unit is
+  written instead of assuming `/usr/bin/redis-server`, so a box where the
+  binary lives elsewhere no longer gets a unit that fails to execute with
+  nothing explaining why. `genesis-server` now ORDERS itself after the engine —
+  ordering only, deliberately without pulling it in, so an install that never
+  opted in still never starts it.
+
   Even with consent, every step declines rather than forces. **If you already
   run redis-server, Genesis leaves it and the apt repo completely alone** --
   adding the repo would upgrade your Redis on your next unrelated `apt upgrade`,

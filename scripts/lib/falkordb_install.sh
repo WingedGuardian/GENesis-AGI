@@ -126,6 +126,40 @@ FALKORDB_REDIS_BINARIES="${FALKORDB_REDIS_BINARIES:-redis-server valkey-server}"
 # as a constant so the remediation text and any future check cite one source.
 FALKORDB_MIN_REDIS="8.0.0"
 
+# _falkordb_redis_server_bin — the ABSOLUTE path the unit's ExecStart needs.
+#
+# systemd requires an absolute ExecStart and does no PATH lookup, so the path
+# has to be resolved at render time rather than assumed. It was hardcoded to
+# /usr/bin/redis-server, which is right on Debian/Ubuntu and wrong anywhere the
+# binary lands in /usr/local/bin (a source build, Homebrew on a dev box, some
+# RPM layouts) — there the unit would fail to start with a bare 203/EXEC and
+# nothing pointing at the cause.
+#
+# Falls back to the historical literal when nothing is on PATH. A wrong-but-
+# absolute path is better than an empty ExecStart, which would not parse at all.
+# (An earlier version of this comment claimed "no module was installed either,
+# so the unit is inert". That was FALSE: falkordb_module_install is NOT gated on
+# consent, so the module is present even where redis is not. The unit is inert
+# on such a box because nothing enables it and nothing pulls it in — genesis-
+# server orders after it with After= and deliberately does not Wants= it.)
+_falkordb_redis_server_bin() {
+    local binary path
+    for binary in $FALKORDB_REDIS_BINARIES; do
+        path="$(command -v "$binary" 2>/dev/null || true)"
+        # Absolute AND executable, not merely non-empty. `command -v` echoes a
+        # RELATIVE path from a relative PATH entry, and a bare name when a shell
+        # function shadows the binary — either makes systemd refuse to PARSE the
+        # unit, which is worse than the hardcoded literal this replaced: the
+        # unit fails to load rather than merely failing to execute.
+        case "$path" in /*) ;; *) path="" ;; esac
+        if [ -n "$path" ] && [ -x "$path" ]; then
+            printf '%s' "$path"
+            return 0
+        fi
+    done
+    printf '/usr/bin/redis-server'
+}
+
 # _falkordb_redis_present — is there a redis on this box we must not disturb?
 #
 # `dpkg -s` is the obvious check and it is WRONG: it exits 0 for a

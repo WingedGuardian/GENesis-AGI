@@ -513,6 +513,140 @@ def test_start_limit_directives_are_in_the_unit_section():
         assert key not in service_section, f"{key} in [Service] is ignored"
 
 
+def test_the_resolver_never_emits_a_non_absolute_path(tmp_path):
+    """systemd REFUSES TO PARSE a unit whose ExecStart is not absolute.
+
+    `command -v` is not enough on its own: it echoes a RELATIVE path when PATH
+    holds a relative entry, and a bare name when a shell function shadows the
+    binary. Either would ship a unit that fails to LOAD — strictly worse than
+    the hardcoded literal this replaced, which at least parsed.
+    """
+    relative_dir = tmp_path / "relbin"
+    relative_dir.mkdir()
+    stub = relative_dir / "redis-server"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+    # PATH entry given RELATIVE to cwd — `command -v` resolves it relatively.
+    result = subprocess.run(
+        ["bash", "-c", f'set -u; source "{LIB}"; _falkordb_redis_server_bin'],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env={"PATH": "relbin:/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert result.stdout.startswith("/"), (
+        f"emitted a non-absolute path systemd cannot parse: {result.stdout!r}"
+    )
+
+
+def test_the_resolver_prefers_a_real_binary_over_the_fallback(tmp_path):
+    """The equivalence lock: guarding against relative paths must not make the
+    resolver ignore a perfectly good absolute one."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "redis-server"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-c", f'set -u; source "{LIB}"; _falkordb_redis_server_bin'],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert result.stdout == str(stub), f"did not resolve the real binary: {result.stdout!r}"
+
+
+def test_exec_start_is_rendered_not_hardcoded():
+    """systemd does no PATH lookup, so ExecStart must be an absolute path — but
+    it must not be an ASSUMED one.
+
+    /usr/bin/redis-server is right on Debian/Ubuntu and wrong wherever the
+    binary lands in /usr/local/bin (source build, some RPM layouts). There the
+    unit fails with a bare 203/EXEC and nothing points at the cause. The path
+    is resolved at render time instead, the same way the version pin is.
+    """
+    unit = UNIT_TEMPLATE.read_text()
+    assert "ExecStart=__REDIS_SERVER__" in unit, "ExecStart is not rendered"
+    assert "/usr/bin/redis-server" not in _exec_argv(unit), (
+        "a hardcoded interpreter path is back in ExecStart"
+    )
+
+    # and the render step must actually substitute it, or the unit ships a
+    # literal placeholder that fails to parse
+    bootstrap = (REPO_ROOT / "scripts" / "bootstrap.sh").read_text()
+    # The SHAPE, not the token: `s|__REDIS_SERVER__||g` would substitute an
+    # empty string and ship an ExecStart that does not parse, and a commented-
+    # out sed line mentioning the token would also pass a bare `in` check.
+    assert "s|__REDIS_SERVER__|$(_falkordb_redis_server_bin" in bootstrap, (
+        "render loop does not substitute the resolved path"
+    )
+
+
+def test_readiness_is_notified_not_assumed():
+    """Type=notify and --supervised systemd are ONE invariant, not two.
+
+    With Type=simple, systemd reports active as soon as the process forks and
+    the socket is not answering yet — MEASURED 3/3 restarts, 61-147ms. The
+    posture rule reads "unit active + socket missing" as a fault, so that
+    window is a false alert waiting to fire.
+
+    They are asserted TOGETHER because either alone is worse than neither:
+    Type=notify without --supervised systemd means nothing ever sends the
+    readiness notification, so every start hangs until TimeoutStartSec and
+    then fails.
+    """
+    unit = UNIT_TEMPLATE.read_text()
+    # Line-anchored on the DIRECTIVE. A substring check matched the comment
+    # above it that explains the choice, so reverting Type=notify left this
+    # test green -- verified by mutation. Prose is not structure.
+    types = [ln for ln in unit.splitlines() if ln.startswith("Type=")]
+    assert types == ["Type=notify"], f"expected exactly Type=notify, found {types}"
+    # Comment-stripped: _exec_argv runs to the next section header, so it
+    # carries every comment below ExecStart too. Asserting the raw substring
+    # is one future comment away from the vacuity already caught twice here.
+    argv = [
+        ln.strip().rstrip("\\").strip()
+        for ln in _exec_argv(unit).splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    assert "--supervised systemd" in argv, (
+        "Type=notify without --supervised systemd hangs every start to timeout"
+    )
+    # And the hang must be bounded: notify can park a start job for the
+    # manager default (90s here) where simple never could.
+    assert any(ln.startswith("TimeoutStartSec=") for ln in unit.splitlines()), (
+        "Type=notify with no TimeoutStartSec can park a start job for 90s"
+    )
+
+
+def test_the_server_waits_for_the_engine_but_does_not_require_it():
+    """Wants=, never Requires=: the engine is optional and arms nothing.
+
+    Ordering only. A Requires= would make genesis-server fail to start on every
+    install that never adopted the graph engine, which is most of them.
+    """
+    server = REPO_ROOT / "scripts" / "systemd" / "genesis-server.service.template"
+    text = server.read_text()
+    # BOTH directives, checked separately: After= alone orders without pulling
+    # the unit in, Wants= alone pulls it in without ordering. A whole-file
+    # substring check passed with one of them reverted -- verified by mutation.
+    after = [ln for ln in text.splitlines() if ln.startswith("After=")]
+    assert any("genesis-falkordb.service" in ln for ln in after), f"no ordering: {after}"
+    # Every directive that would START it, not just the hard ones. MEASURED: a
+    # DISABLED unit named in another unit's Wants= is started anyway —
+    # enablement gates only what default.target pulls in. bootstrap renders the
+    # engine unit on EVERY install but arms it on none, so any of these would
+    # start it on a box that declined provisioning, where there is no
+    # redis >= 8.0.0 and it restart-loops to `failed`.
+    for line in text.splitlines():
+        if line.startswith(("Wants=", "Requires=", "Requisite=", "BindsTo=", "PartOf=")):
+            assert "genesis-falkordb" not in line, (
+                f"this ARMS an engine the operator never enabled: {line}"
+            )
+
+
 def test_unit_write_scope_is_narrow():
     """ReadWritePaths=%h would grant the engine the whole home."""
     unit = UNIT_TEMPLATE.read_text()

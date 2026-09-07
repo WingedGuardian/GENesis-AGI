@@ -22,7 +22,20 @@ StartLimitBurst=4
 StartLimitIntervalSec=120
 
 [Service]
-Type=simple
+# notify, not simple: with Type=simple systemd reports the unit active as soon
+# as it FORKS, and the socket is not answering yet. MEASURED on the reference
+# install, 3 restarts per config with the start limiter respected: Type=simple
+# was not ready immediately 3/3 times (61ms, 147ms, 78ms), Type=notify 0/3.
+# The posture rule reads "unit active + socket missing" as a fault, so that
+# window is a false alert waiting to fire; --supervised systemd below is what
+# makes redis send the readiness notification that closes it.
+Type=notify
+# Type=notify can hang where Type=simple could not: redis only sends READY=1
+# when built with libsystemd, and USE_SYSTEMD=yes is NOT redis's Makefile
+# default -- so a source build accepts --supervised systemd and never notifies.
+# Bound it well under the 90s manager default, so such a build fails fast into
+# the restart limiter instead of parking a start job for a minute and a half.
+TimeoutStartSec=20
 # Socket-only by design: --port 0 disables the TCP listener entirely, so this
 # never collides with an operator's own redis on 6379 and is not reachable off
 # the box. Readers connect over the unix socket.
@@ -40,7 +53,7 @@ Type=simple
 # size. noeviction: silently evicting graph keys would corrupt the projection —
 # a write that cannot fit must fail loudly and be repaired by a re-project.
 ExecStartPre=/bin/mkdir -p __HOME__/.genesis/falkordb
-ExecStart=/usr/bin/redis-server \
+ExecStart=__REDIS_SERVER__ \
     --port 0 \
     --unixsocket __HOME__/.genesis/falkordb/falkordb.sock \
     --unixsocketperm 700 \
@@ -49,7 +62,8 @@ ExecStart=/usr/bin/redis-server \
     --save "" \
     --appendonly no \
     --maxmemory 512mb \
-    --maxmemory-policy noeviction
+    --maxmemory-policy noeviction \
+    --supervised systemd
 Restart=always
 RestartSec=5
 # Budgeted on RSS, not on the allocator figure. Note this only bites where the

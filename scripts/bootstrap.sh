@@ -1081,6 +1081,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                        -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
                        -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
                        -e "s|__FALKORDB_VERSION__|${FALKORDB_VERSION:-4.20.4}|g" \
+                       -e "s|__REDIS_SERVER__|$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")
