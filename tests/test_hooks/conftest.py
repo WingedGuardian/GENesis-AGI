@@ -44,6 +44,26 @@ def _hermetic_e2e_declaration(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_review_bodies(monkeypatch):
+    """Give EVERY hook test an EMPTY review-body set by default.
+
+    The inline finding scan reads a SECOND endpoint (``pulls/N/reviews``) for the
+    outside-diff channel. Without this pin the fetch falls through to the shared
+    paginated helper and is answered by whatever the test's ``subprocess.run``
+    mock returns — which for the existing suites is the INLINE comments payload,
+    a shape that happens to parse to zero findings. Those tests would then pass
+    for an accidental reason and would start failing the day an unrelated fixture
+    changed its payload.
+
+    Empty is the honest default: a test that says nothing about outside-diff
+    findings should see none. The channel's own behaviour — every severity, both
+    fail directions, dedupe, and the dismissed-review rule — is exercised in
+    tests/test_hooks/test_outside_diff_findings.py, which overrides this per case."""
+    monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", "")
+    yield
+
+
 def _load_settings() -> dict:
     """Load .claude/settings.json from the repo root."""
     here = Path(__file__).resolve()

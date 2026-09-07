@@ -37,6 +37,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `GENESIS_LEDGER_ESCALATION_DISABLED=1`.
 ### Fixed
 
+- **The merge gate now reads review findings it previously could not see at all.**
+  When a reviewer's finding points at a line outside the changes a pull request
+  actually made, CodeRabbit cannot attach it to the diff and puts it in the review
+  summary instead. The gate only ever read the attached findings, so those went
+  unreported — a pull request could show a clean review status with real findings
+  outstanding. Measured on the install this was built against: 27 findings across
+  23 open pull requests were invisible this way, 15 of them rated Major, including
+  one about silently losing a stored preference and one about writing unredacted
+  URLs to a log.
+
+  Those findings are now collected and shown, deduplicated across re-reviews. Only
+  a Critical one holds up a merge: the rest are reported but do not block, because
+  a finding delivered this way has no comment thread, and the usual way to accept a
+  finding you disagree with is to reply in its thread. Blocking on something you
+  cannot answer would leave no way forward. A review dismissed by a maintainer is
+  left out entirely, and an unreadable review list holds the merge rather than
+  reporting all-clear.
+
 - **A model your account tier cannot use no longer stalls the fallback chain.**
   When a provider refuses a call because the plan does not include that model,
   the refusal arrives as an HTTP 403 whose message names the plan or subscription
