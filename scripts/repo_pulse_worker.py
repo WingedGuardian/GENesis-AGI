@@ -30,6 +30,44 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
+def _print_verification_backlog(db_path: str | None) -> None:
+    """The pr_verifications day-one reader: open obligations, oldest merge first.
+
+    Read-only, no worker run, no debounce — usable while the Wave-3 validator
+    session (the eventual consumer) does not exist yet. Prints one line per
+    open row plus a status histogram; "0 open" with a nonzero closed count
+    means the lane is running and everything recent was docs-exempt or
+    verified, while an EMPTY histogram means the table is empty or
+    pre-migration — two different states, both printed as what they are.
+    """
+    import asyncio as _asyncio
+
+    from genesis.db.crud import pr_verifications as verif_crud
+    from genesis.env import genesis_db_path
+
+    resolved = db_path or str(genesis_db_path())
+
+    async def _read() -> tuple[list[dict], dict]:
+        import aiosqlite
+
+        async with aiosqlite.connect(resolved, timeout=10) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+            return await verif_crud.list_open(db), await verif_crud.counts(db)
+
+    rows, histogram = _asyncio.run(_read())
+    if not histogram:
+        print("pr_verifications: no rows (table empty or pre-migration)")
+        return
+    for row in rows:
+        title = (row.get("pr_title") or "").strip()
+        print(f"OPEN  PR #{row['pr_number']}  merged {str(row['merged_at'])[:10]}  {title[:80]}")
+    print(
+        f"pr_verifications: {histogram.get('open', 0)} open, "
+        f"{histogram.get('closed', 0)} closed ({resolved})"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trigger", default="manual", choices=["session_start", "manual"])
@@ -50,7 +88,17 @@ def main() -> None:
         default=None,
         help="override the cursor-less enumeration window (config default: 7)",
     )
+    parser.add_argument(
+        "--verification-backlog",
+        action="store_true",
+        help="list OPEN post-merge verification obligations (oldest merge "
+        "first) and exit — no worker run, no debounce, read-only",
+    )
     args = parser.parse_args()
+
+    if args.verification_backlog:
+        _print_verification_backlog(args.db_path)
+        return
 
     from genesis.session_awareness.repo_pulse_worker import run_pulse_worker
 

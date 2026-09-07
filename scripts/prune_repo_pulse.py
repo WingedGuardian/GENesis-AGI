@@ -23,13 +23,23 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
-async def _prune(days: int) -> int:
+async def _prune(days: int, verification_days: int) -> tuple[int, int]:
     from genesis.db.connection import get_raw_db
+    from genesis.db.crud.pr_verifications import prune_closed
     from genesis.db.crud.repo_pulse import prune_repo_pulse
 
     now = datetime.now(UTC).isoformat()
     async with get_raw_db() as conn:
-        return await prune_repo_pulse(conn, older_than_days=days, now=now)
+        pulse_deleted = await prune_repo_pulse(conn, older_than_days=days, now=now)
+        # pr_verifications retention (issue #1718 half B): CLOSED rows only —
+        # an OPEN row IS the obligation and is never pruned; deleting one would
+        # silently forgive an unverified merge. Separate, longer window than
+        # the runs/annotations telemetry: closed rows are the audit trail behind
+        # "no row within the window means the lane never recorded that PR" — a
+        # claim the lane earns by FAILING its run rather than advancing the
+        # shared cursor past PRs it could not write.
+        verif_deleted = await prune_closed(conn, older_than_days=verification_days, now=now)
+        return pulse_deleted, verif_deleted
 
 
 def main() -> None:
@@ -40,10 +50,23 @@ def main() -> None:
         default=45,
         help="retention window in days (rows older than this are deleted)",
     )
+    ap.add_argument(
+        "--verification-days",
+        type=int,
+        default=180,
+        help="retention for CLOSED pr_verifications rows (open rows are the "
+        "obligation and are never pruned)",
+    )
     args = ap.parse_args()
     try:
-        deleted = asyncio.run(_prune(args.days))
-        print(f"repo_pulse prune: deleted {deleted} row(s) older than {args.days}d")
+        pulse_deleted, verif_deleted = asyncio.run(_prune(args.days, args.verification_days))
+        # Two windows, two numbers: one total against one window would assert a
+        # denominator neither count actually has.
+        print(
+            f"repo_pulse prune: deleted {pulse_deleted} run/annotation row(s) "
+            f"older than {args.days}d; {verif_deleted} closed verification row(s) "
+            f"older than {args.verification_days}d"
+        )
     except Exception as exc:
         print(f"repo_pulse prune error: {exc}", file=sys.stderr)
 

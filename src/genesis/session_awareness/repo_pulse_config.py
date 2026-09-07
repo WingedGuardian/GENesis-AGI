@@ -54,6 +54,9 @@ DEFAULTS: dict[str, Any] = {
     "max_items": 40,  # open ledger rows fed to the fuzzy judge
     "max_proposals_per_run": 10,  # fuzzy annotations stored per run
     "inject_confidence_floor": 0.7,  # proposals below this never surface
+    # PR-verification lane (issue #1718 half B): one durable obligation row per
+    # merged PR; docs-only diffs auto-close. Master switch, open_pr_enabled's twin.
+    "verification_enabled": True,
     # Open-PR lane (session-manager PR-4c): age-stale open-PR surface.
     "open_pr_enabled": True,  # master switch for the open-PR lane (bool)
     "open_pr_stale_days": 7,  # a PR idle >= this many days is "stale"

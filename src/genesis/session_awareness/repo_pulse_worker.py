@@ -41,9 +41,11 @@ from pathlib import Path
 
 from genesis.db.crud import follow_ups as followups_crud
 from genesis.db.crud import pending_issue_posts as pip_crud
+from genesis.db.crud import pr_verifications as verif_crud
 from genesis.db.crud import repo_pulse as pulse_crud
 from genesis.db.crud.session_charters import ledger_all, ledger_update
 from genesis.env import genesis_db_path, genesis_home
+from genesis.session_awareness.doc_paths import is_doc_path
 from genesis.session_awareness.headless import run_headless_json
 from genesis.session_awareness.repo_pulse import (
     PROMPT_VERSION,
@@ -64,6 +66,7 @@ from genesis.session_awareness.repo_pulse_config import (
 from genesis.session_awareness.repo_pulse_gh import (
     list_merged_prs,
     list_open_prs,
+    list_pr_files,
     resolve_default_branch,
 )
 
@@ -469,6 +472,96 @@ async def _run(
         )
     finally:
         lock_fh.close()
+
+
+async def _verification_lane(
+    db_path: Path | str,
+    prs: list[dict],
+    repo: str | None,
+    now_iso: str,
+) -> tuple[int, int, bool]:
+    """Open one pr_verifications row per merged PR (issue #1718 half B).
+
+    The durable half of the post-merge E2E obligation: a merge-time
+    declaration is advisory (#1824), so this row is what survives the merge.
+    A DOCS-ONLY diff (every changed path passes ``is_doc_path``) is born
+    CLOSED with the reason recorded — the owner's deterministic exemption, no
+    model in the loop. Everything else is born OPEN for the validator.
+
+    Fail directions, each deliberate:
+    - changed-file list unreadable (API error, cap, malformed row, or EMPTY —
+      a merged PR touches at least one file, so empty means the read lied,
+      the exact empty-vs-unreadable ambiguity measured as a security HIGH on
+      the hook's sibling reader) → the PR is NOT docs-only; its row opens.
+      Cost: one validator look. The other direction silently forgives an
+      unverified merge.
+    - tables absent (pre-migration subprocess window) → nothing written and
+      COMPLETE=FALSE, which makes the caller fail the run and KEEP the cursor.
+      That third value is load-bearing and was missing in review: idempotency
+      is not recovery. The unique index guarantees a retry cannot duplicate,
+      but nothing retries a PR the shared cursor has already advanced past —
+      so a silent no-op here would strand exactly the merges this lane exists
+      to record. The window is real and structural on every existing install:
+      the run-recording tables predate this one, so between a code deploy and
+      the next server restart (when migrations run) ``_record_run`` succeeds
+      while this lane cannot write.
+    - ``exists`` pre-check before the files fetch: window re-coverage must
+      not re-spend a GitHub API call per already-recorded PR. The INSERT OR
+      IGNORE against the unique index remains the actual guard; the
+      pre-check is an API-cost optimization only.
+
+    Returns (opened, auto_closed, complete). ``complete`` is False when this
+    run could not record every PR it was given — the caller then keeps the
+    cursor so the next tick re-covers the window (every other lane's writes
+    are dedup-guarded, so re-coverage is safe, and the ``exists`` pre-check
+    makes it nearly free). The caller also wraps this in its own try/except:
+    an exception must never break the absorb lanes or ``_record_run``.
+    """
+    if not prs or not repo:
+        return 0, 0, True
+    import aiosqlite
+
+    opened = auto_closed = 0
+    async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        db.row_factory = aiosqlite.Row
+        if not await verif_crud.tables_available(db):
+            return 0, 0, False
+        for pr in prs:
+            number = pr["number"]
+            if await verif_crud.exists(db, repo=repo, pr_number=number):
+                continue
+            listing = await list_pr_files(number, repo=repo)
+            reason: str | None = None
+            if (
+                "error" not in listing
+                and listing["files"]
+                and all(is_doc_path(p) for p in listing["files"])
+            ):
+                reason = (
+                    f"docs-only diff ({len(listing['files'])} path(s)) — "
+                    "deterministic exemption, no runtime surface"
+                )
+            outcome = await verif_crud.open_verification(
+                db,
+                repo=repo,
+                pr_number=number,
+                pr_title=str(pr.get("title") or "")[:200] or None,
+                merged_at=str(pr["mergedAt"]),
+                now=now_iso,
+                closed_reason=reason,
+            )
+            if outcome == "unavailable":
+                # The table vanished mid-loop (a restore, a hostile drop).
+                # Everything after this PR is unrecorded too — stop and let
+                # the caller keep the cursor.
+                return opened, auto_closed, False
+            if outcome == "created":
+                if reason:
+                    auto_closed += 1
+                else:
+                    opened += 1
+    return opened, auto_closed, True
 
 
 async def _run_locked(
@@ -958,6 +1051,61 @@ async def _run_locked(
                                 )
     if n_closes:
         detail_notes.append(f"issue-close exact={n_closes}")
+
+    # ── PR-verification lane (issue #1718 half B) ────────────────────────────
+    # One durable row per merged PR; docs-only diffs auto-close (deterministic).
+    # Placed BEFORE the fuzzy tier: that tier can return early on a judge
+    # timeout, and this lane must run on every tick that has new PRs. Own
+    # try/except + knob (the open-PR-lane posture): a gh/DB failure surfaces on
+    # the run row's detail and never breaks the absorb lanes or _record_run.
+    # Rides its own dedup (the (repo, pr_number) unique index), so the cursor
+    # advancing past a failed tick is recovered by the next window re-coverage
+    # only when the failure was per-PR transient — a hard lane failure is
+    # visible in detail and the rows self-heal on the next tick that sees the
+    # same PRs; PRs the cursor has passed are backfilled by nothing, which is
+    # why the failure note matters.
+    if cfg.get("verification_enabled", True):
+        verif_complete = True
+        try:
+            n_verif_open, n_verif_autoclosed, verif_complete = await _verification_lane(
+                db_path, prs, repo, now_iso
+            )
+            if n_verif_open or n_verif_autoclosed:
+                detail_notes.append(
+                    f"verification opened={n_verif_open} auto-closed={n_verif_autoclosed}"
+                )
+        except Exception as exc:  # never break the absorb lanes / _record_run
+            detail_notes.append(f"verification_lane_failed: {str(exc)[:120]}")
+            verif_complete = False
+        if not verif_complete:
+            # The lane could not record every PR in this window. FAIL the run and
+            # KEEP the cursor, the same posture every other lane takes on an
+            # incomplete read (posted_index_read_failed above) — because the
+            # cursor is SHARED: advancing it would retire these PRs from every
+            # future enumeration, and no mechanism re-presents them. Idempotency
+            # is not recovery. Re-coverage is cheap and safe: every lane's writes
+            # are dedup-guarded, and this lane's `exists` pre-check means the
+            # already-recorded PRs cost no GitHub calls on the retry.
+            detail_notes.append("verification_lane_incomplete")
+            recorded = await _record_run(
+                db_path,
+                **_base_row(
+                    status="failed",
+                    repo=repo,
+                    n_prs=len(prs),
+                    n_open_items=len(open_items),
+                    n_exact=n_exact,
+                ),
+                annotations=annotations,
+            )
+            if recorded:
+                _write_cursor(root, cursor, merged_at=None)
+            await _record_telemetry(db_path, "failed", "verification_lane_incomplete")
+            return {
+                "status": "failed",
+                "detail": "verification_lane_incomplete",
+                "n_exact": n_exact,
+            }
 
     remaining = [i for i in open_items if i["id"] not in absorbed]
     n_fuzzy = 0

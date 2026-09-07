@@ -28,6 +28,11 @@ from genesis.session_awareness.repo_pulse_config import DEFAULTS
 M58 = importlib.import_module("genesis.db.migrations.0058_session_charters")
 M62 = importlib.import_module("genesis.db.migrations.0062_repo_pulse")
 M84 = importlib.import_module("genesis.db.migrations.0084_repo_pulse_target_kind")
+# The verification lane rides every run: without its table the lane reports
+# INCOMPLETE and the run fails by design (it must not let the shared cursor
+# retire PRs it could not record). These tests exercise the absorb lanes on a
+# normally-migrated install, so the fixture applies it like any other migration.
+MVERIF = importlib.import_module("genesis.db.migrations.20260906234824_pr_verifications")
 
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 ITEM = "0123456789abcdef0123456789abcdef"
@@ -72,6 +77,7 @@ async def db_path(tmp_path) -> Path:
         await M58.up(db)
         await M62.up(db)
         await M84.up(db)  # target_kind column + widened index
+        await MVERIF.up(db)  # pr_verifications — see the import note above
         await db.execute(TABLES["follow_ups"])  # the follow-up lane reads this
         await db.commit()
     yield path
@@ -478,6 +484,7 @@ async def test_pre_migration_never_absorbs_ledger(pulse_root, tmp_path, monkeypa
     async with aiosqlite.connect(str(bare)) as db:
         await M62.up(db)
         await M84.up(db)  # target_kind — record_run writes it
+        await MVERIF.up(db)  # else the verification lane reports incomplete → failed run
         await db.commit()
     pulse_crud._tables_verified = False
     out2 = await _run(bare, monkeypatch, gh=_gh([_pr(body=f"Ledger: {ITEM}")]))
