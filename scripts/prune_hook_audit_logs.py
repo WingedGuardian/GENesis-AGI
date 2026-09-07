@@ -69,6 +69,23 @@ def main() -> None:
             if not os.path.isdir(directory):
                 print(f"hook audit trim: {directory}: absent, nothing to do")
                 continue
+            if not os.access(directory, os.W_OK | os.X_OK):
+                # SAY IT. `trim_dir_by_size` skips an unlink it cannot perform,
+                # without a word — so an unwritable store reports "removed 0
+                # byte(s)", which is byte-identical to "already under bound" while
+                # the store grows forever. That is the same silent-unbounded-store
+                # failure this whole prune path exists to end, one layer down.
+                # Reachable in practice: the resolver honours any ABSOLUTE
+                # override, and the hygiene unit runs under ProtectSystem=strict
+                # with ReadWritePaths=%h, so a store configured outside $HOME is
+                # readable and unwritable exactly here.
+                print(
+                    f"hook audit trim: {directory}: NOT WRITABLE by this process — "
+                    "the store is UNBOUNDED until this is fixed (a store outside "
+                    "$HOME is blocked by the hygiene unit's sandbox)",
+                    file=sys.stderr,
+                )
+                continue
             freed = _trim(directory, args.max_bytes)
             print(f"hook audit trim: {directory}: removed {freed} byte(s) (bound {args.max_bytes})")
         except Exception as exc:  # noqa: BLE001 — never abort the groom

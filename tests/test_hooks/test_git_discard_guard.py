@@ -636,3 +636,49 @@ def test_no_additional_context_when_nothing_snapshotted(repo, snap_log, monkeypa
     )
     assert _gd.main() == 0
     assert capsys.readouterr().out == ""
+
+
+def test_an_unavailable_writer_says_so_on_stderr(repo, snap_log, monkeypatch, capsys):
+    """The guard's own message must not point at evidence it never emits.
+
+    `_record_snapshots` tells the operator "NOT logged — see the [audit-log] line
+    on stderr for why". When `audit_jsonl` failed to import, no such line existed:
+    the durable recovery pointer was dropped and the only explanation offered was
+    a reference to a line that was never printed (Codex P2, PR #1609). The sibling
+    condition in `git_push_guard._flush_overrides` already reports itself; this is
+    the other half of that rule.
+    """
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(_gd, "audit_jsonl", None)
+    notes = _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
+    captured = capsys.readouterr()
+    assert notes and "NOT logged" in notes[0], notes
+    assert "[audit-log]" in captured.err, (
+        "the note sends the operator to an [audit-log] line that was never printed"
+    )
+    assert _snap_files(snap_log) == []
+
+
+def test_the_superseded_file_knob_is_reported_not_silently_ignored(snap_log, monkeypatch, capsys):
+    """`GENESIS_DISCARD_SNAPSHOT_LOG` named a FILE and this store is a DIRECTORY.
+
+    An install that set the old knob would otherwise keep writing to the new
+    default while its tooling read the old path — snapshots appearing to have
+    stopped, with nothing said (Codex P2, PR #1609). Deliberately NOT translated:
+    a file path does not carry a correct directory, and inventing one would put
+    recovery records somewhere nobody chose. The resolved directory must therefore
+    still be the one the NEW knob names.
+    """
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", "/tmp/legacy-snapshots.jsonl")
+    resolved = _gd._snapshot_dir()
+    err = capsys.readouterr().err
+    assert "GENESIS_DISCARD_SNAPSHOT_LOG" in err, "the superseded knob was dropped in silence"
+    assert "GENESIS_DISCARD_SNAPSHOT_DIR" in err, "the notice does not name the replacement"
+    assert resolved == str(snap_log), "the legacy value must not steer the store"
+
+
+def test_no_notice_when_the_superseded_knob_is_unset(snap_log, monkeypatch, capsys):
+    """The control. A notice on every ordinary run is a notice nobody reads."""
+    monkeypatch.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
+    assert _gd._snapshot_dir() == str(snap_log)
+    assert "GENESIS_DISCARD_SNAPSHOT_LOG" not in capsys.readouterr().err

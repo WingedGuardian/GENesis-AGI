@@ -282,6 +282,12 @@ def _isolate_override_log(tmp_path):
     # the NEXT test that drives that guard cannot write to the operator's real
     # recovery store. Isolating one of two sibling stores was the gap.
     mp.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(tmp_path / "git_discard_snapshots"))
+    # And the SUPERSEDED knob, which is config the operator may still carry. It no
+    # longer steers the store, but setting it now makes the guard print a migration
+    # notice — so leaving it inherited means the suite's stderr depends on the
+    # developer's environment. Same gap as the sibling store above, one level up:
+    # isolating the store but not the config that talks about it.
+    mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
     yield
     mp.undo()
 

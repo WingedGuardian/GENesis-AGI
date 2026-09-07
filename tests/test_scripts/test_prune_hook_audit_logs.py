@@ -142,3 +142,74 @@ def test_old_files_are_still_trimmed_when_a_new_one_exists(tmp_path):
     assert r.returncode == 0, r.stderr
     assert fresh.exists(), "the newest file was taken"
     assert sum(f.stat().st_size for f in store.glob("*.jsonl")) <= 5100
+
+
+def test_an_unwritable_store_is_reported_not_silently_skipped(tmp_path):
+    """A store the pruner cannot write reports "removed 0 byte(s)" — byte-identical
+    to "already under bound" — while it grows forever.
+
+    `trim_dir_by_size` skips an unlink it cannot perform, without a word. That is
+    reachable in practice, not hypothetical: `resolve_store_dir` honours any
+    ABSOLUTE override, and the hygiene unit runs under `ProtectSystem=strict` with
+    `ReadWritePaths=%h`, so a store configured outside $HOME is readable and
+    unwritable exactly here. It is the same silent-unbounded-store failure this
+    prune path exists to end, one layer down.
+    """
+    store = tmp_path / "store"
+    _seed(store, 20, size=1000)
+    before = len(list(store.glob("*.jsonl")))
+    os.chmod(store, 0o500)  # readable + traversable, not writable
+    try:
+        r = _run(str(store), "--max-bytes", "10")
+    finally:
+        os.chmod(store, 0o700)
+    assert r.returncode == 0, "a prune failure must never abort the rest of the groom"
+    assert "NOT WRITABLE" in r.stderr, f"the failure was silent: {r.stdout!r} {r.stderr!r}"
+    assert "removed 0 byte(s)" not in r.stdout, (
+        "an unwritable store must not report the same line as a store under its bound"
+    )
+    assert len(list(store.glob("*.jsonl"))) == before
+
+
+def test_a_writable_store_still_reports_the_ordinary_line(tmp_path):
+    """The control. Without it the assertion above passes against a pruner that
+    calls every store unwritable and trims nothing at all."""
+    store = tmp_path / "store"
+    _seed(store, 20, size=1000)
+    r = _run(str(store), "--max-bytes", "5000")
+    assert r.returncode == 0, r.stderr
+    assert "NOT WRITABLE" not in r.stderr
+    assert "removed" in r.stdout
+    assert sum(f.stat().st_size for f in store.glob("*.jsonl")) <= 5000
+
+
+def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env():
+    """The trim needs two variables that live in `secrets.env`, and the unit
+    deliberately does NOT load that file.
+
+    MEASURED on systemd 255: an `EnvironmentFile=` overrides `Environment=`
+    regardless of the order the directives appear in, so loading secrets.env into
+    the hygiene unit would silently replace the gh/git PATH that unit pins — and
+    hand every provider key to a oneshot that runs `rm -rf`. The knobs are read by
+    name in the script instead, and never by `eval`/`source`, because that file is
+    the one place on the box holding every credential.
+    """
+    unit = (_REPO / "scripts" / "systemd" / "genesis-disk-hygiene.service.template").read_text()
+    # DIRECTIVES only. The unit explains in a comment why this is absent, and a bare
+    # substring scan matches that explanation — a test that fails on its own
+    # rationale teaches the next person to delete the rationale.
+    directives = [ln.strip() for ln in unit.splitlines() if not ln.lstrip().startswith("#")]
+    assert not any(ln.startswith("EnvironmentFile") for ln in directives), (
+        "loading secrets.env here overrides the unit's own pinned PATH (systemd 255)"
+    )
+    assert any(ln.startswith("Environment=PATH=") for ln in directives), (
+        "the pinned PATH this test protects is gone, so the assertion above guards nothing"
+    )
+
+    body = _HYGIENE.read_text()
+    for knob in ("GENESIS_MERGE_OVERRIDE_DIR", "GENESIS_DISCARD_SNAPSHOT_DIR"):
+        assert knob in body, f"the groom never resolves {knob}"
+    loader = body.split("_load_store_knob() {", 1)[-1].split("\n    }", 1)[0]
+    assert "eval" not in loader and "source " not in loader and ". " not in loader, (
+        "the knob loader executes secrets.env content"
+    )

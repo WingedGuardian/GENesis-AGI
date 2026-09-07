@@ -28,9 +28,16 @@ WHAT THIS GUARANTEES
 * **Own-user-only, with no umask window.** ``os.open`` applies the mode at CREATE
   time; ``open()`` then ``chmod`` is briefly group/world-readable. These files sit in
   ``~/.genesis`` beside secrets.
-* **One resolution by name per flush, and it creates the file.** Nothing reopens it.
+* **Two names per flush, each resolved exactly once, and neither is ever reopened.**
+  The bytes go to a STAGING name (:data:`_STAGING_SUFFIX`), and the record is then
+  PUBLISHED by hard-linking that inode to its final ``.jsonl`` name. ``link`` rather
+  than ``rename`` because link fails ``EEXIST`` on a taken name instead of replacing
+  what is there, which keeps the create-or-fail property the retry loop rests on.
 * **A batch is one ``os.write``, or as many as the kernel needs to finish it.** All
-  rows land or none do, so a multi-sigil command is never half-recorded.
+  rows land or none do — for a CONCURRENT READER as well as for the writer, which is
+  what the staging name buys: the ``*.jsonl`` glob that ``cat`` and ``backup.sh``
+  both use can only ever match a complete record, and a mid-write kill leaves a
+  scrap the pruner reaps rather than a truncated line that breaks the whole store.
 * **Bounded work.** Serialisation happens before any filesystem call, and the row
   count is capped — see :data:`_MAX_ROWS` for why that is a security property here.
 * **Failures are reported, never fatal.** A caller on a hook path must not break the
@@ -46,6 +53,12 @@ KNOWN RESIDUALS, stated rather than implied
 * No ``fsync``. A crash immediately after a write can lose that flush. The previous
   design could lose the entire retained history to the same crash, because the
   atomic replace was what published it.
+* Publishing needs HARD LINKS. On a store directory placed (via the env knob) on a
+  filesystem that does not support them, every write fails — loudly, with a stderr
+  warning and ``None``, never silently. That is deliberate: the alternative,
+  falling back to ``rename``, would silently REPLACE whatever sits at the final
+  name, so the degraded mode would destroy records instead of refusing to write
+  them. The default store is an ordinary directory under ``~/.genesis``.
 * Files are named from the wall clock plus pid. Two flushes in the same microsecond
   from one process take the retry suffix; the ordering the pruner relies on is the
   name, so a clock stepped backwards makes a NEW file sort as though it were old.
@@ -75,6 +88,32 @@ LOG_FILE_MODE = 0o600
 #: Distinct names to try before giving up. Only a same-microsecond collision from the
 #: same pid consumes one, so this is generous by design.
 _NAME_RETRIES = 100
+
+#: Suffix of the STAGING name a batch is written to before it is published.
+#:
+#: Deliberately not ``.jsonl``: the store's documented reader is
+#: ``cat <store>/*.jsonl`` and ``backup.sh`` globs the same pattern, so a name the
+#: glob matches is a PUBLISHED record by definition. Writing under this name and
+#: publishing afterwards is what makes "all rows land or none do" true for a
+#: CONCURRENT READER as well as for the writer — opening the final name first
+#: exposes an empty file for the length of the write, and a mid-write SIGKILL
+#: leaves a truncated line there permanently, which makes the whole store
+#: unparseable (CodeRabbit Major + Codex P2, PR #1609).
+#:
+#: The cost of hiding a scrap from the glob is that it is also hidden from the
+#: pruner, which would be a new unbounded store — so ``trim_dir_by_size`` reaps
+#: stale scraps, under the same recency rule it applies to records.
+#:
+#: TWO limits of that reaping, stated because "unconditionally reaped" would be too
+#: strong. Scrap bytes are NOT added to the size total, so the byte bound bounds the
+#: records only and a store can sit somewhat over its nominal bound while live
+#: scraps exist — bounded by the reap rather than by the trim. And a scrap that is
+#: not a REGULAR file is skipped, exactly as a record is: neither is read nor
+#: unlinked through, which is the property that matters more than reaping every
+#: name. The grace window protects a STALLED writer, not structurally; a flush is
+#: milliseconds, and the failure mode if a scrap is taken anyway is a reported
+#: ``None`` (the publish raises ENOENT), never a record that silently vanishes.
+_STAGING_SUFFIX = ".part"
 
 #: Rows accepted in one flush. A caller notes one row per override sigil on one
 #: command, so a real flush is one to four.
@@ -130,10 +169,12 @@ def write_batch(dir_path: str, rows: Sequence[dict], *, sort_keys: bool = False)
         pid = os.getpid()
         stamp = _stamp()
         for n in range(_NAME_RETRIES):
-            path = os.path.join(dir_path, f"{stamp}Z-{pid}-{n}.jsonl")
+            stem = f"{stamp}Z-{pid}-{n}"
+            path = os.path.join(dir_path, f"{stem}.jsonl")
+            staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
             try:
                 fd = os.open(
-                    path,
+                    staging,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
                     LOG_FILE_MODE,
                 )
@@ -145,18 +186,44 @@ def write_batch(dir_path: str, rows: Sequence[dict], *, sort_keys: bool = False)
                     # os.write may write fewer bytes than asked; a single call would
                     # truncate the batch silently on a short write.
                     written += os.write(fd, payload[written:])
-            except BaseException:
-                # A partial record is worse than no record. The store's documented
-                # reader is `cat <store>/*.jsonl`, so one truncated final line makes
-                # every consumer raise on the WHOLE store — the failure the shared
-                # file used a tail-terminator check to survive. Here the record is
-                # its own file, so removing it contains the damage to itself and
-                # makes "all rows land or none do" true rather than aspirational.
-                os.close(fd)
+                # Disown BEFORE closing, not after. Linux frees the descriptor even
+                # when close(2) reports an error, so a handler that saw `fd >= 0`
+                # would close it a second time and raise EBADF over whatever the
+                # real failure was.
+                _fd, fd = fd, -1
+                os.close(_fd)
+                # PUBLISH. `link` rather than `rename` on purpose: rename REPLACES
+                # whatever sits at the destination, which would silently destroy an
+                # existing record and throw away the create-or-fail property the
+                # retry loop is built on. `link` fails EEXIST instead, so a taken
+                # name — a real record, or a symlink or FIFO someone planted — sends
+                # us to the next candidate exactly as the old direct open did, and
+                # nothing is ever written or linked THROUGH a planted name.
+                os.link(staging, path)
+            except FileExistsError:
+                # The final name was taken between the staging open and the link.
+                # Drop this scrap and try the next candidate rather than leaving it
+                # for the pruner to reap later.
+                if fd >= 0:
+                    os.close(fd)
                 with contextlib.suppress(OSError):
-                    os.unlink(path)
+                    os.unlink(staging)
+                continue
+            except BaseException:
+                # A partial record is worse than no record. Because the bytes went to
+                # a staging name the `*.jsonl` glob does not match, no reader ever saw
+                # this — cleanup here is tidiness, and the SIGKILL case (where this
+                # handler never runs) is covered by the pruner's scrap reaping rather
+                # than by hoping the handler gets to run.
+                if fd >= 0:
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.unlink(staging)
                 raise
-            os.close(fd)
+            # The scrap has served its purpose; the record now lives under its own
+            # name. A failure to unlink here costs a reapable scrap, never the record.
+            with contextlib.suppress(OSError):
+                os.unlink(staging)
             return path
         warn(f"{dir_path}: no free name after {_NAME_RETRIES} attempts — batch dropped")
         return None
@@ -227,15 +294,42 @@ def trim_dir_by_size(dir_path: str, max_bytes: int) -> int:
     """
     freed = 0
     try:
+        cutoff = time.time() - _ACTIVE_WRITER_GRACE_S
         with os.scandir(dir_path) as entries:
             files = []
+            scraps = []
             for entry in entries:
+                if entry.name.endswith(_STAGING_SUFFIX):
+                    with contextlib.suppress(OSError):
+                        st = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(st.st_mode) and st.st_mtime <= cutoff:
+                            # `st_nlink` decides whether unlinking this RECLAIMS the
+                            # bytes. A scrap whose post-publish unlink failed shares
+                            # its inode with the published record, so removing the
+                            # scrap frees nothing — counting its size would put a
+                            # number in the timer's journal that is simply false, in
+                            # the one line an operator reads to see whether retention
+                            # is working.
+                            scraps.append((entry.path, st.st_size if st.st_nlink <= 1 else 0))
+                    continue
                 if not entry.name.endswith(".jsonl"):
                     continue
                 with contextlib.suppress(OSError):
                     st = entry.stat(follow_symlinks=False)
                     if stat.S_ISREG(st.st_mode):
                         files.append((entry.name, entry.path, st.st_size))
+        # Reap abandoned STAGING scraps unconditionally, before any size decision.
+        # A scrap is never an audit record — it is what a writer killed mid-batch
+        # left behind — and it is invisible to `*.jsonl`, so nothing else would ever
+        # remove it. Not gated on the size bound: an unbounded store of scraps is
+        # precisely the leak the staging name would otherwise introduce. Anything
+        # inside the grace window is skipped above: that is a LIVE writer's scrap.
+        for path, size in scraps:
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+            freed += size
         files.sort()  # timestamp-prefixed names sort oldest-first
         total = sum(size for _, _, size in files)
         # The newest is excluded from the CANDIDATE LIST rather than guarded by a
@@ -256,8 +350,10 @@ def trim_dir_by_size(dir_path: str, max_bytes: int) -> int:
         # a candidate, however many newer names exist. The window is generous
         # because the cost is asymmetric — keeping a few extra KB for a minute is
         # nothing, and deleting a live writer's file loses an audit record that
-        # exists nowhere else yet.
-        cutoff = time.time() - _ACTIVE_WRITER_GRACE_S
+        # exists nowhere else yet. (``cutoff`` is the one computed above, so records
+        # and staging scraps are judged against the SAME instant — two reads of the
+        # clock could put a file on either side of the window depending on which
+        # loop reached it.)
         for _name, path, size in files[:-1]:
             if total <= max_bytes:
                 break

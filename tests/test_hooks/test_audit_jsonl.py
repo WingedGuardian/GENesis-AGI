@@ -123,18 +123,30 @@ def test_write_never_raises_on_an_unusable_store(tmp_path, capsys):
 # ── retention ────────────────────────────────────────────────────────────────
 
 
-def _seed(d: Path, n: int, size: int = 100) -> list[Path]:
-    """Seed ``n`` records of roughly ``size`` bytes each, oldest first.
+def _seed(d: Path, n: int, size: int = 100, *, age_s: float = 3600) -> list[Path]:
+    """Seed ``n`` records of roughly ``size`` bytes each, oldest first, BACKDATED.
 
     Real JSONL rather than padding, so ``_rows`` can read the store afterwards —
     a seeded file that cannot be parsed would fail the readers, not the code.
+
+    The mtime is set deliberately, not left at "now". ``trim_dir_by_size`` refuses
+    to delete a file touched inside ``_ACTIVE_WRITER_GRACE_S``, so a fixture that
+    writes everything in the same millisecond is protected in full and every
+    deletion assertion below goes VACUOUS — which is exactly what happened when
+    the grace window landed: this file's twin in ``tests/test_scripts`` was
+    backdated and this one was not, so two tests went red and three more passed
+    while exercising nothing. A store the daily timer trims holds files hours old;
+    backdating is what makes these tests model that. Pass ``age_s=0`` to exercise
+    the protection itself.
     """
     d.mkdir(parents=True, exist_ok=True)
+    when = time.time() - age_s
     out = []
     for i in range(n):
         f = d / f"20200101T000000_{i:06d}Z-1-0.jsonl"
         body = json.dumps({"seeded": i, "pad": "x" * max(size - 30, 1)}) + "\n"
         f.write_text(body)
+        os.utime(f, (when, when))
         out.append(f)
     return out
 
@@ -186,6 +198,82 @@ def test_a_failed_unlink_cannot_cost_the_newest_record(tmp_path, monkeypatch):
     assert seeded[-1] in survivors, "the newest record was deleted after a failed unlink"
 
 
+def test_the_jsonl_name_appears_only_once_the_record_is_complete(tmp_path, monkeypatch):
+    """A concurrent reader must never observe an incomplete ``*.jsonl``.
+
+    The store's documented reader is ``cat <store>/*.jsonl``, and ``backup.sh``
+    globs the same pattern — so publishing the final name before the payload is
+    written exposes an empty or half-written record to both. Opening the final
+    name first also makes a mid-write SIGKILL permanent: the cleanup handler
+    never runs, and a truncated line then makes the WHOLE store unparseable
+    (CodeRabbit Major + Codex P2, PR #1609).
+
+    Asserted from INSIDE the write, which is the only place the window exists.
+    """
+    d = tmp_path / "store"
+    seen: list[list[str]] = []
+    real_write = os.write
+    monkeypatch.setattr(
+        os,
+        "write",
+        lambda fd, buf: (seen.append(sorted(p.name for p in _files(d))), real_write(fd, buf))[1],
+    )
+    path = aj.write_batch(str(d), [{"a": "x" * 200}])
+    monkeypatch.undo()
+    assert path is not None
+    assert seen and all(s == [] for s in seen), f"a .jsonl was visible mid-write: {seen}"
+    assert _rows(d) == [{"a": "x" * 200}]
+
+
+def test_an_interrupted_write_publishes_nothing_and_leaves_nothing(tmp_path, monkeypatch):
+    """A signal-shaped failure must publish no record AND drop its own scrap.
+
+    ``KeyboardInterrupt`` is used deliberately: it is a ``BaseException`` the
+    module's ``except Exception`` net does not catch, so this exercises the same
+    handler an interrupt would.
+    """
+    d = tmp_path / "store"
+    real_write = os.write
+
+    def die_midway(fd, buf):
+        real_write(fd, buf[:5])
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "write", die_midway)
+    with pytest.raises(KeyboardInterrupt):
+        aj.write_batch(str(d), [{"a": "x" * 200}])
+    monkeypatch.undo()
+    assert _files(d) == [], "a partial record was published under the .jsonl name"
+    assert list(d.iterdir()) == [], "the handler left its own staging scrap behind"
+
+
+def test_the_pruner_reaps_a_stale_scrap_but_spares_a_live_one(tmp_path):
+    """The leak the staging name would otherwise create, and its bound.
+
+    A SIGKILL between the staging open and the publish leaves a scrap that NO
+    handler can clean up — and the scrap is invisible to ``*.jsonl``, so without
+    this the store grows forever in a way no reader or pruner can see. A scrap is
+    never an audit record, so reaping one drops nothing; recency is what separates
+    an abandoned scrap from a live writer's, exactly as it does for records.
+
+    Both directions asserted together — a pruner that reaped nothing, and one that
+    reaped everything, each pass half of this.
+    """
+    d = tmp_path / "store"
+    d.mkdir()
+    stale = d / f"20200101T000000_000000Z-1-0{aj._STAGING_SUFFIX}"
+    stale.write_text("partial")
+    os.utime(stale, (0, 0))
+    live = d / f"20200101T000000_000001Z-1-0{aj._STAGING_SUFFIX}"
+    live.write_text("partial")
+
+    # Well under the bound, so nothing here rides on the size trim: scrap reaping
+    # is unconditional, because a scrap store has no other bound at all.
+    aj.trim_dir_by_size(str(d), 10_000_000)
+    assert not stale.exists(), "the pruner left an abandoned scrap behind forever"
+    assert live.exists(), "the pruner took a scrap inside the active-writer grace window"
+
+
 def test_a_partial_write_leaves_no_truncated_record(tmp_path, monkeypatch):
     """A truncated final line makes the WHOLE store unreadable to `cat …/*.jsonl`.
 
@@ -227,6 +315,30 @@ def test_trim_ignores_entries_it_must_not_follow_or_delete(tmp_path):
     aj.trim_dir_by_size(str(d), 10)
     assert victim.read_text() == "untouched"
     assert victim.exists()
+
+
+def test_trim_spares_everything_inside_the_active_writer_grace_window(tmp_path):
+    """The guard that made the backdating in ``_seed`` necessary, pinned HERE.
+
+    Excluding only the newest NAME is not enough when two flushes overlap: the
+    earlier writer's file is not the newest name and was otherwise an ordinary
+    deletion candidate (Codex P2, PR #1609). So recency, not position — nothing
+    touched inside ``_ACTIVE_WRITER_GRACE_S`` may be taken, however far over the
+    bound the store is and however many newer names sit above it.
+
+    Its twin is the assertion right below that a BACKDATED store of the same shape
+    and the same bound IS trimmed — without that control this test passes against
+    a ``trim_dir_by_size`` that deletes nothing at all.
+    """
+    fresh = tmp_path / "fresh"
+    _seed(fresh, 10, size=1000, age_s=0)
+    assert aj.trim_dir_by_size(str(fresh), 10) == 0
+    assert len(_files(fresh)) == 10, "a file inside the grace window was deleted"
+
+    old = tmp_path / "old"
+    _seed(old, 10, size=1000, age_s=aj._ACTIVE_WRITER_GRACE_S + 60)
+    assert aj.trim_dir_by_size(str(old), 10) > 0
+    assert len(_files(old)) == 1, "the control did not trim, so the test above proves nothing"
 
 
 def test_trim_on_a_missing_store_is_zero_and_creates_nothing(tmp_path):

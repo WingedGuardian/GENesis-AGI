@@ -482,6 +482,19 @@ _backup_has_payload() {
     _dir_has_file "$d/memory" && return 0
     _dir_has_file "$d/eval" && return 0
     _dir_has_file "$d/creds" && return 0
+    # §6d restores this store, so it is a restorable payload and must be counted
+    # here or a backup whose ONLY surviving payload is the audit trail dies at the
+    # guard below and never reaches the section that would restore it — after this
+    # change advertised it as a Tier-1 payload (Codex P2, PR #1609). A partial
+    # Tier-1 recovery, or a run that skipped the encrypted sections, is exactly
+    # when that shape occurs.
+    # Matched to what §6d actually restores (`-name '*.jsonl'`), NOT the generic
+    # `_dir_has_file`, which accepts any file: a backup killed between staging a
+    # mirror copy and sweeping leaves a `.<name>.partial.<pid>` scrap, and a mirror
+    # holding zero restorable records would otherwise satisfy this guard and let the
+    # run report success having restored nothing.
+    find "$d/audit/merge_overrides" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
+        2>/dev/null | grep -q . && return 0
     [ -f "$d/secrets/secrets.env.gpg" ] && return 0
     find "$d/config_overrides" -type f -name '*.local.yaml' -print -quit 2>/dev/null | grep -q . && return 0
     # §7/§8 also restore secrets/creds from the host-side credential MIRROR when

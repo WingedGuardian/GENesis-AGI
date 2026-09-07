@@ -226,6 +226,23 @@ def _snapshot_dir() -> str:
     where it is rather than migrated. Its rows point at unreachable stash objects git
     prunes on its own schedule, so it self-obsoletes within weeks; moving it would
     carry pointers that are about to stop resolving anyway."""
+    # The knob this REPLACES is not silently ignored. `GENESIS_DISCARD_SNAPSHOT_LOG`
+    # named a FILE and is documented in the code it superseded as a config knob, so
+    # an install that set it would otherwise keep writing to the new default while
+    # its operator tooling read the old path — snapshots appearing to have stopped,
+    # with nothing said (Codex P2, PR #1609). It is NOT auto-translated: a file path
+    # does not carry a correct directory, and inventing one would put recovery
+    # records somewhere the operator did not choose. Say it, and let them decide.
+    _legacy = os.environ.get("GENESIS_DISCARD_SNAPSHOT_LOG")
+    if _legacy:
+        with contextlib.suppress(Exception):
+            print(
+                "[audit-log] GENESIS_DISCARD_SNAPSHOT_LOG is no longer read (the store "
+                "is now a DIRECTORY of one file per snapshot) — set "
+                "GENESIS_DISCARD_SNAPSHOT_DIR to an absolute directory instead; "
+                "records are being written to the default until you do",
+                file=sys.stderr,
+            )
     # ONE resolver, shared with the other guard and the pruner. This rule
     # was written out three times and the pruner's copy omitted the
     # absolute-path refusal, so it trimmed an unrelated directory while the
@@ -284,6 +301,19 @@ def _write_log_row(row: dict) -> str | None:
     refuse a destructive command has no business also rewriting a file.
     """
     if audit_jsonl is None:
+        # SAY SO. `_record_snapshots` tells the operator the snapshot was "NOT
+        # logged — see the [audit-log] line on stderr for why", and on this path no
+        # such line existed: the message pointed at evidence that was never emitted
+        # (Codex P2, PR #1609). The sibling in git_push_guard._flush_overrides
+        # already reports the same condition; this is the second half of that rule.
+        # Cannot use audit_jsonl.warn — that is the module we do not have. Suppressed
+        # for the same reason it is there: an unwritable stderr must not raise out of
+        # a best-effort logging call on a guard's verdict path.
+        with contextlib.suppress(Exception):
+            print(
+                "[audit-log] audit_jsonl unavailable — snapshot record NOT written",
+                file=sys.stderr,
+            )
         return None
     return audit_jsonl.write_batch(_snapshot_dir(), [row])
 
