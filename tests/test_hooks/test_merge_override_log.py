@@ -223,13 +223,21 @@ class TestWriter:
             _note_and_flush(waived="ci:red", pr="1", repo="o/r")
         finally:
             audit_jsonl.os.open = real_open
-        # Keyed on the RECORD FILE, not merely "some open happened": recording only
-        # modes once let a sibling file satisfy this while the record was insecure.
+        # Keyed on the RECORD FILE's own INODE, not merely "some open happened":
+        # recording only modes once let a sibling file satisfy this while the record
+        # was insecure. The record is published by hard-linking the staging name, so
+        # the record and its scrap ARE one inode — which is why the create mode
+        # applies to the record even though the record's name was never opened. Map
+        # by name so a sibling file still cannot stand in for it.
         created = _files(log_dir)
         assert created, "no record file was created"
         for f in created:
-            assert str(f) in seen, f"{f} was never os.open'd: {sorted(seen)}"
-            assert seen[str(f)] == 0o600, oct(seen[str(f)])
+            staged = str(f)[: -len(".jsonl")] + audit_jsonl._STAGING_SUFFIX
+            assert staged in seen, f"{f} was never created by an os.open: {sorted(seen)}"
+            assert seen[staged] == 0o600, oct(seen[staged])
+            # The end state too — the create mode is only the interesting half if the
+            # publish did not relax it on the way through.
+            assert stat.S_IMODE(f.stat().st_mode) == 0o600, oct(f.stat().st_mode)
 
     def test_the_SECOND_writer_of_waived_cannot_bypass_the_shape_check(self, log_dir):
         """Validation belongs at the chokepoint, not at each call site.
@@ -387,7 +395,7 @@ class TestWiredIntoTheMergePath:
     the real ``main()`` with a real merge command.
     """
 
-    def _drive(self, monkeypatch, command, *, ci="SUCCESS", mergeable="MERGEABLE"):
+    def _drive(self, monkeypatch, command, *, ci="SUCCESS", mergeable="MERGEABLE", rounds=1):
         monkeypatch.delenv("CLAUDE_TOOL_INPUT", raising=False)
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
@@ -398,9 +406,15 @@ class TestWiredIntoTheMergePath:
         # ELSE: four of them blocked on a real PR's review state while their
         # docstrings claimed to exercise "a real merge". Mirrors the seam set in
         # test_merge_gate_characterization.py, which is network-free by design.
+        # ONE JSON OBJECT PER LINE, per `_codex_reviews`' documented seam contract —
+        # which is what makes `rounds` the round COUNT the escalation gate sees, and
+        # so the only way a test here can reach that gate's cap comparisons at all.
         monkeypatch.setenv(
             "_TEST_GH_CODEX_REVIEWS",
-            json.dumps({"login": "chatgpt-codex-connector[bot]", "commit_id": HEAD}),
+            "\n".join(
+                json.dumps({"login": "chatgpt-codex-connector[bot]", "commit_id": HEAD})
+                for _ in range(rounds)
+            ),
         )
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
         monkeypatch.setenv(
@@ -557,27 +571,64 @@ class TestWiredIntoTheMergePath:
         assert [r["outcome"] for r in _rows(log_dir)] == ["allowed"]
 
     def test_command_scoped_acks_are_not_logged_at_all(self, monkeypatch, log_dir):
-        """`escalation-ack` and `merge-to-main-override` are deliberately OUT of
-        scope — the pin for a decision, not an oversight.
+        """The command-scoped acks are OUT of this store's scope — the pin for a
+        decision, not an oversight. Two DIFFERENT reasons, kept distinct.
 
-        Both are COMMAND-scoped acks whose gate is not evaluated where the sigil
-        is seen, so any row would assert a waiver that was never consulted, with
-        every identifying field empty. Two attempts to attribute them honestly
-        both produced fiction, MEASURED: `escalation-ack` on `git commit`,
-        `git status` and `pytest` each claimed the round cap was waived; after
-        narrowing, `git commit … # escalation-ack && gh pr comment 5 …` recorded
-        the COMMIT gate's ack against PR 5; and `merge-to-main-override` on a repo
-        checked out at a feature branch — where the gate would have allowed the
-        merge anyway — still claimed a local-merge-into-main waiver.
+        `merge-to-main-override` waives a gate that short-circuits BEFORE the
+        branch is resolved, so a row asserts a waiver that was never consulted,
+        with every identifying field empty. MEASURED on a repo checked out at a
+        feature branch — where the gate would have allowed the merge anyway — the
+        row still claimed a local-merge-into-main waiver.
+
+        The round-cap acks (`escalation-ack`, `final-round-accept`) are a SCOPE
+        decision, not an impossibility. Under the bare short-circuit this branch
+        was written against, attribution was hopeless: `escalation-ack` on
+        `git commit`, `git status` and `pytest` each claimed the round cap was
+        waived; after narrowing, `git commit … # escalation-ack && gh pr comment 5
+        …` recorded the COMMIT gate's ack against PR 5. #1680 retired that
+        short-circuit — both sigils are now honoured inside
+        `_check_codex_round_escalation`'s scan loop, where the PR NUMBER and the
+        real round count are resolved (`repo` only when the command carries
+        `--repo` or a PR URL) — so a row naming a waiver that actually happened is
+        writable today. Whether this store should carry ack-class sigils is a
+        separate decision; this test pins the CURRENT answer (it does not), so a
+        future change to it is deliberate rather than accidental.
+
+        Which means the cases below must REACH the honour points, not merely run
+        the scan. With one seeded review `effective == 1`, neither cap comparison
+        is taken and the sigil is never consulted — a `_note_override` added inside
+        either branch would leave such a test green, which is the exact accident
+        this docstring claims to prevent. So the tail of this test drives the round
+        count up to each cap.
         """
         for cmd in (
             'git commit -m "wip"  # escalation-ack',
             "git status  # escalation-ack",
             'gh pr comment 5 --body "@codex review"  # escalation-ack',
             'git commit -m "x"  # escalation-ack && gh pr comment 5 --body "@codex review"',
+            'gh pr comment 5 --body "@codex review"  # final-round-accept',
         ):
             self._drive(monkeypatch, cmd)
             assert _rows(log_dir) == [], f"{cmd!r} produced a row"
+
+        # THE HONOUR POINTS. Everything above runs with `effective == 1`, below both
+        # caps, so the sigil is never consulted — those cases pin "the scan writes
+        # nothing", not "the waiver writes nothing". These two put the round count
+        # ON each cap, which is where `acked` / `final_acked` actually decide
+        # something, and are therefore the cases a future `_note_override` inside
+        # either branch would have to survive.
+        for cmd, rounds in (
+            (
+                'gh pr comment 5 --body "@codex review"  # escalation-ack',
+                _mod.ESCALATION_ROUND_CAP,
+            ),
+            (
+                'gh pr comment 5 --body "@codex review"  # final-round-accept',
+                _mod.FINAL_ROUND_CAP,
+            ),
+        ):
+            self._drive(monkeypatch, cmd, rounds=rounds)
+            assert _rows(log_dir) == [], f"{cmd!r} logged at the HONOUR point"
 
     def test_no_sigil_writes_nothing(self, monkeypatch, log_dir):
         """Positive control's twin: an ordinary merge must not log."""

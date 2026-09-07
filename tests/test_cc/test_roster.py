@@ -356,6 +356,60 @@ def test_every_documented_auth_env_has_a_secrets_slot():
     )
 
 
+def test_a_peer_too_long_to_observe_is_announced_at_load(monkeypatch, caplog):
+    """Selection accepts any configured name; the availability record rejects one
+    over its bound rather than truncating it, because a truncated key would merge
+    two peers and let one peer's success clear another's failure.
+
+    So such a peer serves traffic while being permanently invisible in health.
+    That is a silent hole in an observability surface, which is the one thing
+    that surface exists to prevent — so it is announced at load time.
+    """
+    from genesis.cc import roster as R
+
+    long_name = "p" * (R._MAX_OBSERVABLE_NAME + 1)
+    monkeypatch.setenv("FAKE_PEER_TOKEN", "x")
+    fake = {"models": {
+        "active-one": {"failover_order": 0, "auth_env": "FAKE_PEER_TOKEN"},
+        long_name: {"failover_order": 1, "auth_env": "FAKE_PEER_TOKEN"},
+    }}
+
+    with caplog.at_level("WARNING", logger="genesis.cc.roster"):
+        chain = R.failover_chain("active-one", roster=fake)
+
+    assert long_name in chain, "selection must still route to it — this is not a gate"
+    hits = [r for r in caplog.records if "never appear in peer-availability" in r.getMessage()]
+    assert len(hits) == 1, f"an unobservable peer must be announced, got {len(hits)}"
+    assert long_name not in caplog.text, "the name itself must not be logged whole"
+
+
+def test_a_non_string_roster_key_cannot_disable_the_backup_chain(monkeypatch, caplog):
+    """A hand-edited YAML roster with an unquoted numeric key parses to an int.
+
+    The observability warning added at load time calls len() on the name, and a
+    TypeError there is raised while BUILDING failover_chain — before the
+    per-peer skip logic — so one malformed entry silently disabled the entire
+    backup chain at exactly the moment it was needed. The defect was introduced
+    by the warning itself, which is why this lock exists.
+    """
+    from genesis.cc import roster as R
+
+    monkeypatch.setenv("FAKE_PEER_TOKEN", "x")
+    fake = {"models": {
+        "active-one": {"failover_order": 0, "auth_env": "FAKE_PEER_TOKEN"},
+        123: {"failover_order": 1, "auth_env": "FAKE_PEER_TOKEN"},
+        "good-peer": {"failover_order": 2, "auth_env": "FAKE_PEER_TOKEN"},
+    }}
+
+    with caplog.at_level("WARNING", logger="genesis.cc.roster"):
+        chain = R.failover_chain("active-one", roster=fake)
+
+    assert "good-peer" in chain, "one malformed key must not cost the whole chain"
+    assert 123 not in chain
+    hits = [r for r in caplog.records if "not a string" in r.getMessage()]
+    assert len(hits) == 1, "the skipped entry must be announced"
+    assert "123" not in caplog.text, "the key's VALUE must not be logged"
+
 def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
     """The shipped file states this rule in prose; nothing enforced it.
 
