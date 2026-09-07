@@ -1024,6 +1024,22 @@ else
 fi
 echo
 
+# --- Graph engine (FalkorDB) provisioning ---
+# Same guarded-source contract as the resilience libs. Server side ONLY: this
+# installs a redis-server new enough to load the module plus the module itself,
+# and stops there. The unit rendered below is left DISABLED and nothing in
+# Genesis reads the engine yet, so a box where this skips entirely is fully
+# functional — the memory graph keeps using its in-process NetworkX projection.
+echo "--- Graph engine (optional) ---"
+if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    falkordb_provision
+else
+    echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
+fi
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
@@ -1056,10 +1072,15 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
+        # source of truth for the pin); the literal fallback keeps the render
+        # working when that lib is absent, in which case the unit is inert
+        # anyway because no module was installed.
         rendered=$(sed -e "s|__HOME__|$HOME|g" \
                        -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
                        -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
                        -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+                       -e "s|__FALKORDB_VERSION__|${FALKORDB_VERSION:-4.20.4}|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

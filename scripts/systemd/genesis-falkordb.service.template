@@ -1,0 +1,82 @@
+[Unit]
+Description=Genesis FalkorDB — graph engine for the memory graph (socket-only)
+# The memory graph's engine (issue #1641): SQLite stays the system of record,
+# this holds a DERIVED, rebuildable index. Nothing consumes it yet — the client
+# and the config that can select it arrive in a later slice — so this unit is
+# rendered by bootstrap but NOT auto-enabled, the same posture as
+# genesis-code-intel-freeze. Arm it deliberately:
+#   systemctl --user enable --now genesis-falkordb
+#   systemctl --user disable --now genesis-falkordb
+#
+# Provisioned by scripts/lib/falkordb_install.sh: redis-server >= 8.0.0 from the
+# official upstream apt repo (Ubuntu/Debian stable ship 7.x, which the module
+# refuses to load on) plus the released module under ~/.genesis/deps.
+# StartLimit* live in [Unit], NOT [Service]: systemd ignores
+# StartLimitIntervalSec there (it accepts StartLimitBurst as a legacy alias, so
+# the misplacement is HALF-silent and leaves burst counting against the 10s
+# manager default). Measured: with RestartSec=5 and a 10s window, burst=4 is
+# unreachable and a unit whose module fails to load restarts forever without
+# ever entering `failed` — which is also what the posture rule assumes cannot
+# happen. No network.target: this service opens no socket on the network.
+StartLimitBurst=4
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+# Socket-only by design: --port 0 disables the TCP listener entirely, so this
+# never collides with an operator's own redis on 6379 and is not reachable off
+# the box. Readers connect over the unix socket.
+#
+# No persistence (--save "" --appendonly no): the graph is a projection of
+# memory_links and the recovery path is to re-project, not to restore. That is
+# also why backup.sh does not cover it — same reasoning it already applies to
+# Qdrant, whose snapshot is an optimisation rather than a correctness need.
+#
+# --maxmemory is set BELOW the cgroup MemoryMax on purpose. It bounds the
+# allocator, but RSS runs ~1.6-2.0x the allocator figure (measured during the
+# engine evaluation), so a 1gb maxmemory could reach ~1.8G RSS and be OOM-killed
+# by the cgroup before redis's own limit ever engaged. 512mb keeps worst-case
+# RSS around the 1G ceiling and is still ~6x the measured peak for this graph's
+# size. noeviction: silently evicting graph keys would corrupt the projection —
+# a write that cannot fit must fail loudly and be repaired by a re-project.
+ExecStartPre=/bin/mkdir -p __HOME__/.genesis/falkordb
+ExecStart=/usr/bin/redis-server \
+    --port 0 \
+    --unixsocket __HOME__/.genesis/falkordb/falkordb.sock \
+    --unixsocketperm 700 \
+    --dir __HOME__/.genesis/falkordb \
+    --loadmodule __HOME__/.genesis/deps/falkordb/__FALKORDB_VERSION__/falkordb.so \
+    --save "" \
+    --appendonly no \
+    --maxmemory 512mb \
+    --maxmemory-policy noeviction
+Restart=always
+RestartSec=5
+# Budgeted on RSS, not on the allocator figure. Note this only bites where the
+# memory controller is delegated to the user slice; --maxmemory above is the
+# backstop that holds regardless.
+MemoryMax=1G
+LimitNOFILE=65536
+# No OOMScoreAdjust: lowering oom_score_adj needs CAP_SYS_RESOURCE, which an
+# unprivileged `systemd --user` manager does not have. systemd treats the
+# failure as non-fatal, so the directive would sit here reporting itself as
+# configured (via `systemctl show`) while the process keeps the manager's
+# inherited score. Measured: the running engine had oom_score_adj=100, the
+# same as the user manager. Real protection needs a drop-in on user@.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Narrowed to what the comment actually claims. `%h` would grant write to the
+# whole home — the repo and its secrets.env, ~/.ssh, ~/.claude — which defeats
+# the point of ProtectSystem=strict. --save "" does not close that: an explicit
+# BGSAVE after CONFIG SET dir writes wherever dir points, and the module is
+# native code. ~/.genesis (not the falkordb subdir) so ExecStartPre can create
+# the data dir when it is missing.
+ReadWritePaths=%h/.genesis
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+ProtectKernelTunables=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

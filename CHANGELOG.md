@@ -9,6 +9,35 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Optional graph engine, provisioned but not armed.** Bootstrap can now set up
+  FalkorDB -- a graph engine for the memory graph. It installs two things: a
+  `redis-server` new enough to load the engine module (the module refuses
+  anything below 8.0.0, and Ubuntu/Debian stable ship 7.x, so this adds Redis's
+  official upstream apt repo), and the engine module itself under
+  `~/.genesis/deps`. Nothing reads the engine yet, so its service unit is
+  written but left **disabled**; the memory graph keeps using its in-process
+  projection exactly as before. Arm it deliberately with
+  `systemctl --user enable --now genesis-falkordb` once a later release wires
+  a consumer.
+
+  Every step declines rather than forces. **If you already run redis-server,
+  Genesis leaves it and the apt repo completely alone** -- adding the repo would
+  silently upgrade your Redis on your next unrelated `apt upgrade`, which is not
+  ours to do; you get printed instructions instead. No passwordless sudo, an
+  unsupported architecture, an unrecognised distro, or a failed download each
+  skip with a note and let bootstrap continue. The downloaded module is checked
+  against a pinned digest, because upstream publishes no checksums of its own.
+
+  Two things worth knowing: the service listens on **no TCP port at all** (it
+  speaks over a unix socket in `~/.genesis/falkordb`), and Redis 8 is
+  tri-licensed under RSALv2/SSPLv1/AGPLv3 rather than the plain BSD of the 7.x
+  in your distro -- running it unmodified places no obligation on your own code,
+  but you are installing it, so you should know. Uninstall removes Genesis's own
+  files; the `redis-server` package and the apt repo are deliberately left in
+  place, since other software on the machine may rely on them.
+
 ### Fixed
 
 - **SECURITY.md described a posture the code left behind two months ago.** The
