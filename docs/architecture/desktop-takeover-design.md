@@ -561,10 +561,17 @@ consumption at teardown** (§2.1), without which the TTL is the only thing
 retiring a grant. A **stable window identity** carried from the resolve step,
 replacing the title comparison in §2.1, belongs there too.
 
-One question is open and deliberately not answered here. `voice:` is an
-allowlisted grant channel because the operator ruled for a spoken
-challenge-response, but the voice channel's resistance to ambient or replayed
-audio has not been established. Whether a spoken "yes" is strong enough to open
-a session-length grant over the operator's own keyboard is a decision to take
-explicitly, before the consent path is built, rather than one inherited from a
-line in a constant.
+One question was raised in review and has been answered. A spoken
+challenge-response **may** open a session-length grant; `voice:` stays an
+allowlisted channel. That settles the policy, and it is not reopened on
+ambient-audio or replay grounds.
+
+It does not assert that the voice pipeline resists replayed audio, which is an
+engineering property rather than a decision, and the distinction is worth
+keeping straight. The mitigation the design relies on is structural: the consent
+path names the target window back to the operator and waits for a specific
+answer, which is materially harder to trigger by accident or by replay than a
+bare "approve" — an attacker would need the window name — and the resulting
+grant is bounded, revocable and scoped to that one window regardless. The loop
+must therefore build the challenge-response as specified rather than accept a
+naked "yes".
