@@ -2286,6 +2286,42 @@ TABLES = {
             unknown_reason            TEXT                        -- set iff status='skipped'/'failed' on dependency outage
         )
     """,
+    # Zero-drop findings — one row per STANDING stranded-work condition (a local
+    # branch with no PR, a pushed branch with no PR, a dirty worktree), so the
+    # reconciler can ENUMERATE what fell through the cracks instead of a session
+    # having to remember. Identity is (class, branch), never the tip SHA — a
+    # SHA-keyed row resets the recurrence counter on every commit. See
+    # db/crud/zero_drop.py for the New-Store justification + retention (only
+    # RESOLVED rows are pruned; pruning an ACKED row would un-suppress it).
+    # DDL byte-identical to migration 20260905215957_zero_drop_findings.
+    "zero_drop_findings": """
+    CREATE TABLE IF NOT EXISTS zero_drop_findings (
+        id                TEXT PRIMARY KEY,
+        class             TEXT NOT NULL
+                            CHECK (class IN (
+                              'unpushed_branch','pushed_no_pr','dirty_worktree')),
+        branch            TEXT NOT NULL,
+        tip_sha           TEXT,
+        ahead_count       INTEGER,
+        worktree_path     TEXT,
+        status            TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open','acked','resolved')),
+        first_seen_at     TEXT NOT NULL,
+        last_seen_at      TEXT NOT NULL,
+        consecutive_runs  INTEGER NOT NULL DEFAULT 1,
+        escalated_at      TEXT,
+        last_run_id       TEXT,
+        ack_reason        TEXT,
+        acked_at          TEXT,
+        acked_tip_sha     TEXT,
+        resolved_at       TEXT,
+        reopen_count      INTEGER NOT NULL DEFAULT 0,
+        details           TEXT,
+        created_at        TEXT NOT NULL,
+        updated_at        TEXT NOT NULL,
+        UNIQUE(class, branch)
+    )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2637,6 +2673,11 @@ INDEXES = [
     # Memory integrity Phase 1 — reconcile-run audit rows
     "CREATE INDEX IF NOT EXISTS idx_mrr_created ON memory_reconcile_runs(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_mrr_status ON memory_reconcile_runs(status, created_at)",
+    # Zero-drop findings — the open-set scan (every surface reads status) and the
+    # detector-freshness / retention sweeps (both order by last_seen_at)
+    "CREATE INDEX IF NOT EXISTS idx_zero_drop_findings_status ON zero_drop_findings(status)",
+    "CREATE INDEX IF NOT EXISTS idx_zero_drop_findings_last_seen "
+    "ON zero_drop_findings(last_seen_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
