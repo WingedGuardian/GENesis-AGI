@@ -72,6 +72,7 @@ finds nothing is indistinguishable from one that looks at nothing.
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import sys
 from pathlib import Path
@@ -96,7 +97,7 @@ def _qualname(tree: ast.AST, node: ast.AST) -> str:
     live collisions today; `_write::tmp` and `_atomic_write_json::tmp` already
     repeat across files, and `tmp` is the temp name in most rows, so it is a
     matter of time rather than of luck."""
-    parts: list[str] = []
+    parts: list[tuple[int, str]] = []
     for anc in ast.walk(tree):
         if (
             isinstance(anc, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
@@ -162,7 +163,7 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
             temps.update(_bound_names(n.optional_vars))
 
     # Assignments, iterated to a fixpoint so a derived name is reached.
-    pairs: list[tuple[list[str], str]] = []
+    pairs: list[tuple[list[str], ast.AST]] = []
     for n in ast.walk(func):
         if isinstance(n, ast.Assign):
             targets, value = n.targets, n.value
@@ -172,16 +173,36 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
             continue
         names = [nm for t in targets for nm in _bound_names(t)]
         if names:
-            pairs.append((names, _unparse(value)))
+            pairs.append((names, value))
 
-    for names, rhs in pairs:
-        if any(m in rhs for m in _TEMP_MAKERS) or any(x in rhs for x in _TEMP_SUFFIXES):
+    def _makes_temp(value: ast.AST) -> bool:
+        """A temp-maker call, or a STRING LITERAL ending in a scratch suffix.
+
+        Anchored to the literal's END rather than matched anywhere in the
+        unparsed text: `path.with_suffix(".tmp")` makes a temp, while a variable
+        merely named `tmp_dir_listing` does not, and a substring test cannot tell
+        them apart."""
+        for n in ast.walk(value):
+            if isinstance(n, ast.Call):
+                fn = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+                if fn in _TEMP_MAKERS:
+                    return True
+            if (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                    and n.value.endswith(_TEMP_SUFFIXES)):
+                return True
+        return False
+
+    for names, value in pairs:
+        if _makes_temp(value):
             temps.update(names)
 
     for _ in range(len(pairs) + 1):  # bounded: at most one new name per pass
         grew = False
-        for names, rhs in pairs:
-            if any(t in rhs for t in temps) and not set(names) <= temps:
+        for names, value in pairs:
+            # Propagate through the RHS's IDENTIFIERS, not its text: a name that
+            # merely CONTAINS a known temp's name is a different variable.
+            refs = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
+            if (refs & temps) and not set(names) <= temps:
                 temps.update(names)
                 grew = True
         if not grew:
@@ -206,10 +227,107 @@ def _handlers_covering(func: ast.AST, lineno: int) -> list:
     return out
 
 
-def _unlinks(nodes: list, temp_expr: str) -> bool:
-    """Does any handler unlink something naming the temp expression?"""
+#: Wrappers that do not change WHICH path is meant, so `Path(tmp)`, `str(tmp)`
+#: and `tmp.expanduser()` all still name `tmp`.
+_TRANSPARENT = ("Path", "str", "os.fspath", "pathlib.Path")
+
+
+def _strip_wrappers(expr: ast.AST) -> ast.AST:
+    """Remove path-neutral wrappers: Path(x), str(x), x.expanduser()/resolve()."""
+    node = expr
+    for _ in range(8):  # bounded; nesting deeper than this is not real code
+        if isinstance(node, ast.Call) and _unparse(node.func) in _TRANSPARENT and node.args:
+            node = node.args[0]
+            continue
+        if isinstance(node, ast.Attribute) and node.attr in ("expanduser", "resolve", "absolute"):
+            node = node.value
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in ("expanduser", "resolve", "absolute"):
+            node = node.func.value
+            continue
+        break
+    return node
+
+
+def _core_name(expr: ast.AST) -> str:
+    return _unparse(_strip_wrappers(expr))
+
+
+def _alias_map(func: ast.AST) -> dict[str, ast.AST]:
+    """Local single-assignment aliases, for resolving a reconstructed path.
+
+    Cleanup often names the temp by REBUILDING it rather than reusing the
+    variable: `tmp = path.with_suffix(".tmp")` written, then
+    `Path(plan_path).expanduser().with_suffix(".tmp").unlink()` in the handler.
+    That is genuinely clean, and identity matching alone reads it as a leak --
+    so a false CLEAN became a false FLAG, which is better but still wrong.
+
+    Only names assigned EXACTLY ONCE are resolved; a rebound name is ambiguous
+    and is left alone rather than guessed at.
+    """
+    counts: dict[str, int] = {}
+    values: dict[str, ast.AST] = {}
+    for n in ast.walk(func):
+        if not isinstance(n, ast.Assign) or len(n.targets) != 1:
+            continue
+        t = n.targets[0]
+        if isinstance(t, ast.Name):
+            counts[t.id] = counts.get(t.id, 0) + 1
+            values[t.id] = n.value
+    return {k: v for k, v in values.items() if counts.get(k) == 1}
+
+
+class _Substitute(ast.NodeTransformer):
+    """Replace single-assignment local names with the expression they were bound to."""
+
+    def __init__(self, aliases: dict[str, ast.AST]) -> None:
+        self.aliases = aliases
+        self.changed = False
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:  # noqa: N802 (ast API)
+        repl = self.aliases.get(node.id)
+        if repl is None:
+            return node
+        self.changed = True
+        return copy.deepcopy(repl)
+
+
+def _resolve(expr: ast.AST, aliases: dict[str, ast.AST], depth: int = 4) -> str:
+    """Fully-substituted, wrapper-normalised form of an expression.
+
+    Substitution is RECURSIVE, not root-only: the reconstructed cleanup path is
+    `Path(plan_path).expanduser().with_suffix(".tmp")` while the temp is `tmp`,
+    bound to `path.with_suffix(".tmp")` where `path` is itself a local. Resolving
+    only the outermost name leaves `path.with_suffix('.tmp')` on one side and the
+    fully-spelled form on the other, and they never meet.
+
+    Bounded by `depth` and by single-assignment aliases only, so this cannot loop
+    on a rebinding and cannot invent a resolution for an ambiguous name.
+    """
+    node = copy.deepcopy(expr)
+    for _ in range(depth):
+        sub = _Substitute(aliases)
+        node = sub.visit(node)
+        if not sub.changed:
+            break
+    return _unparse(_strip_wrappers(node))
+
+
+def _unlinks(nodes: list, temp_expr: str, func: ast.AST | None = None) -> bool:
+    """Does any handler unlink THE TEMP -- by identity, not by substring?
+
+    Containment (`temp_expr in args`) was wrong in the direction that matters:
+    MEASURED, `os.unlink(tmp_backup)` credited cleanup for temp `tmp`, so a
+    genuinely leaking site read CLEANS_UP. A false CLEAN is strictly worse than a
+    false flag here -- the leak is invisible AND excluded from the debt ledger,
+    so nothing ever revisits it.
+    """
     if not temp_expr:
         return False
+    aliases = _alias_map(func) if func is not None else {}
+    want_node = ast.parse(temp_expr, mode="eval").body
+    wants = {_core_name(want_node), _resolve(want_node, aliases)}
     for grp in nodes:
         for item in (grp if isinstance(grp, list) else [grp]):
             for n in ast.walk(item):
@@ -218,9 +336,14 @@ def _unlinks(nodes: list, temp_expr: str) -> bool:
                 fn = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
                 if fn not in ("unlink", "remove"):
                     continue
-                args = " ".join(_unparse(a) for a in n.args)
-                recv = _unparse(n.func.value) if isinstance(n.func, ast.Attribute) else ""
-                if temp_expr in args or temp_expr in recv:
+                targets: set[str] = set()
+                for a in n.args:
+                    targets.add(_core_name(a))
+                    targets.add(_resolve(a, aliases))
+                if isinstance(n.func, ast.Attribute):
+                    targets.add(_core_name(n.func.value))
+                    targets.add(_resolve(n.func.value, aliases))
+                if wants & targets:
                     return True
     return False
 
@@ -288,7 +411,7 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         handlers = _handlers_covering(func, node.lineno)
         if not handlers:
             verdict = "NO_HANDLER"
-        elif _unlinks(handlers, temp):
+        elif _unlinks(handlers, temp, func):
             verdict = "CLEANS_UP"
         else:
             verdict = "LEAKS"

@@ -457,3 +457,135 @@ def test_an_unreadable_file_fails_closed(tmp_path):
     rows, errors = chk.scan(tmp_path)
     assert errors, "a syntax error must be reported, not skipped"
     assert rows == []
+
+
+# --------------------------------------------------------------------------
+# IDENTITY, NOT SUBSTRING. Raised by CodeRabbit on the PR; the false-CLEAN
+# direction is the dangerous one, because a leak that reads clean is both
+# invisible AND excluded from the debt ledger, so nothing revisits it.
+# --------------------------------------------------------------------------
+
+_UNLINKS_A_DIFFERENT_FILE = '''
+import os, tempfile
+def f(path):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        os.unlink(tmp_backup)
+        raise
+'''
+
+_UNLINKS_THE_TEMP = '''
+import os, tempfile
+def f(path):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        os.unlink(tmp)
+        raise
+'''
+
+_UNLINKS_WRAPPED = '''
+import os, tempfile
+from pathlib import Path
+def f(path):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        Path(tmp).unlink()
+        raise
+'''
+
+#: The real shape from src/genesis/autonomy/executor/engine.py -- the cleanup
+#: REBUILDS the temp path from a local instead of reusing the variable. Genuinely
+#: clean, and unresolvable without recursive alias substitution.
+_UNLINKS_RECONSTRUCTED = '''
+import contextlib
+from pathlib import Path
+def f(plan_path, content):
+    path = Path(plan_path).expanduser()
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(content)
+        tmp.rename(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            Path(plan_path).expanduser().with_suffix(".tmp").unlink(missing_ok=True)
+'''
+
+
+@pytest.mark.parametrize(
+    "src,expected",
+    [
+        (_UNLINKS_A_DIFFERENT_FILE, "LEAKS"),
+        (_UNLINKS_THE_TEMP, "CLEANS_UP"),
+        (_UNLINKS_WRAPPED, "CLEANS_UP"),
+        (_UNLINKS_RECONSTRUCTED, "CLEANS_UP"),
+    ],
+    ids=["different-file", "the-temp", "wrapped", "reconstructed"],
+)
+def test_cleanup_is_credited_by_identity_not_by_substring(src, expected):
+    """`temp_expr in args` credited `os.unlink(tmp_backup)` as cleanup for temp
+    `tmp` -- MEASURED, a leaking site read CLEANS_UP.
+
+    The reconstructed case is why the fix is alias RESOLUTION rather than a
+    stricter string test: identity alone turns that false CLEAN into a false
+    FLAG, which is better and still wrong. It is the real shape from
+    autonomy/executor/engine.py, whose cleanup rebuilds the path from a local.
+    """
+    assert [r["verdict"] for r in chk.analyse_source(src, "s.py")] == [expected]
+
+
+def test_a_name_that_merely_CONTAINS_a_temp_name_is_not_that_temp():
+    """The `_born_in` half of the same class: propagation walked the RHS TEXT, so
+    any name containing a known temp's name counted as derived from it."""
+    src = '''
+import os, tempfile
+def f(path):
+    fd, tmp = tempfile.mkstemp()
+    tmp_unrelated_listing = compute_something_else()
+    try:
+        os.replace(tmp_unrelated_listing, path)
+    except OSError:
+        pass
+'''
+    # The renamed operand is NOT a temp this function created, so the site is
+    # not this guard's business at all.
+    assert chk.analyse_source(src, "s.py") == []
+
+
+def test_a_suffix_that_merely_CONTAINS_tmp_is_not_a_temp_suffix():
+    """`.tmpl` contains `.tmp` and is a TEMPLATE, not a scratch file.
+
+    The suffix test is anchored to the END of a string literal for this reason.
+    Matching anywhere in the literal would classify every `.tmpl` write as a temp
+    -- and this repo really does write those (systemd `.service.template`), so
+    the guard would start flagging template renders as leaked temps.
+    """
+    src = '''
+import os
+def f(path):
+    rendered = path.with_suffix(".tmpl")
+    try:
+        os.replace(rendered, path)
+    except OSError:
+        pass
+'''
+    assert chk.analyse_source(src, "s.py") == []
+
+
+def test_a_real_temp_suffix_at_the_END_still_counts():
+    """The other direction, so the anchoring cannot be tightened into blindness."""
+    src = '''
+import os
+def f(path):
+    scratch = path.with_suffix(".tmp")
+    try:
+        os.replace(scratch, path)
+    except OSError:
+        pass
+'''
+    assert [r["verdict"] for r in chk.analyse_source(src, "s.py")] == ["LEAKS"]
