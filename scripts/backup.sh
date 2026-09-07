@@ -639,6 +639,23 @@ if [ -d "$_OVERRIDE_STORE" ]; then
     mkdir -p audit/merge_overrides
     _AUDIT_COUNT=0
     _AUDIT_LIVE=""
+    # LIST FIRST, and keep the listing's exit status. `find … 2>/dev/null` inside a
+    # process substitution throws both away, so a store that cannot be listed — a
+    # mode change on the directory, an I/O error — yielded an EMPTY `_AUDIT_LIVE`,
+    # indistinguishable from a store with no records. The mirror loop below then
+    # read every mirrored record as "gone from the live store" and deleted the lot:
+    # the last known-good copies, destroyed by the very loop whose comment says that
+    # must not happen (CodeRabbit Major, PR #1609).
+    #
+    # This is the SAME generator as the per-file bug above — deriving state from
+    # whether work succeeded — one level up, at the listing instead of the copy.
+    # Enumerated the other four `find`s in this store's paths while fixing it; each
+    # of them fails toward doing LESS (no delete, no sweep, no restore, and
+    # `_backup_has_payload` returning 1 aborts), so this was the only destructive one.
+    _AUDIT_LIST="$(mktemp -p "$GENESIS_BIG_TMP")"
+    _AUDIT_LISTED=true
+    find "$_OVERRIDE_STORE" -maxdepth 1 -type f -name '*.jsonl' -print0 \
+        > "$_AUDIT_LIST" 2>/dev/null || _AUDIT_LISTED=false
     while IFS= read -r -d '' _f; do
         _base="$(basename "$_f")"
         # The deletion set below is derived from THIS list — every name the live
@@ -665,20 +682,28 @@ if [ -d "$_OVERRIDE_STORE" ]; then
             rm -f "$_tmp" 2>/dev/null || true
             log "WARNING: failed to copy $_base (${_AUDIT_ERR:-no error text}) — previous mirror copy, if any, left intact"
         fi
-    done < <(find "$_OVERRIDE_STORE" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    done < "$_AUDIT_LIST"
+    rm -f "$_AUDIT_LIST" 2>/dev/null || true
     # MIRROR the store, do not merely add to it. A copy-only loop left every
     # record the daily pruner had deleted in the backup forever: the mirror grows
     # past the 5 MB bound the store advertises, and a disaster restore
     # REINTRODUCES every record retention removed (Codex P2, PR #1609). Deleting
     # only names the live store no longer has keeps the backup a snapshot of the
     # store rather than its union over time.
+    # ONLY when the live store was actually listed. Without that guard this loop
+    # cannot tell "no records" from "could not look", and the two call for opposite
+    # actions: delete everything, or touch nothing.
     _AUDIT_DROPPED=0
-    while IFS= read -r -d '' _b; do
-        _bbase="$(basename "$_b")"
-        if ! printf '%s' "$_AUDIT_LIVE" | grep -qxF "$_bbase"; then
-            rm -f "$_b" && _AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))
-        fi
-    done < <(find audit/merge_overrides -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    if ! $_AUDIT_LISTED; then
+        log "WARNING: could not list $_OVERRIDE_STORE — mirror prune SKIPPED (existing backup copies kept)"
+    else
+        while IFS= read -r -d '' _b; do
+            _bbase="$(basename "$_b")"
+            if ! printf '%s' "$_AUDIT_LIVE" | grep -qxF "$_bbase"; then
+                rm -f "$_b" && _AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))
+            fi
+        done < <(find audit/merge_overrides -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    fi
     # Sweep any staging scrap a KILLED EARLIER run left behind, so the mirror cannot
     # grow a second, invisible store beside itself. Dot-prefixed, so the `*.jsonl`
     # loop above never sees one and never mistakes one for a record.

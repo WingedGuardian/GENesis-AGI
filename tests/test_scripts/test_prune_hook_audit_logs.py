@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -18,6 +19,34 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO / "scripts" / "prune_hook_audit_logs.py"
 _HYGIENE = _REPO / "scripts" / "disk_hygiene.sh"
+
+
+#: Shell builtins that execute the CONTENT of a file rather than reading it.
+_EXEC_WORDS = frozenset({"eval", "source", "."})
+
+
+def _executes_file_content(line: str) -> frozenset[str]:
+    """Which execution builtins appear as COMMAND WORDS in one shell line.
+
+    ONE implementation, used by both the scan of the real loader and the test that
+    locks this predicate's own coverage. They were briefly two copies, and the
+    duplicate made the lock vacuous: mutating the scan's predicate left the lock
+    green because it was checking a different function.
+
+    Tokens via ``shlex``, never string prefixes. A prefix test reads only the first
+    word of a line, so ``if source "$path"; then`` walks past it, and it keys on a
+    single space, so ``eval\\t"$v"`` does too — both demonstrated against the
+    previous version of this check (CodeRabbit, PR #1609). Reaching for a canonical
+    tokenizer rather than hand-rolling shell semantics is the house rule, and it
+    applies in a test as much as in a guard.
+    """
+    try:
+        tokens = shlex.split(line, comments=True)
+    except ValueError:
+        # A line shlex cannot read (unbalanced quotes across a continuation) is a
+        # line this cannot clear — fail toward FLAGGING, never toward passing.
+        tokens = line.replace("\t", " ").split()
+    return _EXEC_WORDS.intersection(tokens)
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:
@@ -220,6 +249,72 @@ def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env()
     ]
     assert code, "the loader body is all comments — it cannot be doing the work"
     for ln in code:
-        assert not ln.startswith(("eval ", "source ", ". ")) and " eval " not in f" {ln} ", (
-            f"the knob loader executes secrets.env content: {ln!r}"
-        )
+        hit = _executes_file_content(ln)
+        assert not hit, f"the knob loader executes secrets.env content ({sorted(hit)}): {ln!r}"
+
+
+def test_the_exec_predicate_catches_the_shapes_a_prefix_test_missed():
+    """The guard's own guard: lock the bypasses, and the loader's real lines.
+
+    The previous version of the assertion above tested string PREFIXES, so it read
+    only the first word of a line and keyed on a single space. Three shapes walked
+    through it (CodeRabbit, PR #1609). Locking them here means a future
+    simplification of that predicate fails loudly instead of quietly going blind —
+    the must-not-fire half matters just as much, since a predicate that flags every
+    line would satisfy the must-catch half on its own.
+
+    Calls the SHARED `_executes_file_content`, not a local copy. A first draft
+    reimplemented it here, and MEASURED: reverting the real predicate to first-word
+    matching left this test green, because it was locking a different function.
+    """
+
+    def flags(line: str) -> bool:
+        return bool(_executes_file_content(line))
+
+    for line in (
+        'if source "$path"; then',
+        'eval\t"$value"',
+        'if .\t"$path"; then',
+        'eval "$(cat "$REPO_DIR/secrets.env")"',
+        'source "$REPO_DIR/secrets.env"',
+        '. "$REPO_DIR/secrets.env"',
+        'x=1; eval "$y"',
+    ):
+        assert flags(line), f"a bypass shape is not caught: {line!r}"
+
+    for line in (
+        'local key="$1"',
+        '[ -f "$REPO_DIR/secrets.env" ] || return 0',
+        'line="$(grep -aE "^${key}=" "$REPO_DIR/secrets.env" | tail -1)" || line=""',
+        'val="${line#*=}"',
+        '[ -n "$val" ] && export "$key=$val"',
+        "return 0",
+    ):
+        assert not flags(line), f"an ordinary loader line is flagged: {line!r}"
+
+
+def test_the_backup_mirror_prune_is_gated_on_a_successful_listing():
+    """A failed listing and an empty store must not lead to the same action.
+
+    `find … 2>/dev/null` inside a process substitution discards both the errors and
+    the exit status, so a store that cannot be listed produced an EMPTY live-name
+    set — indistinguishable from a store with no records. The mirror loop then read
+    every mirrored record as deleted upstream and removed the lot: the last
+    known-good copies, destroyed by the loop whose own comment says that must not
+    happen (CodeRabbit Major, PR #1609).
+
+    A WIRING check, and said plainly rather than dressed up: driving the real
+    failure end-to-end needs the full backup harness in test_backup_dr_signal.py
+    (git remote, gpg, NAS stubs) for one branch. What it pins is that the listing's
+    status is captured and that the destructive loop sits behind it.
+    """
+    body = (_REPO / "scripts" / "backup.sh").read_text()
+    assert "_AUDIT_LISTED=false" in body, "the listing's exit status is not captured"
+    section = body.split("Backing up hook audit stores", 1)[-1].split("--- 7.", 1)[0]
+    assert section, "the audit-store section could not be located"
+    guard = section.split("if ! $_AUDIT_LISTED; then", 1)
+    assert len(guard) == 2, "the mirror prune is not gated on a successful listing"
+    # The destructive loop must live on the ELSE side of that gate.
+    assert "_AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))" in guard[1], (
+        "the mirror-delete loop is not inside the successful-listing branch"
+    )
