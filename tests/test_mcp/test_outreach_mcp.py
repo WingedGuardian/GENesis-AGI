@@ -537,3 +537,124 @@ async def test_generic_outreach_send_forwards_labeled_surplus(tmp_path):
     finally:
         mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
         await conn.close()
+
+
+# ── Discord sub-channel routing ──────────────────────────────────────────────
+#
+# Origin (2026-09-07): asked to post a release announcement to Discord, the only
+# thing `outreach_send` accepted was `channel="discord"` — which resolves to
+# `OUTREACH_RECIPIENT_DISCORD`, defaulting to "dev-discussion". So a release
+# announcement would have landed in the dev channel, silently: no error, and the
+# webhook adapter falls back to the default webhook rather than failing on an
+# unknown name, so nothing anywhere says "that is not where you asked to go".
+#
+# The pipeline could always steer this (`target_chat_id` beats the configured
+# default in _deliver). What was missing was a way for a caller to SAY it.
+
+
+class TestDiscordSubChannelRouting:
+    @staticmethod
+    def _capture():
+        """A pipeline stub that records the OutreachRequest it was handed.
+
+        Patches `submit` — the method outreach_send actually calls. An earlier
+        version of this stub patched a `process_request` that does not exist, so
+        every test failed on `MagicMock can't be used in 'await'` rather than on
+        the assertion. A stub that mocks the wrong method tests nothing.
+        """
+        seen = {}
+
+        async def _send(req):
+            seen["req"] = req
+            # outreach_send reads result.status.value / .channel / .error, so the
+            # stub has to carry that shape or the test dies formatting its own
+            # success rather than on an assertion.
+            return MagicMock(
+                outreach_id="o-test",
+                status=MagicMock(value="delivered"),
+                channel=req.channel,
+                error=None,
+            )
+
+        pipe = MagicMock()
+        pipe.submit = AsyncMock(side_effect=_send)
+        pipe.submit_urgent = AsyncMock(side_effect=_send)
+        return pipe, seen
+
+    async def test_named_channel_routes_to_that_channel(self):
+        """`channel="announcements"` must reach announcements, not the default."""
+        pipe, seen = self._capture()
+        old = mcp_mod._pipeline
+        try:
+            mcp_mod._pipeline = pipe
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="release notes", category="notification", channel="announcements",
+            )
+        finally:
+            mcp_mod._pipeline = old
+
+        req = seen["req"]
+        assert req.channel == "discord", "must route through the discord ADAPTER"
+        assert req.target_chat_id == "announcements", (
+            "the sub-channel must ride as the recipient override — without it the "
+            "send silently lands in OUTREACH_RECIPIENT_DISCORD (default dev-discussion)"
+        )
+
+    async def test_every_known_channel_is_accepted(self):
+        """Whole-set, not just the one that bit us — a name in DISCORD_CHANNELS
+        that this tool does not recognise is a channel nobody can target."""
+        from genesis.outreach.types import DISCORD_CHANNELS
+
+        for name in sorted(DISCORD_CHANNELS):
+            pipe, seen = self._capture()
+            old = mcp_mod._pipeline
+            try:
+                mcp_mod._pipeline = pipe
+                tools = await mcp.get_tools()
+                await tools["outreach_send"].fn(
+                    message="m", category="notification", channel=name,
+                )
+            finally:
+                mcp_mod._pipeline = old
+            assert seen["req"].channel == "discord", name
+            assert seen["req"].target_chat_id == name, name
+
+    async def test_bare_discord_still_uses_the_configured_default(self):
+        """Backward compatibility: `channel="discord"` must not gain an override."""
+        pipe, seen = self._capture()
+        old = mcp_mod._pipeline
+        try:
+            mcp_mod._pipeline = pipe
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="m", category="notification", channel="discord",
+            )
+        finally:
+            mcp_mod._pipeline = old
+        assert seen["req"].channel == "discord"
+        assert seen["req"].target_chat_id is None, (
+            "bare 'discord' must keep resolving to the configured recipient"
+        )
+
+    async def test_a_non_discord_channel_is_untouched(self):
+        """Telegram/email must not be rewritten by the discord branch."""
+        pipe, seen = self._capture()
+        old = mcp_mod._pipeline
+        try:
+            mcp_mod._pipeline = pipe
+            tools = await mcp.get_tools()
+            await tools["outreach_send"].fn(
+                message="m", category="notification", channel="telegram",
+            )
+        finally:
+            mcp_mod._pipeline = old
+        assert seen["req"].channel == "telegram"
+        assert seen["req"].target_chat_id is None
+
+    async def test_the_two_channel_lists_are_one_list(self):
+        """scheduler and outreach_send must not drift apart on what a channel is."""
+        from genesis.outreach.scheduler import _DISCORD_CHANNELS
+        from genesis.outreach.types import DISCORD_CHANNELS
+
+        assert _DISCORD_CHANNELS is DISCORD_CHANNELS

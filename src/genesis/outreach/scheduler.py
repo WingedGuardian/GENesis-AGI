@@ -18,19 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Discord sub-channel names used by campaign sessions in pending_outreach.
 # The outreach pipeline routes via adapter name ("discord"), not sub-channel.
-_DISCORD_CHANNELS = frozenset(
-    {
-        "announcements",
-        "dev-discussion",
-        "general",
-        "showcase",
-        "getting-started",
-        "design",
-        "bug-reports",
-        "feature-requests",
-        "troubleshooting",
-    }
-)
+# Moved to outreach.types so `outreach_send` shares ONE list with this module;
+# the alias is kept so existing references here keep reading.
+from genesis.outreach.types import DISCORD_CHANNELS as _DISCORD_CHANNELS  # noqa: E402
 
 
 class OutreachScheduler:

@@ -80,7 +80,29 @@ async def outreach_send(
     For email replies, pass thread_id to route to the correct recipient.
     The thread_id maps to a registered email thread whose recipient is
     used for delivery.
+
+    **Discord: name the CHANNEL, not the adapter.** Pass
+    ``channel="announcements"`` (or any name in ``DISCORD_CHANNELS``) and it is
+    routed to that channel. ``channel="discord"`` still works and goes wherever
+    ``OUTREACH_RECIPIENT_DISCORD`` points, which defaults to ``dev-discussion``.
+
+    That default is why this exists. The pipeline has always supported steering
+    a Discord send (the recipient IS the webhook name), but this tool exposed no
+    way to say which channel — so every caller asking for "Discord" got
+    dev-discussion, silently, including a release announcement that belonged in
+    announcements. A caller could not tell it had been redirected: there is no
+    error, and the webhook adapter falls back to the default webhook rather than
+    failing on an unknown name.
     """
+    # Discord sub-channel → adapter + recipient. `target_chat_id` is the
+    # pipeline's existing per-request recipient override (it wins over the
+    # configured default in _deliver), so this needs no new plumbing — only a
+    # name the caller can actually pass.
+    from genesis.outreach.types import DISCORD_CHANNELS
+
+    discord_channel: str | None = None
+    if channel in DISCORD_CHANNELS:
+        discord_channel, channel = channel, "discord"
     # Resolve the per-thread recipient for email sends BEFORE the
     # pipeline/fallback split — so a QUEUED follow-up (pipeline=None subprocess)
     # carries its thread recipient through pending_outreach instead of arriving
@@ -158,6 +180,10 @@ async def outreach_send(
         channel=channel,
         labeled_surplus=labeled_surplus,
         validated_recipient=validated_recipient,
+        # The Discord sub-channel, when one was named. `_deliver` resolves
+        # `validated_recipient or target_chat_id or <configured default>`, so
+        # this steers the send without disturbing any other channel.
+        target_chat_id=discord_channel,
         thread_id=thread_id,
         # The caller composed this message; deliver it exactly — never route an
         # agent-authored message back through the LLM drafter (it once inverted
