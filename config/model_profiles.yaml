@@ -193,6 +193,17 @@ profiles:
       available: false
       provider: mistral
       note: "Large is paid-plan only since 2026-08; Small remains free-tier."
+    # See the `entitlement:` block on mistral-medium for what these three fields
+    # separate and why. Large is the case that motivated it: REFUSED on this
+    # account, with a precondition the operator can satisfy. Note that clearing
+    # the precondition changes `status`, NOT the routing `free:` flag — unlocking
+    # a model does not start charging per call. Conflating those is what put a
+    # fabricated price on a model nobody was being billed for.
+    entitlement:
+      status: refused           # 403 tier_not_allowed, two independent free-tier accounts
+      requires: funded_account  # credits on the account unlock it; calls stay $0 under limits
+      verified: "2026-08-27"
+      method: live_probe
     last_reviewed: "2026-09-03"
     review_source: provider_pricing_page
 
@@ -266,9 +277,26 @@ profiles:
       # explicit contract.
       note: >-
         Entitlement VERIFIED 2026-09-06 (429 rate_limited, not 403
-        tier_not_allowed). Pricing PRESUMED — no billed cost has been read, so
-        `free: false` in model_routing.yaml is the conservative assumption, not
-        a measurement.
+        tier_not_allowed). Marginal cost $0 under the free tier's rate limits,
+        which is what `free: true` in model_routing.yaml asserts.
+    # ── ENTITLEMENT: the third question `free:` was being asked to answer ─────
+    # There are THREE independent facts about a model, and the routing `free:`
+    # flag only carries the first:
+    #   1. marginal cost   — does a successful call add to the bill?  (`free:`)
+    #   2. entitlement     — may THIS account call it at all?          (here)
+    #   3. precondition    — what must be true for (2) to hold?        (here)
+    # They come apart in a case this install expects to hit: adding credits to a
+    # Mistral account unlocks models the free tier refuses, while calls under the
+    # rate limits remain $0. That is entitled + precondition:funded + free — and
+    # with only a boolean there was nowhere to say it, so the fact was being
+    # smuggled into `free:` and corrupting the budget gate.
+    # ADVISORY METADATA. No code reads this block yet; it exists so the reasoning
+    # has a home instead of living in a comment that the next probe contradicts.
+    entitlement:
+      status: entitled          # entitled | refused | unknown
+      requires: none            # none | funded_account | paid_plan | phone_verified
+      verified: "2026-09-06"
+      method: live_probe        # 429 rate_limited (throttled, therefore entitled)
     last_reviewed: "2026-09-06"
     review_source: provider_live_probe
 

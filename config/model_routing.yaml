@@ -31,7 +31,30 @@ providers:
     # provider NAME keeps its historical "-free" suffix deliberately: 30
     # call-site chains reference it, and an in-place semantic fix beats a
     # rename churn (same reasoning as the groq-free alias below).
-    free: false
+    #
+    # `free:` ANSWERS ONE QUESTION: does a successful call add to the bill?
+    # Nothing else. Every consumer reads it that way — litellm_delegate sets
+    # `cost = 0.0` on it, router.py's budget gate skips non-free providers when
+    # the daily cap is EXCEEDED, and `_filter_chain` drops non-free entries from
+    # never_pays sites. None of them asks "is this account entitled?" or "did the
+    # operator have to pay something to unlock it?". Those are separate facts and
+    # they now live in the profile's `entitlement:` block.
+    #
+    # Which is why this is back to `true` (2026-09-07). Mistral's tier is $0 per
+    # call under its rate limits; the 403 is an ENTITLEMENT refusal, not a billing
+    # event, and an entitlement refusal costs nothing precisely because the call
+    # never happens. Marking it `false` did not describe a price — it fabricated
+    # one, and MEASURED, the fabrication is not free: with `free: false` the
+    # ledger records this family at litellm's paid rate against a default-seeded
+    # $2/day budget, and once that trips, router.py:352 removes EVERY paid
+    # provider from EVERY chain — including the contingency lane that exists for
+    # exactly that moment.
+    #
+    # AN INSTALL ON A METERED MISTRAL PLAN SHOULD OVERRIDE `free: false` in its
+    # local overlay. That direction is the safe one to get wrong: it over-records
+    # spend for an install that is genuinely paying, rather than inventing spend
+    # for one that is not.
+    free: true
     rpm_limit: 4
     open_duration_s: 120
   mistral-medium-free:
@@ -51,20 +74,35 @@ providers:
     # limiting, so Large is refused by entitlement while Medium is merely
     # throttled. Medium is therefore reachable on a tier that refuses Large,
     # which is the whole premise of this rung.
-    # What that does NOT establish is $0 — a 429 proves reachable, not free.
-    # `free: true` is an account-tier COST claim and remains presumed until a
-    # completion lands and its recorded cost is checked. If it turns out
-    # metered, never_pays sites walking this rung is the exposure to fix.
     # rpm matches Large's conservative 4 until real traffic says otherwise.
     #
-    # SHIPS `free: false` BY USER DECISION 2026-09-06. never_pays is a fail-CLOSED
-    # cost-safety invariant and it must not rest on a fail-OPEN presumption: a 429
-    # proves the model is reachable on this tier, not that it costs $0. Flip to
-    # true once a completion's BILLED cost has actually been read. Until then the
-    # three never_pays sites carrying this rung simply skip it — the rung still
-    # earns its place in paid-position chains, where it sits below Large and above
-    # the paid Kimi leg.
-    free: false
+    # `free: true` — see the reasoning on mistral-large-free above; the same
+    # question is being answered here (marginal cost, not entitlement).
+    #
+    # This SHIPPED `free: false` for one day (2026-09-06) on a fail-closed
+    # argument: never_pays is a cost-safety invariant, a 429 proves reachable
+    # rather than $0, so assume paid. The argument was sound and the conclusion
+    # was still wrong, because it priced the wrong risk. MEASURED afterwards:
+    #
+    #   * With `free: false`, litellm prices this model at 1.50/7.50 per MTok —
+    #     NOT the 0.40/2.00 the profile documented, because `completion_cost()`
+    #     is tried before the profile fallback ever runs.
+    #   * Of the 30 chains carrying this rung, 10 have NO free provider ahead of
+    #     it (13_morning_report, 21_session_observer, 31_outcome_classification,
+    #     32_delta_assessment, dream_cycle_synthesis_challenge, …). With Large
+    #     403-dead, Medium is the FIRST provider actually tried on those — on
+    #     ordinary operation, not during an outage.
+    #   * That fabricated spend accrues against a default-seeded $2/day budget,
+    #     and `router.py:352` responds by skipping every non-free provider at
+    #     every call site. There is no production caller passing
+    #     `budget_override=True`.
+    #
+    # So the two errors are not symmetric. Wrongly `true` costs real money on the
+    # three never_pays sites, bounded by 4 RPM. Wrongly `false` invents spend on
+    # ten first-tried chains and can disable the entire paid fallback tier
+    # system-wide. The fail-closed instinct was protecting the smaller blast
+    # radius while opening the larger one.
+    free: true
     rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:

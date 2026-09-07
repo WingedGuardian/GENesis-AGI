@@ -365,10 +365,18 @@ class TestPaidProviderProfilePricing:
         ]
 
     def test_the_pairing_is_actually_discovered(self):
-        """Guard the guard — an empty list makes the test below vacuous."""
+        """Guard the guard — an empty list makes the test below vacuous.
+
+        Deliberately does NOT name a provider. It used to anchor on
+        `mistral-large-free`, which broke the day that provider's `free:` flag
+        legitimately changed — a guard-the-guard test that fails on a correct
+        config change is itself a defect, because it teaches the next person to
+        edit the assertion rather than read it. The property that matters is
+        "some paid provider carries a profile", not which one.
+        """
         pairs = self._paid_providers_with_profiles()
         assert len(pairs) >= 5, pairs
-        assert any(n == "mistral-large-free" for n, _ in pairs), pairs
+        assert all(name and profile for name, profile in pairs), pairs
 
     def test_every_paid_provider_profile_has_a_nonzero_rate(self):
         """A paid provider whose profile prices it at 0 records $0 spend on the

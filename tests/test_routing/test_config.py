@@ -241,11 +241,17 @@ def test_load_full_yaml(monkeypatch):
     ]
 
     # mistral-large-free provider (consolidated from mistral-free + mistral-large).
-    # free: false since 2026-09: Mistral removed Large from free-tier entitlement
-    # (403 tier_not_allowed, measured on two independent free-tier accounts), so
-    # cost is tracked at paid rates and never_pays chains exclude it.
+    #
+    # `free: true` since 2026-09-07, reverting a one-day `false`. The flag answers
+    # MARGINAL COST ("does a successful call add to the bill?") and nothing else —
+    # every consumer reads it that way (litellm_delegate sets cost=0.0 on it,
+    # router.py's budget gate, _filter_chain's never_pays filter). Mistral's tier
+    # is $0 per call under its rate limits, and the 403 tier_not_allowed this
+    # account gets is an ENTITLEMENT refusal, which costs nothing precisely
+    # because the call never happens. Entitlement now lives in the profile's
+    # `entitlement:` block, where it can be stated without corrupting the budget.
     ml = cfg.providers["mistral-large-free"]
-    assert ml.is_free is False
+    assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
 
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
