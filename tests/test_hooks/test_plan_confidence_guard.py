@@ -275,9 +275,13 @@ def test_a_deficient_plan_is_refused_with_exit_2():
 
 
 def test_the_refusal_names_what_is_missing_and_where():
-    proc = _run(_payload(_DEFICIENT, path="/home/x/.claude/plans/foo.md"))
+    # Synthetic path with NO /home/<user> shape: this repo is public, and the
+    # portability scanner bans that shape from tracked files by CLASS, not by
+    # whether the username in it happens to be real.
+    fake = "/synthetic/plans/foo.md"
+    proc = _run(_payload(_DEFICIENT, path=fake))
     assert "confidence" in proc.stderr and "diligence" in proc.stderr
-    assert "/home/x/.claude/plans/foo.md" in proc.stderr, "name the file being refused"
+    assert fake in proc.stderr, "name the file being refused"
     assert "Confidence: none" in proc.stderr, "the escape hatch must be discoverable"
 
 
