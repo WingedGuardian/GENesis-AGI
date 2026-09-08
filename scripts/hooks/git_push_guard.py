@@ -125,12 +125,13 @@ from hook_input import field, read_payload, run_guard  # noqa: E402
 # convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
 # gate in this file (force-push, merge, sqlite) would silently vanish.
 try:
-    from review_state import ESCALATION_ROUND_CAP  # noqa: E402
+    from review_state import ESCALATION_ROUND_CAP, FINAL_ROUND_CAP  # noqa: E402
 except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
     # read error, top-level runtime error in review_state) must degrade to the
     # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
     # and silently disables every fail-closed gate in this file (round-6 P1).
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
+    FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
 
 from shell_parse import (  # noqa: E402
     analyze,
@@ -971,6 +972,48 @@ _REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
 # 118 merged PRs passed unseen, 64 of them P1).
 _INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
 _INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
+
+# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+#   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+# Its findings were already REACHED by the scan below — `user.type` is "Bot", so
+# they pass the author filter — and then dropped, because neither badge pattern
+# above matches and the if/elif has no else. Read, not recognised; a PR carrying
+# a Major reported `inline-findings: ok`, indistinguishable from a clean one.
+_CODERABBIT_LOGINS = {"coderabbitai[bot]"}
+# The documented ladder. An unrecognised level is NON-BLOCKING (surfaced with a
+# canary) — a severity name this set has not seen must not silently start
+# blocking every PR the moment the vendor adds one.
+_CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
+_CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
+# ONE header field: an italic span carrying no interior underscore. Anchored
+# whole (`^…$`) so a field is recognised only as a complete span, never as a
+# substring found somewhere inside one.
+#
+# The 64-char bound is deliberately double the observed ceiling, not tight to
+# it. MEASURED across 124 real findings, the longest category field is
+# `📐 Maintainability & Code Quality` at EXACTLY 32 characters — so a 32-char
+# bound sits precisely on live data, and a vendor renaming one category one
+# character longer would push a genuine Critical into the non-blocking path.
+# The bound is a sanity check against runaway prose, not a filter doing real
+# work, so it costs nothing to give it real headroom.
+_CR_HEADER_FIELD_RE = re.compile(r"^_([^_\n]{1,64})_$")
+# A line that LOOKS like an attempted severity header — italic markers and a
+# field separator — used only to tell "not a header" apart from "a header this
+# code failed to parse". Conflating those two makes an unparsed finding print
+# as "below Major", a false statement about a level that was never read.
+_CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
+# CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
+# markdown rule, when they land near each other in the diff. Each segment is
+# its own finding with its own severity.
+# At most THREE leading spaces: CommonMark reads a 4+-space-indented rule as
+# CODE, and CodeRabbit quotes markdown as indented code blocks — an indented
+# `---` inside quoted code must not become a finding boundary (Codex P2, #1677).
+_CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
+# Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
+# 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
+# the SAME weighted machinery as the Codex findings rather than a second blocking
+# path, so there is one score and one threshold to reason about.
+_CR_BLOCKING_WEIGHT = 1.0
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
 # is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
 # Doc-path and maintainer-replied (consciously-accepted) findings are excluded
@@ -1026,11 +1069,25 @@ _DOC_STEMS = {
 
 
 def _is_doc_path(path: str) -> bool:
-    """Whether a review finding's file *path* is documentation whose findings do
-    NOT block a merge. FAIL-CLOSED allowlist (see the section comment): anything
-    not provably prose — a source/config/manifest file under ``docs/`` (incl. a
-    ``.txt`` build manifest), a random top-level ``*.md``, a missing path, or a
-    control-char-bearing path — blocks."""
+    """Whether a review finding's file *path* is documentation.
+
+    OWNER DECISION 2026-09-04: a documentation extension is prose AT ANY DEPTH,
+    not only under ``docs/``. Previously a markdown file outside ``docs/`` was
+    treated as code, so a finding on ``AGENTS.md``, ``CLAUDE.md`` or any
+    ``.claude/skills/**/SKILL.md`` could block a merge. The old narrowness was
+    deliberate — a ``.md`` here is often an executable prompt surface rather than
+    prose — and it is being widened knowingly, on one specific ground: the
+    COMMIT-time gate classifies those files independently via
+    ``review_enforcement_commit._is_prompt_surface`` ("behavior surface —
+    reviewable, never docs-skipped"), so editing them still requires an
+    adversarial review. What changes is only whether a REVIEWER'S FINDING on a
+    prose file can block the MERGE. See ``_doc_findings_mode`` for the lever that
+    turns this back on.
+
+    Still FAIL-CLOSED on everything that is not provably prose: a source, config
+    or manifest file (including one under ``docs/``, and including a ``.txt``
+    build manifest), a missing path, or a control-char-bearing path all block.
+    """
     # Reject the COMPLETE control-character range (Unicode Cc): C0 (<0x20), DEL
     # (0x7F), and C1 (0x80-0x9F, incl. NEL 0x85 which ``gh --jq`` emits literally).
     if not path or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
@@ -1042,11 +1099,64 @@ def _is_doc_path(path: str) -> bool:
     # (1) A known doc-named file with a doc/text/empty extension, at any depth.
     if stem_l in _DOC_STEMS and ext in _DOC_STEM_EXTS:
         return True
-    # (2) A pure documentation format (reStructuredText) anywhere.
-    if ext == "rst":
-        return True
-    # (3) An unambiguous documentation extension under a top-level docs/ directory.
-    return ext in _DOC_EXTS and path.startswith("docs/")
+    # (2) An unambiguous documentation extension, AT ANY DEPTH. ``.txt`` is still
+    # excluded here and remains prose only on a known doc stem (rule 1), because
+    # a build/dep manifest carries it too.
+    return ext in _DOC_EXTS
+
+
+# How a finding on a documentation path is treated. The lever exists so the
+# widening above is reversible without a code change:
+#   skip     — a doc-path finding NEVER scores, at any severity (the default,
+#              and the owner's current policy: prose must not block a merge).
+#   p1_only  — a doc-path P1 scores and can block; lower severities only surface.
+#   score    — doc paths get no special treatment; findings score as code does.
+# Findings are SURFACED in every mode — the lever decides whether they count
+# toward the blocking score, never whether a human sees them.
+_DOC_FINDINGS_MODES = ("skip", "p1_only", "score")
+_DEFAULT_DOC_FINDINGS_MODE = "skip"
+
+
+def _doc_findings_mode() -> str:
+    """Resolve the doc-findings policy: env seam, then local config, then default.
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          doc_findings: p1_only
+
+    Unlike its siblings this does NOT fail toward more review, and the asymmetry
+    is deliberate rather than an oversight: the SHIPPED default is the permissive
+    end by owner decision, so there is no stricter default to fall back to. Any
+    unreadable file, parse error, duplicate key, wrong type or unknown value
+    therefore falls back to ``skip`` — the documented default — which is the
+    predictable behaviour, not a silent tightening an operator never asked for.
+    An install that wants findings to block on prose sets the key explicitly.
+    """
+    raw = os.environ.get("_TEST_DOC_FINDINGS_MODE") or os.environ.get(
+        "GENESIS_MERGE_GATE_DOC_FINDINGS"
+    )
+    if raw is None:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # Same duplicate-key line scan as the sibling readers: yaml.safe_load
+            # silently keeps the LAST value for a repeated key, so a badly-merged
+            # file could quietly change policy without anyone editing it.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*doc_findings\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/doc_findings key")
+            cfg = yaml.safe_load(text) or {}
+            raw = (cfg.get("merge_gate") or {}).get("doc_findings")
+        except Exception:
+            raw = None
+    if isinstance(raw, str) and raw.strip().lower() in _DOC_FINDINGS_MODES:
+        return raw.strip().lower()
+    return _DEFAULT_DOC_FINDINGS_MODE
 
 
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
@@ -1096,6 +1206,240 @@ def _inline_title(body: str) -> str:
     # which line is shown as the title (consistent with the JSONL parser).
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return (first[0].strip() if first else "")[:120]
+
+
+def _cr_severity(body: str) -> tuple[str | None, bool]:
+    """Severity read from a CodeRabbit finding's header LINE. -> (level, header_seen)
+
+    Anchored to the header rather than searched for anywhere in the body, because
+    a review-bot comment is a CODE-BEARING DOCUMENT: it quotes the diff and embeds
+    ```suggestion``` blocks. `_` is simultaneously CodeRabbit's severity delimiter,
+    markdown emphasis, AND the snake_case separator, so a body-wide search for a
+    `_`-delimited severity word matches ordinary source. MEASURED against this
+    repo, a whole-body search matched `MAX_CRITICAL_ERRORS`, `def is_major_bump`,
+    the prose NEGATION `_not critical_`, the path `runtime_critical_path.py` —
+    152 such tokens — and, self-demonstratingly, this feature's own test fixture
+    `_CR_MAJOR_BODY`. A *Minor* finding quoting any one of them would have blocked
+    the merge and been reported as "Critical/Major": worse than the blindness it
+    replaces, since issue #1642 warns that poor precision trains reflex overrides.
+
+    Every field must be a COMPLETE italic span, so a line is accepted as a header
+    only if it is entirely one. Severity is read as the field's LAST word, never
+    by position — one observed finding omits the severity field entirely, and a
+    positional read would take the effort field ("Heavy lift") for a severity.
+    The emoji is deliberately not matched: only Minor and Major were ever observed
+    across 104 findings, so the emoji for Critical, Trivial and Info is unknown
+    here and guessing it would silently miss the most severe level.
+
+    `header_seen` separates "a CodeRabbit finding whose level we do not recognise"
+    from "a comment with no severity header at all". Neither blocks; only the
+    first is a canary worth printing. A line that LOOKS like a header but does
+    not fully parse counts as SEEN — reporting it as "below Major" would be a
+    false statement about a level this code never actually read.
+    """
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = [_CR_HEADER_FIELD_RE.match(f.strip()) for f in stripped.split("|")]
+        if not all(fields):
+            # Header-SHAPED but unparseable is a canary, not a clean miss.
+            return None, bool(_CR_HEADER_SHAPE_RE.match(stripped))
+        hits = []
+        for fld in fields:
+            words = fld.group(1).split()  # type: ignore[union-attr]
+            if words and words[-1].casefold() in _CR_SEVERITIES:
+                hits.append(words[-1].casefold())
+        if len(set(hits)) == 1 and hits:
+            # Exactly one DISTINCT level — including the unanimous-duplicate
+            # case (`_Business Critical_ | _🔴 Critical_`), where demoting a
+            # real Critical to the non-blocking canary would be the worse read.
+            return hits[0], True
+        if len(hits) > 1:
+            # Two severity-looking fields (`_Business Critical_ | _🟡 Minor_`)
+            # is a format this code cannot adjudicate. First-match-wins read
+            # that example as Critical — a false block; last-match-wins would
+            # hide a real Major behind a decorative trailing field. Neither
+            # guess is safe, so it is reported as unknown, the canary path
+            # (Codex P2, PR #1677).
+            return None, True
+        return None, True  # a header, but no field names a level we know
+    return None, False
+
+
+#: An opening or closing code fence: three-or-more backticks/tildes, then an
+#: optional info string. Captured separately because CommonMark's CLOSING rule
+#: depends on both — same character, at least as long, and no info string.
+_CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
+
+def _cr_markup_mask(body: str) -> list[bool]:
+    """Per line: True when it sits inside a fenced block or a ``<details>`` section.
+
+    Shared by the splitter and the title extractor because they MUST agree about
+    what is quoted content. They did not: the title extractor skipped fences while
+    the splitter cut across them, so a horizontal rule inside a ```suggestion```
+    manufactured a finding out of quoted markdown — which the title extractor then
+    could only name by its severity header.
+
+    MEASURED before the fix, on a body CodeRabbit plausibly emits (a Minor whose
+    suggestion edits a markdown file containing a rule and an italic two-field
+    line): one Minor finding split into two, the second reading as a MAJOR, and a
+    non-blocking review blocking the merge on the strength of quoted code.
+
+    Fence lines and the ``<details>`` tags themselves count as markup — they are
+    never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
+    how a markdown renderer reads it.
+    """
+    lines = body.split("\n")
+    # Fence and <details> contributions are tracked as SEPARATE masks and OR'd
+    # at the end, because each has an unclosed-construct recovery that clears
+    # its own contribution — and clearing a single combined mask would also
+    # unmask the OTHER construct's quoted content, silently re-opening the
+    # fence bug whenever a fence sits inside an unclosed <details>.
+    fence_mask = [False] * len(lines)
+    details_mask = [False] * len(lines)
+    fence_char: str | None = None
+    fence_len = 0
+    fence_opened_at: int | None = None
+    details_depth = 0
+    details_opened_at: int | None = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        # CommonMark gives fence DELIMITERS at most three leading spaces; a
+        # 4+-space-indented backtick run is code CONTENT. Stripping first and
+        # matching meant an indented ```` line inside a four-backtick
+        # suggestion closed the outer fence (Codex P2, #1677).
+        indent = len(line) - len(line.lstrip(" \t"))
+        fence = _CR_FENCE_RE.match(stripped) if indent <= 3 else None
+        if fence:
+            run, info = fence.group(1), fence.group(2).strip()
+            if fence_char is None:
+                fence_char, fence_len, fence_opened_at = run[0], len(run), idx
+            elif run[0] == fence_char and len(run) >= fence_len and not info:
+                # CommonMark: a closing fence uses the SAME character, is at
+                # least as long as the opener, and carries NO info string.
+                # Toggling on any fence line broke on CodeRabbit's own output:
+                # it wraps a suggestion in FOUR backticks precisely when the
+                # suggested markdown contains a three-backtick fence, so the
+                # inner ```md closed the outer block and everything after it —
+                # a quoted `---` and a Major-shaped header — was read as real
+                # findings, blocking a merge on the strength of quoted content
+                # (Codex P2, PR #1677).
+                fence_char, fence_len, fence_opened_at = None, 0, None
+            fence_mask[idx] = True
+            continue
+        if fence_char is not None:
+            fence_mask[idx] = True
+            continue
+        low = stripped.casefold()
+        if low.startswith("<details"):
+            # Nesting is a DEPTH, not a boolean: valid nested <details> meant
+            # the INNER close unmasked the rest of the outer collapsed section,
+            # so a quoted rule + severity header there manufactured a blocking
+            # finding out of collapsed content (Codex P2, PR #1677).
+            if details_depth == 0:
+                details_opened_at = idx
+            details_depth += 1
+            details_mask[idx] = True
+            continue
+        if low.startswith("</details"):
+            details_depth = max(0, details_depth - 1)
+            if details_depth == 0:
+                details_opened_at = None
+            details_mask[idx] = True
+            continue
+        details_mask[idx] = details_depth > 0
+    if fence_opened_at is not None:
+        # An UNCLOSED fence. CommonMark says it runs to the end of the document,
+        # and masking to the end is therefore "correct" — but this mask decides
+        # what the merge gate is allowed to SEE, and hiding every finding after a
+        # stray backtick run is the fail-OPEN direction: a real Critical goes
+        # unreported and the merge proceeds. A phantom finding, the other error,
+        # blocks loudly and gets looked at. So a fence that never closes is
+        # treated as ordinary content from the line it opened on.
+        for i in range(fence_opened_at, len(lines)):
+            fence_mask[i] = False
+    if details_opened_at is not None:
+        # An UNCLOSED <details> gets the same recovery for the same reason: a
+        # stray tag must not hide a later genuine Major from the gate. Only the
+        # details CONTRIBUTION is cleared — quoted fenced content inside the
+        # section stays masked via fence_mask. A complete inner section between
+        # the unclosed opener and end-of-body is unmasked too; that is the
+        # phantom-finding direction, which blocks loudly, and is accepted for
+        # the same reason the fence recovery accepts it (Codex P2, PR #1677).
+        for i in range(details_opened_at, len(lines)):
+            details_mask[i] = False
+    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
+
+
+def _cr_findings(body: str) -> list[str]:
+    """Split one CodeRabbit comment into its individual findings.
+
+    ONE GitHub comment is not one finding. CodeRabbit bundles several into a
+    single inline comment, separated by a markdown rule, when they land near
+    each other in the diff. Reading only the first is the ORIGINAL BUG of this
+    feature reincarnated one level down — read, then silently dropped.
+
+    MEASURED on live PR #1647, comment id 3925021846: one comment carrying two
+    distinct Major findings. Before this split, `_cr_severity` returned the
+    first and the second existed nowhere in the gate's output. The dangerous
+    ordering is Minor-then-Major: the comment scored as `minor`, landed in the
+    advisory list, and printed "below Major, NOT counted" — a false claim about
+    a Major that was never seen at all.
+
+    A segment carrying no header is folded into the previous one rather than
+    treated as a finding: a rule inside prose is not a finding boundary, and
+    splitting on it would invent findings that do not exist. That fold is not
+    sufficient on its own — it only catches a rule whose following segment has no
+    header, and quoted markdown routinely supplies one. Rules inside fenced or
+    ``<details>`` content are therefore not boundaries at all (see
+    ``_cr_markup_mask``).
+    """
+    lines = body.split("\n")
+    markup = _cr_markup_mask(body)
+    parts: list[str] = []
+    current: list[str] = []
+    for line, is_markup in zip(lines, markup, strict=True):
+        if not is_markup and _CR_FINDING_SPLIT_RE.match(line):
+            parts.append("\n".join(current))
+            current = []
+            continue
+        current.append(line)
+    parts.append("\n".join(current))
+    out: list[str] = []
+    for part in parts:
+        if not part.strip():
+            continue
+        _, header_seen = _cr_severity(part)
+        if header_seen or not out:
+            out.append(part)
+        else:
+            out[-1] = out[-1] + "\n---\n" + part
+    return out or [body]
+
+
+def _coderabbit_title(body: str) -> str:
+    """The finding's title, which for CodeRabbit is not its first line.
+
+    Codex leads with badge-plus-title, so `_inline_title` reads correctly there.
+    CodeRabbit leads with the severity header (`_category_ | _severity_ |
+    _effort_`) and puts the title in the first BOLD line beneath it — using the
+    generic extractor here reports the severity header as the finding's name,
+    which tells a reader nothing about what is wrong.
+
+    Fenced blocks and `<details>` sections are skipped: both routinely carry bold
+    text belonging to QUOTED CODE or to collapsed static-analysis output, not to
+    the finding, and reporting one of those as the title misnames the finding in
+    the pre-merge report a human reads to decide a merge.
+    """
+    for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
+        if is_markup:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("**") and stripped.rstrip("*").strip():
+            return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
+    return _inline_title(body)
 
 
 def _scan_unreadable(what: str) -> tuple[bool, str]:
@@ -1240,10 +1584,21 @@ def _check_inline_review_findings(
     Returns (should_block, message). Each unresolved finding contributes to a review
     score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
     >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
-    reply (engagement = consciously accepted) or its path is documentation
-    (``_is_doc_path``). The two exclusions differ in VISIBILITY by design: a doc-path
-    finding was auto-excluded by PATH (not engaged), so it is still SURFACED as a NOTE —
-    scored P2s print as a WARNING, doc-path P1s/P2s as a NOTE — nothing unaddressed is
+    reply (engagement = consciously accepted), its path is documentation
+    (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
+    merge of main stamps base-branch findings onto the PR; scoring them makes
+    the gate demand base-branch fixes as this PR's price — reconciliation must
+    stay gate-neutral). Off-diff findings are surfaced with their paths so real
+    ones can be routed to the base branch's tracker; a MISSING/null path always
+    scores (never silently discount a finding this check cannot place), and an
+    unreadable changed-file set scores everything (status quo) with a loud
+    NOTE. Scoping leans on the Codex FRESHNESS gate as its backstop: code moved
+    away from a reverted file re-enters the diff at the new head, where a current
+    review is separately required — weakening that gate widens this one.
+    The exclusions differ in VISIBILITY by design: doc-path and off-diff findings
+    were auto-excluded by PATH (not engaged), so both are still SURFACED as NOTEs —
+    scored P2s print as a WARNING, doc-path P1s/P2s and off-diff findings as NOTEs —
+    nothing unaddressed is
     dropped. A maintainer-replied finding was CONSCIOUSLY ENGAGED (the reply IS the
     acknowledgement), so it is excluded from the report too: the pre-merge report shows
     what still needs attention, not what a maintainer already handled (re-listing every
@@ -1284,6 +1639,45 @@ def _check_inline_review_findings(
     p2: list[str] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
+    cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
+    cr_advisory: list[str] = []  # every other CodeRabbit level — surfaced, 0.0
+    cr_unknown: list[str] = []  # a severity header naming a level we don't know
+    cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
+    unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
+    cr_off_diff: list[tuple[str, str]] = []
+    off_diff_p1: list[tuple[str, str]] = []
+    off_diff_p2: list[tuple[str, str]] = []
+    # The PR's changed-file set, resolved LAZILY and at most once: only a PR
+    # that actually carries a candidate blocking finding pays for the read
+    # (one paginated `gh api pulls/N/files` under _gh_timeout(8), which clamps
+    # to the remaining merge deadline). [] = unresolved; [set] = resolved;
+    # [None] = resolution failed → every check answers "in diff" (scored),
+    # which re-creates the pre-scoping behavior, announced by a NOTE below.
+    _scope_cache: list[set[str] | None] = []
+
+    def _off_diff(path: str | None) -> bool:
+        """True only when the finding names a path PROVABLY outside the diff.
+
+        An EMPTY changed-file set is treated like an UNREADABLE one (score
+        everything + the loud NOTE), not like a resolved answer: over the API,
+        200-with-zero-rows cannot be told apart from a transiently-degraded
+        response, and "discount every finding on the whole PR" is the one
+        outcome this gate must never reach through an ambiguity (security
+        review HIGH, 2026-09-06). The cost is only that a genuinely empty PR
+        (head == base) scores its findings — the stricter direction, and such
+        a PR has no content to merge anyway. NOTE: `_hook_surface_override_check`
+        deliberately keeps the opposite reading of `[]` ("no hook files") —
+        that consumer fails CLOSED on `None` and an empty PR truly has no hook
+        files, so its contract is untouched.
+        """
+        if not path:
+            return False  # pathless/outdated comment — never silently discounted
+        if not _scope_cache:
+            files = _pr_changed_files(pr_num, repo=repo)
+            _scope_cache.append(set(files) if files else None)
+        changed = _scope_cache[0]
+        return changed is not None and path not in changed
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1291,19 +1685,91 @@ def _check_inline_review_findings(
             continue
         if c.get("reply_to"):
             continue  # replies aren't findings
+        if login in _CODERABBIT_LOGINS:
+            # Engagement is checked ONCE, for the whole comment, BEFORE severity —
+            # not per-severity below. It used to sit inside the blocking branch, so
+            # only Critical/Major honoured a maintainer reply while every Minor,
+            # Trivial, Info and unknown-severity finding was re-reported on every
+            # run no matter how many times it had been consciously answered. That
+            # contradicted the promise made two comments down ("the same engagement
+            # treatment the Codex path gets"), and a growing list of already-settled
+            # advisories is how a genuinely unresolved one gets buried.
+            #
+            # Comment-level granularity is the only granularity GitHub offers — a
+            # reply attaches to the comment, not to one finding inside a bundle —
+            # and it matches what the Codex P1/P2 paths already do.
+            if c.get("id") in replied_to:
+                continue
+            # ONE COMMENT CAN CARRY SEVERAL FINDINGS — see _cr_findings. Scoring
+            # the comment rather than each finding undercounts, and a Major
+            # bundled after a Minor disappears entirely.
+            for seg in _cr_findings(body):
+                # Same engagement and doc-path treatment the Codex path gets
+                # below — otherwise the two reviewers are inconsistent for no
+                # stated reason, and a maintainer-accepted finding from one
+                # would still block.
+                severity, _header_seen = _cr_severity(seg)
+                if severity not in _CR_BLOCKING_SEVERITIES:
+                    title = _coderabbit_title(seg)
+                    if severity is None:
+                        # No recognised severity — whether the header names a
+                        # level this gate does not know, is ambiguous, or is
+                        # missing entirely. Every observed CodeRabbit finding
+                        # leads with the italic pipe header, so a headerless
+                        # original is FORMAT DRIFT: filing it as an ordinary
+                        # advisory printed "below Major" about a level that was
+                        # never read, and a drifted Major would ride through
+                        # under that label (Codex P2, PR #1677).
+                        cr_unknown.append(title)
+                    else:
+                        cr_advisory.append(title)
+                    continue
+                if _off_diff(c.get("path")):
+                    # Checked BEFORE the doc-path lever: off-diff is the broader
+                    # exclusion (a base-branch finding is not this PR's to
+                    # answer whatever the file type), and unlike doc-skipping it
+                    # is not mode-gated — it enforces ratified policy (#1728),
+                    # not a per-install preference.
+                    cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
+                    continue
+                if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
+                    # Its OWN list, not the Codex `doc_skipped` one — landing a
+                    # CodeRabbit finding there printed it as "[doc P1]" under a
+                    # heading that names Codex severities, which misattributes
+                    # both the reviewer and the level. Mirrors the Codex P1
+                    # branch's mode handling: Critical/Major carry P1-equivalent
+                    # weight, so under `p1_only` or `score` this falls through
+                    # and DOES block — otherwise the stricter setting silently
+                    # enforced one reviewer and not the other (Codex P2, #1677).
+                    cr_doc_skipped.append(_coderabbit_title(seg))
+                    continue
+                cr_block.append(_coderabbit_title(seg))
+            continue
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
-            if _is_doc_path(c.get("path") or ""):
+            if _off_diff(c.get("path")):
+                # Same scoping the CodeRabbit branch gets above — the stale-
+                # anchor mechanism (#1728) is reviewer-agnostic, and enforcing
+                # it for one reviewer only would be an asymmetry with no
+                # stated reason (the #1677 class).
+                off_diff_p1.append((_inline_title(body), c.get("path") or ""))
+                continue
+            if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
+                # Under `p1_only` or `score` this falls through and DOES block —
+                # a doc-path P1 is the one a reader most often wants enforced.
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
-            if _is_doc_path(c.get("path") or ""):
+            if _off_diff(c.get("path")):
+                off_diff_p2.append((_inline_title(body), c.get("path") or ""))
+                continue
+            if _is_doc_path(c.get("path") or "") and _doc_findings_mode() in ("skip", "p1_only"):
                 # A P2 on a doc path is not a code defect — excluded from the SCORE, but
                 # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
                 # correctness P2 can be substantive, so it must stay visible in the
@@ -1312,11 +1778,83 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+        else:
+            # The silent-drop CLASS, not just its CodeRabbit instance. A comment
+            # that reached this loop was authored by a Bot or an allowlisted review
+            # account, so it is review output by construction — and until this
+            # branch existed, any such comment matching no known severity format
+            # fell out of the if/elif and contributed nothing, indistinguishable
+            # from a clean PR. That is exactly how 104 CodeRabbit findings went
+            # unseen. `github-advanced-security[bot]` is allowlisted TODAY with no
+            # matcher of its own and would have been the next one.
+            # Surfaced, never scored: recognising a format is what earns a weight,
+            # and guessing a severity from an unknown format would be worse than
+            # the blindness. The point is that it can no longer be INVISIBLE.
+            unmatched_bot.append((login, _inline_title(body)))
 
+    if unmatched_bot:
+        print(
+            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
+            f"format this gate does not recognise. NOT scored; listed so an "
+            f"unrecognised reviewer cannot be silently invisible:",
+            file=sys.stderr,
+        )
+        for bot_login, title in unmatched_bot[:5]:
+            print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+    if _scope_cache and _scope_cache[0] is None:
+        # Resolution was ATTEMPTED (a candidate finding consulted it) and
+        # failed — say so loudly, because from here the scan behaves exactly
+        # as it did before scoping existed: everything scores.
+        print(
+            f"NOTE: PR #{pr_num} — diff scoping unavailable (changed-file set "
+            f"unreadable or empty: gh error, a >3000-file PR, or a no-content "
+            f"PR). ALL findings scored, including any on base-branch content.",
+            file=sys.stderr,
+        )
+    if cr_off_diff:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_off_diff)} CodeRabbit Critical/Major "
+            f"finding(s) on files outside this PR's diff (base-branch content, "
+            f"typically stamped by a merge of main) — NOT scored. A real one "
+            f"belongs to the base branch's tracker, not this PR's gate:",
+            file=sys.stderr,
+        )
+        for title, fpath in cr_off_diff[:8]:
+            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+    if off_diff_p1 or off_diff_p2:
+        print(
+            f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
+            f"[P2] inline finding(s) on files outside this PR's diff — NOT "
+            f"scored (base-branch content; route real ones to the base "
+            f"branch's tracker):",
+            file=sys.stderr,
+        )
+        for title, fpath in off_diff_p1[:5]:
+            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+        for title, fpath in off_diff_p2[:5]:
+            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
+    if cr_unknown:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
+            f"severity this gate could not read (unknown level, ambiguous header, "
+            f"or no recognisable header — the format may have changed). "
+            f"NOT scored — verify the level by hand before merging:",
+            file=sys.stderr,
+        )
+        for title in cr_unknown[:5]:
+            print(f"  [CodeRabbit unknown-severity] {title}", file=sys.stderr)
+    if cr_doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_doc_skipped)} CodeRabbit Critical/Major "
+            f"finding(s) on documentation paths, NOT blocking:",
+            file=sys.stderr,
+        )
+        for title in cr_doc_skipped[:5]:
+            print(f"  [doc CodeRabbit Critical/Major] {title}", file=sys.stderr)
     if doc_skipped:
         print(
             f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
-            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst) "
+            f"documentation paths (any *.md/*.rst/*.adoc, plus CHANGELOG/README/LICENSE) "
             f"NOT blocking:",
             file=sys.stderr,
         )
@@ -1334,7 +1872,26 @@ def _check_inline_review_findings(
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
     # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
-    score = len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2)
+    score = (
+        len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2) + _CR_BLOCKING_WEIGHT * len(cr_block)
+    )
+    if cr_advisory:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_advisory)} CodeRabbit finding(s) below "
+            f"Major, surfaced and NOT counted toward the review score:",
+            file=sys.stderr,
+        )
+        for title in cr_advisory[:5]:
+            print(f"  [CodeRabbit] {title}", file=sys.stderr)
+    if cr_block:
+        print(
+            f"WARNING: PR #{pr_num} has {len(cr_block)} CodeRabbit "
+            f"Critical/Major finding(s) (each adds "
+            f"{_CR_BLOCKING_WEIGHT:.0f} to the review score):",
+            file=sys.stderr,
+        )
+        for title in cr_block[:8]:
+            print(f"  [CodeRabbit Critical/Major] {title}", file=sys.stderr)
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
@@ -1347,12 +1904,16 @@ def _check_inline_review_findings(
             print(f"  [P2] {title}", file=sys.stderr)
     if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
         listing = "\n".join(
-            [f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]]
+            [f"  [P1] {t}" for t in p1[:5]]
+            + [f"  [P2] {t}" for t in p2[:5]]
+            + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
         )
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
-            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT} each): {len(p1)} unresolved [P1] + "
-            f"{len(p2)} unresolved [P2] finding(s), none maintainer-replied:\n{listing}\n"
+            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
+            f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
+            f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
+            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )
@@ -1735,6 +2296,64 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
+def _final_round_chained_advisory(pr_num: str) -> str:
+    """A second terminal-stage dispatch behind the SAME acceptance.
+
+    The sigil is matched command-wide so the documented nested form
+    (`bash -c '…' # final-round-accept`) keeps working, which also meant
+    `request && request # final-round-accept` could chain arbitrarily many rounds
+    behind one decision while the advisory promised "ONE more round".
+    """
+    return (
+        f"BLOCKED: a second terminal-stage review request for PR #{pr_num} in the "
+        "same command. '# final-round-accept' authorises ONE dispatch — the user "
+        "directed one more round, not a chain of them.\n\n"
+        "Run the requests separately, each with its own decision behind it."
+    )
+
+
+def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
+    """The terminal, stated for the DISPATCH side of the loop.
+
+    Counted from the PR's own review history rather than the local counter, so it
+    fires even when every round ran in the cloud and none was marked locally —
+    which is the case this gate exists for, and therefore the case the commit-side
+    terminal cannot see.
+
+    DELIBERATELY STATELESS, unlike the commit-side terminal. That one spends its
+    acceptance because it licenses a state change (a commit that lands work); this
+    one licenses a review REQUEST, which changes nothing on its own — a session
+    that can re-request reviews but cannot commit fixes achieves nothing, so the
+    commit gate remains the terminal that bites. Making an advisory, fail-open
+    gate carry per-branch consumption state would also contradict the
+    "stateless, authoritative" property the rest of this scan is built on. The
+    consequence is stated rather than hidden: the ack is required on EVERY
+    dispatch past the terminal, and it is not one-shot here.
+    """
+    repo_arg = f" --repo {repo}" if repo else ""
+    return (
+        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
+        f"{rounds} rounds already ran on this PR, at or past the terminal "
+        f"({FINAL_ROUND_CAP}). Two full escalation cycles have run and each already "
+        "asked for a fresh decision. '# escalation-ack' does NOT clear this one; if "
+        "it did, the cycle would simply continue, which is what the terminal exists "
+        "to end.\n\n"
+        "There are exactly two ways out, and neither is this session's to choose "
+        "alone:\n"
+        "  (a) ACCEPT the outstanding findings and merge — document each one and why "
+        "it is acceptable in the PR body. The COMMIT gate is where that decision is "
+        "recorded, and there the acceptance is one-shot.\n"
+        "  (b) ABANDON the branch and restart from a design that does not need this "
+        "many rounds.\n\n"
+        "If the user directs ONE more round, that decision rides on this command:\n"
+        f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
+        "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
+        "the sigil is not spent here.\n\n"
+        "Take it to the user. A dispatched session with nobody reading cannot pick "
+        "any of these — surface it and stop."
+    )
+
+
 def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
     repo_arg = f" --repo {repo}" if repo else ""
     return (
@@ -1787,11 +2406,17 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
       '# escalation-ack' trailing ANY segment     → allow the whole command (a
         nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
         segment; the ack is a conscious human-directed act, so one ack licenses
-        the command it trails)
+        the command it trails) — BUT ONLY BELOW THE TERMINAL. At or past
+        FINAL_ROUND_CAP it does not clear the block; '# final-round-accept' does.
+        This is why the ack is no longer a top-of-function short-circuit: a
+        short-circuit could never see the count it needed to be bounded by.
+      rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
+        escalation-ack here is deliberately not enough)
       numberless/branch target (no PR number)     → that segment allows;
         SCANNING CONTINUES (an allowed segment must not shield a later one)
       gh/API/parse error (ids is None)            → that segment allows, scan on
       rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
+      cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
       any segment at rounds >= cap, no ack        → BLOCK with the step-back
         order (URL targets carry their OWN repo into the count — counting the
         hook cwd's repo for a cross-repo URL could produce a FALSE block)
@@ -1799,8 +2424,16 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
     fail-closed exit-2, which would turn an advisory bug into a hard block).
     """
     try:
-        if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
-            return False, ""
+        # Both sigils resolved up front, and the escalation-ack short-circuit is
+        # now CONDITIONAL on not having reached the terminal. It used to return
+        # before any counting, which meant this gate — the one that counts the
+        # PR's ACTUAL Codex rounds, and exists precisely because the local counter
+        # sleeps through them — could be re-acked forever. The commit-side terminal
+        # reads only that sleeping local counter, so it inherited the same blind
+        # spot: a review/fix loop driven entirely through cloud rounds never
+        # reached it.
+        acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
+        final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
         # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
         # so a slow API + a compound command can't push the aggregate past the
         # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
@@ -1814,7 +2447,18 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
         # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
         in_cmd: dict[str, int] = {}
+        # One '# final-round-accept' authorises ONE dispatch across the whole
+        # command; see where it is spent below.
+        terminal_license_spent = False
         for seg in segs:
+            # Stop scanning once the shared budget is drained. Past that point every
+            # remaining gh call still gets the 1.0s floor, so a long compound command
+            # against a hung API could walk the aggregate toward the hook wall-clock
+            # and get the WHOLE hook SIGKILLed — which fails open on every gate. The
+            # merge path already breaks here; this scan did not, and it now makes gh
+            # calls on acked commands that previously short-circuited before arming.
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                break
             if gh_pr_subcommand(seg.argv) != "comment":
                 continue
             if not any("@codex review" in tok.lower() for tok in seg.argv):
@@ -1830,7 +2474,26 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
                 continue
             key = f"{repo or ''}|{pr_num}"
             effective = len(reviews) + in_cmd.get(key, 0)
-            if effective >= ESCALATION_ROUND_CAP:
+            # TERMINAL tier, checked first and NOT clearable by the repeatable
+            # sigil — the whole point of a terminal is that the cycle cannot reach
+            # past it. Counted from the PR's real review history, so it holds even
+            # when every one of those rounds went unmarked locally.
+            if effective >= FINAL_ROUND_CAP:
+                if not final_acked:
+                    return True, _final_round_advisory(pr_num, effective, repo)
+                # ONE decision licenses ONE dispatch. `final_acked` is computed with
+                # any() over the whole command — deliberately, because a nested
+                # `bash -c '…' # final-round-accept` carries the sigil on the OUTER
+                # segment, so per-segment binding would break the documented nested
+                # form. But command-wide truth also let `request && request # sigil`
+                # chain arbitrarily many rounds behind a single decision, while the
+                # advisory promises the user is directing "ONE more round". Spending
+                # the license on first use keeps the nested form working and closes
+                # the chain.
+                if terminal_license_spent:
+                    return True, _final_round_chained_advisory(pr_num)
+                terminal_license_spent = True
+            elif effective >= ESCALATION_ROUND_CAP and not acked:
                 return True, _escalation_advisory(pr_num, effective, repo)
             in_cmd[key] = in_cmd.get(key, 0) + 1
     except Exception:
@@ -2047,9 +2710,14 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
                 ],
                 capture_output=True,
                 text=True,
-                # Merge-path timeout budget (see main()): this runs ONLY on the
-                # rare `# stale-review-override` path, so one paginated read
-                # stays inside the hook's wall-clock.
+                # Merge-path timeout budget (see main()): THREE consumers —
+                # the hook-surface override check (rare override path),
+                # _pin_blob_unchanged (rare pin path), and the inline-findings
+                # diff scoping (#1728), which is on the hot merge path but
+                # LAZY: it reads only when a candidate blocking finding exists,
+                # at most once per scan. _gh_timeout clamps this call to the
+                # remaining merge deadline, and a timeout degrades to None →
+                # the scoping caller scores everything (status quo) + a NOTE.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -2901,10 +3569,7 @@ def _marker_kind_or_none(block: str) -> str | None:
 
 def _scheduled_review_marker_scan(
     pr_num: str, repo: str | None = None, head_sha: str | None = None
-) -> (
-    tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
-    | None
-):
+) -> tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]] | None:
     """``(accepted, rejected_not_clean, unusable, blocking_residue)`` for the PR's scheduled-review
     markers, or ``None`` on an UNREADABLE fetch.
 
@@ -2967,7 +3632,7 @@ def _scheduled_review_marker_scan(
     # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
     # timestamp in the API, so a finding added by editing a review keeps the review's
     # original position.
-    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
+    rows = sorted(rows, key=lambda r: r.get("stamp") or r.get("created_at") or "")
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -3018,8 +3683,7 @@ def _scheduled_review_marker_scan(
                         )
                 else:
                     why = (
-                        "it is carried by a DISMISSED review, which no longer vouches "
-                        "for anything"
+                        "it is carried by a DISMISSED review, which no longer vouches for anything"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
             continue
@@ -3114,9 +3778,7 @@ def _scheduled_review_marker_scan(
                     # is not evidence about one review, it is evidence about all of them.
                     _residue_kind = _marker_kind_or_none(block)
                     blocking_residue.setdefault("", set()).add(
-                        _residue_kind
-                        if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS
-                        else "*"
+                        _residue_kind if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS else "*"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
                 continue
@@ -4133,6 +4795,198 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     except Exception:
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+#: MIRROR of e2e_declaration.E2E_CUTOFF_ISO, for the degraded path only. Without it
+#: the cutoff exemption was gated on the parser importing, so a PRE-CUTOFF PR was
+#: BLOCKED whenever the module could not load — a false block on a gate with no
+#: override, against the one population the cutoff exists to protect (CodeRabbit
+#: Minor, 2026-09-06; an earlier comment here claimed a reorder had fixed this, when
+#: the reorder only removed a wasted round-trip). Duplicating a constant invites
+#: drift, so `test_the_degraded_cutoff_mirror_matches_the_parser` locks the two
+#: together and fails the moment either moves.
+_E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
+
+#: Last-resort matcher for the E2E declaration, used ONLY when
+#: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
+#: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
+#: addition: the value must contain NO `<…>` placeholder span, because this path
+#: cannot strip HTML comments and the shipped template's guidance lives in one.
+#: An earlier version used `(?!<)`, which only guards the FIRST character — so the
+#: template's own `E2E: none — <reason there is no runtime surface to verify>` line
+#: matched, and every straight-from-template PR would have satisfied the degraded
+#: gate while the comment right here claimed it could not (Kimi P2, 2026-09-06,
+#: reproduced). A real one-line declaration does not carry an angle-bracketed span;
+#: a template line always does. Kept adjacent to the loader so the two are read
+#: together; the real pattern remains the parser's.
+_E2E_FALLBACK_RE = re.compile(
+    r"^[^\S\n]*(?:[-*+>][^\S\n]*)*(?:\[[ xX]\][^\S\n]*)?"
+    r"[*_`]{0,2}E2E[*_`]{0,2}[^\S\n]*:[^\S\n]*(?![^\n]*<[^<>\n]*>)(\S[^\n]*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _load_e2e_declaration():
+    """Import scripts/e2e_declaration.py, or None if unavailable.
+
+    Same lazy, failure-tolerant shape as ``_load_pin_receipt_checker``: a sibling
+    script rather than a package, and a hook that cannot import it must not stop
+    being a merge gate for everything else."""
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "e2e_declaration.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_e2e_declaration", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec (dataclasses resolve their module from sys.modules),
+        # and popped on failure so a half-initialised entry cannot poison a later
+        # import — the same hygiene the sibling loader in e2e_declaration.py argues
+        # for. The two loaders disagreeing about it is how one of them ends up wrong.
+        sys.modules["_e2e_declaration"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("_e2e_declaration", None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
+    """The PR's creation timestamp (ISO-8601), or None if unreadable.
+
+    Mirrors ``_pr_body_text``: ``None`` is UNREADABLE, which the caller treats as
+    "not exempt" — the pre-cutoff population is finite and shrinking, so a parse
+    failure must not become a permanent exemption."""
+    raw = os.environ.get("_TEST_GH_PR_CREATED_AT")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "view", pr_num, *_repo_args(repo),
+                "--json", "createdAt", "--jq", ".createdAt",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a merge whose PR body never DECIDED about a post-merge E2E (§8.12).
+
+    Returns (should_block, message). The obligation is one line in the PR body —
+    either a plan or an explicit reasoned ``none`` (see scripts/e2e_declaration.py
+    for the full convention and why its parsing is what it is).
+
+    GUARD AXIOMS, stated because every gate change owes them:
+      * VERDICT: block, at MERGE time only. The push arm never calls this — a
+        body is written and revised while a PR is open, so demanding it at push
+        would gate the wrong moment.
+      * AUDIENCE: the agent. The message names both valid forms verbatim.
+      * BACKGROUND: none. Background sessions cannot merge PRs by design, so this
+        cannot impede one.
+
+    Fail directions, each chosen rather than inherited:
+      * body UNREADABLE → BLOCK. This gate guards EVERY merge, so an unreadable
+        body is an unanswered question, not a pass. (The pin gate fails open on
+        the same read because it guards only the rare pin-bump path — the
+        divergence is deliberate, not an oversight.)
+      * createdAt UNREADABLE → BLOCK, naming the cause. Treating it as "old"
+        would turn the transition window into a permanent hole.
+      * parser module MISSING → the body is still scanned for a bare ``E2E:``
+        line and a NOTE says the comment/fence stripping was unavailable. Losing
+        the invisibility defence must not lose the whole gate.
+
+    NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
+    escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
+    """
+    # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
+    # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
+    # module was missing — a false block, on a gate with no override, against the one
+    # population the exemption exists to protect. Degraded mode compares the mirror
+    # constant lexicographically: both values are ISO-8601 UTC of the same shape, so
+    # that ordering is exact without a parser.
+    mod = _load_e2e_declaration()
+    created_at = _pr_created_at(pr_num, repo=repo)
+    if created_at is None:
+        if mod is None:
+            # Neither the parser NOR the timestamp: nothing can be established, and
+            # the presence scan below still runs. Fail toward asking for a line.
+            print(
+                f"NOTE: PR #{pr_num} — createdAt unreadable AND the E2E parser could "
+                f"not load; the pre-convention exemption could not be checked.",
+                file=sys.stderr,
+            )
+        else:
+            return True, (
+                f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
+                f"pre-convention exemption cannot be established. Re-run; if it "
+                f"persists, the gh read is failing."
+            )
+    else:
+        if mod is not None:
+            exempt = mod.is_pre_cutoff(created_at)
+        else:
+            exempt = created_at.strip() < _E2E_CUTOFF_FALLBACK
+        if exempt:
+            return False, f"n/a (PR created {created_at}, before the convention)"
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return True, (
+            f"E2E obligation: PR #{pr_num}'s body is unreadable, so the declaration "
+            f"cannot be confirmed. This gate guards every merge — an unread body is "
+            f"an unanswered question, not a pass."
+        )
+
+    if mod is None:
+        # Degraded: no comment/fence stripping. A hand-written second matcher here
+        # DIVERGED from the parser in BOTH directions (architect SHOULD-FIX,
+        # 2026-09-06, measured): it accepted the shipped PR template's guidance line
+        # — which lives inside an HTML comment, so every straight-from-template PR
+        # would have passed — while REJECTING `- E2E: …`, `* E2E: …`, `> E2E: …` and
+        # checkbox forms, the exact markdown tolerance the real pattern exists for.
+        # Two matchers for one rule, selected by an exception handler, is the defect;
+        # this one is derived from the same shape and refuses any value carrying a
+        # `<…>` span, so no template line can satisfy it. (The narrower `(?!<)` this
+        # comment used to name was itself the bug — it guarded only the first
+        # character; see the pattern's own docstring.)
+        found = _E2E_FALLBACK_RE.search(body)
+        if found:
+            print(
+                f"NOTE: PR #{pr_num} — e2e_declaration.py could not be loaded; the "
+                f"E2E: line was matched WITHOUT comment/fence stripping, so a "
+                f"declaration hidden in an HTML comment would not be caught.",
+                file=sys.stderr,
+            )
+            return False, "ok (degraded: parser unavailable)"
+        return True, (
+            f"E2E obligation: no E2E: line found in PR #{pr_num}'s body (parser "
+            f"unavailable, presence-only scan)."
+        )
+
+    result = mod.parse_e2e(body)
+    kind = result.get("kind")
+    if kind in ("plan", "none"):
+        label = "plan" if kind == "plan" else "none"
+        print(
+            f"NOTE: PR #{pr_num} — E2E obligation declared ({label}): "
+            f"{result.get('text', '')[:200]}",
+            file=sys.stderr,
+        )
+        return False, f"ok ({label})"
+
+    detail = result.get("detail") or "no E2E: line in the PR body"
+    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{mod.GUIDANCE}"
 
 
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -5815,14 +6669,36 @@ def main() -> int:
                     )
                     print(receipts_msg, file=sys.stderr)
                     return 2
-                elif receipts_msg.startswith("NOTE:"):
+                if receipts_msg.startswith("NOTE:"):
                     # A NOTE means the gate did NOT verify the receipts and is allowing the
                     # merge anyway. That is the fail-open direction, so it has to be VISIBLE
                     # at the moment of merging — every other fail-open gate on this path
                     # prints its note, and this one silently discarded seven of them, which
                     # made "the residue is narrow and named" false at the only surface a
                     # human reads.
+                    #
+                    # A plain `if`, NOT an `elif`: this NOTE belongs to the PIN gate
+                    # above. When the E2E block below was first inserted between the
+                    # two, this clause re-bound to IT, so a merge blocked for a missing
+                    # E2E line silently swallowed the pin gate's fail-open note —
+                    # reintroducing, in miniature, the exact suppression the paragraph
+                    # above records as measured (architect SHOULD-FIX, 2026-09-06).
                     print(receipts_msg, file=sys.stderr)
+
+                # E2E obligation (§8.12). Sits beside the pin gate because it is
+                # the same KIND of check — a merge-time read of the PR body, which
+                # stays mutable after any CI run — and because both are cheap
+                # reads that should fail before the expensive finding scans.
+                # Like the pin gate it carries NO override sigil: `E2E: none —
+                # <reason>` is the escape hatch, and it costs one honest sentence.
+                should_block, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — no post-merge E2E decision in the PR body.",
+                        file=sys.stderr,
+                    )
+                    print(e2e_msg, file=sys.stderr)
+                    return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6108,6 +6984,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
     failures += 1 if blocked else 0
+    # E2E obligation (§8.12), same tier and same reason as pin-receipts: a
+    # merge-time read of a mutable body, so CI could never be its authority.
+    blocked, msg = _check_e2e_plan(pr_num, repo=repo)
+    print(f"e2e-plan       : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
+    failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]
@@ -6162,10 +7046,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             # NEVER render a carried-forward review as one made at head: this line is
             # what a human (and a structured consumer) reads to judge freshness, and
             # "ok (at head)" here would be a false assertion about what was reviewed.
-            sched_state = "ok (" + "; ".join(
-                f"{kind} carried from {anc}, {check} green at head"
-                for kind, anc, check in sched_relief
-            ) + ")"
+            sched_state = (
+                "ok ("
+                + "; ".join(
+                    f"{kind} carried from {anc}, {check} green at head"
+                    for kind, anc, check in sched_relief
+                )
+                + ")"
+            )
         else:
             sched_state = "ok (at head)"
         print(f"scheduled-claude: {sched_state}")

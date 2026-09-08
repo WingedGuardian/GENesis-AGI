@@ -73,7 +73,7 @@ async def _run(svc):
 @pytest.mark.asyncio
 async def test_critical_site_down_is_critical():
     """A failing site in CRITICAL_CALL_SITES → CRITICAL/red."""
-    svc = _make_service([("21_embeddings", "2026-07-12T10:00:00", "embedding")])
+    svc = _make_service([("21_embeddings", (datetime.now(UTC) - timedelta(hours=1)).isoformat(), "embedding")])
     alerts = await _run(svc)
     down = [a for a in alerts if a["id"] == "callsite:down:21_embeddings"]
     assert len(down) == 1
@@ -83,7 +83,7 @@ async def test_critical_site_down_is_critical():
 @pytest.mark.asyncio
 async def test_noncritical_site_down_is_warning():
     """A failing site NOT in the critical set → WARNING/yellow (watched)."""
-    svc = _make_service([("30_triage_calibration", "2026-07-12T10:00:00", "mistral")])
+    svc = _make_service([("30_triage_calibration", (datetime.now(UTC) - timedelta(hours=1)).isoformat(), "mistral")])
     alerts = await _run(svc)
     down = [a for a in alerts if a["id"] == "callsite:down:30_triage_calibration"]
     assert len(down) == 1
@@ -93,7 +93,7 @@ async def test_noncritical_site_down_is_warning():
 @pytest.mark.asyncio
 async def test_autonomous_executor_is_warning_not_critical():
     """autonomous_executor_reasoning is deliberately yellow (has CC fallback)."""
-    svc = _make_service([("autonomous_executor_reasoning", "2026-07-12T10:00:00", "openrouter")])
+    svc = _make_service([("autonomous_executor_reasoning", (datetime.now(UTC) - timedelta(hours=1)).isoformat(), "openrouter")])
     alerts = await _run(svc)
     down = [a for a in alerts if a["id"] == "callsite:down:autonomous_executor_reasoning"]
     assert len(down) == 1
@@ -115,11 +115,23 @@ async def test_recency_and_success_filter_via_real_db():
     and stale-failed rows are excluded. Proves the WHERE clause, not a mock."""
     import aiosqlite
 
-    from genesis.mcp.health.critical_sites import CALLSITE_DOWN_RECENCY_HOURS
+    from genesis.mcp.health.critical_sites import (
+        CALLSITE_DOWN_RECENCY_HOURS,
+        CRITICAL_CALLSITE_DOWN_RECENCY_HOURS,
+    )
 
     now = datetime.now(UTC)
     fresh = (now - timedelta(hours=1)).isoformat()
+    # Past the tight window but well inside the critical one — the shape of a
+    # failed WEEKLY critical site a few days later. Under the old single 24h
+    # ceiling this fell silent: Genesis got QUIETER the longer a critical
+    # site stayed broken (the property behind the provider-death incident).
     stale = (now - timedelta(hours=CALLSITE_DOWN_RECENCY_HOURS + 48)).isoformat()
+    # Beyond even the critical window — an abandoned/retired site. The floor
+    # that stops "alarms forever".
+    ancient = (
+        now - timedelta(hours=CRITICAL_CALLSITE_DOWN_RECENCY_HOURS + 24)
+    ).isoformat()
 
     async with aiosqlite.connect(":memory:") as db:
         await db.execute(
@@ -133,7 +145,9 @@ async def test_recency_and_success_filter_via_real_db():
             [
                 ("21_embeddings", fresh, "embedding", 0),  # fresh fail, critical
                 ("30_triage_calibration", fresh, "mistral", 0),  # fresh fail, non-crit
-                ("5_deep_reflection", stale, "cc", 0),  # STALE fail → excluded
+                ("5_deep_reflection", stale, "cc", 0),  # stale fail, CRITICAL → stays audible
+                ("29_retrospective_triage", stale, "mistral", 0),  # stale fail, non-crit → excluded
+                ("6_strategic_reflection", ancient, "cc", 0),  # ancient fail, critical → floor excludes
                 ("9_fact_extraction", fresh, "groq", 1),  # recovered → excluded
             ],
         )
@@ -156,6 +170,7 @@ async def test_recency_and_success_filter_via_real_db():
     assert down == {
         "callsite:down:21_embeddings": "CRITICAL",
         "callsite:down:30_triage_calibration": "WARNING",
+        "callsite:down:5_deep_reflection": "CRITICAL",
     }
 
 

@@ -550,6 +550,13 @@ _KNOWN_SIGILS = (
     # missing declaration nor an unwarranted one can ship unnoticed.
     "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
     "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
+    # THIRD occurrence of the class the comment above describes, caught by that
+    # test rather than in review: the round-7 terminal shipped its sigil query
+    # without this line, and the terminal's own block message printed the losing
+    # token order. At streak>=3 AND lifetime>=7 — a reachable state, since the
+    # terminal does not reset the streak — `# final-round-accept escalation-ack`
+    # was refused while `# escalation-ack final-round-accept` passed.
+    "final-round-accept",  # review_enforcement_commit: the round-7 lifetime terminal
 )
 
 
