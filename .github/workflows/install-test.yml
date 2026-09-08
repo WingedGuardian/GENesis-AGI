@@ -1,0 +1,96 @@
+name: Install Test
+
+# Fresh-machine install verification. Replaces the retired EC2 install-test
+# harness (removed in #623): a clean GitHub-hosted runner clones the repo and
+# runs the public installer end-to-end, so the PR that breaks a fresh install
+# fails here instead of on a user's machine weeks later.
+#
+# Coverage notes: GitHub-hosted runners are full Ubuntu VMs (systemd present),
+# so this exercises the real install path. Not covered: arbitrary cloud images
+# and the LXC/Incus container-install variant — run a manual VM install before
+# a release when those matter.
+#
+# Do NOT add this workflow to required status checks: it is path-filtered, so
+# PRs touching none of the filtered paths report no status and would wait on
+# "Expected" forever.
+
+on:
+  pull_request:
+    branches: [main]
+    # The filter mirrors what install.sh actually CONSUMES (sourced libs,
+    # rendered templates, seed files, the dependency set) — not what merely
+    # sounds install-related. Derived by enumerating install.sh's inputs.
+    paths:
+      - "scripts/install.sh"
+      - "scripts/lib/**"
+      - "scripts/systemd/**"
+      - "scripts/hooks/pre-commit"
+      - "scripts/hooks/pre-push"
+      - "config/mcp.json.template"
+      - "config/genesis-tmp-watchgod.service"
+      - "pyproject.toml"
+      - "secrets.env.example"
+      - "src/genesis/identity/*.example"
+      - ".claude/mcp/run-codebase-memory"
+      - ".github/workflows/install-test.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"  # weekly Mon 07:00 UTC — catch drift even without install-path commits
+
+concurrency:
+  group: install-test-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-install:
+    runs-on: ubuntu-latest
+    # A healthy full install measures in the tens of minutes (apt + Node +
+    # Qdrant + venv + Claude Code). The failure mode bounded here is a hung
+    # network fetch or apt lock burning the 6h default job budget on a weekly
+    # schedule; 60 min is ~2-3x a healthy run.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Provision a user systemd session
+        # Hosted runners execute steps via a system unit with no logind session
+        # and no XDG_RUNTIME_DIR, so `systemctl --user` cannot reach a user bus
+        # — and Qdrant's only start path in install.sh is a user unit. Linger
+        # gives the runner user a manager; the final line makes "still no user
+        # bus" a legible failure of THIS step instead of an unexplained Qdrant
+        # timeout deep in the install log. No-op where a manager already runs.
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 20); do
+            systemctl --user is-system-running >/dev/null 2>&1 && break
+            sleep 1
+          done
+          systemctl --user show-environment >/dev/null
+
+      - name: Run installer (non-interactive, strict)
+        env:
+          GENESIS_INSTALL_STRICT: "1"
+        run: ./scripts/install.sh --non-interactive
+
+      - name: Verify install outcome
+        run: |
+          set -euo pipefail
+          # Deliberately NOT a re-run of the installer's own smoke test (that
+          # already gates via strict mode): assert artifacts the installer only
+          # WARNs about, plus rendered-template integrity it never checks.
+          test -f ~/.config/systemd/user/genesis-server.service
+          grep -q "$PWD" ~/.config/systemd/user/genesis-server.service
+          ! grep -q '__[A-Z_]*__' ~/.config/systemd/user/genesis-server.service
+          test -f .mcp.json
+          ! grep -q '{{' .mcp.json
+          command -v claude
+          . scripts/lib/cc_version.sh
+          claude --version | grep -q "$CC_VERSION"
+          .venv/bin/python -c "import genesis, sys; print(genesis.__file__)"

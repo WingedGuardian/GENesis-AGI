@@ -25,6 +25,7 @@
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
 #   NODE_MAJOR             — Node.js major version (default: 20)
+#   GENESIS_INSTALL_STRICT — exit nonzero on any smoke failure/setup warning (default: 0; used by CI)
 
 set -euo pipefail
 
@@ -1701,3 +1702,15 @@ if ! echo "$_os_name" | grep -qi 'ubuntu 24'; then
     echo "  Report issues: https://github.com/WingedGuardian/GENesis-AGI/issues"
 fi
 echo ""
+
+# Strict mode for CI (the install-test workflow): any smoke-test failure OR
+# setup warning must fail the run — SETUP_WARNINGS is where real breakage in
+# the Claude Code / venv / port-conflict paths lands (they only WARN for
+# humans, and a fresh-install test that greens through a broken CC install is
+# a false green). Kept off for humans — a partial install with a readable
+# summary beats a nonzero exit mid-setup.
+if [ "${GENESIS_INSTALL_STRICT:-0}" = "1" ] \
+   && { [ "${SMOKE_FAIL:-0}" -gt 0 ] || [ "${SETUP_WARNINGS:-0}" = "1" ]; }; then
+    echo "  STRICT: smoke failures=${SMOKE_FAIL:-0}, SETUP_WARNINGS=${SETUP_WARNINGS:-0} — exiting nonzero." >&2
+    exit 1
+fi
