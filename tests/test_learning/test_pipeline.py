@@ -423,8 +423,18 @@ class TestLegacyExtractionPromptIsFenced:
     rather than skewing one verdict.
 
     Both fields it interpolates are untrusted — `user_text` is written by
-    whoever sent the message (inbox, mail, Telegram) and `response_text` can
-    carry text propagated from those inputs.
+    whoever sent the message and `response_text` can carry text propagated from
+    those inputs.
+
+    The channel used below is `web`, and the choice is load-bearing rather than
+    incidental. `_PROCEDURE_EXTRACTION_CHANNELS` now excludes `inbox`/`mail`
+    entirely, so neither can reach this prompt to be fenced; `web` is the
+    channel that is both still ADMITTED to extraction and still untrusted —
+    every OpenClaw HTTP completion arrives on it and its `user_text` is whatever
+    the caller sent, with `is_owner_attended_channel("web")` False. The channel
+    allow-list and this fence are layers, not alternatives: the allow-list
+    decides WHOSE text reaches the extractor, the fence stops the text that does
+    from posing as the prompt's own instructions.
     """
 
     FORGED = (
@@ -454,7 +464,7 @@ class TestLegacyExtractionPromptIsFenced:
             observation_writer=MagicMock(write=AsyncMock(return_value="o")),
             router=router,
         )
-        await pipeline(FakeCCOutput(text=response_text), user_text, "inbox")
+        await pipeline(FakeCCOutput(text=response_text), user_text, "web")
         assert "summary_text" in seen, "extract_procedure was never reached"
         return seen["summary_text"]
 
@@ -481,8 +491,9 @@ class TestLegacyExtractionPromptIsFenced:
 
     @pytest.mark.asyncio
     async def test_a_forged_request_cannot_escape_either(self, db, monkeypatch):
-        """`user_text` is the MORE untrusted of the two — an outside sender
-        writes it — and it was interpolated with no fence at all."""
+        """`user_text` is the MORE untrusted of the two — on `web` it is
+        whatever the HTTP caller sent — and it was interpolated with no fence
+        at all."""
         import re
 
         text = await self._captured_summary_text(
