@@ -727,16 +727,58 @@ def untokenizable(command: str) -> bool:
 #:     depth 5   2.67s   53%             1.9x margin   <- chosen
 #:     depth 4   2.52s   50%             2.0x margin
 #:
+#: THIS TABLE IS THE ONLY PLACE THESE FIGURES ARE DERIVED. Two other files and a test
+#: docstring used to restate the depth-5 row from memory, as 2.92s and 3.19s, so one
+#: measurement appeared with three values and nothing said which was current — they
+#: now point here instead. The reason a copy drifts is that the figure is
+#: load-dependent: re-measured 2026-09-08 through the same path on a box under heavy
+#: concurrent load, the depth-5 row came out at a 2.84s median over three runs with a
+#: 2.80-3.25s spread, which is the same decision and a different number. Treat the row
+#: as the scale at which the bound was chosen, and RE-MEASURE before quoting it as a
+#: current fact.
+#:
 #: Depth 4 buys almost no time for meaningfully less headroom, so 5 is the balance:
-#: 1.9x on the clock and 1.67x over the deepest nesting any real command reaches.
+#: 1.9x on the clock and 1.25x over the deepest nesting any real command reaches. That
+#: second ratio read 1.67x, from a corpus whose deepest command was 3; the re-derivation
+#: below finds one at 4, and a margin term is quoted against the DEEPEST observation
+#: available, never the friendliest. Nothing reaches 5 in either corpus, so the bound
+#: itself does not move — only the honesty of the margin does.
 #: The asymmetry decides which side to buy margin on — exceeding a bound fails CLOSED
 #: (a refusal), while exceeding the hook timeout fails OPEN (the command runs
 #: unchecked), so the clock is the side that must not be shaved.
 #:
-#: Headroom: MEASURED over 45,956 distinct real Bash commands from this install's
-#: history, the longest is 43,480 chars, so this is 1.13x anything ever actually run
-#: here and fires on 0 of the 45,956. The cap CANNOT go lower without refusing real
-#: work, which is why depth carries the tuning.
+#: Headroom: over 45,956 distinct real Bash commands from this install's history the
+#: longest is 43,480 chars, so the cap is 1.13x that and fires on 0 of them. The cap
+#: CANNOT go lower without refusing real work, which is why depth carries the tuning.
+#:
+#: THAT MAXIMUM IS METHOD-UNRECORDED and is deliberately no longer labelled MEASURED.
+#: The re-derivation below, which DOES carry its method, finds a longest of 40,925 over
+#: a corpus 2.65x larger — and a superset harvested the same way cannot have a smaller
+#: maximum, so the two harvests are not the same population and 43,480 cannot be
+#: re-checked from anything written down. It is kept rather than replaced because it is
+#: the LARGER of the two, and every claim resting on it (the cap clears the longest real
+#: command; the fixtures assert `longest_real < cap`) is the more conservative for using
+#: it. The ratio is what the choice costs: 1.13x against 43,480, 1.20x against 40,925.
+#: Quote whichever you can defend, and never present the unrecorded one as measured.
+#:
+#: RE-DERIVED 2026-09-08 with the method stated, because a denominator whose method is
+#: not recorded cannot be checked — and this one could not be: two harvests taken in
+#: the same session left 45,956 and 45,358 side by side in these files with nothing to
+#: arbitrate them. Method: every `Bash` tool_use `input.command` in this install's CC
+#: transcripts (`~/.claude/projects` and `~/.genesis/background-sessions`, 11,298
+#: `.jsonl` files), deduplicated by exact string. That yields 121,927 distinct
+#: commands, longest 40,925 chars: 0 above this cap, 9 above the old 32,768 one, and a
+#: `Segment.depth` distribution of 91.4% / 7.9% / 0.7% / 16 commands / 1 command at
+#: depths 0-4. Exactly one command in the whole corpus trips a bound, and it is a probe
+#: typed while writing this note. So both bounds still fire on 0 real work at 2.65x the
+#: denominator they were chosen on.
+#:
+#: READ THAT AS A SECOND OPINION, NOT AS A CORRECTION, because the two are not nested:
+#: this harvest has 2.65x the COUNT and a SHORTER longest command (40,925 vs 43,480).
+#: A corpus that merely grew could not do that, so the harvests differ in what they
+#: admit, not only in when they were taken — which is the whole argument for recording
+#: a method beside a denominator. Neither number is wrong; they are different
+#: populations, and the cap sits above the longest command in BOTH.
 #:
 #: THIS CAP WAS 32,768 AND THAT WAS TOO SMALL — recorded because the mistake is
 #: instructive rather than embarrassing. It was sized against an earlier corpus of
@@ -772,7 +814,10 @@ MAX_COMMAND_CHARS = 49_152
 #: without the other. MEASURED over 45,956 distinct real commands, counting the depth
 #: ``analyze`` ACTUALLY recurses to (``Segment.depth``, so ``bash -c`` wrappers and
 #: substitutions both): 87.5% reach depth 0, 11.7% depth 1, 0.79% depth 2, and 7
-#: commands reach depth 3. Nothing reaches 5.
+#: commands reach depth 3. Nothing reaches 5. Re-derived 2026-09-08 over the larger
+#: corpus recorded with :data:`MAX_COMMAND_CHARS`: 91.4% / 7.9% / 0.7%, 16 commands at
+#: depth 3 and ONE at depth 4. Still nothing at 5, which is the clause the bound rests
+#: on — but the deepest real command is 4 rather than 3, so quote the margin as 1.25x.
 #:
 #: This was 8, and came down twice: once when the cap went up, and again when the
 #: end-to-end budget turned out to carry FIVE parses rather than two. The cap cannot
@@ -973,7 +1018,7 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     documented to ignore. MEASURED: appending a trailing ``# don't`` to a nested
     command flipped three guards from BLOCK to ALLOW, because an apostrophe in a
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
-    2 of 45,358 real commands a reclassification and no change of verdict.
+    2 of 45,956 real commands a reclassification and no change of verdict.
     """
     segments, reason = _analyze_bounded(command)
     if reason == "length":
@@ -1108,9 +1153,16 @@ def analyze(command: str) -> list[Segment]:
     commands are surfaced (the parent's override propagates to them).
 
     The descent stops at :data:`MAX_SUBSTITUTION_DEPTH`, which is a SECURITY bound
-    rather than a performance one — see the constant. A truncated parse returns the
-    segments it DID resolve, so this signature and its result are unchanged for every
-    caller that does not care.
+    rather than a performance one — see the constant. A DEPTH-truncated parse returns
+    the segments it DID resolve, so this signature and its result are unchanged for
+    every caller that does not care.
+
+    THE OTHER BOUND BEHAVES DIFFERENTLY, and this docstring used to omit it entirely
+    while asserting the depth bound's behaviour as if it were the whole story. Over
+    :data:`MAX_COMMAND_CHARS` this returns NO segments at all, silently — not a prefix,
+    not what it managed to reach, nothing. The two bounds are therefore NOT
+    interchangeable in any argument about what a caller sees, which is exactly the axis
+    the exemptions in ``_BARE_ANALYZE_ALLOWED`` reason on.
 
     A caller that must not be BLIND wants :func:`analyze_checked`, which returns the
     same segments plus WHY they might be incomplete, from the same single parse. That

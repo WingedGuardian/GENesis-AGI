@@ -163,7 +163,10 @@ def test_the_command_is_parsed_exactly_once_per_process(monkeypatch):
     same command, this one included — and this guard reaches three consumers that each
     analyse it. That put FIVE full parses on one 5s clock. MEASURED end to end with
     the worst payload inside both bounds: 6.12s BEFORE memoisation, i.e. the hook is
-    KILLED, and a killed hook does not refuse — it PERMITS. 2.67s after.
+    KILLED, and a killed hook does not refuse — it PERMITS. Comfortably inside the
+    budget after; the after-figure is the depth-5 row in `shell_parse.MAX_COMMAND_CHARS`
+    and is not repeated here, because three files restating it from memory is how it
+    came to have three different values.
 
     So bounding the input was not sufficient on its own; the same work had to stop
     being done three times. This test exists because a mutation removing the memo

@@ -599,6 +599,33 @@ class TestNoConsumerCanSkipTheChokepoint:
             "cap, and such a command is caught upstream by this guard's own "
             "blind-spot net before this code runs (verified end to end)."
         ),
+        "tmux_kill_server_guard.py": (
+            "ADVISORY-only: exit 0 plus additionalContext, no block, so there is "
+            "nothing here that can fail OPEN — the worst this exemption can do is "
+            "produce an advisory nobody needed. The operative fact is a containment: "
+            "`analyze`'s segment list is a SUPERSET of `analyze_checked`'s (identical "
+            "when no bound fires, and `analyze_checked` returns [] when one does), so "
+            "the exemption can only ever add advice, never remove it. MEASURED on "
+            "`tmux kill-server && echo <9-deep substitution>`: `analyze` returns the "
+            "visible top-level tmux segment and the advisory FIRES, while "
+            "`analyze_checked` returns [] and it goes silent. Losing that is the "
+            "direction this guard's own header calls the expensive one, since the miss "
+            "it exists to prevent reaped every session on the box. Over the LENGTH cap "
+            "the two are identical (neither returns a segment), so the depth bound is "
+            "the only axis where the choice matters at all. "
+            "THE COST, STATED RATHER THAN WAVED AWAY: on that shape the guard advises "
+            "about the VISIBLE kill-server while a second one past the bound goes "
+            "unmentioned — verbatim the 'found something AND stopped looking' pattern "
+            "`analyze_checked` exists to prevent. It is accepted here only because an "
+            "advisory authorizes nothing. Two earlier justifications for this entry "
+            "were unsound and are recorded so they are not re-derived: bare `analyze` "
+            "is NOT 'strictly more informed' (it has the reachable segments; "
+            "`analyze_checked` has the knowledge that it stopped), and the guard's "
+            "module docstring does NOT already settle this — its stated reason for "
+            "silence is a mention/execution ambiguity in the fallback SPLIT, which "
+            "exists on the untokenizable axis and not on the depth axis, where the "
+            "parser simply stops."
+        ),
     }
 
     def _shell_parse_imports(self, path: Path) -> set[str]:

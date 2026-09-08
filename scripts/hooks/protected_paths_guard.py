@@ -30,14 +30,24 @@ not hidden): a `cd` INSIDE a compound command shifts the real cwd and is not
 tracked here — same posture as shell_parse: this is an approval/friction
 layer, not a sandbox. The old substring check missed that case too.
 
-Fail modes: a command this module cannot fully read falls back to the legacy
-substring check — conservative, never weaker than the old guard. There are two
-such blind spots and `shell_parse.analyze_checked` reports either: a command
-shlex cannot tokenize (ANSI-C quoting), and one nested deeper than the parser
-follows. The second is a SECURITY bound, not a nicety — an unbounded parse of a
-deeply-nested command runs this guard past its registered 10s timeout, and a
-hook killed at its timeout does not block, it PERMITS. An unexpected crash fails
-CLOSED via hook_input.run_guard (exit 2).
+Fail modes — THE TWO BLIND SPOTS ARE NOT TREATED ALIKE, and stating them as one
+was this docstring's own bug for a while:
+
+  * A command shlex cannot tokenize (ANSI-C quoting) falls back to the legacy
+    substring check. That is unchanged, pre-existing behaviour, and the word
+    "conservative" applies only relative to the OLD guard being reinstated — it
+    is strictly WEAKER than the parse it stands in for (see `_block`'s caller).
+  * A command past one of `shell_parse`'s BOUNDS is REFUSED outright and never
+    reaches that fallback, because the fallback is weakest exactly where the
+    command is most destructive: it cannot see an ancestor of a protected
+    directory, nor a glob over its contents. The bounds are a SECURITY limit,
+    not a nicety — an unbounded parse of a deeply-nested command runs this guard
+    past its registered 10s timeout, and a hook killed at its timeout does not
+    block, it PERMITS.
+
+`shell_parse.analyze_checked` reports which one fired; `bounds_induced` is the
+only thing this module branches on. An unexpected crash fails CLOSED via
+hook_input.run_guard (exit 2).
 """
 
 from __future__ import annotations
@@ -243,7 +253,7 @@ def main() -> int:
         # does catch.
         #
         # We are past the _RM_PATTERN fast path, so this can only ever refuse a
-        # command that mentions rm, and bounds-induced blindness fires on 0 of 45,358
+        # command that mentions rm, and bounds-induced blindness fires on 0 of 45,956
         # real commands — so refusing outright costs nothing measurable.
         #
         # Both bounds refuse, uniformly with every other fail-closed guard here.

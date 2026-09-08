@@ -72,6 +72,15 @@ def _nested(depth: int, length: int = _UNDER_CAP) -> str:
 #: The realistic worst case is this length, NOT the synthetic bomb. (Was 14,682 from
 #: a corpus half this size — see test_the_cap_admits_every_real_command for why that
 #: number is a trap worth remembering rather than just a stale figure.)
+#:
+#: METHOD-UNRECORDED, and kept as the LARGER of the two figures on record rather than
+#: the better-documented one. A 2026-09-08 re-derivation that DOES state its method
+#: (see `shell_parse.MAX_COMMAND_CHARS`) found 40,925 over a corpus 2.65x larger,
+#: which cannot be a superset of the harvest behind this number. Every assertion in
+#: this file built on it — that the cap clears the longest real command, that the
+#: unbounded parse stays inside budget at this length — is the STRICTER claim for
+#: using the bigger value, so the unverifiable figure is at least the safe one to be
+#: stuck with. Re-derive both before moving the cap on the strength of either.
 _REAL_MAX_LEN = 43_480
 
 
@@ -167,7 +176,10 @@ def test_ordinary_commands_are_not_reported_as_over_nested(cmd):
 
     MEASURED over 45,956 distinct real Bash commands from this install's history,
     counting the depth ``analyze`` actually recurses to: 87.5% reach depth 0, 11.7%
-    depth 1, 0.79% depth 2, and 7 commands reach depth 3. Nothing reaches the bound of 5.
+    depth 1, 0.79% depth 2, and 7 commands reach depth 3. Re-derived 2026-09-08 over a
+    larger corpus: 91.4% / 7.9% / 0.7%, 16 at depth 3 and ONE at depth 4. Nothing
+    reaches the bound of 5 in either, which is the clause the bound rests on — the
+    deepest real command is 4, not 3, so the margin is 1.25x rather than 1.67x.
 
     Those are ``Segment.depth`` units, which is what the bound counts — NOT how deep
     a command looks, since ``bash -c "$(…)"`` descends twice per level. Comparing the
@@ -278,7 +290,11 @@ def test_the_worst_shape_at_the_cap_still_leaves_the_guard_its_clock():
     is registered at and not the "two parses" an earlier version of this docstring
     claimed. MEASURED end to end through the real hook, payload inside both bounds so
     nothing short-circuits and allowed by every guard so nothing exits early:
-    1.06s at depth 0, 2.16s at depth 3, 3.19s at depth 5.
+    about a second at depth 0, rising to the depth-5 figure recorded in
+    `shell_parse.MAX_COMMAND_CHARS`. The number is deliberately NOT restated here.
+    It was, as 3.19s, while the table said 2.67s and `git_discard_guard` said 2.92s —
+    one measurement, three files, three values, and no way for a reader to tell which
+    was current. It moves with machine load, so a copy of it is a copy that drifts.
 
     This asserts the in-process parse only, so its threshold is deliberately looser
     than the end-to-end figures; it exists to catch a bound raised far enough to
@@ -313,9 +329,11 @@ def test_the_cap_admits_every_real_command():
     assertion being tightened, because a wide margin is NOT wanted here: the cost
     ceiling is the binding constraint and the headroom is deliberately 1.13x.)
 
-    MEASURED over 45,956 distinct real Bash commands from this install's history: the
-    longest is 43,480 chars, so the cap is 1.13x anything ever actually run here and
-    fires on 0 of them.
+    Over 45,956 distinct real Bash commands from this install's history the longest is
+    43,480 chars, so the cap is 1.13x that and fires on 0 of them — 1.20x against the
+    40,925 a later, method-recorded re-derivation found. Deliberately not labelled
+    MEASURED: see the provenance note on `_REAL_MAX_LEN` for why one of those two
+    numbers cannot be re-checked, and why this file keeps the larger one anyway.
 
     THE FIGURE IN THIS TEST WAS ONCE 14,682, AND THAT IS THE POINT OF THE COMMENT.
     It came from an earlier corpus of 20,514 commands and justified a 32,768 cap as
@@ -337,7 +355,10 @@ def test_the_cap_admits_every_real_command():
     the same figure `shell_parse` explicitly labels as the mistake that produced an
     over-budget cap. Cost is length x levels; see the grid in `MAX_COMMAND_CHARS`.
     """
-    longest_real = 43_480
+    # ONE definition, shared with the module-level constant, which carries the
+    # provenance caveat. A second literal here is a second thing to update, and the
+    # figure has already been wrong once.
+    longest_real = _REAL_MAX_LEN
     assert longest_real < sp.MAX_COMMAND_CHARS, (
         f"cap {sp.MAX_COMMAND_CHARS} is BELOW the longest real command "
         f"({longest_real}) — real work would be refused"

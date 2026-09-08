@@ -23,6 +23,19 @@ _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _WORKTREE / "scripts" / "hooks" / "protected_paths_guard.py"
 _PYTHON = sys.executable
 
+# The cap is READ from the parser, never restated here: a fixture built from a
+# literal length stops crossing the bound the moment the bound moves, and a test
+# that no longer reaches its subject goes on passing for another reason.
+#
+# Imported by PATH rather than by `spec_from_file_location` + `module_from_spec`,
+# which a sibling test uses and which does NOT register the module in `sys.modules`:
+# `shell_parse` defines a dataclass, and `@dataclass` looks its own module up there,
+# so that form raises AttributeError at COLLECTION unless something else happened to
+# import shell_parse first. The sibling gets away with it only because it loads a
+# guard that imports shell_parse normally one line earlier.
+sys.path.insert(0, str(_WORKTREE / "scripts" / "hooks"))
+import shell_parse  # noqa: E402
+
 
 @pytest.fixture
 def fake_home(tmp_path: Path) -> Path:
@@ -368,11 +381,33 @@ class TestBoundedParseNeverDowngradesToTheWeakerCheck:
         )
 
     def test_an_over_length_rm_is_refused_too(self, fake_home):
-        """The other bound reaches the same weak fallback, so it gets the same test."""
-        over = f'rm -rf {H}/genesis "' + "x" * 40_000 + '"'
+        """The other bound reaches the same weak fallback, so it gets the same test.
+
+        The length is DERIVED from the cap, never written out. This test shipped with
+        a literal 40,000 — correct against the 32,768 cap it was written for, and
+        silently below the cap once that moved to 49,152 in the same branch. It went
+        on passing, because `rm -rf $HOME/genesis` is refused by the ORDINARY parse
+        path as an ancestor of a protected directory: a test of the length bound that
+        never reached the length bound, green for a reason that had nothing to do with
+        its name.
+
+        So the exit code alone cannot attribute the refusal. The stderr assertion is
+        what does: only the bounds branch says the command is too long, and a guard
+        with no bounds handling at all would still return 2 here.
+        """
+        over = f'rm -rf {H}/genesis "' + "x" * shell_parse.MAX_COMMAND_CHARS + '"'
+        assert len(over) > shell_parse.MAX_COMMAND_CHARS, (
+            "the fixture must actually cross the cap, or this test is about the "
+            "ordinary parse path wearing the length bound's name"
+        )
         r = _run(over, fake_home)
         assert r.returncode == 2, (
             f"an over-length rm naming a protected ancestor was ALLOWED.\n"
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+        assert "longer than" in r.stderr, (
+            "the refusal did not come from the LENGTH bound — this test can pass on "
+            f"the ordinary parse path, which is how it stayed green while vacuous.\n"
             f"out={r.stdout!r} err={r.stderr!r}"
         )
 

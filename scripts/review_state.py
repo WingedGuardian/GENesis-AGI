@@ -550,7 +550,7 @@ def clear_all_markers() -> tuple[int, list[str]]:
     marker whose commit already happened. This module's cost model settles it: an
     extra clear costs some session a redundant re-review, while a survivor
     authorizes an UNREVIEWED commit for the marker's TTL. MEASURED, this fires on
-    0 of 45,358 real commands, so the redundant-review cost is theoretical and the
+    0 of 45,956 real commands, so the redundant-review cost is theoretical and the
     bypass it closes is not.
 
     Never raises: invalidation runs post-commit, and a crash here would leave the

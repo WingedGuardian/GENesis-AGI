@@ -123,10 +123,20 @@ from shell_parse import analyze_checked, has_trailing_override  # noqa: E402
 #: That clock is the reason this exists rather than being a tidiness nicety.
 #: `bash_safety_hook.sh` is registered at 5s and delegates to THREE guards over the
 #: same command, this one included, so those duplicates were 3 of the 5 full parses on
-#: one budget. MEASURED end to end, worst payload inside both bounds: 6.12s BEFORE
-#: (over the registration, i.e. the hook is killed and the command is PERMITTED) and
-#: 2.92s after. Bounding the input was not enough on its own; the work per command had
-#: to stop being done three times.
+#: one budget. MEASURED end to end, worst payload inside both bounds: 6.12s BEFORE —
+#: over the registration, i.e. the hook is killed and the command is PERMITTED — and
+#: comfortably inside the budget after. The after-figure is the depth-5 row of the cost
+#: table in `shell_parse.MAX_COMMAND_CHARS` and is deliberately NOT repeated here: this
+#: line carried 2.92s while that table said 2.67s and a test docstring said 3.19s, and
+#: the figure is load-dependent, so a copy is a copy that drifts. A copy that points at
+#: its source is still a copy.
+#:
+#: Do not re-pair those two numbers into a speedup ratio, either. 6.12s is this guard's
+#: own before/after-memoisation measurement; the depth-5 row comes from a sweep taken
+#: to CHOOSE the bound. Nothing on record establishes they are the same run, and an
+#: earlier revision of this comment asserted they were. Bounding the input was not
+#: enough on its own; the work per command had to stop being done three times, and that
+#: claim rests on the 6.12s pair alone.
 _PARSE_MEMO: dict[str, tuple] = {}
 
 

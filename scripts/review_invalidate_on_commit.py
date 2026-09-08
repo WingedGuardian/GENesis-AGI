@@ -269,7 +269,7 @@ def main() -> None:
     # a bounded parse returns nothing by design. Recovering the selector from the raw
     # string would mean a second, hand-rolled shell parser — the exact trap these
     # guards exist to avoid — so the fail-safe is breadth instead. MEASURED at 0 of
-    # 45,358 real commands, against a bypass that authorizes an unreviewed commit for
+    # 45,956 real commands, against a bypass that authorizes an unreviewed commit for
     # the marker's TTL.
     if bounds_blind:
         cleared, failures = clear_all_markers()

@@ -6182,8 +6182,10 @@ def main() -> int:
             if blind.bounds_induced:
                 # The DEPTH bound refuses outright, interactive or not, and the
                 # asymmetry between the two bounds is measured rather than felt.
-                # Over 45,358 real commands the deepest nesting is 3 against a
-                # bound of 5, so nothing legitimate comes near this and a command
+                # Across this install's history the deepest real nesting is 4
+                # against a bound of 5 — see the distribution recorded with
+                # `shell_parse.MAX_SUBSTITUTION_DEPTH`, which is the one place it
+                # is derived. Nothing legitimate reaches the bound, and a command
                 # that does is not a shape ordinary work produces. It is also the
                 # axis the decoy attacks use: a visible benign `git push` with a
                 # force push buried past the bound, which reaches an approval
