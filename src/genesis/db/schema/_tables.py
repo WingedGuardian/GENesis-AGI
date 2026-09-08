@@ -1255,12 +1255,15 @@ TABLES = {
             -- All NULLable with NO default: expiry is strictly opt-in
             -- (durability='temporary' + an elapsed expires_at only), so an
             -- unclassified row NEVER expires. Contract in memory/judgment.py;
-            -- added to existing DBs by migration 0079.
+            -- added to existing DBs by migration 0081 (renumbered from 0079);
+            -- preference_domain by 20260906042425 (# GROUNDWORK(mw-4-preference-domain):
+            -- domain a preference is scoped to, open vocab, write-only).
             speech_act            TEXT,
             speech_act_confidence REAL,
             assertion_provenance  TEXT,
             durability            TEXT,
-            expires_at            TEXT
+            expires_at            TEXT,
+            preference_domain     TEXT
         )
     """,
     "graduation_events": """
