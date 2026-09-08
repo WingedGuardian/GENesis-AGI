@@ -135,12 +135,12 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
 
 from shell_parse import (  # noqa: E402
     analyze,
+    analyze_checked,
     commit_skips_hooks,
     gh_pr_subcommand,
     git_subcommand,
     has_trailing_override,
     split_segments,
-    untokenizable,
 )
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
@@ -2993,6 +2993,295 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
 
 
+def _pr_contribution(
+    base_sha: str, tip_sha: str, repo: str | None
+) -> tuple[str, str, list] | None:
+    """``(merge_base_sha, status, files)`` for what ``tip`` contributes over ``base``.
+
+    ``compare/base...tip`` is three-dot, so GitHub computes it from the MERGE
+    BASE of the two — which is what makes this the PR's own work rather than a
+    commit range. **That merge base is returned, not discarded, because it is
+    load-bearing**: it is the LEFT-hand side of the diff, it MOVES when the
+    branch catches up, and a file's blob sha is only the RIGHT-hand side. Two
+    diffs with the same right side and different left sides are different
+    diffs. The caller needs the left side to know whether it may compare them
+    at all.
+
+    Returns None on any error — including a returncode, unparseable JSON, or an
+    exit-0 with an EMPTY payload. An empty stdout is not an empty diff: reading
+    it as ``[]`` would manufacture positive evidence of "unchanged" out of a
+    degraded response.
+
+    Tests inject via ``_TEST_GH_CONTRIBUTION`` — a JSON object keyed
+    ``"<base12>..<tip12>"`` whose value is ``{"mb": <sha>, "files": [...]}``.
+    """
+    raw = os.environ.get("_TEST_GH_CONTRIBUTION")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(f"{base_sha[:12]}..{tip_sha[:12]}")
+        except Exception:
+            return None
+        if not isinstance(got, dict) or not isinstance(got.get("files"), list):
+            return None
+        mb, st = got.get("mb"), got.get("status")
+        if not (isinstance(mb, str) and mb) or not isinstance(st, str) or not st:
+            return None
+        return (mb, st, got["files"])
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/compare/{base_sha}...{tip_sha}",
+                "--jq",
+                '{mb: .merge_base_commit.sha, status: .status, '
+                'files: [.files[]? | {filename, sha, additions, deletions, status, '
+                'previous_filename, has_patch: has("patch")}]}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        # No `or "[]"` fallback: an exit-0 with an EMPTY payload must not become an
+        # empty diff. json.loads("") raises, which the except below turns into
+        # None — a degraded response reads as unreadable, never as "unchanged".
+        parsed = json.loads(result.stdout)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("files"), list):
+        return None
+    mb, st = parsed.get("mb"), parsed.get("status")
+    if not (isinstance(mb, str) and mb) or not isinstance(st, str) or not st:
+        return None
+    return (mb, st, parsed["files"])
+
+
+def _classify_base_advance_delta(
+    reviewed_sha: str, head_sha: str, base_sha: str, repo: str | None
+) -> str | None:
+    """Re-judge a "substantial" delta as what the BRANCH actually changed.
+
+    A branch that merges its base to catch up acquires every commit the base
+    contributed. The raw ``reviewed...head`` compare cannot tell that from a
+    force-push and reports all of it as unreviewed, so the gate demands a fresh
+    review of code that was already reviewed on its own PR — MEASURED on this
+    repo: PR #1847 showed 28 files / 7 commits after merging main, of which the
+    branch's own change was 2 files. #1690 made catching up MANDATORY for every
+    branch carrying a changelog entry, so this stopped being incidental.
+
+    The question this asks instead: did the PR's OWN contribution change? Both
+    sides are the PR's diff over its base — at review time and now — compared by
+    file identity. It returns ``"inline"`` for exactly ONE finding: the two
+    contributions are IDENTICAL. It never sizes a residual change, so its only
+    two answers are "provably a pure base-advance" and None.
+
+    That is a deliberate narrowing over a version that DID size the residual
+    (Codex P1, #1849): the records available here are base-relative, so a
+    contribution that SHRANK between the review and head presents small counts
+    while the reviewed...head delta is large, and the sizing read as trivial. See
+    the ``if changed:`` block below.
+
+    NARROWING, so uncertainty fails CLOSED at every point it can be SEEN: a
+    failing fetch returns None (the caller blocks), an unreadable identity
+    withdraws the claim, an unreadable base move withdraws it, and a file the base
+    touched that the branch ALSO touches is a collision rather than an advance.
+
+    The one uncertainty it CANNOT see is file MODE, which the compare record does
+    not carry at all. That is why the enforcement surface is declined outright
+    rather than trusted to the identity — see the block above the hook-surface
+    loop. On a NON-hook path a mode-only change still rides through as unchanged,
+    and this docstring says so rather than claiming a closure the code does not
+    have.
+    """
+    got_before = _pr_contribution(base_sha, reviewed_sha, repo)
+    got_after = _pr_contribution(base_sha, head_sha, repo)
+    if got_before is None or got_after is None:
+        return None
+    before_mb, _before_status, before = got_before
+    after_mb, _after_status, after = got_after
+    if not before and not after:
+        # Two empty lists are not evidence of "unchanged" — they are evidence of
+        # nothing. The sibling path already fails closed on an empty `files`
+        # (Codex P2, #1373: "an empty files would read as inline and permit a
+        # STALE review to bind the merge on a delta that was never verified");
+        # a narrowing built on the same shape must not read it the other way.
+        return None
+    if len(before) >= 300 or len(after) >= 300:
+        # GitHub caps compare `files` at 300. The cap must be checked on the
+        # FETCHED lists, not on the changed subset derived from them — a subset
+        # is always under the cap, so checking it there tests nothing. MEASURED
+        # on this repo: a wide compare reports 300 files against 1293 real ones,
+        # so the invisible remainder could hold the very change being claimed
+        # unchanged.
+        return None
+    def _identities(records: list) -> dict[str, tuple[str, object, str | None]] | None:
+        """filename -> (blob sha, status, rename source), or None if unreadable.
+
+        Blob sha alone is CONTENT identity, not file identity: it encodes bytes
+        and not mode, so a script that becomes executable keeps its blob and
+        would drop out of the changed set. `status` is folded in because it is
+        what the compare record actually offers. This does NOT fully close the
+        mode question — GitHub's compare record carries no mode field at all —
+        and saying so here is the point: the earlier docstring claimed "exact
+        content identity" and was read as exact FILE identity, which it is not.
+
+        ``previous_filename`` is folded in for the same reason, and it is the
+        half an earlier version omitted (Codex P1, #1849). A rename is a diff
+        with two endpoints, and the compare record reports only the DESTINATION
+        as ``filename``; the blob is the destination's bytes. So a contribution
+        that renames ``A -> B`` and one that renames ``D -> B`` present the same
+        filename, the same blob and the same ``renamed`` status while deleting
+        DIFFERENT files. MEASURED on this code before the fix: those two compared
+        equal, the file dropped out of the changed set, and the branch's changed
+        rename read as a base-advance.
+
+        A record MISSING its ``sha`` must not compare EQUAL to another missing
+        one. MEASURED on this code before the check: two absent shas matched, the
+        file dropped out of the changed set, and a genuinely modified file read as
+        a base-advance — a stale review allowed on changed code, which is the one
+        outcome this refinement must never produce. Triviality is an exception
+        granted on POSITIVE evidence; an identity that cannot be read is not it,
+        so the whole claim is withdrawn rather than made on partial data.
+        """
+        out: dict[str, tuple[str, object, str | None]] = {}
+        for f in records:
+            if not isinstance(f, dict):
+                return None
+            name, blob = f.get("filename"), f.get("sha")
+            if not isinstance(name, str) or not name:
+                return None
+            if not isinstance(blob, str) or not blob:
+                return None
+            prev = f.get("previous_filename")
+            if prev is not None and (not isinstance(prev, str) or not prev):
+                return None  # present but unreadable — cannot compare honestly
+            if name in out:
+                return None  # duplicate filename — cannot compare honestly
+            out[name] = (blob, f.get("status"), prev)
+        return out
+
+    a, b = _identities(before), _identities(after)
+    if a is None or b is None:
+        return None
+    changed = {name for name in set(a) | set(b) if a.get(name) != b.get(name)}
+    # Every path the PR's contribution touches, on EITHER side — destinations AND
+    # rename SOURCES. The source is a path this branch changes (it deletes it), so
+    # a base that touches it is a base change to a file the branch touches. Folding
+    # only destinations here is the same omission as in the identity above, one
+    # scope out: the overlap test below would compare the base's moved set against
+    # destinations alone and miss the collision entirely (Codex P1, #1849).
+    touched = set(a) | set(b) | {p for (_blob, _st, p) in (*a.values(), *b.values()) if p}
+    moved_names: set[str] = set()  # what the BASE changed, when it moved
+    if before_mb != after_mb:
+        # THE MERGE BASE MOVED, which is the normal case here — catching up is
+        # what advances it. A file's blob sha is only the RIGHT-hand side of the
+        # diff; the merge base is the LEFT. So identical blobs across a moved
+        # base do NOT mean an identical diff, and treating them as such is a
+        # fail-open with a specific, routine trigger: resolve a catch-up conflict
+        # with `--ours` and the merge silently REVERTS what the base contributed
+        # while every tip blob stays put. Codex reviewed `F1 -> X`; what ships is
+        # `F2 -> X`, which it never saw.
+        #
+        # So ask what the base itself changed across the move, and refuse the
+        # claim if it overlaps the files this PR touches. A genuine base-advance
+        # — the base moving in files the branch does not touch — has an empty
+        # intersection and is still allowed.
+        moved = _pr_contribution(before_mb, after_mb, repo)
+        if moved is None:
+            return None
+        _mb, moved_status, moved_files = moved
+        if moved_status != "ahead":
+            # The base must have moved FORWARD for "the base advanced" to mean
+            # anything. MEASURED: a three-dot compare of a base that moved
+            # BACKWARDS reports status "behind" with ZERO files, so the overlap
+            # test below would find nothing and wave the claim through. Only a
+            # genuine advance qualifies; behind / diverged / identical fail closed.
+            return None
+        if not moved_files:
+            # The base MOVED, so it changed something — a compare that reports
+            # ZERO files is a degraded read, not an empty advance. The jq at
+            # `_pr_contribution` is `.files[]?`, and `?` swallows a MISSING or
+            # null `files` key, so an upstream response without it arrives here
+            # as `[]`, indistinguishable from a real empty diff.
+            #
+            # It is also self-contradictory: this refinement runs only when the
+            # RAW range classified `substantial`, and an empty compare `files`
+            # classifies `inline` (review_scope.classify_compare_substantiality:
+            # "An empty / None list means no reviewable delta"). So a base that
+            # advanced while changing nothing could not have produced the
+            # substantial raw verdict that got us here. No evidence, no claim —
+            # the same rule the two contribution lists already get above.
+            return None
+        if len(moved_files) >= 300:
+            return None  # truncated: cannot rule out an overlap
+        # Rename SOURCES count on BOTH sides of this intersection — here for the
+        # base's moved set, and in `touched` above for the branch's, matching
+        # `classify_compare_substantiality` and `_pr_changed_files`. A file the
+        # base renamed out from under the branch is a change to that path, and so
+        # is a file the branch renamed away.
+        for f in moved_files:
+            name = f.get("filename") if isinstance(f, dict) else None
+            if not isinstance(name, str) or not name:
+                return None  # malformed record — cannot establish the overlap
+            moved_names.add(name)
+            prev = f.get("previous_filename")
+            if prev is not None:
+                if not isinstance(prev, str) or not prev:
+                    return None
+                moved_names.add(prev)
+        if moved_names & touched:
+            return None
+    # THE HOOK SURFACE IS NEVER RESCUED, whatever the blobs say.
+    #
+    # This refinement RECONSTRUCTS "what changed" from two base-relative
+    # snapshots plus a synthetic identity, where the raw path diffs the two
+    # commits directly. That reconstruction loses whatever the identity does not
+    # carry — and GitHub's compare record carries no file MODE at all. So a
+    # content-preserving `chmod +x` on a guard keeps its blob AND its status,
+    # never enters `changed`, and the teeth that exist to catch "any touch to the
+    # enforcement surface, however small" never run. The raw path would have
+    # caught it, so this is a REGRESSION the refinement introduces rather than a
+    # limitation it inherits.
+    #
+    # Rather than chase an identity rich enough to be safe, decline the rescue
+    # outright when the enforcement surface is anywhere in view. A hook-surface
+    # PR forgoing a stale-review allowance is exactly the trade the surrounding
+    # gate already makes everywhere else.
+    for name in touched | moved_names:
+        if _is_hook_surface_path(name):
+            return None
+    if changed:
+        # ANY change to the branch's own contribution withdraws the claim. The
+        # ONLY thing this refinement establishes is "byte-identical contribution";
+        # it does not, and must not, try to SIZE a residual change.
+        #
+        # An earlier version sized it, by handing the changed subset's `after`
+        # records to the shared substantiality classifier — and that was a
+        # fail-open with a mundane trigger (Codex P1, #1849). Those records are
+        # BASE-relative, not reviewed-relative: a file the review saw as a 100-line
+        # addition that head trims back to 3 lines presents an `after` record of 3
+        # lines, classifies `inline`, and lets a ~97-line unreviewed rewrite bind a
+        # stale review. MEASURED on this code before the fix: before=100 additions,
+        # after=3 additions returned "inline" (the growing direction, 3 -> 100,
+        # correctly returned "substantial" — so the leak was one-directional and
+        # invisible from the side anyone would test).
+        #
+        # Reconstructing the true reviewed...head size from two base-relative
+        # snapshots is exactly the argv->effect reconstruction the guard doctrine
+        # says not to build: any bound would rest on the diff algorithm's
+        # minimality, which is not a guarantee GitHub makes. So the residual is not
+        # sized at all — it blocks, and the fresh review the gate would have
+        # demanded anyway is the answer. Nothing is lost against the status quo:
+        # without this refinement the raw range read `substantial` and blocked too.
+        return None
+    # The branch contributes byte-identical content over its base, and the base
+    # did not touch any path the branch touches. Everything new since the review
+    # came from the base, and was reviewed there.
+    return "inline"
+
+
 def _check_codex_reviewed_head(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
@@ -3092,7 +3381,34 @@ def _check_codex_reviewed_head(
         )
     if reviewed != head:
         level = _classify_post_review_delta(reviewed, head, repo)
+        base_advance = False
+        if level == "substantial":
+            # The raw range says substantial. Ask the narrower question before
+            # blocking: did the BRANCH change, or did its base just advance
+            # underneath it? Only a definite "substantial" is re-judged — a None
+            # (API/parse failure) is the fail-closed state and must not be
+            # rescued by a second read that could itself be degraded.
+            base_sha = _pr_base_sha(pr_num, repo=repo)
+            # COST guard, not a correctness one — say so, because a mutation that
+            # deletes it is behaviourally NULL and will survive any sweep: without
+            # a base the refinement already declines (its fetches cannot resolve a
+            # revision, so it returns None and the block stands). What this saves
+            # is two doomed `gh` round-trips against the 45s merge budget.
+            if base_sha:
+                refined = _classify_base_advance_delta(reviewed, head, base_sha, repo)
+                if refined == "inline":
+                    level, base_advance = "inline", True
         if level == "inline":
+            if base_advance:
+                print(
+                    f"NOTE: Codex's review on PR #{pr_num} is on {reviewed[:12]} (head "
+                    f"{head[:12]}), but the branch's own contribution over its base is "
+                    f"UNCHANGED since — the delta is a base-advance (commits the base "
+                    f"contributed, each reviewed on its own PR) — allowing. Inspect: "
+                    f"git log {reviewed[:12]}..{head[:12]} --oneline",
+                    file=sys.stderr,
+                )
+                return False, "", head
             # The unreviewed delta is provably review-trivial — allow, but still
             # bind the merge to THIS head (TOCTOU): the triviality claim is about
             # exactly this reviewed...head range, not any later push.
@@ -4807,6 +5123,33 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
 #: together and fails the moment either moves.
 _E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
 
+# The remedy, for the degraded path where scripts/e2e_declaration.py could not be
+# loaded and its GUIDANCE is therefore unreachable. Deliberately short: the full
+# version lives in the module, and a second long copy here would be a replica to
+# drift. Both forms, because an author who can only copy the `none` line gets the
+# one answer that creates no obligation.
+_E2E_GUIDANCE_FALLBACK = (
+    "Add an E2E: line to the PR body — one of:\n"
+    "  E2E: <one-line plan for the post-merge verification>\n"
+    "  E2E: none — <reason there is no runtime surface to verify>"
+)
+
+
+def _e2e_undeclared(pr_num: str, detail: str, mod) -> tuple[bool, str]:
+    """Build an `undeclared` verdict that ALWAYS carries the remedy.
+
+    Structural, not a convention: the callers open with "Declaring one takes 10
+    seconds:" and then print this whole string, so a return that omits the forms
+    answers a colon-promise with a restatement of the problem. Three of the four
+    undeclared returns used to do exactly that while a docstring two functions up
+    claimed the tail was always GUIDANCE — the claim was true only of the path
+    someone happened to check (fresh-context audit, 2026-09-06). Routing every
+    return through here makes the property hold by construction; the docstring
+    now describes the code instead of hoping for it.
+    """
+    tail = mod.GUIDANCE if mod is not None else _E2E_GUIDANCE_FALLBACK
+    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{tail}"
+
 #: Last-resort matcher for the E2E declaration, used ONLY when
 #: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
 #: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
@@ -4881,33 +5224,46 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
 
 
 def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
-    """Block a merge whose PR body never DECIDED about a post-merge E2E (§8.12).
+    """Report whether a PR body DECIDED about its post-merge E2E (§8.12).
 
-    Returns (should_block, message). The obligation is one line in the PR body —
-    either a plan or an explicit reasoned ``none`` (see scripts/e2e_declaration.py
-    for the full convention and why its parsing is what it is).
+    Returns ``(undeclared, message)``. ``undeclared`` is a FINDING, not a
+    verdict: no caller blocks on it. The merge arm prints an advisory NOTE and
+    proceeds; ``--check-pr`` prints an ``advisory`` row that never counts toward
+    `failures`. Keeping the severity in the CALLERS is what let this become
+    advisory without touching a line of the classification below.
 
     GUARD AXIOMS, stated because every gate change owes them:
-      * VERDICT: block, at MERGE time only. The push arm never calls this — a
-        body is written and revised while a PR is open, so demanding it at push
-        would gate the wrong moment.
-      * AUDIENCE: the agent. The message names both valid forms verbatim.
-      * BACKGROUND: none. Background sessions cannot merge PRs by design, so this
-        cannot impede one.
+      * VERDICT: **advisory** (owner decision 2026-09-06, reversing the
+        2026-09-05 hard-fail). A block only guaranteed that a SENTENCE EXISTS,
+        never that it was true, so it added no determinism to the judgment —
+        while taxing every merge on an n=2 justification. The obligation is
+        MEANT to be carried by a per-merge row from the repo-pulse worker; that
+        row is UNBUILT (issue #1718, half B), so in the interim this advisory is
+        the only record. See the merge-arm comment.
+      * AUDIENCE: the agent — and both callers print the WHOLE message, whose
+        tail is the remedy (both valid forms plus, when the parser loaded,
+        copyable examples). Printing only its first line silently drops that.
+        Every ``undeclared`` return is built by ``_e2e_undeclared``, which
+        appends the remedy, so this is a property of the code rather than a
+        claim about it — the earlier wording asserted the tail was always
+        GUIDANCE while three of the four returns omitted it.
+      * BACKGROUND: none — background sessions cannot merge PRs by design.
 
-    Fail directions, each chosen rather than inherited:
-      * body UNREADABLE → BLOCK. This gate guards EVERY merge, so an unreadable
-        body is an unanswered question, not a pass. (The pin gate fails open on
-        the same read because it guards only the rare pin-bump path — the
-        divergence is deliberate, not an oversight.)
-      * createdAt UNREADABLE → BLOCK, naming the cause. Treating it as "old"
-        would turn the transition window into a permanent hole.
+    "Fail direction" now means which way an UNREADABLE input is REPORTED, since
+    nothing blocks:
+      * body UNREADABLE → reported undeclared. An unread body is an unanswered
+        question, not a pass — the row will still be opened post-merge.
+      * createdAt UNREADABLE, parser LOADED → reported undeclared, naming the
+        cause, rather than assuming the pre-convention exemption.
+      * createdAt UNREADABLE *and* parser MISSING → neither the exemption nor the
+        stripping can be established, so this returns whatever the bare presence
+        scan below finds: a body carrying an ``E2E:`` line is reported declared
+        (degraded), one without it undeclared. Stating that exception here because
+        the line above read as unconditional and is not (Kimi P3, 2026-09-06).
       * parser module MISSING → the body is still scanned for a bare ``E2E:``
-        line and a NOTE says the comment/fence stripping was unavailable. Losing
-        the invisibility defence must not lose the whole gate.
+        line and a NOTE says the comment/fence stripping was unavailable.
 
-    NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
-    escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
+    No override sigil exists because there is nothing to override.
     """
     # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
     # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
@@ -4927,10 +5283,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
                 file=sys.stderr,
             )
         else:
-            return True, (
-                f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
-                f"pre-convention exemption cannot be established. Re-run; if it "
-                f"persists, the gh read is failing."
+            return _e2e_undeclared(
+                pr_num,
+                "could not read the PR's createdAt, so the pre-convention "
+                "exemption cannot be established. Re-run; if it persists, the "
+                "gh read is failing",
+                mod,
             )
     else:
         if mod is not None:
@@ -4942,10 +5300,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
 
     body = _pr_body_text(pr_num, repo)
     if body is None:
-        return True, (
-            f"E2E obligation: PR #{pr_num}'s body is unreadable, so the declaration "
-            f"cannot be confirmed. This gate guards every merge — an unread body is "
-            f"an unanswered question, not a pass."
+        return _e2e_undeclared(
+            pr_num,
+            "the PR body is unreadable, so the declaration cannot be confirmed. "
+            "Reported undeclared rather than assumed declared — an unread body is "
+            "an unanswered question, not a pass",
+            mod,
         )
 
     if mod is None:
@@ -4969,9 +5329,10 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
                 file=sys.stderr,
             )
             return False, "ok (degraded: parser unavailable)"
-        return True, (
-            f"E2E obligation: no E2E: line found in PR #{pr_num}'s body (parser "
-            f"unavailable, presence-only scan)."
+        return _e2e_undeclared(
+            pr_num,
+            "no E2E: line found in the body (parser unavailable, presence-only scan)",
+            mod,
         )
 
     result = mod.parse_e2e(body)
@@ -4986,7 +5347,7 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
         return False, f"ok ({label})"
 
     detail = result.get("detail") or "no E2E: line in the PR body"
-    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{mod.GUIDANCE}"
+    return _e2e_undeclared(pr_num, detail, mod)
 
 
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -6082,7 +6443,10 @@ def main() -> int:
         # like sudo/env and /path/to/git stripped, nested `bash -c` recursed,
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
-        segs = analyze(cmd)
+        # `blind` is this same parse reporting whether it could read the WHOLE
+        # command. An empty segment list means "no gated op here" only when it does
+        # not also mean "I stopped reading", and one call cannot disagree with itself.
+        segs, blind = analyze_checked(cmd)
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
@@ -6128,24 +6492,43 @@ def main() -> int:
         blind_spot_reason: str | None = None
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-            and untokenizable(cmd)
+            and blind is not None
             and _mentions_gated_op(cmd)
         ):
+            if blind.bounds_induced:
+                # The DEPTH bound refuses outright, interactive or not, and the
+                # asymmetry between the two bounds is measured rather than felt.
+                # Across this install's history the deepest real nesting is 4
+                # against a bound of 5 — see the distribution recorded with
+                # `shell_parse.MAX_SUBSTITUTION_DEPTH`, which is the one place it
+                # is derived. Nothing legitimate reaches the bound, and a command
+                # that does is not a shape ordinary work produces. It is also the
+                # axis the decoy attacks use: a visible benign `git push` with a
+                # force push buried past the bound, which reaches an approval
+                # prompt describing the decoy. A human approving what looks like an
+                # ordinary push is not a gate on the operation actually hidden
+                # there. Length still asks — a long here-doc IS ordinary work.
+                print(
+                    f"BLOCKED: this command {blind.cause} and names a gated "
+                    "operation, so the guard cannot see every publish it would "
+                    "run. A command can carry a second, hidden one past the point "
+                    "the parser stops — approving the visible one would approve "
+                    f"that too.\nTo proceed: {blind.hint}.",
+                    file=sys.stderr,
+                )
+                return 2
             if _is_dispatched():
                 # No human is present to answer a prompt, and an unverifiable
                 # gated command must not proceed unattended. Mirrors the
                 # dispatched deny legs on the push / pr-create asks below.
                 print(
-                    "BLOCKED: this command cannot be parsed safely (e.g. "
-                    "ANSI-C $'...' quoting) and names a gated operation. "
-                    "Autonomous sessions cannot proceed on an unverifiable "
-                    "command.\n"
-                    "To proceed: if you are WRITING TEXT (a commit message, a "
-                    "plan, review notes) whose content merely mentions push or "
-                    "merge, use the Write tool instead of a here-doc — the "
-                    "apostrophe in ordinary prose is what makes this "
-                    "unparseable, and no amount of re-quoting a here-doc fixes "
-                    "it. If you are RUNNING a git command, rewrite it in a "
+                    f"BLOCKED: this command {blind.cause} and names a gated "
+                    "operation. Autonomous sessions cannot proceed on an "
+                    "unverifiable command.\n"
+                    f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                    "message, a plan, review notes) whose content merely mentions "
+                    "push or merge, use the Write tool instead of a here-doc. If "
+                    "you are RUNNING a git command, rewrite it in a "
                     "directly-parseable form (plain quotes, or -F <file>).",
                     file=sys.stderr,
                 )
@@ -6158,13 +6541,12 @@ def main() -> int:
                 # directly-parseable form") does not apply to it.
                 return 2
             blind_spot_reason = (
-                "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                "quoting) and mentions a gated operation (push / merge / "
-                "gh pr create / --force / --no-verify / --admin), so the guard "
-                "cannot verify "
-                "what it would actually run. Approve only if you are sure. To "
-                "avoid the prompt, rewrite it in a directly-parseable form "
-                "(plain quotes, or -F <file>)."
+                f"This command {blind.cause} and mentions a gated operation "
+                "(push / merge / gh pr create / --force / --no-verify / --admin), "
+                "so the guard cannot verify what it would actually run. Approve "
+                f"only if you are sure. To avoid the prompt: {blind.hint}, or "
+                "rewrite it in a directly-parseable form (plain quotes, or "
+                "-F <file>)."
             )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
@@ -6685,20 +7067,60 @@ def main() -> int:
                     # above records as measured (architect SHOULD-FIX, 2026-09-06).
                     print(receipts_msg, file=sys.stderr)
 
-                # E2E obligation (§8.12). Sits beside the pin gate because it is
-                # the same KIND of check — a merge-time read of the PR body, which
-                # stays mutable after any CI run — and because both are cheap
-                # reads that should fail before the expensive finding scans.
-                # Like the pin gate it carries NO override sigil: `E2E: none —
-                # <reason>` is the escape hatch, and it costs one honest sentence.
-                should_block, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
-                if should_block:
+                # E2E obligation (§8.12) — ADVISORY, never blocking (owner
+                # decision 2026-09-06, reversing the 2026-09-05 hard-fail call).
+                #
+                # The gate never made the JUDGMENT deterministic: whether a change
+                # needs an E2E is an LLM call either way, and a block only
+                # guarantees that a SENTENCE EXISTS, not that it is true —
+                # `E2E: none — docs only` on a code PR passes and the gate cannot
+                # tell. Worse, a mandatory field produces compliance text: a line
+                # typed to get past a gate is the cheapest thing that passes, which
+                # is lower-quality signal than a line written because the author
+                # had something to say. Against that, the block's measured
+                # justification was 1-of-2 merges (n=2) — far under this repo's own
+                # bar for escalating past advisory — while binding EVERY merge
+                # forever, including external contributors who have never heard of
+                # the convention.
+                #
+                # What WILL close the obligation is a durable row: a follow-on PR
+                # (issue #1718, half B) teaches the repo-pulse worker to open one
+                # per merged PR, auto-closed with the reason recorded when the diff
+                # is documentation-only. **UNBUILT as of this commit** — MEASURED as
+                # zero occurrences of `parse_e2e`, `e2e_declaration` or the row's
+                # dedup key anywhere under src/, and repo_pulse_gh.PR_FIELDS still
+                # lacks the `createdAt` the lane needs. (Stated that way on purpose:
+                # the earlier phrasing counted "repo_pulse modules", a denominator
+                # three reviewers agreed on and none of us had measured — it is 4 or
+                # 6 depending on whether you count the crud and scripts modules. A
+                # grep for the thing itself does not depend on how you count.)
+                # Until it lands, this NOTE is the
+                # only thing that remembers, which is a deliberate and tracked gap,
+                # not a covered one. Say so rather than implying coverage: the
+                # measured miss rate the block was justified by is unmitigated in
+                # the interim, and a message claiming otherwise is worse than
+                # silence.
+                #
+                # Branch on the RETURNED FLAG, never on the message text. Both arms
+                # must apply the same predicate to the same value or "report and
+                # enforcement share a function so they cannot disagree" stops being
+                # true — sharing the call while re-deriving severity from a string
+                # prefix is the divergence wearing the invariant's clothes.
+                undeclared, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
+                if undeclared:
                     print(
-                        f"BLOCKED: PR #{pr_num} — no post-merge E2E decision in the PR body.",
+                        f"NOTE: PR #{pr_num} — no post-merge E2E decision in the PR "
+                        f"body. Not blocking. The obligation row that will carry this "
+                        f"automatically is NOT built yet (issue #1718), so right now "
+                        f"this NOTE is the only record. Declaring one takes 10 seconds:",
                         file=sys.stderr,
                     )
+                    # The WHOLE message: its tail is GUIDANCE, which carries both
+                    # valid forms and two copyable examples. Printing only line 0
+                    # ended a colon-promise with a restatement of the problem and
+                    # dropped the remedy — an advisory minus its remedy is noise,
+                    # which is the strongest argument for ignoring it.
                     print(e2e_msg, file=sys.stderr)
-                    return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6984,14 +7406,20 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
     failures += 1 if blocked else 0
-    # E2E obligation (§8.12), same tier and same reason as pin-receipts: a
-    # merge-time read of a mutable body, so CI could never be its authority.
-    blocked, msg = _check_e2e_plan(pr_num, repo=repo)
-    print(f"e2e-plan       : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
-    if blocked:
+    # E2E obligation (§8.12) — ADVISORY. Reported so the declaration is visible
+    # at merge time, but it NEVER contributes to `failures`: the enforcement arm
+    # does not block on it either, and a report row that counted a gate the gate
+    # does not enforce would be the report and the enforcement disagreeing —
+    # the one property this whole report rests on not doing.
+    undeclared, msg = _check_e2e_plan(pr_num, repo=repo)
+    if undeclared:
+        print(f"e2e-plan       : advisory — {msg.splitlines()[0]}")
+        # Indented tail, the same idiom pin-receipts and scheduled-review use —
+        # the remedy is the point of an advisory.
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
-    failures += 1 if blocked else 0
+    else:
+        print(f"e2e-plan       : {msg.splitlines()[0]}")
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]

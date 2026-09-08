@@ -62,19 +62,27 @@ def _default_added_by() -> str:
 
 
 def _unresolved_short_id_error(sid: str) -> dict | None:
-    """Refuse WRITES under a truncated id that did not resolve.
+    """Refuse WRITES under an id that is not a whole session id.
 
     A stub created under a short prefix would be orphaned the moment the
     PreCompact hook writes the real full session id — mission/ledger rows
     would never re-inject (Codex P2, PR #1053). Reads fail soft (not-found);
     writes must fail loud here.
+
+    The test is the id's SHAPE, not its length. `len(sid) < 32` let a mistyped
+    UUID or a 32-character fragment through, and a charter stub then exists
+    under a key no session will ever carry — the same defect Codex found on the
+    follow-up provenance path (P2, PR #1622), sharing this one generator, so it
+    is fixed here in the same move rather than left as the next round's finding.
     """
-    if len(sid) < 32:
+    from genesis.db.crud.session_charters import is_full_session_id
+
+    if not is_full_session_id(sid):
         return {
-            "error": f"Session id prefix '{sid}' did not resolve to a known "
-            "session. Pass the full session id (the [Clock | Session: x] tag "
-            "shows the first 8 chars; the full id is this conversation's "
-            "session UUID)."
+            "error": f"Session id '{sid}' did not resolve to a complete session "
+            "id. Pass the full session id (the [Clock | Session: x] tag shows "
+            "the first 8 chars; the full id is this conversation's session "
+            "UUID)."
         }
     return None
 

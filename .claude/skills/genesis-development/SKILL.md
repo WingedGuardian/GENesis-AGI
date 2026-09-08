@@ -453,6 +453,30 @@ to be reverted as cross-branch contamination. Guard false-positives make this
 worse: `shell_parse` mis-parses backslash line-continuations and quoted heredoc
 bodies, so legitimate commands get blocked too.
 
+### Editing source in bypass/auto mode: reads via Bash, WRITES via Edit/Write
+
+In bypass or auto permission mode the CC binary injects a meta message telling
+the session to prefer Bash (`sed`, heredocs, scripts) over Read/Edit/Write —
+and NOT only there: a third selector branch is a cohort assignment, so a
+default-mode session can receive it too. It is an EFFICIENCY heuristic making no
+correctness claim, which follows from how the message is phrased (a preference,
+with its own escape hatch back to the dedicated tools) rather than from where it
+is gated (provenance + full measurement:
+`docs/reference/cc-compatibility.md` "Bypass/auto mode tells the agent to edit
+via Bash"). For reads and search it is simply right — use `cat`/`sed -n`/`grep`/
+`find` freely. For WRITES TO SOURCE it is not: a bare `sed -i` returns exit 0 on
+an absent anchor (silent no-op), rewrites ALL matches of a non-unique one, and
+silently hits the wrong line on a regex-metacharacter anchor where a literal was
+meant — where Edit fails LOUDLY on each. A Bash write also fires none of the five
+`Edit|Write` PostToolUse hooks (the repo's own post-edit verification plane) and
+a heredoc sits in the blocked-compound blast radius above. MEASURED: 54.9% of
+real edit anchors in this repo carry a character `sed` treats as special in BRE,
+its default dialect (2,750 / 5,013; an ERE set scores 74.0% over the same
+corpus, so quote the dialect or the number misleads) — the unsafe case is the
+common one. Use Edit/Write for source; a script that does a literal replace AND
+asserts its occurrence count is acceptable (it re-implements Edit's checks). This
+is universal — the machinery is tracked, so every clone inherits it.
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a
@@ -947,10 +971,19 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   fail-open by design and says so in its own docstring, so argue with the design
   rather than patching it; `protected_paths_guard`'s calls itself "conservative:
   over-blocks, never under", which is true relative to the old guard it
-  reinstates (`protected_paths_guard.py:33-35`) and false of the parsed resolver
-  it stands in for — one sentence, two readings, and that ambiguity is the
-  defect. Verify a docstring's stated direction IN CONTEXT; never quote it as a
-  fact. The shapes are deliberately not enumerated here, per the rule above.
+  reinstates (`_legacy_substring_block`'s docstring) and false of the parsed
+  resolver it stands in for — one sentence, two readings, and that ambiguity is
+  the defect. Verify a docstring's stated direction IN CONTEXT; never quote it as
+  a fact. The shapes are deliberately not enumerated here, per the rule above.
+
+  That guard's MODULE docstring has since been split so it no longer states one
+  fail direction for both blind spots: a bounds-induced blind spot REFUSES and an
+  untokenizable one falls back. The sentence quoted above still sits on the
+  fallback helper, where both readings remain available, so the lesson is
+  unchanged — and note the citation here is now to a SYMBOL rather than to a line
+  range, because the range this paragraph originally named stopped containing the
+  quote the moment that docstring was edited. A line number is a claim with a
+  shelf life.
 
   Within the git-operation blind-spot net, the two rules are scoped by who is
   present: `ask` is the interactive form of the refusal, and where a session is
@@ -1638,6 +1671,34 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the user with a minimize-change recommendation. The ack asserts that
   step-back happened — appending it without doing the work is the same
   violation as falsifying `--clean`.
+- **Some PRs are not a review problem — hand them to an architecture session.**
+  When you ARE driving a PR toward green (per "When to DRIVE a Merge" below),
+  asking a few clarifying questions is not a substitute for the design
+  conversation. STOP and hand the PR to a foreground architecture conversation —
+  a session with the USER present, never a `genesis-architect` subagent, which is
+  review-session judgment by another name — when any of these holds: the conflict
+  is STRUCTURAL, main having superseded the mechanism the PR implements, so no
+  conflict resolution is correct on its own terms; it changes or contradicts the
+  spec at a significant level; it raises real questions about how Genesis
+  operates, its architecture, or its infrastructure; its consequences are
+  far-reaching or irreversible; or it is delicate enough that getting it wrong
+  damages a running Genesis. Treat arrival at any tier of the cap (the round-2
+  mode-switch, the round-3 hard stop, and certainly the round-7 terminal) as its
+  own trigger to ask whether this is that kind of PR rather than merely another
+  round — taking this exit does NOT discharge that tier's own stop, which is
+  still owed; the handoff is the answer you bring to it, not a way around it.
+  If you ARE the session with the user present, hold the conversation now. With
+  no user to ask, the action is: comment on the PR naming WHICH trigger fired and
+  the evidence for it, apply the `needs-architecture-session` label (create it if
+  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  `ready` follow-up naming the PR and the decision it awaits — the label is a
+  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
+  is on the order of 1 in 10 or fewer, so a session reaching for it often is
+  mis-triaging. Worked example, PR #1605: main's shared settings writer had
+  replaced the two inline heredocs the PR reimplements, and the literal base-wins
+  resolution measured 61 passed → 36 failed / 25 passed, because it deleted the
+  PR's own fix on two of its three declared paths.
 - **External review feedback is a set of claims to VERIFY, not orders.** For
   every bot/external finding: check it against the actual code (its stated
   mechanism may be wrong even when the underlying concern is real — quote the
@@ -2054,9 +2115,10 @@ merge, the Pre-Merge Gate below governs unchanged.
 
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
-BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
-(mergeable → CI → base-invariant → Codex-freshness → scheduled-Claude-review →
-review-body → inline findings), so the report and the gate can never disagree —
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses, in the gate's own order
+(mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
+Codex-freshness → head-binding → review-body → inline findings →
+scheduled-Claude-review), so the two read the same state —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
 before any merge** — never hand-roll a
