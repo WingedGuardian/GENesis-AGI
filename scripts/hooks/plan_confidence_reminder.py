@@ -37,10 +37,21 @@ reason. There was never one here: nothing about a plan lacking a confidence
 figure is irreversible or destructive, which is the only thing that earns a
 refusal.
 
-So: `permissionDecision: "allow"`, always exit 0, on every call. The one bound
-kept is the harness's own 10,000-character stdout cap, which is externally
-imposed rather than invented -- `print_json_bounded` trims the free text and
-never the envelope, so the decision survives even if the prose is clipped.
+So: `permissionDecision: "allow"`, and exit 0 on every path this module can
+reach. The one exception is stated rather than swept up: an ImportError at MODULE
+scope -- a missing sibling helper -- exits 1, because the `try/except` in
+`__main__` cannot catch a failure that happens before it is installed. Under the
+PreToolUse contract only exit 2 blocks, so exit 1 still costs nothing but the
+reminder. "Always exit 0" was the wrong promise to write when a test in this
+module's own suite proves the exception.
+
+The one bound kept is the harness's own 10,000-character stdout cap, which is
+externally imposed rather than invented: `print_json_bounded` trims the named
+free-text field and never the envelope, so the decision survives a clip. Note
+what that does NOT claim -- this reminder is a fixed string far under the budget,
+so the writer is defence-in-depth here rather than a live bound. The call exists
+so a later edit that grows the text cannot silently breach the cap, not because
+anything currently approaches it.
 """
 
 from __future__ import annotations

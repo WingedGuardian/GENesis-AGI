@@ -50,7 +50,7 @@ _EXECUTION_PROTOCOL = (
     # "STATE CONFIDENCE - explicit percentages for each part of the plan" used to
     # be step 2 here. It was a PLAN-level instruction delivered at PostToolUse,
     # i.e. after the plan had already been shown and approved - the wrong-moment
-    # bug that plan_confidence_guard.py exists to fix. It is now asked for BEFORE
+    # bug that plan_confidence_reminder.py exists to fix. It is now asked for BEFORE
     # the plan is presented, so repeating it here would be a second, weaker copy
     # of a reminder that arrives too late to act on. Step 3 below is NOT the same
     # thing and stays: reading the files you are about to edit is implementation
