@@ -710,25 +710,40 @@ class TestBaseAdvanceRefinement:
         assert block is True and verified is None
         assert "SUBSTANTIAL" in msg
 
-    def test_hook_surface_in_the_changed_contribution_still_blocks(self, monkeypatch):
-        # Teeth rule 1: a delta touching the enforcement-hook surface is NEVER
-        # review-trivial, however small. The refinement routes through the SAME
-        # _classify_delta_files, so it cannot acquire a weaker rule than the raw path.
-        # Anchored on a NON-hook path on purpose. A hook path now declines the
-        # rescue outright, one layer earlier — so anchoring here would block for
-        # that reason and prove nothing about the classifier. Two substantial
-        # code files is what only `_classify_delta_files` can judge.
-        before = [
-            _contrib("src/genesis/a.py", "b1", additions=200),
-            _contrib("src/genesis/b.py", "b2", additions=200),
-        ]
-        after = [
-            _contrib("src/genesis/a.py", "b3", additions=200),
-            _contrib("src/genesis/b.py", "b4", additions=200),
-        ]
+    def test_ANY_changed_contribution_blocks_however_small(self, monkeypatch):
+        """The refinement's only finding is "the two contributions are IDENTICAL".
+
+        A one-line difference on one non-hook file is the smallest possible
+        residual, and it still blocks. This pins the rule that replaced an
+        earlier version which SIZED the residual through the shared
+        substantiality classifier — see the shrinking-contribution test below for
+        the fail-open that sizing produced.
+        """
+        before = [_contrib("src/genesis/a.py", "b1", additions=1)]
+        after = [_contrib("src/genesis/a.py", "b2", additions=1)]
         self._setup(monkeypatch, before, after)
         block, _msg, _v = _mod._check_codex_reviewed_head("5")
         assert block is True
+
+    def test_a_SHRUNKEN_contribution_is_not_review_trivial(self, monkeypatch):
+        """Codex P1 (#1849): base-relative records cannot SIZE a reviewed...head delta.
+
+        Codex reviewed a 100-line addition to this file; head trims it back to 3
+        lines. The real ``reviewed...head`` delta is a ~97-line removal of code
+        Codex approved — the same failure the ``behind`` note in
+        `_classify_post_review_delta` describes (a head can carry the reviewed
+        commit's removals unreviewed), arriving by a different route.
+
+        MEASURED on this code before the fix: before=100 additions / after=3
+        additions returned "inline" and allowed the stale review. The GROWING
+        direction (3 -> 100) correctly returned "substantial", so the leak was
+        one-directional — the side anyone would think to test was the sound one.
+        """
+        before = [_contrib("src/genesis/a.py", "blob1", additions=100)]
+        after = [_contrib("src/genesis/a.py", "blob2", additions=3)]
+        self._setup(monkeypatch, before, after)
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "a contribution that SHRANK since the review is not trivial"
 
     def test_a_file_dropped_from_the_contribution_counts_as_changed(self, monkeypatch):
         # The PR used to touch this file and no longer does. It has no record on
@@ -785,9 +800,30 @@ class TestBaseAdvanceRefinement:
                 [{"filename": "src/a.py", "sha": None}],
             ),
             (
+                # The two duplicates carry the SAME sha deliberately. With
+                # differing shas, last-write-wins would leave the two sides
+                # unequal and the block would happen via `changed` instead —
+                # the duplicate guard would never be observed (MEASURED: with
+                # differing shas, deleting the guard leaves this file green).
                 "duplicate filename in one contribution",
-                [{"filename": "src/a.py", "sha": "x"}, {"filename": "src/a.py", "sha": "y"}],
+                [{"filename": "src/a.py", "sha": "x"}, {"filename": "src/a.py", "sha": "x"}],
                 [{"filename": "src/a.py", "sha": "x"}],
+            ),
+            (
+                # previous_filename is OPTIONAL, but a present-and-unreadable one
+                # is an identity that cannot be compared honestly — the rename
+                # source is half of what a renamed record means. Unreadable on
+                # BOTH sides on purpose: differing values would land in `changed`
+                # and block for that reason instead, leaving the validation
+                # untested (the shape that makes a guard test vacuous).
+                "previous_filename present but empty on both sides",
+                [{"filename": "src/a.py", "sha": "x", "previous_filename": ""}],
+                [{"filename": "src/a.py", "sha": "x", "previous_filename": ""}],
+            ),
+            (
+                "previous_filename present but not a string on both sides",
+                [{"filename": "src/a.py", "sha": "x", "previous_filename": 7}],
+                [{"filename": "src/a.py", "sha": "x", "previous_filename": 7}],
             ),
         ],
     )
@@ -886,6 +922,107 @@ class TestBaseAdvanceRefinement:
         block, _msg, _v = _mod._check_codex_reviewed_head("5")
         assert block is True
 
+    def test_a_REROUTED_rename_source_counts_as_changed(self, monkeypatch):
+        """Codex P1 (#1849): a rename has two endpoints; the record names one.
+
+        The compare record reports only the rename DESTINATION as ``filename``,
+        and the blob is the destination's bytes. So a contribution that renames
+        ``A -> B`` and one that renames ``D -> B`` present the same filename, the
+        same blob and the same ``renamed`` status — while deleting DIFFERENT
+        files. The base never moves here, so nothing downstream can catch it:
+        this pins the IDENTITY itself.
+
+        MEASURED on this code before ``previous_filename`` joined the identity:
+        the two compared equal, the file left the changed set, and the branch's
+        rerouted rename read as a pure base-advance.
+        """
+        before = [_contrib("src/genesis/B.py", "sameblob", status="renamed")]
+        before[0]["previous_filename"] = "src/genesis/A.py"
+        after = [_contrib("src/genesis/B.py", "sameblob", status="renamed")]
+        after[0]["previous_filename"] = "src/genesis/D.py"
+        self._setup(monkeypatch, before, after)
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "the branch renamed a DIFFERENT file to the same destination"
+
+    def test_a_base_change_to_the_branchs_rename_SOURCE_blocks(self, monkeypatch):
+        """Codex P1 (#1849): the overlap test needs the branch's rename sources too.
+
+        The branch renames ``A -> B``, so it DELETES ``A`` — ``A`` is a path this
+        branch changes. The base then modifies ``A``. Merging discards the base's
+        edit, which is the same ``--ours`` shape the moved-base check exists for,
+        arriving through the rename door.
+
+        The branch's touched set held only the DESTINATION ``B``, so
+        ``{A} & {B}`` was empty and the collision was invisible; the identity
+        cannot catch it either, because the rename is byte-identical on both
+        sides. With sources folded in, ``{A} & {A, B}`` collides.
+        """
+        same = [_contrib("src/genesis/B.py", "sameblob", status="renamed")]
+        same[0]["previous_filename"] = "src/genesis/A.py"
+        self._setup(
+            monkeypatch, same, [dict(same[0])],
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[_contrib("src/genesis/A.py", "abase", additions=80)],
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "the base edited the very file the branch renames away"
+
+    def test_an_IDENTICAL_rename_with_the_base_elsewhere_is_still_rescued(self, monkeypatch):
+        # The control for the two tests above: folding rename sources into the
+        # identity and the touched set must not make every rename unrescuable.
+        # Same source, same destination, same blob, base moved in an unrelated
+        # file -> still a pure base-advance.
+        same = [_contrib("src/genesis/B.py", "sameblob", status="renamed")]
+        same[0]["previous_filename"] = "src/genesis/A.py"
+        self._setup(
+            monkeypatch, same, [dict(same[0])],
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[_contrib("docs/unrelated.md", "other")],
+        )
+        block, _msg, verified = _mod._check_codex_reviewed_head("5")
+        assert block is False and verified == HEAD
+
+    def test_a_BASE_change_to_the_hook_surface_is_never_rescued(self, monkeypatch):
+        # The base advanced by touching a guard; the branch touches nothing
+        # hook-related. `moved_names & touched` is therefore EMPTY, so the
+        # overlap test passes it through and the `| moved_names` half of the
+        # hook-surface scan is the only thing that blocks it. Without that half
+        # this returns "inline".
+        same = [_contrib("src/genesis/a.py", "blobX")]
+        self._setup(
+            monkeypatch, same, list(same),
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[_contrib("scripts/hooks/git_push_guard.py", "hookblob")],
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "the base moved the enforcement surface — never rescued"
+
+    def test_a_base_advance_reporting_ZERO_files_is_a_degraded_read(self, monkeypatch):
+        """A base that MOVED must have changed something.
+
+        `_pr_contribution`'s jq is ``.files[]?``, and ``?`` swallows a MISSING or
+        null ``files`` key — so a degraded response arrives as ``[]``, which is
+        indistinguishable from a real empty diff and used to leave `moved_names`
+        empty, pass the overlap test, and rescue the review.
+
+        It is also self-contradictory: this refinement runs only when the RAW
+        range read `substantial`, and an empty compare `files` classifies
+        `inline`, so a base that advanced while changing nothing could not have
+        produced the verdict that got us here.
+
+        Distinct from `test_a_base_that_moved_BACKWARDS_is_not_an_advance`, which
+        also passes ``moved=[]`` but blocks on ``status != "ahead"`` and so
+        cannot observe this guard.
+        """
+        same = [_contrib("src/genesis/a.py", "blobX")]
+        self._setup(
+            monkeypatch, same, list(same),
+            mb_before="1111" * 10, mb_after="2222" * 10,
+            moved=[], moved_status="ahead",
+        )
+        block, _msg, _v = _mod._check_codex_reviewed_head("5")
+        assert block is True, "an advance that changed no files is a degraded read"
+
     def test_a_base_that_moved_BACKWARDS_is_not_an_advance(self, monkeypatch):
         # MEASURED against live GitHub: a three-dot compare of a base that moved
         # backwards reports status "behind" with ZERO files — so the overlap test
@@ -921,15 +1058,14 @@ class TestBaseAdvanceRefinement:
     ):
         """Blob sha encodes bytes, not mode — so identity folds in `status`.
 
-        Anchored on a SUBSTANTIAL non-hook change. A same-blob record whose
-        status differs must land in the CHANGED set, and a 200-line file is what
-        makes that observable as a block. A hook path would block one layer
-        earlier (the surface is never rescued), so it would pass with the
-        identity broken and prove nothing.
+        Anchored on a NON-hook path on purpose: a hook path would block one layer
+        earlier (the surface is never rescued), so it would pass with the identity
+        broken and prove nothing. The line counts are deliberately irrelevant now
+        — any changed contribution blocks — so this observes the identity alone.
         """
-        before = [_contrib("src/genesis/big.py", "sameblob", additions=200,
+        before = [_contrib("src/genesis/big.py", "sameblob", additions=5,
                            status="modified")]
-        after = [_contrib("src/genesis/big.py", "sameblob", additions=200,
+        after = [_contrib("src/genesis/big.py", "sameblob", additions=5,
                           status="changed")]
         self._setup(monkeypatch, before, after)
         block, _msg, _v = _mod._check_codex_reviewed_head("5")

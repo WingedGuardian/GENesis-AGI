@@ -2950,25 +2950,7 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         # a STALE review to bind the merge on a delta that was never verified
         # (Codex P2, #1373). Only the documented linear statuses are classifiable.
         return None
-    return _classify_delta_files(data.get("files"))
-
-
-def _classify_delta_files(files: object) -> str | None:
-    """Classify a list of compare FILE RECORDS as ``inline`` / ``substantial`` / None.
-
-    The shared tail of every unreviewed-delta judgement, extracted so the
-    base-advance refinement below cannot quietly acquire weaker RECORD rules than
-    the raw compare path: the hook-surface teeth, the malformed-record refusal
-    and the shared substantiality classifier all reach both callers here.
-
-    The 300-file truncation guard below does NOT protect both, and an earlier
-    version of this docstring claimed it did. It tests the list it is HANDED,
-    and the refinement hands it a changed SUBSET — always under the cap, so the
-    check would be vacuous there. The refinement therefore applies its own cap
-    to the lists it FETCHES, which is where truncation can actually hide a file.
-    Stated rather than fixed by moving the check, because the two callers
-    legitimately have different lists to guard.
-    """
+    files = data.get("files")
     if not isinstance(files, list):
         return None
     if len(files) >= 300:
@@ -3091,15 +3073,27 @@ def _classify_base_advance_delta(
 
     The question this asks instead: did the PR's OWN contribution change? Both
     sides are the PR's diff over its base — at review time and now — compared by
-    blob sha. Files whose content is identical in both were reviewed and have
-    not moved; only the remainder is unreviewed.
+    file identity. It returns ``"inline"`` for exactly ONE finding: the two
+    contributions are IDENTICAL. It never sizes a residual change, so its only
+    two answers are "provably a pure base-advance" and None.
 
-    NARROWING, so every uncertainty fails CLOSED: either fetch failing returns
-    None (the caller blocks), and the surviving subset goes through the SAME
-    ``_classify_delta_files`` as the raw path, keeping the hook-surface teeth and
-    the truncation guard. A file the base touched that the branch ALSO touches
-    shows a different blob and stays in the delta — the PR's diff over its base
-    genuinely changed there, which is the case most worth re-reading.
+    That is a deliberate narrowing over a version that DID size the residual
+    (Codex P1, #1849): the records available here are base-relative, so a
+    contribution that SHRANK between the review and head presents small counts
+    while the reviewed...head delta is large, and the sizing read as trivial. See
+    the ``if changed:`` block below.
+
+    NARROWING, so uncertainty fails CLOSED at every point it can be SEEN: a
+    failing fetch returns None (the caller blocks), an unreadable identity
+    withdraws the claim, an unreadable base move withdraws it, and a file the base
+    touched that the branch ALSO touches is a collision rather than an advance.
+
+    The one uncertainty it CANNOT see is file MODE, which the compare record does
+    not carry at all. That is why the enforcement surface is declined outright
+    rather than trusted to the identity — see the block above the hook-surface
+    loop. On a NON-hook path a mode-only change still rides through as unchanged,
+    and this docstring says so rather than claiming a closure the code does not
+    have.
     """
     got_before = _pr_contribution(base_sha, reviewed_sha, repo)
     got_after = _pr_contribution(base_sha, head_sha, repo)
@@ -3122,8 +3116,8 @@ def _classify_base_advance_delta(
         # so the invisible remainder could hold the very change being claimed
         # unchanged.
         return None
-    def _identities(records: list) -> dict[str, tuple[str, object]] | None:
-        """filename -> (blob sha, status), or None if any identity is unreadable.
+    def _identities(records: list) -> dict[str, tuple[str, object, str | None]] | None:
+        """filename -> (blob sha, status, rename source), or None if unreadable.
 
         Blob sha alone is CONTENT identity, not file identity: it encodes bytes
         and not mode, so a script that becomes executable keeps its blob and
@@ -3133,6 +3127,16 @@ def _classify_base_advance_delta(
         and saying so here is the point: the earlier docstring claimed "exact
         content identity" and was read as exact FILE identity, which it is not.
 
+        ``previous_filename`` is folded in for the same reason, and it is the
+        half an earlier version omitted (Codex P1, #1849). A rename is a diff
+        with two endpoints, and the compare record reports only the DESTINATION
+        as ``filename``; the blob is the destination's bytes. So a contribution
+        that renames ``A -> B`` and one that renames ``D -> B`` present the same
+        filename, the same blob and the same ``renamed`` status while deleting
+        DIFFERENT files. MEASURED on this code before the fix: those two compared
+        equal, the file dropped out of the changed set, and the branch's changed
+        rename read as a base-advance.
+
         A record MISSING its ``sha`` must not compare EQUAL to another missing
         one. MEASURED on this code before the check: two absent shas matched, the
         file dropped out of the changed set, and a genuinely modified file read as
@@ -3141,7 +3145,7 @@ def _classify_base_advance_delta(
         granted on POSITIVE evidence; an identity that cannot be read is not it,
         so the whole claim is withdrawn rather than made on partial data.
         """
-        out: dict[str, tuple[str, object]] = {}
+        out: dict[str, tuple[str, object, str | None]] = {}
         for f in records:
             if not isinstance(f, dict):
                 return None
@@ -3150,15 +3154,25 @@ def _classify_base_advance_delta(
                 return None
             if not isinstance(blob, str) or not blob:
                 return None
+            prev = f.get("previous_filename")
+            if prev is not None and (not isinstance(prev, str) or not prev):
+                return None  # present but unreadable — cannot compare honestly
             if name in out:
                 return None  # duplicate filename — cannot compare honestly
-            out[name] = (blob, f.get("status"))
+            out[name] = (blob, f.get("status"), prev)
         return out
 
     a, b = _identities(before), _identities(after)
     if a is None or b is None:
         return None
     changed = {name for name in set(a) | set(b) if a.get(name) != b.get(name)}
+    # Every path the PR's contribution touches, on EITHER side — destinations AND
+    # rename SOURCES. The source is a path this branch changes (it deletes it), so
+    # a base that touches it is a base change to a file the branch touches. Folding
+    # only destinations here is the same omission as in the identity above, one
+    # scope out: the overlap test below would compare the base's moved set against
+    # destinations alone and miss the collision entirely (Codex P1, #1849).
+    touched = set(a) | set(b) | {p for (_blob, _st, p) in (*a.values(), *b.values()) if p}
     moved_names: set[str] = set()  # what the BASE changed, when it moved
     if before_mb != after_mb:
         # THE MERGE BASE MOVED, which is the normal case here — catching up is
@@ -3185,13 +3199,28 @@ def _classify_base_advance_delta(
             # test below would find nothing and wave the claim through. Only a
             # genuine advance qualifies; behind / diverged / identical fail closed.
             return None
+        if not moved_files:
+            # The base MOVED, so it changed something — a compare that reports
+            # ZERO files is a degraded read, not an empty advance. The jq at
+            # `_pr_contribution` is `.files[]?`, and `?` swallows a MISSING or
+            # null `files` key, so an upstream response without it arrives here
+            # as `[]`, indistinguishable from a real empty diff.
+            #
+            # It is also self-contradictory: this refinement runs only when the
+            # RAW range classified `substantial`, and an empty compare `files`
+            # classifies `inline` (review_scope.classify_compare_substantiality:
+            # "An empty / None list means no reviewable delta"). So a base that
+            # advanced while changing nothing could not have produced the
+            # substantial raw verdict that got us here. No evidence, no claim —
+            # the same rule the two contribution lists already get above.
+            return None
         if len(moved_files) >= 300:
             return None  # truncated: cannot rule out an overlap
-        # Rename SOURCES count, matching `_classify_delta_files` and
-        # `_pr_changed_files`: a file the base renamed out from under the branch
-        # is a change to that path. This was the one place in the feature that
-        # folded only `filename`, and the asymmetry is the shape this whole
-        # refinement exists to close.
+        # Rename SOURCES count on BOTH sides of this intersection — here for the
+        # base's moved set, and in `touched` above for the branch's, matching
+        # `classify_compare_substantiality` and `_pr_changed_files`. A file the
+        # base renamed out from under the branch is a change to that path, and so
+        # is a file the branch renamed away.
         for f in moved_files:
             name = f.get("filename") if isinstance(f, dict) else None
             if not isinstance(name, str) or not name:
@@ -3202,7 +3231,7 @@ def _classify_base_advance_delta(
                 if not isinstance(prev, str) or not prev:
                     return None
                 moved_names.add(prev)
-        if moved_names & (set(a) | set(b)):
+        if moved_names & touched:
             return None
     # THE HOOK SURFACE IS NEVER RESCUED, whatever the blobs say.
     #
@@ -3211,34 +3240,46 @@ def _classify_base_advance_delta(
     # commits directly. That reconstruction loses whatever the identity does not
     # carry — and GitHub's compare record carries no file MODE at all. So a
     # content-preserving `chmod +x` on a guard keeps its blob AND its status,
-    # never enters `changed`, never reaches `_classify_delta_files`, and the
-    # teeth that exist to catch "any touch to the enforcement surface, however
-    # small" never run. The raw path would have caught it, so this is a
-    # REGRESSION the refinement introduces rather than a limitation it inherits.
+    # never enters `changed`, and the teeth that exist to catch "any touch to the
+    # enforcement surface, however small" never run. The raw path would have
+    # caught it, so this is a REGRESSION the refinement introduces rather than a
+    # limitation it inherits.
     #
     # Rather than chase an identity rich enough to be safe, decline the rescue
     # outright when the enforcement surface is anywhere in view. A hook-surface
     # PR forgoing a stale-review allowance is exactly the trade the surrounding
     # gate already makes everywhere else.
-    for name in set(a) | set(b) | moved_names:
+    for name in touched | moved_names:
         if _is_hook_surface_path(name):
             return None
-    if not changed:
-        # The branch contributes byte-identical content over its base, and the
-        # base did not touch any file the branch touches. Everything new since
-        # the review came from the base, and was reviewed there.
-        return "inline"
-    records = [f for f in after if isinstance(f, dict) and f.get("filename") in changed]
-    # A file the PR USED to touch and no longer does still counts as a change to
-    # its contribution; it has no record on the `after` side, so take the `before`
-    # one rather than dropping it silently.
-    seen = {f.get("filename") for f in records}
-    records += [
-        f
-        for f in before
-        if isinstance(f, dict) and f.get("filename") in changed and f.get("filename") not in seen
-    ]
-    return _classify_delta_files(records)
+    if changed:
+        # ANY change to the branch's own contribution withdraws the claim. The
+        # ONLY thing this refinement establishes is "byte-identical contribution";
+        # it does not, and must not, try to SIZE a residual change.
+        #
+        # An earlier version sized it, by handing the changed subset's `after`
+        # records to the shared substantiality classifier — and that was a
+        # fail-open with a mundane trigger (Codex P1, #1849). Those records are
+        # BASE-relative, not reviewed-relative: a file the review saw as a 100-line
+        # addition that head trims back to 3 lines presents an `after` record of 3
+        # lines, classifies `inline`, and lets a ~97-line unreviewed rewrite bind a
+        # stale review. MEASURED on this code before the fix: before=100 additions,
+        # after=3 additions returned "inline" (the growing direction, 3 -> 100,
+        # correctly returned "substantial" — so the leak was one-directional and
+        # invisible from the side anyone would test).
+        #
+        # Reconstructing the true reviewed...head size from two base-relative
+        # snapshots is exactly the argv->effect reconstruction the guard doctrine
+        # says not to build: any bound would rest on the diff algorithm's
+        # minimality, which is not a guarantee GitHub makes. So the residual is not
+        # sized at all — it blocks, and the fresh review the gate would have
+        # demanded anyway is the answer. Nothing is lost against the status quo:
+        # without this refinement the raw range read `substantial` and blocked too.
+        return None
+    # The branch contributes byte-identical content over its base, and the base
+    # did not touch any path the branch touches. Everything new since the review
+    # came from the base, and was reviewed there.
+    return "inline"
 
 
 def _check_codex_reviewed_head(
