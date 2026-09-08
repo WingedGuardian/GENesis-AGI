@@ -1013,8 +1013,8 @@ class TestSettingsStructure:
         matchers = [h.get("matcher") for h in settings["hooks"]["PreToolUse"]]
         assert "WebFetch" in matchers
 
-    def test_the_plan_confidence_gate_is_wired(self, settings: dict) -> None:
-        """Built is not wired. The guard's own 41 tests all pass with the
+    def test_the_plan_confidence_reminder_is_wired(self, settings: dict) -> None:
+        """Built is not wired. The hook's own tests all pass with the
         settings.json entry deleted, so nothing else in the suite would notice a
         rebase or a merge conflict dropping it -- and the failure is silent, since
         a hook that is not wired simply never speaks."""
@@ -1026,8 +1026,9 @@ class TestSettingsStructure:
         commands = " ".join(
             h.get("command", "") for e in entries for h in e.get("hooks", [])
         )
-        assert "hooks/plan_confidence_guard.py" in commands, (
-            "the ExitPlanMode PreToolUse entry does not run plan_confidence_guard.py"
+        assert "hooks/plan_confidence_reminder.py" in commands, (
+            "the ExitPlanMode PreToolUse entry does not run "
+            "plan_confidence_reminder.py"
         )
 
     def test_bash_hook_is_command(self, settings: dict) -> None:
