@@ -632,6 +632,15 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   exec-replaces itself and loses the marker from its argv — add a
   guard-the-guard assert that the fixture really has the property). Ask of every
   new test: *would this still pass if the mechanism it names were deleted?*
+  When the DISTINGUISHING fact is produced by a lane the assertion cannot see,
+  asking every test to assert it is a convention, and conventions decay — the
+  merge gate's own suite carried that request in a fixture docstring and 3 tests
+  had already drifted from it. `tests/test_hooks/conftest.py`'s `offdiff_lock` is
+  the worked chokepoint: it fails any IN-PROCESS hook test whose finding was
+  silently discounted as outside the diff, so a forgotten allowlist entry can no
+  longer turn a not-block assertion green for the wrong reason. It fails OPEN,
+  so its own self-tests are the load-bearing part — a lock nobody checks is the
+  convention it replaced.
 - **Contested/subtle specs: write the expectations first.** When what-should-
   happen is itself under discussion (which keys count, which states clear an
   alarm), enumerate the expectation table as failing tests BEFORE implementing
