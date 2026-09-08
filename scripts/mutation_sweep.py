@@ -254,6 +254,14 @@ def _has_result_line(stdout: str) -> bool:
         # Only a line with NO outcome at all ("2 deselected", "no tests ran")
         # means nothing ran. The earlier test covered the `passed` variant and
         # not the `failed` one, which is why this survived.
+        # An ERROR outcome is NOT a result, whatever the exit code. A fixture
+        # setup failure exits 1 with "1 error", and a teardown failure produces
+        # "1 passed, 1 error" -- both previously read as a result, so rc=1 scored
+        # BIT while the named test body never ran. That is the exact import/setup
+        # class the exit-code check was added to exclude, surviving one layer in
+        # because it arrives as rc=1 rather than rc=2.
+        if "error" in line:
+            return False
         if "passed" in line or "failed" in line:
             return True
         if "no tests ran" in line or "deselected" in line:
@@ -288,6 +296,28 @@ def _validate(case: Case, text: str) -> str | None:
     return None
 
 
+def _reject_symlink(path: Path) -> str | None:
+    """A symlink target cannot be safely mutated, so it is REFUSED, not handled.
+
+    MEASURED: the mutation writes THROUGH the link into the referent; if the
+    child then deletes the link, `copy2(baseline, target)` recreates `target` as
+    a regular file holding the baseline text while THE REFERENT STAYS MUTATED --
+    permanently, with the case still reporting BIT. Source corruption in the tool
+    whose entire justification is that it does not corrupt source.
+
+    Refusing is the right call rather than snapshotting link+referent: the
+    correct semantics (restore the link? the referent? both? what if the referent
+    is outside the repo?) are genuinely ambiguous, and a mutation harness has no
+    business guessing about them. A case naming a symlink is a case that should
+    name the real file.
+    """
+    if path.is_symlink():
+        return (f"{path} is a SYMLINK; mutating it writes through to the "
+                "referent and the restore cannot put the link back. Point the "
+                "case at the real file.")
+    return None
+
+
 def run_case(
     case: Case,
     baseline: Path,
@@ -304,6 +334,10 @@ def run_case(
     # A case gated on shared live state ABORTS when that state is absent. It does
     # NOT skip: a skipped case and a killed one look identical in a summary line,
     # and "11/11 bit" means nothing if two of them never ran.
+    symlink = _reject_symlink(target)
+    if symlink:
+        return Result(case, ABORTED, symlink)
+
     missing = [r for r in case.requires if r not in (available or set())]
     if missing:
         return Result(case, ABORTED,
@@ -503,6 +537,68 @@ def sweep(
     if not cases:
         raise ValueError("a sweep with no cases proves nothing")
 
+    # SNAPSHOT FIRST, BEFORE ANY CHILD PROCESS RUNS. The baseline check used to
+    # come first, and a baseline test (or one of its fixtures) that edits or
+    # deletes a target then had no recovery copy anywhere: a deleted target made
+    # the later copy2 raise with nothing to restore from, and an edited one
+    # became the snapshot and survived the sweep. A failing baseline left the
+    # same damage. The window existed for every case, on every run, before a
+    # single mutation was written.
+    #
+    # `~/tmp` is a Genesis-container convention, not a property of hosts, and
+    # mkdtemp against an absent parent raises.
+    tmp_root = Path.home() / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(prefix="mutation-sweep-", dir=str(tmp_root)))
+    baselines: dict[Path, Path] = {}
+    completed = False
+    for c in {c.path for c in cases}:
+        snap = tmpdir / (str(c).replace("/", "__"))
+        shutil.copy2(c, snap)
+        baselines[c] = snap
+
+    try:
+        _run_baseline_and_verify(
+            cases, baselines, cwd=cwd, python=python, env=env, timeout=timeout,
+            available=available, check_baseline=check_baseline,
+        )
+    except BaseException:
+        print(f"mutation-sweep: baselines PRESERVED for recovery: {tmpdir}",
+              file=sys.stderr)
+        raise
+
+    try:
+        out = Sweep()
+        for case in cases:
+            out.results.append(
+                run_case(case, baselines[case.path], cwd=cwd, python=python,
+                         env=env, timeout=timeout, available=available)
+            )
+        completed = True
+        return out
+    finally:
+        if completed:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        else:
+            # An abnormal exit is exactly when the snapshots are worth keeping:
+            # they may be the only surviving copy of a file whose restore did not
+            # finish. Deleting them here is what turned a crash into data loss.
+            print(f"mutation-sweep: baselines PRESERVED for recovery: {tmpdir}",
+                  file=sys.stderr)
+
+
+def _run_baseline_and_verify(
+    cases, baselines, *, cwd, python, env, timeout, available, check_baseline
+) -> None:
+    """Green-baseline check, then confirm no target was damaged by running it.
+
+    The verification half is not paranoia: a baseline test -- or one of its
+    fixtures -- can edit or delete the very file a case is about to mutate. With
+    the snapshot now taken first, that damage is recoverable; without the CHECK
+    it would still go unnoticed, and the sweep would mutate a file that no longer
+    matches what it was baselined against.
+    """
+    problem: str | None = None
     if check_baseline:
         # A case gated on state this run does not have CANNOT be baselined: its
         # test fails without that state, the gate reads that as a RED baseline,
@@ -522,39 +618,29 @@ def sweep(
             problem = assert_green_baseline(
                 baselineable, cwd=cwd, python=python, env=env, timeout=timeout
             )
-            if problem:
-                raise RuntimeError(problem)
+    # NOTE the deliberate ordering: the baseline verdict is CAPTURED, not raised
+    # yet. A damaged target EXPLAINS a red baseline -- if a fixture deleted the
+    # file under test, "baseline is RED" is a true statement and a useless
+    # diagnosis, and it hides the one fact the operator needs (their file is gone,
+    # and here is the copy). The specific cause reports first.
 
-    # `~/tmp` is a Genesis-container convention (CLAUDE.md "Temp files"), NOT a
-    # property of hosts in general -- a CI runner's HOME has no `tmp`, and
-    # `mkdtemp` against an absent parent raises FileNotFoundError. Create it.
-    tmp_root = Path.home() / "tmp"
-    tmp_root.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(prefix="mutation-sweep-", dir=str(tmp_root)))
-    baselines: dict[Path, Path] = {}
-    completed = False
-    try:
-        for c in {c.path for c in cases}:
-            snap = tmpdir / (str(c).replace("/", "__"))
-            shutil.copy2(c, snap)
-            baselines[c] = snap
-        out = Sweep()
-        for case in cases:
-            out.results.append(
-                run_case(case, baselines[case.path], cwd=cwd, python=python,
-                         env=env, timeout=timeout, available=available)
+    # Whether or not the baseline ran, confirm every target still matches its
+    # snapshot before a single mutation is written.
+    for target, snap in baselines.items():
+        if not target.exists():
+            raise RuntimeError(
+                f"{target} was DELETED before any mutation -- by a baseline test "
+                f"or its fixture. A recovery copy exists at {snap}."
             )
-        completed = True
-        return out
-    finally:
-        if completed:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        else:
-            # An abnormal exit is exactly when the snapshots are worth keeping:
-            # they may be the only surviving copy of a file whose restore did not
-            # finish. Deleting them here is what turned a crash into data loss.
-            print(f"mutation-sweep: baselines PRESERVED for recovery: {tmpdir}",
-                  file=sys.stderr)
+        if target.read_bytes() != snap.read_bytes():
+            raise RuntimeError(
+                f"{target} was MODIFIED before any mutation -- by a baseline test "
+                f"or its fixture. Mutating it now would be mutating a file that "
+                f"no longer matches what it was baselined against. Snapshot: {snap}"
+            )
+
+    if problem:
+        raise RuntimeError(problem)
 
 
 def render(result: Sweep) -> str:

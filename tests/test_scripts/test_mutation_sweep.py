@@ -242,9 +242,13 @@ def test_aborts_are_not_counted_as_clean(project):
     # exactly how it survived.
     ("1 failed, 1 deselected in 0.1s", True),
     ("2 deselected in 0.1s", False),
-    # A collection error. The exit-code check catches this first now, but the
-    # string still must not read as a result on its own.
-    ("1 error in 0.24s", True),
+    # AN ERROR IS NOT A RESULT, and this row previously asserted True --
+    # encoding the bug. A fixture setup failure exits 1 with "1 error", which
+    # passed the exit-code check (rc in (0,1)) and then read as a result, so the
+    # case scored BIT while the test body never ran. A teardown failure produces
+    # both words at once.
+    ("1 error in 0.24s", False),
+    ("1 passed, 1 error in 0.3s", False),
 ])
 def test_the_result_line_detector(stdout, expected):
     assert ms._has_result_line(stdout) is expected
@@ -637,3 +641,84 @@ def test_the_anti_deadlock_lever_survives_the_allowlist(monkeypatch):
     assert "GENESIS_PYTEST_LOCK_HELD" not in ms._child_env({})
     monkeypatch.setenv("GENESIS_PYTEST_LOCK_HELD", "1")
     assert ms._child_env({})["GENESIS_PYTEST_LOCK_HELD"] == "1"
+
+
+# --------------------------------------------------------------------------
+# THREE P1s: a fixture error scoring as caught, and two ways to corrupt source.
+# --------------------------------------------------------------------------
+
+def test_a_fixture_error_is_an_ABORT_not_a_BIT(project, monkeypatch):
+    """rc=1 with "1 error" is a setup failure, not a caught mutation.
+
+    The exit-code check closed rc != 1 and left this open: an error arrives as
+    rc=1, passed the result-line test, and scored BIT while the named test body
+    never ran — the same false GREEN the exit-code check was added to prevent,
+    one layer in.
+    """
+    class Fake:
+        returncode = 1
+        stdout = "1 error in 0.24s"
+        stderr = ""
+
+    monkeypatch.setattr(ms.subprocess, "run", lambda *a, **k: Fake())
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.ABORTED
+    assert not result.clean
+
+
+def test_a_symlink_target_is_REFUSED(project):
+    """Mutating a symlink writes THROUGH to the referent, and the restore cannot
+    put the link back — MEASURED: the referent stays mutated permanently while
+    the case reports BIT. Refused rather than handled, because the correct
+    semantics (restore the link? the referent? one outside the repo?) are
+    genuinely ambiguous and a mutation harness must not guess."""
+    real = project / "guard.py"
+    link = project / "guard_link.py"
+    link.symlink_to(real)
+    before = real.read_bytes()
+
+    result = _sweep(project, [_case(project, path=link)])
+    assert result.results[0].outcome == ms.ABORTED
+    assert "SYMLINK" in result.results[0].detail
+    assert real.read_bytes() == before, "the referent was mutated"
+    assert link.is_symlink(), "the link was replaced by a regular file"
+
+
+def test_a_baseline_that_DELETES_the_target_is_caught_with_a_copy_surviving(
+    project, monkeypatch, capsys
+):
+    """The snapshot used to be taken AFTER the baseline ran, so a baseline test
+    (or a fixture) that deleted a target left no recovery copy anywhere — a
+    permanently missing file, before a single mutation was written."""
+    target = project / "guard.py"
+    real_run = ms.subprocess.run
+
+    def delete_during_baseline(*a, **k):
+        if target.exists():
+            target.unlink()
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", delete_during_baseline)
+    with pytest.raises(RuntimeError, match="DELETED before any mutation"):
+        ms.sweep([_case(project)], cwd=project, python=sys.executable,
+                 env={"PYTHONPATH": str(project)}, timeout=120, check_baseline=True)
+    err = capsys.readouterr().err
+    assert "baselines PRESERVED" in err, "no recovery copy was reported"
+    snap_dir = err.split("baselines PRESERVED for recovery:")[1].strip().split()[0]
+    assert (Path(snap_dir)).exists(), "the recovery copy was deleted anyway"
+
+
+def test_a_baseline_that_MODIFIES_the_target_refuses_to_mutate(project, monkeypatch):
+    """Mutating a file that no longer matches what it was baselined against makes
+    every verdict from it meaningless."""
+    target = project / "guard.py"
+    real_run = ms.subprocess.run
+
+    def edit_during_baseline(*a, **k):
+        target.write_text("# a fixture rewrote this\n", encoding="utf-8")
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", edit_during_baseline)
+    with pytest.raises(RuntimeError, match="MODIFIED before any mutation"):
+        ms.sweep([_case(project)], cwd=project, python=sys.executable,
+                 env={"PYTHONPATH": str(project)}, timeout=120, check_baseline=True)
