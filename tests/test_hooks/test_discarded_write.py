@@ -286,6 +286,69 @@ def test_a_substitution_bomb_is_refused_before_parsing():
 # ── every consumer's guarded import must match its own fallback ──────────────
 
 
+def _guarded_import_aliases(tree: ast.AST, name: str) -> set[str]:
+    """Local aliases a module binds for ``discarded_write.<name>``.
+
+    Consumers import under an alias (``warn as _warn_discarded``), so the tests
+    below must ask the AST what the local name IS rather than assume it.
+    """
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "discarded_write"
+        for alias in node.names
+        if alias.name == name
+    }
+
+
+def _emitting_calls(tree: ast.AST, names: set[str]) -> int:
+    """Real ``Call`` nodes to any of ``names``, OUTSIDE the fallback handler.
+
+    A substring scan cannot do this job, and that is the point. Every consumer is
+    REQUIRED by ``test_each_guarded_import_has_a_stand_in_for_every_name_it_imports``
+    to define ``def _warn_discarded(...)`` in its ``except`` branch — so the text
+    ``_warn_discarded(`` is present in every file this suite walks whether or not
+    the guard ever emits. MEASURED: deleting the sole ``_warn_discarded(cmd)`` call
+    from ``full_suite_guard.py`` left all 8 wiring tests green. Only a Call node,
+    with the fallback DEFINITION excluded, distinguishes wired from unwired.
+    """
+    in_fallback = {
+        id(sub)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+        for stmt in handler.body
+        for sub in ast.walk(stmt)
+    }
+    return sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in names
+        and id(node) not in in_fallback
+    )
+
+
+def _wrapper_is_reachable(tree: ast.AST, wrapper: str) -> bool:
+    """Whether a defined ``_main_with_note`` wrapper is actually referenced.
+
+    Two guards emit through a wrapper handed to ``run_guard`` rather than by a
+    direct call, so "defines the wrapper" is not "runs the wrapper" — unwiring the
+    ``run_guard(_main_with_note, …)`` argument is a silent regression a
+    definition-presence check cannot see.
+    """
+    defined = any(
+        isinstance(n, ast.FunctionDef) and n.name == wrapper for n in ast.walk(tree)
+    )
+    if not defined:
+        return True  # nothing to unwire
+    return any(
+        isinstance(n, ast.Name) and n.id == wrapper and isinstance(n.ctx, ast.Load)
+        for n in ast.walk(tree)
+    )
+
+
 def test_every_guard_with_an_ask_path_wires_the_prompt_note():
     """The class, not the two instances: an approval prompt must carry the warning.
 
@@ -296,6 +359,8 @@ def test_every_guard_with_an_ask_path_wires_the_prompt_note():
     pattern that keeps producing findings in this area.
 
     Derived by ast so a THIRD guard growing an ``_ask`` is covered automatically.
+    The check is the CALL, not the import: an import with no call site is wiring
+    that does nothing, and the import alone stays green when the call is deleted.
     """
     scripts = _HOOKS.parent
     asking, wired = set(), set()
@@ -304,10 +369,9 @@ def test_every_guard_with_an_ask_path_wires_the_prompt_note():
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_ask":
                 asking.add(path.name)
-            if isinstance(node, ast.ImportFrom) and node.module == "discarded_write":
-                for alias in node.names:
-                    if alias.name == "prompt_note":
-                        wired.add(path.name)
+        aliases = _guarded_import_aliases(tree, "prompt_note")
+        if aliases and _emitting_calls(tree, aliases):
+            wired.add(path.name)
     assert asking, "the walk found no guard with an _ask path — it went blind"
     missing = asking - wired
     assert not missing, f"guards with an _ask that never append the prompt note: {missing}"
@@ -325,19 +389,31 @@ def test_every_consumer_actually_emits_the_note_it_imports():
     This is the repo's convention -> chokepoint -> LOCK pattern: six call sites
     that must each REMEMBER to emit, and no lock. Deriving the consumer set from
     the imports means a seventh guard is covered the day it is added.
+
+    The assertion is a Call node, not a substring. An earlier revision asserted
+    ``"_warn_discarded(" in src`` and was VACUOUS by construction: the sibling
+    stand-in test REQUIRES every consumer to define ``def _warn_discarded(...)``
+    in its fallback, so the substring is present in every file walked here even
+    with the emission deleted. MEASURED: removing the sole call from
+    ``full_suite_guard.py`` left all 8 wiring tests green.
     """
     scripts = _HOOKS.parent
     checked = 0
     for path in sorted(scripts.rglob("*.py")):
         if path.name == "discarded_write.py":
             continue  # the module itself is not one of its own consumers
-        src = path.read_text()
-        if "from discarded_write import" not in src:
+        tree = ast.parse(path.read_text())
+        aliases = _guarded_import_aliases(tree, "warn")
+        if not aliases:
             continue
         checked += 1
-        assert "_warn_discarded(" in src, (
+        assert _emitting_calls(tree, aliases), (
             f"{path.name}: imports the note helper but never emits it — "
             "the import is wiring that does nothing"
+        )
+        assert _wrapper_is_reachable(tree, "_main_with_note"), (
+            f"{path.name}: defines the _main_with_note wrapper but nothing "
+            "references it — the guard runs without ever emitting the note"
         )
     assert checked >= 6, f"the walk found only {checked} consumers — it went blind"
 
@@ -487,9 +563,20 @@ def test_every_configured_bash_blocker_is_wired_for_the_note():
                 src = script.read_text()
                 if re.search(r"return 2|sys\.exit\(2\)", src):
                     checked_scripts += 1
-                    assert "from discarded_write import" in src, (
+                    tree = ast.parse(src)
+                    aliases = _guarded_import_aliases(tree, "warn")
+                    assert aliases, (
                         f"{script.name}: configured Bash blocker never wires "
                         "the discarded-command note"
+                    )
+                    # The CALL, not the import — an import a later edit orphans
+                    # leaves this blocker silent while the import still reads wired.
+                    assert _emitting_calls(tree, aliases), (
+                        f"{script.name}: configured Bash blocker imports the note "
+                        "helper but never emits it"
+                    )
+                    assert _wrapper_is_reachable(tree, "_main_with_note"), (
+                        f"{script.name}: _main_with_note is defined but unreferenced"
                     )
             elif "exit 2" in cmd:
                 checked_inline += 1
