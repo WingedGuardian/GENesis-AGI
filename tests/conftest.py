@@ -441,6 +441,42 @@ def _guard_db_crud_not_mocked():
         )
 
 
+def require_access_denied(path) -> None:
+    """Skip unless THIS process is actually stopped by ``path``'s mode bits.
+
+    Probes the path that was chmod'd, not some writable neighbour of it — a
+    probe aimed at the wrong path reports "denied" from a directory nobody
+    restricted, which skips every run and pins nothing. Directories are probed
+    by listing, files by opening, because those are the operations the callers
+    rely on being refused.
+
+    Any test that chmods a directory or file and then asserts on the failure is
+    resting on a premise the environment can void: root and anything holding
+    CAP_DAC_OVERRIDE write straight through mode bits, and CI containers
+    routinely run as root. There the operation SUCCEEDS, and the test either
+    fails for an unrelated reason or — worse — passes vacuously, having
+    asserted that nothing went wrong in a run where nothing was ever blocked.
+
+    Shared rather than repeated: the same premise underpins several chmod-based
+    tests across the suite, and a lesson applied only where it was learned
+    leaves the rest of the population exactly as it was.
+
+    Restores nothing and mutates nothing — call it AFTER chmod, before the
+    assertions, and let the caller's own ``finally`` restore the mode.
+    """
+    import pathlib
+
+    p = pathlib.Path(path)
+    try:
+        if p.is_dir():
+            list(p.iterdir())
+        else:
+            p.open("rb").close()
+    except OSError:
+        return  # genuinely denied — the premise holds
+    pytest.skip(f"this process reads through mode bits on {p} (root / CAP_DAC_OVERRIDE)")
+
+
 @pytest.fixture
 async def empty_db():
     """In-memory SQLite database with tables but no seed data."""

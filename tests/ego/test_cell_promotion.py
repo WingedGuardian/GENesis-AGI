@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 
 import genesis
+from genesis.autonomy.capabilities import InvalidTransition
 from genesis.autonomy.types import CellEvent, CellState
 from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import ego as ego_crud
@@ -156,3 +157,84 @@ def test_excluded_from_approved_proposal_sweep():
     root = Path(genesis.__file__).parent
     src = (root / "ego" / "session.py").read_text()
     assert '"cell_promotion"' in src
+
+
+# ── promotable-domain allowlist ───────────────────────────────────────────
+# A cell outside PROMOTABLE_DOMAINS must never reach GRANTED. The candidate
+# scan already refuses to propose one, so a proposal here is the case that
+# scan cannot cover: one created BEFORE the domain left the allowlist, or by
+# any future path that builds a proposal without going through the scan.
+
+_WIDGET = {"domain": "widget", "verb": "poke", "risk_class": "standard"}
+
+
+async def test_approved_proposal_for_non_promotable_domain_does_not_promote(db):
+    await cg.apply_event(
+        db, origin_class="first_party", event=CellEvent.CLASSIFY, updated_at=_TS, **_WIDGET
+    )
+    for _ in range(cg.MIN_PROMOTE_N):
+        await cg.record_success(db, origin_class="first_party", updated_at=_TS, **_WIDGET)
+    prop = await _make_proposal(db, status="approved", cell=("widget", "poke", "standard"))
+
+    ok = await handle_cell_promotion_resolution(db, prop, "approved")
+
+    assert ok is False
+    assert (await cg.get_cell(db, **_WIDGET))["state"] == CellState.ASK.value
+    resolved = await ego_crud.get_proposal(db, prop["id"])
+    # The message the OWNER sees must name the real reason. The staleness guard
+    # below it would say "evidence changed", which is false here and would send
+    # the owner off waiting for evidence that can never matter.
+    assert resolved["status"] == "executed"
+    response = resolved["user_response"] or ""
+    assert "refused" in response
+    assert "standing" in response
+    assert "evidence changed" not in response
+
+
+async def test_approved_proposal_for_allowlisted_domain_still_promotes(db):
+    """Control: the allowlist must not break the domain it exists to permit."""
+    await _promotable_cell(db)
+    prop = await _make_proposal(db, status="approved")
+
+    assert await handle_cell_promotion_resolution(db, prop, "approved") is True
+    assert (await cg.get_cell(db, **_CELL))["state"] == CellState.GRANTED.value
+
+
+async def test_refusal_without_a_raise_is_not_reported_as_promoted(db, monkeypatch):
+    """apply_event has non-raising refusal exits too — the gate-3 immunity path
+    returns the cell's UNCHANGED state rather than transitioning. The caller
+    must read that outcome: reporting a refusal as "promoted to GRANTED" is the
+    gate lying about what it did.
+
+    Uses an allowlisted domain on purpose, so what is under test is the
+    caller's handling of the returned state, not the domain allowlist.
+    """
+    await _promotable_cell(db)
+    prop = await _make_proposal(db, status="approved")
+
+    async def _refuse_without_raising(*_a, **_kw):
+        return CellState.ASK
+
+    monkeypatch.setattr(cg, "apply_event", _refuse_without_raising)
+
+    ok = await handle_cell_promotion_resolution(db, prop, "approved")
+
+    assert ok is False
+    assert (await cg.get_cell(db, **_CELL))["state"] == CellState.ASK.value
+    assert "failed" in ((await ego_crud.get_proposal(db, prop["id"]))["user_response"] or "")
+
+
+async def test_apply_event_raising_is_reported_as_a_failure(db, monkeypatch):
+    """The other exit: a raise (which is how the promotable-domain backstop
+    refuses) must also surface as a failure, never a silent success."""
+    await _promotable_cell(db)
+    prop = await _make_proposal(db, status="approved")
+
+    async def _raise(*_a, **_kw):
+        raise InvalidTransition("refused")
+
+    monkeypatch.setattr(cg, "apply_event", _raise)
+
+    assert await handle_cell_promotion_resolution(db, prop, "approved") is False
+    assert (await cg.get_cell(db, **_CELL))["state"] == CellState.ASK.value
+    assert "failed" in ((await ego_crud.get_proposal(db, prop["id"]))["user_response"] or "")
