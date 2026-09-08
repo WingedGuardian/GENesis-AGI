@@ -48,7 +48,7 @@ async def run_centrality_recompute(
         "computation_ms": 0.0,
     }
 
-    from genesis.memory.graph import centrality_scores
+    from genesis.memory.graph import GraphUnavailableError, centrality_scores
 
     t0 = time.monotonic()
     try:
@@ -57,6 +57,16 @@ async def run_centrality_recompute(
         # how many rows land in the cache, which the importance shield reads
         # as its bridge-node population.
         scores = await centrality_scores(db, top_n=None)
+    except GraphUnavailableError as exc:
+        # The store could not answer — which is NOT "no bridges". Returning
+        # here (before any DELETE below) keeps the previous cache standing, so
+        # the importance shield keeps its last real threshold instead of
+        # silently shielding nothing. The stale-cache cost is bounded: the
+        # next successful run atomically replaces it.
+        logger.warning("Centrality skipped — graph unavailable: %s", exc)
+        report["graph_unavailable"] = True
+        report["error"] = str(exc)
+        return report
     except Exception as exc:
         logger.warning("Centrality computation failed: %s", exc, exc_info=True)
         report["error"] = str(exc)
