@@ -40,7 +40,9 @@ which is exactly what lets Round-1 bugs through.
   subprocess, SQL, path handling, external input (Telegram/dashboard/MCP), or hooks/gates.
 - Run them SEQUENTIALLY, almost never in parallel on the same diff (standing rule — the second
   reviewer must see the fixed code, and parallel doubles spend). Sequential means WAIT for a
-  running reviewer to finish; it never means killing one to start the next.
+  running reviewer to finish; it never means killing one to start the next. The one
+  exception is an ORPHAN — its session gone, or wedged holding a slot — which is
+  ordinary cleanup once you have established that is what it is.
 
 Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this into the prompt:
 
