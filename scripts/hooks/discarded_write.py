@@ -242,16 +242,24 @@ def _main(argv: list[str]) -> int:
     """CLI for the shell hooks, so they call THIS implementation rather than
     re-deriving the check in bash.
 
-    ``python3 discarded_write.py --command "$CMD"`` prints the note (if any) to
-    stderr. Always exits 0: the caller's own exit code is the verdict, and this
-    must not perturb it.
+    ``printf %s "$CMD" | python3 discarded_write.py`` prints the note (if any)
+    to stderr. Always exits 0: the caller's own exit code is the verdict, and
+    this must not perturb it.
+
+    THE COMMAND ARRIVES ON STDIN, NEVER IN ARGV, and there is deliberately no
+    flag to pass it any other way. A Bash payload can carry credentials — this
+    repo says so where it refuses to log one (``git_discard_guard._record_snapshots``:
+    "the Bash payload can carry credentials (`curl -H 'Authorization: …' && git
+    checkout`)") — and argv is world-readable through ``/proc/<pid>/cmdline``.
+    The refused command is never executed, so spawning a COSMETIC helper must not
+    become the thing that publishes it. Keeping the argv path "for convenience"
+    is what would let a future caller reintroduce the exposure, so it is gone
+    rather than merely unused; ``tests/test_hooks/test_discarded_write.py``
+    locks every configured blocker against passing the command as an argument.
     """
+    del argv  # nothing is read from the command line, by design — see above
     cmd = ""
-    if "--command" in argv:
-        idx = argv.index("--command")
-        if idx + 1 < len(argv):
-            cmd = argv[idx + 1]
-    if not cmd and not sys.stdin.isatty():
+    if not sys.stdin.isatty():
         try:
             cmd = sys.stdin.read()
         except (OSError, ValueError):

@@ -70,7 +70,12 @@ _discarded_write_note() {
     # stdout only to /dev/null — the note is written to STDERR, which is how it
     # reaches the operator. Silencing stderr here would make the whole feature inert
     # on this path while every test that checks exit codes still passed.
-    timeout 1 python3 "$SCRIPT_DIR/hooks/discarded_write.py" --command "$CMD" \
+    # ON STDIN, NOT IN ARGV. The Bash payload can carry credentials (this repo
+    # refuses to log one for that reason — see git_discard_guard._record_snapshots),
+    # and argv is readable through /proc/<pid>/cmdline. The refused command is
+    # never executed, so a cosmetic note must not be what publishes it.
+    printf '%s' "$CMD" \
+        | timeout 1 python3 "$SCRIPT_DIR/hooks/discarded_write.py" \
         >/dev/null || true
 }
 trap _discarded_write_note EXIT

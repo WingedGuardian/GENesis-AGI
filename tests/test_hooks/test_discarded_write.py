@@ -287,15 +287,30 @@ def test_a_substitution_bomb_is_refused_before_parsing():
 
 
 def _guarded_import_aliases(tree: ast.AST, name: str) -> set[str]:
-    """Local aliases a module binds for ``discarded_write.<name>``.
+    """Local aliases a module binds for ``discarded_write.<name>``, GUARDED ONLY.
 
     Consumers import under an alias (``warn as _warn_discarded``), so the tests
     below must ask the AST what the local name IS rather than assume it.
+
+    Only imports inside a ``try`` count, and that is the module's own CAPS safety
+    rule rather than tidiness: an UNGUARDED import that failed would abort the
+    guard's module load, exit 1, and CC reads a non-2 exit as NON-blocking — the
+    guarded command then RUNS. A cosmetic helper must not be able to buy that. An
+    unguarded import therefore makes the consumer INVISIBLE here, which fails the
+    walk's own blind-floor assertions rather than passing quietly.
     """
+    guarded = {
+        id(stmt)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        for stmt in node.body
+    }
     return {
         alias.asname or alias.name
         for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "discarded_write"
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "discarded_write"
+        and id(node) in guarded
         for alias in node.names
         if alias.name == name
     }
@@ -327,6 +342,34 @@ def _emitting_calls(tree: ast.AST, names: set[str]) -> int:
         and isinstance(node.func, ast.Name)
         and node.func.id in names
         and id(node) not in in_fallback
+    )
+
+
+def _has_zero_arg_call(tree: ast.AST, names: set[str]) -> bool:
+    """Whether any real call to ``names`` passes NO command.
+
+    Four consumers wire the note as two cooperating calls — ``remember(cmd)``
+    early, then a bare ``warn()`` at each refusal, so the many exit sites do not
+    each have to hold the command. For those, asserting the EMIT half alone is
+    only half a lock: deleting the single ``remember`` line silences the note at
+    every one of that guard's refusals with the emit call still sitting there.
+    """
+    in_fallback = {
+        id(sub)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+        for stmt in handler.body
+        for sub in ast.walk(stmt)
+    }
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in names
+        and not node.args
+        and not node.keywords
+        and id(node) not in in_fallback
+        for node in ast.walk(tree)
     )
 
 
@@ -415,6 +458,16 @@ def test_every_consumer_actually_emits_the_note_it_imports():
             f"{path.name}: defines the _main_with_note wrapper but nothing "
             "references it — the guard runs without ever emitting the note"
         )
+        # The OTHER half of the wiring, and the half a mutation sweep proved was
+        # unlocked: a bare `warn()` reads the command that `remember(cmd)` stashed.
+        # MEASURED: deleting the sole `_remember_command(cmd)` from
+        # protected_paths_guard.py left this whole file green (48 passed) while the
+        # real guard, run as a subprocess, stopped emitting the note entirely.
+        if _has_zero_arg_call(tree, aliases):
+            assert _emitting_calls(tree, _guarded_import_aliases(tree, "remember")), (
+                f"{path.name}: emits the note with no command and never calls "
+                "remember() — the note has nothing to report and goes silent"
+            )
     assert checked >= 6, f"the walk found only {checked} consumers — it went blind"
 
 
@@ -481,10 +534,10 @@ def test_cli_prints_the_note_to_stderr_and_always_exits_zero():
     """`bash_safety_hook.sh` calls this; a non-zero exit here would perturb the
     caller's own verdict, which is the one thing a cosmetic helper must not do."""
     proc = subprocess.run(
-        [sys.executable, str(_HOOKS / "discarded_write.py"), "--command", "cd /x && git push"],
+        [sys.executable, str(_HOOKS / "discarded_write.py")],
+        input="cd /x && git push",
         capture_output=True,
         text=True,
-        stdin=subprocess.DEVNULL,
         timeout=30,
     )
     assert proc.returncode == 0
@@ -494,14 +547,81 @@ def test_cli_prints_the_note_to_stderr_and_always_exits_zero():
 
 def test_cli_is_silent_and_zero_for_a_single_step_command():
     proc = subprocess.run(
-        [sys.executable, str(_HOOKS / "discarded_write.py"), "--command", "git push"],
+        [sys.executable, str(_HOOKS / "discarded_write.py")],
+        input="git push",
         capture_output=True,
         text=True,
-        stdin=subprocess.DEVNULL,
         timeout=30,
     )
     assert proc.returncode == 0
     assert proc.stderr == ""
+
+
+def test_no_configured_blocker_puts_the_refused_command_in_argv():
+    """The command reaches the helper on STDIN — never as a process argument.
+
+    A Bash payload can carry credentials; this repo already refuses to LOG one
+    for that reason (``git_discard_guard._record_snapshots``). ``argv`` is worse
+    than a log for a moment: ``/proc/<pid>/cmdline`` is readable by any local
+    process while the helper runs. And the refused command is never executed, so
+    without this rule the cosmetic note would be the ONLY thing that published
+    it.
+
+    Derived from the two places that spawn the helper — the shell safety hook and
+    the inline ``.claude/settings.json`` blocker — so a third spawn site is
+    covered the day it is written. Checking for the flag is not enough on its own,
+    so this also asserts the CLI has no argv path to reintroduce.
+    """
+    import json
+    import re
+
+    repo = _HOOKS.parents[1]
+    settings = json.loads((repo / ".claude" / "settings.json").read_text())
+    # The parsed JSON gives the REAL shell text, not its JSON escaping — the
+    # escaped form is unreadable and a matcher written against it is a matcher
+    # nobody can check.
+    inline = [
+        h["command"]
+        for group in settings["hooks"]["PreToolUse"]
+        for h in group["hooks"]
+        if "discarded_write.py" in h.get("command", "")
+    ]
+    assert inline, "the inline settings.json blocker that spawns the helper was not found"
+    spawns = [(repo / "scripts" / "bash_safety_hook.sh").read_text(), *inline]
+
+    # `python3 <path-to-helper> <ARGS>` — ARGS must be empty. The path is spelled
+    # differently at each site (a literal, or a shell variable holding it), so the
+    # pattern matches the interpreter and then whatever single token follows.
+    # `>` and `\` end the capture too: a redirection and a line continuation are
+    # not arguments, and the shell hook spells the spawn across two lines.
+    spawn_re = re.compile(r"python3\s+\"?\$?[^\s\"']*(?:discarded_write\.py|_dw)\"?([^;|&}\n><\\]*)")
+    seen = 0
+    for src in (s.replace("\\\n", " ") for s in spawns):
+        assert "--command" not in src, (
+            "a blocker passes the refused command in argv — it must arrive on "
+            "stdin, because argv is world-readable via /proc/<pid>/cmdline"
+        )
+        for m in spawn_re.finditer(src):
+            seen += 1
+            trailing = m.group(1).strip()
+            assert not trailing, (
+                f"a blocker spawns the helper with arguments ({trailing!r}) — the "
+                "refused command must reach it on stdin, never in argv"
+            )
+            before = src[: m.start()]
+            assert re.search(r"printf\s+.{0,4}%s.{0,4}\s+\"?\$\{?CMD\}?\"?\s*\|\s*(?:timeout[^|]*)?$", before), (
+                "a blocker spawns the helper without piping $CMD into it — the "
+                "command must be fed on stdin"
+            )
+    assert seen >= 2, f"the spawn walk found only {seen} sites — it went blind"
+
+    cli = (_HOOKS / "discarded_write.py").read_text()
+    assert '"--command"' not in cli, (
+        "the CLI still accepts the command in argv — the flag is the exposure, "
+        "and leaving it lets a future caller reintroduce it"
+    )
+
+
 _FORCE = "--" + "force"  # split so substring-matching safety hooks don't trip on fixtures
 _LONE_SUBSTITUTION = [
     f'git push {_FORCE} "$(cp a b)"',
@@ -582,6 +702,16 @@ def test_every_configured_bash_blocker_is_wired_for_the_note():
                 checked_inline += 1
                 assert "discarded_write.py" in cmd, (
                     "inline settings.json Bash blocker never invokes the note CLI"
+                )
+                # Presence of the path is satisfied by the `note(){ _dw="…"; }`
+                # DEFINITION, so it cannot tell a wired blocker from an unwired
+                # one. MEASURED: stripping every `note;` invocation while keeping
+                # the definition left this file green. Assert the SHAPE instead —
+                # each refusal calls note before it exits.
+                unnoted = re.findall(r"(?<!note; )exit 2", cmd)
+                assert not unnoted, (
+                    f"{len(unnoted)} inline blocker exit-2 site(s) refuse without "
+                    "calling note; first — the refusal loses its discarded-command note"
                 )
     assert checked_scripts >= 8, f"blocker walk went blind: {checked_scripts}"
     assert checked_inline >= 1, "the inline settings.json blocker was not seen"
