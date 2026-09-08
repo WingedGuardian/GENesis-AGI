@@ -38,6 +38,10 @@ _JUDGMENT_COLS = {
     "assertion_provenance",
     "durability",
     "expires_at",
+    # MW-4 satellite: same class, same trap — create_all_tables runs
+    # _migrate_add_columns and NOT the numbered runner, so the base-path
+    # mirror is the ONLY thing adding this column on an existing DB.
+    "preference_domain",
 }
 
 
