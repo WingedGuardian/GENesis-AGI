@@ -335,11 +335,25 @@ def run_case(
     if err:
         return Result(case, ABORTED, err)
 
-    # TOCTOU: the drift check above happened before `compile()` (and, for a
-    # `bash` validator, before an out-of-process `bash -n`). A peer edit landing
-    # in that window would be clobbered by the write below and then "restored"
-    # to the baseline -- silently destroying their work, which is the one thing
-    # guarantee (6) exists to prevent. Re-check immediately before writing.
+    # TOCTOU, NARROWED BUT NOT CLOSED -- stated plainly because the difference
+    # matters and a re-check cannot do better.
+    #
+    # The original drift check ran before `compile()` and, for a `bash`
+    # validator, before an out-of-process `bash -n`: a window measured in
+    # subprocess time. Re-checking here shrinks it to the gap between this read
+    # and the write on the next line. It does NOT eliminate it: a peer writing in
+    # that gap is clobbered, the restore then sees its own hash, and no CONFLICT
+    # is reported.
+    #
+    # A re-check can only ever narrow a TOCTOU. Closing it needs one of:
+    #   * mutating an ISOLATED COPY so the shared file is never written -- the
+    #     only option that actually closes it, and a rewrite of this module's
+    #     core (the test must then run against the copy);
+    #   * an exclusive lock across check/write/test/restore -- which serialises
+    #     other SWEEPS but not an arbitrary editor, and the arbitrary editor is
+    #     the threat. `flock` is advisory; a peer CC session does not take it.
+    # Accepted for now, and named here rather than left for the next reviewer to
+    # rediscover. Raised by CodeRabbit on PR #1851, tagged "heavy lift" by it too.
     if target.read_bytes() != base_bytes:
         return Result(case, CONFLICT,
                       "the target changed between the drift check and the "
