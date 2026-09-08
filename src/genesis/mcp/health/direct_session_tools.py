@@ -235,6 +235,13 @@ async def _lookup_session(db, session_id: str) -> dict | None:
         "output_preview": (metadata.get("output_text") or "")[:500],
         "transcript_path": metadata.get("transcript_path"),
         "tools_summary": metadata.get("tools_summary", {}),
+        # A run that dropped an over-limit stream line built `tools_summary`
+        # from the events the reader PARSED, so it is a floor rather than an
+        # inventory — a `Write` can be missing while the CLI performed it.
+        # Both projections carry the count, because a consumer cannot tell a
+        # short list from a complete one without it (the value is 0 on every
+        # intact run, which is the overwhelming majority).
+        "stream_lines_dropped": metadata.get("stream_lines_dropped", 0),
         "error": metadata.get("error"),
         "duration_s": metadata.get("duration_s"),
         "caller_context": metadata.get("caller_context"),
@@ -281,6 +288,8 @@ async def _impl_direct_session_list(
             "duration_s": metadata.get("duration_s"),
             "error": metadata.get("error"),
             "tools_summary": metadata.get("tools_summary", {}),
+            # Same qualifier as the status projection — see there.
+            "stream_lines_dropped": metadata.get("stream_lines_dropped", 0),
         })
 
     active_count = _runner.active_count() if _runner else 0

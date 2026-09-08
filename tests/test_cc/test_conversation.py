@@ -820,12 +820,21 @@ async def test_a_truncation_with_no_rate_limit_cause_records_none(
 async def test_a_truncation_after_streaming_does_not_answer_twice(
     loop_with_contingency, mock_invoker,
 ):
-    """The BOUND on the contingency degradation.
+    """The BOUND on the contingency degradation — and it must not be silence.
 
     An oversized TOOL-RESULT line can be dropped after answer text already
     reached the user. Running contingency then stacks a second,
-    differently-sourced answer on top of what is already on screen — the same
-    double-output the peer loop returns "" to avoid.
+    differently-sourced answer on top of what is on screen.
+
+    But returning "" is the wrong way to stop it, which is the correction this
+    test now carries (Codex P1, PR #1625 round 4). `streamed["text"]` records
+    that a text EVENT passed `_failover_tracked`, NOT that anything was
+    delivered: outside a private Telegram chat the streamer is None
+    (`_handler_messages.py:122-128`) and `_on_event` no-ops
+    (`_handler_context.py:99`) while the flag still flips. An empty return
+    there shows the user nothing at all — a silent empty success, the exact
+    shape this PR exists to prevent. A short notice is safe when text DID
+    arrive and is the only output when it did not.
     """
     from genesis.cc.exceptions import CCStreamTruncatedError
     from genesis.cc.types import StreamEvent
@@ -843,5 +852,10 @@ async def test_a_truncation_after_streaming_does_not_answer_twice(
         "hello", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
     )
 
-    assert result == "", f"contingency answered over the streamed text: {result!r}"
+    # No second answer...
     contingency.dispatch_conversation.assert_not_awaited()
+    assert "Kimi fallback response" not in result
+    # ...and no silence either. The second assertion is the one that would have
+    # caught the regression; `!= ""` alone would pass on any stray whitespace.
+    assert result.strip(), "a truncated turn returned an empty, non-error reply"
+    assert "lost this answer" in result, f"the user was told nothing useful: {result!r}"

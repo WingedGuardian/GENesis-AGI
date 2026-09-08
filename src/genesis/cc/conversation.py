@@ -61,6 +61,20 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
+# What a turn says when an over-limit stream line ate its answer. A SENTENCE,
+# never "": an empty reply is a silent empty success, and the whole point of
+# CCStreamTruncatedError is that this failure is never silent. Deliberately
+# names the reason the turn is not being retried for the user — the tools the
+# first attempt already ran would run a second time — so "just try again" is
+# their decision rather than an invisible default.
+_TRUNCATION_NOTICE = (
+    "⚠️ Genesis lost this answer: one line of the model's output was too "
+    "large to read back. It is not being retried automatically, because the "
+    "tools the first attempt already ran would run again. Send it again if "
+    "you want another attempt."
+)
+
+
 # Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
 # durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
 # kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
@@ -1311,11 +1325,18 @@ class ConversationLoop:
                     )
                     if streamed and streamed.get("text"):
                         # The peer demonstrably SERVED — clear any stale block,
-                        # as the branches above do — and return "" so the caller
-                        # skips contingency, which would stack a second answer
-                        # on the text already on the user's screen.
+                        # as the branches above do — and stop the caller running
+                        # contingency, which would stack a second answer on text
+                        # the user may already be reading.
+                        #
+                        # The NOTICE rather than "", for the reason spelled out
+                        # in `_handle_stream_truncated`: this flag records that a
+                        # text EVENT was observed, not that anything reached the
+                        # user, so on a channel whose streamer is a no-op an
+                        # empty return shows nothing at all. A sentence is safe
+                        # either way; silence is not.
                         await _record_peer(peer_availability.note_success, peer_name)
-                        return ""
+                        return _TRUNCATION_NOTICE
                     # None → contingency, which is a TOOL-LESS API call
                     # (`contingency.dispatch_conversation`: "no CC tool access"),
                     # so it cannot repeat what the peer already did. The turn
@@ -1822,14 +1843,28 @@ class ConversationLoop:
             except Exception:
                 logger.error("Failed to record rate limit", exc_info=True)
         if streamed and streamed.get("text"):
-            # Answer text is already on the user's screen. Contingency would
-            # stack a second, differently-sourced answer on top of it — the
-            # same double-output the peer loop returns "" to avoid.
+            # Text was OBSERVED on the stream, so contingency must not run — it
+            # would stack a second, differently-sourced answer on top of what
+            # the user may already be reading.
+            #
+            # Returning "" here would be wrong, and this is the one place in
+            # the file where the difference is load-bearing. `streamed["text"]`
+            # records that a text EVENT went past `_failover_tracked`
+            # (`conversation.py:693`), NOT that anything was delivered: the
+            # Telegram streamer is None outside a private chat
+            # (`_handler_messages.py:122-128`), so `_on_event` no-ops
+            # (`_handler_context.py:99`) while the flag still flips. An empty
+            # return there shows the user nothing at all — a silent empty
+            # success, which is precisely what this PR exists to prevent.
+            #
+            # So say it instead. The notice is a short sentence, not a second
+            # answer, so it is safe when text DID reach the user and it is the
+            # only output when it did not. Strictly better than "" in both.
             logger.warning(
-                "CC stream truncated after text streamed — not running "
-                "contingency over it: %s", exc,
+                "CC stream truncated after text was streamed — contingency "
+                "suppressed, returning the notice only: %s", exc,
             )
-            return ""
+            return _TRUNCATION_NOTICE
         fallback = await self._try_contingency(
             prompt_text, system_prompt, channel, session_id=session["id"],
         )
@@ -1838,11 +1873,7 @@ class ConversationLoop:
         logger.error(
             "CC stream truncated and contingency unavailable: %s", exc, exc_info=True,
         )
-        return (
-            "[Genesis lost this answer to an oversized tool result. It is not "
-            "being retried automatically — the tools the first attempt already "
-            "ran would run again. Send it again if you want another attempt.]"
-        )
+        return _TRUNCATION_NOTICE
 
     async def _try_contingency(
         self,

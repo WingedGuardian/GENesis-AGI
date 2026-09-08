@@ -909,5 +909,11 @@ async def test_a_dropped_result_after_streaming_does_not_double_output(
     assert calls == [("success", "peer-a")], (
         f"the generic CCError branch ran instead of the truncation branch: {calls}"
     )
-    assert result == "", "None here lets contingency answer over the streamed text"
     assert invoker.run.await_count == 1  # peer-b never attempted
+    # Not None (that lets contingency answer over the streamed text) and not ""
+    # either: `streamed["text"]` means a text EVENT was observed, not that the
+    # channel delivered it, so an empty return can show the user nothing at all
+    # (Codex P1, PR #1625 round 4). A notice is safe in both cases.
+    assert result is not None
+    assert result.strip(), "a truncated failover returned an empty, non-error reply"
+    assert "lost this answer" in result, f"the user was told nothing useful: {result!r}"
