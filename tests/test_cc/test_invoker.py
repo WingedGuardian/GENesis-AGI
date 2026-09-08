@@ -4,15 +4,17 @@ import asyncio
 import json
 import logging
 import signal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from genesis.cc.exceptions import CCProcessError, CCTimeoutError
+from genesis.cc.exceptions import CCProcessError, CCStreamTruncatedError, CCTimeoutError
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
+    ChannelType,
     EffortLevel,
     StreamEvent,
     clamp_effort,
@@ -866,23 +868,54 @@ def _make_mock_stderr(data: bytes = b""):
     return _AsyncReader()
 
 
-def _make_async_stdout(data: bytes):
-    """Create a mock async iterator for proc.stdout."""
+def _make_async_stdout(data: bytes, *, raise_on: tuple[int, ...] = ()):
+    """A faithful-enough stand-in for asyncio.StreamReader over `data`.
+
+    Faithfulness matters here in one specific way. The reader consumes stdout
+    with readline(), where an empty return means EOF and ONLY EOF — a blank
+    line in the stream comes back as b"\n". A fake built on data.split(b"\n")
+    yields a bare b"" for a blank line, which the reader would take as EOF and
+    silently truncate the stream mid-run. So lines keep their terminator and
+    b"" is emitted exactly once, at the end.
+
+    `raise_on` names 0-based line indices where readline() raises ValueError,
+    reproducing StreamReader's over-limit behaviour: it discards the offending
+    span BEFORE raising, so the next call returns the FOLLOWING line — which is
+    what makes skip-and-continue safe rather than an infinite loop.
+    """
 
     class _AsyncStdout:
-        def __init__(self, lines):
-            self._lines = iter(lines)
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
+            # Which indices the reader actually asked for. A fault injected at
+            # an index that is never requested makes a test VACUOUS, and the
+            # loop breaks on the `result` event — so anything after it is never
+            # read. Tests assert against this rather than assuming.
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            if self._i >= len(self._lines):
+                return b""
+            idx = self._i
+            self._i += 1                      # consumed BEFORE raising
+            self.reads.append(idx)
+            if idx in raise_on:
+                raise ValueError(
+                    "Separator is not found, and chunk exceed the limit"
+                )
+            return self._lines[idx]
 
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            try:
-                return next(self._lines)
-            except StopIteration:
-                raise StopAsyncIteration from None
+            line = await self.readline()
+            if not line:
+                raise StopAsyncIteration
+            return line
 
-    return _AsyncStdout(data.split(b"\n"))
+    return _AsyncStdout(data)
 
 
 @pytest.mark.asyncio
@@ -957,16 +990,24 @@ async def test_run_streaming_timeout_returns_partial(invoker, monkeypatch):
     data = _make_stream_lines(*events)
 
     mock_proc = AsyncMock()
-    # Simulate: stdout yields lines then hangs → timeout fires
-    lines = data.split(b"\n")
+    # Simulate: stdout yields lines then hangs → timeout fires. Must expose
+    # readline() (the reader no longer uses the async-iterator protocol), and
+    # must hang at the AWAIT rather than end the stream — an EOF would exit
+    # the loop cleanly and never reach the timeout this test is about.
+    class _SlowStdout:
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
 
-    async def _slow_iter():
-        for line in lines:
-            yield line
-        # Simulate hang
-        await asyncio.sleep(999)
+        async def readline(self) -> bytes:
+            if self._i < len(self._lines):
+                line = self._lines[self._i]
+                self._i += 1
+                return line
+            await asyncio.sleep(3600)  # hang, do not EOF
+            return b""
 
-    mock_proc.stdout = _slow_iter()
+    mock_proc.stdout = _SlowStdout(data)
     mock_proc.stdin = _make_mock_stdin()
     mock_proc.stderr = _make_mock_stderr()
     mock_proc.pid = 99999  # Must set — see test_run_timeout comment
@@ -2044,6 +2085,11 @@ async def test_run_streaming_cancelled_kills_subprocess(invoker, monkeypatch):
         def __aiter__(self):
             return self
 
+        async def readline(self):
+            # Cancellation is delivered at the stdout await point, which is
+            # now readline() rather than __anext__.
+            raise asyncio.CancelledError()
+
         async def __anext__(self):
             # Simulate task.cancel() delivered at the stdout await point
             raise asyncio.CancelledError
@@ -2531,6 +2577,769 @@ async def test_streaming_escalates_when_leader_exits_but_group_survives(
     assert (99992, _signal.SIGKILL) in calls
 
 
+# --- Over-limit stream-json lines must cost the LINE, not the SESSION -------
+# MEASURED 2026-09-02: a browser session emitted one stream-json line above the
+# 1 MiB reader limit. StreamReader.readline() raised ValueError, it propagated
+# out of `async for raw_line in proc.stdout`, and the whole session died after
+# 104.4s of completed work. One occurrence since 2026-08-01 — rare, and total
+# loss when it fires.
+
+
+def _result_event(text: str = "done") -> dict:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": text,
+        "session_id": "s1",
+        "total_cost_usd": 0.01,
+        "duration_ms": 10,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+def _streaming_proc(data: bytes, *, raise_on: tuple[int, ...] = ()):
+    proc = AsyncMock()
+    proc.stdout = _make_async_stdout(data, raise_on=raise_on)
+    proc.stdin = _make_mock_stdin()
+    proc.stderr = _make_mock_stderr()
+    proc.wait = AsyncMock()
+    proc.terminate = MagicMock()
+    proc.returncode = 0
+    return proc
+
+
+def _no_host_syscalls(monkeypatch):
+    """Keep BOTH host-touching calls off the real process table.
+
+    `killpg` is the known one (procedure `process_kill_safety`). The second bites
+    one syscall earlier and the same fake pid feeds it: `run_streaming` calls
+    `set_oom_score_adj(proc.pid, 500)` (`invoker.py:1202`), which writes
+    `/proc/<pid>/oom_score_adj` (`invoker.py:57-58`). A MagicMock pid makes that
+    path nonsense and it fails harmlessly, but an int pid that happens to be a
+    live same-uid process gets its OOM score raised to +500 — the kernel is then
+    told to prefer killing an unrelated process. Stub it rather than gamble on
+    the pid being vacant.
+    """
+    def _gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _gone)
+    monkeypatch.setattr("genesis.cc.invoker.set_oom_score_adj", lambda *a, **k: None)
+
+
+@pytest.mark.asyncio
+async def test_over_limit_line_is_dropped_and_the_session_survives(invoker):
+    """The exact incident shape: an oversized line mid-stream, with the real
+    result arriving after it."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        _result_event("survived"),
+    )
+    # index 1 = the assistant line; it raises instead of being returned.
+    proc = _streaming_proc(data, raise_on=(1,))
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "survived"
+    assert output.session_id == "s1"
+    assert not output.is_error
+    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+
+
+@pytest.mark.asyncio
+async def test_multiple_over_limit_lines_all_dropped(invoker):
+    """Several oversized lines in one stream must not compound into a failure,
+    and must not spin: readline() consumes the span before raising."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "a"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "b"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "c"}]}},
+        _result_event("still here"),
+    )
+    proc = _streaming_proc(data, raise_on=(1, 2, 3))
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "still here"
+    assert {1, 2, 3} <= set(proc.stdout.reads), proc.stdout.reads
+
+
+@pytest.mark.asyncio
+async def test_dropping_the_result_line_raises_instead_of_faking_success(invoker):
+    """THE dangerous case, and the reason dropping cannot be silent.
+
+    If the dropped line was the `result` event there is no result at all. The
+    no-result path builds CCOutput(is_error=False, session_id="", cost_usd=0.0),
+    and downstream `success = not output.is_error` would record a phantom
+    completion — which on the home model calls note_home_recovery() and clears
+    an account-wide rate-limit fallback, and whose empty-text shape forges the
+    silent subscription-cap signature that becomes a CRITICAL alert. Before the
+    drop-and-continue loop this raised; it must keep raising.
+
+    Also the drop-then-EOF shape: nothing parseable follows, so a loop that
+    failed to advance would spin instead of reaching EOF.
+
+    The TYPE is pinned, not just the raising. This asserted `CCProcessError`,
+    which `CCStreamTruncatedError` subclasses — so reverting to the generic
+    error left this test green while restoring the replay hazard it exists to
+    prevent (Codex P1, PR #1625 round 1). The subclass relationship is asserted
+    separately, since existing `except CCProcessError` handlers depend on it.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _result_event("never seen"),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))   # the RESULT line is dropped
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="NO result event"),
+    ):
+        await asyncio.wait_for(
+            invoker.run_streaming(CCInvocation(prompt="x")), timeout=10
+        )
+
+    assert issubclass(CCStreamTruncatedError, CCProcessError), (
+        "handlers catching CCProcessError must keep catching this"
+    )
+
+    # Guard the guard: prove the injected fault was actually REACHED. The reader
+    # breaks on a result event, so a fault placed after one is never read and
+    # the test would pass with the whole except-branch deleted.
+    assert 1 in proc.stdout.reads, proc.stdout.reads
+
+
+@pytest.mark.asyncio
+async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(invoker):
+    """A drop is a KNOWN cause of thin output, so it must not be reported as the
+    unexplained-empty signature the silent-cap detector aggregates into a
+    CRITICAL alert.
+
+    The reachable shape is a result that DID arrive but is empty, alongside a
+    drop. (Drop + NO result raises before reaching any detector, so a guard on
+    that branch would be dead code — a mutation sweep caught exactly that.)
+
+    Not firing the detector was only HALF the answer, and the half this test
+    originally asserted — returning the empty output as a success — was the
+    other half done wrong (Codex P1, PR #1625 round 1). An empty result after a
+    drop is a LOST ANSWER: downstream `success = not output.is_error` records a
+    phantom completion, and on the home model that clears an account-wide
+    rate-limit fallback. So the run raises, and the assertion that matters here
+    is that it raises WITHOUT forging the cap signature on its way out.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}},
+        _result_event(""),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))   # drop the assistant line
+    fired = []
+
+    async def _spy(*a, **k):
+        fired.append(a)
+
+    invoker._fire_empty_output_callback = _spy
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+    assert not fired, "a dropped-line run forged the silent-cap signature"
+
+
+@pytest.mark.asyncio
+async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
+    invoker, monkeypatch
+):
+    """A drop plus NO result normally raises — but not when something else
+    already accounts for the missing result.
+
+    A background run SIGKILLed at the CLI's wait ceiling legitimately emits no
+    result event, and the no-result fallback returns what it collected with
+    ``bg_truncated=True`` and its own truncation notice. Raising instead throws
+    away a usable partial deliverable and blames a cause that is not the cause
+    (Codex P2, PR #1625 round 1): the trace line was oversized, the ANSWER was
+    not — it is right there in the collected text.
+
+    Ordering is the whole finding. The raise sat ahead of the fallback, so the
+    two conditions could never be weighed against each other.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "oversized"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "keep me"}]}},
+    )
+    # index 1 = the oversized tool-result trace; no result event ever arrives.
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.stderr = _make_mock_stderr(
+        b"Background tasks still running after 600s; terminating.\n"
+    )
+    proc.pid = 424201  # explicit + distinct; never a mock default
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+    assert output.text == "keep me", "the partial deliverable was discarded"
+    assert output.bg_truncated is True, "the truncation notice was lost"
+    # The OTHER return path that hands back a drop-affected output. Its CCOutput
+    # is hand-built rather than derived from a result event, so it needs its own
+    # assertion — the sibling stamp on the result path cannot cover it.
+    assert output.stream_lines_dropped == 1, (
+        "the no-result path returned a partial run as a clean one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(
+    invoker, monkeypatch
+):
+    """CLAUSE COVER for `oversized_dropped` in the result guard.
+
+    Empty output with NO drop is the unexplained-empty shape the silent-cap
+    detector exists to aggregate. Only a DROP explains it away. Without this,
+    deleting that clause — so any empty result raises — passes the suite, and
+    the cap detector goes permanently silent behind an exception.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _result_event(""),
+    )
+    proc = _streaming_proc(data)  # nothing dropped
+    proc.pid = 424202  # explicit + distinct; never a mock default
+    fired = []
+
+    async def _spy(*a, **k):
+        fired.append(a)
+
+    invoker._fire_empty_output_callback = _spy
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
+
+    assert output.text == ""
+    assert fired, "an unexplained empty result stopped reaching the cap detector"
+
+
+@pytest.mark.asyncio
+async def test_no_result_and_no_drop_returns_the_collected_text(invoker, monkeypatch):
+    """CLAUSE COVER for `oversized_dropped` in the no-result guard.
+
+    A stream that ends without a result event is an ordinary supported shape —
+    the collected text IS the response. Deleting that clause turns every one of
+    those into a raise, which this pins.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "answer"}]}},
+    )
+    proc = _streaming_proc(data)  # nothing dropped, no result event
+    proc.pid = 424203  # explicit + distinct; never a mock default
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(
+    invoker, monkeypatch
+):
+    """CLAUSE COVER for the `bg_truncated` conjunct of the exemption.
+
+    Surviving partial text is NOT on its own a reason to forgive a missing
+    result — the exemption exists for a background run killed at the wait
+    ceiling, which is what makes the absence explainable. Drop the
+    ``bg_truncated`` conjunct and any run with leftover text goes quiet.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "oversized"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "keep me"}]}},
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.pid = 424204  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="NO result event"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+
+@pytest.mark.asyncio
+async def test_bg_truncation_with_nothing_collected_still_raises(invoker, monkeypatch):
+    """CLAUSE COVER for the `partial_text` conjunct of the exemption.
+
+    Background truncation forgives a missing result only when there is a
+    deliverable to return instead. With the answer itself dropped there is
+    nothing to hand back, so this is the lost-answer case again and must raise.
+    Drop that conjunct and it returns an empty success — the phantom completion
+    the whole guard exists to prevent.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "the answer"}]}},
+    )
+    proc = _streaming_proc(data, raise_on=(1,))  # the only text line is dropped
+    proc.stderr = _make_mock_stderr(
+        b"Background tasks still running after 600s; terminating.\n"
+    )
+    proc.pid = 424205  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="NO result event"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_result_never_retries_the_same_failover_peer():
+    """The SECOND retry site, which the first fix missed entirely.
+
+    `_run_failover_peer` re-runs the same prompt on the same peer when a sticky
+    resume fails. Its only side-effect guard is "answer text already streamed" —
+    and an oversized line eats the answer, so that guard reads empty exactly
+    when a re-run is least safe. Before the failure was typed it arrived as a
+    bare ValueError and missed this handler; typing it ARMED this path, so the
+    type has to be re-raised here too or the fix relocates the hazard.
+    """
+    from genesis.cc.conversation import ConversationLoop
+
+    loop = ConversationLoop.__new__(ConversationLoop)
+    calls = []
+
+    async def _invoke(inv, on_event):
+        calls.append(inv)
+        raise CCStreamTruncatedError("result line dropped")
+
+    loop._invoke_peer = _invoke
+
+    with pytest.raises(CCStreamTruncatedError):
+        await loop._run_failover_peer(
+            "peer-a",
+            CCInvocation(prompt="x"),
+            sticky={"roster_model": "peer-a", "cc_session_id": "sess-1"},
+            on_event=None,
+            streamed={"text": ""},  # the answer was lost, so nothing streamed
+        )
+
+    assert len(calls) == 1, f"the prompt was replayed on the same peer ({len(calls)}x)"
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_result_never_triggers_stale_resume_recovery():
+    """The error type is load-bearing, so pin it at the HANDLER, not the raise.
+
+    A resumed turn that raises a bare ``CCError`` lands in
+    ``_recover_stale_resume``, which fails the session and re-runs the prompt
+    from scratch — after the first attempt already executed its tool calls. An
+    MCP write or an outreach send would happen twice, with nothing downstream
+    to dedupe (Codex P1, PR #1625 round 1).
+
+    Asserting the raise alone would not catch this: the old code raised too,
+    just with a type the retry path swallowed. What must hold is that the
+    exception REACHES the caller on a resume.
+    """
+    from genesis.cc.conversation import ConversationLoop
+
+    loop = ConversationLoop.__new__(ConversationLoop)
+    loop._invoker = SimpleNamespace(
+        run_streaming=AsyncMock(side_effect=CCStreamTruncatedError("result line dropped"))
+    )
+
+    async def _must_not_run(*a, **k):  # pragma: no cover - the point is it never runs
+        raise AssertionError("stale-resume recovery replayed a size failure")
+
+    loop._recover_stale_resume = _must_not_run
+
+    with pytest.raises(CCStreamTruncatedError):
+        await loop._try_invoke_streaming(
+            CCInvocation(prompt="x"),
+            session={"session_id": "s1"},
+            was_resume=True,  # the dangerous case: a live session mid-conversation
+            prompt_text="x",
+            model=CCModel.SONNET,
+            effort=EffortLevel.MEDIUM,
+            user_id="u1",
+            channel=ChannelType.TELEGRAM,
+            thread_id=None,
+            on_event=None,
+        )
+
+
+def _error_result_event(text: str) -> dict:
+    ev = _result_event(text)
+    ev["subtype"] = "error_during_execution"
+    ev["is_error"] = True
+    return ev
+
+
+@pytest.mark.asyncio
+async def test_a_drop_before_an_error_result_is_not_a_retryable_error(
+    invoker, monkeypatch
+):
+    """The RETRYABLE branches run before the drop guard, so they had to learn it.
+
+    The first round's fix only covered the shapes that fall THROUGH to the guard.
+    An oversized line followed by an `is_error` result never reaches it: the
+    error is classified and raised first, and a classified CCError is exactly
+    what `_recover_stale_resume` reruns and what roster failover replaces with a
+    second full-tools peer run — after the tool calls behind the dropped line
+    already happened (Codex P1, PR #1625 round 2). Before drop-and-continue this
+    shape aborted the read with a bare ValueError, so it never reached a retry
+    path at all; surviving the line is what exposed it.
+
+    Note the result here carries TEXT. The hazard is not "the answer is missing"
+    — it is "this run must not be replayed" — so a guard keyed on empty text
+    would sail straight past this case.
+    """
+    from genesis.cc.exceptions import CCQuotaExhaustedError
+
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "oversized tool result"},
+        ]}},
+        _error_result_event("You've hit your usage limit"),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.pid = 424206  # explicit + distinct; never a mock default
+    statuses: list = []
+
+    async def _spy(err):
+        statuses.append(err)
+
+    invoker._notify_status_change = _spy
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError) as caught,
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+    assert isinstance(caught.value.__cause__, CCQuotaExhaustedError), (
+        "the provider's own classification must survive as the cause"
+    )
+    # The status signal is real evidence about the account and still worth
+    # having — suppressing the retry must not also suppress the back-off.
+    assert [type(e) for e in statuses] == [CCQuotaExhaustedError]
+
+
+@pytest.mark.asyncio
+async def test_an_error_result_without_a_drop_still_raises_the_classified_error(
+    invoker, monkeypatch
+):
+    """CLAUSE COVER for `oversized_dropped` at the is_error branch.
+
+    A run that errors with the stream fully read is an ordinary, retryable
+    failure — stale-resume recovery and roster failover exist for it. Drop the
+    clause and every CC error becomes un-retryable, which silently disables both.
+    """
+    from genesis.cc.exceptions import CCQuotaExhaustedError
+
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _error_result_event("You've hit your usage limit"),
+    )
+    proc = _streaming_proc(data)  # nothing dropped
+    proc.pid = 424207  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCQuotaExhaustedError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+
+@pytest.mark.asyncio
+async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
+    invoker, monkeypatch
+):
+    """The second retryable branch, and the more expensive one.
+
+    A rate-limit error is what sends the turn to roster failover, so replaying
+    it costs a whole second peer running the same prompt with full tools. Same
+    ordering defect as the is_error branch: it raises before the drop guard.
+    """
+    from genesis.cc.exceptions import CCRateLimitError
+
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "oversized tool result"},
+        ]}},
+        {"type": "rate_limit_event", "info": {}},
+        _result_event(""),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.pid = 424208  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError) as caught,
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+    assert isinstance(caught.value.__cause__, CCRateLimitError)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(
+    invoker, monkeypatch
+):
+    """CLAUSE COVER for `oversized_dropped` at the rate-limit branch.
+
+    Without a drop, an empty rate-limited result is exactly what failover is
+    for. Drop the clause and the turn stops reaching a peer at all.
+    """
+    from genesis.cc.exceptions import CCRateLimitError
+
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "rate_limit_event", "info": {}},
+        _result_event(""),
+    )
+    proc = _streaming_proc(data)  # nothing dropped
+    proc.pid = 424209  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCRateLimitError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+
+@pytest.mark.asyncio
+async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
+    invoker, monkeypatch
+):
+    """The BOUND on the two fixes above, and the reason they are placed where
+    they are rather than hoisted above the whole result block.
+
+    A rate-limit event alongside a real answer RETURNS that answer — it raises
+    nothing, so it permits no replay and needs no guard. Hoisting the drop check
+    over this branch would throw away a delivered answer to prevent a retry that
+    was never going to happen.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "oversized tool result"},
+        ]}},
+        {"type": "rate_limit_event", "info": {}},
+        _result_event("the answer survived"),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.pid = 424210  # explicit + distinct; never a mock default
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+    assert output.text == "the answer survived"
+
+
+@pytest.mark.asyncio
+async def test_a_surviving_answer_still_reports_the_lines_it_lost(
+    invoker, monkeypatch
+):
+    """The drop has to be visible OUTSIDE `run_streaming`.
+
+    This is the return path that matters most, because it is the one that looks
+    completely healthy: an oversized tool trace is dropped, the real answer
+    arrives, and the output is handed back as an ordinary success. Any consumer
+    that derives an inventory from the events it saw — `direct_session`'s tool
+    telemetry, and through it the protected-path auditor's pre-filter — then
+    treats a floor as a complete list.
+
+    Asserted against the REAL reader on purpose. The direct-session test for the
+    same mechanism fakes `run_streaming` and constructs its own `CCOutput`, so
+    it cannot see whether the invoker stamps anything — a mutation sweep caught
+    exactly that, with the stamp deleted and that test still green.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "oversized tool result"},
+        ]}},
+        _result_event("the answer survived"),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))
+    proc.pid = 424301  # explicit + distinct; never a mock default
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+    assert output.text == "the answer survived"
+    assert output.stream_lines_dropped == 1, (
+        "a run that lost a line reported itself as a clean one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_run_reports_no_dropped_lines(invoker, monkeypatch):
+    """The other direction of the stamp: an intact stream reports zero, or every
+    ego dispatch would skip the cheap audit pre-filter forever.
+
+    Stated precisely, because the obvious mutation for it does nothing. A clean
+    run SKIPS the guarded stamp entirely, and `replace(..., 0)` is a no-op
+    anyway, so no edit inside that branch can be felt here. What this actually
+    pins is the field DEFAULT meaning "nothing was dropped" — changing
+    `CCOutput.stream_lines_dropped`'s default is what turns it RED, and that is
+    the mutation it was verified against.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _result_event("clean"),
+    )
+    proc = _streaming_proc(data)  # nothing dropped
+    proc.pid = 424302  # explicit + distinct; never a mock default
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.stream_lines_dropped == 0
+
+
+class _TailAfterOverrunStdout:
+    """The half of ``readline()``'s overrun behaviour the shared fake omits.
+
+    MEASURED against CPython 3.12 ``StreamReader.readline`` (``asyncio/streams.py``,
+    the ``LimitOverrunError`` arm): it deletes through the separator only when the
+    separator is ALREADY BUFFERED. When the newline has not arrived yet it merely
+    clears the buffer, so the REMAINDER of that physical line is returned by the
+    NEXT call. A 64-byte-limit probe returned the tail verbatim as the following
+    "line". ``_make_async_stdout`` models only the favourable case — which is
+    exactly why the raw-tail path went unnoticed.
+    """
+
+    def __init__(self, tail: bytes, rest: bytes):
+        self._steps: list = [ValueError("Separator is not found"), tail, *rest.splitlines(keepends=True)]
+        self._i = 0
+        self.reads: list[int] = []
+
+    async def readline(self) -> bytes:
+        if self._i >= len(self._steps):
+            return b""
+        step = self._steps[self._i]
+        self.reads.append(self._i)
+        self._i += 1
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+@pytest.mark.asyncio
+async def test_the_tail_of_a_dropped_line_never_reaches_the_log_verbatim(
+    invoker, monkeypatch, caplog
+):
+    """A dropped over-limit line does not vanish — its TAIL comes back.
+
+    `readline()` clears the buffer without consuming the rest of the physical
+    line, so the next call hands back raw tool-result bytes that fail JSON
+    parsing and used to be logged 200 characters at a time. Tool output can
+    carry a credential or personal data, and this repo's logs feed health
+    snapshots and LLM prompts elsewhere, so the bytes must not go to the log.
+    The size still does: it is what shows the stream resynchronising.
+    """
+    _no_host_syscalls(monkeypatch)
+    canary = "tok-live-canary-value"
+    proc = _streaming_proc(b"")
+    proc.stdout = _TailAfterOverrunStdout(
+        tail=f'nput":"{canary}"}}}}\n'.encode(),
+        rest=_make_stream_lines(_result_event("the real answer")),
+    )
+    proc.pid = 424211  # explicit + distinct; never a mock default
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+    ):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "the real answer"  # the run still completes
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any(canary in m for m in messages), (
+        f"raw tool bytes reached the log: {[m for m in messages if canary in m]}"
+    )
+    assert any("content withheld" in m for m in messages), (
+        "the resync was silent — nothing says the stream dropped and recovered"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(
+    invoker, monkeypatch, caplog
+):
+    """CLAUSE COVER for `oversized_dropped` at the non-JSON log.
+
+    With nothing dropped, a non-JSON line is a CLI protocol fault and its text
+    is the whole diagnostic. Withholding it unconditionally would blind that.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = b"this-is-not-json-at-all\n" + _make_stream_lines(_result_event("ok"))
+    proc = _streaming_proc(data)  # nothing dropped
+    proc.pid = 424212  # explicit + distinct; never a mock default
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+    ):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "ok"
+    assert any(
+        "this-is-not-json-at-all" in r.getMessage() for r in caplog.records
+    ), "a protocol fault on a clean stream lost its only diagnostic"
+
+
+@pytest.mark.asyncio
+async def test_blank_line_mid_stream_is_not_treated_as_eof(invoker):
+    """readline() returns b"" ONLY at EOF; a blank line comes back as b"\\n".
+
+    A reader that treats any falsy line as EOF truncates the stream at the
+    first blank line and silently loses the result — which is worse than the
+    crash being fixed, because it looks like a clean empty run.
+    """
+    data = (
+        _make_stream_lines({"type": "system", "subtype": "init", "session_id": "s1"})
+        + b"\n"
+        + _make_stream_lines(_result_event("after blank"))
+    )
+    proc = _streaming_proc(data)
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "after blank"
+
+
 @pytest.mark.asyncio
 async def test_a_multi_block_assistant_line_warns_exactly_once(invoker, caplog):
     """Pin the assumption the stream loop relies on, instead of coding around a
@@ -2620,3 +3429,86 @@ async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog
     assert output.text == "done"
     hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
     assert not hits, "canary fired on a line from_raw parses losslessly"
+
+
+@pytest.mark.asyncio
+async def test_a_drop_then_a_timeout_is_still_unreplayable(invoker, monkeypatch):
+    """The THIRD retryable exit, and the one a wrong comment hid.
+
+    A failover peer can run its tools, drop an oversized line, and only then hit
+    `timeout_s`. `CCTimeoutError` looks safe because `_try_invoke` and
+    `_try_invoke_streaming` both re-raise it — but `_run_failover_peer`
+    (`conversation.py:1114-1119`) does NOT carry it, so it lands on
+    `_try_roster_failover`'s generic `except CCError` and the loop advances to
+    the next peer, replaying the prompt with full tools (Codex P1, PR #1625
+    round 5). Before drop-and-continue the over-limit ValueError escaped every
+    retry path, so this combination is newly reachable.
+
+    A drop outranks the timeout: the only question the TYPE answers is "may I
+    re-run this?", and after a drop the answer is no regardless of what else
+    went wrong.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "oversized tool result"},
+        ]}},
+    )
+
+    class _DropThenHang:
+        """Drop line 1, then never return — the reader hits its timeout."""
+
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            idx = self._i
+            self.reads.append(idx)
+            self._i += 1
+            if idx == 1:
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+            if idx < len(self._lines):
+                return self._lines[idx]
+            await asyncio.Event().wait()  # hang until the timeout fires
+            return b""
+
+    proc = _streaming_proc(b"")
+    proc.stdout = _DropThenHang(data)
+    proc.pid = 424303  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="timed out"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x", timeout_s=1))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_without_a_drop_is_still_a_timeout(invoker, monkeypatch):
+    """CLAUSE COVER: an ordinary timeout must keep its own type, or the
+    timeout-specific handling in every caller stops matching."""
+    _no_host_syscalls(monkeypatch)
+
+    class _Hang:
+        def __init__(self):
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            self.reads.append(0)
+            await asyncio.Event().wait()
+            return b""
+
+    proc = _streaming_proc(b"")
+    proc.stdout = _Hang()
+    proc.pid = 424304  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCTimeoutError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x", timeout_s=1))

@@ -519,6 +519,16 @@ class CCOutput:
     # user and/or a cc.bg_truncated observability event — so the silent-death
     # class (2026-07-20 deep-research) can never recur unremarked.
     bg_truncated: bool = False
+    # How many over-limit stream-json lines the reader DROPPED on this run.
+    # Nonzero means the event stream this output was built from is INCOMPLETE:
+    # a `tool_use` event can have been lost while the CLI still executed that
+    # tool, so anything derived from the observed events (telemetry, tool
+    # counts, "which tools ran") is a floor, never an inventory. Consumers that
+    # would otherwise treat their derived summary as authoritative must fall
+    # back to a source that does not depend on our reading of the stream — the
+    # CC transcript on disk. Sibling of `bg_truncated`: both say "this result is
+    # partial", and both exist so the partiality cannot be silent.
+    stream_lines_dropped: int = 0
 
 
 @dataclass(frozen=True)

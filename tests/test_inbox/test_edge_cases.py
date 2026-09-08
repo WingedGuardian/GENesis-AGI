@@ -1048,17 +1048,32 @@ async def test_run_streaming_sends_prompt_via_stdin(invoker):
     })
 
     class _AsyncStdout:
+        """Fake stdout for the streaming reader.
+
+        Carries `readline` as well as async iteration: the reader stopped using
+        `async for` when an over-limit line had to cost the LINE rather than the
+        session (an oversized line raises `ValueError` out of the iterator and
+        kills the whole run), and a fake that only implements `__aiter__` then
+        fails with AttributeError rather than exercising anything.
+        """
+
         def __init__(self):
             self._lines = iter([result_event.encode() + b"\n"])
+
+        async def readline(self):
+            try:
+                return next(self._lines)
+            except StopIteration:
+                return b""  # EOF, as StreamReader.readline reports it
 
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            try:
-                return next(self._lines)
-            except StopIteration:
-                raise StopAsyncIteration from None
+            line = await self.readline()
+            if not line:
+                raise StopAsyncIteration
+            return line
 
     mock_proc = AsyncMock()
     mock_proc.stdout = _AsyncStdout()

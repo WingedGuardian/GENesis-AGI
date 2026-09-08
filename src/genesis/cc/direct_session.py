@@ -930,8 +930,22 @@ class DirectSessionRunner:
                 roster_model=output.roster_model,
             )
 
-            # Persist result in session metadata (merge, don't overwrite)
-            await self._store_result(session_id, request, result)
+            # Persist result in session metadata (merge, don't overwrite).
+            # A dropped over-limit stream line is recorded alongside the result:
+            # `tools_summary` below is built from the events `on_event` SAW, so
+            # a drop makes it a floor rather than an inventory, and every later
+            # reader of this row (the audit call below, the MCP session views)
+            # needs that stated rather than inferable only from a log line.
+            await self._store_result(
+                session_id,
+                request,
+                result,
+                extra_metadata=(
+                    {"stream_lines_dropped": output.stream_lines_dropped}
+                    if output.stream_lines_dropped
+                    else None
+                ),
+            )
 
             # Turn-independent fallback recovery: a successful run on the HOME model
             # proves it's back (no foreground conversation turn needed). "Home" is the
@@ -970,10 +984,27 @@ class DirectSessionRunner:
                             with contextlib.suppress(json.JSONDecodeError, TypeError):
                                 metadata = json.loads(row["metadata"])
 
+                    # The auditor's pre-filter (autonomy/audit.py) skips
+                    # transcript parsing — and records a clean audit — when a
+                    # TRUTHY tools_summary contains no Write/Edit. That filter is
+                    # only sound while the summary is an inventory. A dropped
+                    # over-limit line can have carried the `tool_use` event for a
+                    # Write the CLI still executed, so with any other small tool
+                    # present the summary is truthy AND missing the mutation, and
+                    # a protected-path write would be certified audit-clean.
+                    #
+                    # Withhold the summary rather than trying to repair it: a
+                    # FALSY summary is exactly the "I cannot pre-filter" signal
+                    # that arm already understands, and it routes the session to
+                    # the CC transcript on disk — a source that does not depend
+                    # on our reading of the stream. Fail toward inspection, per
+                    # the fail-closed data-access rule; the cost is parsing one
+                    # transcript on a rare run.
+                    _incomplete = bool(metadata.get("stream_lines_dropped"))
                     await self._auditor.audit_session(
                         session_id,
                         transcript_path=metadata.get("transcript_path", ""),
-                        tools_summary=metadata.get("tools_summary"),
+                        tools_summary=None if _incomplete else metadata.get("tools_summary"),
                         session_success=result.success,
                         caller_context=_audit_ctx,
                     )

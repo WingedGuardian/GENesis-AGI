@@ -20,6 +20,7 @@ from genesis.cc.exceptions import (
     CCNetworkOfflineError,
     CCProcessError,
     CCRateLimitError,
+    CCStreamTruncatedError,
 )
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.system_prompt import SystemPromptAssembler
@@ -816,3 +817,103 @@ async def test_whitespace_only_streaming_is_not_evidence_of_service(
     assert st is not None and st.available is False, (
         "a whitespace-only attempt cleared a genuine quota block"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_result_never_advances_to_another_failover_peer(
+    loop, invoker, monkeypatch,
+):
+    """The multi-peer loop, which the same-peer fix did not reach.
+
+    Re-raising `CCStreamTruncatedError` out of `_run_failover_peer` only stopped
+    the sticky retry on THAT peer. One level out, the loop's generic
+    `except CCError` caught it and `continue`d — handing the identical prompt,
+    with full tools, to the NEXT peer, after the first may already have made an
+    MCP write or sent outreach. The `streamed["text"]` guard the loop otherwise
+    leans on reads empty precisely because the answer is what the oversized line
+    ate (Codex P1, PR #1625 round 2).
+
+    None is the right return: the caller then runs contingency, which is a
+    TOOL-LESS API call, so the turn degrades without repeating anything.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    invoker.run = AsyncMock(side_effect=CCStreamTruncatedError("result line dropped"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed={},
+    )
+
+    assert invoker.run.await_count == 1, (
+        f"the prompt was replayed on another peer ({invoker.run.await_count}x)"
+    )
+    assert result is None, "contingency is tool-less and should still answer"
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_result_after_streaming_does_not_double_output(
+    loop, invoker, monkeypatch,
+):
+    """The other half of the peer-loop stop, and the one that needs "" not None.
+
+    An oversized TOOL-RESULT line can be dropped after the peer already streamed
+    answer text. Returning None there would let contingency answer a second time
+    over text the user can already see — the same double-output the sibling
+    branches return "" to prevent. The peer demonstrably served, so a stale
+    block on it is cleared too.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_drop(*a, **k):
+        streamed["text"] = "partial answer already shown to the user"
+        raise CCStreamTruncatedError("result line dropped")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_drop)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    # The OUTCOME assertions (result == "", one attempt, peer recorded
+    # available) are all reproduced by the generic `except CCError` branch, so
+    # asserting only those left this test surviving deletion of the very
+    # handler it is named after — MEASURED by mutation during review. What
+    # distinguishes the branches is that the truncation branch never OFFERS the
+    # exception as evidence about the peer: the generic branch calls
+    # note_failure first (which declines it, invisibly), this one does not call
+    # it at all. Assert the call ORDER, not the end state.
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        peer_availability, "note_failure",
+        lambda p, e: bool(calls.append(("failure", p))),
+    )
+    monkeypatch.setattr(
+        peer_availability, "note_success",
+        lambda p: bool(calls.append(("success", p))) or True,
+    )
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+
+    assert calls == [("success", "peer-a")], (
+        f"the generic CCError branch ran instead of the truncation branch: {calls}"
+    )
+    assert invoker.run.await_count == 1  # peer-b never attempted
+    # Not None (that lets contingency answer over the streamed text) and not ""
+    # either: `streamed["text"]` means a text EVENT was observed, not that the
+    # channel delivered it, so an empty return can show the user nothing at all
+    # (Codex P1, PR #1625 round 4). A notice is safe in both cases.
+    assert result is not None
+    assert result.strip(), "a truncated failover returned an empty, non-error reply"
+    assert "lost this answer" in result, f"the user was told nothing useful: {result!r}"

@@ -726,3 +726,136 @@ async def test_should_reset_uses_local_midnight_not_utc(loop, monkeypatch):
     assert loop._should_reset({"started_at": "2026-08-24T02:00:00+00:00"}, now=now) is True
     # Started 06:00 UTC — after local midnight → not stale yet today.
     assert loop._should_reset({"started_at": "2026-08-24T06:00:00+00:00"}, now=now) is False
+
+
+# ── Stream-truncation degradation (PR #1625) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_turn_degrades_to_contingency_and_never_parks(
+    loop_with_contingency, mock_invoker, monkeypatch,
+):
+    """Typing the size failure must not cost the turn its SAFE degradation.
+
+    `CCStreamTruncatedError` is a `CCProcessError`, so it stopped matching the
+    `(CCQuotaExhaustedError, CCRateLimitError)` handler — and with it went the
+    rate-limit stamp, the failure-detector class, and `_try_contingency`. The
+    turn fell to the terminal `except CCError` and dead-ended on raw internal
+    prose. Contingency routes through the API with NO CC tool access, so it is
+    the one fallback that cannot repeat what the truncated run already did.
+
+    The PARK stays suppressed on purpose: `park_conversation` stores the prompt
+    for a resume worker to re-dispatch with full tools, which is a SCHEDULED
+    replay of the exact hazard.
+    """
+    from genesis.cc import rate_limit_park
+    from genesis.cc.exceptions import CCRateLimitError, CCStreamTruncatedError
+
+    loop, contingency = loop_with_contingency
+    parked: list = []
+    monkeypatch.setattr(
+        rate_limit_park, "park_conversation",
+        AsyncMock(side_effect=lambda *a, **k: parked.append(a)),
+    )
+
+    exc = CCStreamTruncatedError("dropped 1 over-limit line")
+    exc.__cause__ = CCRateLimitError("429")
+    mock_invoker.run.side_effect = exc
+
+    result = await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert "Contingency mode" in result, f"turn dead-ended instead: {result!r}"
+    contingency.dispatch_conversation.assert_awaited_once()
+    assert not parked, "a truncated turn queued itself for a full-tools re-dispatch"
+    assert mock_invoker.run.await_count == 1, "the prompt was replayed"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_turn_records_the_rate_limit_it_was_hiding(
+    loop_with_contingency, mock_invoker, db,
+):
+    """The provider's classification survives as `__cause__`, and the stamp is
+    recovered from it rather than guessed from the message text. Without this
+    the account looks healthy to scheduling while it is actually rate-limited.
+    """
+    from genesis.cc.exceptions import CCQuotaExhaustedError, CCStreamTruncatedError
+
+    loop, _ = loop_with_contingency
+    exc = CCStreamTruncatedError("dropped 1 over-limit line")
+    exc.__cause__ = CCQuotaExhaustedError("usage limit reached")
+    mock_invoker.run.side_effect = exc
+
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    row = await cc_sessions.get_active_foreground(db, user_id="u1", channel="terminal")
+    assert row is not None and row.get("rate_limited_at"), (
+        "a rate limit behind a truncation went unrecorded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_with_no_rate_limit_cause_records_none(
+    loop_with_contingency, mock_invoker, db,
+):
+    """CLAUSE COVER for the `__cause__` isinstance check.
+
+    An ordinary truncation (no provider limit behind it) must not stamp the
+    session rate-limited — that stamp drives scheduling back-off, and a false
+    one throttles a healthy account.
+    """
+    from genesis.cc.exceptions import CCStreamTruncatedError
+
+    loop, _ = loop_with_contingency
+    mock_invoker.run.side_effect = CCStreamTruncatedError("dropped 1 over-limit line")
+
+    await loop.handle_message("hello", user_id="u1", channel=ChannelType.TERMINAL)
+
+    row = await cc_sessions.get_active_foreground(db, user_id="u1", channel="terminal")
+    assert row is not None and not row.get("rate_limited_at"), (
+        "a plain truncation was recorded as a rate limit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_after_streaming_does_not_answer_twice(
+    loop_with_contingency, mock_invoker,
+):
+    """The BOUND on the contingency degradation — and it must not be silence.
+
+    An oversized TOOL-RESULT line can be dropped after answer text already
+    reached the user. Running contingency then stacks a second,
+    differently-sourced answer on top of what is on screen.
+
+    But returning "" is the wrong way to stop it, which is the correction this
+    test now carries (Codex P1, PR #1625 round 4). `streamed["text"]` records
+    that a text EVENT passed `_failover_tracked`, NOT that anything was
+    delivered: outside a private Telegram chat the streamer is None
+    (`_handler_messages.py:122-128`) and `_on_event` no-ops
+    (`_handler_context.py:99`) while the flag still flips. An empty return
+    there shows the user nothing at all — a silent empty success, the exact
+    shape this PR exists to prevent. A short notice is safe when text DID
+    arrive and is the only output when it did not.
+    """
+    from genesis.cc.exceptions import CCStreamTruncatedError
+    from genesis.cc.types import StreamEvent
+
+    loop, contingency = loop_with_contingency
+
+    async def _stream_then_drop(inv, on_event=None):
+        if on_event:
+            await on_event(StreamEvent(event_type="text", text="half an answer"))
+        raise CCStreamTruncatedError("dropped 1 over-limit line")
+
+    mock_invoker.run_streaming = AsyncMock(side_effect=_stream_then_drop)
+
+    result = await loop.handle_message_streaming(
+        "hello", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+
+    # No second answer...
+    contingency.dispatch_conversation.assert_not_awaited()
+    assert "Kimi fallback response" not in result
+    # ...and no silence either. The second assertion is the one that would have
+    # caught the regression; `!= ""` alone would pass on any stray whitespace.
+    assert result.strip(), "a truncated turn returned an empty, non-error reply"
+    assert "lost this answer" in result, f"the user was told nothing useful: {result!r}"
