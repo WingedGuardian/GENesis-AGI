@@ -9,16 +9,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
-### Changed
-
-- **Graph-enriched recall no longer surfaces memories that recall itself
-  hides.** When a memory was returned, Genesis also showed its graph
-  neighbours — but that traversal never applied the visibility filter the rest
-  of recall uses, so consolidated-away and expired memories were presented as
-  live context. They are now filtered out of the graph entirely. On this
-  install that changed the neighbour list for roughly a quarter of enriched
-  results, and 6.5% of them turned out to have had neighbours that were
-  *entirely* hidden memories.
 ### Fixed
 
 - **SECURITY.md described a posture the code left behind two months ago.** The
@@ -95,7 +85,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   on prose), or `score` (prose is treated exactly like code, the previous
   behaviour). Findings are listed in the pre-merge report under every setting —
   the lever decides whether they count, never whether anyone sees them.
-
 ## [v3.0b18] - 2026-09-07
 
 ### Added
