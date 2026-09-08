@@ -39,27 +39,170 @@ import sys
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, run_guard, tool_input  # noqa: E402
+from shell_parse import (  # noqa: E402
+    analyze,
+    git_subcommand_index,
+    untokenizable,
+)
 
-# Matches 'git worktree remove' with optional flags
-_WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")
+# Kept ONLY for the untokenizable fallback below and as a cheap pre-gate — never
+# as the verdict. As the verdict it was quote-blind: it matched the phrase inside
+# a quoted grep pattern, a heredoc body or a commit message, and target
+# extraction then read the following word as a path, so a read-only search was
+# refused with "use the lifecycle manager". Observed over 51,052 (command,
+# directory) pairs, replayed from the directory each was typed in: this coarse
+# predicate blocks 154, the parser below also blocks 154, and 148 are common —
+# so the swap releases 6 mentions and catches 6 real removals.
+#
+# PROVENANCE, because the distinction matters: this is one operator's local
+# session history at 2026-09-03, not a published result. The corpus is built
+# from real transcripts and holds secrets passed in argv, so it can never be
+# checked in and no reader or fork can reproduce or falsify these totals. Treat
+# them as the SCALE at which the swap was observed. The composition is the
+# claim; the totals are context.
+#
+# The numbers here churned twice, which is the reason for the precision: an
+# earlier draft said 147/3, a later one 150/146/4 over a 48,363-command corpus
+# that replayed everything from the repo root. The classifier producing them has
+# its own blind spot (a commit message whose markdown backticks parse as command
+# substitution), so treat the composition as the claim and the total as context.
+#
+# It does NOT require `git` adjacent to the subcommand, and that omission is the
+# point. It used to (`\bgit\s+worktree\s+remove\b`), which carried into the
+# untokenizable fallback the very assumption the parsed route had already been
+# fixed for: `git -C <dir> worktree remove <target>` produced no target, so a
+# command nothing could tokenize fell OPEN. Cross-model review, 2026-09-06.
+# Modelling git's global-option grammar here instead — which options take a
+# value — is the open-set claim this file refuses to make in a regex, so the
+# assumption is DELETED rather than extended. Anchoring on the subcommand and
+# the operation alone can over-match and never under-match, and both readers of
+# this pattern (the untokenizable fallback, and the carrier gate) are branches
+# where over-blocking is the declared correct side.
+_WORKTREE_REMOVE = re.compile(r"\bworktree\s+remove\b")
+# Dropping `git` from the pattern above is right for the untokenizable branch and
+# WRONG for the carrier branch, which fires on commands that parse perfectly.
+# MEASURED: without this, `rg 'worktree remove' -l | xargs wc -l` and
+# `ssh box 'ls' && echo 'the worktree remove doc'` — a read-only search and a line
+# of prose — both began to block, and `_legacy_targets` then invented the target
+# ("Cannot remove worktree 'runbook'"). That is the exact harm this branch exists
+# to remove, so the carrier branch keeps a `git` token as a separate conjunct
+# instead. It is checked as raw text, not as a parsed executable, because in the
+# shapes that branch covers the removal is INSIDE a quoted string and has no
+# segment of its own.
+_GIT_TOKEN = re.compile(r"\bgit\b")
+_SUBCOMMAND = "worktree"
+_OPERATION = "remove"
+
+# Executables that CARRY a command string ``analyze`` does not descend into, and
+# the shell function-definition syntax, which hides one the same way.
+#
+# This is a SECOND blind spot, distinct from the one ``untokenizable`` covers:
+# `eval '<removal>'`, `ssh box "<removal>"`, `find -exec`, `parallel`, `watch`,
+# `script -c` all tokenize PERFECTLY. The parser reads the carrier as the
+# executable, skips the segment, finds no target, and the removal is allowed.
+# Observed against the pre-parser version: 9 real removals it blocked and the
+# parser let through (same local corpus and caveat as above).
+#
+# This list IS an open set, and unlike the shell-side arms that fact is
+# tolerable here, because of the direction it fails in: a carrier absent from
+# the list costs a missed block (bad, but no worse than not having the list),
+# while every ADDITION only ever routes more commands to the coarse extractor.
+# The list grows toward safety, which is why adding an entry is a one-line
+# change with no design question attached.
+#
+# Read that as a claim about DIRECTION, not about cost. The entries present were
+# observed cheap on one install's history; that measurement is not something a
+# later contributor can repeat, so the safety of an addition rests on the
+# argument above — it can only route MORE commands to the coarse extractor —
+# and never on a number. Do not add one believing its cost has been checked.
+_CARRIER_NAMES = frozenset(
+    {"eval", "ssh", "find", "parallel", "watch", "script", "su", "docker", "flock", "xargs"}
+)
+# The raw-text half. It stays because it is the only thing that sees a shell
+# FUNCTION DEFINITION, which has no executable to resolve.
+_COMMAND_CARRIER = re.compile(
+    r"(?:^|[\s;&|(])(?:" + "|".join(sorted(_CARRIER_NAMES)) + r")(?:\s|$)"
+    r"|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{"
+)
+
+
+def _legacy_targets(cmd: str) -> list[str]:
+    """The pre-parser extractor, kept ONLY for the untokenizable fallback.
+
+    Quote-blind — it matches the phrase anywhere and reads the following word as
+    a path — which is exactly why it is not the primary route any more. But when
+    shlex cannot tokenize the command there is nothing better available, and this
+    guard's operation can strand a session, so the coarse reading is the correct
+    fail-closed behaviour there rather than a silent allow.
+    """
+    targets: list[str] = []
+    for match in _WORKTREE_REMOVE.finditer(cmd):
+        for token in cmd[match.end() :].split():
+            token = token.strip("'\"")
+            if not token or token.startswith("-"):
+                continue
+            targets.append(token)
+            break
+    return targets
 
 
 def _extract_worktree_targets(cmd: str) -> list[str]:
-    """Extract target paths from git worktree remove commands."""
+    """Target paths of every EXECUTED worktree-removal segment.
+
+    Keyed on parsed structure, not on the phrase appearing in the text: the
+    segment's resolved executable must be ``git``, its subcommand ``worktree``,
+    and the next positional ``remove``. Operands come from ``seg.argv``, which is
+    already shlex-dequoted — the old ``rest.split()`` + ``strip("'\\"")`` mangled
+    any quoted path containing a space.
+
+    ``analyze`` flattens nested ``bash -c`` bodies, so a wrapped removal is still
+    seen; depth is deliberately NOT filtered, because a removal inside
+    ``bash -c`` really does execute. It does NOT descend into a command string
+    handed to an ordinary executable (``eval``, ``ssh host "…"``, ``find -exec``)
+    — see ``_COMMAND_CARRIER`` and the fallback in ``_handle_bash``, which is
+    what covers that class.
+    """
     targets: list[str] = []
-    for match in _WORKTREE_REMOVE.finditer(cmd):
-        rest = cmd[match.end() :]
-        # Skip flags, grab paths
-        for token in rest.split():
-            token = token.strip("'\"")
-            if not token:
-                continue
+    for seg in analyze(cmd):
+        if seg.exe != "git":
+            continue
+        # The INDEX from the parser's own scan, never `argv.index(_SUBCOMMAND)`:
+        # that returns the first token equal to the name, and a global option's
+        # operand can BE that name. `git -C worktree worktree remove /tmp/x` anchored on
+        # the `-C` operand, so `after_sub[0]` was the literal "worktree" instead of
+        # "remove", the segment was skipped, and a real removal was ALLOWED.
+        sub_idx = git_subcommand_index(seg.argv)
+        if sub_idx is None or seg.argv[sub_idx] != _SUBCOMMAND:
+            continue
+        after_sub = seg.argv[sub_idx + 1 :]
+        if not after_sub or after_sub[0] != _OPERATION:
+            continue
+        for token in after_sub[1:]:
             if token.startswith("-"):
-                continue  # skip flags like --force
-            # This looks like a path
+                continue  # a flag such as --force
             targets.append(token)
-            break  # git worktree remove takes one path
+            break  # the removal takes one path
     return targets
+
+
+def _carries_a_command(cmd: str) -> bool:
+    """Whether ``cmd`` hands a command STRING to something ``analyze`` skips.
+
+    Asks the PARSER first, and the raw text only as a fallback. The regex above
+    requires the carrier's name to follow the start of the string or one of a few
+    separators, so ``/`` did not end the preceding word and a path-qualified
+    carrier — ``/usr/bin/find … -exec <removal>`` — matched nothing and the
+    removal was allowed. Cross-model review, 2026-09-06.
+
+    Patching the regex would have fixed ``find`` and left the other nine names
+    for the next round. ``analyze`` has already resolved and BASENAMED every
+    segment's executable by this point, so consulting it closes the whole list at
+    once, for every spelling of a path, with no new name to guess. The regex is
+    still consulted because a shell function definition has no executable at all.
+    """
+    if any(seg.exe in _CARRIER_NAMES for seg in analyze(cmd)):
+        return True
+    return bool(_COMMAND_CARRIER.search(cmd))
 
 
 def _resolve_path(path: str) -> str:
@@ -148,14 +291,67 @@ def _handle_bash(data: dict) -> int:
     if not cmd:
         return 0
 
-    if not _WORKTREE_REMOVE.search(cmd):
+    # Cheap pre-gate: cost only. Correctness rests on the parser below, never on
+    # this substring.
+    if _SUBCOMMAND not in cmd:
+        return 0
+
+    # A command shlex cannot tokenize gets the PREVIOUS, coarser reading rather
+    # than a silent allow. analyze() degrades to a naive split without SAYING so,
+    # so "no removal segment found" and "no removal present" are indistinguishable
+    # in its output; untokenizable() is the only way to tell them apart, and this
+    # guard covers an operation that can strand a session, so the unreadable case
+    # keeps failing CLOSED.
+    #
+    # The fallback has to use the LEGACY extractor, not the parser: a first cut
+    # gated on the regex here and then called the parser anyway, which returned []
+    # on precisely the input the parser could not read, so the loop never ran and
+    # the command was allowed — a branch whose comment claimed fail-closed while
+    # the code fell open. `echo 'it's fine' ; git worktree remove /wt/X` is the
+    # shape (an unbalanced quote collapses everything into one echo segment).
+    if untokenizable(cmd):
+        targets = _legacy_targets(cmd)
+    else:
+        targets = _extract_worktree_targets(cmd)
+        # The text says a removal and the parser found none, in a command that
+        # hands a command STRING to something. That is the carrier class: it
+        # tokenizes cleanly, so the probe above cannot see it, and the parser
+        # reads the carrier as the executable and skips the segment. Fall back
+        # to the coarse extractor rather than allow — this operation strands a
+        # session and cannot be undone.
+        #
+        # Ordered deliberately: the carrier test runs ONLY when the parser found
+        # nothing, so a normally-parsed command never touches it, and a mention
+        # inside `grep` / `echo` / `git commit -m` is unaffected because no
+        # carrier is present.
+        #
+        # A mention CAN carry one, though — `ssh box 'ls' && echo 'the worktree
+        # remove doc'` is prose next to a carrier, and `rg '<phrase>' -l | xargs
+        # wc -l` is a read-only search next to one. The `git` token is what
+        # separates those from the shapes this branch is for; every carried
+        # removal names the executable it is about to run, and none of the
+        # mentions above does. MEASURED: five such commands blocked without this
+        # conjunct and are allowed with it, while all three carrier controls
+        # (`eval`, `ssh`, `find -exec`) keep blocking.
+        #
+        # The "+2 blocks (0.004%) over 51,052 commands" figure this comment used
+        # to carry was measured against a NARROWER pattern and a raw-text-only
+        # carrier test, both of which have since widened. It is not re-derivable
+        # (the corpus is one install's transcripts) so it has been removed rather
+        # than restated for a gate it no longer describes.
+        if (
+            not targets
+            and _WORKTREE_REMOVE.search(cmd)
+            and _GIT_TOKEN.search(cmd)
+            and _carries_a_command(cmd)
+        ):
+            targets = _legacy_targets(cmd)
+    if not targets:
         return 0
 
     # Get the current working directory
     cwd = os.getcwd()
     cwd_real = os.path.realpath(cwd)
-
-    targets = _extract_worktree_targets(cmd)
     for target in targets:
         target_real = _resolve_path(target)
 

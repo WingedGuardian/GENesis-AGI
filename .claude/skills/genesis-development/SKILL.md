@@ -453,6 +453,30 @@ to be reverted as cross-branch contamination. Guard false-positives make this
 worse: `shell_parse` mis-parses backslash line-continuations and quoted heredoc
 bodies, so legitimate commands get blocked too.
 
+### Editing source in bypass/auto mode: reads via Bash, WRITES via Edit/Write
+
+In bypass or auto permission mode the CC binary injects a meta message telling
+the session to prefer Bash (`sed`, heredocs, scripts) over Read/Edit/Write —
+and NOT only there: a third selector branch is a cohort assignment, so a
+default-mode session can receive it too. It is an EFFICIENCY heuristic making no
+correctness claim, which follows from how the message is phrased (a preference,
+with its own escape hatch back to the dedicated tools) rather than from where it
+is gated (provenance + full measurement:
+`docs/reference/cc-compatibility.md` "Bypass/auto mode tells the agent to edit
+via Bash"). For reads and search it is simply right — use `cat`/`sed -n`/`grep`/
+`find` freely. For WRITES TO SOURCE it is not: a bare `sed -i` returns exit 0 on
+an absent anchor (silent no-op), rewrites ALL matches of a non-unique one, and
+silently hits the wrong line on a regex-metacharacter anchor where a literal was
+meant — where Edit fails LOUDLY on each. A Bash write also fires none of the five
+`Edit|Write` PostToolUse hooks (the repo's own post-edit verification plane) and
+a heredoc sits in the blocked-compound blast radius above. MEASURED: 54.9% of
+real edit anchors in this repo carry a character `sed` treats as special in BRE,
+its default dialect (2,750 / 5,013; an ERE set scores 74.0% over the same
+corpus, so quote the dialect or the number misleads) — the unsafe case is the
+common one. Use Edit/Write for source; a script that does a literal replace AND
+asserts its occurrence count is acceptable (it re-implements Edit's checks). This
+is universal — the machinery is tracked, so every clone inherits it.
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a
@@ -811,6 +835,17 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
 
+  **An instrument's stated invariant is its blind spot — and so is the one it
+  does not state.** Before trusting a harness's clean result, read what it
+  promises to hold fixed, then ask what ELSE it holds fixed without saying so.
+  READ, and EXTERNAL to this repo — a sibling toolkit's own release notes,
+  2026-09, not a Genesis measurement: a fuzzer whose mutators were all fixed
+  one-character strings had a whole mutant shape unreachable by construction,
+  and that writeup attributes its own long-lived bypass to exactly that. The
+  remedy generalises even if the number does not: vary what the instrument
+  never varies, rather than running it more times.
+  Method for the whole class: `references/high-stakes-verification.md`.
+
   **Three corollaries, each bought with a non-converging review loop.**
 
   **(a) NEVER normalize the command text before a blind-spot probe.** A probe
@@ -883,7 +918,6 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   knowing the rule, it is believing you already applied it.
 
   A corpus run only ever yields `did not, here`, and by the rule above it is
-  corpus run only ever yields `did not, here`, and by the rule above it is
   structurally blind to the shape nobody typed. Run the corpus as
   corroboration, never as the proof, and pair it with a control that DOES flip
   — an unflipped corpus and an inert measurement look identical.
@@ -919,14 +953,42 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   This does NOT loosen the fail-closed mandate above, and the two are easy to
   read as contradicting each other. Rule (b) is scoped to the git-operation
   blind-spot net — a guard whose trigger is deliberately broad and whose false
-  positive is one confirmation. It is NOT a template for every guard: the
-  protected-paths and destructive-command guards hard-block an unreliable parse
-  even when a person is present, by design, because their false negative is an
-  irreplaceable path or a broad recursive removal and their false positive is a
-  rewrite. Within the net, the two rules are scoped by who is present: `ask` is
-  the interactive form of the refusal, and where a session is unattended
-  fail-closed governs and (c) applies. The operation proceeds unverified in
-  neither case.
+  positive is one confirmation. It is NOT a template for every guard: where the
+  false negative is an irreplaceable path or a broad recursive removal and the
+  false positive is a rewrite, that asymmetry justifies refusing outright rather
+  than asking. Neither the protected-paths nor the destructive-command guard has
+  an `ask` branch at all — both return only 0 or 2 — so a person's presence
+  genuinely cannot change their verdict.
+
+  One clause of that used to read "hard-block an unreliable parse", and it is
+  FALSE. MEASURED 2026-09-06 through both live hook entries, controls flipping:
+  each guard refuses on the PARSED path and then falls back to a DIFFERENT
+  matcher, neither a subset nor a superset of it — it misses spellings the
+  parser catches, AND it drops the target tests the parser applies, so it also
+  refuses commands the parser allows. **A guard's fail direction is a property
+  of its DEGRADED path, and that path has to be read in BOTH directions.** The
+  two differ in what their fallback is for: `destructive_command_guard`'s is
+  fail-open by design and says so in its own docstring, so argue with the design
+  rather than patching it; `protected_paths_guard`'s calls itself "conservative:
+  over-blocks, never under", which is true relative to the old guard it
+  reinstates (`_legacy_substring_block`'s docstring) and false of the parsed
+  resolver it stands in for — one sentence, two readings, and that ambiguity is
+  the defect. Verify a docstring's stated direction IN CONTEXT; never quote it as
+  a fact. The shapes are deliberately not enumerated here, per the rule above.
+
+  That guard's MODULE docstring has since been split so it no longer states one
+  fail direction for both blind spots: a bounds-induced blind spot REFUSES and an
+  untokenizable one falls back. The sentence quoted above still sits on the
+  fallback helper, where both readings remain available, so the lesson is
+  unchanged — and note the citation here is now to a SYMBOL rather than to a line
+  range, because the range this paragraph originally named stopped containing the
+  quote the moment that docstring was edited. A line number is a claim with a
+  shelf life.
+
+  Within the git-operation blind-spot net, the two rules are scoped by who is
+  present: `ask` is the interactive form of the refusal, and where a session is
+  unattended fail-closed governs and (c) applies. The operation proceeds
+  unverified in neither case.
 
   This is the shipped shape now, not an aspiration, and one distinction inside
   it must stay visible. The shared parser still degrades to a naive split with
@@ -1302,6 +1364,23 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
 ### Review-loop discipline
 
+- **A RELEASE review is scoped to what the release CHANGES; a whole-codebase
+  audit gates nothing.** Point a reviewer at "the repository" and it returns
+  findings that PRE-DATE the release — real, worth fixing, and not release
+  blockers. Treating them as blockers is how a release never ships. Scope the
+  gating pass to the diff between the previous RELEASE tag and HEAD (this repo
+  also carries non-release tags, so `git describe --tags` alone can land on the
+  wrong one); run the broader
+  audit separately, on its own clock, where its findings become ordinary work
+  rather than a stop. The distinction is not "which findings are real" but
+  "which findings this release is answerable for" — a defect that already
+  shipped in the last release is answerable by the next fix, not by this gate.
+  Release scope decides what BLOCKS, never whether an external round COUNTS: a
+  pre-dating finding is still a defect-bearing round on the escalation counter,
+  filed as ordinary work rather than held as a release blocker. "It pre-dates
+  the release" is otherwise just a new spelling of the rationalization that
+  counter exists to kill.
+
 - **A review's findings are a SAMPLE, not a to-do list.** This is the single
   highest-value habit in this section, and the one most often skipped. CLAUDE.md
   already says to treat the *user's* examples as a sample and enumerate the
@@ -1592,6 +1671,34 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the user with a minimize-change recommendation. The ack asserts that
   step-back happened — appending it without doing the work is the same
   violation as falsifying `--clean`.
+- **Some PRs are not a review problem — hand them to an architecture session.**
+  When you ARE driving a PR toward green (per "When to DRIVE a Merge" below),
+  asking a few clarifying questions is not a substitute for the design
+  conversation. STOP and hand the PR to a foreground architecture conversation —
+  a session with the USER present, never a `genesis-architect` subagent, which is
+  review-session judgment by another name — when any of these holds: the conflict
+  is STRUCTURAL, main having superseded the mechanism the PR implements, so no
+  conflict resolution is correct on its own terms; it changes or contradicts the
+  spec at a significant level; it raises real questions about how Genesis
+  operates, its architecture, or its infrastructure; its consequences are
+  far-reaching or irreversible; or it is delicate enough that getting it wrong
+  damages a running Genesis. Treat arrival at any tier of the cap (the round-2
+  mode-switch, the round-3 hard stop, and certainly the round-7 terminal) as its
+  own trigger to ask whether this is that kind of PR rather than merely another
+  round — taking this exit does NOT discharge that tier's own stop, which is
+  still owed; the handoff is the answer you bring to it, not a way around it.
+  If you ARE the session with the user present, hold the conversation now. With
+  no user to ask, the action is: comment on the PR naming WHICH trigger fired and
+  the evidence for it, apply the `needs-architecture-session` label (create it if
+  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  `ready` follow-up naming the PR and the decision it awaits — the label is a
+  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
+  is on the order of 1 in 10 or fewer, so a session reaching for it often is
+  mis-triaging. Worked example, PR #1605: main's shared settings writer had
+  replaced the two inline heredocs the PR reimplements, and the literal base-wins
+  resolution measured 61 passed → 36 failed / 25 passed, because it deleted the
+  PR's own fix on two of its three declared paths.
 - **External review feedback is a set of claims to VERIFY, not orders.** For
   every bot/external finding: check it against the actual code (its stated
   mechanism may be wrong even when the underlying concern is real — quote the
@@ -1967,13 +2074,51 @@ never edit-in-place dev environments. An emergency hand-edit on a host gets a
 same-day PR that lands the same change at source — a host divergence that
 outlives its incident is a bug.
 
+## When to DRIVE a Merge (standing user rule, 2026-09-05)
+
+A session does not shepherd its own PRs toward merge by default: open the
+work and let the PR bake in the normal flow. DRIVING is the UNPROMPTED extra
+cycle — polling a quiet PR's gates, soliciting re-review with nothing new
+pushed, initiating a merge on a PR that still has un-green gates — and it is
+justified ONLY when:
+
+- tracked work is GATED on that PR's merge: the PR body carries a
+  `Ledger:`/`Follow-up:` completion marker, a hot follow-up's close depends
+  on it, a stacked branch needs its base, or a live hazard closes with it; or
+- the user asks for that PR by name.
+
+Three things are NEVER driving — they stay mandatory:
+
+- **Answering.** Findings received while you are present are answered before
+  you stop (the zero-drop rule), and the mandatory post-push
+  `@codex review` (Gate Machinery above) is part of answering. A fix round
+  you have begun is FINISHED, not "chased": answered, pushed, re-review
+  triggered — never abandoned half-answered.
+- **Closing a green PR.** A PR already fully green at head is past baking:
+  merging it under the standing pre-approval (or asking, where none exists)
+  is closing, not driving — green DECAYS with base drift and head-freshness
+  rules, so a cleared gate is a now-or-re-earn asset.
+- **The stopping handoff.** A session that stops while its own PR has any
+  gate un-green creates a `ready` follow-up naming the PR and the event it
+  awaits, BEFORE stopping. That row is the drain's intake — an un-driven
+  open PR without its row IS a stranded artifact under the zero-drop rule,
+  never "the normal flow". Until a dedicated closing station exists, the
+  queue drains through those rows under the project's ≈51/49 lean.
+
+Scope against CLAUDE.md's ≈51/49 close-before-open lean: unchanged for
+closing-shaped work (answering, merging green PRs, the handoff row). What
+this rule removes is only the WATCHING — unprompted gate-polling and
+review-soliciting between a push and the next external event. When you do
+merge, the Pre-Merge Gate below governs unchanged.
+
 ## Pre-Merge Gate
 
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
-BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
-(mergeable → CI → base-invariant → Codex-freshness → scheduled-Claude-review →
-review-body → inline findings), so the report and the gate can never disagree —
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses, in the gate's own order
+(mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
+Codex-freshness → head-binding → review-body → inline findings →
+scheduled-Claude-review), so the two read the same state —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
 before any merge** — never hand-roll a
@@ -2198,6 +2343,7 @@ references on every trigger.
 | Phase 6 contribution pipeline, sanitizer | `references/contribution.md` |
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
 | Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
+| Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,
@@ -2244,10 +2390,30 @@ Standard open-source workflow: PRs go directly to the public repo.
   is how coverage disappears.
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
+- **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`
+  fragment.** (The one exception is the release-fold PR, where the
+  `CHANGELOG.md` diff is produced by `scripts/assemble_changelog.py` and the
+  section rename rather than written by hand — see the release procedure in
+  `docs/reference/recovery-and-portability-workflow.md`.)
+  One file per change, named `<YYYYMMDDHHMMSS>-<category>-<slug>.md`
+  (timestamp from `date -u +%Y%m%d%H%M%S`; category is one of `added`,
+  `changed`, `deprecated`, `removed`, `fixed`, `security`). The file holds
+  the entry exactly as it should appear — a Markdown bullet, spliced in
+  verbatim. `scripts/assemble_changelog.py` folds them into `[Unreleased]`
+  at RELEASE time, not per PR.
+
+  This is not bookkeeping preference: two branches editing one shared
+  changelog insert at the same position, which git calls a conflict.
+  Measured 2026-09-04 — of 49 open PRs, 21 could not merge and **18 of
+  those conflicted on `CHANGELOG.md` and nothing else**. Two branches
+  writing two different filenames have nothing to merge. A merge driver
+  cannot substitute: GitHub ignores repository `.gitattributes`
+  server-side, measured against its own merge engine.
 - **CHANGELOG audience is users** — only include entries a user updating
   their install would care about. No internal refactors, README changes,
   CI tweaks, or process artifacts. Lead with the user-visible effect, not
-  the implementation technique.
+  the implementation technique. Same bar for a fragment: it becomes a
+  changelog entry verbatim.
 - **No sensitive data in commits** — voice data, research profiles, IPs,
   and secrets must never enter the repo. User data lives in overlays
   outside the repo (e.g., `~/.claude/skills/*/`, `~/.genesis/`).

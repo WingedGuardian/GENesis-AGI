@@ -25,6 +25,57 @@ def _pin_required_ci_workflows(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_e2e_declaration(monkeypatch):
+    """Keep the ADVISORY E2E read hermetic for EVERY hook test (§8.12).
+
+    The reader shells out to ``gh pr view`` for the body and for ``createdAt``, so
+    without this pin each test that drives the merge arm or its report would make a
+    LIVE call: green on a dev box with gh authenticated and PR "1" answering, red in
+    CI, and in both cases testing the network rather than the thing under test.
+
+    Since 2026-09-06 the E2E reader is advisory, so ITS verdict cannot fail a merge
+    and what this prevents for that gate is NOTE noise, not a false block.
+
+    But do not read that as "nothing here can fail a merge" — an earlier version of
+    this docstring said exactly that and it is FALSE. ``_TEST_GH_PR_BODY`` is a
+    SHARED seam: ``_check_pin_receipts`` reads the same body via ``_pr_body_text``
+    and DOES block. MEASURED 2026-09-06 — feeding it this fixture's body with a
+    forward pin returns blocked=True ("CC pin moves FORWARD … but the PR body is
+    missing 2 required gate receipt(s)"). So changing or deleting the default here
+    silently changes what every pin-gate test in this directory is fed; edit it only
+    with those tests in view.
+
+    Still the hermetic default rather than a waiver: the E2E reader's own behaviour
+    (every classification, both report directions, the cutoff, the degraded path) is
+    exercised in tests/test_hooks/test_e2e_plan_gate.py, which overrides these per
+    case; a later ``monkeypatch.setenv`` in any test wins over this one."""
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "E2E: none — hermetic default for hook tests\n")
+    monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_base_advance(monkeypatch):
+    """Hermetic defaults for the base-advance refinement of the freshness gate.
+
+    When the raw ``reviewed...head`` compare reads SUBSTANTIAL, the gate now asks
+    a second question — did the BRANCH change, or did its base advance under it?
+    — which reads the base tip and the PR's own contribution. Without a seam both
+    are LIVE ``gh`` calls: green on a dev box with gh authenticated, red in CI,
+    and slow either way, so every existing freshness test would be testing the
+    network.
+
+    The contribution seam defaults to ``{}``, which resolves to None for any
+    revision pair → the refinement declines to rescue → existing tests keep the
+    exact verdicts they were written for. That is the fail-CLOSED direction, so
+    the default cannot mask a regression by accidentally allowing something.
+    Cases that exercise the refinement set both seams themselves and win."""
+    monkeypatch.setenv("_TEST_GH_BASE_OID", "ba5e" * 10)
+    monkeypatch.setenv("_TEST_GH_CONTRIBUTION", "{}")
+    yield
+
+
 def _load_settings() -> dict:
     """Load .claude/settings.json from the repo root."""
     here = Path(__file__).resolve()
