@@ -604,8 +604,17 @@ jobs:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
+    #
+    # fetch-depth: 0 because measurement tests derive a rate from this
+    # repository's own commit history and SKIP on a shallow clone rather than
+    # lie. A skipped gate is an unevaluated gate: the commit-msg framing
+    # advisory asserts a 0.1% fire-rate bar over real subjects, and under the
+    # default depth-1 checkout that assertion never ran at all, so a later
+    # pattern change with a bad rate would have passed CI (Codex P2, PR #1623).
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
