@@ -229,7 +229,12 @@ long-lived FalkorDB server reached over a unix socket, selected by
 the lever is inert until moved). It carries its own projection of
 `memory_links` and applies the SAME visibility predicate — but at QUERY time,
 over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
-future-`invalid_at` gap the NetworkX store states below. Traversal follows the
+future-`invalid_at` gap the NetworkX store states below. That closes the TIME
+half only, and the other half runs the other way: `deprecated` is a
+projection-time snapshot, so a memory deprecated after the last projection stays
+visible here until the next one, where NetworkX hides it on its next rebuild.
+Fresher on elapsed time, staler on every write — the write half bounded only by
+how often the projector runs. Traversal follows the
 lever and degrades falkordb → networkx → CTE; **centrality does NOT follow it**
 and is pinned to NetworkX, because FalkorDB cannot compute betweenness and
 `centrality_scores` has no fallback by design, so routing it through the lever

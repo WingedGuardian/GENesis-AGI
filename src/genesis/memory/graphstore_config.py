@@ -127,12 +127,22 @@ def effective_mode() -> str:
     """The store to use: ``networkx`` or ``falkordb``.
 
     Three ways to land on networkx, in precedence order: the env kill switch,
-    `enabled: false`, or anything the file says that is not a recognised mode.
+    `enabled` being anything other than exactly True, or anything the file says
+    that is not a recognised mode.
     """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "networkx"
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    # `is not True`, not falsiness. A hand-edited overlay is YAML, and a QUOTED
+    # `enabled: "false"` parses as a non-empty string, which is truthy — so a
+    # falsiness test reads an operator's attempt to DISABLE the backend as
+    # permission to enable it, which is both the wrong answer and the wrong fail
+    # direction for a module whose whole posture is degrade-toward-networkx.
+    # Only the settings API type-checks this; the file does not, and the file is
+    # the surface a person edits. Every non-True value now degrades, including
+    # `1` and `"true"` — narrower than YAML's own boolean set on purpose: a
+    # value we cannot read as exactly True is a value we decline to act on.
+    if cfg.get("enabled", True) is not True:
         return "networkx"
     mode = cfg.get("mode")
     if mode is False:

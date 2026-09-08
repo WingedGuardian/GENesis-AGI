@@ -1575,7 +1575,22 @@ def _validate_graphstore(changes: dict) -> list[str]:
     # projection needs an async query to detect, and is caught one layer down:
     # FalkorGraphStore.traverse raises rather than reporting every root as
     # neighbourless.
-    if changes.get("mode") == "falkordb":
+    #
+    # JUDGE THE EFFECTIVE POST-UPDATE STATE, not the incoming keys. Testing
+    # `changes` alone was wrong in BOTH directions, and the two callers hit one
+    # each. The dashboard submits the whole current config, so an operator
+    # turning `enabled` off while the stored mode is falkordb still sends
+    # `mode: falkordb` — and if the socket has since disappeared, the check
+    # refused the save, trapping the install in a mode it could no longer leave.
+    # The MCP sends partial updates, so flipping `enabled` to true against a
+    # stored `mode: falkordb` carried no `mode` key at all and skipped the check
+    # entirely. The precondition belongs to the state the update RESULTS IN:
+    # required only when the effective config both enables the lever and selects
+    # falkordb, which also mirrors `effective_mode()`'s own `is True` test.
+    from genesis.memory.graphstore_config import load_config
+
+    effective = {**load_config(), **changes}
+    if effective.get("enabled", True) is True and effective.get("mode") == "falkordb":
         from genesis.env import falkordb_socket_path
 
         socket_path = falkordb_socket_path()

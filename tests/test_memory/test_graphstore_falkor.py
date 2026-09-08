@@ -44,6 +44,7 @@ come back into range.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -408,6 +409,423 @@ async def test_the_base_config_file_matches_the_defaults():
     assert yaml.safe_load(base.read_text()) == cfg.DEFAULTS
 
 
+async def test_a_truthy_non_boolean_enabled_does_not_arm_the_backend(monkeypatch):
+    """`enabled: "false"` must DISABLE, not enable.
+
+    The overlay is YAML a person hand-edits, and a quoted `false` is a non-empty
+    string — truthy. A falsiness test therefore read an operator's clearest
+    attempt to switch the backend OFF as permission to switch it on, in a module
+    whose entire posture is degrade-toward-networkx. Only `settings_update`
+    type-checks this key; the file does not, and the file is the surface being
+    edited.
+    """
+    from genesis.memory import graphstore_config as cfg
+
+    for value in ("false", "no", "off", 1, "true", [], {}):
+        monkeypatch.setattr(cfg, "load_config", lambda v=value: {"enabled": v, "mode": "falkordb"})
+        assert cfg.effective_mode() == "networkx", (
+            f"enabled={value!r} is not exactly True and must degrade to networkx"
+        )
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"enabled": True, "mode": "falkordb"})
+    assert cfg.effective_mode() == "falkordb", "a real boolean True must still arm it"
+
+
+async def test_expiry_keeps_subsecond_precision():
+    """Flooring an expiry to whole seconds hides a memory up to a second early.
+
+    MEASURED on the live engine 2026-09-08, both directions: with the stored
+    epoch and `now` both truncated to 100, `invalid_epoch > now` is false and the
+    node is HIDDEN; at full precision (100.9 against 100.1) it is VISIBLE — which
+    is what SQLite and NetworkX answer, since they compare the full ISO strings.
+    Genesis writes microseconds (`db/timeutil.py::canonical_iso`), so the
+    fractional part is real data.
+    """
+    epoch = falkor_mod._to_epoch("2026-09-08T12:00:00.900000+00:00")
+    assert epoch is not None
+    assert epoch % 1 != 0, "the fractional second must survive the conversion"
+
+    just_before = epoch - 0.8  # same whole second, earlier fraction
+    assert int(just_before) == int(epoch), "the two must share a whole second, or this is vacuous"
+    assert not falkor_mod._is_hidden((epoch, 0), just_before), (
+        "a memory expiring later this second is still visible"
+    )
+    assert falkor_mod._is_hidden((epoch, 0), epoch + 0.1), "and hidden once the moment passes"
+
+
+async def test_the_traversal_sends_an_unfloored_now(tmp_path, monkeypatch):
+    """The conversion above is worthless if the query still floors the comparand.
+
+    The clock is pinned rather than sampled. Asserting `now % 1 != 0` on a real
+    `time.time()` is a ~1-in-10^6 flake whose failure would read as a genuine
+    regression, and a test that cries wolf gets deleted by whoever hits it.
+    """
+    monkeypatch.setattr(falkor_mod.time, "time", lambda: 1757000000.75)
+    seen: dict = {}
+
+    class _Graph:
+        async def query(self, _cypher, params):
+            seen.update(params)
+            raise RuntimeError("stop here — the parameters are the assertion")
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, _key):
+            return _Graph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        pytest.raises(GraphUnavailableError),
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert seen["now"] == 1757000000.75, (
+        "`now` must reach the engine unfloored — flooring it to 1757000000 hides a "
+        f"memory expiring later in that second; got {seen['now']!r}"
+    )
+
+
+async def test_a_failure_mid_build_leaves_no_staging_graph(tmp_path):
+    """Cleanup covers the WHOLE build, not just the swap.
+
+    The earlier version wrapped only the rename, so a failure in index creation
+    or in any batch orphaned the staging graph — and a staging graph is a full
+    copy of the projection against a 512mb engine cap. The opening `delete`
+    reclaims this PROCESS's own orphan next run, which bounds the leak at one per
+    process; it does nothing for a process that never runs again, which is every
+    CLI invocation and every server restart. Once the projector runs on a
+    schedule this path stops being rare.
+    """
+    deleted: list[str] = []
+
+    class _Conn:
+        async def delete(self, key):
+            deleted.append(key)
+
+        async def rename(self, *a):  # pragma: no cover - never reached here
+            raise AssertionError("the build failed before the swap")
+
+        async def exists(self, *a):  # pragma: no cover
+            return 1
+
+    class _Graph:
+        async def query(self, cypher, _params):
+            if "CREATE INDEX" in cypher:
+                return object()
+            raise RuntimeError("engine died mid-batch")
+
+    class _Client:
+        connection = _Conn()
+
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, _key):
+            return _Graph()
+
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    try:
+        await db.execute(
+            "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, "
+            "link_type TEXT, strength REAL)"
+        )
+        await db.execute(
+            "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+        )
+        await db.execute("INSERT INTO memory_links VALUES ('a', 'b', 'related_to', 0.9)")
+        await db.commit()
+
+        store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"), graph_key="test_cleanup")
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", _Client),
+            pytest.raises(GraphUnavailableError),
+        ):
+            await store.project(db)
+    finally:
+        await db.close()
+
+    staging = f"test_cleanup_staging_{os.getpid()}"
+    assert deleted.count(staging) == 2, (
+        "the staging key must be deleted twice — once opening the build, once "
+        f"cleaning up after it failed; saw {deleted}"
+    )
+
+
+async def test_two_projections_of_one_key_never_interleave(tmp_path):
+    """Concurrent projections of the same key must serialise, not overlap.
+
+    The staging key is per-PROCESS, so two coroutines projecting the same key in
+    one process share it — and with the whole-build cleanup, the loser's cleanup
+    wipes the winner's staging mid-build. The winner then writes its marker LAST
+    and renames a partial graph that reads as complete: a silent wrong answer,
+    which is the worst outcome this store can produce.
+
+    Unreachable today (`project()` has one caller, the CLI, one run per process)
+    but it is exactly the shape an in-server scheduled projector introduces, so
+    the invariant is mechanical here rather than a note for a future PR.
+    """
+    import asyncio as _asyncio
+
+    import aiosqlite
+
+    order: list[str] = []
+
+    class _Graph:
+        def __init__(self, tag):
+            self._tag = tag
+
+        async def query(self, cypher, _params=None):
+            if "CREATE INDEX" in cypher:
+                order.append(f"{self._tag}:start")
+                await _asyncio.sleep(0.05)  # a window for the other run to barge in
+            elif "ProjectionMeta" in cypher:
+                order.append(f"{self._tag}:end")
+            return object()
+
+    class _Conn:
+        async def delete(self, _key):
+            return 1
+
+        async def rename(self, *_a):
+            return True
+
+    # ONE patch around the whole gather. Patching inside each coroutine has the
+    # first to finish restore `_FALKOR_AVAILABLE` while the second is still
+    # running — which is how this test failed on its first outing, for a reason
+    # entirely unrelated to the one it names.
+    tags = iter("AB")
+
+    class _Client:
+        connection = _Conn()
+
+        def __init__(self, *a, **k):
+            self._tag = next(tags)
+
+        def select_graph(self, _key):
+            return _Graph(self._tag)
+
+    async def _run():
+        db = await aiosqlite.connect(":memory:")
+        try:
+            await db.execute(
+                "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, "
+                "link_type TEXT, strength REAL)"
+            )
+            await db.execute(
+                "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+            )
+            await db.commit()
+            store = FalkorGraphStore(
+                socket_path=str(tmp_path / "s.sock"), graph_key="test_lock_key"
+            )
+            await store.project(db)
+        finally:
+            await db.close()
+
+    falkor_mod._PROJECT_LOCKS.pop("test_lock_key", None)
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+    ):
+        await _asyncio.gather(_run(), _run())
+
+    assert order in (
+        ["A:start", "A:end", "B:start", "B:end"],
+        ["B:start", "B:end", "A:start", "A:end"],
+    ), f"projections of one key must not interleave; saw {order}"
+
+
+async def test_a_hanging_engine_is_bounded_by_the_read_deadline(tmp_path):
+    """Connect is inside the deadline, not outside it.
+
+    The bound used to cover `graph.query` alone, so the client CONSTRUCTION — a
+    blocking `Is_Cluster` round-trip — could hang forever with no ceiling at all,
+    and a recall would wait on it past any budget.
+    """
+    import asyncio as _asyncio
+
+    class _Client:
+        def __init__(self, *a, **k):
+            import time as _time
+
+            _time.sleep(5)  # blocking, exactly like the real constructor
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+    ):
+        started = _asyncio.get_running_loop().time()
+        with pytest.raises(GraphUnavailableError, match="exceeded"):
+            await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+        elapsed = _asyncio.get_running_loop().time() - started
+
+    assert elapsed < 4.0, (
+        f"the connect must be inside the deadline, not outside it (took {elapsed:.2f}s)"
+    )
+
+
+async def test_a_timed_out_connect_does_not_burn_a_thread_per_attempt(tmp_path):
+    """The deadline must cancel the WAIT, not the CONSTRUCTION.
+
+    MEASURED 2026-09-08: cancelling an `asyncio.wait_for` does NOT stop the
+    `to_thread` worker underneath it. So bounding the connect naively trades the
+    old "one thread held forever" for a NEW thread on every attempt — which
+    exhausts the default executor under a wedged engine and then stalls every
+    other `to_thread` in the process. This is the regression the bound would
+    otherwise have introduced, so it is pinned rather than trusted.
+    """
+    import threading
+
+    attempts = 0
+    release = threading.Event()
+
+    class _SlowClient:
+        def __init__(self, *a, **k):
+            nonlocal attempts
+            attempts += 1
+            release.wait(timeout=5)
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    try:
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", _SlowClient),
+            patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        ):
+            for _ in range(4):
+                with pytest.raises(GraphUnavailableError):
+                    await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+    finally:
+        release.set()
+
+    assert attempts == 1, (
+        "four timed-out traversals must join ONE construction, not start four; "
+        f"the constructor ran {attempts} times"
+    )
+
+
+async def test_every_network_operation_goes_through_the_bounded_chokepoint():
+    """Guard-the-guard: no call site may reach the socket unbounded.
+
+    This is the actual finding rather than a restatement of it. An earlier
+    version bounded `graph.query` and left the client construction and the raw
+    `delete`/`rename` key operations with no deadline — three of five network
+    paths unbounded, while the reviewer named two. A behavioural test can only
+    cover the paths someone thought to exercise; this fails when a NEW one is
+    added, which is the case that actually recurs.
+    """
+    import ast
+
+    source = Path(falkor_mod.__file__).read_text()
+    tree = ast.parse(source)
+
+    # Attribute every call to its TOP-LEVEL enclosing method, not to whatever
+    # closure it sits in: both helpers do their work inside a nested `_run`, so
+    # walking every FunctionDef would credit the calls to `_run` and the guard
+    # would pass while proving nothing about which method owns them.
+    methods = [
+        node
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef)
+        for node in cls.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    ]
+    assert methods, "no methods found — the guard is parsing the wrong thing"
+
+    wait_for_owners = set()
+    key_op_owners = set()
+    for node in methods:
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call) or not isinstance(inner.func, ast.Attribute):
+                continue
+            if inner.func.attr == "wait_for":
+                wait_for_owners.add(node.name)
+            if inner.func.attr == "_connection":
+                key_op_owners.add(node.name)
+
+    assert wait_for_owners == {"_bounded"}, (
+        f"asyncio.wait_for must live only in _bounded; found in {sorted(wait_for_owners)}"
+    )
+    assert key_op_owners == {"_key_op"}, (
+        "the raw connection must be reached only through _key_op, which bounds it; "
+        f"found in {sorted(key_op_owners)}"
+    )
+
+    # The two assertions above locate the deadline; they do NOT prove anything
+    # reaches it. Mutation-tested: deleting the `_bounded` call from `_query` —
+    # the exact regression this guard exists to prevent — left both of them
+    # green, because `wait_for` was still in `_bounded` and nothing else touched
+    # `_connection`. A guard that passes its own motivating regression is worse
+    # than none, so the delegation is asserted too.
+    delegators = {
+        node.name
+        for node in methods
+        for inner in ast.walk(node)
+        if isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Attribute)
+        and inner.func.attr == "_bounded"
+    }
+    assert delegators == {"_query", "_key_op"}, (
+        "_query and _key_op must each route through _bounded — a wrapper that stops "
+        f"calling it reaches the socket unbounded; found {sorted(delegators)}"
+    )
+
+    # And the accessor can be sidestepped entirely by touching the attribute:
+    # `self._db.connection.delete(...)` never calls `_connection()`.
+    raw = sorted(
+        node.name
+        for node in methods
+        for inner in ast.walk(node)
+        if isinstance(inner, ast.Attribute)
+        and inner.attr == "connection"
+        and node.name != "_connection"
+    )
+    assert not raw, f"self._db.connection must go through _connection(); touched by {raw}"
+
+
+async def test_the_projector_escapes_a_uri_significant_database_path(monkeypatch, tmp_path):
+    """A `?` or `#` in the path must not be read as a query string or fragment.
+
+    Interpolating the raw path into `file:...?mode=ro` lets SQLite parse
+    everything after the first `?` as URI syntax, so a database at
+    `.../memory?copy.db` silently opens `.../memory` — a DIFFERENT file, with no
+    error. Operator-controlled rather than attacker-controlled, so this is a
+    correctness bug and not a security one, but a silent wrong-file read is the
+    worst shape a correctness bug can take.
+    """
+    from genesis.memory import graphstore_project
+
+    weird = tmp_path / "memory?copy.db"
+    monkeypatch.setattr(graphstore_project, "genesis_db_path", lambda: weird)
+
+    seen: dict = {}
+
+    async def _fake_connect(dsn, **kwargs):
+        seen["uri"] = dsn
+        raise RuntimeError("stop here — the URI is the assertion")
+
+    import aiosqlite
+
+    monkeypatch.setattr(aiosqlite, "connect", _fake_connect)
+
+    with pytest.raises(RuntimeError, match="stop here"):
+        await graphstore_project.build()
+
+    assert seen["uri"].endswith("?mode=ro"), "mode=ro must remain the only query string"
+    assert "memory%3Fcopy.db" in seen["uri"], (
+        f"the path's `?` must be percent-encoded, got {seen['uri']!r}"
+    )
+
+
 # ── engine-gated: real Cypher against a live engine ───────────────────
 #
 # Everything above stubs the client. That is what let five semantic mutations
@@ -543,7 +961,7 @@ async def test_projecting_twice_swaps_atomically_and_leaves_no_staging_key(tmp_p
 
 
 @engine_gated
-async def test_an_empty_projection_is_unavailable_not_neighbourless(tmp_path):
+async def test_an_unbuilt_projection_is_unavailable_not_neighbourless(tmp_path):
     """THE blocker: an unbuilt projection must raise, never answer [].
 
     The seam blesses "root absent -> []" as genuinely no-neighbours. An unbuilt
@@ -551,22 +969,74 @@ async def test_an_empty_projection_is_unavailable_not_neighbourless(tmp_path):
     every memory in the system while staying perfectly reachable — nothing
     raises, nothing falls back, nothing logs, and the health probe is documented
     not to care. The failure would be silent and total.
+
+    UNBUILT now means NO PROJECTION MARKER, which is a different question from
+    "holds no nodes" — see the sibling test below for why that distinction is a
+    real install and not a hair split. It is also not the same as "the key is
+    missing": MEASURED here, a read-only MATCH against a missing key CREATES it,
+    so the traversal that reaches this check has already materialised a blank
+    graph and key existence can no longer tell the two apart.
     """
-    store = FalkorGraphStore(graph_key="test_f2_empty")
+    store = FalkorGraphStore(graph_key="test_f2_unbuilt")
     try:
         conn = await store._connection()
-        await conn.delete("test_f2_empty")
-        # Create the key with an index but no nodes — reachable, and empty.
-        await store._ensure_index(key="test_f2_empty")
-        with pytest.raises(GraphUnavailableError, match="holds no nodes"):
+        await conn.delete("test_f2_unbuilt")
+        with pytest.raises(GraphUnavailableError, match="no projection marker"):
             await store.traverse(None, "anything", max_depth=2, min_strength=0.3)
         # UNLATCHED, and this is the assertion that matters. An earlier version
         # cached "the projection exists" for the process lifetime; because the
         # engine holds no persistence, a restart then emptied the graph while the
         # cached answer said otherwise, and every traversal returned [] silently
         # until the SERVER restarted. Raising only the first time is the bug.
-        with pytest.raises(GraphUnavailableError, match="holds no nodes"):
+        with pytest.raises(GraphUnavailableError, match="no projection marker"):
             await store.traverse(None, "anything", max_depth=2, min_strength=0.3)
     finally:
         conn = await store._connection()
-        await conn.delete("test_f2_empty")
+        await conn.delete("test_f2_unbuilt")
+
+
+@engine_gated
+async def test_a_built_but_empty_projection_answers_rather_than_raising(tmp_path):
+    """The other side of the same contract, and the one that was wrong.
+
+    Node count cannot tell "never built" from "built, and the graph really is
+    empty". On a fresh or fully pruned install `memory_links` legitimately holds
+    zero rows, so a correct projection of an empty graph counted zero and
+    reported itself unavailable — the facade then fell back and logged a warning
+    on every graph-enriched recall, about a backend that was representing the
+    empty graph exactly right. It also contradicted the seam's own contract,
+    which blesses an empty graph as an answer.
+
+    Driven through the REAL `project()` against a link-free database, not by
+    hand-building the end state — the point is that the projector produces a
+    graph this check accepts, and a hand-made fixture could agree with the check
+    while the projector disagreed with both.
+    """
+    import aiosqlite
+
+    store = FalkorGraphStore(graph_key="test_f2_built_empty")
+    db = await aiosqlite.connect(str(tmp_path / "empty.db"))
+    try:
+        await db.execute(
+            "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, "
+            "link_type TEXT, strength REAL)"
+        )
+        await db.execute(
+            "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+        )
+        await db.commit()
+
+        conn = await store._connection()
+        await conn.delete("test_f2_built_empty")
+
+        stats = await store.project(db)
+        assert stats == {"nodes": 0, "edges": 0, "hidden": 0}, (
+            "a link-free database must project to an empty graph, not fail"
+        )
+        assert await store.traverse(None, "anything", max_depth=2, min_strength=0.3) == [], (
+            "a built-but-empty projection answers [] — it is not unavailable"
+        )
+    finally:
+        conn = await store._connection()
+        await conn.delete("test_f2_built_empty")
+        await db.close()

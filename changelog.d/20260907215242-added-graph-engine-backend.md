@@ -25,9 +25,12 @@
   If you do arm the engine, build its projection first with `python -m
   genesis.memory.graphstore_project` — safe to re-run at any time, including
   while the engine is being read, because the new copy is built alongside the
-  old one and swapped in atomically. Selecting the engine without a projection
-  is refused rather than silently answered, since an empty graph and a memory
-  with no connections are indistinguishable from the answer alone.
+  old one and swapped in atomically. Selecting the engine before building a
+  projection is refused rather than silently answered, since a never-built
+  projection makes every memory look like it has no connections and the answer
+  alone cannot tell you which it is. A projection that was built and is
+  genuinely empty — a fresh install, or one whose links were all pruned — is
+  answered normally, not refused.
 
   **This update does change your dependencies.** The graph engine is part of the
   memory architecture rather than an optional add-on, so its client ships as a

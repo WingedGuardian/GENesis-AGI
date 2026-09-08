@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from urllib.parse import quote
 
 from genesis.env import genesis_db_path
 from genesis.memory.graphstore import GraphUnavailableError
@@ -37,7 +38,18 @@ async def build(graph_key: str = GRAPH_KEY) -> dict[str, int]:
 
     db_path = genesis_db_path()
     store = FalkorGraphStore(graph_key=graph_key)
-    db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
+    # Percent-encode the path before it becomes a URI. `?` and `#` are
+    # URI-significant, so a raw interpolation lets SQLite read everything after
+    # one as a query string or fragment: a database at `.../memory?copy.db`
+    # would silently open `.../memory` instead — the wrong file, with no error.
+    # `safe="/"` keeps the separators. Same shape as `inbox/writer.py`.
+    #
+    # NOTE for a class sweep, not this PR: `connect(f"file:{path}?mode=ro")`
+    # without quoting is the prevailing pattern in this repo (~20 sites across
+    # db/data_migrations, attention, channels/voice, db/crud and eval, measured
+    # 2026-09-08). This fixes the instance this PR introduced rather than
+    # shipping a new member of a known class; the sweep is its own change.
+    db = await aiosqlite.connect(f"file:{quote(str(db_path), safe='/')}?mode=ro", uri=True)
     try:
         return await store.project(db)
     finally:
