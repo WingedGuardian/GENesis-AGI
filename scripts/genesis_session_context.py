@@ -952,7 +952,17 @@ def _emit_body() -> tuple[str, str, str] | None:
         # Emitted once at session start rather than per turn: this is a
         # session-lifetime constant, and the per-turn tag exists for the clock
         # beside it, not for the id.
-        if _hook_session_id:
+        #
+        # GATED ON THE PART, and "once" is why. settings.json wires FOUR
+        # SessionStart invocations of this script, one per --part; an ungated
+        # block inside `is_genesis_session` therefore ran in every part that
+        # reaches here, which MEASURED as two copies (charter and knowledge) —
+        # so the sentence above was false of the code beneath it (Codex P2).
+        # Charter is the right home: it is the identity part, it renders first,
+        # and the knowledge part is the one under a tight character budget,
+        # where a duplicate would push out later capability and MCP-crash
+        # warnings.
+        if _in("charter") and _hook_session_id:
             if not first:
                 _emit("\n\n---\n\n")
             # The argument NAME differs per tool and the difference is not

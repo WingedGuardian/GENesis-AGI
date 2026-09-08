@@ -45,7 +45,7 @@ def _isolated_home(tmp_path: Path) -> Path:
     return home
 
 
-def _run(tmp_path: Path, session_id: str, *, dispatched: bool) -> str:
+def _run(tmp_path: Path, session_id: str, *, dispatched: bool, part: str | None = None) -> str:
     home = _isolated_home(tmp_path)
     env = dict(os.environ)
     env["HOME"] = str(home)
@@ -70,7 +70,7 @@ def _run(tmp_path: Path, session_id: str, *, dispatched: bool) -> str:
     else:
         env.pop("GENESIS_CC_SESSION", None)
     proc = subprocess.run(
-        [sys.executable, str(_SCRIPT)],
+        [sys.executable, str(_SCRIPT), *(["--part", part] if part else [])],
         input=json.dumps({"session_id": session_id, "hook_event_name": "SessionStart"}),
         capture_output=True,
         text=True,
@@ -110,6 +110,29 @@ def test_it_names_the_ledger_argument_correctly(tmp_path):
     # the two calls back into one shared keyword.
     assert "session_ledger_add(source_session=" not in block
     assert "follow_up_create(source_session=" in block
+
+
+def test_the_block_is_emitted_by_exactly_ONE_part(tmp_path):
+    """ "Once per session" is a claim about the WIRING, not about one process.
+
+    settings.json wires FOUR SessionStart invocations of this script, one per
+    `--part`. A block gated only on `is_genesis_session` runs in every part that
+    reaches it, so the first version of this feature emitted TWO copies — in
+    `charter` and in `knowledge` — while its own comment said "emitted once"
+    (Codex P2). Duplicate context in the highest-salience slot is the visible
+    cost; the quieter one is that the knowledge part is budget-capped, so a
+    second copy pushes later warnings out of the window entirely.
+
+    Parametrised over the real wired part list rather than the two that happened
+    to fire, so a part added to settings.json later cannot quietly start
+    emitting a third copy.
+    """
+    emitting = [
+        part
+        for part in ("charter", "identity-core", "identity-user", "knowledge")
+        if "## This Session" in _run(tmp_path, _SID, dispatched=True, part=part)
+    ]
+    assert emitting == ["charter"], f"expected exactly the charter part, got {emitting}"
 
 
 def test_the_subprocess_does_not_read_the_live_production_database(tmp_path):
