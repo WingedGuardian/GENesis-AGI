@@ -38,8 +38,9 @@ which is exactly what lets Round-1 bugs through.
   ladder with per-finding `file:line` + confidence, completion status last.
 - **ALSO `genesis-security-reviewer`** when the diff touches auth, credentials/secrets,
   subprocess, SQL, path handling, external input (Telegram/dashboard/MCP), or hooks/gates.
-- Run them SEQUENTIALLY, never in parallel (standing rule — the second reviewer must see the
-  fixed code, and parallel doubles spend).
+- Run them SEQUENTIALLY, almost never in parallel on the same diff (standing rule — the second
+  reviewer must see the fixed code, and parallel doubles spend). Sequential means WAIT for a
+  running reviewer to finish; it never means killing one to start the next.
 
 Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this into the prompt:
 

@@ -1410,12 +1410,45 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review (local `codex exec` when quota allows, else genesis-architect), evidence
   recorded naming the head, then the merge re-run — the gate's block message walks
   through it.
-- **One reviewer at a time — NEVER run two review agents simultaneously.** Run
-  one reviewer (e.g. Codex), apply/verify its findings, then run the next
-  reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
-  The second reviewer should see the improved code, not the same unfixed diff
-  both would otherwise review; parallel also doubles review spend per baseline.
-  (Standing user directive.)
+- **One reviewer at a time on a given diff — almost never two at once.** Run one
+  reviewer (e.g. Codex), apply/verify its findings, then run the next reviewer
+  (e.g. Claude) on the *fixed* code. The second reviewer should see the improved
+  code, not the same unfixed diff both would otherwise review; parallel also
+  doubles review spend per baseline. (Standing user directive.)
+
+  **Sequential means WAIT. It does not mean kill.** When a review is already
+  running and a different reviewer gets named — a tool switch, a stated
+  preference, a peer session's run — let the in-flight one FINISH. Terminating
+  it destroys the findings the next reviewer is supposed to build on, which is
+  the opposite of what this rule is for. MEASURED 2026-09-08: a running review
+  was killed four minutes in, mid-analysis on the load-bearing question, to
+  honour this rule's former "NEVER" — and nothing was gated on stopping it.
+
+  The "almost" is load-bearing. This is standard practice, not a prohibition:
+  * Two reviewers on DIFFERENT diffs is fine — no shared baseline, no
+    cross-bias. It is not licence to fan out across the queue: external
+    reviewers share one quota, and exhausting it strands the cross-model gate
+    every open PR depends on. Concurrency here is a tolerated exception, not a
+    throughput strategy.
+  * A peer session's reviewer is not yours to stop while that session is alive.
+    An ORPHAN — a process whose session is gone, or one wedged holding a
+    semaphore slot — is ordinary cleanup; establish it is orphaned first.
+  * The user may ask for both, in their own words naming the running one. A
+    preference for a different tool is NOT that ask; that misreading is the
+    incident above.
+
+  **If you are about to terminate a running reviewer in order to satisfy this
+  rule, that is the tell that you are misreading it.** Wait, or ask.
+
+  This rule prohibits a STATE ("two running") rather than an ACTION, which is
+  why it is spelled out: a state prohibition can be satisfied by DESTROYING the
+  offending state, where an action prohibition — never push to main, never
+  hardcode the slug — can only be satisfied by not acting. The other instance of
+  the shape is `CLAUDE.md`'s genesis-bridge line ("must never run alongside the
+  server"), where the wrong discharge is worse: stopping the server rather than
+  declining to start the bridge. Prefer phrasing a new rule as an action; where
+  it must name a state, say which side gives way, because an absolute with an
+  unstated remedy is discharged in whatever direction the reader already leans.
 - **A different model is the real correctness gate; Codex is the default.** A Claude
   reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
   the cross-model gate. When the GitHub Codex reviewer is unavailable AND the install
