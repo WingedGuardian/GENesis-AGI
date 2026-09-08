@@ -9,6 +9,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **"Where deferred work goes" now says plainly that filing is not deferring.**
+  The rule opened with a fix-now bias and then spent a paragraph on routing by
+  owner, and the routing half read as though it answered the whole question —
+  so "this is repo work, therefore a GitHub issue" became a disposition, and an
+  in-scope item got a ticket instead of a fix. The two decisions are now
+  separated in the order they should be made: is it in scope for what this
+  session is doing, and only then, where does the record live. An issue is a
+  public record, not a disposal; in-scope work gets filed *and* done. The
+  mechanics section of the MCP tools guide says the same at its top, since that
+  is the page someone lands on when they are already reaching for the routing
+  answer.
+
 ### Fixed
 
 - **SECURITY.md described a posture the code left behind two months ago.** The
