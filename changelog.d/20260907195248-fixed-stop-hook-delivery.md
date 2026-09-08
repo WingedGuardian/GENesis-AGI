@@ -33,3 +33,17 @@
   repeating on purpose, and is unchanged. A reminder said twice adds nothing; a
   gate that gives up after being acknowledged once was never a gate. It still
   lets go the moment the document is verified or the draft is abandoned.
+
+  Now that the two reminders cost a step instead of nothing, three ways they
+  read a reply wrongly are fixed. A quoted review verdict saying the work is
+  *not* ready no longer reads as a claim that it is. A reply quoting the phrase
+  "read the implementation completely" no longer reads as "implementation
+  complete". And naming a check that has not happened yet — testing planned for
+  next session, verification deferred or blocked — no longer buys silence from
+  the reminder that exists for exactly that case; only a check reported as done
+  does.
+
+  Deliberately unchanged: a reply that phrases finishing in the negative ("I
+  won't merge without your go-ahead") still gets the reminder. Measured against
+  this install's own history, suppressing those would have silenced the
+  reminder on turns that genuinely wanted it and caught none of the wrong ones.

@@ -300,15 +300,62 @@ _FINISHING_PATTERNS = re.compile(
     r"merge\s+(?:back\s+)?to\s+main"
     r"|create\s+a\s+pull\s+request"
     r"|push\s+and\s+create"
-    r"|implementation\s+complete"
+    # `complete[sd]?\b` and not a bare `complete`: without the boundary,
+    # "implementation COMPLETELY" matches. MEASURED — 2 of the 6 wrong fires in
+    # the corpus below were that exact bleed, both of them quotations of the
+    # genesis-development rule "Read the reference implementation COMPLETELY
+    # before deriving from it". `complete[sd]?` keeps "completed"/"completes",
+    # which are real finishing claims; a bare `complete\b` would have lost them.
+    r"|implementation\s+complete[sd]?\b"
     r"|what\s+would\s+you\s+like\s+to\s+do\?"
     r"|keep\s+the\s+branch\s+as-is"
     r"|discard\s+this\s+work"
-    r"|ready\s+to\s+(?:ship|merge|land|deploy)"
-    r"|all\s+(?:changes|work)\s+(?:are\s+)?(?:done|complete)"
+    r"|ready\s+to\s+(?:ship|merge|land|deploy)\b"
+    r"|all\s+(?:changes|work)\s+(?:are\s+)?(?:done|complete[sd]?\b)"
     r")",
     re.IGNORECASE,
 )
+
+# This repo's own review protocol closes every review with
+# `Ready to merge: Yes | No | With fixes` (genesis-development skill, "Close
+# every review with a verdict"). When the assistant QUOTES a reviewer's verdict,
+# the two negative values are a report that the work is NOT finished — the exact
+# inverse of what `_FINISHING_PATTERNS` is looking for.
+#
+# A CLOSED set of two literals from a protocol this repo defines, deliberately —
+# not a general model of negation. That general model was measured and is worse
+# than nothing here: over the corpus, a negation cue in the 60 characters BEFORE
+# a finishing match selects 8 messages, and reading all 8 by hand, every one is a
+# TRUE fire ("I won't merge to main without your go-ahead" is a finishing-stage
+# turn, not a status-unfinished one) and none is a wrong fire. Suppressing on
+# negation would therefore have blinded the matcher 8 times to buy nothing. The
+# polarity that actually discriminates sits AFTER the match, in a fixed vocabulary.
+#
+# The separator is written out rather than assumed: these messages are Markdown,
+# so the verdict routinely arrives bolded or dash-joined. MEASURED across this
+# install's transcripts, of 710 negative-verdict occurrences the plain `: No`
+# spelling covers 674 and the bold-value and dash forms account for the other 36
+# — a 5% hole in a rule whose whole job is polarity. Admitting the dash also
+# admits "ready to merge - no problem", which is why `no` carries the lookahead:
+# without it the widening would trade one wrong fire for one wrong SILENCE, and
+# a wrong silence is the direction that loses the feature.
+_NOT_READY_VERDICT = re.compile(
+    r"\**\s*[:—–-]\s*\**\s*"
+    r"(?:no\b(?!\s+(?:blocker|issue|problem|concern|finding|change))|with\s+fixes\b)",
+    re.IGNORECASE,
+)
+
+
+def _finishing_claim(assistant_message: str) -> bool:
+    """Is the assistant claiming to be at the finishing stage?
+
+    A finishing phrase carrying a negative review verdict is a quotation of
+    someone saying the work is NOT done, so it does not count.
+    """
+    for m in _FINISHING_PATTERNS.finditer(assistant_message):
+        if not _NOT_READY_VERDICT.match(assistant_message, m.end()):
+            return True
+    return False
 
 # Patterns indicating integration/e2e verification was actually done.
 # If any of these appear alongside finishing language, skip the reminder.
@@ -329,14 +376,81 @@ _VERIFICATION_EVIDENCE = re.compile(
     re.IGNORECASE,
 )
 
+# A mention of verification is not evidence that verification HAPPENED. These
+# qualifiers say it is still owed — planned, deferred, blocked, or failed — and
+# a sentence carrying one alongside an evidence phrase is the case where the
+# reminder is most warranted, not least.
+#
+# The window is the SENTENCE, not a character count: a qualifier binds the
+# evidence phrase it shares a sentence with. MEASURED over the corpus, 9 messages
+# reach the evidence suppressor at all and 3 of those suppressions are wrong;
+# hand-reading all 9, this closed vocabulary un-suppresses 2 of the 3 and leaves
+# every correct suppression standing. The word "never" is deliberately ABSENT:
+# it appears in a correctly-suppressed message ("values never printed") in a
+# clause that has nothing to do with whether the test ran.
+#
+# Every branch is spelled to its own word boundary. The trailing `\b` closes the
+# WHOLE alternation, so a stem written as a stem is a contradiction: an earlier
+# draft carried `before\s+(?:merg|ship|land)\b`, which matched the non-word
+# "before merg" and NOT "before merge" or "before merging" — a member of a
+# closed, hand-chosen vocabulary that could never fire. Verified by running the
+# pattern over the inflection table rather than by reading it.
+_NOT_YET_VERIFIED = re.compile(
+    r"\b(?:next\s+session|needs?|needed|deferred|pending|todo|to-do|not\s+yet"
+    r"|planned|could\s?n[o']?t|cannot|can'?t|failed|failing|unable\s+to"
+    r"|skip(?:s|ped|ping)?|untested|unverified"
+    r"|before\s+(?:merg(?:e|es|ed|ing)|ship(?:s|ped|ping)?|land(?:s|ed|ing)?))\b",
+    re.IGNORECASE,
+)
+
+# Sentence bounds, for scoping the qualifier above. A newline counts: these
+# messages are Markdown, where a list item is a sentence. So does `;`, which
+# joins two clauses that can be about different things ("the first attempt
+# failed; after the fix the integration test passes" is evidence, and treating
+# the whole line as one sentence would have thrown it away). `:` is deliberately
+# NOT a break — it is the joint in "Phase 2 next session: E2E testing", one of
+# the two shapes this repair exists for.
+#
+# An abbreviation or a decimal ("e.g.", "3.5") splits a sentence that should not
+# have been split, which only SHRINKS the window a qualifier is looked for in —
+# so that error can lose a repair, never invent one, and the fail direction stays
+# the status quo.
+_SENTENCE_BREAK = ".!?;\n"
+
+
+def _sentence_around(text: str, start: int, end: int) -> tuple[int, int]:
+    """Bounds of the sentence containing text[start:end]."""
+    left = max(text.rfind(c, 0, start) for c in _SENTENCE_BREAK) + 1
+    rights = [i for i in (text.find(c, end) for c in _SENTENCE_BREAK) if i != -1]
+    return left, (min(rights) if rights else len(text))
+
+
+def _has_verification_evidence(assistant_message: str) -> bool:
+    """Did the message claim verification was actually DONE?
+
+    A phrase naming verification counts as evidence only when its own sentence
+    does not also say the verification is still owed.
+
+    The window is the WHOLE sentence, on both sides of the phrase. An earlier
+    draft scanned only the text before it and claimed in its docstring to scan
+    the sentence; English puts these qualifiers after the noun phrase at least
+    as often as before it, so "the integration test failed" — the exact case the
+    `failed` qualifier was added for — still bought silence.
+    """
+    for m in _VERIFICATION_EVIDENCE.finditer(assistant_message):
+        left, right = _sentence_around(assistant_message, m.start(), m.end())
+        if not _NOT_YET_VERIFIED.search(assistant_message, left, right):
+            return True
+    return False
+
 
 def _check_outcome_verification(assistant_message: str) -> str | None:
     """Remind to verify actual outcomes before presenting completion options."""
     if not assistant_message:
         return None
-    if not _FINISHING_PATTERNS.search(assistant_message):
+    if not _finishing_claim(assistant_message):
         return None
-    if _VERIFICATION_EVIDENCE.search(assistant_message):
+    if _has_verification_evidence(assistant_message):
         return None
     return (
         "OUTCOME VERIFICATION REMINDER: You're presenting completion options "

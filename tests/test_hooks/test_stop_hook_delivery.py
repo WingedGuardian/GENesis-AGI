@@ -259,3 +259,150 @@ def test_the_suppressor_does_not_blind_the_real_cases(tmp_path, message):
         cwd=tmp_path,
     )
     assert proc.stdout.strip(), f"suppressed a real nudge: {message!r}"
+
+
+@pytest.mark.parametrize(
+    ("message", "should_fire"),
+    [
+        # A reviewer's verdict, quoted. This repo's own review protocol closes
+        # with `Ready to merge: Yes | No | With fixes`, so the two negative
+        # values are a report that the work is NOT finished.
+        ("Codex marked it Ready to merge: No, so I fixed the four findings.", False),
+        ("The architect returned Ready to merge: With fixes on the dedup work.", False),
+        # Markdown spellings of the same verdict. MEASURED: of 710 negative
+        # verdicts in this install's transcripts, 36 arrive bolded or
+        # dash-joined — a 5% hole in a rule whose only job is polarity.
+        ("The architect returned Ready to merge: **No** on the dedup work.", False),
+        ("Codex said **Ready to merge:** No, so I fixed the findings.", False),
+        ("Codex said Ready to merge — No, so I fixed the findings.", False),
+        # The affirmative verdict is a finishing claim like any other, and the
+        # message around it carries no verification evidence.
+        ("The architect returned Ready to merge: Yes — all closed at class level.", True),
+        # Admitting the dash admits "ready to merge - no problem", where "no"
+        # opens a reason rather than being the verdict. A wrong SILENCE is the
+        # direction that loses the feature, so this must still fire.
+        ("Ready to merge — no blockers remain on the branch.", True),
+    ],
+)
+def test_a_NOT_ready_verdict_is_not_a_completion_claim(tmp_path, message, should_fire):
+    """Polarity, from a CLOSED set of two literals — not a model of negation.
+
+    MEASURED over 12,653 unique turn-final assistant messages from this
+    install's transcripts: 3 of the 6 wrong outcome-verification fires were a
+    quoted `Ready to merge: No`. The discriminator sits AFTER the phrase, in a
+    vocabulary this repo defines, which is why it can be a fixed list.
+    """
+    proc = _run_hook(
+        "genesis_stop_hook.py",
+        {"session_id": _SID, "last_assistant_message": message},
+        tmp_path,
+        cwd=tmp_path,
+    )
+    assert bool(proc.stdout.strip()) is should_fire, message
+
+
+@pytest.mark.parametrize(
+    ("message", "should_fire"),
+    [
+        # The bleed: `implementation complete` used to match the ADVERB. Both of
+        # these fired under the old pattern — verified against it directly,
+        # because a case that never fired proves nothing about the boundary. (A
+        # first draft used "implementation-completely", where the hyphen means
+        # `\s+` never matched it either way: vacuous, and it read as coverage.)
+        ("The skill already says: Read the reference implementation COMPLETELY.", False),
+        ("I read the implementation completely before editing.", False),
+        # The inflections that are real finishing claims must survive the fix —
+        # a bare `complete\b` would have lost them.
+        ("Implementation completed on the branch, 12 files changed.", True),
+        ("Implementation complete, 12 files changed.", True),
+    ],
+)
+def test_a_finishing_word_is_matched_WHOLE(tmp_path, message, should_fire):
+    """`complete[sd]?\\b`, so COMPLETELY is not a completion claim."""
+    proc = _run_hook(
+        "genesis_stop_hook.py",
+        {"session_id": _SID, "last_assistant_message": message},
+        tmp_path,
+        cwd=tmp_path,
+    )
+    assert bool(proc.stdout.strip()) is should_fire, message
+
+
+@pytest.mark.parametrize(
+    ("message", "should_fire"),
+    [
+        # Verification that has NOT happened. Naming it must not buy silence —
+        # this is the case the reminder exists for.
+        ("Implementation complete. Phase 2 next session: E2E testing.", True),
+        ("Ready to merge. Design 4 is deferred: it needs a dedicated session "
+         "with live testing.", True),
+        ("Ready to merge. I could not run the integration test on this host.", True),
+        # The qualifier AFTER the phrase — English puts it there at least as
+        # often. A window that scanned only the preceding text let the exact
+        # case `failed` was added for buy silence.
+        ("Ready to merge. The integration test failed.", True),
+        ("Ready to merge. The e2e test is still pending.", True),
+        # Each of these carries exactly ONE qualifier, so it locks that entry's
+        # inflection. `\b` closes the whole alternation, so a branch written as
+        # a stem ("before merg") matches only a non-word and is dead on arrival.
+        ("Ready to merge. The e2e test will run before merging.", True),
+        ("Ready to merge. Skipping the smoke test until the host is back.", True),
+        # Verification that DID happen still buys silence. The reminder that
+        # fires on a verified message is worse than the one that misses.
+        ("Ready to merge. The fix is verified end-to-end.", False),
+        ("Ready to merge. The integration test passes on the live server.", False),
+        # Two clauses about different things. `;` is a sentence break precisely
+        # so the first clause's qualifier does not bind the second's evidence.
+        ("Ready to merge. The first attempt failed; the integration test now passes.", False),
+        ("Ready to merge. This needs no follow-up; the smoke test passed.", False),
+        # `never` is deliberately not a qualifier: it occurs in a correctly
+        # suppressed message ("values never printed") in a clause with nothing
+        # to do with whether the test ran.
+        ("Ready to merge. Values are never printed and the smoke test passes.", False),
+    ],
+)
+def test_verification_NAMED_is_not_verification_DONE(tmp_path, message, should_fire):
+    """MEASURED: 9 messages reach the evidence suppressor; 3 wrongly.
+
+    Two of the three were verification that was planned or deferred, named in
+    the same sentence as the qualifier saying so. This closed vocabulary
+    repairs those two and leaves all 6 correct suppressions standing.
+    """
+    proc = _run_hook(
+        "genesis_stop_hook.py",
+        {"session_id": _SID, "last_assistant_message": message},
+        tmp_path,
+        cwd=tmp_path,
+    )
+    assert bool(proc.stdout.strip()) is should_fire, message
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Per the standing rule I won't merge to main without your go-ahead.",
+        "The merge is your call — I don't merge to main autonomously.",
+        "This is not ready to ship on its own; it rides the other PR.",
+    ],
+)
+def test_a_negated_finishing_phrase_STILL_fires(tmp_path, message):
+    """The measurement that decided against a negation filter — pinned.
+
+    A general negation filter is the obvious repair and it is net-harmful here.
+    MEASURED: a negation cue in the 60 characters before a finishing match
+    selects 8 of the 130 fires, and hand-reading all 8, every one is a TRUE
+    fire — a finishing-stage turn holding at the merge gate, not a status
+    update saying the work is unfinished. Suppressing on negation would have
+    blinded the matcher 8 times and removed none of the 6 wrong fires, whose
+    polarity sits after the phrase rather than before it.
+
+    This test exists so the next session that reaches for a negation filter has
+    to argue with the measurement instead of rediscovering it.
+    """
+    proc = _run_hook(
+        "genesis_stop_hook.py",
+        {"session_id": _SID, "last_assistant_message": message},
+        tmp_path,
+        cwd=tmp_path,
+    )
+    assert proc.stdout.strip(), f"a negation filter would have blinded this: {message!r}"
