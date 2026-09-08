@@ -3429,3 +3429,86 @@ async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog
     assert output.text == "done"
     hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
     assert not hits, "canary fired on a line from_raw parses losslessly"
+
+
+@pytest.mark.asyncio
+async def test_a_drop_then_a_timeout_is_still_unreplayable(invoker, monkeypatch):
+    """The THIRD retryable exit, and the one a wrong comment hid.
+
+    A failover peer can run its tools, drop an oversized line, and only then hit
+    `timeout_s`. `CCTimeoutError` looks safe because `_try_invoke` and
+    `_try_invoke_streaming` both re-raise it — but `_run_failover_peer`
+    (`conversation.py:1114-1119`) does NOT carry it, so it lands on
+    `_try_roster_failover`'s generic `except CCError` and the loop advances to
+    the next peer, replaying the prompt with full tools (Codex P1, PR #1625
+    round 5). Before drop-and-continue the over-limit ValueError escaped every
+    retry path, so this combination is newly reachable.
+
+    A drop outranks the timeout: the only question the TYPE answers is "may I
+    re-run this?", and after a drop the answer is no regardless of what else
+    went wrong.
+    """
+    _no_host_syscalls(monkeypatch)
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "oversized tool result"},
+        ]}},
+    )
+
+    class _DropThenHang:
+        """Drop line 1, then never return — the reader hits its timeout."""
+
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            idx = self._i
+            self.reads.append(idx)
+            self._i += 1
+            if idx == 1:
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+            if idx < len(self._lines):
+                return self._lines[idx]
+            await asyncio.Event().wait()  # hang until the timeout fires
+            return b""
+
+    proc = _streaming_proc(b"")
+    proc.stdout = _DropThenHang(data)
+    proc.pid = 424303  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCStreamTruncatedError, match="timed out"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x", timeout_s=1))
+
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_without_a_drop_is_still_a_timeout(invoker, monkeypatch):
+    """CLAUSE COVER: an ordinary timeout must keep its own type, or the
+    timeout-specific handling in every caller stops matching."""
+    _no_host_syscalls(monkeypatch)
+
+    class _Hang:
+        def __init__(self):
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            self.reads.append(0)
+            await asyncio.Event().wait()
+            return b""
+
+    proc = _streaming_proc(b"")
+    proc.stdout = _Hang()
+    proc.pid = 424304  # explicit + distinct; never a mock default
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCTimeoutError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x", timeout_s=1))

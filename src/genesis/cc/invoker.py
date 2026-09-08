@@ -1495,19 +1495,32 @@ class CCInvoker:
 
         if timed_out:
             partial = "".join(collected_text)
-            # Name the drops too. No catch site replays a timeout (both re-raise
-            # tuples in cc/conversation.py carry CCTimeoutError), so this is
-            # diagnosability rather than safety — but a timeout on a stream that
-            # also lost N lines is a different incident from a plain one, and
-            # the message is the only place that shows it.
+            # A drop OUTRANKS the timeout, for the same reason it outranks the
+            # two error branches below: the question a caller asks of the type
+            # is "may I re-run this?", and once a line was dropped the answer is
+            # no, whatever else also went wrong.
+            #
+            # An earlier revision of this comment claimed the opposite — that no
+            # catch site replays a timeout, "both re-raise tuples in
+            # cc/conversation.py carry CCTimeoutError". That was FALSE, and
+            # false in the specific way this file keeps having to relearn: there
+            # are THREE re-raise sites, not two. `_try_invoke` and
+            # `_try_invoke_streaming` do carry CCTimeoutError;
+            # `_run_failover_peer` (conversation.py:1114-1119) does NOT, so a
+            # timeout there falls to the generic `except CCError` in
+            # `_try_roster_failover` and advances to the next peer — replaying
+            # the prompt with full tools after the first peer already ran its
+            # own. Enumerating two of three members of a set and writing "both"
+            # is how a safety claim gets shipped without being checked.
+            if oversized_dropped:
+                raise _unreplayable_after_drop(
+                    oversized_dropped,
+                    f"the stream then timed out after {invocation.timeout_s}s"
+                    + (f" (partial: {len(partial)} chars)" if partial else ""),
+                )
             raise CCTimeoutError(
                 f"Timeout after {invocation.timeout_s}s"
-                + (f" (partial: {len(partial)} chars)" if partial else "")
-                + (
-                    f", after dropping {oversized_dropped} over-limit line(s)"
-                    if oversized_dropped
-                    else ""
-                ),
+                + (f" (partial: {len(partial)} chars)" if partial else ""),
             )
 
         if result_data is not None:
