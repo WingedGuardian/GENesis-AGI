@@ -509,10 +509,15 @@ class Router:
                 failed_providers=tuple(failed_providers),
                 # The WALKABLE chain: post-`_filter_chain`, so a `never_pays`
                 # site does not count paid entries it was never going to try.
-                # That is the only length `attempts` can be reconciled against
-                # — but it is NOT the length a reader counts in
-                # `model_routing.yaml`, and the two currently differ on three
-                # of this install's nine `never_pays` sites.
+                # That is the only length `attempts` can be reconciled against,
+                # and it is not necessarily the length a reader counts in
+                # `model_routing.yaml`. As of 2026-09-07 the two AGREE on all
+                # nine `never_pays` sites — the three that used to differ did so
+                # because both Mistral rungs were `free: false`, and flipping
+                # them to `free: true` made every never_pays chain fully
+                # walkable. Do not read that agreement as an invariant: it is a
+                # property of the current config, and adding one non-free
+                # provider to a never_pays chain re-opens the gap.
                 chain_size=len(chain),
             )
 
@@ -596,9 +601,23 @@ class Router:
             #    burning more of this provider's rate quota.
             #  - BAD_REQUEST: a 400/422 is deterministic (our payload) — the
             #    same provider with the same payload fails identically.
+            #  - NOT_ENTITLED: a 403 on account tier is deterministic — the
+            #    same credential and model fail identically on every retry.
+            #  - QUOTA_EXHAUSTED: an exhausted allowance is a BILLING state, not
+            #    a timing one. Unlike a 429 it cannot clear inside a backoff
+            #    window, and the limit is usually account-global rather than
+            #    per-model — one OpenRouter key limit covers every openrouter
+            #    entry in the chain — so retrying pays the same toll repeatedly
+            #    within a single walk. MEASURED 2026-09-05 on this install:
+            #    4.1-6.8s average per exposure (n=22) spent sleeping on a
+            #    provider whose answer could not change.
+            # Both were previously retried, which is the inversion this fixes:
+            # RATE_LIMITED — the one 4xx that genuinely might clear — already
+            # fails fast, while the two that certainly will not did not.
             if category in (
                 ErrorCategory.PERMANENT, ErrorCategory.TIMEOUT,
                 ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
+                ErrorCategory.NOT_ENTITLED, ErrorCategory.QUOTA_EXHAUSTED,
             ):
                 return result
 

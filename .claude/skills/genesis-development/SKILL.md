@@ -453,6 +453,30 @@ to be reverted as cross-branch contamination. Guard false-positives make this
 worse: `shell_parse` mis-parses backslash line-continuations and quoted heredoc
 bodies, so legitimate commands get blocked too.
 
+### Editing source in bypass/auto mode: reads via Bash, WRITES via Edit/Write
+
+In bypass or auto permission mode the CC binary injects a meta message telling
+the session to prefer Bash (`sed`, heredocs, scripts) over Read/Edit/Write —
+and NOT only there: a third selector branch is a cohort assignment, so a
+default-mode session can receive it too. It is an EFFICIENCY heuristic making no
+correctness claim, which follows from how the message is phrased (a preference,
+with its own escape hatch back to the dedicated tools) rather than from where it
+is gated (provenance + full measurement:
+`docs/reference/cc-compatibility.md` "Bypass/auto mode tells the agent to edit
+via Bash"). For reads and search it is simply right — use `cat`/`sed -n`/`grep`/
+`find` freely. For WRITES TO SOURCE it is not: a bare `sed -i` returns exit 0 on
+an absent anchor (silent no-op), rewrites ALL matches of a non-unique one, and
+silently hits the wrong line on a regex-metacharacter anchor where a literal was
+meant — where Edit fails LOUDLY on each. A Bash write also fires none of the five
+`Edit|Write` PostToolUse hooks (the repo's own post-edit verification plane) and
+a heredoc sits in the blocked-compound blast radius above. MEASURED: 54.9% of
+real edit anchors in this repo carry a character `sed` treats as special in BRE,
+its default dialect (2,750 / 5,013; an ERE set scores 74.0% over the same
+corpus, so quote the dialect or the number misleads) — the unsafe case is the
+common one. Use Edit/Write for source; a script that does a literal replace AND
+asserts its occurrence count is acceptable (it re-implements Edit's checks). This
+is universal — the machinery is tracked, so every clone inherits it.
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a
@@ -1638,6 +1662,34 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the user with a minimize-change recommendation. The ack asserts that
   step-back happened — appending it without doing the work is the same
   violation as falsifying `--clean`.
+- **Some PRs are not a review problem — hand them to an architecture session.**
+  When you ARE driving a PR toward green (per "When to DRIVE a Merge" below),
+  asking a few clarifying questions is not a substitute for the design
+  conversation. STOP and hand the PR to a foreground architecture conversation —
+  a session with the USER present, never a `genesis-architect` subagent, which is
+  review-session judgment by another name — when any of these holds: the conflict
+  is STRUCTURAL, main having superseded the mechanism the PR implements, so no
+  conflict resolution is correct on its own terms; it changes or contradicts the
+  spec at a significant level; it raises real questions about how Genesis
+  operates, its architecture, or its infrastructure; its consequences are
+  far-reaching or irreversible; or it is delicate enough that getting it wrong
+  damages a running Genesis. Treat arrival at any tier of the cap (the round-2
+  mode-switch, the round-3 hard stop, and certainly the round-7 terminal) as its
+  own trigger to ask whether this is that kind of PR rather than merely another
+  round — taking this exit does NOT discharge that tier's own stop, which is
+  still owed; the handoff is the answer you bring to it, not a way around it.
+  If you ARE the session with the user present, hold the conversation now. With
+  no user to ask, the action is: comment on the PR naming WHICH trigger fired and
+  the evidence for it, apply the `needs-architecture-session` label (create it if
+  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  `ready` follow-up naming the PR and the decision it awaits — the label is a
+  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
+  is on the order of 1 in 10 or fewer, so a session reaching for it often is
+  mis-triaging. Worked example, PR #1605: main's shared settings writer had
+  replaced the two inline heredocs the PR reimplements, and the literal base-wins
+  resolution measured 61 passed → 36 failed / 25 passed, because it deleted the
+  PR's own fix on two of its three declared paths.
 - **External review feedback is a set of claims to VERIFY, not orders.** For
   every bot/external finding: check it against the actual code (its stated
   mechanism may be wrong even when the underlying concern is real — quote the
@@ -2115,9 +2167,10 @@ merge, the Pre-Merge Gate below governs unchanged.
 
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
-BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
-(mergeable → CI → base-invariant → Codex-freshness → scheduled-Claude-review →
-review-body → inline findings), so the report and the gate can never disagree —
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses, in the gate's own order
+(mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
+Codex-freshness → head-binding → review-body → inline findings →
+scheduled-Claude-review), so the two read the same state —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
 before any merge** — never hand-roll a
@@ -2389,10 +2442,30 @@ Standard open-source workflow: PRs go directly to the public repo.
   is how coverage disappears.
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
+- **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`
+  fragment.** (The one exception is the release-fold PR, where the
+  `CHANGELOG.md` diff is produced by `scripts/assemble_changelog.py` and the
+  section rename rather than written by hand — see the release procedure in
+  `docs/reference/recovery-and-portability-workflow.md`.)
+  One file per change, named `<YYYYMMDDHHMMSS>-<category>-<slug>.md`
+  (timestamp from `date -u +%Y%m%d%H%M%S`; category is one of `added`,
+  `changed`, `deprecated`, `removed`, `fixed`, `security`). The file holds
+  the entry exactly as it should appear — a Markdown bullet, spliced in
+  verbatim. `scripts/assemble_changelog.py` folds them into `[Unreleased]`
+  at RELEASE time, not per PR.
+
+  This is not bookkeeping preference: two branches editing one shared
+  changelog insert at the same position, which git calls a conflict.
+  Measured 2026-09-04 — of 49 open PRs, 21 could not merge and **18 of
+  those conflicted on `CHANGELOG.md` and nothing else**. Two branches
+  writing two different filenames have nothing to merge. A merge driver
+  cannot substitute: GitHub ignores repository `.gitattributes`
+  server-side, measured against its own merge engine.
 - **CHANGELOG audience is users** — only include entries a user updating
   their install would care about. No internal refactors, README changes,
   CI tweaks, or process artifacts. Lead with the user-visible effect, not
-  the implementation technique.
+  the implementation technique. Same bar for a fragment: it becomes a
+  changelog entry verbatim.
 - **No sensitive data in commits** — voice data, research profiles, IPs,
   and secrets must never enter the repo. User data lives in overlays
   outside the repo (e.g., `~/.claude/skills/*/`, `~/.genesis/`).

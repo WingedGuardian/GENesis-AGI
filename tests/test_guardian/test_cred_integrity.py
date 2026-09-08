@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -342,9 +343,45 @@ def test_restore_placement_failure_leaves_no_plaintext_temp(tmp_path, monkeypatc
 
 
 def test_default_targets_match_backup_paths():
-    """Guard: every target's backup_rel matches scripts/backup.sh §8 naming."""
-    by_name = {t.name: t for t in DEFAULT_TARGETS}
-    assert by_name["secrets_env"].backup_rel == "secrets/secrets.env.gpg"
-    assert by_name["claude_credentials"].backup_rel == "creds/claude_credentials.json.gpg"
-    assert by_name["gh_hosts"].backup_rel == "creds/gh_hosts.yml.gpg"
-    assert by_name["ssh_guardian_key"].backup_rel == "creds/ssh/genesis_guardian_ed25519.gpg"
+    """Guard: EVERY target's backup_rel matches scripts/backup.sh §8 naming.
+
+    Derived from backup.sh rather than a hand-listed sample. The previous
+    version's docstring said "every target" while its body asserted four of
+    them, so a new target — and a typo in its backup_rel — joined the unchecked
+    set silently. That matters more here than in most tests: cred_integrity's
+    own module docstring makes the name/path match a MUST, because a mismatch
+    means a corrupt file has no decryptable last-known-good copy and the
+    restore no-ops. The repo's enumerate-don't-spot-check rule, applied to the
+    test that exists to enforce an enumeration.
+    """
+    spec = (
+        pathlib.Path(__file__).resolve().parents[2] / "scripts" / "backup.sh"
+    ).read_text(encoding="utf-8")
+
+    checked = 0
+    for t in DEFAULT_TARGETS:
+        if t.backup_rel.startswith("creds/ssh/"):
+            continue  # §8 sweeps all of ~/.ssh by find(1), not the named list
+        if not t.backup_rel.startswith("creds/"):
+            continue  # secrets.env is §7 (its own GPG step), not the §8 loop
+        flat = t.backup_rel.removeprefix("creds/").removesuffix(".gpg")
+        assert f'"$HOME/{t.path}:{flat}"' in spec, (
+            f"{t.name}: backup.sh §8 has no entry producing creds/{flat}.gpg "
+            f"from $HOME/{t.path}"
+        )
+        checked += 1
+
+    # A derived assertion that matched nothing would pass silently; pin the
+    # population so an empty sweep is a failure rather than a clean run.
+    assert checked >= 5, f"only {checked} §8 targets checked — the filter is wrong"
+
+
+def test_secrets_env_is_backed_up_by_its_own_section():
+    """secrets_env is excluded from the §8 loop above; prove it is not simply
+    unbacked-up. Without this the exclusion could hide a real gap."""
+    spec = (
+        pathlib.Path(__file__).resolve().parents[2] / "scripts" / "backup.sh"
+    ).read_text(encoding="utf-8")
+    target = next(t for t in DEFAULT_TARGETS if t.name == "secrets_env")
+    assert target.backup_rel == "secrets/secrets.env.gpg"
+    assert "secrets/secrets.env.gpg" in spec
