@@ -285,6 +285,26 @@ def _stderr_bg_truncated(stderr_text: str | None) -> bool:
     return bool(stderr_text) and _BG_TRUNCATION_MARKER in stderr_text
 
 
+def _unreplayable_after_drop(dropped: int, outcome: str) -> CCStreamTruncatedError:
+    """The no-retry error for a run whose stream we could not fully read.
+
+    A drop is not only a lost-ANSWER problem; it is a lost-EVIDENCE problem. The
+    over-limit line is typically a tool result, so the tool call behind it may
+    already have run — an MCP write, an outreach send — and nothing downstream
+    dedupes a second one. Whatever the result event then says about the run, a
+    retry of it is unsafe, so every raise on a dropped stream carries the type
+    the retry sites know to leave alone.
+
+    ``outcome`` names what the run reported, so the message says which shape hit
+    it rather than inviting a guess.
+    """
+    return CCStreamTruncatedError(
+        f"CC stream dropped {dropped} over-limit line(s) "
+        f"(limit={_STREAM_LINE_LIMIT} bytes) and {outcome}. The run must not be "
+        "replayed: the tool calls behind the dropped line may already have run."
+    )
+
+
 async def _emit_bg_truncation_event(cc_session_id: str) -> None:
     """Fire a ``cc.bg_truncated`` observability event via the runtime singleton.
 
@@ -1268,6 +1288,41 @@ class CCInvoker:
                     try:
                         event_raw = json.loads(line)
                     except json.JSONDecodeError:
+                        if oversized_dropped:
+                            # This is almost certainly the TAIL of the line we
+                            # just dropped, not a new record. MEASURED against
+                            # CPython 3.12 `StreamReader.readline`: on a limit
+                            # overrun it deletes through the separator only when
+                            # the separator is ALREADY BUFFERED
+                            # (`asyncio/streams.py`, the LimitOverrunError arm);
+                            # when the newline has not arrived yet it clears the
+                            # buffer and the REMAINDER of that physical line
+                            # comes back from the next call. A 64-byte-limit
+                            # probe returned the tail verbatim as the following
+                            # "line".
+                            #
+                            # So its bytes are raw tool output — which may carry
+                            # a credential or personal data, and which this
+                            # repo's logs feed into health snapshots and LLM
+                            # prompts elsewhere. It has no diagnostic value as
+                            # content (a mid-JSON span never parses), so state
+                            # the SIZE and withhold the bytes rather than
+                            # printing 200 characters of somebody's tool result.
+                            # Withheld rather than dropped silently: the count
+                            # is what tells you the stream is resynchronising.
+                            #
+                            # Gated on the drop, not applied unconditionally: an
+                            # ordinary non-JSON line on a clean stream is a CLI
+                            # protocol fault, and there its text is the whole
+                            # diagnostic.
+                            logger.warning(
+                                "CC stream non-JSON line after %d dropped "
+                                "over-limit line(s) — content withheld "
+                                "<%d chars, presumed tail of a dropped line>",
+                                oversized_dropped,
+                                len(line),
+                            )
+                            continue
                         logger.warning("CC stream non-JSON line: %s", line[:200])
                         continue
 
@@ -1440,9 +1495,19 @@ class CCInvoker:
 
         if timed_out:
             partial = "".join(collected_text)
+            # Name the drops too. No catch site replays a timeout (both re-raise
+            # tuples in cc/conversation.py carry CCTimeoutError), so this is
+            # diagnosability rather than safety — but a timeout on a stream that
+            # also lost N lines is a different incident from a plain one, and
+            # the message is the only place that shows it.
             raise CCTimeoutError(
                 f"Timeout after {invocation.timeout_s}s"
-                + (f" (partial: {len(partial)} chars)" if partial else ""),
+                + (f" (partial: {len(partial)} chars)" if partial else "")
+                + (
+                    f", after dropping {oversized_dropped} over-limit line(s)"
+                    if oversized_dropped
+                    else ""
+                ),
             )
 
         if result_data is not None:
@@ -1451,14 +1516,43 @@ class CCInvoker:
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
                 output = replace(output, text="".join(collected_text))
+            if oversized_dropped:
+                # Stamp it BEFORE the branches below, so every exit of this
+                # block carries it — including the rate-limit-with-text branch,
+                # which RETURNS a perfectly good answer off an event stream we
+                # nonetheless read incompletely. A consumer that derives an
+                # inventory from the events it saw (direct_session's tool
+                # telemetry, and through it the protected-path auditor) has no
+                # other way to know its inventory has a hole in it.
+                output = replace(output, stream_lines_dropped=oversized_dropped)
             if bg_truncated:
                 output = replace(output, bg_truncated=True)
                 await _emit_bg_truncation_event(output.session_id)
+            # The two branches below both raise a RETRYABLE error, and on a
+            # dropped stream neither may. `_recover_stale_resume`
+            # (cc/conversation.py) reruns the prompt from scratch on an ordinary
+            # CCError, and a rate-limit error additionally sends the turn to
+            # roster failover — a second full-tools invocation. Either replays
+            # the side effects behind the dropped line, which is exactly what
+            # CCStreamTruncatedError exists to stop; before drop-and-continue an
+            # over-limit line aborted the read with a bare ValueError, so these
+            # shapes never reached a retry path at all. So the classification
+            # still happens — the provider's own status signal is real evidence
+            # and drives scheduling back-off — but the exception that LEAVES here
+            # is the no-retry type, chained so the diagnosis survives.
+            #
+            # Only these two. The rate-limit-WITH-text branch RETURNS rather than
+            # raising, so it permits no replay, and a drop that cost nothing but
+            # a trace line is still an honest success.
             if output.is_error:
                 stderr_hint = stderr_data.decode(errors="replace") if stderr_data else ""
                 error_text = output.error_message or output.text or stderr_hint or "CC error"
                 err = self._classify_error(error_text)
                 await self._notify_status_change(err)
+                if oversized_dropped:
+                    raise _unreplayable_after_drop(
+                        oversized_dropped, "CC reported an error result"
+                    ) from err
                 raise err
 
             # CC may return is_error=false but emit rate_limit_event in
@@ -1486,6 +1580,14 @@ class CCInvoker:
                     raw_event=rate_limit_raw,
                 )
                 await self._notify_status_change(err)
+                if oversized_dropped:
+                    # A rate-limit error is the one that reaches roster failover,
+                    # so this is the branch where a replay costs a SECOND live
+                    # peer running the same prompt with full tools.
+                    raise _unreplayable_after_drop(
+                        oversized_dropped,
+                        "the result carried no text under a rate-limit event",
+                    ) from err
                 raise err
 
             # A result arrived, but a dropped line left it with NO text — so the
@@ -1509,10 +1611,10 @@ class CCInvoker:
             # not "the caller wanted output and got none", it is "an answer was
             # produced and we lost it", which is a failure either way.
             if oversized_dropped and not output.text.strip():
-                raise CCStreamTruncatedError(
-                    f"CC stream dropped {oversized_dropped} over-limit line(s) "
-                    f"(limit={_STREAM_LINE_LIMIT} bytes) and the result carried "
-                    "no text — the answer was almost certainly one of them"
+                raise _unreplayable_after_drop(
+                    oversized_dropped,
+                    "the result carried no text — the answer was almost "
+                    "certainly one of them",
                 )
 
             # Success — notify recovery if previously errored
@@ -1558,10 +1660,10 @@ class CCInvoker:
         # forge. Join and strip: the question is whether real text survived.
         partial_text = "".join(collected_text).strip()
         if oversized_dropped and result_data is None and not (bg_truncated and partial_text):
-            raise CCStreamTruncatedError(
-                f"CC stream dropped {oversized_dropped} over-limit line(s) "
-                f"(limit={_STREAM_LINE_LIMIT} bytes) and NO result event "
-                "arrived — the result line was almost certainly one of them"
+            raise _unreplayable_after_drop(
+                oversized_dropped,
+                "NO result event arrived — the result line was almost "
+                "certainly one of them",
             )
 
         # No result event — treat collected text as response (success path)
@@ -1579,6 +1681,7 @@ class CCInvoker:
             model_requested=str(invocation.model),
             via_proxy=bool(invocation.anthropic_base_url),
             bg_truncated=bg_truncated,
+            stream_lines_dropped=oversized_dropped,
         )
         if bg_truncated:
             await _emit_bg_truncation_event(output.session_id)

@@ -378,6 +378,13 @@ class ConversationLoop:
                     effort=effort,
                 )
                 return outcome.copy
+            except CCStreamTruncatedError as e:
+                # Ahead of the terminal `except CCError`, which would otherwise
+                # dead-end this turn on raw internal prose. See the handler.
+                return await self._handle_stream_truncated(
+                    e, session=session, system_prompt=system_prompt,
+                    prompt_text=prompt_text, channel=channel,
+                )
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -752,6 +759,15 @@ class ConversationLoop:
                     effort=effort,
                 )
                 return outcome.copy
+            except CCStreamTruncatedError as e:
+                # Ahead of the terminal `except CCError`, which would otherwise
+                # dead-end this turn on raw internal prose. `streamed` is passed
+                # so the handler can tell whether contingency would answer over
+                # text the user can already see.
+                return await self._handle_stream_truncated(
+                    e, session=session, system_prompt=system_prompt,
+                    prompt_text=prompt_text, channel=channel, streamed=streamed,
+                )
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -858,6 +874,14 @@ class ConversationLoop:
             # internet is down — DON'T fail the live session as stale-resume and
             # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
+            raise
+        except CCStreamTruncatedError:
+            # PROPHYLACTIC, and say so rather than implying it fires today:
+            # `run()` reads with `communicate()` and has no drop loop, so this
+            # type cannot currently reach here. The streaming twin's tuple
+            # carries it, and the asymmetry is the trap — the day truncation is
+            # classified on the non-streaming path too, its absence here would
+            # SILENTLY restore the full stale-resume replay this PR removed.
             raise
         except CCError:
             if not was_resume:
@@ -1263,6 +1287,41 @@ class ConversationLoop:
                         # would stack a SECOND answer on the first.
                         return ""
                     continue  # this peer is also down → try the next one
+                except CCStreamTruncatedError:
+                    # The SAME hazard as the re-run inside `_run_failover_peer`,
+                    # one level out: re-raising there only stopped the sticky
+                    # retry on THIS peer, and the generic `except CCError` below
+                    # would then `continue` the loop — handing the identical
+                    # prompt, with full tools, to the NEXT peer. The first peer
+                    # may already have made an MCP write or sent outreach before
+                    # the over-limit line ate its answer, and the
+                    # `streamed["text"]` guard the loop otherwise relies on reads
+                    # empty precisely because the answer is what was lost. So the
+                    # loop ENDS here rather than advancing.
+                    #
+                    # Availability is deliberately not recorded on the failure
+                    # side: an over-limit line is our own reader's ceiling, not
+                    # the peer refusing, and `note_failure` would decline it as
+                    # evidence anyway.
+                    logger.warning(
+                        "failover peer %s lost its answer to an over-limit stream "
+                        "line — abandoning failover rather than replaying the "
+                        "prompt on another peer",
+                        peer_name, exc_info=True,
+                    )
+                    if streamed and streamed.get("text"):
+                        # The peer demonstrably SERVED — clear any stale block,
+                        # as the branches above do — and return "" so the caller
+                        # skips contingency, which would stack a second answer
+                        # on the text already on the user's screen.
+                        await _record_peer(peer_availability.note_success, peer_name)
+                        return ""
+                    # None → contingency, which is a TOOL-LESS API call
+                    # (`contingency.dispatch_conversation`: "no CC tool access"),
+                    # so it cannot repeat what the peer already did. The turn
+                    # degrades instead of dead-ending, and no side effect runs
+                    # twice.
+                    return None
                 except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     # Routed through the SAME classifier on purpose: a local fault
@@ -1714,6 +1773,76 @@ class ConversationLoop:
         except Exception:
             logger.warning("Failed to load recovery context", exc_info=True)
             return ""
+
+    async def _handle_stream_truncated(
+        self,
+        exc: CCStreamTruncatedError,
+        *,
+        session: dict,
+        system_prompt: str | None,
+        prompt_text: str,
+        channel: ChannelType,
+        streamed: dict | None = None,
+    ) -> str:
+        """Degrade a size-truncated turn without replaying it ANYWHERE.
+
+        Typing this failure is what stops stale-resume recovery and roster
+        failover re-running tool calls the first attempt already made. But the
+        new type also stops the turn matching the
+        ``(CCQuotaExhaustedError, CCRateLimitError)`` handler, and three of the
+        things that handler did are NOT replays and were lost with it: the
+        rate-limit stamp, the failure-detector class, and ``_try_contingency``.
+        Without this clause the turn fell through to the terminal
+        ``except CCError`` and dead-ended on raw internal prose.
+
+        Contingency is the one safe degradation, and it is the SAME reasoning
+        ``_try_roster_failover`` returns None for:
+        ``contingency.dispatch_conversation`` routes messages through the API
+        with no CC tool access, so it cannot repeat anything the truncated run
+        did.
+
+        What stays suppressed, deliberately: the rate-limit PARK.
+        ``rate_limit_park.park_conversation`` stores the prompt for a resume
+        worker to re-dispatch later with full tools — a park IS a scheduled
+        replay, which is the hazard itself. A truncated turn degrades or says
+        so; it never queues itself for a re-run.
+        """
+        self._fire_failure_detection("stream_truncated")
+        # The provider's own classification survives as ``__cause__`` — the
+        # raise sites chain it precisely so this bookkeeping is RECOVERED here
+        # rather than guessed from the message text.
+        cause = exc.__cause__
+        if isinstance(cause, CCRateLimitError | CCQuotaExhaustedError):
+            try:
+                from datetime import UTC, datetime
+                await cc_sessions.update_rate_limit(
+                    self._db, session["id"],
+                    rate_limited_at=datetime.now(UTC).isoformat(),
+                )
+            except Exception:
+                logger.error("Failed to record rate limit", exc_info=True)
+        if streamed and streamed.get("text"):
+            # Answer text is already on the user's screen. Contingency would
+            # stack a second, differently-sourced answer on top of it — the
+            # same double-output the peer loop returns "" to avoid.
+            logger.warning(
+                "CC stream truncated after text streamed — not running "
+                "contingency over it: %s", exc,
+            )
+            return ""
+        fallback = await self._try_contingency(
+            prompt_text, system_prompt, channel, session_id=session["id"],
+        )
+        if fallback is not None:
+            return fallback
+        logger.error(
+            "CC stream truncated and contingency unavailable: %s", exc, exc_info=True,
+        )
+        return (
+            "[Genesis lost this answer to an oversized tool result. It is not "
+            "being retried automatically — the tools the first attempt already "
+            "ran would run again. Send it again if you want another attempt.]"
+        )
 
     async def _try_contingency(
         self,
