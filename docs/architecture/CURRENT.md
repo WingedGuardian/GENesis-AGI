@@ -260,6 +260,19 @@ at gate time (`security/immunity.py`). Migration 0053 backfilled history
 (no owner heuristics); `scripts/backfill_origin_class_qdrant.py` mirrors the
 payloads idempotently.
 
+**Judgment axes (DARK — written, no reader):** `memory_metadata` carries six
+write-only classification columns stamped at extraction time and consumed by
+nothing yet — `speech_act` + `speech_act_confidence`
+(# GROUNDWORK(mw-5-speech-act-protection)), `assertion_provenance`
+(# GROUNDWORK(mw-4-provenance-weight)), `durability` + `expires_at`
+(# GROUNDWORK(mw-4-durability-ttl)), and `preference_domain`
+(# GROUNDWORK(mw-4-preference-domain) — the domain a preference is scoped to,
+so a later conflicting preference coexists as a different-context truth
+instead of overwriting). Contract + normalizers in `memory/judgment.py`;
+distinct from `origin_class` above, which is a pipeline-trust label. Expiry is
+opt-in (`durability='temporary'` + an elapsed `expires_at` only), so an
+unclassified row never expires.
+
 ## 2. Execution — CC sessions (DirectSession)
 
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
