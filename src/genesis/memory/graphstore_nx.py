@@ -296,6 +296,19 @@ class NetworkxGraphStore:
             )
 
         self._graph = G
+        # DO NOT introduce an `await` between the fetch above and this line.
+        # Clearing _dirty is safe only because the two staleness signals cover
+        # complementary cases (MEASURED 2026-09-07):
+        #   * ANOTHER connection's mid-load commit is invisible to our held
+        #     snapshot — and moves data_version, which the token catches.
+        #   * OUR OWN connection's mid-load commit is VISIBLE to the fetch that
+        #     races it (a connection reads its own writes), so the graph already
+        #     contains it and there is no staleness to signal. data_version
+        #     deliberately does not move for it, and does not need to.
+        # An await here would break the second case and only the second case: a
+        # same-connection writer could then commit AFTER the fetch, set _dirty,
+        # and have it cleared on the next line with nothing else left to notice.
+        # Locked by test_a_same_connection_write_is_seen_by_the_load_that_races_it.
         self._dirty = False
         self._built_conn = db
         self._built_data_version = pre_load_version
