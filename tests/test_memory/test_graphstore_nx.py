@@ -239,6 +239,61 @@ async def test_a_commit_inside_the_load_window_is_not_lost(tmp_path, monkeypatch
         await db.close()
 
 
+async def test_a_same_connection_write_is_seen_by_the_load_that_races_it(tmp_path, monkeypatch):
+    """Why the token's same-connection blind spot is not a hole.
+
+    `PRAGMA data_version` deliberately does not move for our OWN connection's
+    commits, so a reviewer's natural worry is that a writer sharing the reader's
+    connection could commit inside the load window and go unnoticed. Genesis
+    does share one connection across subsystems, and SerializedConnection holds
+    its lock per METHOD, so such a writer really can interleave there.
+
+    It is still not a hole, and this test says why rather than leaving the next
+    reader to re-derive it. MEASURED 2026-09-07: a commit on the SAME connection
+    between `execute()` and `fetchall()` is VISIBLE to that fetch (a connection
+    reads its own writes), while the same commit from ANOTHER connection is
+    invisible because the snapshot is held. The two cases are complementary —
+    the same-connection write needs no staleness signal because the load already
+    contains it, and the other-connection write is exactly what the token
+    catches. Losing `_dirty` for the former discards nothing.
+
+    Pinned because the reasoning is not obvious from the code, and a future
+    reader who notices the blind spot without noticing the visibility will
+    "fix" a bug that does not exist.
+    """
+    path = tmp_path / "g.db"
+    await _seed(path, [("A", "B")])
+    store = NetworkxGraphStore()
+    db = await aiosqlite.connect(str(path))
+
+    real_execute = db.execute
+    fired = {"n": 0}
+
+    async def _execute_then_same_conn_commit(sql, *a, **kw):
+        cursor = await real_execute(sql, *a, **kw)
+        if "FROM memory_links" in str(sql) and not fired["n"]:
+            fired["n"] += 1
+            # SAME connection: data_version will NOT move for this commit.
+            await real_execute(
+                "INSERT INTO memory_links VALUES ('A', 'C', 'supports', 0.9, '2026-09-06')"
+            )
+            await db.commit()
+            store.invalidate()  # exactly what every memory_links writer does
+        return cursor
+
+    monkeypatch.setattr(db, "execute", _execute_then_same_conn_commit)
+    try:
+        first = await store.traverse(db, "A", max_depth=1, min_strength=0.0)
+        assert fired["n"] == 1, "the mid-load write never fired — this test is inert"
+        # THE POINT: the racing same-connection write is already in this load.
+        assert "C" in {n.memory_id for n in first}, (
+            "a same-connection commit inside the load window should be visible "
+            "to the fetch that races it"
+        )
+    finally:
+        await db.close()
+
+
 # ── visibility parity with normal recall ────────────────────────────────────
 
 
