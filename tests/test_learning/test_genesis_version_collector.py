@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
 
+from genesis.learning.signals import genesis_version
 from genesis.learning.signals.genesis_version import GenesisVersionCollector
 
 
@@ -521,3 +523,82 @@ class TestCheckDisabled:
         )
         row = await cursor.fetchone()
         assert row["cnt"] == 0
+
+
+# ── the count must be the READER's distance, not the release span ─────────
+#
+# Every test above mocks `_check_upstream`, so the counting itself was never
+# exercised — which is how this stayed wrong in two files at once. These drive it
+# against a real throwaway repo shaped like a live install: a release tag some
+# way back, and a deployed HEAD that has tracked main since.
+
+
+def _g(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.fixture()
+def tagged_repo(tmp_path):
+    """A repo where the release tag and the deployed HEAD are far apart.
+
+    The ordinary shape of an install that pulls main between releases, and the
+    shape on which the two candidate numbers diverge: 10 commits between the
+    tags, 2 between the deployed commit and the tip.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _g(origin, "-c", "init.defaultBranch=main", "init", "-q")
+    _g(origin, "config", "user.email", "t@e.st")
+    _g(origin, "config", "user.name", "tester")
+    (origin / "f.txt").write_text("base\n")
+    _g(origin, "add", "-A")
+    _g(origin, "commit", "-qm", "base")
+    _g(origin, "tag", "-a", "v1.0", "-m", "release 1.0")
+
+    deployed = None
+    for i in range(1, 11):
+        (origin / "f.txt").write_text(f"c{i}\n")
+        _g(origin, "add", "-A")
+        _g(origin, "commit", "-qm", f"c{i}")
+        if i == 8:
+            deployed = _g(origin, "rev-parse", "HEAD")
+    _g(origin, "tag", "-a", "v2.0", "-m", "release 2.0")
+
+    clone = tmp_path / "clone"
+    _g(tmp_path, "clone", "-q", str(origin), str(clone))
+    _g(clone, "checkout", "-q", deployed)
+    return clone
+
+
+@pytest.mark.asyncio
+async def test_the_count_is_the_distance_from_the_DEPLOYED_commit(tagged_repo, db):
+    """MEASURED 2026-09-08: the dashboard read "v3.0b18 (668 commits behind)" on
+    a tree 20 commits behind that tag. 668 was the span between the two release
+    TAGS — true about the release, false about the reader, and the label says
+    "behind", so it is read as the reader's. That is worse than an arithmetic
+    error: it wears verified grammar.
+
+    Here the deployed commit is 2 behind the tip while the tag range is 10.
+    """
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
+        behind, summary = await collector._check_upstream()
+
+    assert behind == 2, f"expected the deployed tree's distance, got {behind}"
+    assert behind != 10, "counted the release span instead of the reader's distance"
+    # The summary must describe the SAME range, or one alert's two halves
+    # disagree — a count the reader reads as theirs beside a list that is not.
+    assert len([ln for ln in summary.splitlines() if ln.strip()]) == 2, summary
+
+
+@pytest.mark.asyncio
+async def test_the_untagged_fallback_measures_the_same_thing(tagged_repo, db):
+    """The two branches previously measured different things, so which number a
+    reader got depended on whether a tag happened to exist."""
+    _g(tagged_repo, "tag", "-d", "v1.0")
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
+        behind, _ = await collector._check_upstream()
+    assert behind == 2

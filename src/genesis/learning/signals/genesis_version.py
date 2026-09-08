@@ -238,8 +238,12 @@ class GenesisVersionCollector:
         if commit SHAs differ.
 
         Returns (0, "") when tags match (up to date).
-        Returns (N, summary) where N is commits between tags and summary
-        shows what changed in the tag range.
+        Returns (N, summary) where N is how far the DEPLOYED COMMIT is behind
+        the upstream ref, and summary lists that same range. Not the distance
+        between the release tags — the caller renders this as "N commits
+        behind", which a reader takes as their own, and on an install that
+        tracks main between releases those numbers differ by an order of
+        magnitude.
         Raises RuntimeError on git failure.
         """
         remote = _update_remote()
@@ -273,33 +277,32 @@ class GenesisVersionCollector:
 
         # If only one side has tags, there's definitely an update
         if local_tag != origin_tag:
-            # Count commits in the tag range for a meaningful number
-            behind = 0
-            if local_tag and origin_tag:
-                count_str = await self._git_output(
-                    "rev-list", "--count", f"{local_tag}..{origin_tag}",
-                )
-                behind = int(count_str) if count_str and count_str.isdigit() else 1
-            else:
-                # One side untagged — use commit count as fallback
-                count_str = await self._git_output(
-                    "rev-list", "--count", f"HEAD..{ref}",
-                )
-                behind = int(count_str) if count_str and count_str.isdigit() else 1
+            # Count from the DEPLOYED COMMIT, never between the release tags.
+            #
+            # This used to count `local_tag..origin_tag`, and the alert that
+            # renders it says "N commits behind" — which every reader takes as
+            # their own distance from the target. Those two numbers diverge by
+            # more than an order of magnitude on any install that tracks main
+            # between releases, because the tag moves at a release and HEAD moves
+            # constantly. MEASURED 2026-09-08: the dashboard read "v3.0b18 (668
+            # commits behind)" on a tree that was 20 commits behind the b18 tag
+            # and 31 behind origin/main. The number was true about the tag range
+            # and false about the reader, which is worse than an arithmetic
+            # error — it wears verified grammar.
+            #
+            # `observability/snapshots/deploy_health.py` already had this right,
+            # and its field name says so: `commits_behind_upstream`, counted
+            # `HEAD..@{upstream}`. This is the same measurement.
+            count_str = await self._git_output("rev-list", "--count", f"HEAD..{ref}")
+            behind = int(count_str) if count_str and count_str.isdigit() else 1
 
-            # Summary of what changed between tags
-            summary = ""
-            if local_tag and origin_tag:
-                raw = await self._git_output(
-                    "log", "--oneline", "--no-merges",
-                    f"{local_tag}..{origin_tag}",
-                )
-                summary = raw or ""
-            else:
-                raw = await self._git_output(
-                    "log", "--oneline", "--no-merges", f"HEAD..{ref}",
-                )
-                summary = raw or ""
+            # The summary must describe the SAME range as the count, or the two
+            # halves of one alert disagree: the tag-range version ended "... and
+            # 658 more" beside a count the reader reads as theirs.
+            raw = await self._git_output(
+                "log", "--oneline", "--no-merges", f"HEAD..{ref}",
+            )
+            summary = raw or ""
 
             # Truncate to first 10 lines
             lines = summary.split("\n")
