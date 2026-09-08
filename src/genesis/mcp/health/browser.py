@@ -23,6 +23,8 @@ import random
 import re
 import signal
 import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.mcp.health import mcp
@@ -51,6 +53,12 @@ _TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
 def _ts_log_write(msg: str) -> None:
     """Write a timestamped line directly to the Turnstile debug log."""
     try:
+        # Deliberate LOCAL import despite the module-level one: it keeps this
+        # writer out of reach of patch.object(browser, "datetime"), which the
+        # clock-controlled screenshot tests use. Deleting it as "redundant"
+        # would let this function consume an injected side_effect entry and
+        # write a MagicMock repr into the log — silently, since this block
+        # swallows exceptions.
         from datetime import UTC, datetime
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -2120,7 +2128,18 @@ async def _impl_browser_screenshot() -> dict:
         page = _active_page
     try:
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        screenshot_path = _SCREENSHOT_DIR / "genesis_browser_screenshot.png"
+        # Unique per call: consecutive captures must not overwrite one another
+        # (a session capturing 8 pages kept only the last one). The timestamp
+        # makes a capture SEQUENCE sortable at MICROSECOND resolution — a
+        # 1-second stamp ties an 8-capture burst (measured). The full uuid4 hex,
+        # not a truncation, keeps collisions negligible across the 7-day ~/tmp
+        # retention window. Sibling writer: scripts/browser.py — the stamp
+        # FORMAT is asserted on both sides, see the _STAMP regex in each test.
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        screenshot_path = (
+            _SCREENSHOT_DIR
+            / f"genesis_browser_screenshot_{stamp}_{uuid.uuid4().hex}.png"
+        )
         await page.screenshot(path=str(screenshot_path))
         return {
             "path": str(screenshot_path),
@@ -2341,8 +2360,10 @@ async def browser_upload(selector: str, file_path: str) -> dict:
 async def browser_screenshot() -> dict:
     """Take a screenshot of the current page.
 
-    Saves to ~/tmp/genesis_browser_screenshot.png and returns the path.
-    Use the Read tool to view the image.
+    Saves to a uniquely-named, timestamp-prefixed file under ~/tmp/ (each
+    call gets its own file, so consecutive screenshots don't overwrite one
+    another and sort chronologically) and returns the path. Always read the
+    returned "path" — never reconstruct it. Use the Read tool to view it.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"

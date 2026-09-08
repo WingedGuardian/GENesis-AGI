@@ -90,6 +90,40 @@ BENIGN_SUBJECTS = [
     "fix: the vulnerable dependency was updated to 3.2.1",
     "docs: note that detection is shape-based and not exhaustive",
     "fix: avoid logging the full request body",
+    # Reviewer-cited (PR #1623). Each fired before the atom groups were bounded
+    # and the progressive forms were given a tense requirement; each is ordinary
+    # forward-looking work, and two of them (`unrecoverable`, `restored`) carried
+    # the OPPOSITE meaning to the thing being detected.
+    "fix: restored credential loading after update",
+    "docs: explain prerecorded token fixtures",
+    "fix: ensure deleted tokens are unrecoverable",
+    "feat: support storing API keys in the system keyring",
+    "feat: logging tokens to metrics",
+    "fix: keyboard logging",
+    # The stopping phrase was an inline literal and so escaped the boundary
+    # sweep — `stop` inside `stopgap`/`backstop`/`nonstop`/`stopwatch`,
+    # `prevent` inside `preventive`, `used to` inside `reused to`.
+    "feat: add a stopgap that writes the api key cache",
+    "chore: backstop the retry loop that logs the token id",
+    "fix: nonstop retries stores the session key",
+    "feat: stopwatch timer logs the api key latency",
+    "docs: preventive notes on how we store keys",
+    "fix: preventative cleanup stores the cookie jar",
+    "feat: reused to log the refresh token path",
+]
+
+# Subjects that DO fire and arguably should not. Kept as a named, asserted set
+# rather than as prose, so that closing one is visible instead of silent. Each
+# is a face of the same limit: one spelling, two grammars, and only a parser
+# separates them — see the KNOWN LIMIT notes in the hook.
+KNOWN_RESIDUE_SUBJECTS = [
+    # Present passive participle: forward-looking, reads as past to the pattern.
+    "feat: API keys are now stored in the system keyring",
+    # Part of speech: `logs` is a noun here and a verb in "no longer logs the
+    # token", which this branch exists to catch.
+    "docs: prevent flaky logs from the token refresh test",
+    "chore: stop the noisy logs in the key rotation job",
+    "fix: prevents duplicate logs for the token refresh path",
 ]
 
 
@@ -103,6 +137,13 @@ def _run(msg: str, tmp_path: Path) -> subprocess.CompletedProcess:
         text=True,
         env={
             "PATH": "/usr/bin:/bin:/usr/local/bin",
+            # A real `git commit` runs the hook under the user's UTF-8 locale.
+            # With no LC_ALL the subprocess inherits C, where `grep` counts the
+            # `[^.]{0,45}` windows in BYTES rather than characters — so the tests
+            # would exercise a different engine configuration than production,
+            # and a non-ASCII subject could straddle the window in one and not
+            # the other. Pin it rather than inherit whatever the runner has.
+            "LC_ALL": "C.UTF-8",
             "HOME": str(tmp_path),
             "GENESIS_RELEASE_FINGERPRINTS": str(tmp_path / "none.txt"),
         },
@@ -115,23 +156,42 @@ def _advises(msg: str, tmp_path: Path) -> bool:
     return "incident framing" in (r.stdout + r.stderr).lower()
 
 
+def _atom_groups() -> dict[str, str]:
+    """Every `_FRAMING_*` group the hook defines, DISCOVERED not enumerated.
+
+    A hard-coded name list silently ignores a group added later — which is
+    exactly how an unbounded group would slip past the boundary invariant
+    below. Discovery makes a new group opt OUT loudly instead of in silently.
+    """
+    groups = {
+        m.group(1): m.group(2)
+        for m in re.finditer(r"^(_FRAMING_[A-Z0-9_]+)='(.*)'$", HOOK.read_text(), re.M)
+    }
+    assert groups, "no _FRAMING_* atom groups found in the hook"
+    return groups
+
+
 def _pattern() -> re.Pattern:
     """The hook's own pattern, assembled from the hook's own definitions.
 
     Read out of the script rather than duplicated here, so the measurements
     below can never drift from what actually ships.
+
+    ONE SUBSTITUTION, named because it is the gap in this instrument: the hook
+    runs `grep -qiE`, and this compiles the same source with Python `re`. The
+    labelled sets do not rely on it — `TestIncidentFramingIsFlagged` and
+    `TestOrdinaryWorkIsNotFlagged` go through `_advises()`, which invokes the
+    real hook — so only the corpus rate rests on the substitution.
     """
     src = HOOK.read_text()
-    parts: dict[str, str] = {}
-    for name in ("_FRAMING_NOUN", "_FRAMING_STATE", "_FRAMING_PAST", "_FRAMING_STOPV"):
-        m = re.search(rf"^{name}='(.*)'$", src, re.M)
-        assert m, f"{name} not found in the hook"
-        parts[name] = m.group(1)
+    parts = _atom_groups()
     m = re.search(r'^FRAMING_PATTERNS="(.*)"$', src, re.M)
     assert m, "FRAMING_PATTERNS not found in the hook"
     pat = m.group(1)
-    for name, value in parts.items():
-        pat = pat.replace("${" + name + "}", value)
+    # Groups may reference one another; expand to a fixed point.
+    for _ in range(len(parts) + 1):
+        for name, value in parts.items():
+            pat = pat.replace("${" + name + "}", value)
     assert "${" not in pat, f"unexpanded variable in the pattern: {pat[:80]}"
     return re.compile(pat, re.I)
 
@@ -200,9 +260,24 @@ class TestMeasuredRates:
         rx = _pattern()
         hits = [s for s in subjects if rx.search(s)]
         rate = len(hits) / len(subjects)
-        assert rate <= 0.001, (
-            f"fire rate {len(hits)}/{len(subjects)} ({rate:.3%}) exceeds the 0.1% "
-            f"bar set before measuring; hits: {hits[:10]}"
+        # Asserted on the COUNT, with the rate and its denominator still reported
+        # so the 0.1% bar stays visible and re-derived. The bar over this corpus
+        # tolerates exactly one hit and fails at two — and what it counts is
+        # something this layer cannot prevent, because layer 3 never blocks a
+        # commit. Two genuine TRUE positives entering history would therefore
+        # redden the suite on an unrelated future PR, with the failure text
+        # blaming a pattern that had done its job. The tolerance is the same
+        # number either way; the message is what changes.
+        # Derived from the bar rather than frozen at today's n: 1737 x 0.001 is
+        # 1.7, so this is exactly `rate <= 0.001` now, and stays faithful to the
+        # declared bar as history grows instead of silently tightening.
+        allowed = max(1, int(0.001 * len(subjects)))
+        assert len(hits) <= allowed, (
+            f"{len(hits)} of {len(subjects)} subjects fire ({rate:.3%}; bar 0.1% "
+            f"set before measuring). One TRUE positive in history is expected and "
+            f"tolerated — read the hits before touching the pattern, because two "
+            f"means either the pattern broadened or two real incident-framed "
+            f"subjects landed: {hits[:10]}"
         )
 
 
@@ -333,6 +408,13 @@ class TestTheAdvisoryNeverEchoesABlockedFingerprint:
             text=True,
             env={
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
+            # A real `git commit` runs the hook under the user's UTF-8 locale.
+            # With no LC_ALL the subprocess inherits C, where `grep` counts the
+            # `[^.]{0,45}` windows in BYTES rather than characters — so the tests
+            # would exercise a different engine configuration than production,
+            # and a non-ASCII subject could straddle the window in one and not
+            # the other. Pin it rather than inherit whatever the runner has.
+            "LC_ALL": "C.UTF-8",
                 "HOME": str(tmp_path),
                 "GENESIS_RELEASE_FINGERPRINTS": str(fp),
             },
@@ -349,6 +431,37 @@ class TestTheAdvisoryNeverEchoesABlockedFingerprint:
         )
         assert "subject withheld" in out
 
+    def test_a_fingerprint_in_the_BODY_does_not_withhold_a_clean_subject(self, tmp_path):
+        """The suppression is scoped to the SUBJECT, not to the whole message.
+
+        Layer 2 blocks on a match anywhere, which is right. But withholding the
+        advisory's subject because a BODY line matched suppresses a subject that
+        was clean and asserts something untrue about it — over-broad in the safe
+        direction, and still a cost paid where nothing was concealed.
+        """
+        fp = tmp_path / "fingerprints.txt"
+        fp.write_text("# an install fingerprint\nULTRA_PRIVATE_TOKEN_123\n")
+        f = tmp_path / "COMMIT_EDITMSG"
+        subject = "the key was persisted in plaintext"
+        f.write_text(subject + "\n\nseen while testing ULTRA_PRIVATE_TOKEN_123 here\n")
+        r = subprocess.run(
+            ["bash", str(HOOK), str(f)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "LC_ALL": "C.UTF-8",
+                "HOME": str(tmp_path),
+                "GENESIS_RELEASE_FINGERPRINTS": str(fp),
+            },
+        )
+        out = r.stdout + r.stderr
+        assert "install-specific private identifier" in out, "layer 2 must still block"
+        assert "ULTRA_PRIVATE_TOKEN_123" not in out, "the body value must not be echoed"
+        assert "incident framing" in out.lower()
+        assert subject in out, "a clean subject must still be quoted"
+        assert "subject withheld" not in out
+
     def test_an_ordinary_framing_subject_is_STILL_quoted(self, tmp_path):
         """CONTROL. Withholding always would make the advisory useless — the
         author needs to see which line is being flagged. Only the fingerprint
@@ -360,6 +473,177 @@ class TestTheAdvisoryNeverEchoesABlockedFingerprint:
         out = r.stdout + r.stderr
         assert "install-specific private identifier" not in out
         assert subject in out, "a non-fingerprint subject must still be quoted"
+
+
+class TestEveryAtomGroupIsWordBounded:
+    """The boundary invariant, stated once instead of per offender.
+
+    Bounding only the alternatives a reviewer happened to name leaves the same
+    class alive in every other group — which is what happened: `cred`/`key` were
+    bounded, and the next round found `stored` inside `restored`, `recorded`
+    inside `prerecorded`, and `recoverable` inside `unrecoverable`. That last one
+    inverts the meaning outright, firing on the subject that says the tokens are
+    gone. So the rule is checked STRUCTURALLY, over groups discovered from the
+    hook, and a group added unbounded later fails here rather than in review.
+    """
+
+    def test_the_composed_pattern_contains_no_inline_group(self):
+        """The hole that let the invariant be claimed while it was false.
+
+        Checking only the discovered `_FRAMING_*` variables cannot see a group
+        written inline in `FRAMING_PATTERNS` — and that is exactly where the one
+        unbounded group was hiding, so the sweep that bounded "every group"
+        missed the loosest branch in the pattern. Every group must therefore be
+        a hoisted variable, which is what brings it under the check below.
+        """
+        raw = re.search(
+            r'^FRAMING_PATTERNS="(.*)"$', HOOK.read_text(), re.M
+        ).group(1)
+        residue = re.sub(r"\$\{_FRAMING_[A-Z0-9_]+\}|\[\^\.\]\{\d+,\d+\}", "", raw)
+        assert residue.strip("|") == "", (
+            "FRAMING_PATTERNS contains an inline group, which no boundary check "
+            "can reach — hoist it into a _FRAMING_* variable: "
+            f"{residue.strip('|')!r}"
+        )
+
+    def test_every_atom_in_every_group_is_bounded(self):
+        """Checked per ATOM, not by the group's first and last characters.
+
+        A group can open `\\b(` and close `)\\b` and still be unbounded in the
+        middle — `\\b(dumped)\\b[^.]{0,30}(cred|key)\\b` passes a first/last-character
+        check and still matches `sacred`, which is the very bug this class is
+        named after.
+        """
+        offenders: dict[str, list[str]] = {}
+        for name, value in _atom_groups().items():
+            # Split into the alternation groups the value is built from, then
+            # require each to be immediately preceded by \b and followed by \b
+            # (optionally through the shared `s?` plural suffix).
+            for m in re.finditer(r"(\\b)?\(([^)]*)\)(s\?)?(\\b)?", value):
+                lead, body, _plural, trail = m.groups()
+                if not lead or not trail:
+                    offenders.setdefault(name, []).append(body)
+        assert not offenders, (
+            "every alternation group must sit between \\b bounds — an unbounded "
+            f"atom matches inside unrelated words: {offenders}"
+        )
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "fix: restored credential loading after update",
+            "docs: explain prerecorded token fixtures",
+            "fix: ensure deleted tokens are unrecoverable",
+        ],
+    )
+    def test_a_state_or_verb_atom_inside_a_word_does_not_fire(self, subject, tmp_path):
+        assert not _advises(subject + "\n", tmp_path), subject
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "the token was stored in plaintext",
+            "the crash log contained the raw token",
+            "the key was recoverable from the log file",
+        ],
+    )
+    def test_the_bare_atoms_STILL_fire_as_whole_words(self, subject, tmp_path):
+        """CONTROL. Deleting these atoms would also pass the cases above while
+        dropping real coverage — the boundary is the fix, not the removal."""
+        assert _advises(subject + "\n", tmp_path), subject
+
+
+class TestProgressiveVerbsNeedPastTenseContext:
+    """A bare gerund is not a past-tense claim.
+
+    `storing` sits equally in "was storing tokens" (an incident) and "support
+    storing API keys" (a feature), so on its own it is no evidence at all. The
+    progressive forms therefore require a past auxiliary; the imperative case
+    ("stop ... persisting credentials") is the stopping-phrase branch, which is
+    unaffected. Recall over the labelled incident set is unchanged at 23/23.
+    """
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "feat: support storing API keys in the system keyring",
+            "feat: logging tokens to metrics",
+            "chore: add a helper for writing credentials to the keyring",
+        ],
+    )
+    def test_a_bare_gerund_is_not_an_incident(self, subject, tmp_path):
+        assert not _advises(subject + "\n", tmp_path), subject
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "we were logging secrets to disk",
+            "the guard was leaking credentials into memory",
+            "the pane tail was storing tokens",
+        ],
+    )
+    def test_a_gerund_WITH_a_past_auxiliary_still_fires(self, subject, tmp_path):
+        """CONTROL, and load-bearing: dropping the progressive forms entirely
+        would also pass the cases above while blinding the detector to the
+        commonest incident phrasing there is."""
+        assert _advises(subject + "\n", tmp_path), subject
+
+    def test_the_stopping_phrase_branch_is_unaffected(self, tmp_path):
+        """The acceptance case routes through the stopping branch, not the
+        progressive one — proof the tense requirement did not blind it."""
+        assert _advises("stop captured session output persisting credentials", tmp_path)
+
+    @pytest.mark.parametrize("subject", KNOWN_RESIDUE_SUBJECTS)
+    def test_the_KNOWN_residue_still_fires(self, subject, tmp_path):
+        """Documented limits, pinned so closing one is visible rather than silent.
+
+        Two faces of one problem, both requiring a parser rather than a regex:
+        a past participle after a PRESENT auxiliary ("are now stored") reads as
+        past, and `logs`/`stores`/`writes` are nouns in one sentence and verbs in
+        the next. ERE has no negative lookbehind, and dropping the ambiguous
+        forms would take the true positives with them — "no longer stores API
+        keys" is precisely what the stopping branch is for.
+
+        On an ADVISORY axis measuring 0/1737 over this repo's own subjects, that
+        residue is cheaper than a hand-rolled grammar classifier, which is an
+        open-set claim about English and the shape that does not converge.
+
+        If one of these starts failing, the residue was closed: drop it from
+        KNOWN_RESIDUE_SUBJECTS, move it to BENIGN_SUBJECTS, and update the hook's
+        KNOWN LIMIT notes.
+        """
+        assert _advises(subject + "\n", tmp_path), subject
+
+
+class TestTheFireRateGateActuallyRunsInCI:
+    """A skipped gate is an unevaluated gate.
+
+    `test_fire_rate_on_this_repositorys_real_subjects` skips rather than lies on
+    a shallow clone — correct behaviour, but under the default depth-1 checkout
+    that meant the 0.1% bar never ran in CI at all, so a later pattern change
+    with a bad rate would have passed. The measurement needs history, so the job
+    that runs it must check out history (Codex P2, PR #1623).
+    """
+
+    def test_the_blocking_test_job_checks_out_full_history(self):
+        """Asserted against the PARSED workflow, not its text.
+
+        A substring check is satisfied by the explanatory comment that sits two
+        lines above the setting — measured: deleting the real `with:` block left
+        a text-based version of this test green. Read the step.
+        """
+        import yaml
+
+        wf = yaml.safe_load((REPO / ".github" / "workflows" / "ci.yml").read_text())
+        steps = wf["jobs"]["test"]["steps"]
+        checkout = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+        assert checkout, "the `test` job does not check out the repository"
+        depths = [(s.get("with") or {}).get("fetch-depth") for s in checkout]
+        assert 0 in depths, (
+            "the blocking `test` job checks out shallow (fetch-depth "
+            f"{depths}), so every history-derived measurement in the suite "
+            "silently SKIPS instead of gating"
+        )
 
 
 class TestTheVersionLedgerIsAppendOnly:
@@ -375,23 +659,51 @@ class TestTheVersionLedgerIsAppendOnly:
 
     LEDGER = REPO / ".genesis-hook-versions"
 
-    def test_every_hash_main_shipped_is_still_present(self):
-        proc = subprocess.run(
-            ["git", "-C", str(REPO), "show", "origin/main:.genesis-hook-versions"],
+    @staticmethod
+    def _hashes(text: str) -> set[str]:
+        return {
+            line.strip()
+            for line in text.split("\n")
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+    def test_no_hash_this_repo_ever_shipped_has_been_removed(self):
+        """Checked against the ledger's OWN history, not against `origin/main`.
+
+        Two reasons, and the second is why this does not skip. Every revision
+        that ever touched the file is a version some install may still be
+        carrying, so the union over history is the set that matters — the tip of
+        one branch is a strictly weaker check. And `origin/main` is a REMOTE ref
+        that a CI checkout does not reliably create, so keying on it meant this
+        guard skipped exactly where it was needed; a skip here is also not free,
+        because the suite's dormancy ceiling is pinned exact-fit.
+        """
+        revs = subprocess.run(
+            # --full-history so a merge does not prune a side branch that touched
+            # the file (default simplification drops TREESAME parents), --follow
+            # so a rename does not truncate the history at the rename point.
+            # Both matter for a union that claims to be "every version shipped".
+            [
+                "git", "-C", str(REPO), "log", "--full-history", "--follow",
+                "--format=%H", "--", ".genesis-hook-versions",
+            ],
             capture_output=True,
             text=True,
         )
-        if proc.returncode != 0:
-            pytest.skip("origin/main unavailable")
-        def _hashes(text):
-            return {
-                line.strip()
-                for line in text.split("\n")
-                if line.strip() and not line.lstrip().startswith("#")
-            }
-        before = _hashes(proc.stdout)
-        after = _hashes(self.LEDGER.read_text())
-        dropped = before - after
+        assert revs.returncode == 0, f"git log failed: {revs.stderr}"
+
+        ever_shipped: set[str] = set()
+        for rev in [r for r in revs.stdout.split("\n") if r.strip()]:
+            blob = subprocess.run(
+                ["git", "-C", str(REPO), "show", f"{rev}:.genesis-hook-versions"],
+                capture_output=True,
+                text=True,
+            )
+            if blob.returncode == 0:
+                ever_shipped |= self._hashes(blob.stdout)
+
+        assert ever_shipped, "no ledger revisions readable — the check would be vacuous"
+        dropped = ever_shipped - self._hashes(self.LEDGER.read_text())
         assert not dropped, (
             "hashes removed from the ledger — every install carrying one of these "
             f"stops receiving hook updates: {sorted(dropped)}"

@@ -654,6 +654,7 @@ if $_ENCRYPT_READY; then
         "$HOME/.config/gh/hosts.yml:gh_hosts.yml" \
         "$HOME/.claude/.credentials.json:claude_credentials.json" \
         "$HOME/.claude.json:claude.json" \
+        "$HOME/.claude/settings.json:claude_settings.json" \
         "$HOME/.genesis/guardian_remote.yaml:guardian_remote.yaml" \
         "$HOME/.genesis/config/genesis.yaml:genesis.yaml" \
         "$HOME/.genesis/release-fingerprints.txt:release-fingerprints.txt"; do

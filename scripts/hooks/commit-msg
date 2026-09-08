@@ -61,9 +61,17 @@ if [ -f "$FP_FILE" ]; then
     if [ -n "$FP_PATTERNS" ] && printf '%s\n' "$FP_PATTERNS" | grep -qE -f - "$MSG_FILE"; then
         echo ""
         echo "BLOCKED: Commit message contains an install-specific private identifier."
-        printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1 | sort -un | sed 's/^/  line /'
+        _fp_lines="$(printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1 | sort -un)"
+        printf '%s\n' "$_fp_lines" | sed 's/^/  line /'
         blocked=1
-        fingerprint_blocked=1
+        # The advisory below withholds its subject only when the SUBJECT ITSELF
+        # matched. A fingerprint on a BODY line conceals nothing about line 1, so
+        # withholding there would suppress a clean subject and assert something
+        # untrue about it — over-broad in the safe direction, but it costs the
+        # advisory its clarity in a case where nothing was hidden.
+        if printf '%s\n' "$_fp_lines" | grep -qx '1'; then
+            fingerprint_blocked=1
+        fi
     fi
 fi
 
@@ -99,19 +107,67 @@ fi
 # separates the two. `(was|were) vulnerable` was dropped outright — it carried
 # no credential-noun requirement, had zero support in the corpus, and fires on
 # an ordinary CVE dependency bump.
-# The noun group is BOUNDED on both sides. Two of its alternatives are short
-# enough to live inside ordinary words — `cred` in `sacred`, `key` in `monkey`,
-# `turnkey`, `keyboard` — so unbounded they fire on neutral subjects
-# (`fix: logged monkey patch state` matched, via `logged` + the `key` inside
-# `monkey`). That is precisely the noise this checker was measured to avoid, and
-# it lands on the ADVISORY axis, where a false fire teaches the reader to ignore
-# the next one. Bounding the group rather than the two offenders keeps the rule
-# one thing: a credential noun is a WORD, not a substring (Codex P2, PR #1623).
+# EVERY group is BOUNDED on both sides — not only the two alternatives that were
+# caught firing. An atom short enough to live inside an ordinary word matches a
+# word with an unrelated or opposite meaning: `cred` in `sacred`, `key` in
+# `monkey`, but equally `stored` in `restored`, `recorded` in `prerecorded`, and
+# `recoverable` in `unrecoverable` — the last an outright INVERSION, firing on
+# the subject that says the tokens are gone. Bounding the offenders one at a time
+# leaves the same class alive in the next group, so the invariant is stated once,
+# structurally: an atom in this pattern is a WORD, never a substring.
+# `TestEveryAtomGroupIsWordBounded` fails on any group added unbounded later
+# (Codex P2 x2 + CodeRabbit, PR #1623).
+#
+# The stopping phrase is a `_FRAMING_*` variable for that reason and no other.
+# It was an inline literal in the alternation below, so the sweep that bounded
+# "every group" missed it — and it is the loosest branch in the pattern, so it
+# was the worst one to miss: `stop` matched inside `stopgap`, `backstop`,
+# `nonstop` and `stopwatch`, and `prevent` inside `preventive`. An invariant that
+# only covers the groups someone remembered to hoist is not structural, so the
+# test now also refuses an inline group in `FRAMING_PATTERNS` outright.
+#
+# TENSE. `_FRAMING_PAST` holds forms that are past tense on their own — a bare
+# `-ed` after a subject is simple past ("we leaked an API key"). `_FRAMING_PROG`
+# holds the progressive forms, which are not: `storing` is equally at home in
+# "was storing tokens" (an incident) and "support storing API keys" (a feature).
+# So the progressive branch now requires a past auxiliary, and a bare gerund no
+# longer fires on its own. Recall is unaffected — every incident phrasing here
+# that leans on a progressive form already carries `was`/`were`/`been`, and the
+# imperative case is the stopping-phrase branch below, not this one.
+#
+# KNOWN LIMIT, stated rather than chased: a past participle after a PRESENT
+# auxiliary — "API keys are now stored in the keyring" — still fires. Separating
+# `are stored` from `were stored` needs negative lookbehind, which ERE does not
+# have, and the alternative (dropping `stored`/`logged`/`exposed` from the bare
+# set) costs real recall on the simple-past phrasings that are the common shape.
+# On an ADVISORY axis measuring 0/1737 over this repo's own subjects, that
+# residue is cheaper than a hand-rolled tense classifier — an open-set claim
+# about English grammar, which is the shape that does not converge.
+#
+# SAME LIMIT, second face: PART OF SPEECH. In the stopping branch, `logs`,
+# `stores` and `writes` are verbs in "no longer logs the token" and nouns in
+# "stop the noisy logs in the key rotation job" — one spelling, and only a POS
+# tagger separates them. Dropping them kills the false fire and the true one
+# together ("no longer stores API keys" is exactly what this branch is for), so
+# they stay and the residue is declared. Bounding fixed the substring half of
+# this class; the POS half is not a regex's to fix.
+#
+# NOT COVERED, measured and recorded rather than quietly widened: a credential
+# noun spelled as a snake_case identifier. `\b` cannot match inside
+# `session_token`, because `_` is a word character — so `session_token was logged
+# in plaintext` does not fire, while `api_key` does, only because `api[ _-]?key`
+# spells the separator out. The labelled set contains no snake_case identifier,
+# so the 23/23 recall figure does not speak to this shape. Widening the bare
+# nouns to absorb it would need the whole false-positive side re-measured, which
+# is a change with its own evidence, not a line to slip in here.
 _FRAMING_NOUN='\b(credential|secret|token|api[ _-]?key|private[ _-]?key|signing[ _-]?key|password|passphrase|cred|cookie|key)s?\b'
-_FRAMING_STATE='(plaintext|cleartext|unencrypted|unredacted|verbatim|in the clear|recoverable)'
-_FRAMING_PAST='(leaked|exposed|persisted|stored|storing|wrote|written|writing|logged|logging|printed|recorded|contained|revealed|leaking|exposing|persisting)'
-_FRAMING_STOPV='(leaking|exposing|persisting|storing|writing|logging|persists|leaks|exposes|stores|writes|logs|write|store|log|leak|expose)'
-FRAMING_PATTERNS="${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_STATE}|${_FRAMING_STATE}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_PAST}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_PAST}|(no longer|used to|stop|stops|stopped|prevent|prevents|prevented)[^.]{0,30}${_FRAMING_STOPV}[^.]{0,45}${_FRAMING_NOUN}"
+_FRAMING_STATE='\b(plaintext|cleartext|unencrypted|unredacted|verbatim|in the clear|recoverable)\b'
+_FRAMING_PAST='\b(leaked|exposed|persisted|stored|wrote|written|logged|printed|recorded|contained|revealed)\b'
+_FRAMING_PROG='\b(leaking|exposing|persisting|storing|writing|logging)\b'
+_FRAMING_PASTAUX='\b(was|were|been|being|had)\b'
+_FRAMING_STOPV='\b(leaking|exposing|persisting|storing|writing|logging|persists|leaks|exposes|stores|writes|logs|write|store|log|leak|expose)\b'
+_FRAMING_STOPPHRASE='\b(no longer|used to|stop|stops|stopped|prevent|prevents|prevented)\b'
+FRAMING_PATTERNS="${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_STATE}|${_FRAMING_STATE}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_PAST}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_PAST}|${_FRAMING_PASTAUX}[^.]{0,20}${_FRAMING_PROG}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_PASTAUX}[^.]{0,20}${_FRAMING_PROG}|${_FRAMING_STOPPHRASE}[^.]{0,30}${_FRAMING_STOPV}[^.]{0,45}${_FRAMING_NOUN}"
 
 framing_hit=""
 _subject=$(head -n 1 "$MSG_FILE")

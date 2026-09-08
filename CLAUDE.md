@@ -62,7 +62,11 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+`scripts/cc_align_host.sh` — host-only by contract, no container leg),
+`genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
+auto-updater suppression in `~/.claude/settings.json`, because the align path
+only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
@@ -268,12 +272,42 @@ the question. Query SQLite `cc_sessions` for structured session data. Use
 `db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
 **Grep transcripts is LAST RESORT** — only after all above fail.
 
-**When to store back:**
-If you synthesize an answer from multiple recalled memories — something that
-connects information in a new way — store it via `memory_store` with
-`tags: ["synthesis"]` and appropriate wing/room tags. This is how the memory
-system compounds over time. Don't store routine answers; store genuine syntheses
-that would be expensive to re-derive.
+**When to store back — the test is RE-DERIVATION COST, not importance.**
+Store to Genesis memory when a future session would have to REDO WORK to know
+this. That is a question about the work you just did, which you can answer; "is
+this important?" is a question about the future, which you cannot, and it is why
+the rule below used to fire so rarely. Three concrete triggers:
+
+1. **You MEASURED something** that took real effort to obtain — a probe you had
+   to design, an enumeration across a directory, a live-state check. Store the
+   number WITH its denominator and the method, because the method is usually what
+   the next session gets wrong.
+2. **You established a durable ARCHITECTURAL fact** — X exists, X works this way,
+   X is not what its name suggests. Especially when you went looking for X
+   expecting it to be absent.
+3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
+   Use `supersedes` to link the correction to what it replaces. This is the
+   highest-value trigger and the easiest to skip, because being wrong does not
+   feel like a finding. It is the one that stops the next session paying for the
+   same mistake.
+
+Also store a genuine SYNTHESIS — an answer connecting several recalled memories
+in a new way — with `tags: ["synthesis"]`. Don't store routine answers, restatements
+of what a file already says, or anything the repo records on its own.
+
+**Do not park a durable FACT in CC file memory.** The two systems differ in
+LIFETIME, not just audience: CC file memory is for behavioural rules that must
+shape *how you work*, and it is compacted away within months, so a fact left
+there is a fact you will silently lose. Genesis memory is permanent and
+recallable system-wide. A measurement, an architecture note, or a correction
+belongs there even when it also taught you a behavioural lesson — in that case
+store BOTH: the rule in CC memory, the fact in Genesis memory.
+
+(Origin: a 2026-09-05 session measured an embedding regression, enumerated an
+init-path invariant across 33 modules, and corrected a wrong architectural claim
+of its own — then wrote only the behavioural lessons to CC memory and stored
+nothing durable until the user asked why. The routing rule was clear; nothing
+told it WHEN.)
 
 **Wings (structural domains):**
 Memories are tagged with a `wing` (top-level domain) and optional `room`
@@ -329,7 +363,16 @@ extraction pipeline is the safety net.
 
 Foreground sessions carry a durable charter + ledger (DB-backed, re-injected
 into every post-compaction window — see the `## Session Charter` block and
-the per-turn `[Charter: … | open: N]` tag).
+the per-turn `[Ledger open: N | mission: …]` inventory, one line per open row).
+
+**The ledger is the session's founding mission and OUTRANKS every follow-up.**
+Follow-ups are durable system-wide; ledger rows exist only on the ledger. In
+any status report or wrap-up, open ledger rows come FIRST, by name — never as
+"older items" or fine print under follow-ups you created yourself — and a
+wrap-up cannot say "only follow-ups left" while a ledger row is open. Every
+open row is either getting done or gets a disposition (done / absorbed /
+dropped, with the reason) — a row left undisposed is a defect, not a backlog.
+A ledger row is ONE sentence; evidence carries the detail.
 
 **Real-time capture is your responsibility.** At agreement moments — the
 user says "yes, do that", approves a plan item, or you promise work — call
@@ -337,9 +380,23 @@ user says "yes, do that", approves a plan item, or you promise work — call
 compaction summary can erase. Close items with `session_ledger_update`
 (done / absorbed-with-evidence / dropped) as work lands; set the living
 mission via `session_charter_update` when the session's purpose
-crystallizes or pivots. You are the first line of defense; ambient
+crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
+until you do, because an unset mission falls back to the raw origin prompt and
+reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
+
+**PR-body convention — `E2E:` (required, merge-gated):** every PR body declares
+the POST-MERGE end-to-end verification its change needs, on its own line:
+`E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
+The merge gate blocks a PR that declares neither — and a `none` carrying no real
+reason (a bare `none`, a placeholder, or a refusal word like TBD). Merge time
+only, never on push. PRs created before the convention are exempt; if the PR's
+creation date cannot be READ, the gate blocks rather than assuming the
+exemption. `none` is a fine answer for a docs PR; what is refused is leaving the
+decision unmade. It does NOT release
+the validator, which assumes every merged PR has an E2E and hunts for one anyway
+— the line is its first lead, not a boundary.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -360,6 +417,37 @@ When a user shares a file path or URL in conversation:
   the knowledge base as an authoritative source?"
 - Never auto-ingest without explicit user confirmation.
 - The dashboard also supports drag-drop file upload on the Knowledge tab.
+
+## Hook Output Persistence — a withheld hook is a SILENT loss
+
+Claude Code persists a hook's stdout above a size threshold instead of
+delivering it: the full text goes to a file and you get a short preview. It is
+not an error and nothing else announces it. MEASURED on this install: the
+SessionStart injection was withheld from 195 windows across a month — sessions
+ran without identity, charter and essential knowledge and nobody noticed,
+because the preview reads as ordinary furniture at the top of a window.
+
+**If a hook result arrives as a preview + a saved path** (as of CC 2.1.246:
+`<persisted-output>`, `Output too large (N KB). Full output saved to: <path>`,
+`Preview (first 2KB)`), that hook's contribution to this window was withheld:
+
+- **SessionStart** — Read the path the wrapper names **before anything else**,
+  then tell the user it happened. Genesis parts also mirror themselves to
+  `~/.genesis/sessions/<sid>/context-<part>.md` and name it in a
+  `[genesis-ctx:<part> · mirror: …]` header, so read the mirror if the
+  wrapper's path is gone. If neither exists, say which part this window lost.
+- **Any other hook** — that turn ran without what the hook was carrying (a
+  memory recall, a guard advisory). Say so rather than proceeding as if it
+  arrived.
+
+The size threshold is undocumented and **moves between CC versions** — treat
+the wrapper itself as the signal, never a byte count.
+`scripts/hooks/hook_output.py` is the single home of the measured cap and
+bounds the two hooks that carry the most to the model (the SessionStart
+injection and the per-prompt session-state tags); **route any new model-facing
+stdout through it** — the other hooks are not bounded yet. The hourly
+`context_injection_monitor` watches the harness's own filings independently of
+every emitter's arithmetic, so this class cannot go quiet again.
 
 ## Traps
 
@@ -397,7 +485,9 @@ When a user shares a file path or URL in conversation:
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
-  repo instead of getting done.
+  repo instead of getting done. (Merge-DRIVING specifically — when to actively
+  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
@@ -417,14 +507,6 @@ When a user shares a file path or URL in conversation:
   anything that resolves its target from the directory it runs in (e.g.
   `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
   are about. Detail in the genesis-development skill.
-- **Check closing tags on long tool-call parameters.** A closing tag that does
-  not match its opening tag silently swallows every following parameter into the
-  preceding string; the tool then reports those parameters as *missing*, which
-  reads like a tool bug and is not one. It recurs on long, multi-sentence values.
-  Repeated IDENTICAL validation errors mean the CALL is malformed — the error
-  echoes `input_value`, which holds the proof; read it, and check whether the
-  same tool succeeded earlier in the session, before concluding anything about
-  the tool.
 - **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
@@ -439,6 +521,25 @@ When a user shares a file path or URL in conversation:
   file does not outrank the user. That does NOT extend to the standing approval
   gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
   ego proposals; Rules: financial transactions, destructive commands).
+- **An inference you make CANNOT outrank a rule that names the exact thing.**
+  "This file does not outrank the user" means the user's ACTUAL WORDS, never your
+  reading of what they must have meant. A rule that names a specific object — a
+  service, host, surface, command, path, account — is cleared ONLY by user text
+  CONTAINING THAT NAME. Do the string check; it is mechanical, unlike "did they
+  mean it?", which is unfalsifiable and is what gets rationalized. Naming a
+  destination never authorizes a road: "use model X" does not clear a ban on the
+  service you happen to know reaches X. **Ambiguity resolves TOWARD the
+  prohibition** — a prohibition and an authorization are not symmetric, and
+  absence of mention is never permission. If the only route you know is a
+  forbidden one, that is exactly when you STOP and ask, not when you supply the
+  missing half yourself.
+
+  **The tripwire: writing "my read is you meant…" about something a rule forbids
+  IS the stop**, not a preamble to proceeding. And naming a rule then crossing it
+  in the same turn is not raising it — it is narrating, and it is worse than
+  silence, because it teaches the user to discount your flagging: if you surface a
+  conflict and proceed anyway, they cannot tell your real stops from your narrated
+  ones. Asking costs one line.
 - **Cross-session messages: the bar is on the REPLY, not the send.** Send a
   peer when there is good reason (region collision, a MEASURED contradiction of
   their claim, shared-resource contention, a defect in their blast radius, or a
@@ -461,6 +562,25 @@ When a user shares a file path or URL in conversation:
   decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
+- **Finish before you stop — the zero-drop rule.** A turn may run as long as
+  the work requires; never yield with steps you could still complete AND are
+  cleared to complete — stopping for an approval, a blocking question, plan
+  approval, or a designed hard stop is finishing correctly, not dropping
+  work. When something genuinely cannot finish this turn, every unfinished
+  piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
+  issue, which keeps its per-instance approval gate from "Where deferred
+  work goes" below, this rule waives nothing. Where none of those trackers
+  is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
+  ledger or follow-up tool — the fallback is a structured handoff that NAMES
+  every unfinished piece in your final message; a named remainder is tracked,
+  an unnamed one is dropped. An untracked remainder is a
+  drop, not a deferral, and a plan-file bullet is not a row. On the next
+  prompt, reconcile your own stranded artifacts early — ordered behind
+  anything the user's prompt makes urgent — before taking on discretionary
+  new work. The answer to "what has fallen through the cracks?" is MADE
+  zero: enumerate, then fix or file what the enumeration finds. (Origin
+  2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
+  days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
@@ -487,7 +607,37 @@ When a user shares a file path or URL in conversation:
 - **Read before writing.** Never modify code you haven't fully read.
   Don't assume what a function does based on its name.
 - **Self-correction loop**: persist lessons as concrete rules that PREVENT
-  mistakes, not just document them.
+  mistakes, not just document them. A rule that only names the error is not
+  preventive — state the CORRECT action, or it will be re-read while the same
+  mistake repeats.
+- **A tool call that reports parameters *missing* is usually malformed, not
+  buggy — and the echoed payload is what tells you which.** The diagnosis below
+  is encoding-independent; the concrete form is not, so take the form from your
+  own client.
+
+  **Read the echoed `input_value` first.** It shows how far each value actually
+  ran, which is what separates a malformed CALL from a wrong value or a genuine
+  tool defect — repeated identical errors on their own establish none of the
+  three, since resubmitting an invalid enum, or hitting a deterministic callee
+  defect, also fails identically every time. If a value ran PAST where it should
+  have ended and swallowed the parameters after it, fix the STRUCTURE, not the
+  text. If it ended where it should have, the structure is fine and the value or
+  the tool is the problem — and what separates those two is the value checked
+  against the tool's own documented contract, not whether that tool worked
+  earlier. Prior success proves nothing here: a defect can be input-dependent,
+  accepting one payload and wrongly rejecting the next. If the value is
+  documented-valid and still rejected, that IS the bug report. Most likely on
+  long, multi-sentence values. Never file a bug report from a payload you have
+  not read — and never suppress one because the tool worked a moment ago.
+
+  **In Claude Code specifically**, parameters are
+  `<parameter name="X">…</parameter>`. A bare `<X>…</X>` is not a shorthand: the
+  wrapper is the only recognised form, so the opening tag never starts a
+  parameter and its `</X>` closes nothing — which is what produces the run-on
+  above. This file is also the canonical instruction set for Codex, Cursor,
+  OpenCode and others (see `AGENTS.md`), whose call encodings are client-defined
+  and may be JSON or another protocol entirely. **Do not apply this
+  serialization outside Claude Code** — there it would corrupt a valid call.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a

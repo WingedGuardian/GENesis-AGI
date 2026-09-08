@@ -905,6 +905,108 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             exc_info=True,
         )
 
+    # Add 'marketing' category so the marketing campaign's tick digest routes to
+    # its own "Marketing" supergroup topic (never the shared Morning Reports
+    # topic that 'digest' lands in).  Rebuild #5, appended AFTER the enforcing
+    # engagement rebuild (#4) so this becomes the FINAL DDL — it therefore
+    # carries the ENFORCING engagement CHECK ('engaged' + IS NULL OR ...) and
+    # preserves every earlier category-probe fragment VERBATIM, or an older
+    # rebuild re-fires next boot (see test_final_ddl_preserves_all_chain_probe_
+    # fragments).  Probe on the exact trailing pair 'notification', 'marketing'.
+    # By the time this runs the engagement rebuild has already normalized
+    # engagement_outcome, so a straight column copy is safe.
+    _MARKETING_FRAGMENT = "'notification', 'marketing'"
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='outreach_history'"
+        )
+        row = await cursor.fetchone()
+        if row and _MARKETING_FRAGMENT not in (row[0] or ""):
+            # Clean up an orphaned temp table from any prior failed rebuild
+            await db.execute("DROP TABLE IF EXISTS outreach_history_new")
+            await db.execute("""
+                CREATE TABLE outreach_history_new (
+                    id                  TEXT PRIMARY KEY,
+                    person_id           TEXT,
+                    signal_type         TEXT NOT NULL,
+                    topic               TEXT NOT NULL,
+                    category            TEXT NOT NULL CHECK (category IN (
+                        'blocker', 'alert', 'finding', 'insight', 'opportunity',
+                        'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
+                    )),
+                    salience_score      REAL NOT NULL,
+                    channel             TEXT NOT NULL,
+                    message_content     TEXT NOT NULL,
+                    drive_alignment     TEXT,
+                    labeled_surplus     INTEGER DEFAULT 0,
+                    content_hash        TEXT,
+                    delivery_id         TEXT,
+                    delivered_at        TEXT,
+                    opened_at           TEXT,
+                    user_response       TEXT,
+                    action_taken        TEXT,
+                    engagement_outcome  TEXT CHECK (
+                        engagement_outcome IS NULL OR engagement_outcome IN (
+                        'useful', 'engaged', 'acted_on', 'acknowledged',
+                        'not_useful', 'ambivalent', 'ignored'
+                    )),
+                    engagement_signal   TEXT,
+                    prediction_error    REAL,
+                    created_at          TEXT NOT NULL
+                )
+            """)
+            # Copy over the live↔rebuild column INTERSECTION (drift-safe). If the
+            # live table carries a column this rebuild target lacks — e.g. a
+            # concurrent schema-bearing branch added one — _intersection_copy
+            # RAISES instead of silently dropping it; the enclosing try/except then
+            # keeps the ORIGINAL table intact (recoverable) and the rebuild
+            # self-heals once this CREATE is corrected to match the canonical
+            # _tables.py DDL. By the time this block runs, rebuild #4 has already
+            # normalized engagement_outcome under the enforcing CHECK, so the
+            # straight column copy is clean.
+            await _intersection_copy(
+                db, src="outreach_history", dst="outreach_history_new"
+            )
+            await db.execute("DROP TABLE outreach_history")
+            await db.execute(
+                "ALTER TABLE outreach_history_new RENAME TO outreach_history"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_channel "
+                "ON outreach_history(channel)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_category "
+                "ON outreach_history(category)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_delivered "
+                "ON outreach_history(delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_outcome "
+                "ON outreach_history(engagement_outcome)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_dedup "
+                "ON outreach_history(signal_type, topic, category, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_content_hash "
+                "ON outreach_history(signal_type, category, content_hash, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_person "
+                "ON outreach_history(person_id)"
+            )
+            await db.commit()
+            logger.info("outreach_history table rebuilt with 'marketing' category")
+    except Exception:
+        logger.error(
+            "outreach_history CHECK constraint migration (marketing) failed",
+            exc_info=True,
+        )
+
     # Memory photographic: extraction watermark tracking on cc_sessions
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_at TEXT",
