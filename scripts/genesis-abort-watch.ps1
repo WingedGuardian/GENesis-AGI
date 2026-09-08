@@ -53,6 +53,13 @@ if ($Clear) {
     exit 0
 }
 
+# Set by Stop-GenesisWatcher when a LIVE poller was found but could not be
+# proven to be ours. A refusal is not a stop: -Uninstall must not unregister
+# the task on top of it (that is how an invisible orphan becomes permanent).
+# A flag rather than string-matching the return value, so the caller's check
+# cannot drift away from the refusal messages.
+$script:GenesisStopRefused = $false
+
 function Stop-GenesisWatcher {
     <#
       .SYNOPSIS
@@ -80,7 +87,14 @@ function Stop-GenesisWatcher {
     # reuses PIDs, so a record that outlived its process names whatever now
     # holds that number. Killing on the PID alone would terminate an unrelated
     # process - the operator's editor, a build, anything.
-    $raw   = (Get-Content $pidf -Raw).Trim()
+    # Get-Content -Raw yields $null for an empty file, and a file holding only a
+    # UTF-8 BOM is empty by that measure (MEASURED on hardware: length 3 bytes,
+    # content $null). .Trim() on $null throws a TERMINATING error, so the
+    # "unreadable" branch below could never run for the emptiest possible
+    # record - the one case it most obviously exists for.
+    $raw = Get-Content $pidf -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $raw) { $raw = "" }
+    $raw   = $raw.Trim()
     $parts = $raw -split '\|'
     $wpid  = 0
     if (-not [int]::TryParse($parts[0], [ref]$wpid) -or $wpid -le 0) {
@@ -115,14 +129,30 @@ function Stop-GenesisWatcher {
         # stale and genesis-act.ps1 already refuses to act on a stale heartbeat,
         # whereas killing the wrong process is unrecoverable. Restarting the
         # watcher rewrites the record in the verifiable format.
+        $script:GenesisStopRefused = $true
         Remove-Item $stop -Force -ErrorAction Ignore
         return "pid $wpid has a legacy record with no start time - REFUSING to force-kill an unverifiable process; restart the watcher to re-record it"
     }
-    if ($proc.StartTime.Ticks -ne $ticks) {
+    # StartTime is a privileged read. The watcher's own write of this value is
+    # already wrapped (see the identity record below) precisely because it can
+    # fail; this read was not, so a failure here threw instead of refusing.
+    # MEASURED 2026-09-07: 0 of 464 live processes refused the read under an
+    # ELEVATED token, so this is unreachable from an admin shell. It is NOT
+    # unreachable from a non-elevated -Stop, which is the context the watcher
+    # itself runs in, against a reused PID now held by an elevated process.
+    # Unverifiable means REFUSE, never throw and never kill.
+    $liveTicks = $null
+    try { $liveTicks = $proc.StartTime.Ticks }
+    catch {
+        $script:GenesisStopRefused = $true
+        Remove-Item $stop -Force -ErrorAction Ignore
+        return "pid $wpid holds a process whose start time cannot be read ($($_.Exception.GetType().Name)) - REFUSING to force-kill an unverifiable process"
+    }
+    if ($liveTicks -ne $ticks) {
         # Same number, different process: the watcher died and Windows handed
         # its PID to someone else. Discard the stale record; kill nothing.
         Remove-Item $pidf, $stop -Force -ErrorAction Ignore
-        return "pid $wpid now belongs to a DIFFERENT process (started $($proc.StartTime.ToString('o')), recorded $([DateTime]::new($ticks).ToString('o'))) - stale record discarded, nothing killed"
+        return "pid $wpid now belongs to a DIFFERENT process (started $([DateTime]::new($liveTicks).ToString('o')), recorded $([DateTime]::new($ticks).ToString('o'))) - stale record discarded, nothing killed"
     }
 
     Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue
@@ -130,16 +160,36 @@ function Stop-GenesisWatcher {
     return "pid $wpid ignored the stop file and was killed (identity verified)"
 }
 
-if ($Stop) { Stop-GenesisWatcher; exit 0 }
+if ($Stop) {
+    Stop-GenesisWatcher
+    if ($script:GenesisStopRefused) { exit 1 }
+    exit 0
+}
 
 if ($Uninstall) {
     # Stop FIRST. Unregistering a task does not kill a process it no longer
     # owns, so uninstalling without this silently leaves the poller running.
     Stop-GenesisWatcher
+    # ...and a REFUSAL is not a stop. Unregistering here would do exactly the
+    # damage the ordering above exists to prevent, except worse: the poller is
+    # still running AND the task that named it is gone, so nothing is left to
+    # find it by. Recovery is to restart the watcher (which re-records its
+    # identity in the verifiable format) and stop it again.
+    if ($script:GenesisStopRefused) {
+        "REFUSED to unregister $TaskName - a live poller could not be verified as ours and is still running."
+        "  Restart the watcher to re-record its identity, then -Stop, then -Uninstall."
+        exit 1
+    }
+    # The task is not the only thing install created, and the shim must be
+    # removed on BOTH paths: an already-unregistered task is precisely the
+    # state in which a stranded shim would never be collected.
+    . (Join-Path $PSScriptRoot "genesis-win-common.ps1")
+    $shimGone = Remove-GenesisHiddenTaskShim -ScriptPath $PSCommandPath
+    $suffix = $(if ($shimGone) { " (shim removed)" } else { "" })
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Ignore
-    if (-not $t) { "NOT_REGISTERED $TaskName"; exit 0 }
+    if (-not $t) { "NOT_REGISTERED $TaskName" + $suffix; exit 0 }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    "UNREGISTERED $TaskName"
+    "UNREGISTERED $TaskName" + $suffix
     exit 0
 }
 

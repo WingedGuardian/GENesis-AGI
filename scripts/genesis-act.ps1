@@ -41,10 +41,16 @@ $BeatPath    = [System.IO.Path]::Combine($StateDir, "watcher.beat")
 if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
 
 if ($Uninstall) {
+    # The shim is removed on BOTH paths and before the early return. Install
+    # creates two artifacts, and an already-unregistered task is exactly the
+    # state in which a stranded shim would otherwise never be collected.
+    . (Join-Path $PSScriptRoot "genesis-win-common.ps1")
+    $shimGone = Remove-GenesisHiddenTaskShim -ScriptPath $PSCommandPath
+    $suffix = $(if ($shimGone) { " (shim removed)" } else { "" })
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Ignore
-    if (-not $t) { "NOT_REGISTERED $TaskName"; exit 0 }
+    if (-not $t) { "NOT_REGISTERED $TaskName" + $suffix; exit 0 }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    "UNREGISTERED $TaskName"
+    "UNREGISTERED $TaskName" + $suffix
     exit 0
 }
 
