@@ -278,25 +278,36 @@ class WatchdogChecker:
         if service_uptime is not None and service_uptime < self._staleness_threshold:
             state = self._load_state()
             skips = int(state.get("bootstrap_grace_skips", 0)) + 1
-            if skips <= self._max_bootstrap_grace_skips:
-                state["bootstrap_grace_skips"] = skips
-                self._save_state(state)
-                logger.info(
-                    "Status file stale (%.0fs) but %s started only %.0fs ago "
-                    "(< %ds threshold) — bootstrap grace %d/%d, skipping",
-                    staleness_s, self._target_service, service_uptime,
-                    self._staleness_threshold, skips,
-                    self._max_bootstrap_grace_skips,
+            if skips > self._max_bootstrap_grace_skips:
+                logger.error(
+                    "Bootstrap grace exhausted (%d skips): %s keeps presenting "
+                    "a young uptime without ever writing a fresh status file — "
+                    "likely a restart loop; no longer suppressing.",
+                    skips - 1, self._target_service,
                 )
-                return WatchdogAction.SKIP
-            logger.error(
-                "Bootstrap grace exhausted (%d skips): %s keeps presenting a "
-                "young uptime without ever writing a fresh status file — "
-                "likely a restart loop; no longer suppressing.",
-                skips - 1, self._target_service,
-            )
-            self._alert_grace_exhausted(service_uptime, skips - 1)
-            # fall through to the normal stale-restart path below
+                self._alert_grace_exhausted(service_uptime, skips - 1)
+                # fall through to the normal stale-restart path below
+            else:
+                state["bootstrap_grace_skips"] = skips
+                # A skip is granted only when its counter PERSISTED — an
+                # unwritable state file would otherwise reload the old count
+                # every invocation and re-grant the same slot forever
+                # (unbounded grace, the exact hole the counter closes).
+                if self._save_state(state):
+                    logger.info(
+                        "Status file stale (%.0fs) but %s started only %.0fs "
+                        "ago (< %ds threshold) — bootstrap grace %d/%d, "
+                        "skipping",
+                        staleness_s, self._target_service, service_uptime,
+                        self._staleness_threshold, skips,
+                        self._max_bootstrap_grace_skips,
+                    )
+                    return WatchdogAction.SKIP
+                logger.error(
+                    "Bootstrap grace NOT granted: skip counter could not be "
+                    "persisted — falling through to normal stale handling.",
+                )
+                # fall through to the normal stale-restart path below
 
         logger.warning(
             "Status file stale: %.0fs old (threshold %ds) — %s may be down",
@@ -404,18 +415,28 @@ class WatchdogChecker:
                 skips = int(state.get("starved_skips", 0)) + 1
                 if skips <= self._liveness_max_starved_skips:
                     state["starved_skips"] = skips
-                    self._save_state(state)
-                    self._alert_starved(reason, d, skips)
-                    logger.warning(
-                        "Liveness probe: server UP but event loop STARVED "
-                        "(lag %sms, sample %ss old, executor=%s) — suppressing "
-                        "'%s' restart (%d/%d); a restart would re-trigger the "
-                        "starvation. Alerting instead.",
-                        d.get("lag_ms", "?"), d.get("sample_age_s", "?"),
-                        d.get("executor"), reason, skips,
-                        self._liveness_max_starved_skips,
-                    )
-                    return WatchdogAction.SKIP
+                    if not self._save_state(state):
+                        # Same class as the bootstrap-grace persistence gate:
+                        # a suppression whose counter did not land is unbounded
+                        # on a box with a failing state write. Fall through to
+                        # the normal restart path instead of suppressing.
+                        logger.error(
+                            "Starved suppression NOT granted: skip counter "
+                            "could not be persisted — proceeding to normal "
+                            "restart logic.",
+                        )
+                    else:
+                        self._alert_starved(reason, d, skips)
+                        logger.warning(
+                            "Liveness probe: server UP but event loop STARVED "
+                            "(lag %sms, sample %ss old, executor=%s) — "
+                            "suppressing '%s' restart (%d/%d); a restart would "
+                            "re-trigger the starvation. Alerting instead.",
+                            d.get("lag_ms", "?"), d.get("sample_age_s", "?"),
+                            d.get("executor"), reason, skips,
+                            self._liveness_max_starved_skips,
+                        )
+                        return WatchdogAction.SKIP
                 # Past the suppression bound: stop suppressing and proceed to the
                 # restart path. Deliberately do NOT reset starved_skips here (that
                 # would re-enable suppression next cycle) — it stays pinned so we
@@ -732,12 +753,22 @@ class WatchdogChecker:
             state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
         return state
 
-    def _save_state(self, state: dict) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+    def _save_state(self, state: dict) -> bool:
+        """Persist state; True only when the write actually landed.
+
+        The return value is load-bearing for the bounded suppressions (bootstrap
+        grace, starved skips): a suppression whose counter did not persist is
+        unbounded on a box with a failing state write (disk-full, permissions —
+        each oneshot invocation would reload the old count and re-grant the same
+        slot forever), so callers grant a skip only on True.
+        """
         try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
             self._state_path.write_text(json.dumps(state))
+            return True
         except OSError:
             logger.error("Failed to save watchdog state to %s", self._state_path, exc_info=True)
+            return False
 
     def _record_failure(self, state: dict, *, reason: str) -> None:
         now = time.time()

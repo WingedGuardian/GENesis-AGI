@@ -230,6 +230,20 @@ class TestStaleBootstrapGrace:
         with patch.object(WatchdogChecker, "_service_uptime_s", return_value=None):
             assert checker.check() is WatchdogAction.RESTART
 
+    def test_unpersisted_counter_grants_no_grace(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # A grace whose counter did not persist is unbounded on a box with a
+        # failing state write — each oneshot invocation would reload the old
+        # count and re-grant the same slot forever (Codex P2, PR #1858). Deny
+        # the skip and fall through to the pre-existing restart path.
+        checker = _make_checker(tmp_path, stale_status)
+        with (
+            patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0),
+            patch.object(WatchdogChecker, "_save_state", return_value=False),
+        ):
+            assert checker.check() is WatchdogAction.RESTART
+
     def test_grace_is_bounded_by_skip_counter(
         self, tmp_path: Path, stale_status: Path
     ):
@@ -1336,6 +1350,22 @@ class TestLivenessRestartGate:
         assert state["starved_skips"] == 1
         # A suppressed cycle must NOT burn the restart/backoff counter.
         assert state.get("consecutive_failures", 0) == 0
+
+    def test_starved_suppression_requires_persisted_counter(self, tmp_path: Path):
+        # Same class as the bootstrap-grace persistence gate (Codex P2,
+        # PR #1858): a suppression whose counter did not land is unbounded on a
+        # box with a failing state write — fall through to restart instead.
+        c = self._stale(tmp_path)
+        payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True,
+                            "executor": {"pending": 30}}}
+        with (
+            patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)),
+            patch.object(c, "_alert_starved") as alert,
+            patch.object(WatchdogChecker, "_save_state", return_value=False),
+        ):
+            action = c.check()
+        assert action is WatchdogAction.RESTART
+        alert.assert_not_called()
 
     def test_starved_suppression_is_bounded(self, tmp_path: Path):
         c = self._stale(tmp_path)
