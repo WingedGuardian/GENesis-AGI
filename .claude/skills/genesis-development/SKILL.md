@@ -971,10 +971,19 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   fail-open by design and says so in its own docstring, so argue with the design
   rather than patching it; `protected_paths_guard`'s calls itself "conservative:
   over-blocks, never under", which is true relative to the old guard it
-  reinstates (`protected_paths_guard.py:33-35`) and false of the parsed resolver
-  it stands in for — one sentence, two readings, and that ambiguity is the
-  defect. Verify a docstring's stated direction IN CONTEXT; never quote it as a
-  fact. The shapes are deliberately not enumerated here, per the rule above.
+  reinstates (`_legacy_substring_block`'s docstring) and false of the parsed
+  resolver it stands in for — one sentence, two readings, and that ambiguity is
+  the defect. Verify a docstring's stated direction IN CONTEXT; never quote it as
+  a fact. The shapes are deliberately not enumerated here, per the rule above.
+
+  That guard's MODULE docstring has since been split so it no longer states one
+  fail direction for both blind spots: a bounds-induced blind spot REFUSES and an
+  untokenizable one falls back. The sentence quoted above still sits on the
+  fallback helper, where both readings remain available, so the lesson is
+  unchanged — and note the citation here is now to a SYMBOL rather than to a line
+  range, because the range this paragraph originally named stopped containing the
+  quote the moment that docstring was edited. A line number is a claim with a
+  shelf life.
 
   Within the git-operation blind-spot net, the two rules are scoped by who is
   present: `ask` is the interactive form of the refusal, and where a session is
