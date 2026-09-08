@@ -668,9 +668,24 @@ verified: 5808e7cd 2026-09-03
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
   → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
-  capability-promotion path (`capability_grants.detect_promotable_cells` — no
-  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
-  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  capability-promotion path (`capability_grants.detect_promotable_cells` →
+  `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
+  posterior ≥0.70). That path is scoped by
+  `is_promotable_cell` — two closed sets, an allowlisted (DOMAIN, VERB) pair
+  (`PROMOTABLE_CELLS`, `("email", "send")` only today — keyed on the pair, not
+  the domain, so a future verb under an allowlisted domain cannot inherit
+  eligibility) and a risk class that is not
+  FINANCIAL — enforced in BOTH the candidate scan and `apply_event`, which
+  raises `InvalidTransition` on an `APPROVE` that fails either bar. FINANCIAL
+  is the bar `RiskClass` already claimed ("never trust-unlockable") and nothing
+  enforced: financial cells stayed out of the matrix only because
+  `email_gate.check` holds them before the first CLASSIFY, which is one
+  caller's statement ordering rather than a mechanism. So a future capability's
+  cells stay at ASK or below — classifying and accumulating evidence, still
+  able to be DENIED_PERMANENT, but gating every action on the owner — until
+  someone adds its domain in code. Promotion is the one transition
+  that converts per-action approval into a standing grant; a denylist would hand
+  that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
   active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
