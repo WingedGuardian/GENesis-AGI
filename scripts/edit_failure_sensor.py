@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: record Edit/Write tool-call outcomes from the session transcript.
+"""Stop / SessionEnd hook: record Edit/Write tool-call outcomes from the transcript.
 
 Writes to ``tool_call_outcomes`` — the source for the WS-2 tool-call calibration
 base-rate lane (``db/crud/tool_call_outcomes.py::aggregate_success_rates`` →
@@ -9,8 +9,9 @@ Why the transcript, not PostToolUse: on current Claude Code a FAILED Edit fires
 NO PostToolUse/PostToolUseFailure hook at all (MEASURED 2026-09-02, CC 2.1.246 —
 issue #1597), so the old PostToolUse-based sensor recorded 0 failures in 25k rows
 over ~8 weeks (its own #955 regression marker tripped). Failures — and successes —
-ARE both recorded in the session transcript. On the **Stop** event we scan the
-transcript (path in ``transcript_path``) and record EVERY Edit/Write tool call:
+ARE both recorded in the session transcript. On **Stop** (per turn) and
+**SessionEnd** (fallback) we scan the transcript (path in ``transcript_path``)
+and record EVERY Edit/Write tool call:
 ``success=0`` when its ``tool_result`` has ``is_error`` truthy, ``success=1``
 otherwise. Recording both from ONE source keeps success and failure on the same
 population (no base-rate skew); v1 is MAIN-SESSION ONLY (``isSidechain`` records —
@@ -22,7 +23,8 @@ pre-#1597 rows carry NULL ``tool_use_id`` (SQLite allows multiple NULLs in a UNI
 index); every row this writes carries a value.
 
 This REPLACES both the PostToolUse success registration and the dead
-PostToolUseFailure registration for this sensor (see .claude/settings.json).
+PostToolUseFailure registration for this sensor. Registered on **Stop** and
+**SessionEnd** (see .claude/settings.json).
 
 Reads stdin JSON per the hook contract. Stdlib-only (runs outside the server),
 fail-open (never raises, never blocks a tool call). ``GENESIS_DB_PATH`` override is
@@ -50,8 +52,33 @@ _DB_PATH = Path(
 # long before the tail window could roll past them in steady state.
 _MAX_SCAN_BYTES = 25_000_000
 
-# Events that deliver a transcript to scan. Registered on Stop; SessionEnd is
-# accepted too (it also carries transcript_path) as a defensive fallback.
+# Events that deliver a transcript to scan. Stop is the per-turn workhorse;
+# SessionEnd narrows the gap for a session that ends after a tool result but
+# before the next Stop.
+#
+# BOTH are registered in .claude/settings.json. Accepting an event this script is
+# not WIRED to is a claim it cannot keep — the built-but-not-wired shape that is
+# the whole reason #1597 existed (a hook registered on an event that never fires)
+# — so the fallback was made real rather than merely advertised (Codex P2, PR
+# #1616). SessionEnd does carry transcript_path: `scripts/genesis_session_end.py`
+# reads it in production, and a live SessionEnd payload was verified to deliver a
+# non-empty path. It ignores `reason`, so clear/logout/prompt_input_exit all take
+# the same path.
+#
+# Say what it is NOT: a fallback, never a backstop. SessionEnd does not fire when
+# a session is KILLED (OOM, SIGKILL, the tmp-watchgod sweep), so that gap is
+# narrowed, not closed.
+#
+# Cost, MEASURED 2026-09-08 on this install (1,093 transcripts: p50 93 KB, p99
+# 76 MB, max 143 MB; 30/1,093 = 2.7% exceed _MAX_SCAN_BYTES): a worst-case scan
+# is ~1.0-1.7s against the 30s hook timeout, and the re-scan is idempotent
+# (UNIQUE tool_use_id + INSERT OR IGNORE) — it wrote 0 new rows on every
+# transcript tried. Worth noting the sibling on this same event,
+# `scripts/genesis_session_end.py`, declares a deliberate "must complete within
+# 1.5s — file I/O only, no DB queries" budget. This hook does not share that
+# budget and is not bound by it: CC runs the two as separate matcher-free groups,
+# concurrently. Stated so the next reader meets the tension here rather than
+# discovering it.
 _SCAN_EVENTS = ("Stop", "SessionEnd")
 
 
@@ -240,6 +267,47 @@ def _recover_earlier_tool_uses(
         return
 
 
+def _session_id(rec: dict, data: dict) -> str | None:
+    """The session a transcript record belongs to.
+
+    ``sessionId`` (camelCase) is the transcript's own field — ``SESSION_HISTORY.md``
+    documents it, and it is what the record actually carries. Reading only the
+    snake_case ``session_id`` (the HOOK PAYLOAD's spelling) was wrong (Codex P2,
+    PR #1616).
+
+    MEASURED 2026-09-08 over EVERY record in all 1,093 transcripts under
+    ``~/.claude/projects/-home-ubuntu-genesis`` — 155,023 carrying an Edit/Write
+    ``tool_result``:
+      * ``sessionId`` present on 155,023 (100.0%); ``session_id`` on 68,828
+        (44.4%), so the old read stored NULL for over half of them;
+      * the two DISAGREE on 42,451 (27.4%), and ALL 42,451 of those records also
+        carry ``sourceToolAssistantUUID``;
+      * against the CONTAINING FILE's id, ``sessionId`` agrees on 144,255
+        (93.1%) and ``session_id`` on 26,377 (17.0%).
+    (The corpus is this install's, so re-derive rather than quote elsewhere.)
+
+    Read that last line carefully rather than as a validation: Claude Code writes
+    both the filename and the ``sessionId`` stamp, so agreement is a CONSISTENCY
+    check, not independent ground truth. What it does establish is the ordering
+    below — ``session_id`` names the containing transcript only 17% of the time,
+    so it is the WEAKEST of the three, not the second-best.
+
+    Order:
+      1. ``rec["sessionId"]`` — the session the call happened in. Note the 6.9%
+         that differ from the filename: those are exactly the records where this
+         is RIGHT and a file-derived answer would be wrong, which is why it leads.
+      2. ``data["session_id"]`` — the hook payload, i.e. the session whose
+         transcript this is. Correct for any record the live file owns.
+      3. ``rec["session_id"]`` — LAST. It names something else (see the
+         ``sourceToolAssistantUUID`` co-occurrence above); it is kept only so a
+         payload-shape drift degrades to a plausible id instead of NULL.
+    """
+    for value in (rec.get("sessionId"), data.get("session_id"), rec.get("session_id")):
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 def _scan_transcript_outcomes(data: dict) -> None:
     """Scan the session transcript and record every Edit/Write outcome.
 
@@ -327,7 +395,7 @@ def _scan_transcript_outcomes(data: dict) -> None:
         ts = rec.get("timestamp")
         rows.append(
             (
-                rec.get("session_id") or None,
+                _session_id(rec, data),
                 tool_name,
                 file_path,
                 0 if is_err else 1,

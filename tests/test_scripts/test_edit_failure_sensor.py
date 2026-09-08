@@ -3,9 +3,11 @@
 The sensor recorded 0 failures in 25k rows over ~8 weeks (#1597): on current
 Claude Code a failed Edit fires NO PostToolUse/PostToolUseFailure hook. Both
 successes and failures ARE in the session transcript, so the sensor now scans it
-on the Stop event and records EVERY Edit/Write outcome (success=0 on is_error,
-else success=1) — one population, deduped by tool_use_id. These tests pin that
-path against a real temp SQLite DB, using byte-real transcript-record shapes.
+on the Stop and SessionEnd events and records EVERY Edit/Write outcome (success=0
+on is_error, else success=1) — one population, deduped by tool_use_id. These tests
+pin that path against a real temp SQLite DB, using byte-real transcript-record
+shapes (camelCase `sessionId`/`isSidechain`, as real records carry them; the
+snake_case `session_id` belongs to the HOOK PAYLOAD, not to a record).
 
 Fixture ids are synthetic, low-entropy ``toolu_`` values on purpose — these
 fixtures may reach the public repo; a real high-entropy id both leaks an
@@ -87,7 +89,10 @@ def _tool_use(tid, name="Edit", file_path="/tmp/x.py", sidechain=False):
     return {
         "type": "assistant",
         "isSidechain": sidechain,
-        "session_id": "s1",
+        # camelCase, as real transcript records carry it — the snake_case spelling
+        # these fixtures used to carry is the HOOK PAYLOAD's, and using it here
+        # hid a real provenance bug (Codex P2, PR #1616).
+        "sessionId": "s1",
         "message": {
             "content": [
                 {
@@ -114,7 +119,7 @@ def _tool_result(tid, is_error=_MISSING, text="String to replace not found in fi
     rec = {
         "type": "user",
         "isSidechain": sidechain,
-        "session_id": "s1",
+        "sessionId": "s1",  # see _tool_use — camelCase is the transcript's own field
         "timestamp": "2026-09-02T22:00:00+00:00",
         "message": {"content": [result]},
     }
@@ -539,3 +544,132 @@ class TestTheScanCutoffLosesNothing:
         module._process(_stop_payload(tp))
         assert calls == [], "recovery ran on an untruncated transcript"
         assert len(_rows(sensor_db)) == 1
+
+
+# --- Session provenance -------------------------------------------------------
+
+
+def _session_ids(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute("SELECT session_id FROM tool_call_outcomes ORDER BY id")
+        return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+class TestSessionProvenance:
+    """The row must name the session the tool call actually happened in.
+
+    Reading only the snake_case ``session_id`` stored NULL for most rows and a
+    wrong id for much of the rest (Codex P2, PR #1616). MEASURED 2026-09-08 over
+    every record in all 1,093 transcripts under
+    ``~/.claude/projects/-home-ubuntu-genesis`` — 155,023 tool_result-bearing:
+    ``sessionId`` present on 155,023 (100.0%), ``session_id`` on 68,828 (44.4%),
+    the two disagreeing on 42,451 (27.4%). Against the CONTAINING FILE's id,
+    ``sessionId`` agrees on 93.1% and ``session_id`` on 17.0% — which orders the
+    three sources but is a consistency check, not independent validation, since
+    CC writes the filename and the stamp both.
+
+    The order under test is therefore: record ``sessionId`` -> hook payload ->
+    record ``session_id`` LAST.
+    """
+
+    def test_the_records_own_sessionId_is_recorded(self, tmp_path, monkeypatch, sensor_db):
+        records = [_tool_use("toolu_prov1"), _tool_result("toolu_prov1", is_error=True)]
+        tp = _write_transcript(tmp_path, records)
+        payload = _stop_payload(tp)
+        payload["session_id"] = "scanning-session"  # the hook payload disagrees
+        _run_process(monkeypatch, sensor_db, payload)
+        assert _session_ids(sensor_db) == ["s1"], "the record's own sessionId must win"
+
+    def test_a_record_carrying_only_snake_case_still_resolves(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        """MEASURED 0/155,023 real records lack the camelCase id — this branch is
+        DEFENSIVE, not observed. (An earlier version of this docstring claimed
+        7.1%, which was the snake_case ABSENCE rate restated as if it were the
+        camelCase one.) Pinned so a CC payload change that drops ``sessionId``
+        degrades through the payload to this field rather than to NULL.
+
+        The payload is deliberately stripped here: it OUTRANKS this field, so
+        leaving it in would exercise the payload branch and never reach the one
+        this test is named for."""
+        use = _tool_use("toolu_prov2")
+        res = _tool_result("toolu_prov2", is_error=True)
+        for rec in (use, res):
+            rec.pop("sessionId")
+            rec["session_id"] = "snake-only"
+        tp = _write_transcript(tmp_path, [use, res])
+        payload = _stop_payload(tp)
+        payload.pop("session_id")
+        _run_process(monkeypatch, sensor_db, payload)
+        assert _session_ids(sensor_db) == ["snake-only"]
+
+    def test_the_hook_payload_outranks_the_records_snake_case_field(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        """The ordering SHOULD-FIX. ``rec['session_id']`` names the containing
+        transcript on only 26,377/155,023 records (17.0%); the payload names the
+        session whose transcript this IS, so it is right for anything the live
+        file owns. Preferring the record's snake field would downgrade provenance
+        on exactly the payload-drift path the fallback exists for."""
+        use = _tool_use("toolu_prov4")
+        res = _tool_result("toolu_prov4", is_error=True)
+        for rec in (use, res):
+            rec.pop("sessionId")
+            rec["session_id"] = "the-weakest-source"
+        tp = _write_transcript(tmp_path, [use, res])
+        payload = _stop_payload(tp)
+        payload["session_id"] = "owns-this-transcript"
+        _run_process(monkeypatch, sensor_db, payload)
+        assert _session_ids(sensor_db) == ["owns-this-transcript"]
+
+    def test_a_record_with_no_id_at_all_falls_back_to_the_hook_payload(
+        self, tmp_path, monkeypatch, sensor_db
+    ):
+        use = _tool_use("toolu_prov3")
+        res = _tool_result("toolu_prov3", is_error=True)
+        for rec in (use, res):
+            rec.pop("sessionId")
+        tp = _write_transcript(tmp_path, [use, res])
+        payload = _stop_payload(tp)
+        payload["session_id"] = "from-payload"
+        _run_process(monkeypatch, sensor_db, payload)
+        assert _session_ids(sensor_db) == ["from-payload"]
+
+
+# --- Wiring -------------------------------------------------------------------
+
+
+class TestScanEventsAreWired:
+    """`_SCAN_EVENTS` and the settings.json registration must be the SAME SET.
+
+    Accepting SessionEnd while `.claude/settings.json` registered only Stop made
+    the advertised fallback unreachable in production (Codex P2, PR #1616) — the
+    built-but-not-wired shape that #1597 itself was.
+
+    Set EQUALITY, not one-way containment, because the mirror defect is just as
+    silent: an event registered but NOT in `_SCAN_EVENTS` spawns a process on
+    every occurrence that `_process` then drops on the floor. A one-directional
+    version of this test was mutation-checked and let that through, along with an
+    empty `_SCAN_EVENTS` passing vacuously — both are asserted against below.
+    """
+
+    def test_scan_events_and_settings_registration_are_the_same_set(self):
+        settings = json.loads((REPO_ROOT / ".claude" / "settings.json").read_text())
+        module = _load_module()
+        accepted = set(module._SCAN_EVENTS)
+        assert accepted, "_SCAN_EVENTS is empty — this test would pass vacuously"
+        registered = {
+            event
+            for event, groups in settings["hooks"].items()
+            for group in groups
+            for hook in group.get("hooks", [])
+            if "edit_failure_sensor.py" in hook.get("command", "")
+        }
+        assert registered == accepted, (
+            f"_SCAN_EVENTS={sorted(accepted)} but .claude/settings.json registers "
+            f"{sorted(registered)}. Accepted-but-unregistered events never reach the "
+            f"sensor; registered-but-unaccepted events spawn a process that does nothing."
+        )
