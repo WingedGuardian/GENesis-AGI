@@ -260,6 +260,19 @@ at gate time (`security/immunity.py`). Migration 0053 backfilled history
 (no owner heuristics); `scripts/backfill_origin_class_qdrant.py` mirrors the
 payloads idempotently.
 
+**Judgment axes (DARK — written, no reader):** `memory_metadata` carries six
+write-only classification columns stamped at extraction time and consumed by
+nothing yet — `speech_act` + `speech_act_confidence`
+(# GROUNDWORK(mw-5-speech-act-protection)), `assertion_provenance`
+(# GROUNDWORK(mw-4-provenance-weight)), `durability` + `expires_at`
+(# GROUNDWORK(mw-4-durability-ttl)), and `preference_domain`
+(# GROUNDWORK(mw-4-preference-domain) — the domain a preference is scoped to,
+so a later conflicting preference coexists as a different-context truth
+instead of overwriting). Contract + normalizers in `memory/judgment.py`;
+distinct from `origin_class` above, which is a pipeline-trust label. Expiry is
+opt-in (`durability='temporary'` + an elapsed `expires_at` only), so an
+unclassified row never expires.
+
 ## 2. Execution — CC sessions (DirectSession)
 
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
@@ -661,9 +674,24 @@ verified: 5808e7cd 2026-09-03
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
   → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
-  capability-promotion path (`capability_grants.detect_promotable_cells` — no
-  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
-  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  capability-promotion path (`capability_grants.detect_promotable_cells` →
+  `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
+  posterior ≥0.70). That path is scoped by
+  `is_promotable_cell` — two closed sets, an allowlisted (DOMAIN, VERB) pair
+  (`PROMOTABLE_CELLS`, `("email", "send")` only today — keyed on the pair, not
+  the domain, so a future verb under an allowlisted domain cannot inherit
+  eligibility) and a risk class that is not
+  FINANCIAL — enforced in BOTH the candidate scan and `apply_event`, which
+  raises `InvalidTransition` on an `APPROVE` that fails either bar. FINANCIAL
+  is the bar `RiskClass` already claimed ("never trust-unlockable") and nothing
+  enforced: financial cells stayed out of the matrix only because
+  `email_gate.check` holds them before the first CLASSIFY, which is one
+  caller's statement ordering rather than a mechanism. So a future capability's
+  cells stay at ASK or below — classifying and accumulating evidence, still
+  able to be DENIED_PERMANENT, but gating every action on the owner — until
+  someone adds its domain in code. Promotion is the one transition
+  that converts per-action approval into a standing grant; a denylist would hand
+  that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
   active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
@@ -779,7 +807,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: e425b35c 2026-08-21
+verified: 788dd9a9 2026-09-06
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -845,7 +873,53 @@ verified: e425b35c 2026-08-21
   same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
   per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
   config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
-  verify → stage), MEASURED ~5.5 min live.
+  verify → stage), MEASURED ~5.5 min live. **Bite-relay (independent capability on the
+  same daily tick):** its OWN `bite_relay_mode` lever (off/observe/live, ships off),
+  DECOUPLED from the auto-run above — it READS a structured HTTP `data_module`
+  (`pipeline` op, distinct from the SSH reasoning module) and pushes ONE owner Telegram
+  nudge when a company advances into an engaged stage ({in_conversation, interviewing,
+  offer}). Dedup is a PERMANENT per-(company, stage) `career_bite` observation (a
+  point event — `unresolved_only=False`, 365d TTL — unlike the re-emittable
+  `career_outreach_nudged` marker); observe SEEDS the ledger without nudging. Health-
+  gated on the DATA module SEPARATELY: an unhealthy/absent data bridge is a CLEAN SKIP
+  (not a job-health failure — the read service is legitimately down when the search is
+  dormant), while a read the service answered with an error IS a failure. Being a pure
+  read + owner-nudge (no CLI dispatch, no outreach send), it can run `live` while the
+  auto-run stays gated. Hardening: external company names are control-char-sanitized
+  (`strip_control_chars` — collapses newlines / Unicode line+paragraph separators /
+  zero-width+bidi) before the `parse_mode="HTML"` nudge, so a crafted name can't forge
+  or conceal notification lines; a present-but-wrong-type pipeline bucket/entry surfaces
+  as a job-health failure (distinct from a legitimately-absent stage) rather than a
+  silent "no advances"; EVERY malformed entry shape (non-dict, missing/null/blank/
+  whitespace-only id, or an id that is not `str`/`int` — `bool`, `float` and containers
+  are all rejected, since `9` vs `9.0` and a repr-ordered container both re-key the
+  marker) is decided by ONE validation choke point (`_bite_entry_id`), whose
+  normalization is hash-identical to `_bite_hash` so routing
+  through it never changes an existing marker's dedup identity; the
+  deliver-before-`_record_bite` crash-window is closed by a PERMANENT
+  `outreach_history` delivered-`(signal_type, topic)` lookup (`delivered_topic_exists`,
+  unwindowed — the outreach pipeline's own 24h dedup is NOT longer than this job's daily
+  retry interval, so the `REJECTED` branch is belt-and-suspenders, not the recovery), and
+  a recovery consumes no nudge-cap slot since it sends nothing and reports as ONE counted
+  summary line (never one detail per entry — `details` feeds job-health's unbounded
+  `last_error`); the per-tick scan ceiling
+  is a ROTATING window (contiguous windows, one whole ceiling per tick-DAY, no persistent
+  cursor) so an oversized response bounds work without permanently excluding the tail —
+  full coverage in `ceil(len/ceiling)` CONSECUTIVE tick-days, with a missed tick or the
+  live nudge cap deferring entries to a later cycle rather than dropping them; and the
+  auto-run no-progress warning excludes bite activity, since the two
+  sub-capabilities are independent. That independence is ENFORCED in `gather`: each
+  branch is awaited under its own guard, so a raise in one becomes that branch's
+  `errors=1` result and the other still runs — and because that also removes the raise
+  from the runner's own `except`, the exception rides out on `CareerOutreachResult.raised`
+  so the runner still emits the ERROR-severity `career_outreach_monitor.failed` event with
+  its traceback (an isolated crash must not go quiet in the ERROR stream). Misconfig fails LOUD, not
+  silent: an invalid `bite_relay_mode` fails **closed to `off`** (its `observe` seeds
+  permanent markers, so degrading to `observe` like the auto-run would silently suppress
+  the backlog); an ENABLED lever whose `data_module` is unset/unresolvable records a
+  job-health **failure** (not a green no-op); and pause is rechecked **before** the
+  pipeline read AND again after the data-module health probe (itself an awaited external
+  call), not only between nudges.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.
@@ -1071,7 +1145,8 @@ verified: 84c7259d 2026-08-31
 - **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
   by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
   container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
-  `status_writer_loop`) and RESTARTS the bridge/runtime on status-file staleness, or a
+  `status_writer_loop`) and RESTARTS its auto-detected target — genesis-server on any
+  install where that unit file exists, NOT the deprecated relay — on status-file staleness, or a
   specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
   `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
   case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
@@ -1145,7 +1220,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 29a382e7 2026-09-03
+verified: 9730efe9 2026-09-05
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1346,7 +1421,16 @@ verified: 29a382e7 2026-09-03
   Genesis checkouts (foreign filings counted, never alerted); alerts at
   `critical` — the fast Telegram path, deliberately, because this class went
   unnoticed for a month. Settings lever + env kill switch as usual; disabling
-  RESOLVES the open alert rather than orphaning it.
+  RESOLVES the open alert rather than orphaning it. **Cross-store coupling (do
+  not touch blind):** the watcher's blind-scan guard uses a NON-EMPTY
+  `~/.genesis/sessions/` as its proof that CC has ever run here — without it, a
+  moved CC data root reads as a clean all-clear instead of blindness. That
+  directory is pruned at 60 days by `scripts/disk_hygiene.sh` (step 8b), so the
+  60-day floor is load-bearing for THIS check too: lower it toward a live
+  session's age and the guard silently disarms. The two do not collide today (60d
+  is far past any live session), but the coupling lives only in the script's own
+  comment — recorded here because it is exactly the do-not-touch edge the map is
+  for.
 - **Open-PR resurfacing** (LIVE): a SessionStart surface lists open PRs left
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
@@ -1401,22 +1485,63 @@ verified: 29a382e7 2026-09-03
   prompt, fail-closed parse, verbatim-quote verification), matches against
   the live ledger (exact hash + SequenceMatcher ≥0.85 — the precision
   signal) and prior shadow events (`duplicate_of`), and records rows to
-  `session_ledger_shadow_runs`/`_events` (migration 0059) — **the live
-  `session_ledger` is NEVER written until the data-gated flip PR**. Shared
-  subprocess core with the arbiter: `session_awareness/headless.py`;
+  `session_ledger_shadow_runs`/`_events` (migration 0059). **The live write
+  path is BUILT and SHIPPED OFF: the shipped config is `mode: shadow`, so
+  the live `session_ledger` is never written until an operator flips it.**
+  Shared subprocess core with the arbiter: `session_awareness/headless.py`;
   canonical typed-prompt filter `session_awareness/transcript.py` (the
   PreCompact hook keeps a parity-tested stdlib duplicate; honors
   `promptSource` typed/queued, excludes bare slash-commands + markers).
-  Levers: settings domain `session_ledger_shadow` (off|shadow; `live`
-  reserved, coerced+warn) read at worker startup;
-  `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level kill. Per-session flock;
-  `--backfill` replays historical transcripts in typed-turn windows
-  (`trigger='backfill'`, cursor untouched). Measurement:
-  `scripts/ledger_shadow_report.py` (recomputed precision, FP adjudication,
-  FN windowing, leak invariant); retention 45d via
-  `scripts/prune_ledger_shadow.py` (disk-hygiene step 8). Telemetry:
-  `call_site_last_run` row `ambient_ledger_extractor` (deliberately not a
-  critical site).
+  In `live`, qualifying proposals promote into the real ledger stamped
+  `added_by='ambient_ledger_extractor'` (migration 0090 widens the CHECK;
+  distinct from `ambient`, which any dispatched CC session already uses, so
+  the leak invariant can still tell them apart). Promotion is a SWEEP over
+  the shadow store, not over one run's in-memory events — the shadow row is
+  the retry state, so a failed live write costs only time and the cursor is
+  never coupled to promotion outcome (`promoted_item_id` marks a completed
+  one). **Idempotency is the novelty recheck inside a `BEGIN IMMEDIATE`
+  transaction and only that** — a foreground `session_ledger_add` landing
+  mid-flight is detected and the proposal disqualified rather than
+  duplicated; every SQL clause in the sweep is an efficiency filter, not a
+  safety property (mutation-verified), which is why `duplicate_of` is
+  deliberately NOT among them: it suppressed re-proposals whose chain root
+  was ineligible, permanently and silently. The sweep is scoped to
+  `mode='live'` (the flip is not retroactive — proposals gathered under the
+  shadow promise are never drained on it) and to the CURRENT
+  `prompt_version` (a bump never ships the old generation's backlog). The
+  gate is re-read immediately before the write, so a mid-run rollback to
+  `shadow` takes effect. INTERIM cap of 5 rows/run, logged when it bites;
+  qualifying / promoted / disqualified / failed counts all reach the run's
+  telemetry line, so a sweep that failed on every row is distinguishable
+  from one that found nothing. The sweep also runs on live-mode EMPTY-DELTA
+  invocations (a quiet session must not strand a failed promotion), asks the
+  duplicate GROUP's own promotion state before writing — observed-before-
+  closure disqualifies, observed-after is a renewal and promotes — and
+  requires the event-link UPDATE to touch exactly one row, rolling the whole
+  promotion back if the candidate was pruned mid-sweep.
+  Levers: settings domain `session_ledger_shadow` (off|shadow|live) read
+  live per call — **`live` requires BOTH `mode: live` and
+  `live_opt_in: true`**, a renewed opt-in that legacy overlays (which could
+  persist `live` while it was reserved) cannot satisfy; a non-boolean
+  `enabled` reads as off, and every other malformed value degrades to
+  shadow, never to live. `GENESIS_LEDGER_SHADOW_DISABLED=1` hook-level
+  kill. Per-session flock; `--backfill` replays historical transcripts in
+  typed-turn windows (`trigger='backfill'`, cursor untouched, never
+  promotes). Measurement: `scripts/ledger_shadow_report.py` (recomputed
+  precision, FP adjudication, FN windowing, leak invariant) — note its
+  automated precision CANNOT gate the flip: promotion requires
+  `match_kind='none'` and the report classifies exactly that set as its
+  false positives, so the metric measures the complement of what would
+  ship. The flip gate is hand adjudication of what would have been written
+  (v1: 17/40 wanted = 43%, 2026-08-29 — the reason prompt v2 exists).
+  Retention 45d via `scripts/prune_ledger_shadow.py` (disk-hygiene step 8) —
+  EXCEPT promoted events + their runs, which are the leak invariant's
+  attribution record and survive retention unbounded (owner decision
+  2026-09-05; bounded in practice by live-mode-only promotion at
+  PROMOTION_CAP per compaction). Promotion inserts the ledger row and stamps
+  the claiming event in ONE transaction, so a crash leaves both or neither.
+  Telemetry: `call_site_last_run` row `ambient_ledger_extractor`
+  (deliberately not a critical site).
 - **Repo-pulse annotator** (session-manager stage 4) — **LIVE (exact tier)**.
   At SessionStart boundaries (startup/resume/compact, never clear; foreground
   only) `genesis_session_context.py` fire-and-forgets
@@ -1458,6 +1583,35 @@ verified: 29a382e7 2026-09-03
   propose_only). Retention 45d via `scripts/prune_repo_pulse.py`
   (disk-hygiene). Telemetry: `call_site_last_run` row `repo_pulse` (not a
   critical site — failed runs self-heal by re-covering their window).
+- **Undisposed-ledger escalation (2026-09-06)**: repo-pulse above CLOSES a
+  ledger row whose work landed in a cited PR; this is the other half — the row
+  whose work never landed and whose session died. A `session_ledger` row is
+  rendered by its OWN session's injection and by nothing else, so a dead
+  session's open rows become unreachable by every process and person.
+  `session_awareness/ledger_escalation.py` (learning scheduler, hourly at :17 —
+  it MUTATES, so not the read-and-alert awareness band) escalates a row
+  untouched ≥ `stale_days` whose owning session has been quiet ≥ `quiet_days`
+  (`~/.genesis/sessions/<sid>/last_prompt_time`, content preferred over mtime so
+  a backup restore cannot make every dead session look live) into a
+  `user_input_needed` follow-up. BOTH thresholds are load-bearing: a stale row
+  in a LIVE session is that session's to dispose. Reverse sync completes the
+  follow-up once the row reaches a terminal status. The link is the follow-up's
+  `dedup_key` (`session_awareness/ledger_escalation_link.py`, whose formula the
+  two import-free hooks inline under a parity test) — this sweep is the WRITER
+  its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
+  `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
+  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  cannot ask the owner to dispose of something nobody committed to.
+  **Trap: it must never write `session_ledger`** — an evidence write would bump
+  `updated_at` and read as a disposition the owner never made, i.e. the sweep
+  answering its own question. **Do not touch blind: `ledger_escalation` is
+  deliberately ABSENT from the morning report.** Follow-up content reproduces
+  ledger row text verbatim, and real rows on a live install have carried
+  plaintext credentials a session pasted in; the morning report renders
+  `content[:200]` into Telegram. Wiring this source to any egress surface needs
+  a redaction pass first. Follow-ups ship `domain=None` (unclassified) because
+  the sweep cannot tell a dropped user errand from a stale internal dev item —
+  both shapes are really in the ledger.
 
 ## 10. Learning & evaluation
 
@@ -1655,21 +1809,45 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: b8232425 2026-09-02
+verified: ee9ebf85c 2026-09-05
 ```
 
-- **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
+- **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
-  capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
-  failure; state persisted cross-process to
+  capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
+  NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
   a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
   HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
   opened by a real call failure (`_opened_by_call`) is closed only by a real
   `record_success`. A models-listing 200 evidences *reachable*, never *working* —
   it is what a 403-on-use, an exhausted quota or a truncated completion looks
-  like from outside. The probe heal deliberately does NOT fire `on_recovery`
+  like from outside. The 403-on-use half of that is now classified in its own
+  right: `NOT_ENTITLED` (`retry.py` `_ENTITLEMENT_MARKERS`, checked BEFORE
+  `_QUOTA_KEYWORDS` because an entitlement message names the plan/tier/
+  subscription it lacks, and two of those words are themselves quota keywords). It takes
+  one behaviour from each neighbour — fail-fast like PERMANENT, so a dead
+  provider cannot spend the chain's aggregate `max_total_s` before the walk
+  reaches a working one; the 4h cap like QUOTA_EXHAUSTED, since an entitlement
+  does not change in 30 minutes. Either neighbour alone gives up the other half.
+  The same review pass closed the CLASS: QUOTA_EXHAUSTED now fails fast too. The
+  old split was inverted — RATE_LIMITED, the one 4xx that genuinely might clear
+  inside a backoff, already failed fast, while a spent allowance (a billing
+  state, and usually account-global: one OpenRouter key limit covers every
+  openrouter entry in a chain at once) was retried. MEASURED 2026-09-05 before the fix:
+  ~11.9s avg per entitlement exposure (n=15), 4.1-6.8s per quota exposure
+  (n=22), against a 180-600s aggregate `max_total_s`. The two categories are
+  distinct in the ROUTER; the operator-facing surfaces have NOT caught up.
+  Three of them still branch on the literal `quota_exhausted`, so a
+  NOT_ENTITLED breaker falls through to the generic outage arm and an
+  entitlement gap is reported as a provider being down — the exact
+  misreading this classification exists to end, moved from the router to
+  the alert layer: `observability/snapshots/api_keys.py` renders "down
+  (circuit breaker open)", the dashboard overview renders "API down",
+  and `routing/escalation.py` raises `provider_failure` with no category
+  filter at all. A deliberate scope boundary, not an oversight.
+  The probe heal deliberately does NOT fire `on_recovery`
   (which resolves the `provider_failure` observation and clears `first_trip_at`),
   so a listing can no longer erase an outage clock. This does not hold a provider
   out of rotation: OPEN auto-transitions to HALF_OPEN on backoff, HALF_OPEN is
@@ -1716,6 +1894,30 @@ verified: b8232425 2026-09-02
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **Exhaustion is now readable.** `attempts` alone never was: a provider skipped
+  for an open breaker, a missing API key or an exceeded budget costs no attempt,
+  so "attempts: 2" on a seven-provider chain is indistinguishable from a
+  two-provider chain fully tried. The `all_exhausted` event carries
+  `failed_providers` and `chain_size` alongside `attempts`; the log MESSAGE
+  additionally keeps called-and-failed providers (`failed:`) apart from
+  never-called ones (`skipped:` with the reason), while the payload's
+  `failed_providers` keeps the combined meaning its consumers predate. The exhaustion
+  `RoutingResult` returns `failed_providers` — which the SUCCESS path had always
+  returned while the failure path accumulated the same list and dropped it.
+  `chain_size` is the WALKABLE chain (post-`_filter_chain`), not the one written
+  in `model_routing.yaml`: a `never_pays` site never walks its paid entries, so
+  counting them would make every such exhaustion look like it stopped early. The
+  two genuinely differ — MEASURED 2026-09-03, three of this install's nine
+  `never_pays` sites (`4_light_reflection`, `12_surplus_brainstorm`,
+  `45_intelligence_intake`) drop one provider apiece since Mistral Large moved
+  off the free tier. One
+  exit stays deliberately silent and the chain size is what exposes it: the
+  aggregate-deadline `break` abandons the walk without recording anything, so a
+  short `failed_providers` against a longer `chain_size` reads as "walked 3 of 7",
+  not as "the chain was 3 long". NOTE the payload is deliberately NOT wired into
+  `recent_provider_fallback_counts`, whose SQL filters `event_type =
+  'provider.fallback'`; widening that filter would silently change what an
+  existing metric counts.
 - **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
   observation at 5 trips (~10 min), carrying `first_trip_at` — the only
   per-provider "failing since" timestamp. Once the outage passes
@@ -1762,7 +1964,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 9730efe90 2026-09-05
+verified: f24c15e9 2026-09-05
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1797,8 +1999,9 @@ verified: 9730efe90 2026-09-05
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` run ONCE at startup before any
+  schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
+  that drifts every table-adding PR — re-measure, do not trust) plus versioned
+  `migrations/` run ONCE at startup before any
   other init step touches data; a failed migration ABORTS bootstrap. Ids are
   92 FROZEN legacy 4-digit ones (`0001`..`0093`, with a GAP at `0092` from a
   rename) plus new `YYYYMMDDHHMMSS_*.py` UTC timestamps — nobody allocates an
