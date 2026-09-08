@@ -245,7 +245,7 @@ TABLES = {
             topic               TEXT NOT NULL,
             category            TEXT NOT NULL CHECK (category IN (
                 'blocker', 'alert', 'finding', 'insight', 'opportunity',
-                'digest', 'surplus', 'approval', 'content', 'notification'
+                'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
             )),
             salience_score      REAL NOT NULL,
             channel             TEXT NOT NULL,
@@ -1255,12 +1255,15 @@ TABLES = {
             -- All NULLable with NO default: expiry is strictly opt-in
             -- (durability='temporary' + an elapsed expires_at only), so an
             -- unclassified row NEVER expires. Contract in memory/judgment.py;
-            -- added to existing DBs by migration 0079.
+            -- added to existing DBs by migration 0081 (renumbered from 0079);
+            -- preference_domain by 20260906042425 (# GROUNDWORK(mw-4-preference-domain):
+            -- domain a preference is scoped to, open vocab, write-only).
             speech_act            TEXT,
             speech_act_confidence REAL,
             assertion_provenance  TEXT,
             durability            TEXT,
-            expires_at            TEXT
+            expires_at            TEXT,
+            preference_domain     TEXT
         )
     """,
     "graduation_events": """
@@ -1923,8 +1926,10 @@ TABLES = {
                         CHECK(status IN ('open','in_progress','done','absorbed','dropped')),
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
-                        CHECK(added_by IN ('foreground','ambient','pulse')),
+                        CHECK(added_by IN ('foreground','ambient','pulse',
+                                           'ambient_ledger_extractor')),
             evidence    TEXT,
+            source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,
             updated_at  TEXT
         )
@@ -1967,7 +1972,8 @@ TABLES = {
             matched_item_id TEXT,
             match_score     REAL,
             duplicate_of    TEXT,
-            mode            TEXT NOT NULL DEFAULT 'shadow'
+            mode            TEXT NOT NULL DEFAULT 'shadow',
+            promoted_item_id TEXT  -- session_ledger row this proposal became (live mode); NULL = unpromoted, retryable
         )
     """,
     # ── Repo-pulse annotator (session-manager PR-4a) ─────────────────────
