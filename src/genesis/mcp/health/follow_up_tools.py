@@ -150,13 +150,20 @@ async def _impl_follow_up_create(
             from genesis.db.crud import session_charters as _charters
 
             resolved = await _charters.resolve_session_id(db, source_session)
-            if len(resolved) >= 32:
+            # SHAPE, not length. `resolve_session_id` returns the input
+            # unchanged when it cannot resolve, so a >= 32-char value reaching
+            # here has never been checked against anything — a mistyped UUID or
+            # a 32-char fragment used to pass a length test and be written as
+            # provenance (Codex P2, PR #1622). A valid-shaped id that no store
+            # knows yet is still accepted: this asks what the value IS, not
+            # whether it has been seen.
+            if _charters.is_full_session_id(resolved):
                 source_session = resolved
             else:
                 source_session_note = (
                     f"source_session '{source_session}' did not resolve to a "
                     "unique full session id — stored NULL rather than a "
-                    "truncated id"
+                    "truncated or malformed id"
                 )
                 source_session = None
 

@@ -85,6 +85,17 @@ async def create(
         ContextVar to the CC transcript id, NOT ``cc_sessions.id`` (today's
         setters store the internal row id, an indistinguishable-but-wrong
         namespace for this column).
+
+    THIS FUNCTION DOES NOT VALIDATE THE ID'S SHAPE, BY CHOICE. The shape check
+    (``session_charters.is_full_session_id``) lives at the MCP tool boundary,
+    because that is the only place the value is TYPED by a model rather than
+    passed through from a store that already holds a full id — the inbox
+    evaluator, the task executor and the ledger escalator each forward an id
+    they read, and re-validating a value we ourselves stored would buy nothing.
+    The column is therefore NOT guaranteed canonical: it already carries four
+    16-hex ``ego_cycle`` rows (2026-05) that match no session in any store,
+    written before any of this existed. A new DIRECT caller that accepts a
+    model- or user-supplied id must apply the predicate itself.
     NOTHING guesses: a wrong id is worse than none — measured 513/513 NULL
     before this existed, while repo_pulse_worker read the column on every row
     it ever annotated.

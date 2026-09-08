@@ -28,6 +28,46 @@ import aiosqlite
 # construction rather than by an escape rule someone has to remember to apply.
 _SESSION_PREFIX_RE = re.compile(r"[0-9a-fA-F-]+")
 
+# The COMPLETE shape of a CC session id: a canonical UUID, 8-4-4-4-12 hex.
+#
+# Length was the old test at every write boundary (`len(sid) >= 32`), and length
+# is not a shape. A 36-character UUID with one non-hex typo, and a 32-character
+# fragment of something else, are both "long enough" — and both were accepted
+# and written as durable provenance, which the documented contract says should
+# have been NULL (Codex P2, PR #1622). Refusing an id that is not an id is a
+# validity judgement, not a size cap: the value is not truncated to fit, it is
+# declined, and the caller records the honest absence instead.
+#
+# MEASURED 2026-09-08 on a live install: 1,939 of 1,939 distinct ids across
+# session_charters (52), cc_sessions (1,883) and session_heartbeats (4) match
+# this pattern — so nothing real is refused by it.
+#
+# LOWERCASE ONLY, deliberately. An earlier draft accepted either case, on the
+# reasoning that the length check it replaces did — but that is the wrong test,
+# because nothing downstream is case-insensitive: `resolve_session_id` only
+# strips, `upsert_stub` stores the string verbatim, and SQLite `=` on TEXT is
+# case-sensitive. An uppercase id would therefore PASS the guard and create a
+# stub under a key the hook's lowercase id can never match — the exact orphan
+# the guard exists to prevent, admitted by the leniency meant to be safe.
+# Measured across all four id columns: 0 uppercase values, so refusing them
+# regresses nothing and closes a way in.
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def is_full_session_id(value: str) -> bool:
+    """True when `value` is a COMPLETE CC session id, not a prefix or a typo.
+
+    The single test every WRITE boundary should use before storing a session id
+    as durable provenance. `resolve_session_id` cannot make this call itself:
+    its contract is to return the input unchanged when it cannot resolve, so
+    "unresolved prefix" and "malformed full-length value" leave it looking
+    identical by design. Deciding which of those a caller will accept is the
+    caller's job — this is the shared predicate for making that decision the
+    same way twice.
+    """
+    return bool(_SESSION_ID_RE.fullmatch((value or "").strip()))
+
+
 VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "dropped"})
 VALID_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
 
@@ -171,13 +211,20 @@ async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
         return sid
     if not _SESSION_PREFIX_RE.fullmatch(sid):
         return sid
+    # Bound POSITIONALLY, once per branch, not as a repeated `?1`. sqlite3
+    # accepts a numbered placeholder with a sequence today but warns that it is
+    # a NAMED parameter supplied with qmark-style binding, and raises
+    # ProgrammingError from Python 3.14 — so the one-value spelling would have
+    # turned this resolver into a hard failure at an interpreter bump, silently
+    # until then. Same value, three slots.
+    pattern = sid + "%"
     cursor = await db.execute(
-        "SELECT session_id AS sid FROM session_charters WHERE session_id LIKE ?1"
-        " UNION SELECT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ?1"
+        "SELECT session_id AS sid FROM session_charters WHERE session_id LIKE ?"
+        " UNION SELECT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ?"
         " UNION SELECT cc_session_id FROM session_heartbeats"
-        " WHERE cc_session_id LIKE ?1"
+        " WHERE cc_session_id LIKE ?"
         " LIMIT 2",
-        (sid + "%",),
+        (pattern, pattern, pattern),
     )
     rows = await cursor.fetchall()
     if len(rows) == 1:

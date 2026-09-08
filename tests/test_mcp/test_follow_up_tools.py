@@ -804,3 +804,31 @@ async def test_a_full_session_id_passes_through_unresolved(db):
     row = await follow_ups.get_by_id(db, res["id"])
     assert row["source_session"] == full
 
+
+async def test_a_long_but_malformed_id_is_stored_as_NULL(db):
+    """The gate is the id's SHAPE, not its length.
+
+    `resolve_session_id` returns a >= 32-char input unchanged — it never
+    consulted a store — so a length-only acceptance check meant a mistyped UUID
+    or a 32-char fragment of something else became durable provenance the
+    documented contract promised would be NULL (Codex P2, PR #1622). Each value
+    below is long enough to pass the old test.
+    """
+    for bad in (
+        "abcdef12-3456-7890-abcd-ef123456789g",  # one non-hex character
+        "abcdef1234567890abcdef1234567890",  # 32 chars, no hyphens
+        "not-a-session-id-but-definitely-long-enough",
+    ):
+        with patch.object(follow_up_tools, "_get_db", return_value=db):
+            res = await follow_up_tools._impl_follow_up_create(
+                content=f"work claiming provenance {bad}",
+                reason="provenance",
+                strategy="ego_judgment",
+                work_state="ready",
+                source_session=bad,
+            )
+        assert res["source_session"] is None, (bad, res)
+        assert "did not resolve" in res["message"], (bad, res["message"])
+        row = await follow_ups.get_by_id(db, res["id"])
+        assert row["source_session"] is None, bad
+

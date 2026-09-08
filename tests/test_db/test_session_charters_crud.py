@@ -237,6 +237,71 @@ async def test_a_unique_prefix_still_resolves_from_each_store_alone(db):
     assert await crud.resolve_session_id(db, beat[:8]) == beat
 
 
+async def test_the_union_binds_one_value_per_placeholder(db, recwarn):
+    """REGRESSION. The union was first written with a repeated `?1`, bound with
+    a one-element sequence. sqlite3 accepts that today while warning that a
+    NAMED placeholder was supplied qmark-style, and RAISES ProgrammingError from
+    Python 3.14 — so the resolver would have died at an interpreter bump, having
+    passed every behavioural test until then. Nothing else in the suite looks at
+    warnings, so without this the next spelling regresses in silence.
+    """
+    sid = "5555000d-1111-2222-3333-444455556666"
+    await _seed_heartbeat(db, sid)
+    assert await crud.resolve_session_id(db, sid[:8]) == sid
+    assert not [w for w in recwarn if "named parameter" in str(w.message)], [
+        str(w.message) for w in recwarn
+    ]
+
+
+# ─── is_full_session_id: shape, not length (PR #1622) ─────────────────────────
+
+
+def test_a_complete_uuid_is_a_full_session_id():
+    assert crud.is_full_session_id("abcd1234-ffff-0000-1111-222233334444")
+    assert crud.is_full_session_id("  abcd1234-ffff-0000-1111-222233334444  ")
+
+
+def test_an_UPPERCASE_id_is_refused_because_nothing_downstream_folds_case():
+    """Leniency here would ADMIT the orphan the guard exists to prevent.
+
+    `resolve_session_id` only strips, `upsert_stub` stores verbatim, and SQLite
+    `=` on TEXT is case-sensitive — so an accepted uppercase id creates a stub
+    under a key the PreCompact hook's lowercase id will never match. Measured
+    across all four id columns on a live install: 0 uppercase values, so this
+    refuses nothing real.
+    """
+    assert not crud.is_full_session_id("ABCD1234-FFFF-0000-1111-222233334444")
+    assert not crud.is_full_session_id("abcd1234-FFFF-0000-1111-222233334444")
+
+
+def test_a_long_but_malformed_value_is_NOT_a_full_session_id():
+    """THE finding. Every one of these is >= 32 characters, so the length test
+    it replaces accepted all of them and wrote them as durable provenance —
+    while the documented contract says a non-session id becomes NULL.
+
+    Note what is NOT happening here: none of these is truncated to fit. An id
+    that is not an id is refused whole, and the caller records the honest
+    absence — cutting an identifier used as a KEY would merge two identities,
+    which is strictly worse than storing nothing.
+    """
+    for bad in (
+        "abcd1234-ffff-0000-1111-22223333444g",  # one non-hex character
+        "abcd1234ffff00001111222233334444",  # 32 chars, no hyphens
+        "abcd1234-ffff-0000-1111-222233334444-extra",  # trailing junk
+        "abcd1234-ffff-0000-1111-2222333344",  # 34 chars, short final group
+        "x" * 40,
+        "",
+        "   ",
+    ):
+        assert not crud.is_full_session_id(bad), bad
+
+
+def test_a_short_prefix_is_NOT_a_full_session_id():
+    """CONTROL. Without it a predicate that simply returned True would pass
+    every positive case above."""
+    assert not crud.is_full_session_id("abcd1234")
+
+
 # ─── Ledger lifecycle ─────────────────────────────────────────────────────────
 
 

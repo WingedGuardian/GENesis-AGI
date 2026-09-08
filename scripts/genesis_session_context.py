@@ -396,13 +396,19 @@ def main() -> None:
         if _hook_session_id:
             if not first:
                 _emit("\n\n---\n\n")
+            # The argument NAME differs per tool and the difference is not
+            # cosmetic: `session_ledger_add`'s parameter is `session_id`, and an
+            # invocation using `source_session` is rejected before the handler
+            # runs — so instructing one name for both would lose the ledger row
+            # entirely, which is worse than the NULL this block exists to fix
+            # (Codex P2, PR #1622). Spell each call out.
             _emit(
                 "## This Session\n\n"
                 f"- **CC session id**: `{_hook_session_id}`\n\n"
-                "Pass it as `source_session` when a tool asks which session work "
-                "came from (`follow_up_create`, `session_ledger_add`). Without it "
-                "the row records no origin, and nothing downstream can attribute "
-                "the work back here.\n"
+                "Pass it when a tool asks which session work came from — the "
+                "argument is named per tool: `follow_up_create(source_session=…)`, "
+                "`session_ledger_add(session_id=…)`. Without it the row records no "
+                "origin, and nothing downstream can attribute the work back here.\n"
             )
             first = False
 
