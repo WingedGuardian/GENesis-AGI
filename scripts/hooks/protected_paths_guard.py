@@ -208,7 +208,16 @@ def main() -> int:
     # no observed behaviour change.
     if untokenizable(cmd):
         reason = _legacy_substring_block(cmd, dirs)
-        return _block(reason) if reason else 0
+        if reason:
+            return _block(reason)
+        # FALL THROUGH rather than returning 0. This branch used to end here, on
+        # the assumption that the substring check is a superset of the parsed one
+        # below. It is not, and stopped being so the moment brace expansion was
+        # added to the parsed path only: an expanded operand is caught below and
+        # is invisible to a substring scan, so a command that merely TRIPPED the
+        # probe skipped the very check that would have blocked it. Running both
+        # is strictly fail-closed — the probe firing can now only ever add a
+        # reason to block, never remove one.
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in analyze(cmd):
