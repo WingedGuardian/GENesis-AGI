@@ -19,6 +19,10 @@ from genesis.autonomy.watchdog import (
     reclaim_page_cache,
 )
 
+# Captured at import time, BEFORE the autouse fixture stubs the class attribute,
+# so TestServiceUptimeProbe can drive the real body.
+_REAL_SERVICE_UPTIME_S = WatchdogChecker._service_uptime_s
+
 
 @pytest.fixture(autouse=True)
 def _mock_bridge_active():
@@ -39,6 +43,16 @@ def _no_deploy_in_progress():
     """
     with patch("genesis.autonomy.watchdog.update_in_progress", return_value=False):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_service_uptime(monkeypatch):
+    """Default the bootstrap-grace probe to 'unknown' so tests are insulated
+    from the REAL target unit's uptime on a dev box running genesis-server
+    (same pattern as _is_bridge_active above). None falls through to the
+    pre-grace restart path; the grace tests patch their own readings.
+    """
+    monkeypatch.setattr(WatchdogChecker, "_service_uptime_s", lambda self: None)
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +178,127 @@ class TestDeployInProgress:
         # guard adds zero behavior change outside a deploy window.
         checker = _make_checker(tmp_path, stale_status)
         assert checker.check() is WatchdogAction.RESTART
+
+
+class TestStaleBootstrapGrace:
+    """A status file stale from BEFORE the service started is not evidence about
+    THIS process (2026-09-08 incident: post-outage boot left a 22,583s-stale
+    status.json; the watchdog fired 49s into a ~2min bootstrap and SIGKILLed a
+    healthy server — once per boot, twice that day). Service start is treated as
+    the freshness epoch: while the unit's own uptime is below the staleness
+    threshold, the file cannot yet be expected fresh → SKIP. A genuinely wedged
+    server still restarts once its uptime exceeds the threshold, so the grace
+    cannot livelock; a failed probe suppresses nothing (pre-existing behavior).
+    """
+
+    def test_young_service_grace_skips_restart(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # The incident shape: stale file, service 49s old (< 300s threshold).
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            assert checker.check() is WatchdogAction.SKIP
+
+    def test_grace_does_not_trip_failure_counter(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # SKIP returns BEFORE _restart_if_allowed, so backoff/flap counters
+        # never burn during bootstrap (same contract as the deploy guard).
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps({
+            "consecutive_failures": 2, "next_attempt_after": None, "last_reason": "x",
+        }))
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            checker.check()
+        state = json.loads(state_file.read_text())
+        assert state["consecutive_failures"] == 2
+
+    def test_old_service_still_restarts(self, tmp_path: Path, stale_status: Path):
+        # Control (anti-livelock): a service up longer than the threshold with a
+        # still-stale file is genuinely wedged — grace must not suppress that.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=301.0):
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_unknown_uptime_falls_through_to_restart(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # Probe failure (unit absent, no systemd) preserves pre-grace behavior:
+        # suppression requires a POSITIVE young reading.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=None):
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_grace_is_bounded_by_skip_counter(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # ActiveEnter resets on every activation, so a crash-loop that stays
+        # `active` at tick time presents a young uptime FOREVER. The explicit
+        # counter is what keeps that from renewing the grace indefinitely:
+        # max skips, then normal stale-restart handling resumes.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            for _ in range(4):  # default max_bootstrap_grace_skips
+                assert checker.check() is WatchdogAction.SKIP
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_grace_counter_clears_on_fresh_status(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # A genuinely fresh status file (bootstrap finished) resets the whole
+        # state including the grace counter, so the NEXT outage gets a full
+        # grace budget rather than inheriting spent skips.
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps({"bootstrap_grace_skips": 3}))
+        stale_status.write_text(json.dumps({
+            "timestamp": datetime.now(UTC).isoformat(),
+            "resilience_state": {"cloud": "NORMAL"},
+            "human_summary": "All systems normal.",
+        }))
+        assert checker.check() is WatchdogAction.SKIP  # healthy
+        state = json.loads(state_file.read_text())
+        assert state.get("bootstrap_grace_skips", 0) == 0
+
+
+class TestServiceUptimeProbe:
+    """Drive the REAL _service_uptime_s body (the autouse fixture stubs it for
+    every other test, so nothing else executes the subprocess triage). Note the
+    subtlety pinned here: `systemctl show <nonexistent> --value` exits 0 with
+    output "0" (measured), so the `int(raw) == 0` clause — not the returncode
+    check — is the guard that actually rejects a never-activated unit.
+    """
+
+    def _real_uptime(self, checker: WatchdogChecker) -> float | None:
+        return _REAL_SERVICE_UPTIME_S(checker)
+
+    def test_parses_monotonic_active_enter(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status)
+        started = time.clock_gettime(time.CLOCK_MONOTONIC) - 42.0
+        fake = MagicMock(returncode=0, stdout=f"{int(started * 1e6)}\n")
+        with patch("genesis.autonomy.watchdog.subprocess.run", return_value=fake):
+            uptime = self._real_uptime(checker)
+        assert uptime is not None and 41.0 < uptime < 43.0
+
+    @pytest.mark.parametrize(
+        "stdout", ["0\n", "", "  \n", "not-a-number", "[not set]", "-5", "²"],
+    )
+    def test_unparsable_or_never_activated_is_none(
+        self, tmp_path: Path, stale_status: Path, stdout: str
+    ):
+        checker = _make_checker(tmp_path, stale_status)
+        fake = MagicMock(returncode=0, stdout=stdout)
+        with patch("genesis.autonomy.watchdog.subprocess.run", return_value=fake):
+            assert self._real_uptime(checker) is None
+
+    def test_subprocess_failure_is_none(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status)
+        with patch(
+            "genesis.autonomy.watchdog.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("systemctl", 5),
+        ):
+            assert self._real_uptime(checker) is None
 
 
 class TestFlapDamping:

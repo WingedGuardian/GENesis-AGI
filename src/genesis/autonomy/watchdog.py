@@ -90,6 +90,7 @@ class WatchdogChecker:
         liveness_lag_suppress_ms: float = 1000.0,
         liveness_sample_stale_s: float = 120.0,
         liveness_max_starved_skips: int = 6,
+        max_bootstrap_grace_skips: int = 4,
         remediation_registry: RemediationRegistry | None = None,
         outreach_fn: OutreachFn | None = None,
     ) -> None:
@@ -111,6 +112,7 @@ class WatchdogChecker:
         self._liveness_lag_suppress_ms = liveness_lag_suppress_ms
         self._liveness_sample_stale_s = liveness_sample_stale_s
         self._liveness_max_starved_skips = liveness_max_starved_skips
+        self._max_bootstrap_grace_skips = max_bootstrap_grace_skips
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
         self._target_service = self._detect_target_service()
@@ -161,6 +163,7 @@ class WatchdogChecker:
                 liveness_lag_suppress_ms=wd.get("liveness_lag_suppress_ms", 1000.0),
                 liveness_sample_stale_s=wd.get("liveness_sample_stale_s", 120.0),
                 liveness_max_starved_skips=wd.get("liveness_max_starved_skips", 6),
+                max_bootstrap_grace_skips=wd.get("max_bootstrap_grace_skips", 4),
             )
         except (yaml.YAMLError, OSError, AttributeError):
             logger.warning("Failed to load watchdog config — using defaults", exc_info=True)
@@ -253,14 +256,81 @@ class WatchdogChecker:
             self._reset_state()
             return WatchdogAction.SKIP  # Healthy — no action needed
 
+        # 3. Bootstrap grace: a file stale from BEFORE the service started says
+        # nothing about THIS process — after an outage the status.json predates
+        # the boot, so raw staleness is guaranteed huge while the server is
+        # still mid-bootstrap (2026-09-08: 22,583s-stale file, server 49s into
+        # a ~2min bootstrap, SIGKILLed on both boots that day). Service start
+        # is the freshness epoch: until the unit's own uptime exceeds the
+        # staleness threshold, the file cannot yet be expected fresh. A wedged
+        # (still-active) server restarts once its uptime crosses the threshold.
+        # A RESTARTING server is the hole: ActiveEnter resets on every
+        # activation, so a crash-loop that stays `active` at tick time would
+        # renew the grace forever — which is why the grace is bounded by an
+        # explicit skip counter (like every other suppression in this file),
+        # not by uptime alone. The counter clears with the rest of the state
+        # when a genuinely fresh status file appears (_reset_state), so a
+        # healthy bootstrap spends at most one skip. A failed probe suppresses
+        # nothing. The zombie branch above needs no equivalent — it only runs
+        # on a FRESH file, whose uptime_s field it already checks against
+        # stabilization_s.
+        service_uptime = self._service_uptime_s()
+        if service_uptime is not None and service_uptime < self._staleness_threshold:
+            state = self._load_state()
+            skips = int(state.get("bootstrap_grace_skips", 0)) + 1
+            if skips <= self._max_bootstrap_grace_skips:
+                state["bootstrap_grace_skips"] = skips
+                self._save_state(state)
+                logger.info(
+                    "Status file stale (%.0fs) but %s started only %.0fs ago "
+                    "(< %ds threshold) — bootstrap grace %d/%d, skipping",
+                    staleness_s, self._target_service, service_uptime,
+                    self._staleness_threshold, skips,
+                    self._max_bootstrap_grace_skips,
+                )
+                return WatchdogAction.SKIP
+            logger.error(
+                "Bootstrap grace exhausted (%d skips): %s keeps presenting a "
+                "young uptime without ever writing a fresh status file — "
+                "likely a restart loop; no longer suppressing.",
+                skips - 1, self._target_service,
+            )
+            self._alert_grace_exhausted(service_uptime, skips - 1)
+            # fall through to the normal stale-restart path below
+
         logger.warning(
             "Status file stale: %.0fs old (threshold %ds) — %s may be down",
             staleness_s, self._staleness_threshold, self._target_service,
         )
 
-        # 3. Stale — attempt restart via shared logic
+        # 4. Stale — attempt restart via shared logic
         state = self._load_state()
         return self._restart_if_allowed(state, reason="stale_status_restart")
+
+    def _service_uptime_s(self) -> float | None:
+        """Seconds since the target unit entered active, or None if unknowable.
+
+        Reads systemd's MONOTONIC ActiveEnter timestamp so a wall-clock step
+        during boot (a containerized install's clock is stepped by the host
+        rather than disciplined by a local NTP daemon) cannot fake a large
+        uptime. Never raises: unit absent, systemd
+        unreachable, or unparsable output all return None, and the caller
+        falls through to the pre-existing restart path — the grace suppresses
+        only on a positive young reading.
+        """
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show", self._target_service,
+                 "--property=ActiveEnterTimestampMonotonic", "--value"],
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
+            )
+            raw = (result.stdout or "").strip()
+            if result.returncode != 0 or not raw.isdigit() or int(raw) == 0:
+                return None
+            uptime = time.clock_gettime(time.CLOCK_MONOTONIC) - int(raw) / 1e6
+            return uptime if uptime >= 0 else None
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+            return None
 
     def _network_suppresses_restart(self, status: dict) -> bool:
         """True ONLY when a FRESH sentinel probe reports degraded/offline.
@@ -792,6 +862,34 @@ class WatchdogChecker:
         if lag >= self._liveness_lag_suppress_ms:
             return "starved", loop_block
         return "responsive", loop_block
+
+    def _alert_grace_exhausted(self, service_uptime: float, skips: int) -> None:
+        """Surface ONE durable alert that the bootstrap grace ran out — the
+        target keeps presenting a young uptime without ever writing a fresh
+        status file, the signature of a restart loop. Same queue + dedupe
+        mechanism as ``_alert_starved``. Best-effort — never raises."""
+        try:
+            from genesis.env import alert_queue_root
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                alert_queue_root(),
+                severity="warning",
+                source="watchdog",
+                title="Watchdog bootstrap grace exhausted — possible restart loop",
+                body=(
+                    f"{self._target_service} has consumed all "
+                    f"{skips}/{self._max_bootstrap_grace_skips} bootstrap-grace "
+                    f"skips: its unit uptime keeps reading young "
+                    f"({service_uptime:.0f}s) while the status file stays stale, "
+                    "which means it keeps (re)starting without ever finishing "
+                    "bootstrap. The watchdog has resumed normal stale-restart "
+                    "handling. Check the service journal for the crash cause."
+                ),
+                dedupe_key="watchdog:bootstrap-grace-exhausted",
+            )
+        except Exception:
+            logger.debug("Failed to enqueue grace-exhausted alert", exc_info=True)
 
     def _alert_starved(self, reason: str, detail: dict, count: int) -> None:
         """Surface ONE durable alert that a restart was suppressed because the
