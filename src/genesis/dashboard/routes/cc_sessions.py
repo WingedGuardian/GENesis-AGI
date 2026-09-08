@@ -315,9 +315,14 @@ async def _pulse_lookup(db, cc_session_id: str) -> dict:
 
         # Ledger-only: this per-session panel keys on item_session_id, which is
         # a ledger-shaped binding. follow_up-target proposals are session-agnostic
-        # (source_session is often NULL) and get their own global surface (a
-        # tracked follow-up); rendering them here would either hide the NULL ones
-        # or offer a ledger confirm command that can't resolve a follow_up id.
+        # (source_session is often NULL), so rendering them here would either hide
+        # the NULL ones or offer a ledger confirm command that cannot resolve a
+        # follow_up id. Their global surface is the `follow_up_list` MCP tool,
+        # which decorates each row with any pending proposal
+        # (mcp/health/follow_up_tools.py, _enrich_external_state). Until that
+        # existed the promise was unkept and the proposals rendered nowhere at
+        # all; a dashboard panel over the same data would be a fine addition, but
+        # it must not be THIS session-keyed one.
         annotations = await list_annotations(
             db, session_id=cc_session_id, target_kind="ledger", limit=100
         )

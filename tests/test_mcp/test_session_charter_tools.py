@@ -154,6 +154,30 @@ async def test_writes_refuse_unresolved_short_id(db, sessions_dir):
     assert await crud.get(db, "deadbeef") is None  # no stub created
 
 
+async def test_writes_refuse_a_LONG_but_malformed_id(db, sessions_dir):
+    """The sibling of the test above, and the half a LENGTH check could not see.
+
+    `len(sid) < 32` asks how big the value is; a charter stub needs to know
+    whether it is an id at all. A mistyped UUID or a 32-character fragment is
+    long enough to pass, and the stub then exists under a key no session will
+    ever carry — mission and ledger rows written into a row nothing re-injects.
+    Same generator as the follow-up provenance finding (Codex P2, PR #1622).
+    """
+    for bad in (
+        "deadbeef-1111-2222-3333-44445555666g",  # one non-hex character
+        "deadbeef111122223333444455556666",  # 32 chars, no hyphens
+    ):
+        with patch.object(tools, "_get_db", return_value=db):
+            res1 = await tools._impl_session_charter_update(bad, mission="m")
+            res2 = await tools._impl_session_ledger_add(bad, "x")
+        # `.get`, not `[...]`: on a guard regression the success dict has no
+        # "error" key, and a KeyError reads as a broken test rather than the
+        # refused-write regression it actually is.
+        assert "did not resolve" in res1.get("error", ""), (bad, res1)
+        assert "did not resolve" in res2.get("error", ""), (bad, res2)
+        assert await crud.get(db, bad) is None, bad  # no stub created
+
+
 async def test_prefix_resolves_via_cc_sessions_before_first_compaction(db, sessions_dir):
     """Pre-compaction (no charter row), the [Session: xxxxxxxx] prefix must
     resolve through cc_sessions.cc_session_id so the stub lands under the
