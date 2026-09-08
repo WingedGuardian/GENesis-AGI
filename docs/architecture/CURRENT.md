@@ -2172,8 +2172,16 @@ verified: f24c15e9 2026-09-05
     is a rendezvous point CC populates later, not garbage, and the exclusion by
     name is what covers it (MEASURED 2026-09-07: that predicate matched
     `/tmp/cc-socks` and a live daemon's `pty` directory). `check_control_plane`
-    reports severed listeners and stale socket files into the state file, paging
-    once on a confirmed rise. It is strictly READ-ONLY — reaping a stale socket
+    reports severed listeners and stale socket files into the state file, and
+    pages once per severed socket IDENTITY (confirmed across two consecutive
+    polls, forgotten when it recovers). Identities rather than a count, because a
+    count cannot tell "the same sessions are still severed" from "those exited and
+    a different one broke" — both read as the number falling, and the new
+    severance would then never page. The reported set advances only after the
+    alert is observed on the queue: `queue_alert` is best-effort and degrades
+    silently to a no-op, so marking first would let an unwritable queue
+    permanently suppress the alert on exactly the degraded box this exists to
+    expose. It is strictly READ-ONLY — reaping a stale socket
     would put socket deletion back in the daemon that caused the outage — and it
     watches the per-session `cc-socks/` plane ONLY. CC's separate daemon tree
     (`/tmp/cc-daemon-<uid>/`: control, pty and rendezvous sockets for the
@@ -2201,10 +2209,15 @@ verified: f24c15e9 2026-09-05
     directory mtime, and that directory led a DORMANT project's by 10 minutes; one
     more session started in the dormant project and RED would have preserved that
     one and reaped 54 live workspaces while logging "preserving active session".
-    Selection is now by newest file anywhere inside. The preserved UNIT stays the
-    project, deliberately: narrowing it to the single session would reap the
-    active project's other sessions, which is more destruction, not better
-    aim — a separate decision from fixing the aim.
+    Selection is now by the newest ENTRY of any type at depth 3 or below — files
+    AND directories. Files alone left a session that had created its workspace
+    but not yet written anything with no candidate at all, so nothing was
+    preserved and the sweep reaped that live session's directories out from under
+    it; a brand-new session is a fresh directory and nothing else. The depth floor
+    is what keeps the original fix intact: the stale project directory at depth 2
+    is still excluded. The preserved UNIT stays the project, deliberately —
+    narrowing it to the single session would reap the active project's other
+    sessions, which is more destruction, not better aim.
 
   Deliberately NOT done: relocating the sockets out of cc-tmp. That is the real
   fix — the control plane should not live in a directory whose purpose is to be

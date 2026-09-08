@@ -169,6 +169,42 @@ def test_orange_never_touches_old_socket_pin(tmp_path):
     assert not (cctmp / "claude-skills").exists(), "orange should evict the cache"
 
 
+def test_red_preserves_a_session_that_has_not_written_a_file_yet(tmp_path):
+    """A session between creating its workspace and writing its first file.
+
+    Selecting on `-type f` alone found no candidate there, so nothing was
+    preserved and the depth-1 sweep reaped the live session's own directories out
+    from under it — its next write gets ENOENT. A brand-new session IS a fresh
+    directory and nothing else, so directories have to count as evidence of life.
+    (Codex P2 on #1856; the regression was introduced by the newest-FILE fix in
+    the commit before it, which is why both shapes are pinned here.)
+
+    The fixture is deliberately the ONLY session, with no file anywhere under a
+    `claude-*` tree: that is what leaves a `-type f` search with no candidate at
+    all, and an empty selection means the depth-1 skip protects NOTHING. With any
+    other file present the skip covers the whole `claude-<uid>` tree and the
+    hazard is masked — an earlier draft of this test made exactly that mistake
+    and passed against the unfixed code.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    starting = cctmp / "claude-1000" / "-home-dev-starting" / "session-new"
+    starting.mkdir(parents=True)  # dirs exist, no file written yet
+    canary = cctmp / "reclaimable-junk"  # outside claude-*, so it cannot be selected
+    canary.mkdir()
+    (canary / "blob").write_bytes(b"x" * 4096)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert starting.is_dir(), (
+        "RED reaped a session that had created its workspace but not yet written "
+        "a file — the live process's next write would fail with ENOENT"
+    )
+    assert not (canary / "blob").exists(), (
+        "the canary survived, so RED reclaimed nothing and the assertion above "
+        "proved nothing"
+    )
+
+
 def test_red_preserves_the_project_with_the_newest_FILE_not_the_newest_DIR(tmp_path):
     """RED's "preserving active session" must mean the workspace someone is
     actually using — judged by the newest file inside it, not by a directory's

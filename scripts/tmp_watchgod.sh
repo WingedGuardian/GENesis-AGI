@@ -191,6 +191,7 @@ check_control_plane() {
     fi
 
     local listeners=0 severed=0 stale=0
+    local severed_ids=""
     local -A live=()
     local -A dirs=()
     # Always scan cc-tmp's own socket dir, even when no listener points there:
@@ -208,7 +209,15 @@ check_control_plane() {
         dirs["$(dirname "$path")"]=1
         # -S is "exists AND is a socket": a path replaced by an ordinary file is
         # no more reachable than a missing one, so it counts as severed too.
-        [[ -S "$path" ]] || severed=$(( severed + 1 ))
+        if [[ ! -S "$path" ]]; then
+            severed=$(( severed + 1 ))
+            # Carry the IDENTITY, not just the tally. A count cannot tell "the
+            # same four sessions are still severed" from "those four exited and a
+            # different one broke": both read as a number going down, and the new
+            # severance would never page. Basenames are `<pid>.sock`, so the field
+            # is bounded by the number of live CC sessions.
+            severed_ids+="${severed_ids:+ }$(basename "$path")"
+        fi
         # NOTE: `ss -xlp` lists every user's sockets. On a shared box another
         # user's cc-socks path would be counted here, and an unstattable one
         # would read as severed. Genesis is single-user by design, so this is
@@ -225,40 +234,48 @@ check_control_plane() {
     done
 
     if (( listeners == 0 && stale == 0 )); then
-        echo "empty:0:0:0"
+        echo "empty:0:0:0:"
         return 0
     fi
-    echo "ok:${severed}:${stale}:${listeners}"
+    # Fifth field: the severed socket basenames, space separated. write_state
+    # reads only the first four, so the protocol is unchanged for it.
+    echo "ok:${severed}:${stale}:${listeners}:${severed_ids}"
 }
 
-# Should this control-plane reading page, and at what level is the plane now
-# "reported"? Pure arithmetic, kept out of the poll loop so the two rules below
-# can be tested without running the daemon.
+# Should this control-plane reading page, and which severances are now reported?
+# Pure set logic, kept out of the poll loop so it can be tested without running
+# the daemon.
 #
-#   CONFIRMATION — the SAME elevated count must appear on two consecutive polls,
-#   which is stricter than "elevated twice": a count still climbing (1 -> 2 -> 3)
-#   stays silent until it settles, and one that oscillates never pages at all.
-#   Severance is permanent — nothing re-binds — so a real one always settles,
-#   usually within a poll or two. What this buys is the false positive: a session
-#   exiting between ss's snapshot and its own unlink reads as one severed listener
+# IDENTITIES, NOT A COUNT. An earlier version tracked a high-water COUNT that
+# followed the number down, and a count cannot distinguish "the same four
+# sessions are still severed" from "those four exited and a different one broke".
+# Both read as 4 -> 1, the bar dropped to 1, and the NEW severance then never
+# paged — silently losing the one alert the detector exists to send. Sets do not
+# have that failure: a severance is news iff its own id has not been reported.
+#
+#   CONFIRMATION — an id must appear on two consecutive polls before it can page.
+#   A session exiting between ss's snapshot and its own unlink reads as severed
 #   for a single poll, and a monitor that cries wolf gets ignored.
 #
-#   HIGH WATER THAT FOLLOWS DOWN — `paged` is the level already reported, and it
-#   drops with the count. Without that, sessions being restarted (4 -> 0) would
-#   leave the bar at 4 and a later, smaller severance would never page.
+#   FORGET WHAT RECOVERED — an id that is no longer severed drops out of the
+#   reported set, so if that pid is ever severed again it is news again.
 #
-# Args: <prev-count> <already-paged-level> <current-count>.
-# Echoes "<0|1 page>:<new already-paged level>".
+# Args: <prev-ids> <already-paged-ids> <current-ids>  (space separated).
+# Echoes "<0|1 page>:<new already-paged ids>".
 control_plane_page_decision() {
-    local prev="$1" paged="$2" severed="$3"
-    if (( severed < paged )); then
-        paged=$severed
-    fi
-    if (( severed > paged )) && (( severed == prev )); then
-        echo "1:${severed}"
-    else
-        echo "0:${paged}"
-    fi
+    local prev=" $1 " paged=" $2 " cur="$3"
+    local id page=0 new_paged=""
+    for id in $cur; do
+        # Confirmed = seen on the previous poll too.
+        if [[ "$prev" == *" $id "* ]]; then
+            new_paged+="${new_paged:+ }$id"
+            [[ "$paged" == *" $id "* ]] || page=1
+        elif [[ "$paged" == *" $id "* ]]; then
+            # Already reported and still severed: keep it, do not re-page.
+            new_paged+="${new_paged:+ }$id"
+        fi
+    done
+    echo "${page}:${new_paged}"
 }
 
 write_state() {
@@ -430,10 +447,19 @@ clean_cc_red() {
     # project and RED would have preserved that one and reaped the active
     # project's 54 session workspaces — while logging "preserving active session".
     #
-    # `%T@ %p` over files, taking the max per project: a project with no files at
-    # all cannot win, which is correct — there is nothing there to preserve.
+    # Every entry at depth 3 or deeper, of ANY type — not just files.
+    #
+    # `-type f` was wrong in the other direction and is the regression this line
+    # exists to avoid: a session that has created its workspace but not yet
+    # written a regular file has no candidate at all, `newest_session` comes back
+    # empty, and the depth-1 sweep below then reaps the live session's own
+    # directories out from under it (its next write gets ENOENT). Directories
+    # count as evidence of life precisely because a brand-new session IS a fresh
+    # directory and nothing else. The depth floor is what keeps this correct: the
+    # stale PROJECT directory at depth 2 is still excluded, so the divergence
+    # this whole change is about cannot come back.
     local newest_session=""
-    newest_session=$(find "$CC_TMP_DIR" -mindepth 3 -type f -path "*/claude-*" \
+    newest_session=$(find "$CC_TMP_DIR" -mindepth 3 -path "*/claude-*" \
         -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}') || true
     if [[ -n "$newest_session" ]]; then
         # Reduce the winning FILE to its project dir (…/claude-<uid>/<project>),
@@ -719,11 +745,14 @@ main() {
     # level would therefore re-page the same unfixed condition after every deploy
     # or crash-restart. It still follows the count DOWN, so once the sessions ARE
     # restarted a later, smaller severance pages again.
-    local cp_prev_severed=-1 cp_last=""
+    local cp_prev_ids="" cp_last=""
     local cp_paged_file="$ALERT_DIR/control_plane_paged"
-    local cp_paged_severed
-    cp_paged_severed=$(cat "$cp_paged_file" 2>/dev/null) || cp_paged_severed=""
-    [[ "$cp_paged_severed" =~ ^[0-9]+$ ]] || cp_paged_severed=0
+    local cp_paged_ids
+    cp_paged_ids=$(cat "$cp_paged_file" 2>/dev/null) || cp_paged_ids=""
+    # Ids are `<pid>.sock` basenames; anything else is a file from an older
+    # version (which stored a count) or corruption — start clean rather than
+    # treat a stray token as a reported severance.
+    [[ "$cp_paged_ids" =~ ^([0-9]+\.sock( [0-9]+\.sock)*)?$ ]] || cp_paged_ids=""
 
     while true; do
         load_config
@@ -740,8 +769,8 @@ main() {
 
         write_state "$cc_tier" "$cc_used" "$sys_tier" "$sys_pct" "$cp_result"
 
-        local cp_status cp_severed cp_stale cp_listeners
-        IFS=: read -r cp_status cp_severed cp_stale cp_listeners <<<"$cp_result"
+        local cp_status cp_severed cp_stale cp_listeners cp_ids
+        IFS=: read -r cp_status cp_severed cp_stale cp_listeners cp_ids <<<"$cp_result"
 
         # Log only on CHANGE — this runs every poll and an unchanged plane has
         # nothing to say.
@@ -760,10 +789,9 @@ main() {
         if [[ "$cp_status" == "ok" ]]; then
             local cp_decision cp_should_page
             cp_decision=$(control_plane_page_decision \
-                "$cp_prev_severed" "$cp_paged_severed" "$cp_severed")
+                "$cp_prev_ids" "$cp_paged_ids" "$cp_ids")
             cp_should_page="${cp_decision%%:*}"
-            cp_paged_severed="${cp_decision##*:}"
-            printf '%s' "$cp_paged_severed" > "$cp_paged_file" 2>/dev/null || true
+            local cp_next_paged="${cp_decision#*:}"
             if [[ "$cp_should_page" == "1" ]]; then
                 log WARN "control plane SEVERED: ${cp_severed} of ${cp_listeners} session(s) unreachable"
                 # `warning` is the honest severity for the event, but note it does
@@ -772,18 +800,37 @@ main() {
                 # argument, so this pages exactly like the RED emergency does.
                 # That is intended here (the owner asked to be paged on a NEW
                 # severance) — recorded so nobody infers a tier that does not exist.
+                # Record the severance as reported ONLY once the entry is on
+                # disk. `queue_alert` is best-effort by contract — it swallows
+                # every failure and degrades to a no-op when its library is
+                # absent — so marking first would let an unwritable queue silence
+                # the alert permanently, on exactly the degraded box this
+                # detector exists to expose. Count the queue instead of trusting
+                # the return value.
+                local _q="${_ALERT_QUEUE_ROOT:-$HOME/.genesis/alerts/queue}"
+                local _before _after
+                _before=$(find "$_q" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
                 queue_alert warning "watchgod:control-plane" \
                     "CC control plane severed (${cp_severed} session(s) unreachable)" \
                     "${cp_severed} of ${cp_listeners} live Claude Code session(s) are listening on a socket whose PATH no longer exists, so peers get ENOENT and cannot reach them. Nothing re-binds after startup — the only remedy is restarting those sessions. Check what deleted the paths under cc-socks." \
                     "watchgod:control_plane:${cp_severed}"
+                _after=$(find "$_q" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+                if (( _after > _before )); then
+                    cp_paged_ids="$cp_next_paged"
+                else
+                    log WARN "control-plane alert could not be queued (${_q}) — leaving the severance UNREPORTED so a later poll retries"
+                fi
+            else
+                cp_paged_ids="$cp_next_paged"
             fi
-            cp_prev_severed=$cp_severed
+            printf '%s' "$cp_paged_ids" > "$cp_paged_file" 2>/dev/null || true
+            cp_prev_ids="$cp_ids"
         else
             # Neither `unknown` nor `empty` is a recovery: forget the previous
-            # count so the next readable one needs its own confirmation, and leave
-            # the already-paged level alone so a blind spell cannot silently
+            # reading so the next readable one needs its own confirmation, and
+            # leave the reported set alone so a blind spell cannot silently
             # re-arm a page for a severance that was already reported.
-            cp_prev_severed=-1
+            cp_prev_ids=""
         fi
 
         # Durable OOM capture — snapshot + page on any NEW cgroup OOM kill.

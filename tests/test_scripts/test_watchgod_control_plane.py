@@ -113,9 +113,26 @@ def _mksock(path: Path) -> None:
 
 
 def _probe(home: Path, bind: Path, rows: str = "", **kw) -> str:
+    """The COUNTS tuple — `status:severed:stale:listeners`.
+
+    The check also emits a fifth field carrying the severed socket identities;
+    `_probe_ids` is for that. Splitting them keeps the counts assertions readable
+    and stops every one of them having to restate an id list it does not care
+    about.
+    """
+    return ":".join(_probe_full(home, bind, rows, **kw).split(":")[:4])
+
+
+def _probe_full(home: Path, bind: Path, rows: str = "", **kw) -> str:
     proc = _run(home, bind, "check_control_plane", rows=rows, **kw)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     return proc.stdout.strip()
+
+
+def _probe_ids(home: Path, bind: Path, rows: str = "", **kw) -> list[str]:
+    """The severed socket identities, as a list."""
+    parts = _probe_full(home, bind, rows, **kw).split(":")
+    return parts[4].split() if len(parts) > 4 else []
 
 
 # ── severed ──────────────────────────────────────────────────────────────
@@ -280,46 +297,65 @@ def test_state_file_without_a_control_plane_argument_stays_valid(tmp_path):
 # ── paging rules ─────────────────────────────────────────────────────────
 
 
-def _decide(home: Path, bind: Path, prev: int, paged: int, severed: int) -> str:
-    proc = _run(home, bind, f"control_plane_page_decision {prev} {paged} {severed}")
+def _decide(home: Path, bind: Path, prev: str, paged: str, cur: str) -> str:
+    proc = _run(home, bind, f"control_plane_page_decision '{prev}' '{paged}' '{cur}'")
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     return proc.stdout.strip()
 
 
-def test_first_elevated_reading_does_not_page(tmp_path):
-    """Confirmation rule: the daemon's very first reading (prev = -1) cannot page.
-    A session exiting between ss's snapshot and its own unlink shows up as one
-    severed listener for a single poll, and a monitor that cries wolf gets
-    ignored."""
+def test_severed_identities_are_reported_not_just_counted(tmp_path):
+    """The decision is made on WHICH sockets are severed, so the check has to say
+    which — a bare tally cannot support the rules below."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    socks = cctmp / "cc-socks"
+    socks.mkdir(parents=True)
+    _mksock(socks / "77.sock")
+    rows = f"{socks}/11.sock 11\n{socks}/77.sock 77"
+    assert _probe_ids(home, bind, rows) == ["11.sock"]
+    assert _probe(home, bind, rows) == "ok:1:0:2"
+
+
+def test_first_sighting_does_not_page(tmp_path):
+    """Confirmation: an id must be seen on two consecutive polls. A session
+    exiting between ss's snapshot and its own unlink shows up as severed for a
+    single poll, and a monitor that cries wolf gets ignored."""
     home, _cctmp, bind = _sandbox(tmp_path)
-    assert _decide(home, bind, -1, 0, 4) == "0:0"
+    assert _decide(home, bind, "", "", "a.sock b.sock") == "0:"
 
 
-def test_confirmed_rise_pages_once(tmp_path):
-    """The same count on two consecutive polls is a real severance — page, and
-    record the level so the next identical poll stays quiet."""
+def test_confirmed_severance_pages_once(tmp_path):
+    """Seen twice running — page, then record it so the next poll stays quiet."""
     home, _cctmp, bind = _sandbox(tmp_path)
-    assert _decide(home, bind, 4, 0, 4) == "1:4"
-    assert _decide(home, bind, 4, 4, 4) == "0:4", "a steady severance must not re-page"
+    assert _decide(home, bind, "a.sock b.sock", "", "a.sock b.sock") == "1:a.sock b.sock"
+    assert (
+        _decide(home, bind, "a.sock b.sock", "a.sock b.sock", "a.sock b.sock") == "0:a.sock b.sock"
+    ), "a steady severance must not re-page"
 
 
-def test_further_rise_pages_again(tmp_path):
-    """A severance getting worse is news."""
+def test_a_new_severance_pages_even_when_the_COUNT_falls(tmp_path):
+    """The defect identities exist to fix (Codex P2 on #1856).
+
+    A previously-paged population is replaced between polls: four severed
+    sessions exit and one newly severed session appears. The count goes 4 -> 1,
+    so a high-water COUNT that follows the number down lands at 1, and the next
+    poll's `severed > paged` is false — the new unreachable session NEVER pages,
+    silently losing the one alert this detector exists to send. An id that has
+    not been reported is news whatever the tally did.
+    """
     home, _cctmp, bind = _sandbox(tmp_path)
-    assert _decide(home, bind, 5, 4, 5) == "1:5"
+    paged_four = "a.sock b.sock c.sock d.sock"
+    assert _decide(home, bind, "z.sock", paged_four, "z.sock") == "1:z.sock"
 
 
-def test_recovery_lowers_the_bar_so_a_later_severance_still_pages(tmp_path):
-    """High-water that follows DOWN. After sessions are restarted the count drops;
-    if the reported level stayed at its peak, the next — smaller — severance would
-    be silent forever. That miss is the reason this rule exists."""
+def test_a_severance_that_recovers_is_forgotten(tmp_path):
+    """An id that is no longer severed drops out of the reported set, so if that
+    pid is ever severed again it is news again rather than permanently silenced."""
     home, _cctmp, bind = _sandbox(tmp_path)
-    assert _decide(home, bind, 4, 4, 0) == "0:0", "recovery itself is not a page"
-    assert _decide(home, bind, 2, 0, 2) == "1:2", "a later, smaller severance must page"
+    assert _decide(home, bind, "", "a.sock", "") == "0:", "recovery itself is not a page"
+    assert _decide(home, bind, "a.sock", "", "a.sock") == "1:a.sock"
 
 
-def test_zero_severed_never_pages(tmp_path):
-    """A healthy plane says nothing, at any prior level."""
+def test_a_healthy_plane_says_nothing(tmp_path):
     home, _cctmp, bind = _sandbox(tmp_path)
-    assert _decide(home, bind, 0, 0, 0) == "0:0"
-    assert _decide(home, bind, -1, 0, 0) == "0:0"
+    assert _decide(home, bind, "", "", "") == "0:"
+    assert _decide(home, bind, "a.sock", "a.sock", "") == "0:"
