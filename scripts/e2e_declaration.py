@@ -17,7 +17,7 @@ THE CONVENTION, in the PR body:
 The point is NOT to force an E2E onto a docs PR. It is to make the DECISION explicit
 — the obligation-side twin of "a check that could not run must say so" (#1683).
 
-`none` PASSES THE GATE BUT DOES NOT RELEASE THE VALIDATOR (spec §8.13). A validation
+`none` SATISFIES THIS READER BUT DOES NOT RELEASE THE VALIDATOR (spec §8.13). A validation
 session assumes every merged PR has an end-to-end test and hunts for it; this line is
 its first LEAD, never a boundary. So `none` is a declaration, not an authority — a
 builder who forgets, or who declares `none` wrongly, is still caught from the merge
@@ -40,8 +40,10 @@ deliberately rather than re-learned:
   * Horizontal whitespace only (`[^\\S\\n]`) around the colon. Plain `\\s*` crosses
     newlines, which let an EMPTY marker borrow the NEXT line's text as its value.
   * Markdown wrappers are tolerated (`-`, `*`, `>`, `- [x]`, `**E2E**`, `` `E2E` ``).
-    Blocking a compliant PR at merge time is how an operator learns to route around
-    a gate.
+    Refusing to read a compliant PR's declaration is how an operator learns to
+    ignore the advisory. (Written when this reader gated the merge; it is
+    advisory since 2026-09-06, and the tolerance is worth keeping either way —
+    an advisory nobody's declaration matches is an advisory nobody reads.)
   * EVERY occurrence is considered, not the first: a leftover template line above a
     filled one must not veto the filled one.
   * Placeholders are derived from the shipped examples, never hand-listed.
@@ -53,8 +55,8 @@ That rejection is right for a 32-hex id, where any trailing text means the line 
 prose about an id rather than a claim on it. Here the trailing text IS the payload,
 so both-end anchoring cannot be copied. What replaces it is line-START anchoring plus
 a substance check on the reason: prose like "the E2E: I ran it by hand" does not
-begin a line at the marker, and `E2E: none` with no reason is INVALID (blocks) rather
-than a silent pass.
+begin a line at the marker, and `E2E: none` with no reason is INVALID (reported
+undeclared) rather than a silent pass.
 
 Pure functions, stdlib only, no I/O — so the merge gate and the repo-pulse worker can
 both load it without dragging in the other's dependencies.
@@ -95,10 +97,12 @@ _REFUSAL_WORDS = frozenset({"todo", "tbd", "pending", "n/a", "na", "yes", "no", 
 #: A reason/plan must carry real content — but the floor is deliberately LOW, and
 #: the placeholder/refusal checks above it do the real work. MEASURED (architect,
 #: 2026-09-06): at 12 this rejected `none — docs only` (8 alnum) — the exact string
-#: this module's own GUIDANCE prints as the remedy. On a gate with NO override
-#: sigil that is a closed loop: the author is blocked, types the suggested line
-#: verbatim, and is blocked identically, with nothing in the message naming an
-#: undocumented length rule. A false BLOCK here is worse than a false pass, and
+#: this module's own GUIDANCE prints as the remedy. When this reader still GATED
+#: the merge, with no override sigil, that was a closed loop: the author was
+#: blocked, typed the suggested line verbatim, and was refused identically, with
+#: nothing in the message naming an undocumented length rule. A false refusal here
+#: is worse than a false pass — it was worse as a block, and it is still worse as
+#: an advisory, because a reader who is wrongly corrected stops reading. And
 #: `test_every_example_in_the_guidance_passes_the_parser` now makes the class
 #: unrepeatable: any example this module tells an author to write must survive it.
 #: 7 admits "docs only" and "prose-only"; "x", "ok" and "n/a" still fail.
@@ -268,8 +272,9 @@ def parse_e2e(body: str | None) -> dict:
       * ``none``    — an explicit, reasoned "no runtime surface" (the reason).
       * ``absent``  — no ``E2E:`` line at all.
       * ``invalid`` — a line exists but says nothing (empty, placeholder, a bare
-        ``none`` with no reason, a refusal word). Treated as absent by the gate,
-        but reported differently so the author is told WHICH mistake they made.
+        ``none`` with no reason, a refusal word). Classified as undeclared, the
+        same as absent, but reported differently so the author is told WHICH
+        mistake they made.
 
     CRLF is normalised first: GitHub's textarea stores bodies with `\\r\\n`, and a
     line-anchored `$` would otherwise never match a real line (the defect
@@ -328,8 +333,10 @@ def parse_e2e(body: str | None) -> dict:
         elif not saw_invalid_detail:
             # Name the ACTUAL rule. A terse-but-real plan ("manual", "smoke",
             # "run CI") fails only the length floor, and telling that author the
-            # line "has no real content" is a false diagnosis on a gate with no
-            # override — it sends them guessing (Kimi P3, 2026-09-06). Say which
+            # line "has no real content" is a false diagnosis that sends them
+            # guessing (Kimi P3, 2026-09-06). It mattered more when this reader
+            # gated the merge with no override; it still matters, because an
+            # advisory that misdiagnoses is one nobody reads twice. Say which
             # rule bit, and quote what they wrote back to them.
             shown = _strip_formatting(value)[:60]
             if sum(ch.isalnum() for ch in _strip_formatting(value)) < _MIN_SUBSTANCE:
@@ -368,24 +375,31 @@ def is_pre_cutoff(created_at: str | None) -> bool:
         return False
 
 
-#: What the gate prints when a body has no usable declaration. Names BOTH valid
-#: forms and the §8.13 seam, so an author reading the block knows that `none` is a
-#: real option AND that it does not end the obligation.
+#: What the advisory prints when a body has no usable declaration. Names BOTH
+#: valid forms and the §8.13 seam, so an author reading the NOTE knows that `none`
+#: is a real option AND that it does not end the obligation. Nothing here is
+#: enforced — which raises the bar on this text rather than lowering it: an
+#: advisory earns its reading or gets skipped.
 GUIDANCE = (
     "Add an E2E: line to the PR body — one of:\n"
     f"  {MARKER}: <one-line plan for the post-merge verification>\n"
     f"  {MARKER}: none — <reason there is no runtime surface to verify>\n"
-    # A CONCRETE example, not only the bracketed template: an author blocked by
-    # this gate needs a line they can copy, and `test_every_example_in_the_
-    # guidance_passes_the_parser` runs every concrete example here through the
-    # parser so the gate can never again prescribe a remedy it would refuse.
+    # A CONCRETE example, not only the bracketed template: an author reading this
+    # needs a line they can copy, and `test_every_example_in_the_guidance_passes_
+    # the_parser` runs every concrete example here through the parser so this text
+    # can never prescribe a remedy the parser would refuse. That test predates the
+    # advisory downgrade and outlives it: the examples were WORSE than useless when
+    # the reader rejected its own printed remedy, and are still the whole value now
+    # that nothing forces anyone to read them.
     # BOTH forms get a concrete, copyable example. Offering one only for `none`
-    # meant the single line a blocked author could copy was the one that creates NO
-    # obligation — on a gate whose purpose is creating them (Kimi P3, 2026-09-06).
+    # meant the single copyable line was the one that creates NO obligation — in
+    # text whose purpose is prompting them (Kimi P3, 2026-09-06).
     f"For example:  {MARKER}: restart genesis-server and confirm /api/genesis/health answers 200\n"
     f"         or:  {MARKER}: none — docs only, no runtime surface\n"
-    "`none` is a legitimate answer for a docs/prose PR; what is not legitimate is "
-    "leaving the decision unmade. Note it passes this gate but does NOT release the "
-    "validator, which assumes every merged PR has an E2E and hunts for one anyway "
-    "(spec §8.13) — the line is its first lead, not a boundary."
+    "`none` is a legitimate answer for a docs/prose PR. Leaving the line out does "
+    "NOT block the merge — but nothing else records the decision yet either "
+    "(the per-merge obligation row is unbuilt, issue #1718), so right now this "
+    "line is the only record. Note `none` does NOT release the validator, which "
+    "assumes every merged PR has an E2E and hunts for one anyway (spec §8.13) — "
+    "the line is its first lead, not a boundary."
 )

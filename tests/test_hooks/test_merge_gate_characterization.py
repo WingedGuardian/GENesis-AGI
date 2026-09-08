@@ -262,10 +262,11 @@ _PIN_RECEIPTS_BODY = (
     "CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-28\n"
     "CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, "
     "check_cc_running_versions.sh clean, sign-off recorded\n"
-    # These cases assert an ALLOW, so the body must satisfy every body-reading gate,
-    # not just the pin one — the E2E obligation (§8.12) reads the same body and
-    # fails closed without a declaration. A case whose subject is the pin gate must
-    # not start failing for an unrelated missing line.
+    # Kept, but no longer load-bearing: it dated from when the E2E reader (§8.12)
+    # blocked on a body with no declaration, so a pin case would have failed for an
+    # unrelated missing line. That reader is advisory since 2026-09-06 and can no
+    # longer steal this allow. The line stays because these cases assert an ALLOW
+    # and a body that answers every body-reading gate keeps the subject unambiguous.
     "E2E: none — pin bump only, no runtime surface to verify\n"
 )
 
@@ -1048,17 +1049,21 @@ _CASES: list[tuple[str, object, int, str]] = [
         0,
         "",
     ),
-    # ── E2E obligation (§8.12) ──────────────────────────────────────────────
-    # These drive the REAL merge command through the hook. The gate's first
-    # "wiring" tests were source-string greps, and MEASURED: replacing the
-    # enforcement branch with `if False:` left the call in place, so all 147
-    # tests stayed green while the gate did nothing. A grep proves a call exists;
-    # only an exit code proves it BLOCKS.
+    # ── E2E obligation (§8.12) — ADVISORY, never blocking ───────────────────
+    # These drive the REAL merge command through the hook, which is the only
+    # thing that proves a verdict: MEASURED on the blocking version, replacing
+    # the enforcement branch with `if False:` left the call in place and all 147
+    # tests stayed green. A grep proves a call exists; only an exit code proves
+    # what it DOES. The exit code these now assert is 0 — the owner reversed the
+    # hard-fail on 2026-09-06 because the block never made the JUDGMENT
+    # deterministic (an LLM decides either way; a block only guarantees a
+    # sentence exists, not that it is true) while taxing every merge on an n=2
+    # justification. The obligation lives in the per-merge row instead.
     (
-        "e2e_declaration_absent_blocks_merge",
+        "e2e_declaration_absent_is_advisory_not_blocking",
         lambda mp: _run(mp, _merge_cmd(), pr_body="A body that never decided.\n"),
-        2,
-        "no post-merge E2E decision",
+        0,
+        "no post-merge E2E decision",  # the NOTE still fires, on a passing merge
     ),
     (
         "e2e_none_with_reason_allows_merge",
@@ -1077,9 +1082,9 @@ _CASES: list[tuple[str, object, int, str]] = [
         "",
     ),
     (
-        "e2e_bare_none_blocks_merge",
+        "e2e_bare_none_is_advisory_not_blocking",
         lambda mp: _run(mp, _merge_cmd(), pr_body="E2E: none\n"),
-        2,
+        0,
         "no post-merge E2E decision",
     ),
     (
@@ -1089,6 +1094,134 @@ _CASES: list[tuple[str, object, int, str]] = [
         ),
         0,
         "",
+    ),
+    # "Advisory" has to mean the merge arm CONTINUES INTO the blocking gates, not
+    # merely that it exits 0 when everything downstream is already green — which is
+    # all the five cases above can prove, since they run with every other gate
+    # passing. The blocking version `return 2`'d here, so every later check was
+    # skipped for exactly this population; if a future edit "tidies" the advisory
+    # branch with an early `return 0`, Codex-at-head freshness, the TOCTOU head
+    # binding and both finding scans go silently unenforced on every PR that lacks
+    # an E2E line, and the cases above stay green. This is the same shape as the
+    # `if False:` mutation measured on the blocking version (see the comment above),
+    # one gate further on. So: undeclared body AND a stale Codex review — the
+    # DOWNSTREAM gate must still be the thing that decides. (Kimi P2, 2026-09-06.)
+    (
+        "e2e_advisory_does_not_short_circuit_downstream_gates",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            reviews=_reviews_jsonl(STALE),
+        ),
+        2,
+        "has not reviewed the current head",
+    ),
+    # The case above pins only the FIRST downstream gate. An early return placed
+    # after freshness would still bypass everything later while it stayed green.
+    #
+    # COUNT THE GATES FROM THE CODE, NOT FROM THIS COMMENT. As of 2026-09-06 the
+    # merge arm runs FIVE gates after the E2E advisory: Codex freshness
+    # (git_push_guard.py:6761), the TOCTOU head binding (:6785), the review-body
+    # scan (:6797), the inline scan (:6814), and the scheduled-Claude review
+    # (:6855). There is one case below for each.
+    #
+    # An earlier revision of this comment said "one case per remaining gate" while
+    # covering four of the five — the scheduled-review gate was unpinned, and a
+    # `return 0` before :6845 left the entire suite green with every required
+    # scheduled review unenforced for exactly this population. Three consecutive
+    # review rounds each added the gates the previous reviewer named and each
+    # stopped one short; what broke the run was enumerating the arm from the
+    # source instead of from the last finding. If you add a gate to that arm, add
+    # a case here and update the list above — the list is load-bearing.
+    #
+    # Each case leaves everything upstream of the gate under test clean, so that
+    # gate is the only thing that can produce the block.
+    (
+        "e2e_advisory_still_reaches_head_binding",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None),
+            pr_body="A body that never decided.\n",
+        ),
+        2,
+        "bound to the Codex-verified head",
+    ),
+    (
+        "e2e_advisory_still_reaches_review_body_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            router=_router(review_lines=_REVIEW_BODY_P1),
+        ),
+        2,
+        "review-body gate did not pass",
+    ),
+    (
+        "e2e_advisory_still_reaches_inline_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "inline review gate did not pass",
+    ),
+    (
+        "e2e_advisory_still_reaches_scheduled_review",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            pr_body="A body that never decided.\n",
+            scheduled="",
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # ── SAME CLASS, PRE-EXISTING MEMBERS: the `# ci-override` paths ────────────
+    # The E2E advisory is not the only "print a NOTE and continue" path in the
+    # merge arm — the CI gate has two, and their ids say `_continues` while
+    # nothing checked that anything continues: both asserted exit 0 with every
+    # downstream gate green, which is the shape this file's own comment above
+    # calls insufficient ("only an exit code proves what it DOES"). MEASURED
+    # 2026-09-06: a `return 0` after the CI-absent NOTE left 699 tests green.
+    # Covered here rather than filed, because "fix the class" means the
+    # population and not just the member this PR happened to touch — the whole
+    # point of the round that found it. One downstream gate each is enough to
+    # catch an early return; the per-gate enumeration above belongs to the path
+    # this PR actually changes.
+    (
+        "ci_absent_override_still_reaches_inline_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci="[]",
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "inline review gate did not pass",
+    ),
+    (
+        "ci_incomplete_override_still_reaches_inline_scan",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci=json.dumps(
+                [
+                    {
+                        "name": "Analyze (python)",
+                        "workflowName": "CodeQL",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                    }
+                ]
+            ),
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "inline review gate did not pass",
     ),
     (
         "pin_unchanged_allows_through_main",
@@ -1137,6 +1270,30 @@ def test_merge_gate_aggregation(case_id, thunk, expected_rc, expected_msg, monke
     assert rc == expected_rc, f"{case_id}: expected exit {expected_rc}, got {rc}. stderr:\n{err}"
     if expected_msg:
         assert expected_msg in err, f"{case_id}: {expected_msg!r} not in stderr:\n{err}"
+
+
+def test_merge_arm_advisory_follows_the_flag_not_the_message_text(monkeypatch, capsys):
+    """The merge arm decides from the RETURNED FLAG, never from the message prose.
+
+    Behavioural lock. The equivalent assertion in test_e2e_plan_gate.py was a
+    negative grep for the literal `e2e_msg.startswith`, which pins a variable
+    SPELLING: MEASURED 2026-09-06 that renaming the local and reinstating the
+    re-derivation left that lock green while the forbidden behaviour was back.
+    A name is the cheapest thing in a refactor to change.
+
+    Here the classifier is made to return `declared` under a label that does NOT
+    start with "ok"/"n/a". Any arm that re-derives severity from the text emits
+    the undeclared NOTE on a PR the report calls declared — the exact
+    report/enforcement divergence — and this test fails however it is spelled."""
+    monkeypatch.setattr(_mod, "_check_e2e_plan", lambda *a, **k: (False, "declared (plan)"))
+    rc = _run(monkeypatch, _merge_cmd())
+    err = capsys.readouterr().err
+    assert rc == 0, f"a declared PR must not be blocked. stderr:\n{err}"
+    assert "no post-merge E2E decision" not in err, (
+        "the merge arm emitted the UNDECLARED advisory for a declaration the "
+        "classifier reported as present — it is reading the message text, not "
+        f"the returned flag. stderr:\n{err}"
+    )
 
 
 def test_findings_not_fetched_when_freshness_blocks(monkeypatch):
@@ -1265,6 +1422,36 @@ def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
     assert "BLOCK" in sched_line
     assert rc == 1
+
+
+def test_check_pr_report_e2e_row_is_advisory_and_never_flips_the_verdict(monkeypatch, capsys):
+    """The `e2e-plan` row reports, and NEVER counts toward the report's verdict.
+
+    Until this existed, the ONLY reference to `e2e-plan` anywhere in tests/ was a
+    source-string grep asserting the label appears in the file. MEASURED
+    2026-09-06: re-adding `failures += 1 if undeclared else 0` to the report arm —
+    the report blocking a PR the merge arm allows, which is precisely the
+    divergence the arm's own comment forbids — left the whole suite green.
+
+    Locks three things no grep can: the row is labelled `advisory`, the remedy
+    tail is rendered under it, and the verdict stays 0."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "A body that never decided.\n")
+    monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", "2099-01-01T00:00:00Z")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    e2e_line = next(ln for ln in out.splitlines() if ln.startswith("e2e-plan"))
+    assert "advisory" in e2e_line, e2e_line
+    assert "BLOCK" not in e2e_line, "an advisory row must not wear the blocking label"
+    assert "E2E: none —" in out, (
+        "the remedy tail must reach the operator — an advisory minus its remedy "
+        "is the strongest argument for ignoring it"
+    )
+    assert rc == 0, (
+        "an undeclared E2E flipped the report's verdict while the merge arm allows "
+        "it — report and enforcement disagreeing is the one thing this report rests "
+        "on not doing"
+    )
 
 
 def test_check_pr_report_ci_absent_fails_verdict_on_canonical(monkeypatch, capsys):

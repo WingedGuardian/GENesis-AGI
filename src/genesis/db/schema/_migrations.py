@@ -1512,6 +1512,9 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE memory_metadata ADD COLUMN expires_at TEXT",
         "memory_metadata.expires_at")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN preference_domain TEXT",
+        "memory_metadata.preference_domain")
 
     # Bi-temporal columns for temporal fact tracking (0010_bitemporal_memory)
     await _try_alter(db,
