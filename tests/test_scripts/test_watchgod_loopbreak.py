@@ -47,17 +47,21 @@ exit 0
 _JOURNALCTL_STUB = r"""#!/usr/bin/env bash
 [[ -n "${STUB_JOURNAL_ARGLOG:-}" ]] && echo "$*" >> "$STUB_JOURNAL_ARGLOG"
 [[ "${STUB_JOURNAL_RC:-0}" != 0 ]] && exit "${STUB_JOURNAL_RC}"
-# Minimal --since honoring, just enough to test the cursor: when
-# STUB_JOURNAL_TS is set and the query asks for lines since an epoch AFTER it
-# (--since "@<epoch>"), the stubbed line is out of window - print nothing.
-if [[ -n "${STUB_JOURNAL_TS:-}" ]]; then
-  for a in "$@"; do
-    if [[ "$a" == @* && "${a#@}" -gt "${STUB_JOURNAL_TS}" ]]; then
-      exit 0
-    fi
-  done
+# Cursor semantics, enough to exercise the real thing: the guard queries with
+# --after-cursor (a POSITION filter, strictly-after) once it holds a cursor, and
+# falls back to a relative --since window on the first run. STUB_JOURNAL_STALE
+# marks the stubbed line as belonging to an EARLIER position, so any query that
+# carries --after-cursor must not return it — the stale-line case.
+_after_cursor=0
+for a in "$@"; do [[ "$a" == "--after-cursor" ]] && _after_cursor=1; done
+if [[ -n "${STUB_JOURNAL_STALE:-}" && "$_after_cursor" == 1 ]]; then
+  # Out of window: emit only the cursor line, no records.
+  printf -- '-- cursor: s=stub;i=%s\n' "$(date +%s%N)"
+  exit 0
 fi
 [[ -n "${STUB_JOURNAL:-}" ]] && printf '%s\n' "${STUB_JOURNAL}"
+# --show-cursor appends this trailing line; the guard parses it to advance.
+printf -- '-- cursor: s=stub;i=%s\n' "$(date +%s%N)"
 exit 0
 """
 
@@ -313,6 +317,82 @@ def test_oom_noncontained_unit_pages_and_names_it(tmp_path):
     assert "run-u1234.scope" in calls, calls  # the page NAMES the killed unit
 
 
+def test_oom_partially_attributed_batch_pages(tmp_path):
+    """Two kills, ONE contained journal line → PAGE. The second kill is
+    unexplained, and attribution may only downgrade a batch it fully accounts
+    for.
+
+    The pre-fix condition asked only "is every unit I FOUND contained?", which
+    is trivially true of a single contained line — so `oom_kill 4 -> 6` was
+    suppressed while a kill nothing accounted for went silent. That is the
+    fail-open rule inverted in the one direction it exists to protect. The
+    count of journal records must equal the counter delta.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 6)  # +2 kills
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": _KILL_LINE},  # only ONE line
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    calls = home / ".genesis" / "alerts" / "calls.log"
+    assert calls.exists(), "a partially attributed batch must PAGE, not suppress"
+    assert "oom_kill 4->6" in calls.read_text(), calls.read_text()
+
+
+def test_oom_fully_attributed_batch_of_two_does_not_page(tmp_path):
+    """The control for the cell above, in the other direction.
+
+    Without it, the count check would pass a guard that simply pages on every
+    n>1 batch — which would re-open the false-alarm class #1775 closed, since
+    two contained kills inside one poll window is the ordinary shape (measured
+    2026-09-08: a gitnexus and a cbm scope died 39s apart).
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 6)  # +2 kills
+    second = "code-intel-4408aa696643-gitnexus-4107467.scope: Failed with result 'oom-kill'."
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": _KILL_LINE + "\n" + second},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert not (home / ".genesis" / "alerts" / "calls.log").exists(), "both contained → no page"
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "contained in [" in wg_log, wg_log
+
+
+def test_oom_same_unit_killed_twice_is_fully_attributed(tmp_path):
+    """Cardinality, not distinctness: the SAME unit killed twice is two kills.
+
+    This is the cell that makes preserving record cardinality load-bearing.
+    De-duplicating the unit list (`sort -u`) collapses two records of one unit
+    into a single line, so the count reads 1 against a delta of 2 and the batch
+    pages as partially attributed — a FALSE page, in the direction #1775 exists
+    to remove. It degrades safely (over-paging, never silence), which is exactly
+    why no other cell catches it: every other case has distinct unit names, so
+    dedup is a no-op there and the mutation survives them.
+    """
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 6)  # +2 kills
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + 'result=$(check_oom_events 4); echo "BASELINE=$result"',
+        # The identical contained unit, twice — one record per kill.
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": _KILL_LINE + "\n" + _KILL_LINE},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert not (home / ".genesis" / "alerts" / "calls.log").exists(), (
+        "two records of one contained unit fully account for two kills — no page"
+    )
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "contained in [" in wg_log, wg_log
+
+
 def test_oom_mixed_units_page(tmp_path):
     # One contained + one not → page: attribution may only downgrade a kill
     # when EVERY killed unit is accounted for.
@@ -381,13 +461,14 @@ def test_oom_stale_contained_line_cannot_account_for_a_new_kill(tmp_path):
     snippet = (
         _PRELUDE
         + f'OOM_EVENTS_FILE="{oom}"; '
-        # The stubbed line "exists" 10s in the past; the first call's fallback
-        # window (relative --since, no @epoch) sees it, the cursor written by
-        # that call is NEWER, so the second call's @cursor query does not.
-        + 'STUB_JOURNAL_TS=$(( $(date +%s) - 10 )); export STUB_JOURNAL_TS; '
+        # The stubbed line belongs to an EARLIER journal position: the first
+        # call's fallback window (relative --since, no cursor yet) sees it, and
+        # the cursor that call records sits after it — so the second call's
+        # --after-cursor query, being strictly-after, does not.
+        + 'STUB_JOURNAL_STALE=1; export STUB_JOURNAL_STALE; '
         + 'r1=$(check_oom_events 4); echo "B1=$r1"; '
         + f'printf \'%s\' "low 0\nhigh 0\nmax 0\noom 3\noom_kill 6\noom_group_kill 0\n" > "{oom}"; '
-        + 'sleep 1; r2=$(check_oom_events "$r1"); echo "B2=$r2"'
+        + 'r2=$(check_oom_events "$r1"); echo "B2=$r2"'
     )
     out = _run(home, bind, snippet, {"STUB_JOURNAL": _KILL_LINE})
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
@@ -402,7 +483,13 @@ def test_oom_stale_contained_line_cannot_account_for_a_new_kill(tmp_path):
 
 def test_oom_journal_query_uses_the_cursor_after_the_first_read(tmp_path):
     # Mechanism pin: call 1 has no cursor file → relative fallback window;
-    # call 2 must query --since "@<epoch>" with the epoch call 1 recorded.
+    # call 2 must query --after-cursor with the cursor call 1 recorded.
+    #
+    # This used to pin `--since "@<epoch>"`. A timestamp filter is INCLUSIVE at
+    # its boundary, so an entry landing exactly on the stored second is read
+    # twice; --after-cursor is a position filter and is strictly-after. The
+    # invariant ("the second read is bounded by what the first recorded") is
+    # unchanged — only the mechanism that delivers it.
     home, _cc, bind = _sandbox(tmp_path)
     oom = _oom_file(tmp_path, 5)
     arglog = tmp_path / "journal_args.log"
@@ -417,8 +504,10 @@ def test_oom_journal_query_uses_the_cursor_after_the_first_read(tmp_path):
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
     lines = arglog.read_text().splitlines()
     assert len(lines) == 2, lines
-    assert " seconds" in lines[0] and "@" not in lines[0], lines[0]  # fallback window
-    assert "@" in lines[1], lines[1]  # cursor used
+    assert " seconds" in lines[0], lines[0]  # first read: relative fallback window
+    assert "--after-cursor" not in lines[0], lines[0]  # ...and no cursor yet
+    assert "--after-cursor" in lines[1], lines[1]  # second read: cursor used
+    assert "s=stub" in lines[1], lines[1]  # ...and it is the one call 1 recorded
 
 
 def test_oom_cbm_wrapper_kill_is_contained_by_default(tmp_path):

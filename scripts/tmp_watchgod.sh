@@ -481,22 +481,44 @@ _oom_killed_units() {
     # every tick and may change POLL_INTERVAL — a frozen window shorter than
     # one poll gap would miss every contained kill and re-open the false pages.
     local _fallback_s=$(( POLL_INTERVAL * 2 + 60 ))
-    local _since="-${_fallback_s} seconds" _cursor _now
+    local _cursor out rc=0
     _cursor=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || _cursor=""
-    [[ "$_cursor" =~ ^[0-9]+$ ]] && _since="@${_cursor}"
-    _now=$(date +%s)
-    local out rc=0
-    out=$(journalctl --user --since "$_since" --no-pager -o cat 2>/dev/null) || rc=$?
+    # A REAL journal cursor, not a timestamp. `--since` is a TIMESTAMP filter and
+    # is INCLUSIVE at its boundary, so an entry landing exactly on the stored
+    # second is re-read on the next tick; `--after-cursor` is a POSITION filter
+    # and starts strictly AFTER the named entry, so every record is seen exactly
+    # once. That distinction is load-bearing now that the caller compares the
+    # RECORD COUNT against the kill delta: a double-counted boundary entry would
+    # inflate the count and page a kill that was in fact accounted for.
+    # `--show-cursor` appends a trailing `-- cursor: s=…` line, stripped below.
+    if [[ "$_cursor" == s=* ]]; then
+        out=$(journalctl --user --after-cursor "$_cursor" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
+    else
+        # First run, or a cursor file written by an older version (epoch digits):
+        # fall back to the time window. Never trust a malformed value as a cursor.
+        out=$(journalctl --user --since "-${_fallback_s} seconds" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
+    fi
     [[ $rc -ne 0 ]] && return 1
     # Advance the cursor only on a SUCCESSFUL read (this function runs in a
-    # command substitution, but file writes escape the subshell).
-    printf '%s' "$_now" > "$_OOM_CURSOR_FILE" 2>/dev/null || true
+    # command substitution, but file writes escape the subshell). If the read
+    # returned no cursor line (an empty journal window), KEEP the old cursor
+    # rather than clearing it — clearing would re-read the whole window next
+    # tick and double-count.
+    local _newcur
+    _newcur=$(printf '%s\n' "$out" | sed -n 's/^-- cursor: //p' | tail -1)
+    [[ -n "$_newcur" ]] && printf '%s' "s=${_newcur#s=}" > "$_OOM_CURSOR_FILE" 2>/dev/null || true
     # `-o cat` renders systemd's line as `<unit>: Failed with result 'oom-kill'.`
     # A unit name can legally contain ':' (template instances); cut would then
     # truncate it, and a truncated name cannot match a contained prefix — so a
     # pathological name mis-classifies toward PAGING, the safe direction.
+    # NOT `sort -u`: the caller compares this list's RECORD COUNT against the
+    # kill delta, and de-duplicating collapses two kills of the same unit name
+    # into one line — which would under-count and suppress a page for a kill
+    # nothing accounted for. Cardinality is the point; the display string
+    # de-duplicates separately. (The `-- cursor:` line carries no oom-kill
+    # phrase, so grep drops it here.)
     printf '%s
-' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1 | sort -u
+' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1
 }
 
 _oom_units_all_contained() {
@@ -540,13 +562,26 @@ check_oom_events() {
         # non-contained unit, no record, or no journal — pages exactly as
         # before: attribution can only ever DOWNGRADE a known-contained kill,
         # never silence an unknown one.
-        local _oom_units="" _oom_who="unattributed"
+        local _oom_units="" _oom_who="unattributed" _oom_n=0
         if _oom_units=$(_oom_killed_units); then
-            [[ -n "$_oom_units" ]] && _oom_who=$(printf '%s' "$_oom_units" | paste -sd, -)
+            if [[ -n "$_oom_units" ]]; then
+                _oom_who=$(printf '%s\n' "$_oom_units" | sort -u | paste -sd, -)
+                _oom_n=$(printf '%s\n' "$_oom_units" | grep -c . || true)
+            fi
         else
             _oom_units=""
         fi
-        if [[ -n "$_oom_units" ]] && _oom_units_all_contained "$_oom_units"; then
+        # EVERY observed kill must be accounted for, not merely SOME of them.
+        # Checking only "is every unit I found contained?" suppresses a
+        # PARTIALLY attributed batch: oom_kill 4 -> 6 (n=2) with a single
+        # code-intel journal line would silence the page while the second kill
+        # went unexplained — the exact fail-open this attribution was built to
+        # preserve. Requiring the record count to equal the counter delta makes
+        # a missing record page, which is the safe direction; the cursor is a
+        # real journal position (see _oom_killed_units) so the two counts are
+        # comparable rather than approximately aligned.
+        if [[ -n "$_oom_units" ]] && (( _oom_n == n )) \
+            && _oom_units_all_contained "$_oom_units"; then
             log WARN "OOM kill contained in [${_oom_who}] — its own resource cap fired, not container pressure; not paging (snapshot kept)"
         else
             # Emergency tier (pages): an OOM kill is a discrete serious event —
