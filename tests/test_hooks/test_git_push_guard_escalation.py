@@ -205,6 +205,62 @@ class TestEscalationGate:
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
         assert _check('gh pr comment --body "@codex review"') == (False, "")
 
+    def test_variable_target_fails_closed(self, monkeypatch):
+        """A `$n` in the PR position is unknowable to a PreToolUse hook, so it
+        must REFUSE rather than skip. This is the 2026-09-08 bypass: the request
+        written in a `for` loop posted rounds on two PRs already at/past the cap
+        with no ack, because an unresolvable target silently fell through."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        block, msg = _check('gh pr comment $n --body "@codex review"')
+        assert block is True
+        assert "$n" in msg
+
+    def test_variable_target_fails_closed_even_below_cap(self, monkeypatch):
+        """Below the cap too: the refusal is about being unable to COUNT, not
+        about the count. Allowing it under the cap would still be guessing."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(0)))
+        assert _check('gh pr comment $n --body "@codex review"')[0] is True
+
+    def test_expansion_forms_all_fail_closed(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        for form in (
+            'gh pr comment "$PR" --body "@codex review"',
+            'gh pr comment ${PR} --body "@codex review"',
+            'gh pr comment $(cat pr.txt) --body "@codex review"',
+        ):
+            assert _check(form)[0] is True, form
+
+    def test_literal_branch_target_still_fails_open(self, monkeypatch):
+        """The documented fail-open for a BRANCH target is deliberate and stays:
+        it is resolvable in principle, unlike an expansion."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        assert _check('gh pr comment my-branch --body "@codex review"') == (False, "")
+
+    def test_expansion_in_body_is_not_a_target(self, monkeypatch):
+        """Only the FIRST positional is the target. A `$` inside the body must
+        not be read as one, or ordinary review prose starts getting refused."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP - 1)))
+        assert _check('gh pr comment 42 --body "costs $5 per $unit"') == (False, "")
+
+    def test_variable_target_on_non_codex_comment_untouched(self, monkeypatch):
+        """The refusal is scoped to a round REQUEST. An ordinary comment with a
+        variable target is none of this gate's business."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        assert _check('gh pr comment $n --body "nice"') == (False, "")
+
+    def test_ack_does_not_clear_an_unresolvable_target(self, monkeypatch):
+        """The ack must NOT rescue this one, and that is the whole design.
+
+        `acked` is computed command-wide, so a single sigil on
+        `for n in …; do gh pr comment $n …; done` would license a round on every
+        PR the loop touches — the unbounded version of the chaining the terminal
+        tier already spends a license to stop. An acknowledgement names a
+        conscious decision about ONE PR; when the PR is unknowable the sigil has
+        nothing to attach to, so it cannot be honoured."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        cmd = 'gh pr comment $n --body "@codex review"  # escalation-ack'
+        assert _check(cmd)[0] is True
+
     def test_api_error_fails_open(self, monkeypatch):
         monkeypatch.delenv("_TEST_GH_CODEX_REVIEWS", raising=False)
 

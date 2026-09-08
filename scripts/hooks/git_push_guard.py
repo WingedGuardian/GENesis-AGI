@@ -2274,6 +2274,69 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     return pr_num, _comment_repo(argv) or url_repo
 
 
+# A shell expansion the hook can never resolve: PreToolUse sees the command
+# BEFORE the shell runs, so `$n`, `"$PR"`, `$(gh …)` and backticks are literal
+# text here, not a PR number.
+_UNEXPANDED_TARGET_RE = re.compile(r"\$\{?\w|\$\(|`")
+
+
+def _comment_target_unexpanded(argv: list[str]) -> str | None:
+    """The ``gh pr comment`` positional target when it is an UNEXPANDED shell
+    expansion rather than a resolvable PR reference.
+
+    Why this exists as a separate probe instead of widening ``_comment_target``:
+    that function's ``(None, …)`` result is overloaded. It means "no number" for
+    three different situations — no positional at all, a literal BRANCH name,
+    and an expansion — and only the third is unknowable in principle. The first
+    two keep their documented fail-open; a branch is resolvable by anyone who
+    cares to look it up, and a bare ``--body`` request has no target to count
+    against. An expansion is different in kind: no amount of parsing recovers
+    the number, because the value does not exist yet.
+
+    MEASURED 2026-09-08 — why this is a BLOCK and not an advisory: writing the
+    request as ``for n in 1625 1576 1609; do gh pr comment $n --body "@codex
+    review"; done`` posted round requests on two PRs already at or past
+    ``ESCALATION_ROUND_CAP`` with no ``# escalation-ack`` and no step-back
+    triage. The cap is itself a block, so an unknowable target leaves only
+    fail-open or fail-closed; an advisory would not have stopped it. Failing
+    closed here costs one rewrite with a literal number, which the refusal names.
+    """
+    try:
+        idx = argv.index("comment")
+    except ValueError:
+        return None
+    _VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        # FIRST positional only — it is the target. A later one is body text,
+        # which may legitimately mention a price or a shell snippet.
+        return tok if _UNEXPANDED_TARGET_RE.search(tok) else None
+    return None
+
+
+def _unresolvable_target_advisory(token: str) -> str:
+    return (
+        f"BLOCKED: cannot tell which PR '{token}' is, so the Codex round cap "
+        "cannot be checked.\n"
+        "This hook runs BEFORE the shell expands anything, so a variable or "
+        "command substitution in the PR position is unreadable here — and an "
+        "unreadable target used to skip the cap entirely, which is how a loop "
+        "silently requested rounds past it.\n"
+        "Re-run with the PR number written literally, one command per PR:\n"
+        "  gh pr comment 1234 --body \"@codex review\"\n"
+        "If that PR is already at the cap you will get the step-back advisory, "
+        "which is the point."
+    )
+
+
 def _comment_repo(argv: list[str]) -> str | None:
     """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
 
@@ -2465,6 +2528,11 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
                 continue
             pr_num, repo = _comment_target(seg.argv)
             if not pr_num:
+                # An unexpanded expansion is unknowable here, so it fails CLOSED;
+                # a missing or branch target keeps its documented fail-open.
+                unresolvable = _comment_target_unexpanded(seg.argv)
+                if unresolvable:
+                    return True, _unresolvable_target_advisory(unresolvable)
                 continue
             # Count ALL Codex review rounds — including DISMISSED, which still
             # ran and consumed the budget (#1385 round-5). Freshness uses the
