@@ -1951,7 +1951,14 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     # ledger id. follow_up-target proposals (target_kind added by
                     # migration 0084) are session-agnostic and get their own
                     # global surface — never surface them here with a confirm
-                    # command that can't find them. Pre-0084 DBs lack the column;
+                    # command that can't find them. That surface is the
+                    # `follow_up_list` MCP tool, which decorates each row with any
+                    # pending proposal (mcp/health/follow_up_tools.py,
+                    # _enrich_external_state). It was promised here for a long time
+                    # before it existed — during which any follow_up proposal would
+                    # have gone stale unseen; measured, none had yet been proposed
+                    # (they auto-absorb in live mode), so the gap was latent, not
+                    # lossy. Pre-0084 DBs lack the column;
                     # the enclosing try/except then renders the block empty (same
                     # graceful degradation as the pre-0062 no-tables case).
                     cur = await db.execute(

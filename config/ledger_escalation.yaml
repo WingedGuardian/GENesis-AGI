@@ -1,0 +1,42 @@
+# Undisposed-ledger escalation sweep (learning scheduler, hourly).
+#
+# A session_ledger row lives ONLY on the ledger: its own session's injection
+# renders it, and nothing else does. So when a session dies with open rows, its
+# commitments become unreachable — not deleted, just invisible to every process
+# and person. CLAUDE.md already states the rule ("every open row is either
+# getting done or gets a disposition; a row left undisposed is a defect"); this
+# sweep is what enforces it once the owning session can no longer be asked.
+#
+# A row untouched >= stale_days whose owning session has been quiet >=
+# quiet_days becomes a `user_input_needed` follow-up asking for a disposition.
+# The link is the follow-up's dedup_key (session_awareness.ledger_escalation_link),
+# which the two import-free hooks already render beside an open row.
+#
+# The sweep NEVER writes session_ledger — an evidence write would bump
+# updated_at and read as a disposition the owner never made.
+#
+# Env kill switch: GENESIS_LEDGER_ESCALATION_DISABLED=1 forces it off.
+
+enabled: true
+
+# Row untouched this long (updated_at, else created_at). Any ledger_update
+# restarts the clock.
+stale_days: 5
+
+# AND owning session quiet this long (~/.genesis/sessions/<sid>/last_prompt_time).
+# BOTH must pass: a stale row in a live session is that session's to dispose.
+quiet_days: 5
+
+# Escalations created per run (hourly), oldest first. Deferred ids are logged
+# and returned — never silently dropped.
+max_per_run: 5
+
+# Priority of the created follow-up.
+priority: high
+
+# Which session_ledger.added_by values may escalate. foreground-only by default:
+# `ambient_ledger_extractor` rows are the detached extractor's PROPOSALS, not
+# agreements a human made, and asking the owner to dispose of something nobody
+# committed to is noise. Widen deliberately.
+escalate_added_by:
+  - foreground
