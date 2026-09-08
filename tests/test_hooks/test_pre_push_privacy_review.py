@@ -546,3 +546,61 @@ def test_an_unresolvable_remote_advises_rather_than_blocks(monkeypatch, capsys, 
     assert code == 0, "an unresolvable remote must not hard-block"
     assert cap.err == ""
     assert "Pre-push privacy review" in cap.out, "but it must still warn"
+
+
+# ── one parser, both facts (CodeRabbit Major on #1857) ─────────────────
+#
+# Reusing the shared parser for DETECTION while the remote still came from a
+# local re.split left two parsers in one hook that disagreed, and each was wrong
+# in a different direction — both ending in a false exit-2 block on a command
+# that publishes nothing to the public repo.
+
+
+def test_a_ref_named_push_is_not_a_push():
+    """`"push" in argv` is a membership test, so a REF named push made
+    `git checkout push` look like a push — scanned, and refusable. The subcommand
+    is what decides."""
+    for cmd in ("git checkout push", "git branch push", "git switch push"):
+        assert not hook._push_segments(cmd), f"{cmd!r} is not a push"
+    assert hook._push_segments("git push origin x"), "a real push must still be seen"
+
+
+def test_the_remote_survives_a_multi_line_command():
+    """The other direction: the shared parser found the push in a multi-line
+    command and the local splitter did not, so the remote came back None, was
+    folded to "" (= the default remote), and resolved as origin — a push to a
+    PRIVATE fork could then be blocked as public."""
+    assert hook._push_remote("git status\ngit push private feat") == "private"
+    assert hook._push_remote("git add -A && git commit -m x\ngit push private feat") == "private"
+
+
+def test_remote_is_read_from_the_same_segment_that_found_the_push():
+    """The class fix, asserted directly: whatever segment establishes 'this is a
+    push' is the segment the remote is read from, so the two facts cannot come
+    from different readings of the command. The flag here takes a value, which is
+    the shape a naive 'first non-flag token' scan gets wrong."""
+    cmd = "git status\ngit push --receive-pack=/x private feat"
+    segs = hook._push_segments(cmd)
+    assert segs
+    assert hook._remote_from_argv(segs[0].argv) == "private"
+
+
+def test_advisory_does_not_claim_PUBLIC_when_the_remote_did_not_resolve(
+    monkeypatch, capsys, fingerprints
+):
+    """An advisory that overstates its own certainty teaches the reader to
+    discount it. On the unresolved path, 'the PUBLIC repo' asserts as fact the
+    one thing that could not be determined."""
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push notaremote feat"},
+        "cwd": "/tmp",
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(hook, "_targets_public_repo", lambda remote, cwd: True)
+    monkeypatch.setattr(hook, "_target_resolved", lambda remote, cwd: False)
+    monkeypatch.setattr(hook, "_outgoing_diff", lambda cwd: _FINGERPRINT_DIFF)
+    hook.main()
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "PUBLIC repo" not in ctx
+    assert "did not resolve" in ctx

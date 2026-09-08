@@ -86,7 +86,7 @@ from pathlib import Path
 # script and when it is imported for tests (mirrors git_push_guard.py:27).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
-from shell_parse import analyze, has_trailing_override  # noqa: E402
+from shell_parse import analyze, git_subcommand, has_trailing_override  # noqa: E402
 
 # Make `genesis.contribution.sanitize` importable. The genesis-hook wrapper runs
 # the venv python where genesis is editable-installed, so the import normally
@@ -157,46 +157,41 @@ def _norm_url(url: str) -> str:
     return re.sub(r"\.git$", "", url.strip().lower()).rstrip("/")
 
 
+def _remote_from_argv(argv: list[str]) -> str:
+    """The remote/URL a parsed ``git push`` argv targets; "" for a bare push
+    (the branch's default push remote)."""
+    i = 0
+    while i < len(argv) and argv[i] != "push":
+        i += 1
+    j = i + 1
+    while j < len(argv):
+        tok = argv[j]
+        if tok.startswith("-"):
+            if tok in _PUSH_VALUE_FLAGS and j + 1 < len(argv):
+                j += 2
+                continue
+            j += 1
+            continue
+        return tok
+    return ""  # bare push
+
+
 def _push_remote(cmd: str) -> str | None:
     """The remote/URL a ``git push`` targets, or None if cmd is not a git push.
 
-    Returns "" for a bare ``git push`` (the branch's default push remote).
-    Best-effort argv parse over shell segments; ambiguity resolves toward "" so
-    the caller still scans (an advisory over-informs rather than misses).
+    Reads BOTH facts — is this a push, and where to — from the SAME shared parse.
+    It used to re-split the raw command with a local `re.split`, which put two
+    parsers in one hook that disagreed: the shared one found a push in a
+    multi-line command and this one did not, so `git push private feat` written
+    over two lines came back None, was folded to "" (= the default remote),
+    resolved as origin, and a push to a PRIVATE fork could be blocked as public.
+    Each parser was wrong in a different direction and both ended in a false
+    block. There is now one parser and nothing left to disagree with.
     """
-    for seg in re.split(r"\|\||&&|[;|&]", cmd):
-        try:
-            toks = shlex.split(seg)
-        except ValueError:
+    for seg in analyze(cmd):
+        if seg.exe != "git" or git_subcommand(seg.argv) != "push":
             continue
-        # Skip leading `VAR=val` env assignments, then require `git` as the
-        # command word (so `echo git push` is not mistaken for a push).
-        k = 0
-        while k < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[k]):
-            k += 1
-        if k >= len(toks) or toks[k] != "git":
-            continue
-        i = k + 1
-        # Advance past git global options (and their values) to the subcommand.
-        while i < len(toks) and toks[i].startswith("-"):
-            if toks[i] in _GIT_GLOBAL_VALUE_OPTS and i + 1 < len(toks):
-                i += 2
-            else:
-                i += 1
-        if i >= len(toks) or toks[i] != "push":
-            continue
-        # First non-flag positional after `push` is the remote (or a URL).
-        j = i + 1
-        while j < len(toks):
-            tok = toks[j]
-            if tok.startswith("-"):
-                if tok in _PUSH_VALUE_FLAGS and j + 1 < len(toks):
-                    j += 2
-                    continue
-                j += 1
-                continue
-            return tok
-        return ""  # bare push
+        return _remote_from_argv(seg.argv)
     return None
 
 
@@ -385,7 +380,11 @@ def _push_segments(cmd: str) -> list:
     call and DOES parse those spellings, so the operator gets its approval prompt,
     which reads as "this push was reviewed", with no privacy verdict behind it.
     """
-    return [s for s in analyze(cmd) if s.exe == "git" and "push" in s.argv]
+    # `git_subcommand`, not `"push" in argv`: a membership test treats a REF
+    # named push as a push, so `git checkout push` / `git branch push` would be
+    # scanned and could be refused — a false block on a command that publishes
+    # nothing.
+    return [s for s in analyze(cmd) if s.exe == "git" and git_subcommand(s.argv) == "push"]
 
 
 def main() -> None:
@@ -397,12 +396,9 @@ def main() -> None:
         push_segs = _push_segments(cmd)
         if not push_segs:
             return  # not a git push
-        # The remote NAME still comes from the local parser; when it cannot read
-        # one, "" means "the branch's default push remote", which resolves the
-        # same way a bare `git push` does.
-        remote = _push_remote(cmd)
-        if remote is None:
-            remote = ""
+        # The remote comes from the SAME segment that established this is a push,
+        # so the two facts can never come from different readings of the command.
+        remote = _remote_from_argv(push_segs[0].argv)
         # All git calls below share ONE wall-clock budget (see _GIT_BUDGET_S) so
         # the chain can never approach the hook's CC timeout (a timeout = block).
         global _deadline
@@ -470,11 +466,20 @@ def main() -> None:
         if overridden and fingerprint_findings:
             header += (
                 "⚠️ OVERRIDDEN: '# privacy-override' waived a block on "
-                f"{len(fingerprint_findings)} exact fingerprint match(es). "
+                f"{len(fingerprint_findings)} fingerprint match(es). "
                 "This push publishes them. "
             )
+        # Say what is known. On the `unknown` path the remote did not resolve, so
+        # asserting "the PUBLIC repo" states as fact the very thing that could not
+        # be determined — and an advisory that overstates its own certainty is how
+        # a reader learns to discount it.
+        where = (
+            "This push to the PUBLIC repo adds"
+            if target == "public"
+            else "This push adds (its remote did not resolve, so whether it is public is unknown)"
+        )
         context = (
-            header + "This push to the PUBLIC repo adds lines matching private-data "
+            header + where + " lines matching private-data "
             "patterns. Before it lands, confirm each is a generic placeholder "
             "(safe) or scrub the real value:\n"
             + "\n".join(_render(fingerprint_findings + class_findings)[:_MAX_LINES])
