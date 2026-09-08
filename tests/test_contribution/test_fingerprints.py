@@ -479,3 +479,151 @@ def test_sync_secret_no_gh_skips(tmp_path, monkeypatch):
     monkeypatch.setattr(fp.subprocess, "run", boom)
     ok = fp.sync_secret(path=fpfile, repo_root=Path("/x"), home=tmp_path)
     assert ok is False  # degrades cleanly when gh is absent
+
+
+# ── tailnet harvest (the peer half is the point) ────────────────────────────
+class TestTailnetHarvest:
+    """A leaked tailnet address belonged to a PEER, not to this machine.
+
+    `ip -4 addr` sees only the local address, so a local-interface harvest would
+    never have known the value that actually reached a public repo. The harvest
+    reads the whole tailnet for that reason.
+    """
+
+    _STATUS = {
+        "Self": {"TailscaleIPs": ["100.64.0.9", "fd7a:1:2::9"]},
+        "Peer": {
+            "nodekey:aaa": {"TailscaleIPs": ["100.64.0.10"]},
+            "nodekey:bbb": {"TailscaleIPs": ["100.100.5.6", "fd7a:1:2::b"]},
+        },
+    }
+
+    def _run(self, monkeypatch, *, stdout, returncode=0, boom=None):
+        import json as _json
+        import subprocess as _sp
+
+        from genesis.contribution import fingerprints as fp
+
+        def fake_run(*a, **k):
+            if boom:
+                raise boom
+            return _sp.CompletedProcess(a[0], returncode, stdout, "")
+
+        monkeypatch.setattr(fp.subprocess, "run", fake_run)
+        return fp._harvest_tailnet_addrs(), _json
+
+    def test_harvests_peer_hostnames_too(self, monkeypatch):
+        """A MagicDNS name is not address-shaped, so NOTHING else would catch it.
+
+        It does not trip the generic portability advisory either, so a leaked
+        tailnet hostname would reach a public repo with no signal at all.
+        """
+        import json as _json
+
+        status = {
+            "Self": {"TailscaleIPs": ["100.64.0.9"], "HostName": "workstation-alpha"},
+            "Peer": {
+                "nodekey:aaa": {
+                    "TailscaleIPs": ["100.64.0.10"],
+                    "HostName": "buildbox-zeta",
+                    "DNSName": "buildbox-zeta.tail1234.ts.net.",
+                }
+            },
+        }
+        got, _ = self._run(monkeypatch, stdout=_json.dumps(status))
+        assert "workstation-alpha" in got, "self hostname must be harvested"
+        assert "buildbox-zeta" in got, "a PEER hostname must be harvested"
+
+    def test_a_generic_hostname_is_not_turned_into_a_pattern(self, monkeypatch):
+        """`_specific_token` keeps a common word from matching ordinary prose."""
+        import json as _json
+
+        status = {"Self": {"TailscaleIPs": [], "HostName": "genesis"}}
+        got, _ = self._run(monkeypatch, stdout=_json.dumps(status))
+        assert "genesis" not in got
+
+    def test_the_harvest_is_bounded(self, monkeypatch):
+        """A very large tailnet must not inflate a per-line x per-pattern scan."""
+        import json as _json
+
+        from genesis.contribution import fingerprints as fp
+
+        peers = {
+            f"nodekey:{i}": {"TailscaleIPs": [f"100.100.{i // 254}.{i % 254}"]}
+            for i in range(fp._MAX_TAILNET_PATTERNS + 200)
+        }
+        got, _ = self._run(monkeypatch, stdout=_json.dumps({"Peer": peers}))
+        assert len(got) <= fp._MAX_TAILNET_PATTERNS + 1
+
+    def test_harvests_peers_not_just_self(self, monkeypatch):
+        import json as _json
+
+        got, _ = self._run(monkeypatch, stdout=_json.dumps(self._STATUS))
+        assert "100.64.0.9" in got, "self must be included"
+        assert "100.64.0.10" in got, "a PEER address must be included — the leak case"
+        assert "100.100.5.6" in got
+
+    def test_ignores_v6_which_the_ula_harvest_already_covers(self, monkeypatch):
+        import json as _json
+
+        got, _ = self._run(monkeypatch, stdout=_json.dumps(self._STATUS))
+        assert not any(":" in a for a in got)
+
+    def test_ignores_addresses_outside_the_cgnat_range(self, monkeypatch):
+        import json as _json
+
+        got, _ = self._run(
+            monkeypatch,
+            stdout=_json.dumps({"Self": {"TailscaleIPs": ["192.168.1.5", "8.8.8.8"]}}),
+        )
+        assert got == []
+
+    def test_missing_tailscale_yields_nothing_and_never_raises(self, monkeypatch):
+        got, _ = self._run(monkeypatch, stdout="", boom=FileNotFoundError("tailscale"))
+        assert got == []
+
+    def test_unauthenticated_or_failing_tailscale_yields_nothing(self, monkeypatch):
+        got, _ = self._run(monkeypatch, stdout="", returncode=1)
+        assert got == []
+
+    def test_garbage_json_yields_nothing_and_never_raises(self, monkeypatch):
+        got, _ = self._run(monkeypatch, stdout="not json at all")
+        assert got == []
+
+    def test_harvest_can_be_switched_off(self, monkeypatch, tmp_path):
+        """run_tailscale=False must not shell out at all."""
+        from genesis.contribution import fingerprints as fp
+
+        called = {"n": 0}
+
+        def fake(*a, **k):
+            called["n"] += 1
+            raise AssertionError("should not run")
+
+        monkeypatch.setattr(fp, "_harvest_tailnet_addrs", fake)
+        fp.harvest(home=tmp_path, repo_root=tmp_path, run_ip6=False, run_tailscale=False)
+        assert called["n"] == 0
+
+
+def test_harvest_actually_emits_tailnet_addresses(monkeypatch, tmp_path):
+    """The collector must be WIRED INTO harvest(), not merely exist.
+
+    Without this, deleting the call from harvest() leaves every collector test
+    above green while the addresses never reach the fingerprint file — the
+    built-but-not-wired failure, which is invisible precisely because the unit
+    under test still works perfectly on its own.
+    """
+    from genesis.contribution import fingerprints as fp
+
+    monkeypatch.setattr(fp, "_harvest_tailnet_addrs", lambda: ["100.64.0.42"])
+    patterns = fp.harvest(home=tmp_path, repo_root=tmp_path, run_ip6=False)
+
+    # Assert on BEHAVIOUR, not representation: the emitted pattern is an escaped,
+    # word-bounded regex (\b100\.64\.0\.42\b), so a substring check would fail
+    # for the wrong reason. What matters is that it matches the address.
+    import re as _re
+
+    assert any(_re.search(pat, "HOST = '100.64.0.42'") for pat, _ in patterns), (
+        "harvest() dropped the tailnet addresses on the floor"
+    )
+    assert any(comment == "tailnet address" for _, comment in patterns)

@@ -186,6 +186,13 @@ def _over_clear(command: str, payload: dict, segs: list | None = None) -> None:
         clear_marker(cwd=cwd)
 
 
+#: git's success line: ``[<branch> <sha>] <subject>``. Covers ``--amend``, a
+#: detached HEAD (``[detached HEAD abc1234]``) and a root commit
+#: (``[main (root-commit) abc1234]``). Absence of it in READABLE stdout is
+#: positive evidence that no commit was created.
+_COMMIT_OK = re.compile(r"^\[.+ [0-9a-f]{7,40}\]", re.MULTILINE)
+
+
 def main() -> None:
     payload = read_payload()
 
@@ -205,16 +212,40 @@ def main() -> None:
     elif not _STRICT_COMMIT.search(command):
         sys.exit(0)  # no parser: fall back to strict adjacency, never over-clear
 
-    # Only invalidate on successful commits (exit code 0)
+    # Only invalidate when the commit actually SUCCEEDED.
+    #
+    # The previous version read stdout and stderr and then ignored both (two
+    # `noqa: F841` locals), leaving the `error` key as the sole signal. Neither
+    # of the two ways a commit really fails sets it, and both were MEASURED
+    # clearing the marker for a commit that produced nothing:
+    #
+    #   1. a PreToolUse BLOCK (the review gate itself, or any other guard) — the
+    #      tool never ran;
+    #   2. a git-level failure (`fatal: could not read log file ...`).
+    #
+    # Either one created a livelock: mark -> commit refused -> marker cleared ->
+    # mark -> refused again, with nothing in the message explaining why the
+    # freshly-written marker had gone stale.
+    #
+    # Fix shape matters here. The safe direction is ASYMMETRIC: over-clearing
+    # only costs a re-review, while under-clearing lets a later commit ride a
+    # marker that never covered it. So the unknown case still invalidates, as
+    # before — this only adds the POSITIVE-evidence path for stdout we can
+    # actually read.
     try:
         result = tool_response(payload)
-        # CC wraps Bash results — check for error indicators
-        _stdout = result.get("stdout", "")  # noqa: F841
-        _stderr = result.get("stderr", "")  # noqa: F841
-        # A successful git commit prints to stdout with the branch and hash
-        # A failed commit (e.g. pre-commit hook) has non-zero exit
         if "error" in result and result["error"]:
-            sys.exit(0)  # Commit failed, don't invalidate
+            sys.exit(0)  # explicit error — commit failed
+        # git prints "[<branch> <sha>] <subject>" on success — including for
+        # --amend, a detached HEAD, and a root commit. Readable output that does
+        # NOT contain it is positive evidence that no commit was created.
+        stdout = result.get("stdout")
+        if (
+            isinstance(stdout, str)
+            and stdout.strip()
+            and not _COMMIT_OK.search(stdout)
+        ):
+            sys.exit(0)
     except (json.JSONDecodeError, AttributeError):
         pass  # Can't parse result — be conservative, invalidate anyway
 

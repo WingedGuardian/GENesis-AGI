@@ -52,6 +52,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ipaddress
+import json
 import os
 import socket
 import subprocess
@@ -93,6 +95,16 @@ STOPWORDS = frozenset(
 )
 
 #: Hostnames/IPs that are never install-private (loopback / unspecified).
+#: Tailscale's IPv4 space (RFC 6598 CGNAT). A protocol fact, not an install value.
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+
+#: Ceiling on harvested tailnet patterns. Derived from the SCAN cost, not from
+#: an observed tailnet size: _check_fingerprints is per-added-line x per-pattern,
+#: and the hook runs inside CC's tool timeout, where a timeout is treated as a
+#: block. A few hundred patterns keeps that comfortably bounded while covering
+#: any realistic personal tailnet.
+_MAX_TAILNET_PATTERNS = 256
+
 _HOST_SKIP = frozenset({"127.0.0.1", "0.0.0.0", "localhost", "::1", ""})  # noqa: S104 — skip-list, not a bind address
 
 #: A bare token (hostname, host_user) must clear this length AND not be a
@@ -198,6 +210,7 @@ def harvest(
     home: Path | None = None,
     repo_root: Path | None = None,
     run_ip6: bool = True,
+    run_tailscale: bool = True,
 ) -> list[tuple[str, str]]:
     """Collect ``(pattern, comment)`` pairs from local config/environment.
 
@@ -276,6 +289,23 @@ def harvest(
         for prefix in _harvest_ula_prefixes():
             out.append((_escape(prefix), "IPv6 ULA prefix"))
 
+    # 3b. Tailnet IPv4 addresses — THE WHOLE TAILNET, not just this machine.
+    #
+    # Deliberately peers-and-self rather than local interfaces only. A leak of a
+    # PEER's tailnet address is the case that actually happened: the address that
+    # reached a public repo belonged to another machine on this tailnet, so an
+    # `ip -4 addr` harvest (which sees only the local address) would not have
+    # caught it. Every address the tailnet hands out is a value this install
+    # KNOWS, and a known value can be matched exactly — which is what makes
+    # blocking on it free of false positives.
+    #
+    # The generic CGNAT-range check in scripts/check_portability.sh stays where
+    # it is; it cannot tell a documentation literal from a real node, and that
+    # is precisely the distinction this list adds.
+    if run_tailscale:
+        for addr in _harvest_tailnet_addrs():
+            out.append((_bounded(addr), "tailnet address"))
+
     # 4. $HOME absolute path (covers all /home/<user>/... leaks locally).
     with contextlib.suppress(Exception):
         out.append((_escape(str(home).rstrip("/") + "/"), "home directory path"))
@@ -338,6 +368,93 @@ def _harvest_ula_prefixes() -> list[str]:
             seen.add(prefix)
             prefixes.append(prefix)
     return prefixes
+
+
+def _harvest_tailnet_addrs() -> list[str]:
+    """Every IPv4 tailnet address this node knows — its own AND its peers'.
+
+    Peers matter more than self here. The leak this exists to prevent was a
+    PEER's address reaching a public repo, which a local-interface scan cannot
+    see. ``tailscale status`` reports the whole tailnet, and each address in it
+    is a literal this install knows exactly.
+
+    Returns ``[]`` if ``tailscale`` is absent, unauthenticated, errors, or times
+    out — never raises. An install without Tailscale simply contributes nothing,
+    exactly as an install without IPv6 ULA addresses does.
+    """
+    try:
+        proc = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        status = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _take(raw: object) -> None:
+        if not isinstance(raw, str):
+            return
+        addr = raw.strip()
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return
+        # v4 CGNAT only. Tailscale's v6 space is a ULA and is already covered by
+        # the IPv6 prefix harvest above; adding it here would duplicate.
+        if ip.version != 4 or ip not in _TAILNET_V4:
+            return
+        if addr not in seen:
+            seen.add(addr)
+            found.append(addr)
+
+    def _take_name(raw: object) -> None:
+        """Tailnet HOSTNAMES leak too, and nothing else would catch them.
+
+        A MagicDNS name is not RFC1918/CGNAT/ULA-shaped, so it does not even
+        trip the generic portability advisory — it would reach a public repo
+        with NO signal at all. Filtered by the same specificity rule the local
+        hostname uses, so a generic name like "genesis" is not turned into a
+        pattern that matches ordinary prose.
+        """
+        if not isinstance(raw, str):
+            return
+        name = raw.strip().rstrip(".")
+        # A DNSName arrives fully qualified; the leading label is the useful part.
+        for candidate in {name, name.split(".", 1)[0]}:
+            if candidate and _specific_token(candidate) and candidate not in seen:
+                seen.add(candidate)
+                found.append(candidate)
+
+    node = status.get("Self") if isinstance(status, dict) else None
+    peers = status.get("Peer") if isinstance(status, dict) else None
+    for entry in ([node] if isinstance(node, dict) else []) + (
+        list(peers.values()) if isinstance(peers, dict) else []
+    ):
+        if not isinstance(entry, dict):
+            continue
+        for raw in entry.get("TailscaleIPs") or []:
+            _take(raw)
+        _take_name(entry.get("HostName"))
+        _take_name(entry.get("DNSName"))
+        if len(found) >= _MAX_TAILNET_PATTERNS:
+            # Bounded so a very large tailnet cannot inflate the fingerprint file
+            # into a per-line x per-pattern scan that times the hook out. The cap
+            # is REPORTED rather than silent — a truncated pattern set means
+            # later peers are unprotected, which the operator must be able to see.
+            found.append(f"# TRUNCATED at {_MAX_TAILNET_PATTERNS} tailnet patterns")
+            break
+    return [f for f in found if not f.startswith("#")]
 
 
 def build_block(patterns: list[tuple[str, str]]) -> str:

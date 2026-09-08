@@ -11,6 +11,35 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A push carrying your own machine's addresses into the public repo is now
+  refused, not just flagged.** The pre-push privacy check reported every
+  suspicious line and then let the push proceed, because it was advisory by
+  design — and an advisory arrives at the same moment the push completes, so
+  "check this before it lands" described a pause that did not exist. It now
+  refuses outright when a line contains a value your install actually has: a
+  hostname, your home path, a subnet, a tailnet address, a personal email.
+  Generic private-range literals like `192.168.1.5` stay advisory, because
+  those are correct in test code all the time and a check that fires on correct
+  code gets ignored.
+
+- **Your tailnet addresses are now known values.** The leak-detection patterns
+  were built from your machine's own network interfaces, so they covered its
+  IPv6 addresses but never the IPv4 addresses Tailscale assigns — and, more to
+  the point, never the addresses of the OTHER machines on your tailnet. An
+  address belonging to a different machine was therefore invisible to every
+  check. The patterns are now built from the whole tailnet. Existing installs
+  pick this up on the next `bootstrap.sh`, or immediately with
+  `python -m genesis.contribution.fingerprints --write`.
+
+- **A commit that was refused no longer discards your review.** If a commit was
+  blocked by a guard, or failed for an ordinary reason like an unreadable
+  message file, the review marker was cleared anyway — so the next attempt
+  demanded a fresh review, cleared it again, and the author could loop
+  indefinitely with nothing explaining why. The marker is now kept unless the
+  commit actually succeeded.
+
+### Fixed
+
 - **SECURITY.md described a posture the code left behind two months ago.** The
   security policy told operators to treat the dashboard API as
   "unauthenticated administrative access" and said the dashboard password
