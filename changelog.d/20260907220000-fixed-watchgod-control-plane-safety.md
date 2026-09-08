@@ -8,8 +8,12 @@
   "seven days ago" means, it deletes nothing at all. The ORANGE tier no longer
   kills idle Claude Code sessions: sessions are not what fills the temp
   directory, so the kill freed almost nothing while destroying a session's entire
-  context. The /tmp housekeeping now leaves Claude Code's socket directories
-  alone — an empty folder inside a live socket tree is a rendezvous point the
+  context. Its emergency tier now works out which workspace is actually in use
+  from the newest file inside it, rather than from a directory timestamp that
+  stops moving while you work — on one install that timestamp was three days
+  stale and only ten minutes ahead of a long-dormant folder, so the emergency
+  cleanup was a coin flip away from preserving the wrong one. The /tmp
+  housekeeping now leaves Claude Code's socket directories alone — an empty folder inside a live socket tree is a rendezvous point the
   daemon fills in later, not leftover junk.
 
   And a new check reports Claude Code sessions whose messaging socket has been

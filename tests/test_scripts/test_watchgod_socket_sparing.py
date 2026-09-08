@@ -167,3 +167,59 @@ def test_orange_never_touches_old_socket_pin(tmp_path):
         "yellow/orange sweep deleted a socket"
     )
     assert not (cctmp / "claude-skills").exists(), "orange should evict the cache"
+
+
+def test_red_preserves_the_project_with_the_newest_FILE_not_the_newest_DIR(tmp_path):
+    """RED's "preserving active session" must mean the workspace someone is
+    actually using — judged by the newest file inside it, not by a directory's
+    own mtime.
+
+    Same defect as the YELLOW reap had, in the tier where being wrong costs
+    most: a project directory's mtime moves only when a session dir is created
+    or removed under it, never when a live session writes. So the old sort
+    ranked projects by "when did a session last START here".
+
+    MEASURED on a live install: the active project's newest FILE was 3 days newer
+    than its own directory mtime, and that directory led a DORMANT project's by
+    10 minutes. This fixture makes the dormant project win that comparison
+    outright, which is the shape one more dormant session would have produced —
+    RED would preserve the dormant project and reap the active one's workspaces
+    while logging "preserving active session".
+
+    Verify-RED: against the pre-fix selection this fails on the first assertion.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    old = time.time() - 30 * 86400
+
+    # ACTIVE project: stale directory mtime, recently-written file inside.
+    # Aged an HOUR, deliberately: RED's file sweep spares anything touched in the
+    # last 60 seconds, so a just-written file would survive whatever the selection
+    # did and the assertion below would pass for the wrong reason. An hour is
+    # outside that window and still far newer than the dormant project.
+    active = cctmp / "claude-1000" / "-home-dev-active" / "session-a"
+    active.mkdir(parents=True)
+    (active / "live.json").write_bytes(b"a" * 4096)
+    recent = time.time() - 3600
+    os.utime(active / "live.json", (recent, recent))
+    os.utime(active, (recent, recent))
+    os.utime(active.parent, (old, old))  # no NEW session started here in a month
+
+    # DORMANT project: newer directory mtime, nothing written inside for a month.
+    dormant = cctmp / "claude-1000" / "-home-dev-dormant" / "session-b"
+    dormant.mkdir(parents=True)
+    (dormant / "cold.bin").write_bytes(b"b" * 4096)
+    os.utime(dormant / "cold.bin", (old, old))
+    os.utime(dormant, (old, old))
+    # its project dir is left with a NOW mtime — it wins the old comparison
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (active / "live.json").exists(), (
+        "RED reaped the ACTIVE project's files and preserved a dormant one — it "
+        "selected by directory mtime, which does not track writes inside sessions"
+    )
+    assert not (dormant / "cold.bin").exists(), (
+        "the dormant project's files should be reclaimed; if they survive, RED "
+        "preserved everything and this test proves nothing"
+    )

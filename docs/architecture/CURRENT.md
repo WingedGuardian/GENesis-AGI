@@ -2193,6 +2193,18 @@ verified: f24c15e9 2026-09-05
     while destroying a session's whole context. Removed 2026-09-07 (measured: 1
     reach and 0 kills across the entire log history). RED remains the pressure
     valve and still reaps.
+  * **RED decides what to preserve the same way.** "Preserving active session"
+    used to mean the depth-2 project directory with the newest mtime — the same
+    proxy YELLOW got wrong, in the tier where being wrong costs the most, since
+    that mtime moves only when a session dir is created or removed. MEASURED
+    2026-09-07: the active project's newest FILE was 3 days newer than its own
+    directory mtime, and that directory led a DORMANT project's by 10 minutes; one
+    more session started in the dormant project and RED would have preserved that
+    one and reaped 54 live workspaces while logging "preserving active session".
+    Selection is now by newest file anywhere inside. The preserved UNIT stays the
+    project, deliberately: narrowing it to the single session would reap the
+    active project's other sessions, which is more destruction, not better
+    aim — a separate decision from fixing the aim.
 
   Deliberately NOT done: relocating the sockets out of cc-tmp. That is the real
   fix — the control plane should not live in a directory whose purpose is to be

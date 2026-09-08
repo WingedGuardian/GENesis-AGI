@@ -414,10 +414,40 @@ clean_cc_orange() {
 clean_cc_red() {
     log WARN "Zone A RED — NUCLEAR cleanup, preserving active session"
 
-    # Find the most recently modified session UUID dir (the active workspace)
+    # Which workspace is ACTIVE — by the newest file anywhere inside it, not by a
+    # directory's own mtime.
+    #
+    # This is the same defect the YELLOW reap had, in the tier where getting it
+    # wrong costs the most, and fixing it in only one of the two places would have
+    # left the class alive in the nuclear one. Depth 2 is the PROJECT directory,
+    # and its mtime moves only when a session dir is created or removed directly
+    # under it — never when a live session writes. So the sort was ranking
+    # projects by "when did a session last start here", and preserving the winner.
+    #
+    # MEASURED on a live install (2026-09-07): the truly-active project's newest
+    # FILE was 3 days newer than its own directory mtime, and that directory led a
+    # DORMANT project's by 10 minutes. One more session started in the dormant
+    # project and RED would have preserved that one and reaped the active
+    # project's 54 session workspaces — while logging "preserving active session".
+    #
+    # `%T@ %p` over files, taking the max per project: a project with no files at
+    # all cannot win, which is correct — there is nothing there to preserve.
     local newest_session=""
-    newest_session=$(find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*" \
+    newest_session=$(find "$CC_TMP_DIR" -mindepth 3 -type f -path "*/claude-*" \
         -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}') || true
+    if [[ -n "$newest_session" ]]; then
+        # Reduce the winning FILE to its project dir (…/claude-<uid>/<project>),
+        # which is the unit the sweeps below exclude. Deliberately NOT narrowed to
+        # the single session dir, which is what the review that found this
+        # suggested: that would make RED delete the other sessions of the active
+        # project, i.e. MORE destruction in the nuclear tier, and this change is
+        # about preserving the right thing rather than preserving less of it.
+        local _rel="${newest_session#"$CC_TMP_DIR"/}"
+        local _uid="${_rel%%/*}"
+        local _proj="${_rel#*/}"
+        _proj="${_proj%%/*}"
+        newest_session="$CC_TMP_DIR/$_uid/$_proj"
+    fi
 
     # Reap every depth-1 dir except the newest session's ancestor —
     # object-level and socket-sparing (see reap_dir_sparing_sockets); loose
