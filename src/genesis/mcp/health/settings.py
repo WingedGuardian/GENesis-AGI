@@ -1346,6 +1346,9 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     """Validate repo-pulse lever changes (see
     genesis.session_awareness.repo_pulse_config)."""
     from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
+    from genesis.session_awareness.repo_pulse_config import (
+        OPEN_PR_MAX_SURFACE_CAP as _OPEN_PR_CAP,
+    )
 
     errors: list[str] = []
     valid_keys = ("enabled", "open_pr_enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
@@ -1358,6 +1361,16 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "open_pr_max_surface" and (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value > _OPEN_PR_CAP
+        ):
+            # Same contract as pr_watch.max_surface — reject, never silently cap.
+            errors.append(
+                f"'open_pr_max_surface' must be <= {_OPEN_PR_CAP} (the surfacing "
+                "hook caps at that; a larger value would be accepted and ignored)"
+            )
         elif key == "inject_confidence_floor":
             if (
                 isinstance(value, bool)
@@ -1440,7 +1453,7 @@ def _validate_marketing_outreach(changes: dict) -> list[str]:
 def _validate_pr_watch(changes: dict) -> list[str]:
     """Validate pr-watch lever changes (see
     genesis.session_awareness.pr_watch_config)."""
-    from genesis.session_awareness.pr_watch_config import _INT_KNOBS
+    from genesis.session_awareness.pr_watch_config import _INT_KNOBS, MAX_SURFACE_CAP
 
     errors: list[str] = []
     valid_keys = ("enabled", *_INT_KNOBS)
@@ -1452,6 +1465,16 @@ def _validate_pr_watch(changes: dict) -> list[str]:
                 errors.append("'enabled' must be a boolean")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
+        elif key == "max_surface" and value > MAX_SURFACE_CAP:
+            # REJECT rather than silently clamp. The surfacing hook applies
+            # MAX_SURFACE_CAP regardless, so accepting 50 here meant reporting
+            # 50 back to an operator whose config had no effect. A settings
+            # surface that lies about what it accepted is worse than one that
+            # refuses: the operator has no way to notice.
+            errors.append(
+                f"'max_surface' must be <= {MAX_SURFACE_CAP} (the surfacing hook "
+                f"caps at that; a larger value would be accepted and ignored)"
+            )
     return errors
 
 

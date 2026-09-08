@@ -524,7 +524,7 @@ def test_unreadable_essential_knowledge_is_loud_like_an_identity_file(
 #: Every script that writes model-facing stdout through `BoundedStdout`. The
 #: lock below covers ALL of them: it used to read one, while this same branch
 #: created a second emitter — so the class was half-locked and read as locked.
-def _emitters() -> tuple[str, ...]:
+def _emitters(root: Path | None = None) -> tuple[str, ...]:
     """Every script that constructs a `BoundedStdout`, DERIVED not listed.
 
     This was a hardcoded pair, and the branch that added two more emitters did
@@ -539,9 +539,12 @@ def _emitters() -> tuple[str, ...]:
     exists. The empty case is an ERROR, not a pass: a derivation that finds
     nothing is indistinguishable from a lock that checks nothing.
     """
+    base = root or _SCRIPTS_DIR
+    writer = base / "hooks" / "hook_output.py"
     found = tuple(sorted(
-        p.name for p in _SCRIPTS_DIR.glob("*.py")
-        if p.name != "hook_output.py" and "BoundedStdout(" in p.read_text(encoding="utf-8")
+        str(p.relative_to(base)) for p in base.rglob("*.py")
+        if p.resolve() != writer.resolve()
+        and "BoundedStdout(" in p.read_text(encoding="utf-8")
     ))
     assert found, "no BoundedStdout emitters found -- the derivation is broken"
     return found
@@ -815,3 +818,30 @@ def test_a_malformed_probe_value_does_not_silence_the_injection(tmp_path):
     assert "_[ctx charter:" in r.stdout, "a malformed probe value silenced the whole part"
     assert "PROBE" in r.stderr, "the malformed value must be reported, not ignored"
     assert "PROBE-START" not in r.stdout, "probe mode must not engage on garbage"
+
+
+def test_the_emitter_derivation_reaches_NESTED_scripts(tmp_path) -> None:
+    """`scripts/hooks/` is the established hook location, and a non-recursive
+    glob omitted it.
+
+    This needs a FIXTURE, not the live tree: no emitter lives under `scripts/`
+    today, so recursive and non-recursive derivations return the same four names
+    and a mutation between them is behaviourally null. Measured — the `rglob`
+    mutation survived a full run before this test existed. A latent gap needs a
+    constructed case or it is not pinned at all.
+    """
+    (tmp_path / "hooks").mkdir()
+    (tmp_path / "top.py").write_text("BoundedStdout(label='a')\n", encoding="utf-8")
+    (tmp_path / "hooks" / "nested.py").write_text(
+        "BoundedStdout(label='b')\n", encoding="utf-8"
+    )
+    (tmp_path / "hooks" / "hook_output.py").write_text(
+        "class BoundedStdout(...)\n", encoding="utf-8"
+    )
+    (tmp_path / "unrelated.py").write_text("print('x')\n", encoding="utf-8")
+
+    found = _emitters(tmp_path)
+    assert "top.py" in found
+    assert "hooks/nested.py" in found, "a nested emitter is invisible to the lock"
+    assert not any("hook_output" in f for f in found), "the writer excludes itself"
+    assert "unrelated.py" not in found

@@ -57,12 +57,22 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[2]
 _SETTINGS = _REPO / ".claude" / "settings.json"
 
-#: The two events whose hooks write bare stdout the model reads. Everything else
+#: The events whose hooks write bare stdout the model reads. Everything else
 #: reaches the model only through the JSON channel — see SCOPE above.
-_BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit")
+#:
+#: `UserPromptExpansion` was MISSING, and the omission contradicted this repo's
+#: own documented contract: `scripts/hooks/hook_output.py` states "Only
+#: SessionStart, UserPromptSubmit and UserPromptExpansion put a hook's bare
+#: stdout in front of the model". The gate enumerated two of the three, so a hook
+#: wired to the third would have passed an allowlist whose entire guarantee is
+#: that a newly wired model-facing hook fails by construction. The list is
+#: therefore taken FROM that docstring rather than restated from memory.
+_BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit", "UserPromptExpansion")
 
 #: Hooks whose model-facing output CANNOT reach the cap by construction, so how
 #: they print does not matter.
@@ -91,8 +101,12 @@ _STRUCTURALLY_BOUNDED = {
     ),
     "scripts/hooks/skill_injection_hook.py": (
         "_MAX_CATALOG_NUDGES = 2 (:31) applied at :278, plus at most 2 literal "
-        "process nudges from _check_process_discipline (:179-226); descriptions "
-        "sliced [:80]/[:60] at :284/:288/:293"
+        "process nudges from _check_process_discipline (:179-226). EVERY "
+        "user-authored field is sliced in code: name [:80], path [:120], "
+        "description [:80]/[:60]. The row previously cited only the description "
+        "slices, which made the claim false -- name and path come from skill "
+        "frontmatter that generate_skill_catalog.py accepts unsliced, so a long "
+        "name alone could carry this exempt hook past the cap"
     ),
     "scripts/contribution_offer_hook.py": (
         "one fixed f-string; sha[:12] and subject[:200] (:63) are its only "
@@ -201,17 +215,43 @@ def unbounded_stdout_offenders(src: str) -> list[str]:
     ``print(x, **kw)`` is flagged: a `**kwargs` entry has ``arg is None``, so it
     never satisfies the file= test. That direction fails CLOSED, which is right.
     """
-    # split("\n"), NOT splitlines(): the latter also breaks on \x0c, \x85 and
-    # \u2028/9, while CPython's tokenizer treats a form feed as ordinary
-    # whitespace. One form feed anywhere above a waiver desynced the index and
-    # the waiver was silently ignored -- MEASURED: 3 "lines" vs the tokenizer's
-    # 2. It fails CLOSED (a legitimate exemption is dropped, so a routed hook
-    # reads as an offender) which is the safe direction, but a gate that refuses
-    # a correct waiver teaches people to distrust it.
-    lines = src.split("\n")
+
+    def _waived_lines() -> set[int]:
+        """Lines carrying a REAL, REASONED exemption comment.
+
+        Two independent bypasses, both MEASURED before this was rewritten:
+          * `# hook-output-exempt:` with nothing after the colon was accepted,
+            despite the stated contract that every waiver carries a reason. A
+            waiver whose whole purpose is to record WHY cannot be satisfied by
+            an empty string.
+          * The marker inside a STRING LITERAL on the output call silenced it —
+            `sys.stdout.write("# hook-output-exempt: fake")` exempted itself.
+            A substring test over raw source cannot tell a comment from data.
+
+        So the source is TOKENIZED and only `tokenize.COMMENT` tokens count —
+        the shape `scripts/check_frozen_clock.py` already uses, and the
+        best-engineered waiver in this repo. An untokenizable file yields NO
+        waivers, which fails toward scanning rather than toward exemption.
+        """
+        waived: set[int] = set()
+        try:
+            import io
+            import tokenize
+
+            for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                if tok.type != tokenize.COMMENT or _EXEMPT_MARKER not in tok.string:
+                    continue
+                reason = tok.string.split(_EXEMPT_MARKER, 1)[1].strip()
+                if reason:  # an empty reason is not a waiver
+                    waived.add(tok.start[0])
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return set()  # unparseable -> no waivers -> everything is scanned
+        return waived
+
+    _WAIVED = _waived_lines()
 
     def _has_marker(lineno: int) -> bool:
-        return 0 < lineno <= len(lines) and _EXEMPT_MARKER in lines[lineno - 1]
+        return lineno in _WAIVED
 
     def _is_stdout_stream(node: ast.AST) -> bool:
         """`sys.stdout`, `sys.__stdout__`, or the `.buffer` behind either.
@@ -290,6 +330,20 @@ def test_every_model_facing_hook_is_bounded_or_exempt() -> None:
 
     for event, name, path in _wired():
         if name in listed:
+            # An exemption is not a licence to vanish. The early `continue` used
+            # to skip the existence check below, so a hook deleted or renamed
+            # while its settings entry remained stayed "exempt" and CI accepted a
+            # configuration that fails at runtime. The sibling test compares
+            # command-derived NAMES only, so it stayed green too.
+            if path is None:
+                failures.append(
+                    f"{event}: exempt entry {name!r} resolves to no script"
+                )
+            elif not path.exists():
+                failures.append(
+                    f"{event} {name}: EXEMPT but missing at {path} — an exemption "
+                    "for a hook that no longer exists is a stale row, not a waiver"
+                )
             continue
         if path is None:
             failures.append(f"{event}: cannot resolve a script from {name!r}")
@@ -441,3 +495,105 @@ def test_a_form_feed_does_not_desync_the_waiver_index() -> None:
     assert unbounded_stdout_offenders(with_ff) == [], (
         "a form feed above the waiver desynced the line index and dropped it"
     )
+
+
+# ---------------------------------------------------------------------------
+# CLASS A — enumeration coverage.
+# ---------------------------------------------------------------------------
+
+def test_every_bare_stdout_event_is_gated() -> None:
+    """The gated set is taken FROM the writer's docstring, not from memory.
+
+    `UserPromptExpansion` was missing, and the omission contradicted this repo's
+    own documented contract: hook_output.py states that exactly three events put
+    a hook's bare stdout in front of the model. Enumerating two of three means a
+    hook wired to the third passes an allowlist whose whole guarantee is that a
+    newly wired model-facing hook fails by construction.
+    """
+    doc = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(encoding="utf-8")
+    for event in ("SessionStart", "UserPromptSubmit", "UserPromptExpansion"):
+        assert event in doc, f"{event} is no longer named by the writer's docstring"
+        assert event in _BARE_STDOUT_EVENTS, (
+            f"{event} carries bare stdout per hook_output.py but is not gated"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLASS B — exemption integrity. A waiver must be REAL and must SAY something.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "src,exempt",
+    [
+        ("import sys\nsys.stdout.write('x')  # hook-output-exempt: probe emits verbatim", True),
+        # No reason: a waiver whose purpose is to record WHY cannot be satisfied
+        # by an empty string.
+        ("import sys\nsys.stdout.write('x')  # hook-output-exempt:", False),
+        ("import sys\nsys.stdout.write('x')  # hook-output-exempt:   ", False),
+        # In a STRING literal: a substring test over raw source cannot tell a
+        # comment from data, and this silenced the call it appeared in.
+        ("import sys\nsys.stdout.write('# hook-output-exempt: fake')", False),
+        # A form feed desyncs splitlines() from the tokenizer; tokenizing removes
+        # the line-index scheme that made that possible at all.
+        ("import sys\x0c\nsys.stdout.write('x')  # hook-output-exempt: probe", True),
+    ],
+    ids=["reasoned", "empty", "whitespace-only", "in-a-string", "after-form-feed"],
+)
+def test_only_a_real_reasoned_comment_waives(src, exempt) -> None:
+    assert (unbounded_stdout_offenders(src) == []) is exempt
+
+
+def test_an_unparseable_hook_raises_rather_than_passing_silently() -> None:
+    """`ast.parse` guards the waiver logic, so an unparseable hook never reaches
+    the tokenizer at all -- it RAISES, and the gate fails loudly.
+
+    Pinned because the alternative is the failure this whole gate exists to
+    prevent: a hook the detector could not read scoring as clean. The tokenizer's
+    own TokenError branch is therefore unreachable through this entry point and
+    is belt-and-braces, which is worth saying rather than implying it is load
+    bearing.
+    """
+    with pytest.raises(SyntaxError):
+        unbounded_stdout_offenders("def f(:\n    pass  # hook-output-exempt: nope")
+
+
+# ---------------------------------------------------------------------------
+# CLASS C — an exemption may only cite a bound configuration cannot change.
+# ---------------------------------------------------------------------------
+
+def test_the_surfacing_caps_are_one_constant_shared_by_clamp_and_validator() -> None:
+    """The hook CLAMPED to 20 while the validator accepted any positive int, so a
+    config of 50 was accepted, reported back as 50, and silently ignored. A
+    settings surface that lies about what it accepted is worse than one that
+    refuses -- the operator has no way to notice."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(_REPO / "src"))
+    from genesis.mcp.health.settings import _validate_pr_watch, _validate_repo_pulse
+    from genesis.session_awareness.pr_watch_config import MAX_SURFACE_CAP
+    from genesis.session_awareness.repo_pulse_config import OPEN_PR_MAX_SURFACE_CAP
+
+    # The hooks must clamp to the CONSTANT, not a literal that can drift from it.
+    for script, const_name in (
+        ("surface_pr_updates.py", "MAX_SURFACE_CAP"),
+        ("surface_open_prs.py", "OPEN_PR_MAX_SURFACE_CAP"),
+    ):
+        body = (_REPO / "scripts" / script).read_text(encoding="utf-8")
+        assert const_name in body, f"{script} no longer clamps to the shared constant"
+
+    assert _validate_pr_watch({"max_surface": MAX_SURFACE_CAP + 1}), "over-cap accepted"
+    assert not _validate_pr_watch({"max_surface": MAX_SURFACE_CAP}), "at-cap rejected"
+    assert _validate_repo_pulse({"open_pr_max_surface": OPEN_PR_MAX_SURFACE_CAP + 1})
+    assert not _validate_repo_pulse({"open_pr_max_surface": OPEN_PR_MAX_SURFACE_CAP})
+
+
+def test_the_skill_exemption_bounds_every_user_authored_field() -> None:
+    """The row claimed structural boundedness while citing only the description
+    slices. `name` and `path` come from user-authored frontmatter that the
+    catalog accepts unsliced, so a long name alone could carry this exempt hook
+    past the cap -- and the gate skips scanning an exempt hook entirely."""
+    body = (_REPO / "scripts" / "hooks" / "skill_injection_hook.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'skill.get("name", "")[:80]' in body, "the skill name is unbounded again"
+    assert "[:120]" in body, "the skill path is unbounded again"

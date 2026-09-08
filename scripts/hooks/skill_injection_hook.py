@@ -276,7 +276,16 @@ def main() -> None:
         # Catalog budget is independent of process nudges — process nudges
         # keep their own slots and never crowd out skill suggestions.
         for _score, skill in candidates[:_MAX_CATALOG_NUDGES]:
-            name = skill.get("name", "")
+            # Bounded IN CODE, because the exemption this hook holds in
+            # tests/test_scripts/test_hook_output_contract.py claims it cannot
+            # reach the harness cap by construction -- and that was only true of
+            # the description. `name` and `path` come from a user-authored skill
+            # frontmatter, which `generate_skill_catalog.py` accepts unsliced, so
+            # a long name alone could push this exempt hook past the cap while
+            # the gate skipped scanning it. The bound is a DISPLAY bound on a
+            # label rendered next to a hard external cap, not a storage decision:
+            # the catalog keeps the full value, this line only shows one.
+            name = skill.get("name", "")[:80]
             tier = skill.get("tier", "?")
             desc = skill.get("description", "")
 
@@ -285,7 +294,7 @@ def main() -> None:
             elif skill.get("path"):
                 print(
                     f"[Skill] The '{name}' skill matches this task. "
-                    f"Read {skill['path']}/SKILL.md. {desc[:60]}"
+                    f"Read {str(skill['path'])[:120]}/SKILL.md. {desc[:60]}"
                 )
             else:
                 print(
