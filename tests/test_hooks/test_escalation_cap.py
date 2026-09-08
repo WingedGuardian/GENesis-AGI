@@ -10,6 +10,7 @@ convention.)
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -25,6 +26,8 @@ _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
 import review_state  # noqa: E402
+
+COMMIT_WIP = "git" + " commit -m " + chr(34) + "wip" + chr(34)
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -292,7 +295,7 @@ def test_commit_blocked_at_round_cap(repo, home):
 
 def test_escalation_ack_allows_past_cap(repo, home):
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    res = _run_hook('git commit -m "wip"  # escalation-ack:redesign', repo, home)
     assert res.returncode == 0, res.stderr
 
 
@@ -342,7 +345,7 @@ def test_escalation_ack_does_not_satisfy_mode_switch(repo, home):
     # The two acks are distinct: at the round-2 mode-switch the gate wants the
     # AUDIT ack, not the round-3 user-decision ack. A wrong sigil stays blocked.
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    res = _run_hook('git commit -m "wip"  # escalation-ack:redesign', repo, home)
     assert res.returncode == 2, res.stdout + res.stderr
     assert "mode-switch" in res.stderr
 
@@ -393,7 +396,7 @@ def test_ack_resets_budget_no_permanent_friction(repo, home):
     # Acking is a fresh decision → resets the round budget, so subsequent commits
     # (back under the cap) don't each need a fresh ack.
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    r1 = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    r1 = _run_hook('git commit -m "wip"  # escalation-ack:redesign', repo, home)
     assert r1.returncode == 0, r1.stderr  # ack allows + resets the counter
     _git(repo, "commit", "-qm", "wip")  # actually land it
     _stage(repo, "more = 1\n")
@@ -452,7 +455,7 @@ def test_docs_only_commit_still_blocked_at_cap(repo, home):
     assert res.returncode == 2, res.stdout + res.stderr
     assert "escalation cap" in res.stderr
     # ...and an ack lets the docs commit through.
-    res2 = _run_hook('git commit -m "docs"  # escalation-ack', repo, home)
+    res2 = _run_hook('git commit -m "docs"  # escalation-ack:redesign', repo, home)
     assert res2.returncode == 0, res2.stderr
 
 
@@ -962,7 +965,7 @@ def test_commit_blocked_at_final_round(repo, home):
 def test_escalation_ack_does_not_clear_the_final_round_block(repo, home):
     """The whole point: the repeatable sigil must stop working at the terminal."""
     _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    res = _run_hook('git commit -m "wip"  # escalation-ack:redesign', repo, home)
     assert res.returncode == 2, res.stdout + res.stderr
     assert "final" in res.stderr.lower()
 
@@ -1028,10 +1031,10 @@ def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
     assert denied.returncode == 2, denied.stdout + denied.stderr
     assert "already used" not in denied.stderr.lower()
     # The acceptance must still be available to the co-required form.
-    ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack', repo, home)
+    ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack:redesign', repo, home)
     assert ok.returncode == 0, ok.stdout + ok.stderr
     # ...and only NOW is it spent.
-    after = _run_hook('git commit -m "more"  # final-round-accept escalation-ack', repo, home)
+    after = _run_hook('git commit -m "more"  # final-round-accept escalation-ack:redesign', repo, home)
     assert after.returncode == 2, after.stdout + after.stderr
     assert "already used" in after.stderr.lower(), after.stderr
 
@@ -1105,7 +1108,7 @@ def test_below_final_round_the_normal_cycle_still_applies(repo, home):
     without = _run_hook('git commit -m "wip"', repo, home)
     assert without.returncode == 2, "control: the escalation cap must be blocking here"
     assert "escalation cap" in without.stderr.lower()
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    res = _run_hook('git commit -m "wip"  # escalation-ack:redesign', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
 
 
@@ -1152,8 +1155,8 @@ def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
     assert blocked.returncode == 2, "control: both tiers must be live here"
     assert "FINAL ROUND" in blocked.stderr, "the terminal must be the one blocking"
     for cmd in (
-        'git commit -m "wip"  # final-round-accept escalation-ack',
-        'git commit -m "wip"  # escalation-ack final-round-accept',
+        'git commit -m "wip"  # final-round-accept escalation-ack:redesign',
+        'git commit -m "wip"  # escalation-ack:redesign final-round-accept',
     ):
         # The first accepted commit SPENDS the acceptance, so without this the
         # second order would be blocked by consumption rather than by parsing —
@@ -1168,4 +1171,370 @@ def test_terminal_message_names_the_co_required_sigil(repo, home):
     _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 2
-    assert "final-round-accept escalation-ack" in res.stderr
+    # Must show the ARGUMENT too: since the escalation ack became a named choice,
+    # a printed bare `escalation-ack` would be a command the other gate refuses —
+    # the same unescapable loop, one level down. The old assertion still passed on
+    # the new text by substring, so it would not have caught that.
+    assert "final-round-accept escalation-ack:<remedy>" in res.stderr
+
+
+# ── Gate demand: the remedy set as DATA, not prose ────────────────────────
+#
+# A gate that enumerates remedies in its block message is relying on the session
+# to relay them faithfully. It measurably does not: on 2026-08-31 this exact cap
+# printed three remedies and the relay to the user dropped the first, invented a
+# fourth, and added "ship as-is" — the outcome the cap exists to prevent. Writing
+# the set to state makes it something later layers can CHECK against.
+
+
+def test_a_demand_round_trips_through_state(repo, _isolate_rounds):
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="STOP and get a fresh decision",
+        cwd=str(repo),
+    )
+    d = review_state.read_gate_demand(cwd=str(repo))
+    assert d is not None
+    assert d["gate"] == "escalation-cap"
+    assert [r["key"] for r in d["remedies"]] == ["redesign"]
+    assert d["satisfied_with"] is None
+
+
+def test_no_demand_reads_as_none(repo, _isolate_rounds):
+    assert review_state.read_gate_demand(cwd=str(repo)) is None
+
+
+def test_a_demand_is_scoped_to_its_branch(repo, _isolate_rounds):
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="x",
+        cwd=str(repo),
+    )
+    _git(repo, "checkout", "-q", "-b", "feature/other")
+    assert review_state.read_gate_demand(cwd=str(repo)) is None
+
+
+def test_satisfying_a_demand_retires_it_but_keeps_the_record(repo, _isolate_rounds):
+    """The choice survives as an audit trail; the demand stops gating.
+
+    Deleting it would be simpler and wrong: the whole point is that a later
+    reader can see WHICH remedy was chosen, and a decision the ack erases is not
+    a decision anyone can check.
+    """
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="x",
+        cwd=str(repo),
+    )
+    review_state.satisfy_gate_demand("redesign", cwd=str(repo))
+    assert review_state.read_gate_demand(cwd=str(repo)) is None
+    raw = json.loads((review_state._round_file(str(repo))).read_text())
+    assert raw["gate_demand"]["satisfied_with"] == "redesign"
+
+
+def test_a_demand_survives_the_streak_reset_the_ack_performs(repo, _isolate_rounds):
+    """`reset_review_round` rebuilds the state dict from scratch.
+
+    It must carry the demand across, or the ack — whose own last act is that
+    reset — would erase the record of the decision it just made.
+    """
+    _reach_rounds_unit(repo)
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "shelve", "label": "shelve it"}],
+        required_action="x",
+        cwd=str(repo),
+    )
+    review_state.satisfy_gate_demand("shelve", cwd=str(repo))
+    review_state.reset_review_round(cwd=str(repo))
+    raw = json.loads((review_state._round_file(str(repo))).read_text())
+    assert raw["gate_demand"]["satisfied_with"] == "shelve"
+
+
+def _reach_rounds_unit(repo: Path) -> None:
+    """Give the counter a lifetime + branch so reset_review_round rewrites
+    rather than taking its delete-outright path."""
+    for i in range(1, 3):
+        _stage(repo, f"unit = {i}\n")
+        review_state.bump_review_round(cwd=str(repo), source="external")
+
+
+def test_a_corrupt_round_file_yields_no_demand_rather_than_raising(repo, _isolate_rounds):
+    f = review_state._round_file(str(repo))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("{not json")
+    assert review_state.read_gate_demand(cwd=str(repo)) is None
+
+
+def test_a_non_object_demand_yields_none(repo, _isolate_rounds):
+    """A hand-edited or schema-skewed file must not reach a caller's .get()."""
+    f = review_state._round_file(str(repo))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(
+        json.dumps(
+            {
+                "branch": "feature/x",
+                "round": 3,
+                "last_source": "external",
+                "gate_demand": ["not", "an", "object"],
+            }
+        )
+    )
+    assert review_state.read_gate_demand(cwd=str(repo)) is None
+
+
+# ── The ack must NAME the remedy ──────────────────────────────────────────
+
+
+def test_bare_ack_is_refused_once_a_demand_is_live(repo, home):
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    blocked = _run_hook('git commit -m "wip"', repo, home)
+    assert blocked.returncode == 2, blocked.stdout + blocked.stderr
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    # The refusal must NAME the declared set, or it is unactionable.
+    for key in ("redesign", "narrow", "shelve"):
+        assert key in res.stderr
+
+
+def test_an_invented_remedy_is_refused(repo, home):
+    """The measured failure: "ship as-is" is the outcome the cap exists to stop."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    _run_hook('git commit -m "wip"', repo, home)
+    res = _run_hook('git commit -m "wip"  # escalation-ack:ship-as-is', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "ship-as-is" in res.stderr
+
+
+def test_a_declared_remedy_is_accepted_and_recorded(repo, home):
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    _run_hook('git commit -m "wip"', repo, home)
+    res = _run_hook('git commit -m "wip"  # escalation-ack:redesign', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    raw = json.loads((home / ".genesis" / "review_rounds").glob("*.json").__next__().read_text())
+    assert raw["gate_demand"]["satisfied_with"] == "redesign"
+
+
+def test_the_block_message_prints_the_ack_form_for_every_remedy(repo, home):
+    """The keys are only usable if the block that demands them shows them.
+
+    This is also the fail-open floor: when the state write fails, the message is
+    the ONLY place the session can learn the vocabulary, so it must always carry
+    the runnable form for each remedy rather than prose alone.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2
+    for key in ("redesign", "narrow", "shelve"):
+        assert f"# escalation-ack:{key}" in res.stderr
+
+
+def test_the_cap_still_blocks_when_the_demand_was_never_written(repo, home):
+    """Fail direction: a missing demand must never downgrade to a bare ack.
+
+    The remedy set is a CONSTANT the message renders from, so validation has a
+    source even when the best-effort state write failed. Accepting a bare ack
+    here would reopen the exact hole, silently, on the one path nobody exercises
+    by hand.
+
+    The counter itself is left intact on purpose — deleting the whole round file
+    also deletes the streak, so the cap stops firing for a legitimate reason and
+    the test would pass while proving nothing about the fail direction.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    blocked = _run_hook('git commit -m "wip"', repo, home)
+    assert blocked.returncode == 2, blocked.stdout + blocked.stderr
+    rounds = home / ".genesis" / "review_rounds"
+    files = list(rounds.glob("*.json"))
+    assert files, "counter file should exist"
+    for f in files:
+        state = json.loads(f.read_text())
+        assert state.pop("gate_demand", None) is not None, "the block should declare"
+        assert state.get("round", 0) >= review_state.ESCALATION_ROUND_CAP
+        f.write_text(json.dumps(state))
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "redesign" in res.stderr
+
+
+# ── the escape that is NOT here ───────────────────────────────────────────
+#
+# An earlier version of this change accepted `# escalation-ack:proceed`, verified
+# against an AskUserQuestion recorded in the session transcript. It was removed
+# rather than fixed. Two reasons, and the second is the one that settles it:
+#
+#   1. The evidence could not support the claim. The check deliberately never read
+#      WHICH option the user chose, so a user who picked "Redesign it" licensed a
+#      `:proceed` asserting they had declined everything. Reading the selection
+#      means parsing the harness's prose, which is the fail-open shape this repo
+#      has been bitten by repeatedly.
+#   2. It imported the TERMINAL's answer into this gate. `final-round-accept`
+#      already exists for "accept the outstanding findings and merge", several
+#      rounds further on. Withholding that answer here is what the cap IS; a side
+#      door offering it early, and cheaper than any real remedy, becomes the
+#      default path rather than an escape.
+
+
+def test_the_ack_takes_no_escape_argument(repo, home):
+    """`:proceed` must not be resurrected as a fourth accepted argument."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    _run_hook(COMMIT_WIP, repo, home)
+    res = _run_hook(COMMIT_WIP + "  # escalation-ack:proceed", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "not one of them" in res.stderr
+
+
+def test_a_compound_naming_two_remedies_is_not_a_decision(repo, home):
+    """Two named acks on one command is not a choice.
+
+    Driven END-TO-END. An earlier version of this test ran the helper directly
+    and excused itself with "an earlier rule refuses multi-commit compounds
+    outright, so this cannot reach the ack logic". That claim was FALSE — the
+    compound rule refuses commits into DIFFERENT worktrees and allowlists a pure
+    `--amend` chain, which reaches the ack logic exactly as this does. The
+    concession hid an untaken test, not dead code, and it rested on a claim about
+    a sibling rule nobody re-read.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    _run_hook(COMMIT_WIP, repo, home)
+    res = _run_hook(
+        COMMIT_WIP + "  # escalation-ack:redesign && "
+        + "git" + " commit --amend --no-edit  # escalation-ack:shelve",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "different segments" in res.stderr
+
+
+def test_a_compound_with_one_bare_segment_says_so(repo, home):
+    """Reporting a mixed bare/named ack as a CONFLICT names one remedy and calls
+    it a disagreement — nonsense when only one thing was named."""
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    _run_hook(COMMIT_WIP, repo, home)
+    res = _run_hook(
+        COMMIT_WIP + "  # escalation-ack:redesign && "
+        + "git" + " commit --amend --no-edit  # escalation-ack",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Only some segments named a remedy" in res.stderr
+
+
+def test_the_terminal_demand_is_retired_when_its_sigil_is_honoured(repo, home):
+    """A declare with no satisfy is a permanent false block.
+
+    The terminal declared accept/abandon and nothing ever retired it, so once it
+    fired, every AskUserQuestion on the branch had to carry that menu forever —
+    including questions about something else entirely.
+    """
+    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
+    blocked = _run_hook(COMMIT_WIP, repo, home)
+    assert blocked.returncode == 2
+    files = list((home / ".genesis" / "review_rounds").glob("*.json"))
+    demand = json.loads(files[0].read_text())["gate_demand"]
+    assert demand["gate"] == "final-round-cap"
+    assert demand["satisfied_with"] is None
+    ok = _run_hook(
+        COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home
+    )
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    demand = json.loads(files[0].read_text())["gate_demand"]
+    assert demand["satisfied_with"] == "accept"
+
+
+def test_an_external_mark_does_not_disarm_the_ask_gate(repo, _isolate_rounds):
+    """`bump_review_round` rebuilt the state dict and dropped the demand.
+
+    `reset_review_round` was given a careful carry-forward; the sibling writer was
+    not, so an ordinary `mark --source external` silently retired a live demand.
+    Third field lost that way, which is why the fix is a carry SET rather than
+    another one-off.
+    """
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="relay them",
+        cwd=str(repo),
+    )
+    assert review_state.read_gate_demand(cwd=str(repo)) is not None
+    _stage(repo, "after = 1\n")
+    review_state.bump_review_round(cwd=str(repo), source="external")
+    assert review_state.read_gate_demand(cwd=str(repo)) is not None
+
+
+def test_a_demand_is_scoped_to_the_session_that_owes_it(_isolate_rounds, repo):
+    """Another session on the box must not inherit this session's obligation.
+
+    An earlier revision scanned every round file to work around the writer and
+    reader keying on different directories. MEASURED, that let an unrelated
+    worktree's session be refused a question about something else — and, worse,
+    let it DISCHARGE this session's demand by asking a compliant question of its
+    own. The demand carries its owner instead.
+    """
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="relay them",
+        cwd=str(repo),
+        session_id="sess-A",
+    )
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is not None
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-B") is None
+    # No session id supplied (an older payload shape) still sees it — the filter
+    # narrows, it never invents an owner.
+    assert review_state.read_gate_demand(cwd=str(repo)) is not None
+
+
+def test_a_demand_with_no_recorded_owner_is_visible_to_any_session(_isolate_rounds, repo):
+    """Fail direction on the filter: a demand written before session ids were
+    recorded must keep gating, not silently stop."""
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="relay them",
+        cwd=str(repo),
+    )
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="anyone") is not None
+
+
+def test_satisfy_will_not_stamp_another_gates_demand(repo, _isolate_rounds):
+    """Stamping whatever demand is present corrupts the audit trail and retires
+    a block nobody answered."""
+    review_state.write_gate_demand(
+        gate="final-round-cap",
+        remedies=[{"key": "accept", "label": "accept"}],
+        required_action="x",
+        cwd=str(repo),
+    )
+    review_state.satisfy_gate_demand("redesign", cwd=str(repo), gate="escalation-cap")
+    assert review_state.read_gate_demand(cwd=str(repo)) is not None
+def test_the_new_parser_symbol_is_not_a_module_scope_import():
+    """Structural lock on a fail DIRECTION, not on style.
+
+    `review_enforcement_commit.py` imports from `shell_parse` at module scope,
+    where a failure exits 1 — which CC treats as NON-blocking, so the entire
+    review gate silently disappears. That standing hole is tracked separately;
+    what must not happen is widening it. Adding `trailing_override_arg` there
+    would make version skew between a worktree's copy of this file and the main
+    tree's `shell_parse` enough to trigger it, and that skew is a real
+    configuration on this box (the launcher runs the main tree's script by
+    default).
+
+    Imported inside the function instead, the same skew raises inside `main()`,
+    where `run_guard` converts it to a hard BLOCK. Found by
+    `test_real_module_crash_exits_2`, which went red on exactly this and would
+    have been easy to dismiss as fixture drift.
+    """
+    tree = ast.parse(_HOOK.read_text())
+    for node in tree.body:  # module scope only
+        if isinstance(node, ast.ImportFrom) and node.module == "shell_parse":
+            names = {a.name for a in node.names}
+            assert "trailing_override_arg" not in names, (
+                "moving this to module scope converts a fail-CLOSED skew into a "
+                "fail-OPEN one — see the comment at its call site"
+            )

@@ -1155,6 +1155,49 @@ typed turn writes no transcript, and "newest transcript" mis-attributes a
 concurrent session's — identify your own transcript by before/after set
 difference and send a real turn.
 
+### `PreToolUse` DOES fire for `AskUserQuestion` (measured 2.1.246, 2026-09-06)
+
+The official docs contradict themselves — "There is no built-in
+`AskUserQuestion` hook type" alongside "All tools trigger PreToolUse and
+PostToolUse events" — and grepping the 2.1.246 binary found 51
+`AskUserQuestion` strings but nothing about hook dispatch. Since this repo has
+shipped 15 hooks and 2 inline guards that were SILENTLY INERT (commit
+`e960f547`), that was not a question to answer by wiring and assuming.
+
+MEASURED with a passive marker-writing hook wired at USER level: **it fires.**
+11 real firings recorded. The payload envelope is the ordinary PreToolUse one:
+
+```
+cwd, effort, hook_event_name, permission_mode, prompt_id,
+session_id, tool_input, tool_name, tool_use_id, transcript_path
+```
+
+`tool_input.questions[]` carries `{question, header, multiSelect, options}`,
+and each option carries `{label, description}`.
+
+**`transcript_path` is present, and it is present for `Bash` PreToolUse too**
+(measured separately the same day, identical key set). That is what makes a
+guard able to check a claim against the harness's own record rather than the
+session's assertion about itself.
+
+In the transcript JSONL the tool records as a normal pair: an `assistant`
+record whose content holds `{"type": "tool_use", "name": "AskUserQuestion",
+"input": {"questions": [...]}}`, then a `user` record holding
+`{"type": "tool_result", "tool_use_id": ...}`. The OPTIONS are structured JSON;
+the SELECTED answer is reported only inside the result's prose `content`
+("The user answered: \"...\"=\"...\""). Read the structured half; parsing the
+prose half to decide a gate outcome is the shape this repo has repeatedly
+measured as a fail-open.
+
+Recorded as a measured negative-turned-positive, not because anything reads the
+transcript today: a gate that verified a `:proceed` acknowledgment against these
+records was built and then removed, because the evidence could not support the
+claim being made (the structured half says an ask HAPPENED, never which option
+was chosen). The payload facts above stand on their own and are what a future
+consumer would start from — and any such consumer should degrade to "cannot
+prove it", since this shape is undocumented and version-volatile.
+
+
 ## Known Risks
 
 ### Rebase-Like Risk for CC
