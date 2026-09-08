@@ -55,6 +55,27 @@ def _hermetic_e2e_declaration(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_base_advance(monkeypatch):
+    """Hermetic defaults for the base-advance refinement of the freshness gate.
+
+    When the raw ``reviewed...head`` compare reads SUBSTANTIAL, the gate now asks
+    a second question — did the BRANCH change, or did its base advance under it?
+    — which reads the base tip and the PR's own contribution. Without a seam both
+    are LIVE ``gh`` calls: green on a dev box with gh authenticated, red in CI,
+    and slow either way, so every existing freshness test would be testing the
+    network.
+
+    The contribution seam defaults to ``{}``, which resolves to None for any
+    revision pair → the refinement declines to rescue → existing tests keep the
+    exact verdicts they were written for. That is the fail-CLOSED direction, so
+    the default cannot mask a regression by accidentally allowing something.
+    Cases that exercise the refinement set both seams themselves and win."""
+    monkeypatch.setenv("_TEST_GH_BASE_OID", "ba5e" * 10)
+    monkeypatch.setenv("_TEST_GH_CONTRIBUTION", "{}")
+    yield
+
+
 def _load_settings() -> dict:
     """Load .claude/settings.json from the repo root."""
     here = Path(__file__).resolve()

@@ -2993,6 +2993,295 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
 
 
+def _pr_contribution(
+    base_sha: str, tip_sha: str, repo: str | None
+) -> tuple[str, str, list] | None:
+    """``(merge_base_sha, status, files)`` for what ``tip`` contributes over ``base``.
+
+    ``compare/base...tip`` is three-dot, so GitHub computes it from the MERGE
+    BASE of the two — which is what makes this the PR's own work rather than a
+    commit range. **That merge base is returned, not discarded, because it is
+    load-bearing**: it is the LEFT-hand side of the diff, it MOVES when the
+    branch catches up, and a file's blob sha is only the RIGHT-hand side. Two
+    diffs with the same right side and different left sides are different
+    diffs. The caller needs the left side to know whether it may compare them
+    at all.
+
+    Returns None on any error — including a returncode, unparseable JSON, or an
+    exit-0 with an EMPTY payload. An empty stdout is not an empty diff: reading
+    it as ``[]`` would manufacture positive evidence of "unchanged" out of a
+    degraded response.
+
+    Tests inject via ``_TEST_GH_CONTRIBUTION`` — a JSON object keyed
+    ``"<base12>..<tip12>"`` whose value is ``{"mb": <sha>, "files": [...]}``.
+    """
+    raw = os.environ.get("_TEST_GH_CONTRIBUTION")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(f"{base_sha[:12]}..{tip_sha[:12]}")
+        except Exception:
+            return None
+        if not isinstance(got, dict) or not isinstance(got.get("files"), list):
+            return None
+        mb, st = got.get("mb"), got.get("status")
+        if not (isinstance(mb, str) and mb) or not isinstance(st, str) or not st:
+            return None
+        return (mb, st, got["files"])
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/compare/{base_sha}...{tip_sha}",
+                "--jq",
+                '{mb: .merge_base_commit.sha, status: .status, '
+                'files: [.files[]? | {filename, sha, additions, deletions, status, '
+                'previous_filename, has_patch: has("patch")}]}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        # No `or "[]"` fallback: an exit-0 with an EMPTY payload must not become an
+        # empty diff. json.loads("") raises, which the except below turns into
+        # None — a degraded response reads as unreadable, never as "unchanged".
+        parsed = json.loads(result.stdout)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("files"), list):
+        return None
+    mb, st = parsed.get("mb"), parsed.get("status")
+    if not (isinstance(mb, str) and mb) or not isinstance(st, str) or not st:
+        return None
+    return (mb, st, parsed["files"])
+
+
+def _classify_base_advance_delta(
+    reviewed_sha: str, head_sha: str, base_sha: str, repo: str | None
+) -> str | None:
+    """Re-judge a "substantial" delta as what the BRANCH actually changed.
+
+    A branch that merges its base to catch up acquires every commit the base
+    contributed. The raw ``reviewed...head`` compare cannot tell that from a
+    force-push and reports all of it as unreviewed, so the gate demands a fresh
+    review of code that was already reviewed on its own PR — MEASURED on this
+    repo: PR #1847 showed 28 files / 7 commits after merging main, of which the
+    branch's own change was 2 files. #1690 made catching up MANDATORY for every
+    branch carrying a changelog entry, so this stopped being incidental.
+
+    The question this asks instead: did the PR's OWN contribution change? Both
+    sides are the PR's diff over its base — at review time and now — compared by
+    file identity. It returns ``"inline"`` for exactly ONE finding: the two
+    contributions are IDENTICAL. It never sizes a residual change, so its only
+    two answers are "provably a pure base-advance" and None.
+
+    That is a deliberate narrowing over a version that DID size the residual
+    (Codex P1, #1849): the records available here are base-relative, so a
+    contribution that SHRANK between the review and head presents small counts
+    while the reviewed...head delta is large, and the sizing read as trivial. See
+    the ``if changed:`` block below.
+
+    NARROWING, so uncertainty fails CLOSED at every point it can be SEEN: a
+    failing fetch returns None (the caller blocks), an unreadable identity
+    withdraws the claim, an unreadable base move withdraws it, and a file the base
+    touched that the branch ALSO touches is a collision rather than an advance.
+
+    The one uncertainty it CANNOT see is file MODE, which the compare record does
+    not carry at all. That is why the enforcement surface is declined outright
+    rather than trusted to the identity — see the block above the hook-surface
+    loop. On a NON-hook path a mode-only change still rides through as unchanged,
+    and this docstring says so rather than claiming a closure the code does not
+    have.
+    """
+    got_before = _pr_contribution(base_sha, reviewed_sha, repo)
+    got_after = _pr_contribution(base_sha, head_sha, repo)
+    if got_before is None or got_after is None:
+        return None
+    before_mb, _before_status, before = got_before
+    after_mb, _after_status, after = got_after
+    if not before and not after:
+        # Two empty lists are not evidence of "unchanged" — they are evidence of
+        # nothing. The sibling path already fails closed on an empty `files`
+        # (Codex P2, #1373: "an empty files would read as inline and permit a
+        # STALE review to bind the merge on a delta that was never verified");
+        # a narrowing built on the same shape must not read it the other way.
+        return None
+    if len(before) >= 300 or len(after) >= 300:
+        # GitHub caps compare `files` at 300. The cap must be checked on the
+        # FETCHED lists, not on the changed subset derived from them — a subset
+        # is always under the cap, so checking it there tests nothing. MEASURED
+        # on this repo: a wide compare reports 300 files against 1293 real ones,
+        # so the invisible remainder could hold the very change being claimed
+        # unchanged.
+        return None
+    def _identities(records: list) -> dict[str, tuple[str, object, str | None]] | None:
+        """filename -> (blob sha, status, rename source), or None if unreadable.
+
+        Blob sha alone is CONTENT identity, not file identity: it encodes bytes
+        and not mode, so a script that becomes executable keeps its blob and
+        would drop out of the changed set. `status` is folded in because it is
+        what the compare record actually offers. This does NOT fully close the
+        mode question — GitHub's compare record carries no mode field at all —
+        and saying so here is the point: the earlier docstring claimed "exact
+        content identity" and was read as exact FILE identity, which it is not.
+
+        ``previous_filename`` is folded in for the same reason, and it is the
+        half an earlier version omitted (Codex P1, #1849). A rename is a diff
+        with two endpoints, and the compare record reports only the DESTINATION
+        as ``filename``; the blob is the destination's bytes. So a contribution
+        that renames ``A -> B`` and one that renames ``D -> B`` present the same
+        filename, the same blob and the same ``renamed`` status while deleting
+        DIFFERENT files. MEASURED on this code before the fix: those two compared
+        equal, the file dropped out of the changed set, and the branch's changed
+        rename read as a base-advance.
+
+        A record MISSING its ``sha`` must not compare EQUAL to another missing
+        one. MEASURED on this code before the check: two absent shas matched, the
+        file dropped out of the changed set, and a genuinely modified file read as
+        a base-advance — a stale review allowed on changed code, which is the one
+        outcome this refinement must never produce. Triviality is an exception
+        granted on POSITIVE evidence; an identity that cannot be read is not it,
+        so the whole claim is withdrawn rather than made on partial data.
+        """
+        out: dict[str, tuple[str, object, str | None]] = {}
+        for f in records:
+            if not isinstance(f, dict):
+                return None
+            name, blob = f.get("filename"), f.get("sha")
+            if not isinstance(name, str) or not name:
+                return None
+            if not isinstance(blob, str) or not blob:
+                return None
+            prev = f.get("previous_filename")
+            if prev is not None and (not isinstance(prev, str) or not prev):
+                return None  # present but unreadable — cannot compare honestly
+            if name in out:
+                return None  # duplicate filename — cannot compare honestly
+            out[name] = (blob, f.get("status"), prev)
+        return out
+
+    a, b = _identities(before), _identities(after)
+    if a is None or b is None:
+        return None
+    changed = {name for name in set(a) | set(b) if a.get(name) != b.get(name)}
+    # Every path the PR's contribution touches, on EITHER side — destinations AND
+    # rename SOURCES. The source is a path this branch changes (it deletes it), so
+    # a base that touches it is a base change to a file the branch touches. Folding
+    # only destinations here is the same omission as in the identity above, one
+    # scope out: the overlap test below would compare the base's moved set against
+    # destinations alone and miss the collision entirely (Codex P1, #1849).
+    touched = set(a) | set(b) | {p for (_blob, _st, p) in (*a.values(), *b.values()) if p}
+    moved_names: set[str] = set()  # what the BASE changed, when it moved
+    if before_mb != after_mb:
+        # THE MERGE BASE MOVED, which is the normal case here — catching up is
+        # what advances it. A file's blob sha is only the RIGHT-hand side of the
+        # diff; the merge base is the LEFT. So identical blobs across a moved
+        # base do NOT mean an identical diff, and treating them as such is a
+        # fail-open with a specific, routine trigger: resolve a catch-up conflict
+        # with `--ours` and the merge silently REVERTS what the base contributed
+        # while every tip blob stays put. Codex reviewed `F1 -> X`; what ships is
+        # `F2 -> X`, which it never saw.
+        #
+        # So ask what the base itself changed across the move, and refuse the
+        # claim if it overlaps the files this PR touches. A genuine base-advance
+        # — the base moving in files the branch does not touch — has an empty
+        # intersection and is still allowed.
+        moved = _pr_contribution(before_mb, after_mb, repo)
+        if moved is None:
+            return None
+        _mb, moved_status, moved_files = moved
+        if moved_status != "ahead":
+            # The base must have moved FORWARD for "the base advanced" to mean
+            # anything. MEASURED: a three-dot compare of a base that moved
+            # BACKWARDS reports status "behind" with ZERO files, so the overlap
+            # test below would find nothing and wave the claim through. Only a
+            # genuine advance qualifies; behind / diverged / identical fail closed.
+            return None
+        if not moved_files:
+            # The base MOVED, so it changed something — a compare that reports
+            # ZERO files is a degraded read, not an empty advance. The jq at
+            # `_pr_contribution` is `.files[]?`, and `?` swallows a MISSING or
+            # null `files` key, so an upstream response without it arrives here
+            # as `[]`, indistinguishable from a real empty diff.
+            #
+            # It is also self-contradictory: this refinement runs only when the
+            # RAW range classified `substantial`, and an empty compare `files`
+            # classifies `inline` (review_scope.classify_compare_substantiality:
+            # "An empty / None list means no reviewable delta"). So a base that
+            # advanced while changing nothing could not have produced the
+            # substantial raw verdict that got us here. No evidence, no claim —
+            # the same rule the two contribution lists already get above.
+            return None
+        if len(moved_files) >= 300:
+            return None  # truncated: cannot rule out an overlap
+        # Rename SOURCES count on BOTH sides of this intersection — here for the
+        # base's moved set, and in `touched` above for the branch's, matching
+        # `classify_compare_substantiality` and `_pr_changed_files`. A file the
+        # base renamed out from under the branch is a change to that path, and so
+        # is a file the branch renamed away.
+        for f in moved_files:
+            name = f.get("filename") if isinstance(f, dict) else None
+            if not isinstance(name, str) or not name:
+                return None  # malformed record — cannot establish the overlap
+            moved_names.add(name)
+            prev = f.get("previous_filename")
+            if prev is not None:
+                if not isinstance(prev, str) or not prev:
+                    return None
+                moved_names.add(prev)
+        if moved_names & touched:
+            return None
+    # THE HOOK SURFACE IS NEVER RESCUED, whatever the blobs say.
+    #
+    # This refinement RECONSTRUCTS "what changed" from two base-relative
+    # snapshots plus a synthetic identity, where the raw path diffs the two
+    # commits directly. That reconstruction loses whatever the identity does not
+    # carry — and GitHub's compare record carries no file MODE at all. So a
+    # content-preserving `chmod +x` on a guard keeps its blob AND its status,
+    # never enters `changed`, and the teeth that exist to catch "any touch to the
+    # enforcement surface, however small" never run. The raw path would have
+    # caught it, so this is a REGRESSION the refinement introduces rather than a
+    # limitation it inherits.
+    #
+    # Rather than chase an identity rich enough to be safe, decline the rescue
+    # outright when the enforcement surface is anywhere in view. A hook-surface
+    # PR forgoing a stale-review allowance is exactly the trade the surrounding
+    # gate already makes everywhere else.
+    for name in touched | moved_names:
+        if _is_hook_surface_path(name):
+            return None
+    if changed:
+        # ANY change to the branch's own contribution withdraws the claim. The
+        # ONLY thing this refinement establishes is "byte-identical contribution";
+        # it does not, and must not, try to SIZE a residual change.
+        #
+        # An earlier version sized it, by handing the changed subset's `after`
+        # records to the shared substantiality classifier — and that was a
+        # fail-open with a mundane trigger (Codex P1, #1849). Those records are
+        # BASE-relative, not reviewed-relative: a file the review saw as a 100-line
+        # addition that head trims back to 3 lines presents an `after` record of 3
+        # lines, classifies `inline`, and lets a ~97-line unreviewed rewrite bind a
+        # stale review. MEASURED on this code before the fix: before=100 additions,
+        # after=3 additions returned "inline" (the growing direction, 3 -> 100,
+        # correctly returned "substantial" — so the leak was one-directional and
+        # invisible from the side anyone would test).
+        #
+        # Reconstructing the true reviewed...head size from two base-relative
+        # snapshots is exactly the argv->effect reconstruction the guard doctrine
+        # says not to build: any bound would rest on the diff algorithm's
+        # minimality, which is not a guarantee GitHub makes. So the residual is not
+        # sized at all — it blocks, and the fresh review the gate would have
+        # demanded anyway is the answer. Nothing is lost against the status quo:
+        # without this refinement the raw range read `substantial` and blocked too.
+        return None
+    # The branch contributes byte-identical content over its base, and the base
+    # did not touch any path the branch touches. Everything new since the review
+    # came from the base, and was reviewed there.
+    return "inline"
+
+
 def _check_codex_reviewed_head(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
@@ -3092,7 +3381,34 @@ def _check_codex_reviewed_head(
         )
     if reviewed != head:
         level = _classify_post_review_delta(reviewed, head, repo)
+        base_advance = False
+        if level == "substantial":
+            # The raw range says substantial. Ask the narrower question before
+            # blocking: did the BRANCH change, or did its base just advance
+            # underneath it? Only a definite "substantial" is re-judged — a None
+            # (API/parse failure) is the fail-closed state and must not be
+            # rescued by a second read that could itself be degraded.
+            base_sha = _pr_base_sha(pr_num, repo=repo)
+            # COST guard, not a correctness one — say so, because a mutation that
+            # deletes it is behaviourally NULL and will survive any sweep: without
+            # a base the refinement already declines (its fetches cannot resolve a
+            # revision, so it returns None and the block stands). What this saves
+            # is two doomed `gh` round-trips against the 45s merge budget.
+            if base_sha:
+                refined = _classify_base_advance_delta(reviewed, head, base_sha, repo)
+                if refined == "inline":
+                    level, base_advance = "inline", True
         if level == "inline":
+            if base_advance:
+                print(
+                    f"NOTE: Codex's review on PR #{pr_num} is on {reviewed[:12]} (head "
+                    f"{head[:12]}), but the branch's own contribution over its base is "
+                    f"UNCHANGED since — the delta is a base-advance (commits the base "
+                    f"contributed, each reviewed on its own PR) — allowing. Inspect: "
+                    f"git log {reviewed[:12]}..{head[:12]} --oneline",
+                    file=sys.stderr,
+                )
+                return False, "", head
             # The unreviewed delta is provably review-trivial — allow, but still
             # bind the merge to THIS head (TOCTOU): the triviality claim is about
             # exactly this reviewed...head range, not any later push.
