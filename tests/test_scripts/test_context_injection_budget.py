@@ -524,7 +524,27 @@ def test_unreadable_essential_knowledge_is_loud_like_an_identity_file(
 #: Every script that writes model-facing stdout through `BoundedStdout`. The
 #: lock below covers ALL of them: it used to read one, while this same branch
 #: created a second emitter — so the class was half-locked and read as locked.
-_EMITTERS = ("genesis_session_context.py", "genesis_urgent_alerts.py")
+def _emitters() -> tuple[str, ...]:
+    """Every script that constructs a `BoundedStdout`, DERIVED not listed.
+
+    This was a hardcoded pair, and the branch that added two more emitters did
+    not extend it -- so the lock covered half of them while its own docstring
+    asserted it covered all: "half-locked and read as locked", which is exactly
+    the trap that docstring was written to prevent. Caught by a cross-model
+    reviewer, not by the suite.
+
+    A hand-maintained inventory of "everything that does X" goes stale on the
+    first change that does X, and its staleness is invisible because the test
+    still passes. Deriving it means a new emitter is covered the moment it
+    exists. The empty case is an ERROR, not a pass: a derivation that finds
+    nothing is indistinguishable from a lock that checks nothing.
+    """
+    found = tuple(sorted(
+        p.name for p in _SCRIPTS_DIR.glob("*.py")
+        if p.name != "hook_output.py" and "BoundedStdout(" in p.read_text(encoding="utf-8")
+    ))
+    assert found, "no BoundedStdout emitters found -- the derivation is broken"
+    return found
 
 #: Names that denote a BUDGET. Subtracting from one of these is a caller
 #: computing "how much room is left" — the re-derivation the chokepoint deletes.
@@ -588,7 +608,7 @@ def test_no_budget_arithmetic_outside_the_writer():
     what happened is not the defect; branching on how much space remains is.
     """
     offenders: list[str] = []
-    for name in _EMITTERS:
+    for name in _emitters():
         offenders += [f"{name} {o}" for o in _budget_offenders((_SCRIPTS_DIR / name).read_text())]
     assert not offenders, (
         "budget arithmetic leaked back into an emitter: "

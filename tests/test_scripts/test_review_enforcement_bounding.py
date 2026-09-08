@@ -139,9 +139,19 @@ def test_the_base_reminder_alone_is_most_of_the_budget() -> None:
     """Names the underlying hazard: there is very little room for anything else."""
     base = _base_reminder()
     assert len(base) > 5_000, "reminder unexpectedly small — re-derive the margin"
-    assert len(base) < HOOK_STDOUT_CAP, (
-        f"the base reminder ({len(base)}) alone is at or over the {HOOK_STDOUT_CAP} "
-        "cap — bounding the manifest can no longer save it; the prose must shrink"
+    # AGAINST THE CONSTANT PRODUCTION ENFORCES, not the harness cap. The hook
+    # constructs `BoundedStdout(label="review-enforcement")`, which enforces
+    # DEFAULT_BUDGET (9,800); the cap is 10,000, and this same file pins
+    # DEFAULT_BUDGET < HOOK_STDOUT_CAP, so the window between them is non-empty
+    # BY THE SUITE'S OWN CONSTRUCTION. A reminder grown into it -- 9,900 against
+    # a 9,800 budget -- passed this assertion while production took the CUT path,
+    # which truncates the mandatory reminder AND closes the stream, dropping the
+    # manifest with it. Asserting against the looser of two constants is how a
+    # test blesses exactly the state it exists to prevent.
+    assert len(base) < DEFAULT_BUDGET, (
+        f"the base reminder ({len(base)}) alone is at or over the writer's "
+        f"{DEFAULT_BUDGET} budget — production would CUT it, truncating the "
+        "reminder and closing the stream; the prose must shrink"
     )
 
 
@@ -215,3 +225,28 @@ def test_a_small_manifest_is_not_degraded() -> None:
     out = _emit_like_the_hook(_base_reminder(), _manifest(paths))
     for p in paths:
         assert p in out, f"a manifest this small must survive whole; {p} missing"
+
+
+def test_a_reminder_in_the_window_between_the_two_constants_is_rejected() -> None:
+    """THE case that distinguishes the two constants, which the real reminder
+    cannot: at 6,436 it sits far below both, so asserting against the looser one
+    passed identically and the mutation was behaviourally null.
+
+    The window is non-empty by this suite's own construction
+    (DEFAULT_BUDGET < HOOK_STDOUT_CAP), and a base reminder inside it is the
+    exact hazard: it clears the harness cap while production's writer CUTS it --
+    truncating the mandatory reminder and closing the stream, so the manifest
+    goes too. Asserted on a synthetic length, because the point is which
+    constant governs, not how long the prose happens to be today.
+    """
+    assert DEFAULT_BUDGET < HOOK_STDOUT_CAP, "no window to test"
+    in_window = (DEFAULT_BUDGET + HOOK_STDOUT_CAP) // 2
+
+    # Under the harness cap...
+    assert in_window < HOOK_STDOUT_CAP
+    # ...and yet over what the writer will actually emit whole.
+    assert in_window >= DEFAULT_BUDGET, (
+        "a reminder of this length would be CUT by BoundedStdout even though it "
+        "is under the harness cap — which is why the bound is asserted against "
+        "DEFAULT_BUDGET and not HOOK_STDOUT_CAP"
+    )

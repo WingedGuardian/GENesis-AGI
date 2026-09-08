@@ -450,14 +450,27 @@ enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
 unless each one either routes through the writer or carries a stated, measured
 reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
 with unbounded output fails by construction, which a known-bad-pattern scan could
-not do. An exemption may only cite a bound **configuration cannot change** — a
-hardcoded slice or an in-code clamp, never a config DEFAULT, since a `.local.yaml`
-overlay can raise a default.
+not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
+change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
+`.local.yaml` overlay can raise a default.
 
-Two limits, so it is not read as total coverage: hooks wired in a user-level
+There is a SECOND, weaker category, named here because describing only the first
+overstates the gate: `_MEASURED_PENDING_ROUTING` holds a hook that is NOT
+structurally bounded and has simply never been observed filing, with its routing
+tracked in a follow-up. `proactive_memory_hook.py` is its only member and its own
+reason concedes the peer loop is unbounded — so it CAN reach the cap. That is
+debt with a date on it, not a proof, and the two categories are kept separate so
+the debt stays visible rather than laundered into "bounded".
+
+Three limits, so it is not read as total coverage. Hooks wired in a user-level
 `~/.claude/settings.json` or a `settings.local.json` are outside the repo and
-invisible to it, and the detector matches `print` and `sys.stdout.write` but not
-`os.write(1, …)`, an aliased print, or a subprocess inheriting stdout.
+invisible to it. An EXEMPTION SKIPS SCANNING ENTIRELY, so a row is only as good
+as its last read — which is why the table stays small. And the detector's
+enumeration is bounded, not total: it covers `print`, `builtins.print`,
+`file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
+but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
+inheriting stdout. That list grew four times under review; treat it as the
+spellings checked so far rather than a closed set.
 
 Hooks on the OTHER events reach the model through JSON `additionalContext`, the
 same persistence path with a different failure mode — an oversized advisory must

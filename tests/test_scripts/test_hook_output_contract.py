@@ -201,34 +201,58 @@ def unbounded_stdout_offenders(src: str) -> list[str]:
     ``print(x, **kw)`` is flagged: a `**kwargs` entry has ``arg is None``, so it
     never satisfies the file= test. That direction fails CLOSED, which is right.
     """
-    lines = src.splitlines()
+    # split("\n"), NOT splitlines(): the latter also breaks on \x0c, \x85 and
+    # \u2028/9, while CPython's tokenizer treats a form feed as ordinary
+    # whitespace. One form feed anywhere above a waiver desynced the index and
+    # the waiver was silently ignored -- MEASURED: 3 "lines" vs the tokenizer's
+    # 2. It fails CLOSED (a legitimate exemption is dropped, so a routed hook
+    # reads as an offender) which is the safe direction, but a gate that refuses
+    # a correct waiver teaches people to distrust it.
+    lines = src.split("\n")
 
     def _has_marker(lineno: int) -> bool:
         return 0 < lineno <= len(lines) and _EXEMPT_MARKER in lines[lineno - 1]
 
+    def _is_stdout_stream(node: ast.AST) -> bool:
+        """`sys.stdout`, `sys.__stdout__`, or the `.buffer` behind either.
+
+        `sys.stdout.buffer.write(b"x")` reaches the model exactly as
+        `sys.stdout.write` does -- it is the same stream, one attribute deeper.
+        """
+        if isinstance(node, ast.Attribute) and node.attr == "buffer":
+            return _is_stdout_stream(node.value)
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr in ("stdout", "__stdout__")
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        )
+
     def _names_stdout(node: ast.AST) -> bool:
         """Does this expression name the model-facing stream?
 
-        THE ENUMERATION, not another instance. Three spellings reach the same
-        channel and they were fixed ONE AT A TIME across three review rounds:
-        a bare `print()` (no kwarg), `file=None` (documented Python for "use
-        sys.stdout"), and `file=sys.stdout` -- which slipped through because the
-        predicate asked "is there a file kwarg" rather than "where does it go".
-        `sys.__stdout__` is here for the same reason, before someone finds it as
-        round four.
+        AN ENUMERATION, MAINTAINED BY BEING WRONG FOUR TIMES, and the count is
+        the point. A bare `print()` was the original detector; `file=None` was
+        added after the first adversarial pass; `file=sys.stdout` after the
+        second; `builtins.print` and `sys.stdout.buffer.write` after a
+        cross-model pass. Each round patched the spelling that was named.
 
-        WHAT IT CANNOT SEE, stated rather than discovered later: an ALIASED
-        handle (`out = sys.stdout; print(x, file=out)`) is not resolved -- that
-        needs dataflow, and a predicate that flagged every opaque `file=` target
-        would refuse legitimate stderr writes through a variable. The routed
-        path is the defence there; this catches the spellings that NAME stdout.
+        SO THE CLAIM IS NOW BOUNDED RATHER THAN TOTAL. An earlier docstring said
+        "every spelling that NAMES stdout is flagged" -- an assertion of
+        completeness that the very next reviewer falsified, twice over. What is
+        true is narrower and more useful: the spellings BELOW are flagged, and
+        the module docstring lists what is known to be outside them. A detector
+        that claims completeness stops anyone looking for round five.
+
+        KNOWN OUTSIDE: an aliased handle (`out = sys.stdout`), a rebound name
+        (`print = my_printer`), `os.write(1, ...)`, and subprocess stdout
+        inherited by a child. Resolving the first two needs dataflow; flagging
+        every opaque `file=` target would refuse legitimate stderr writes through
+        a variable, which is a false BLOCK and the worse direction for a gate.
         """
         if isinstance(node, ast.Constant) and node.value is None:
             return True  # documented Python for "use sys.stdout"
-        if isinstance(node, ast.Attribute) and node.attr in ("stdout", "__stdout__"):
-            base = node.value
-            return isinstance(base, ast.Name) and base.id == "sys"
-        return False
+        return _is_stdout_stream(node)
 
     def _real_file_kwarg(node: ast.Call) -> bool:
         """True when `file=` sends output somewhere OTHER than the model."""
@@ -242,15 +266,20 @@ def unbounded_stdout_offenders(src: str) -> list[str]:
         if not isinstance(node, ast.Call) or _has_marker(node.lineno):
             continue
         func = node.func
-        if isinstance(func, ast.Name) and func.id == "print" and not _real_file_kwarg(node):
-            offenders.append(f"line {node.lineno}: bare print() reaches the model")
+        is_print = (
+            (isinstance(func, ast.Name) and func.id == "print")
+            # `builtins.print(...)` is the SAME builtin, qualified. Round four.
+            or (isinstance(func, ast.Attribute) and func.attr == "print"
+                and isinstance(func.value, ast.Name) and func.value.id == "builtins")
+        )
+        if is_print and not _real_file_kwarg(node):
+            offenders.append(f"line {node.lineno}: print() reaches the model")
         elif (
             isinstance(func, ast.Attribute)
             and func.attr in {"write", "writelines"}
-            and isinstance(func.value, ast.Attribute)
-            and func.value.attr == "stdout"
+            and _is_stdout_stream(func.value)
         ):
-            offenders.append(f"line {node.lineno}: sys.stdout.{func.attr}() reaches the model")
+            offenders.append(f"line {node.lineno}: stdout.{func.attr}() reaches the model")
     return offenders
 
 
@@ -330,6 +359,15 @@ def test_the_gate_can_itself_fail() -> None:
         "file=sys.__stdout__ is the same stream": (
             "import sys\nprint('x', file=sys.__stdout__)"
         ),
+        # ROUND FOUR, from a cross-model pass. The first three rounds each
+        # patched the spelling that was named; these two are why the docstring
+        # no longer claims completeness.
+        "builtins.print is the same builtin, qualified": (
+            "import builtins\nbuiltins.print('x')"
+        ),
+        "sys.stdout.buffer is the same stream, one attribute deeper": (
+            "import sys\nsys.stdout.buffer.write(b'x')"
+        ),
     }
     for label, src in must_flag.items():
         assert unbounded_stdout_offenders(src), f"detector missed: {label}"
@@ -344,6 +382,9 @@ def test_the_gate_can_itself_fail() -> None:
         # BLOCK, which is the worse direction for a contract gate.
         "an aliased handle is not resolved, by design": (
             "out = open('f')\nprint('x', file=out)"
+        ),
+        "stderr.buffer is not the model's channel either": (
+            "import sys\nsys.stderr.buffer.write(b'x')"
         ),
         "routed through the writer": (
             "from hook_output import BoundedStdout\n"
@@ -381,4 +422,22 @@ def test_every_exemption_states_a_reason() -> None:
     assert not thin, (
         f"Exemptions without a substantive, specific reason: {thin}. State the cap "
         "and the file that defines it."
+    )
+
+
+def test_a_form_feed_does_not_desync_the_waiver_index() -> None:
+    """`splitlines()` breaks on \x0c; CPython's tokenizer does not.
+
+    One form feed above a waiver shifted every subsequent line index, so a
+    legitimate `# hook-output-exempt:` marker was read off the wrong line and
+    silently ignored. Fails CLOSED — a routed hook reads as an offender — which
+    is the safe direction, but a gate that refuses a correct waiver is a gate
+    people learn to route around.
+    """
+    waived = "import sys\nsys.stdout.write('x')  # hook-output-exempt: probe"
+    assert unbounded_stdout_offenders(waived) == [], "baseline waiver not honoured"
+
+    with_ff = "import sys\x0c\nsys.stdout.write('x')  # hook-output-exempt: probe"
+    assert unbounded_stdout_offenders(with_ff) == [], (
+        "a form feed above the waiver desynced the line index and dropped it"
     )
