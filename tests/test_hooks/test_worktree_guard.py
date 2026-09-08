@@ -115,6 +115,38 @@ class TestBashBlockAll:
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
+    def test_removal_past_the_depth_bound_still_blocks(self, guard_cmd: str) -> None:
+        """A removal nested past shell_parse's depth bound must NOT slip through.
+
+        This is the fail-open the bare-`analyze` chokepoint exists to catch. A
+        bounded parse returns NO segments — deliberately, so a searching guard
+        cannot read "stopped looking" as "nothing found" — and this guard decides
+        by searching. Before the blind-spot branch that meant zero targets and a
+        silent allow, on a guard whose entire job is blocking.
+        """
+        deep = "git worktree remove /tmp/nonexistent-worktree-xyz"
+        for _ in range(8):  # comfortably past MAX_SUBSTITUTION_DEPTH (5)
+            deep = f"echo $({deep})"
+        result = _run_guard(guard_cmd, {"command": deep})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "BLOCKED" in result.stderr
+
+    def test_deep_nesting_without_a_removal_is_still_allowed(
+        self, guard_cmd: str
+    ) -> None:
+        """Negative control for the test above.
+
+        Without it, a fallback that simply blocked every unreadable command
+        naming the subcommand would pass the acceptance test while being
+        useless — the "a matcher that finds nothing is indistinguishable from a
+        matcher that looks at nothing" failure, in its blocking direction.
+        """
+        deep = "git worktree list"
+        for _ in range(8):
+            deep = f"echo $({deep})"
+        result = _run_guard(guard_cmd, {"command": deep})
+        assert result.returncode == 0, result.stdout + result.stderr
+
     def test_block_message_mentions_lifecycle(self, guard_cmd: str) -> None:
         result = _run_guard(
             guard_cmd,
