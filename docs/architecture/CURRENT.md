@@ -260,6 +260,19 @@ at gate time (`security/immunity.py`). Migration 0053 backfilled history
 (no owner heuristics); `scripts/backfill_origin_class_qdrant.py` mirrors the
 payloads idempotently.
 
+**Judgment axes (DARK — written, no reader):** `memory_metadata` carries six
+write-only classification columns stamped at extraction time and consumed by
+nothing yet — `speech_act` + `speech_act_confidence`
+(# GROUNDWORK(mw-5-speech-act-protection)), `assertion_provenance`
+(# GROUNDWORK(mw-4-provenance-weight)), `durability` + `expires_at`
+(# GROUNDWORK(mw-4-durability-ttl)), and `preference_domain`
+(# GROUNDWORK(mw-4-preference-domain) — the domain a preference is scoped to,
+so a later conflicting preference coexists as a different-context truth
+instead of overwriting). Contract + normalizers in `memory/judgment.py`;
+distinct from `origin_class` above, which is a pipeline-trust label. Expiry is
+opt-in (`durability='temporary'` + an elapsed `expires_at` only), so an
+unclassified row never expires.
+
 ## 2. Execution — CC sessions (DirectSession)
 
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
@@ -836,7 +849,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: e425b35c 2026-08-21
+verified: 788dd9a9 2026-09-06
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -902,7 +915,53 @@ verified: e425b35c 2026-08-21
   same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
   per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
   config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
-  verify → stage), MEASURED ~5.5 min live.
+  verify → stage), MEASURED ~5.5 min live. **Bite-relay (independent capability on the
+  same daily tick):** its OWN `bite_relay_mode` lever (off/observe/live, ships off),
+  DECOUPLED from the auto-run above — it READS a structured HTTP `data_module`
+  (`pipeline` op, distinct from the SSH reasoning module) and pushes ONE owner Telegram
+  nudge when a company advances into an engaged stage ({in_conversation, interviewing,
+  offer}). Dedup is a PERMANENT per-(company, stage) `career_bite` observation (a
+  point event — `unresolved_only=False`, 365d TTL — unlike the re-emittable
+  `career_outreach_nudged` marker); observe SEEDS the ledger without nudging. Health-
+  gated on the DATA module SEPARATELY: an unhealthy/absent data bridge is a CLEAN SKIP
+  (not a job-health failure — the read service is legitimately down when the search is
+  dormant), while a read the service answered with an error IS a failure. Being a pure
+  read + owner-nudge (no CLI dispatch, no outreach send), it can run `live` while the
+  auto-run stays gated. Hardening: external company names are control-char-sanitized
+  (`strip_control_chars` — collapses newlines / Unicode line+paragraph separators /
+  zero-width+bidi) before the `parse_mode="HTML"` nudge, so a crafted name can't forge
+  or conceal notification lines; a present-but-wrong-type pipeline bucket/entry surfaces
+  as a job-health failure (distinct from a legitimately-absent stage) rather than a
+  silent "no advances"; EVERY malformed entry shape (non-dict, missing/null/blank/
+  whitespace-only id, or an id that is not `str`/`int` — `bool`, `float` and containers
+  are all rejected, since `9` vs `9.0` and a repr-ordered container both re-key the
+  marker) is decided by ONE validation choke point (`_bite_entry_id`), whose
+  normalization is hash-identical to `_bite_hash` so routing
+  through it never changes an existing marker's dedup identity; the
+  deliver-before-`_record_bite` crash-window is closed by a PERMANENT
+  `outreach_history` delivered-`(signal_type, topic)` lookup (`delivered_topic_exists`,
+  unwindowed — the outreach pipeline's own 24h dedup is NOT longer than this job's daily
+  retry interval, so the `REJECTED` branch is belt-and-suspenders, not the recovery), and
+  a recovery consumes no nudge-cap slot since it sends nothing and reports as ONE counted
+  summary line (never one detail per entry — `details` feeds job-health's unbounded
+  `last_error`); the per-tick scan ceiling
+  is a ROTATING window (contiguous windows, one whole ceiling per tick-DAY, no persistent
+  cursor) so an oversized response bounds work without permanently excluding the tail —
+  full coverage in `ceil(len/ceiling)` CONSECUTIVE tick-days, with a missed tick or the
+  live nudge cap deferring entries to a later cycle rather than dropping them; and the
+  auto-run no-progress warning excludes bite activity, since the two
+  sub-capabilities are independent. That independence is ENFORCED in `gather`: each
+  branch is awaited under its own guard, so a raise in one becomes that branch's
+  `errors=1` result and the other still runs — and because that also removes the raise
+  from the runner's own `except`, the exception rides out on `CareerOutreachResult.raised`
+  so the runner still emits the ERROR-severity `career_outreach_monitor.failed` event with
+  its traceback (an isolated crash must not go quiet in the ERROR stream). Misconfig fails LOUD, not
+  silent: an invalid `bite_relay_mode` fails **closed to `off`** (its `observe` seeds
+  permanent markers, so degrading to `observe` like the auto-run would silently suppress
+  the backlog); an ENABLED lever whose `data_module` is unset/unresolvable records a
+  job-health **failure** (not a green no-op); and pause is rechecked **before** the
+  pipeline read AND again after the data-module health probe (itself an awaited external
+  call), not only between nudges.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.
@@ -1203,7 +1262,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 29a382e7 2026-09-03
+verified: 9730efe9 2026-09-05
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1404,7 +1463,16 @@ verified: 29a382e7 2026-09-03
   Genesis checkouts (foreign filings counted, never alerted); alerts at
   `critical` — the fast Telegram path, deliberately, because this class went
   unnoticed for a month. Settings lever + env kill switch as usual; disabling
-  RESOLVES the open alert rather than orphaning it.
+  RESOLVES the open alert rather than orphaning it. **Cross-store coupling (do
+  not touch blind):** the watcher's blind-scan guard uses a NON-EMPTY
+  `~/.genesis/sessions/` as its proof that CC has ever run here — without it, a
+  moved CC data root reads as a clean all-clear instead of blindness. That
+  directory is pruned at 60 days by `scripts/disk_hygiene.sh` (step 8b), so the
+  60-day floor is load-bearing for THIS check too: lower it toward a live
+  session's age and the guard silently disarms. The two do not collide today (60d
+  is far past any live session), but the coupling lives only in the script's own
+  comment — recorded here because it is exactly the do-not-touch edge the map is
+  for.
 - **Open-PR resurfacing** (LIVE): a SessionStart surface lists open PRs left
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
@@ -1594,8 +1662,65 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 50b79ffb 2026-09-01
+verified: 788dd9a9 2026-09-06
 ```
+
+- **The graders are TOLD the response status; they must never infer it.** The
+  triage/outcome/delta graders each judge an `InteractionSummary`, and the
+  summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.
+  If it hands over a bare prefix, a response that stops mid-word is
+  indistinguishable from one the model abandoned — and the resulting verdict is
+  written to permanent record via `observation_writer` (tagged
+  `source_subsystem=reflection`, alongside the other self-observation sources).
+  So: `_MAX_RESPONSE_TEXT` is a SAFETY VALVE sized above real traffic, not a
+  working limit; anything elided is elided from the MIDDLE with an explicit
+  marker and the ENDING preserved, because the ending is what "did generation
+  finish" is judged from.
+- **A note about the response is emitted only on a POSITIVE signal.** The first
+  fix here asserted the opposite of `CCOutput.bg_truncated` as fact
+  ("COMPLETE — the model finished normally") and told the grader not to disagree.
+  That flag is one stderr substring match (`cc/invoker.py` `_stderr_bg_truncated`) whose producer
+  documents the match as version-drift tolerant, and a hand-built `CCOutput`
+  (e.g. `mail/monitor.py`) simply defaults it — so its `False` means "that
+  substring was absent", never "the model finished normally". Restating it as a
+  fact was the original defect with its sign flipped. `learning/response_context.py`
+  is now the single place that decides what the graders are told: silence by
+  default, a narrow note when the runtime really did kill background work, and a
+  note about elision driven by the character count the summarizer REPORTS. Both
+  signals travel out-of-band, on `InteractionSummary`. Deriving either one by
+  searching `response_text` puts the response in charge of the prompt's factual
+  claims about it — a debrief that describes this mechanism, or an inbox item
+  echoing a prompt back, would manufacture a pipeline-status claim that is
+  simply false. For the same reason the elision marker states only how many
+  characters were removed and makes no claim about whether the model stopped
+  early; that is the question the grader is there to answer. The same rule now
+  covers `tool_calls`: names come from the runtime's own `tool_use` events
+  (`CCOutput.tools_used`) when the invocation streamed, and the prompt says so.
+  `conversation.py` also uses the NON-streaming `run()`, where no such events
+  exist, so the text-scraping fallback stays — but a scraped list is presented
+  as "tool names found in the response text", never as tools that ran, because
+  the regex cannot tell a tool that ran from one the reply merely discussed.
+  KNOWN AND ACCEPTED, with both consumers named: `prefilter.should_skip` still
+  counts a scraped name, so a reply that only mentions tools can buy itself a
+  grading pass; and `pipeline.py`'s `session_tools_count` carries that count
+  into a stored procedure's `extraction_context`. Neither is a decision gate the
+  wrong way — `should_skip` can only cause MORE grading, never less, and
+  tightening it would skip real tool use on every non-streaming path. It also fences `response_text`, which is
+  unbounded untrusted content sitting next to authoritative lines — though the
+  fence delimiters are fixed literals, so a response containing them can still
+  break out; closing that is tracked separately. The three-state
+  `CCOutput.tools_used` (None = nothing watched, () = watched and saw none) is
+  what keeps "no report" from rendering as the finding "none".
+- **The REQUEST is sized the same way as the reply, by the same function.**
+  `_MAX_USER_TEXT` was 500 and was a working limit, not a valve: MEASURED on
+  this install, 222 of 1481 inbound messages (15.0%) exceeded it, the longest
+  5,924 characters, and `inbox`/`mail` pass whole-file and joined-subject
+  content that no messaging limit bounds. Each one reached `DeltaAssessor` —
+  the grader comparing what was asked against what was delivered — as a bare
+  prefix with nothing saying so, which reads as an underspecified request.
+  `summarizer._fit` is now one mechanism serving both texts, and
+  `user_text_elided_chars` carries the request's count out-of-band exactly as
+  the response's does.
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
   ~20+ jobs well beyond learning (recovery orchestrator, reapers, email-gate
@@ -1973,8 +2098,9 @@ verified: f24c15e9 2026-09-05
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` run ONCE at startup before any
+  schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
+  that drifts every table-adding PR — re-measure, do not trust) plus versioned
+  `migrations/` run ONCE at startup before any
   other init step touches data; a failed migration ABORTS bootstrap. Ids are
   92 FROZEN legacy 4-digit ones (`0001`..`0093`, with a GAP at `0092` from a
   rename) plus new `YYYYMMDDHHMMSS_*.py` UTC timestamps — nobody allocates an
