@@ -563,8 +563,8 @@ class TestSessionProvenance:
 
     Reading only the snake_case ``session_id`` stored NULL for most rows and a
     wrong id for much of the rest (Codex P2, PR #1616). MEASURED 2026-09-08 over
-    every record in all 1,093 transcripts under
-    ``~/.claude/projects/-home-ubuntu-genesis`` — 155,023 tool_result-bearing:
+    every record in all 1,093 transcripts in this install's CC project transcript
+    dir (``~/.claude/projects/<project-slug>/``) — 155,023 tool_result-bearing:
     ``sessionId`` present on 155,023 (100.0%), ``session_id`` on 68,828 (44.4%),
     the two disagreeing on 42,451 (27.4%). Against the CONTAINING FILE's id,
     ``sessionId`` agrees on 93.1% and ``session_id`` on 17.0% — which orders the

@@ -275,9 +275,9 @@ def _session_id(rec: dict, data: dict) -> str | None:
     snake_case ``session_id`` (the HOOK PAYLOAD's spelling) was wrong (Codex P2,
     PR #1616).
 
-    MEASURED 2026-09-08 over EVERY record in all 1,093 transcripts under
-    ``~/.claude/projects/-home-ubuntu-genesis`` — 155,023 carrying an Edit/Write
-    ``tool_result``:
+    MEASURED 2026-09-08 over EVERY record in all 1,093 transcripts in this
+    install's CC project transcript dir (``~/.claude/projects/<project-slug>/``)
+    — 155,023 carrying an Edit/Write ``tool_result``:
       * ``sessionId`` present on 155,023 (100.0%); ``session_id`` on 68,828
         (44.4%), so the old read stored NULL for over half of them;
       * the two DISAGREE on 42,451 (27.4%), and ALL 42,451 of those records also
