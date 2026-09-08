@@ -9,6 +9,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **A warning when a git command is about to rewind your whole working tree.**
+  `git checkout <commit> -- .` reads like "put these files back", but the `.`
+  matches every tracked path — so it rewrites the entire tree to that commit and
+  silently reverts anything merged since. Because the reversion lands in your own
+  working tree, it then shows up inside your own diff looking deliberate. That
+  happened here: one such command reverted two already-merged changes, the first
+  caught by luck and the second only by a separate check.
+
+  The guard already snapshotted the tree beforehand, so nothing was unrecoverable
+  — but its note was the same one it prints for every checkout, and said nothing
+  about what had just happened. It now recognises the shape (`checkout`,
+  `restore` with a source, `switch`, and `read-tree -u`, applied across a
+  directory or the whole tree) and says so plainly: what the command rewrites,
+  which repository, that the reversion will look intentional in your diff, and
+  the conflict-aware alternatives that fail loudly instead (`merge --squash`,
+  `cherry-pick`, `apply --3way`).
+
+  It also gives you a recovery command that works. The obvious one does not:
+  after a rewind every tracked file is staged, which is exactly what
+  `git stash apply` refuses to merge into — run it and you get conflict markers
+  written into the files you were trying to save. The note points at the
+  restore-from-snapshot form instead, and says why.
+
+  It warns rather than blocks, deliberately: the command is recoverable, and this
+  guard blocks only what its snapshot cannot recover. Everyday discards
+  (`git checkout .`, `git checkout -- file`, `git checkout HEAD -- .`) stay
+  silent, because a warning that fires on routine work is worth nothing on the
+  day it matters.
 ### Fixed
 
 - **SECURITY.md described a posture the code left behind two months ago.** The
