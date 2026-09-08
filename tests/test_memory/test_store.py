@@ -317,3 +317,27 @@ async def test_store_falls_back_on_unexpected_error(store):
     assert isinstance(result, str)
     mock_mem.upsert.assert_awaited_once()
     mock_pending.create.assert_awaited_once()
+
+
+@pytest.mark.asyncio()
+async def test_store_threads_preference_domain_to_metadata(store):
+    """The MW-4 domain qualifier reaches memory_metadata.
+
+    This single line in store() is the whole runtime path for the column: with
+    it deleted, preference_domain is NULL for every row ever written and the
+    consumer finds an empty corpus — while every other test stays green
+    (mutation-verified: 0/89 caught it before this test existed).
+    """
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        await store.store(
+            "prefers muted colors for work materials",
+            "src",
+            speech_act="preference",
+            preference_domain="work",
+        )
+
+    assert mock_mem.create_metadata.call_args.kwargs["preference_domain"] == "work"
