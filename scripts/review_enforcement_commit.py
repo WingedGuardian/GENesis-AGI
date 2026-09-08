@@ -14,7 +14,6 @@ Exit codes:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -654,7 +653,7 @@ def main() -> None:
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
-        # ── Blind-spot net: unverifiable → ASK the human ────────────────────
+        # ── Blind-spot net: unverifiable → DENY ─────────────────────────────
         # "No commit segment" is a trustworthy verdict only when the command was
         # PARSEABLE. The parser can mis-segment a command and DROP the real
         # commit segment, so this very early-out is what lets a commit-to-main
@@ -664,13 +663,15 @@ def main() -> None:
         # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
         # empty parse is not evidence of absence.
         #
-        # The outcome is an approval PROMPT, not a refusal. A hard block here has
-        # to be surgically precise about which un-parseable commands are real
-        # commits — and precision is exactly what an unreliable parse cannot
-        # deliver: every narrowing conjunct became a new way to starve the trigger,
-        # while over-blocking broke benign shapes (`git status # don't commit yet`).
-        # Asking inverts those costs: a false positive is one confirmation, a miss
-        # is the pre-existing status quo.
+        # The outcome is a REFUSAL with the way out spelled in the message —
+        # for every session type. User ruling 2026-09-08: hooks are for the
+        # agent; no gate prompts the user except the deliberate push/PR-create
+        # egress ask. The earlier interactive-ask design priced a false
+        # positive in USER clicks; the deny prices it in an AGENT rewrite the
+        # message names (Write tool for prose; `git commit -F <file>` for real
+        # commits). Keep the predicate broad — narrowing conjuncts starve the
+        # trigger (measured) — and never downgrade this to an advisory: that
+        # would fail-open on exactly the parse failure the net exists for.
         #
         # The probe reads the command RAW — the normalizer that used to
         # pre-process it is deleted, so an ordinary contraction inside quoted
@@ -679,45 +680,40 @@ def main() -> None:
         # resolves the segment, and the net only fires where it found none.
         try:
             if untokenizable(command):
-                # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
-                # "1" and every other consumer compares to it exactly
-                # (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
-                # outcome_verification_hook). A truthiness test also treats
-                # GENESIS_CC_SESSION=0 — an operator explicitly turning it OFF — as
-                # dispatched, and would then HARD-BLOCK a benign unparseable
-                # mention such as `echo $'don\\'t commit this'` that the interactive
-                # path is meant to merely ask about. Over-blocking is the failure
-                # direction this whole design was chosen to avoid.
-                if os.environ.get("GENESIS_CC_SESSION") == "1":
-                    # No human present to answer a prompt in a dispatched session.
-                    _deny(
-                        "BLOCKED: this command cannot be parsed safely (e.g. "
-                        "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
-                        "sessions cannot proceed on an unverifiable command.\n"
-                        "To proceed: if you are WRITING TEXT (a commit message, "
-                        "a plan, review notes) whose content merely mentions a "
-                        "commit, use the Write tool instead of a here-doc — an "
-                        "apostrophe in ordinary prose is what makes this "
-                        "unparseable, and re-quoting the here-doc cannot fix "
-                        "that. If you are RUNNING a git command, rewrite it in "
-                        "a directly-parseable form (plain quotes, or "
-                        "`git commit -F <file>`)."
-                        # The way OUT belongs here more than on the ask below:
-                        # an interactive session can ask a human what it did
-                        # wrong, an unattended one cannot. A refusal it cannot
-                        # act on is a wall; with the rewrite named it is a cost.
-                    )
-                _ask(
-                    "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                    "quoting) and mentions a commit, so review enforcement cannot "
-                    "verify what it would actually run. Approve only if you are "
-                    "sure. To avoid the prompt, rewrite it in a directly-parseable "
-                    "form (plain quotes, or `git commit -F <file>`)."
+                # One deny for every session type — interactive and dispatched
+                # alike (the old split asked the human when present; retired by
+                # the 2026-09-08 ruling above). The way OUT is in the message:
+                # a refusal the session cannot act on is a wall; with the
+                # rewrite named it is a cost.
+                _deny(
+                    "BLOCKED: this command cannot be parsed safely (e.g. "
+                    "ANSI-C $'...' quoting) and mentions a commit, so review "
+                    "enforcement cannot verify what it would actually run.\n"
+                    "To proceed: if you are WRITING TEXT (a commit message, "
+                    "a plan, review notes) whose content merely mentions a "
+                    "commit, use the Write tool instead of a here-doc — an "
+                    "apostrophe in ordinary prose is what makes this "
+                    "unparseable, and re-quoting the here-doc cannot fix "
+                    "that. If you are RUNNING a git command, rewrite it in "
+                    "a directly-parseable form (plain quotes, or "
+                    "`git commit -F <file>`)."
                 )
-        except Exception:  # noqa: BLE001 — never crash into a silent allow
-            _ask(
-                "The commit-guard parseability probe failed, so this command could "
-                "not be verified. Approve only if you are sure."
+        except Exception as exc:  # noqa: BLE001 — never crash into a silent allow
+            # (_deny's SystemExit is a BaseException — it passes through this.)
+            # Name the exception: catching here replaces run_guard's own
+            # "GUARD ERROR (…) — <type>: <msg>" line, so without this the
+            # operator is told the probe failed but never what failed. Less
+            # severe than the push guard's twin (this branch sits behind
+            # _COMMIT_PATTERN and always denies, so something is always
+            # printed), but a probe bug still reads as a mysterious recurring
+            # block unless the type and message travel with it.
+            _deny(
+                "BLOCKED: the commit-guard parseability probe failed "
+                f"({type(exc).__name__}: {exc}), so this command could not be "
+                "verified. Rewrite the command in a directly-parseable form "
+                "(plain quotes, or `git commit -F <file>`); if this persists "
+                "on ordinary commands, the probe itself is broken — flag it "
+                "instead of retrying."
             )
         sys.exit(0)
 
@@ -1267,29 +1263,6 @@ def _deny(message: str) -> None:
     """Output denial message and block the tool via exit code 2."""
     print(message, file=sys.stderr)
     sys.exit(2)
-
-
-def _ask(reason: str) -> None:
-    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
-
-    For the UNVERIFIABLE path only: a command the parser cannot resolve is not
-    evidence of wrongdoing, so it earns a human decision rather than a refusal.
-    Claude Code runs the tool only on explicit approval, which the agent cannot
-    self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
-    stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
-    """
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
-    sys.exit(0)
 
 
 if __name__ == "__main__":
