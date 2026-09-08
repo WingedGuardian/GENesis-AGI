@@ -260,6 +260,19 @@ at gate time (`security/immunity.py`). Migration 0053 backfilled history
 (no owner heuristics); `scripts/backfill_origin_class_qdrant.py` mirrors the
 payloads idempotently.
 
+**Judgment axes (DARK — written, no reader):** `memory_metadata` carries six
+write-only classification columns stamped at extraction time and consumed by
+nothing yet — `speech_act` + `speech_act_confidence`
+(# GROUNDWORK(mw-5-speech-act-protection)), `assertion_provenance`
+(# GROUNDWORK(mw-4-provenance-weight)), `durability` + `expires_at`
+(# GROUNDWORK(mw-4-durability-ttl)), and `preference_domain`
+(# GROUNDWORK(mw-4-preference-domain) — the domain a preference is scoped to,
+so a later conflicting preference coexists as a different-context truth
+instead of overwriting). Contract + normalizers in `memory/judgment.py`;
+distinct from `origin_class` above, which is a pipeline-trust label. Expiry is
+opt-in (`durability='temporary'` + an elapsed `expires_at` only), so an
+unclassified row never expires.
+
 ## 2. Execution — CC sessions (DirectSession)
 
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
@@ -655,9 +668,24 @@ verified: 5808e7cd 2026-09-03
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
   → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
-  capability-promotion path (`capability_grants.detect_promotable_cells` — no
-  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
-  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  capability-promotion path (`capability_grants.detect_promotable_cells` →
+  `email:send:bulk` qualifies once it has ≥5 owner-approved successes +
+  posterior ≥0.70). That path is scoped by
+  `is_promotable_cell` — two closed sets, an allowlisted (DOMAIN, VERB) pair
+  (`PROMOTABLE_CELLS`, `("email", "send")` only today — keyed on the pair, not
+  the domain, so a future verb under an allowlisted domain cannot inherit
+  eligibility) and a risk class that is not
+  FINANCIAL — enforced in BOTH the candidate scan and `apply_event`, which
+  raises `InvalidTransition` on an `APPROVE` that fails either bar. FINANCIAL
+  is the bar `RiskClass` already claimed ("never trust-unlockable") and nothing
+  enforced: financial cells stayed out of the matrix only because
+  `email_gate.check` holds them before the first CLASSIFY, which is one
+  caller's statement ordering rather than a mechanism. So a future capability's
+  cells stay at ASK or below — classifying and accumulating evidence, still
+  able to be DENIED_PERMANENT, but gating every action on the owner — until
+  someone adds its domain in code. Promotion is the one transition
+  that converts per-action approval into a standing grant; a denylist would hand
+  that conversion to every new capability by default. **Contact-stamping (loop-fix):** on a CONFIRMED
   delivery a matching prospect is advanced active → `contacted` via one
   active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
   BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
