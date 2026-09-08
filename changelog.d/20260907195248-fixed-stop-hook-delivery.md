@@ -26,6 +26,10 @@
   A third check, for code changed without a review, deliberately stays out of
   this path. It depends on a condition rather than on something in the reply,
   so it would repeat until the condition cleared; it also already arrives by
-  another route, at the start of each of your messages, and always did. The
-  one other end-of-turn check Genesis runs — the deliverable gate — had the
-  same repeat problem and is now bounded the same way.
+  another route, at the start of each of your messages, and always did.
+
+  The one other end-of-turn check Genesis runs — the deliverable gate, which
+  refuses to end a session that rendered a document nobody verified — keeps
+  repeating on purpose, and is unchanged. A reminder said twice adds nothing; a
+  gate that gives up after being acknowledged once was never a gate. It still
+  lets go the moment the document is verified or the draft is abandoned.

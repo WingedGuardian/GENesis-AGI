@@ -62,17 +62,33 @@ def _decide(data: dict, sessions_root: Path) -> int:
         if spec.get("session_id") != sid:
             return 0
         if spec.get("status") == _BLOCK_STATUS:
-            # A Stop block that REPEATS runs to CLAUDE_CODE_STOP_HOOK_BLOCK_CAP
-            # (default 8) and then surfaces "a hook blocked the turn from ending
-            # 9 consecutive times" to the USER — against the axiom that hooks are
-            # for the agent. `stop_hook_active` is true exactly when the loop is
-            # already continuing because a Stop hook blocked, so blocking again
-            # from that state is what builds the count. One block IS the gate;
-            # more is noise. (Exit 2 and `additionalContext` feed the SAME
-            # counter — this hook uses the former, `genesis_stop_hook.py` the
-            # latter, and both need this guard.)
-            if data.get("stop_hook_active"):
-                return 0
+            # NO `stop_hook_active` guard here, and the omission is deliberate.
+            #
+            # `genesis_stop_hook.py` takes that guard because its nudges are
+            # ADVISORY: saying a thing twice adds nothing, so one emission per
+            # continuation chain is the whole of it. This hook is a GATE. The
+            # skill that owns it declares its pipeline "*non-skippable*" and
+            # tells the model "the Stop-hook enforces this; don't fight it —
+            # pass the gate or `cancel` the deliverable"
+            # (.claude/skills/deliverable-builder/SKILL.md). Releasing after a
+            # single block would make that false: a session could end with an
+            # unverified artifact by merely ACKNOWLEDGING the block, which is
+            # the one outcome the gate exists to prevent.
+            #
+            # Release is therefore bounded by the marker's own states —
+            # `verified` or `cancelled`, both one edit away and both under the
+            # model's control — plus the staleness escape below. The harness's
+            # CLAUDE_CODE_STOP_HOOK_BLOCK_CAP is the last of them, and its
+            # user-visible warning is the correct outcome for a session that
+            # rendered a deliverable and then refused to verify it eight times.
+            # That is not a hook leaking to the user for its own sake; it is the
+            # deliverable being reported as unverified.
+            #
+            # The standing axiom's forbidden case — a block impeding background
+            # work — is not in play: SKILL.md scopes this hook to FOREGROUND
+            # sessions ("Autonomous (v2) … the Stop-hook does NOT apply"), where
+            # the executor's own VERIFYING-phase blocker owns the gate instead.
+            #
             # Staleness escape: an abandoned marker must not wedge Stop forever.
             try:
                 age = time.time() - marker.stat().st_mtime

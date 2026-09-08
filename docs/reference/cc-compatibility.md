@@ -737,7 +737,7 @@ When a new CC version is released, run through this:
 | 2.1.133 | — | All hooks gain `effort.level` JSON field + `$CLAUDE_EFFORT` env var | Additive — Genesis hooks only read fields they need |
 | 2.1.138 | — | Running version before 2026-06-01 upgrade | Proven stable in production |
 | 2.1.139 | — | Hooks run WITHOUT terminal access — terminal I/O silently suppressed | Safe — Genesis hooks only use stderr for logging |
-| 2.1.143 | — | Stop hooks that block cap at 8 consecutive blocks | **Applies — and the exit-code reasoning here was wrong.** `additionalContext` blocks WITHOUT exit 2: it is returned to the agent loop as `blockingErrors`. `genesis_stop_hook.py` emits it and guards with `stop_hook_active`, so it can consume at most one block. `hooks/deliverable_gate_guard.py` blocks via exit 2 with no such guard. See the delivery-channel section below. |
+| 2.1.143 | — | Stop hooks that block cap at 8 consecutive blocks | **Applies — and the exit-code reasoning here was wrong.** `additionalContext` blocks WITHOUT exit 2: it is returned to the agent loop as `blockingErrors`. Whether a hook should take the `stop_hook_active` guard depends on what it IS, not on which channel it blocks through. `genesis_stop_hook.py` is ADVISORY, so it guards and consumes at most one block. `hooks/deliverable_gate_guard.py` is a GATE whose skill declares itself non-skippable, so it deliberately does not — it releases on the marker reaching `verified`/`cancelled`, or on the staleness escape, and the cap is its last resort rather than its bound. See the delivery-channel section below. |
 | 2.1.150 | — | npm `stable` tag | Noted |
 | 2.1.152 | — | `cache_creation_input_tokens` reporting bug fixed (was silently 0) | Dashboard cost numbers will appear higher — this is a correctness fix, not a regression |
 | 2.1.153 | — | `/model` saves selection as default for new sessions | No background session impact (`--model` flag overrides) |
@@ -1121,12 +1121,21 @@ that names its own required guard: *"For Stop/SubagentStop hooks, check
 hook that emits unconditionally will hit that, and a hook whose trigger is
 STATE-based rather than message-based will hit it during ordinary work.
 
-Practical consequence for anything emitting here: check `stop_hook_active`, and
-only send advice whose meaning is "keep going". Anything meant for the user's
-next prompt belongs on UserPromptSubmit, whose stdout the model does receive.
-`genesis_stop_hook.py` now does both — two message-based nudges behind the
-guard, and the state-based review reminder left to
+Practical consequence for anything ADVISORY emitting here: check
+`stop_hook_active`, and only send advice whose meaning is "keep going". Anything
+meant for the user's next prompt belongs on UserPromptSubmit, whose stdout the
+model does receive. `genesis_stop_hook.py` now does both — two message-based
+nudges behind the guard, and the state-based review reminder left to
 `scripts/review_enforcement_prompt.py`, where it already worked.
+
+The guard is not universal, and reading it as universal is the trap on the
+other side. A hook that is a GATE rather than an advisory must keep blocking
+until its own release condition is met, or a model can end the session past it
+by acknowledging the first block. `hooks/deliverable_gate_guard.py` is that
+case: it holds while the marker says `rendered_unverified`, releases on
+`verified`/`cancelled` or on a stale marker, and treats the cap as its last
+resort. The question to ask of a Stop hook is not "which channel does it block
+through" but "is saying this twice redundant, or is it the enforcement".
 
 Corroborating the renderer read, CC documents the semantics itself. Its hook
 schema help for `"Stop" | "SubagentStop"` reads, verbatim:

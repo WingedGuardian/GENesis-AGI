@@ -114,6 +114,39 @@ _RESUME_PATTERNS = re.compile(
 # quo for years, and harmless), a false FIRE costs a model turn and talks over
 # the user. So this errs toward suppressing. The trailing clause is length-bound
 # so a question buried before a long closing paragraph does not qualify.
+#
+# PRECEDENCE — the suppressor outranks BOTH nudges, including a giving-up match.
+# Raised in review as a bug: a delegation phrased as a question ("You'll need to
+# run the migration yourself. Can you do that?") matches _GIVING_UP_PATTERNS and
+# is suppressed anyway. The mechanism is real; the remedy is not, because the
+# shape is not. MEASURED over 26,630 turn-final assistant messages from this
+# install's CC transcripts (the honest base rate: these predate the nudges
+# reaching anyone, so nothing in the corpus was shaped by them) — the full
+# cross-product of the three matchers:
+#
+#   giving-up only .............................  31   0.12%   fires
+#   unverified-completion only .................. 430   1.61%   fires
+#   unverified-completion + yielding ............ 154   0.58%   suppressed
+#   giving-up + yielding ........................  44   0.17%   suppressed  <- disputed cell
+#   giving-up + unverified-completion ............  1   0.00%   fires
+#   neither ................................. 25,970  97.52%   silent
+#
+# The disputed cell is 44 occurrences but only 12 UNIQUE messages (CC forks a
+# transcript per resume, so one message recurs across files). Reading all 12:
+# at least 6 are plainly legitimate yields where a giving-up phrase sits far
+# back in the reply and the question is about something else entirely — "…do it
+# yourself…" 925 and 1,911 characters before "Does this framing make sense
+# before I start implementing?" and "What's your read on this direction?". None
+# of the 12 has the reviewed shape: a terminal delegation with a question
+# appended. The two matchers also read different windows (giving-up scans a
+# 2,000-char tail, this one 400), so overlap mostly means "unrelated sentences
+# in one long reply", not "delegation dressed as a question".
+#
+# Inverting precedence would therefore convert ~6 correct silences into blocks
+# that talk over a user who was just asked something, to catch a shape with no
+# instances — the fail direction above, run backwards. Falsifiable: if that
+# shape shows up at a real rate, or a discriminator separates it from a long
+# reply that merely contains both, let the giving-up match take precedence.
 _AWAITING_USER = re.compile(
     r"(?:\?|\bshall I\b|\bwould you like\b|\bdo you want\b|\blet me know\b"
     r"|\bawaiting your\b|\bplease (?:approve|confirm|advise|decide|provide)\b)"
@@ -210,9 +243,14 @@ def main() -> None:
     # Stop hook spoke last time. Emitting again from that state is what runs to
     # CLAUDE_CODE_STOP_HOOK_BLOCK_CAP and ends in a user-visible override
     # warning — so a nudge is emitted at most once per continuation chain,
-    # which is exactly what the harness's own warning text prescribes. Note the
-    # flag is set by ANY Stop hook blocking, so a sibling hook blocking first
-    # suppresses this one for that turn: a lost advisory, never a loop.
+    # which is exactly what the harness's own warning text prescribes.
+    #
+    # The flag is set by ANY Stop hook blocking, so a sibling blocking first
+    # suppresses this one for the rest of that continuation chain. That matters
+    # in one real case: `hooks/deliverable_gate_guard.py` is a GATE and holds
+    # until its marker clears, so a deliverable session in `rendered_unverified`
+    # keeps these nudges quiet throughout. Correct as a priority — a hard gate
+    # outranks an advisory — and the cost is a lost advisory, never a loop.
     if not hook_input.get("stop_hook_active") and not _is_awaiting_user(assistant_msg):
         _emit([
             _check_giving_up(assistant_msg),
