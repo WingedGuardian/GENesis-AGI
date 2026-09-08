@@ -2233,6 +2233,119 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
     return ids[-1] if ids else None
 
 
+# Value-taking flags whose SEPARATED value must not be read as the positional
+# target — a PR URL inside a `--body` text would otherwise redirect the gate to
+# an unrelated repo (#1385 round-5). Glued forms (`--body=…`, `-b…`, `-R…`,
+# `--repo=…`) are single `-`-prefixed tokens already skipped by the dash branch.
+# ONE copy, walked ONCE: the target scan and the identity check used to carry
+# their own copies of this loop, and two copies of a walk are two answers to
+# "which token is the target" waiting to disagree.
+_COMMENT_VALUE_FLAGS = frozenset({"-b", "--body", "-F", "--body-file", "-R", "--repo"})
+# The short letters of those value flags, for the GLUED spellings (`-bTEXT`,
+# `-F-`, `-Ro/r`, `-R=o/r`), which carry their value inside one token.
+_COMMENT_VALUE_SHORTS = frozenset("bFR")
+# gh pr comment's remaining flags — the ones that take NO value — from
+# `gh pr comment --help` (its own flags plus the inherited `--help`; `-R/--repo`
+# is inherited and lives in the value set above). This is a closed set for the
+# same reason the target forms are: see `_comment_positional`.
+_COMMENT_BOOL_FLAGS = frozenset(
+    {
+        "-e",
+        "--editor",
+        "-w",
+        "--web",
+        "--create-if-none",
+        "--delete-last",
+        "--edit-last",
+        "--yes",
+        "--help",
+    }
+)
+
+
+def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
+    """``(target, unreadable_flag)`` for a ``gh pr comment`` segment's argv.
+
+    ``target`` is the FIRST positional token after ``comment`` — gh documents
+    exactly ONE (``[<number> | <url> | <branch>]``), so the first bare word IS
+    the whole target and a later one is not a second candidate to fall back on.
+    None means the request carries no positional at all
+    (``gh pr comment --body …``, which resolves the PR from the checked-out
+    branch); that keeps its documented fail-open, since there is no target to
+    count against.
+
+    ``unreadable_flag`` is a dash token this walk does not model, encountered
+    BEFORE any positional. It matters because an allowlist on the target's VALUE
+    is only as good as the walk that decides WHICH token the target is, and that
+    walk is the part that can still be a list of spellings. Its failure is
+    silent and in the wrong direction: gh's own parser bundles short flags, so
+    `-ewR o/r <target>` passes `o/r` to ``--repo`` and leaves the real target
+    two tokens later — while a walk that merely SKIPS the unrecognised `-ewR`
+    hands back `o/r`, an innocuous literal, and never looks at the target at
+    all. So an unmodelled flag makes the identity unreadable rather than being
+    skipped; the sibling precedent is `full_suite_guard`'s "an unlisted
+    value-flag falls back to a safe BLOCK, never a fail-open".
+
+    Measured 2026-09-08 against `gh pr comment --help`: no bundle containing
+    `-R` can both parse AND post (every companion short flag either conflicts
+    with the body source or swallows the rest of the bundle as its own value),
+    so this is a divergence with no reachable exploit TODAY — closed here
+    because the next gh flag is what makes it one, and because the walk should
+    not be the soft half of an allowlist design.
+    """
+    try:
+        idx = argv.index("comment")
+    except ValueError:
+        return None, None
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _COMMENT_VALUE_FLAGS:
+            skip_next = True
+            continue
+        # A bare `-` is not a flag: gh takes it as the positional, and so do we
+        # (it resolves to no pull request, which is gh's problem, not the cap's).
+        if tok.startswith("-") and tok != "-":
+            if tok == "--" or tok in _COMMENT_BOOL_FLAGS:
+                continue
+            # Glued value forms carry their own value in one token.
+            if tok.startswith("--") and "=" in tok:
+                continue
+            if not tok.startswith("--") and len(tok) > 2 and tok[1] in _COMMENT_VALUE_SHORTS:
+                continue
+            return None, tok
+        return tok, None
+    return None, None
+
+
+# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` keeps its original
+# shape (trailing context tolerated, e.g. a `#issuecomment-…` fragment) because
+# it reads the number and OWNER/REPO out of a URL.
+_PR_NUMBER_RE = re.compile(r"#?([0-9]+)\Z")
+_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
+
+# ALLOWLIST patterns — what the gate accepts as unambiguously LITERAL. See
+# `_unresolvable_identity` for why these are allowlists and not screens.
+# A PR URL every character of which is inert to the shell. The trailing group
+# admits what a browser actually copies — `/files`, `/commits/<sha>`, a
+# `#issuecomment-…` deep link — none of which the shell acts on (`#` opens a
+# comment only at word start). It stops short of `?query`, because `?` is a
+# glob metacharacter and the shell WOULD act on it.
+_LITERAL_URL_RE = re.compile(
+    r"(?:[a-z]+://[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
+    r"(?:[/#][A-Za-z0-9._/#-]*)?\Z"
+)
+# A branch name in characters that are both legal in a git ref and inert to the
+# shell. `git check-ref-format` already excludes space ~ ^ : ? * [ and \; this
+# set additionally excludes every character the shell acts on — $ ` ! & ; | ( )
+# < > # { } ' " — so a token matching it expands to itself, quoted or not.
+_LITERAL_BRANCH_RE = re.compile(r"[A-Za-z0-9._/+,=%@-]+\Z")
+# `[HOST/]OWNER/REPO` in GitHub's own owner/repo character set.
+_LITERAL_REPO_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){1,2}\Z")
+
+
 def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     """(pr_number, repo) from a ``gh pr comment`` segment's argv.
 
@@ -2241,108 +2354,123 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     produce a wrong count and a FALSE block — Codex round-1 finding). An
     explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
     target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+
+    Reads the FIRST positional only (``_comment_positional``), where this used
+    to scan every one of them for something number-shaped. gh accepts at most
+    one positional — `gh pr comment my-branch 1372` exits with "accepts at most
+    1 arg(s), received 2" — so a second bare word never named the PR that would
+    be commented on, and resolving one was reading an identity out of a command
+    that cannot run.
     """
+    tok, _ = _comment_positional(argv)
     pr_num: str | None = None
     url_repo: str | None = None
-    try:
-        idx = argv.index("comment")
-    except ValueError:
-        return None, None
-    # Value-taking flags whose SEPARATED value must not be read as the positional
-    # target — a PR URL inside a `--body` text would otherwise redirect the gate
-    # to an unrelated repo (#1385 round-5). Glued forms (`--body=…`, `-b…`,
-    # `-R…`, `--repo=…`) are single `-`-prefixed tokens already skipped below.
-    _VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
-    skip_next = False
-    for tok in argv[idx + 1 :]:
-        if skip_next:
-            skip_next = False
-            continue
-        if tok in _VALUE_FLAGS:
-            skip_next = True
-            continue
-        if tok.startswith("-"):
-            continue
-        if pr_num is None and tok.isdigit():
-            pr_num = tok
-        elif pr_num is None and tok.startswith("#") and tok[1:].isdigit():
-            pr_num = tok[1:]
-        elif pr_num is None:
-            url = re.match(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b", tok)
+    if tok is not None:
+        num = _PR_NUMBER_RE.match(tok)
+        if num:
+            pr_num = num.group(1)
+        else:
+            url = _PR_URL_RE.match(tok)
             if url:
                 url_repo, pr_num = url.group(1), url.group(2)
     return pr_num, _comment_repo(argv) or url_repo
 
 
-# A shell expansion the hook can never resolve: PreToolUse sees the command
-# BEFORE the shell runs, so `$n`, `"$PR"`, `$(gh …)` and backticks are literal
-# text here, not a PR number.
-_UNEXPANDED_TARGET_RE = re.compile(r"\$\{?\w|\$\(|`")
+def _unresolvable_identity(argv: list[str]) -> str | None:
+    """The first identity-bearing value on a ``gh pr comment`` segment that is
+    not unambiguously literal, or None when the gate can read every identity it
+    needs.
 
+    THE CLASS, not a list of spellings. The cap counts rounds on ONE pull
+    request in ONE repository, so exactly two values decide what it counts: the
+    positional target, and the repository (an explicit ``--repo``/``-R``, or the
+    OWNER/REPO carried inside a URL target). A PreToolUse hook sees the command
+    BEFORE the shell runs, so a value carrying an expansion is not a value yet —
+    and screening for the expansions one can name is a losing shape: ``$n`` is
+    one spelling; ``$@``, ``$*``, ``${!v}``, ``${#v}``, ``$$``, ``$!``, ``$?``,
+    ``$#``, ``$-``, ``$(…)``, backticks and legacy ``$[…]`` are eleven more, and
+    the next round's finding is whichever one nobody enumerated.
 
-def _comment_target_unexpanded(argv: list[str]) -> str | None:
-    """The ``gh pr comment`` positional target when it is an UNEXPANDED shell
-    expansion rather than a resolvable PR reference.
+    So this ALLOWLISTS, per the house rule that a contract guard names what is
+    PERMITTED rather than what it imagined being attacked. gh documents the
+    target as ``[<number> | <url> | <branch>]`` and the repo as
+    ``[HOST/]OWNER/REPO``; each is accepted only when spelled in characters that
+    are inert to the shell, so it expands to itself. Every other spelling —
+    present and future — is refused by construction, without this function
+    knowing anything about shell expansion syntax.
 
-    Why this exists as a separate probe instead of widening ``_comment_target``:
-    that function's ``(None, …)`` result is overloaded. It means "no number" for
-    three different situations — no positional at all, a literal BRANCH name,
-    and an expansion — and only the third is unknowable in principle. The first
-    two keep their documented fail-open; a branch is resolvable by anyone who
-    cares to look it up, and a bare ``--body`` request has no target to count
-    against. An expansion is different in kind: no amount of parsing recovers
-    the number, because the value does not exist yet.
+    Two fail-opens are DELIBERATELY kept, both documented and both locked by
+    tests: a request with NO positional at all (nothing to count against), and a
+    literal branch target (resolvable by anyone who cares to look it up).
 
-    MEASURED 2026-09-08 — why this is a BLOCK and not an advisory: writing the
-    request as ``for n in 1625 1576 1609; do gh pr comment $n --body "@codex
-    review"; done`` posted round requests on two PRs already at or past
-    ``ESCALATION_ROUND_CAP`` with no ``# escalation-ack`` and no step-back
-    triage. The cap is itself a block, so an unknowable target leaves only
-    fail-open or fail-closed; an advisory would not have stopped it. Failing
-    closed here costs one rewrite with a literal number, which the refusal names.
+    The cost, stated plainly because it is real: ``shell_parse._argv`` runs
+    ``shlex.split`` first, so quoting is already gone by the time argv exists,
+    and a branch LITERALLY named ``$PR`` — legal per ``git check-ref-format``,
+    written ``'$PR'`` — is indistinguishable here from a live expansion and is
+    refused. Recovering it means deciding expandability from raw quoting, i.e.
+    hand-written shell-quote analysis inside the guard, whose failure direction
+    is a reopened bypass rather than a rewrite. One rewrite with a literal PR
+    number is the cheaper side of that trade, and the refusal names the remedy.
+
+    MEASURED 2026-09-08 — why a BLOCK and not an advisory: writing the request
+    as ``for n in 1625 1576 1609; do gh pr comment $n --body "@codex review";
+    done`` posted round requests on two PRs already at or past
+    ``ESCALATION_ROUND_CAP`` with no ``# escalation-ack`` and none of the
+    step-back triage the block exists to force. The cap is itself a block, so an
+    unreadable identity leaves only fail-open or fail-closed; an advisory would
+    not have stopped it.
     """
-    try:
-        idx = argv.index("comment")
-    except ValueError:
-        return None
-    _VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
-    skip_next = False
-    for tok in argv[idx + 1 :]:
-        if skip_next:
-            skip_next = False
-            continue
-        if tok in _VALUE_FLAGS:
-            skip_next = True
-            continue
-        if tok.startswith("-"):
-            continue
-        # FIRST positional only — it is the target. A later one is body text,
-        # which may legitimately mention a price or a shell snippet.
-        return tok if _UNEXPANDED_TARGET_RE.search(tok) else None
+    tok, unreadable_flag = _comment_positional(argv)
+    # A flag the walk does not model comes FIRST: until we know whether it eats
+    # the following word, we do not know which token the target is, so the
+    # target's own allowlist has nothing trustworthy to judge.
+    if unreadable_flag is not None:
+        return unreadable_flag
+    if tok is not None and not (
+        _PR_NUMBER_RE.match(tok) or _LITERAL_URL_RE.match(tok) or _LITERAL_BRANCH_RE.match(tok)
+    ):
+        return tok
+    # The repo is identity-bearing too, and is read on a path the target check
+    # cannot cover: with a LITERAL number and `--repo "$REPO"`, the number
+    # resolves, the query goes to the literal path `repos/$REPO/…`, the API
+    # errors, and the error fails OPEN — the cap skipped by a different door.
+    # Checked against the value AS WRITTEN, before the host reduction, so an
+    # expansion in the host position cannot be dropped on the way in.
+    repo = _comment_repo_value(argv)
+    if repo is None and tok is not None:
+        url = _PR_URL_RE.match(tok)
+        repo = url.group(1) if url else None
+    if repo is not None and not _LITERAL_REPO_RE.match(repo):
+        return repo
     return None
 
 
-def _unresolvable_target_advisory(token: str) -> str:
+def _unresolvable_identity_advisory(token: str) -> str:
     return (
-        f"BLOCKED: cannot tell which PR '{token}' is, so the Codex round cap "
-        "cannot be checked.\n"
-        "This hook runs BEFORE the shell expands anything, so a variable or "
-        "command substitution in the PR position is unreadable here — and an "
-        "unreadable target used to skip the cap entirely, which is how a loop "
-        "silently requested rounds past it.\n"
-        "Re-run with the PR number written literally, one command per PR:\n"
-        "  gh pr comment 1234 --body \"@codex review\"\n"
+        f"BLOCKED: '{token}' does not name a pull request this hook can read, so "
+        "the Codex round cap cannot be checked.\n"
+        "This hook runs BEFORE the shell expands anything, so the PR target and "
+        "the --repo value are readable only when they are written out. The gate "
+        "accepts what gh documents, spelled literally; anything else is refused "
+        "rather than counted against the wrong pull request, or against none.\n"
+        "Re-run with the identity written out — a number, #N or a PR URL, and "
+        "OWNER/REPO for the repo — one command per PR:\n"
+        '  gh pr comment 1234 --body "@codex review"\n'
         "If that PR is already at the cap you will get the step-back advisory, "
         "which is the point."
     )
 
 
-def _comment_repo(argv: list[str]) -> str | None:
-    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
+def _comment_repo_value(argv: list[str]) -> str | None:
+    """The explicit ``--repo``/``-R`` value AS WRITTEN, or None if absent.
 
-    Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, and glued
-    ``-Ro/r`` forms. A host-qualified ``HOST/OWNER/REPO`` is reduced to its
-    OWNER/REPO tail (the REST path shape this gate queries).
+    Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, glued
+    ``-Ro/r`` and ``-R=o/r`` forms. The value is otherwise unnormalised — the
+    identity check needs it as the user typed it, host part included — with one
+    exception: an EMPTY value reads as absent. Both empty spellings are commands
+    gh rejects outright, and treating them alike keeps ``--repo=`` from being
+    refused with an empty-quoted token in the message while ``-R=`` (which no
+    branch below matches) reads as no flag at all.
     """
     val: str | None = None
     for i, tok in enumerate(argv):
@@ -2354,6 +2482,17 @@ def _comment_repo(argv: list[str]) -> str | None:
             val = tok[2:]
         elif tok.startswith("-R=") and len(tok) > 3:
             val = tok[3:]
+    return val or None
+
+
+def _comment_repo(argv: list[str]) -> str | None:
+    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
+
+    A host-qualified ``HOST/OWNER/REPO`` is reduced to its OWNER/REPO tail (the
+    REST path shape this gate queries); see ``_comment_repo_value`` for the
+    flag forms and for the unreduced value.
+    """
+    val = _comment_repo_value(argv)
     if val and val.count("/") >= 2:
         val = "/".join(val.split("/")[-2:])
     return val
@@ -2475,8 +2614,13 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         short-circuit could never see the count it needed to be bounded by.
       rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
         escalation-ack here is deliberately not enough)
-      numberless/branch target (no PR number)     → that segment allows;
+      no positional / literal branch target       → that segment allows;
         SCANNING CONTINUES (an allowed segment must not shield a later one)
+      identity not written literally (target OR
+        repo)                                     → BLOCK. The one fail-CLOSED
+        leg, and the ack does not clear it: `acked` is command-wide, so one
+        sigil on a loop would license a round on every PR it touches. See
+        `_unresolvable_identity` for why the accepted forms are an ALLOWLIST
       gh/API/parse error (ids is None)            → that segment allows, scan on
       rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
       cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
@@ -2526,13 +2670,16 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
                 continue
             if not any("@codex review" in tok.lower() for tok in seg.argv):
                 continue
+            # BEFORE resolving the number, not after: a literal number with an
+            # unreadable `--repo` resolves fine and still counts the wrong repo,
+            # so a check gated on `not pr_num` would never see it.
+            unresolvable = _unresolvable_identity(seg.argv)
+            if unresolvable is not None:
+                return True, _unresolvable_identity_advisory(unresolvable)
             pr_num, repo = _comment_target(seg.argv)
             if not pr_num:
-                # An unexpanded expansion is unknowable here, so it fails CLOSED;
-                # a missing or branch target keeps its documented fail-open.
-                unresolvable = _comment_target_unexpanded(seg.argv)
-                if unresolvable:
-                    return True, _unresolvable_target_advisory(unresolvable)
+                # A missing positional or a literal branch target keeps its
+                # documented fail-open; every other spelling was refused above.
                 continue
             # Count ALL Codex review rounds — including DISMISSED, which still
             # ran and consumed the budget (#1385 round-5). Freshness uses the
