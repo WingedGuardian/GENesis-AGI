@@ -123,8 +123,8 @@ _IDLE_TIMEOUT_S = 3600  # 1 hour
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 #: Pointer readback tolerance. VNC positioning is not exact to the pixel, so a
-#: small delta is normal; a large one is the signature of a coordinate-space
-#: mismatch rather than jitter.
+#: small delta is normal; a large one means the move was not DELIVERED as
+#: asked — clamped, dropped, or the pointer grabbed — rather than jitter.
 _POINTER_DRIFT_TOLERANCE_PX = 3
 #: Pointer readback probe timeout. Generous — xdotool answers in
 #: milliseconds against a healthy X server, so exceeding this means the
@@ -1569,13 +1569,14 @@ async def _read_pointer_position(
 ) -> tuple[int, int] | None:
     """Read the X pointer's ACTUAL position, or ``None`` if it cannot be read.
 
-    Best-effort by contract: every failure returns ``None`` rather than
-    raising, because a click must not be blocked by an unavailable
-    measurement. It is still LOGGED — an absent readback must never read as a
-    clean one. The ``OSError`` catch is load-bearing beyond tidiness: a
-    missing ``xdotool`` raises ``FileNotFoundError`` here, and the caller's
-    outer handler for that exception reports a missing ``vncdo`` and abandons
-    the click.
+    Best-effort by contract: every measurement failure returns ``None`` rather
+    than raising, because a click must not be blocked by an unavailable
+    measurement. Cancellation is not a measurement failure — the caller is
+    gone — so it reaps the child and propagates. It is still LOGGED: an absent
+    readback must never read as a clean one. The ``OSError`` catch is
+    load-bearing beyond tidiness: a missing ``xdotool`` raises
+    ``FileNotFoundError`` here, and the caller's outer handler for that
+    exception reports a missing ``vncdo`` and abandons the click.
     """
     try:
         probe = await asyncio.create_subprocess_exec(
@@ -1590,11 +1591,15 @@ async def _read_pointer_position(
 
     try:
         probe_out, _ = await asyncio.wait_for(probe.communicate(), timeout=timeout_s)
-    except TimeoutError:
+    except asyncio.CancelledError:
+        # MEASURED: an outer cancellation reaches NEITHER handler below and
+        # leaves the child running (returncode None, pid alive). Not an exotic
+        # path — browser_navigate cancels this whole call at its 300s ceiling,
+        # and a wedged X server is both what holds the probe open and what
+        # makes that ceiling get reached.
         await _kill_and_reap(probe)
-        _ts_log.info("VNC: pointer readback unavailable (TimeoutError)")
-        return None
-    except OSError as exc:
+        raise
+    except (TimeoutError, OSError) as exc:
         await _kill_and_reap(probe)
         _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
         return None
@@ -1636,10 +1641,12 @@ async def _vnc_click_turnstile(page) -> bool:
             )
             try:
                 xdo_out, _ = await asyncio.wait_for(xdo.communicate(), timeout=3)
-            except TimeoutError:
+            except (asyncio.CancelledError, TimeoutError):
                 # Same leak as the pointer probe below: the wait is cancelled,
-                # the process is not. Reap it, then fall through to the (0,0)
-                # default via the enclosing handler.
+                # the process is not. Reap it, then re-raise — a timeout falls
+                # through to the (0,0) default via the enclosing
+                # ``except Exception``, a cancellation propagates straight past
+                # it (CancelledError is a BaseException).
                 await _kill_and_reap(xdo)
                 raise
             xdo_text = xdo_out.decode()

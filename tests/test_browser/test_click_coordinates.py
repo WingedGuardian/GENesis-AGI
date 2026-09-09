@@ -96,8 +96,10 @@ class _FakeProc:
         self.killed = False
         self.reaped = False
         self.returncode = None
+        self.waiting = asyncio.Event()
 
     async def communicate(self):
+        self.waiting.set()
         if self._hang:
             await asyncio.sleep(60)  # cancelled by wait_for; process lives on
         return self._stdout, b""
@@ -134,6 +136,33 @@ async def test_a_timed_out_probe_is_killed_and_reaped(monkeypatch):
 
     assert await browser._read_pointer_position(timeout_s=0.01) is None
     assert proc.killed, "timed-out probe was never killed — the process leaks"
+    assert proc.reaped, "killed probe was never awaited — it stays a zombie"
+
+
+async def test_a_cancelled_probe_is_killed_and_the_cancellation_propagates(
+    monkeypatch,
+):
+    """The timeout is not the only way this wait ends — cancellation is.
+
+    MEASURED on a REAL child under this structure: cancelling the outer task
+    while ``wait_for`` is pending raises ``CancelledError``, so neither
+    handler runs, ``returncode`` stays None and the pid is still alive. The
+    timeout test above cannot see that — its own path DOES reap (-9, pid
+    gone). Nor is it exotic: ``browser_navigate`` cancels this whole call at
+    its 300s ceiling, and a wedged X server is both what holds the probe open
+    and what drives the loop to that ceiling. It must still PROPAGATE —
+    returning ``None`` would leave a torn-down request running.
+    """
+    proc = _FakeProc(hang=True)
+    _patch_spawn(monkeypatch, proc)
+
+    task = asyncio.create_task(browser._read_pointer_position(timeout_s=30))
+    await proc.waiting.wait()  # the probe is spawned and inside the wait
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed, "cancelled probe was never killed — the process leaks"
     assert proc.reaped, "killed probe was never awaited — it stays a zombie"
 
 
