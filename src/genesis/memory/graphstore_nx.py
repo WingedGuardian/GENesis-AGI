@@ -45,6 +45,31 @@ except ImportError:  # pragma: no cover
     _NX_AVAILABLE = False
 
 
+def _connection_identity(db: object) -> object:
+    """The object whose replacement means "this is a different connection".
+
+    NOT `db` itself. Production passes a `SerializedConnection` PROXY, and its
+    recovery path swaps the connection it wraps IN PLACE — `db/connection.py`
+    closes the old handle and rebinds `_conn` via `object.__setattr__` — while
+    the proxy's own identity never changes. So an identity check on `db` cannot
+    fire after a reconnect, and the `data_version` comparison below then reads a
+    FRESH connection's counter against one stamped from the connection that was
+    just closed. Those counters are per-connection and unrelated, so staleness
+    detection silently stops working at exactly the moment the database has just
+    recovered from errors.
+
+    Unwrapping is uniform rather than a special case: a bare
+    `aiosqlite.Connection` also exposes `_conn` (its underlying sqlite3 handle),
+    and in both cases that attribute changes precisely when the real connection
+    underneath does. `_conn` is in `SerializedConnection._OWN_ATTRS`, so reading
+    it returns the proxy's own wrapped handle and is never delegated onward.
+
+    Two proxies sharing one underlying connection deliberately compare EQUAL —
+    same connection, same data, nothing to rebuild.
+    """
+    return getattr(db, "_conn", db)
+
+
 def _bfs_with_strength(
     G: object,  # nx.MultiDiGraph
     root_id: str,
@@ -263,7 +288,7 @@ class NetworkxGraphStore:
         # of those processes would turn this into a rebuild storm on a
         # 264k-edge graph (seconds per rebuild) — that invariant is
         # load-bearing and worth re-checking before adding one.
-        if db is not self._built_conn:
+        if _connection_identity(db) is not self._built_conn:
             return True
         if self._built_data_version is None:
             return False
@@ -378,7 +403,7 @@ class NetworkxGraphStore:
         # and have it cleared on the next line with nothing else left to notice.
         # Locked by test_a_same_connection_write_is_seen_by_the_load_that_races_it.
         self._dirty = False
-        self._built_conn = db
+        self._built_conn = _connection_identity(db)
         self._built_data_version = pre_load_version
         return G
 

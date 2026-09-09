@@ -72,7 +72,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: ef6eb541 2026-08-10
+verified: f9555d2e 2026-09-09
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/

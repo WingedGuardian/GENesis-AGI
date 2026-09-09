@@ -537,3 +537,141 @@ async def test_a_healthy_database_still_answers(tmp_path):
         assert await NetworkxGraphStore().centrality(db, None) is not None
     finally:
         await db.close()
+
+
+async def test_a_reconnect_behind_the_proxy_rebuilds(tmp_path):
+    """A reconnect swaps the connection but NOT the proxy, and the store must notice.
+
+    Production does not pass a bare `aiosqlite.Connection`; it passes a
+    `SerializedConnection`. That proxy's recovery path closes the wrapped handle
+    and rebinds `_conn` IN PLACE (`db/connection.py`), so the object the store
+    was handed is identical before and after. An identity check on that object
+    therefore never fires, and the `data_version` comparison behind it then reads
+    a brand-new connection's counter against one stamped from the connection that
+    was just closed — two unrelated per-connection counters. The result is that
+    staleness detection silently stops working at precisely the moment the
+    database has recovered from errors, which is when a stale graph is most
+    likely and least expected.
+
+    The sibling test above covers a DIFFERENT connection object arriving. This
+    one covers the same object arriving with a different connection inside it,
+    which is the shape production actually produces and the one that was missed.
+    """
+
+    class _Proxy:
+        """Minimal stand-in with the one property that matters: `_conn` is
+        rebindable while the proxy's own identity is stable."""
+
+        _OWN = {"_conn"}
+
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_conn"), name)
+
+        def reconnect(self, conn):
+            object.__setattr__(self, "_conn", conn)
+
+    path = tmp_path / "g.db"
+    await _seed(path, [("A", "B")])
+    store = NetworkxGraphStore()
+    first = await aiosqlite.connect(str(path))
+    second = await aiosqlite.connect(str(path))
+    proxy = _Proxy(first)
+    try:
+        await store.traverse(proxy, "A", max_depth=1, min_strength=0.0)
+        cached = store._graph
+
+        # The proxy is the SAME object across this line; only what it wraps moved.
+        proxy.reconnect(second)
+
+        await store.traverse(proxy, "A", max_depth=1, min_strength=0.0)
+        assert store._graph is not cached, (
+            "the projection survived a reconnect — the store compared the proxy, "
+            "whose identity never changes, so the swap went undetected"
+        )
+    finally:
+        await first.close()
+        await second.close()
+
+
+async def test_a_proxy_that_did_not_reconnect_does_not_rebuild(tmp_path):
+    """The negative control, without which the test above passes for free.
+
+    A check that rebuilt on every call would satisfy the reconnect assertion
+    while destroying the cache's entire purpose on a 264k-edge graph. This pins
+    that the same proxy wrapping the same connection is still recognised.
+    """
+
+    class _Proxy:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_conn"), name)
+
+    path = tmp_path / "g.db"
+    await _seed(path, [("A", "B")])
+    store = NetworkxGraphStore()
+    db = await aiosqlite.connect(str(path))
+    proxy = _Proxy(db)
+    try:
+        await store.traverse(proxy, "A", max_depth=1, min_strength=0.0)
+        cached = store._graph
+        await store.traverse(proxy, "A", max_depth=1, min_strength=0.0)
+        assert store._graph is cached, (
+            "rebuilt with nothing changed — the identity token is unstable"
+        )
+    finally:
+        await db.close()
+
+
+async def test_the_cte_hides_a_hidden_memory_reached_at_depth_two(tmp_path):
+    """The RECURSIVE step carries the visibility predicate, not just the anchor.
+
+    The two parity tests above build STAR graphs — every neighbour sits at depth
+    1 — so between them they exercise only the anchor's two clauses. The
+    recursive step has a third, and an audit proved nothing protected it:
+    neutering that clause left every test in this file green while changing what
+    the fallback returns. On `A -> B -> C` with `C` deprecated, the CTE came back
+    with `C` while the NetworkX store correctly did not.
+
+    That is the failure this whole visibility change exists to prevent, one hop
+    further out than anything was checking, and it is in a hunk that auto-merged
+    — which is the region nobody re-reads.
+    """
+    from unittest.mock import patch
+
+    from genesis.memory import graph as graph_mod
+    from genesis.memory import graphstore_nx
+
+    path = tmp_path / "g.db"
+    await _seed_with_metadata(
+        path,
+        [("A", "B"), ("B", "hidden"), ("B", "live2")],
+        {
+            "A": (None, 0),
+            "B": (None, 0),
+            "hidden": (None, 1),
+            "live2": (None, 0),
+        },
+    )
+    db = await aiosqlite.connect(str(path))
+    try:
+        primary = await graph_mod.traverse(db, "A", max_depth=2, min_strength=0.0)
+        with patch.object(graphstore_nx, "_NX_AVAILABLE", False):
+            fallback = await graph_mod.traverse(db, "A", max_depth=2, min_strength=0.0)
+
+        primary_reached = {n.memory_id for n in primary.nodes}
+        fallback_reached = {n.memory_id for n in fallback.nodes}
+
+        assert fallback_reached == {"B", "live2"}, (
+            f"the fallback surfaced a hidden memory at depth 2: {fallback_reached}"
+        )
+        assert fallback_reached == primary_reached, (
+            "the two paths disagree two hops out: "
+            f"primary={primary_reached} fallback={fallback_reached}"
+        )
+    finally:
+        await db.close()
