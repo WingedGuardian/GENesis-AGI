@@ -622,7 +622,13 @@ def _notif(
 
 
 def _fake_notif_gh(
-    pages, *, actor="ext-user", actor_error=False, url_actors=None, review_comments=None
+    pages,
+    *,
+    actor="ext-user",
+    actor_error=False,
+    url_actors=None,
+    review_comments=None,
+    threads=None,
 ):
     """Fake ``run_gh_checked``.
 
@@ -631,7 +637,8 @@ def _fake_notif_gh(
     returns the LIST at ``review_comments[pull_url]`` (default empty). Any other
     api call is a single-object actor lookup → ``{"user":{"login": ...}}`` from
     ``url_actors[url]`` if given (None → no login), else ``actor``.
-    ``actor_error`` fails every resolution call.
+    ``threads[url]`` overrides that with a whole thread object, so a subject's
+    own BODY can carry an @-mention. ``actor_error`` fails every resolution call.
     """
 
     async def fn(*args, **kwargs):
@@ -640,8 +647,12 @@ def _fake_notif_gh(
             return True, json.dumps(pages)
         if actor_error:
             return False, ""
-        if "/comments?" in url:  # PR review comments — a list endpoint
-            return True, json.dumps((review_comments or {}).get(url.split("/comments?")[0], []))
+        if "/comments?" in url or "/reviews?" in url:  # list endpoints
+            sep = "/comments?" if "/comments?" in url else "?"
+            key = url.split(sep)[0] if sep == "/comments?" else url.split("?")[0]
+            return True, json.dumps((review_comments or {}).get(key, []))
+        if threads and url in threads:
+            return True, json.dumps(threads[url])
         login = (url_actors or {}).get(url, actor)
         if login is None:
             return True, json.dumps({})  # resolved, but carries no user login
@@ -728,9 +739,10 @@ async def test_notifications_window_excludes_out_of_range(db, monkeypatch):
 
 
 async def test_notifications_actor_via_latest_comment(db, monkeypatch):
+    """The generic chain (non-mention reason): latest_comment_url names the actor."""
     mon, _ = _mon(db)
     mon._is_automation = _human
-    pages = [[_notif(reason="mention", tid="m", latest_comment_url="LCU", subject_url="SU")]]
+    pages = [[_notif(reason="author", tid="m", latest_comment_url="LCU", subject_url="SU")]]
     monkeypatch.setattr(
         "genesis.recon.account_activity.run_gh_checked",
         _fake_notif_gh(pages, url_actors={"LCU": "commenter"}),
@@ -740,11 +752,10 @@ async def test_notifications_actor_via_latest_comment(db, monkeypatch):
 
 
 async def test_notifications_actor_fallback_to_subject_url(db, monkeypatch):
-    """latest_comment_url carries no login (e.g. mention in the body) → fall back
-    to subject.url."""
+    """latest_comment_url carries no login → fall back to subject.url."""
     mon, _ = _mon(db)
     mon._is_automation = _human
-    pages = [[_notif(reason="mention", tid="m", latest_comment_url="LCU", subject_url="SU")]]
+    pages = [[_notif(reason="author", tid="m", latest_comment_url="LCU", subject_url="SU")]]
     monkeypatch.setattr(
         "genesis.recon.account_activity.run_gh_checked",
         _fake_notif_gh(pages, url_actors={"LCU": None, "SU": "body-mentioner"}),
@@ -776,10 +787,9 @@ async def test_notifications_bot_and_owner_dropped_external_pinged(db, monkeypat
 
     The owner case used to be kept as an actor-less digest row, on the reasoning
     that "the mention is real even if the owner replied last". That row is the
-    thing the owner actually experienced as noise, and it is safe to drop now the
-    mention search is WINDOWED to the notification's own interval: a genuine new
-    mention resolves to whoever wrote it, so only a thread the owner themselves
-    bumped reaches here."""
+    thing the owner actually experienced as noise, and it is safe to drop because
+    attribution now names whoever WROTE the mention: only a thread whose mention
+    the owner themselves wrote reaches the self-activity branch."""
     mon, _ = _mon(db)
     pages = [
         [
@@ -788,17 +798,15 @@ async def test_notifications_bot_and_owner_dropped_external_pinged(db, monkeypat
             _notif(reason="mention", tid="human", latest_comment_url="Lh", subject_url="Sh"),
         ]
     ]
+    body_at = "2026-08-06T02:00:00Z"
     monkeypatch.setattr(
         "genesis.recon.account_activity.run_gh_checked",
         _fake_notif_gh(
             pages,
-            url_actors={
-                "Lself": "me",
-                "Sself": "me",
-                "Lbot": "somebot",
-                "Sbot": "somebot",
-                "Lh": "human1",
-                "Sh": "human1",
+            threads={
+                "Sself": {"user": {"login": "me"}, "created_at": body_at, "body": "note to @me"},
+                "Sbot": {"user": {"login": "somebot"}, "created_at": body_at, "body": "@me nit"},
+                "Sh": {"user": {"login": "human1"}, "created_at": body_at, "body": "@me look?"},
             },
         ),
     )
@@ -1282,9 +1290,10 @@ async def test_author_response_on_foreign_repo_survives_the_fallback(db, monkeyp
 
 
 async def test_thread_author_fallback_keeps_a_non_owner(db, monkeypatch):
-    """The control against over-rejecting: the fallback is still valid when it
-    names someone else — an external contributor whose PR BODY mentions the
-    owner, with no comments on the thread at all."""
+    """An external contributor opens a pull request whose BODY mentions the owner
+    and never comments. The thread body is a mention surface the comment endpoints
+    do not return, so without reading it this resolves to nobody — and if the
+    owner then replies it would read as self-activity and be dropped."""
     mon, _ = _mon(db)
     mon._is_automation = _human
     pages = [
@@ -1300,7 +1309,17 @@ async def test_thread_author_fallback_keeps_a_non_owner(db, monkeypatch):
     ]
     monkeypatch.setattr(
         "genesis.recon.account_activity.run_gh_checked",
-        _fake_notif_gh(pages, url_actors={_PULL: "opener"}, review_comments={_PULL: []}),
+        _fake_notif_gh(
+            pages,
+            review_comments={_PULL: [_rc("me", "2026-08-06T04:00:00Z", "on it")]},
+            threads={
+                _PULL: {
+                    "user": {"login": "opener"},
+                    "created_at": "2026-08-06T01:00:00Z",
+                    "body": "opened this, @me does the approach look right?",
+                }
+            },
+        ),
     )
     _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
     assert items[0]["actor"] == "opener" and items[0]["ping"] is True
@@ -1317,8 +1336,8 @@ async def test_no_comment_surface_spends_no_requests(db, monkeypatch):
         [
             [
                 _notif(
-                    reason="mention",
-                    repo="me/myrepo",
+                    reason="author",
+                    repo="someone/litellm",  # `author` is filtered on OWNED repos
                     tid="x",
                     latest_comment_url=None,
                     subject_url="SU",
@@ -1338,11 +1357,128 @@ async def test_no_comment_surface_spends_no_requests(db, monkeypatch):
     assert not [c for c in calls if "/comments?" in c]
 
 
+async def test_unidentifiable_mention_is_kept_not_dropped(db, monkeypatch):
+    """Codex P2. A `team_mention` carries `@org/team`, which never equals a personal
+    login, so no comment matches. If the owner has since replied, the latest
+    commenter is the owner — and treating THAT as proof of self-activity discards a
+    real external mention. With no identifiable source, keep it digest-only."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="team_mention",
+                repo="me/myrepo",
+                tid="team",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            review_comments={
+                _PULL: [
+                    _rc("outsider", "2026-08-06T01:00:00Z", "cc @me-org/reviewers please"),
+                    _rc("me", "2026-08-06T04:00:00Z", "taking a look"),  # owner replies last
+                ]
+            },
+            threads={_PULL: {"user": {"login": "outsider"}, "created_at": "2026-08-06T00:30:00Z"}},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1  # NOT dropped as self-activity
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_mention_in_a_review_summary_body_is_found(db, monkeypatch):
+    """A pull request has a THIRD text surface: review summary bodies under
+    /pulls/{n}/reviews. A mention written there is invisible to both comment
+    endpoints, so without reading it the item resolves to nobody."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            review_comments={
+                _PULL: [],
+                # reviews carry `submitted_at`, not `created_at`
+                f"{_PULL}/reviews": [
+                    {
+                        "user": {"login": "reviewer"},
+                        "submitted_at": "2026-08-06T02:00:00Z",
+                        "body": "@me one concern before I approve",
+                    }
+                ],
+            },
+            threads={_PULL: {"user": {"login": "opener"}, "created_at": "2026-08-06T00:30:00Z"}},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "reviewer" and items[0]["ping"] is True
+
+
+async def test_stale_mention_is_reported_but_never_re_pinged(db, monkeypatch):
+    """The cell between the two failure modes, and the one a mutation found unlocked.
+
+    An outsider mentioned the owner BEFORE this window; someone else (not the
+    owner) has since replied, so the window is not owner-only and the thread is
+    still worth reporting. It must be reported WITHOUT a ping: the mention is old
+    news to the person who wrote it, and GitHub's sticky `reason` would otherwise
+    re-ping them on every later update to the thread."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            review_comments={
+                _PULL: [
+                    # BEFORE _SINCE — the mention this thread is nominally about.
+                    _rc("outsider", "2026-08-05T00:00:00Z", "@me could you look?"),
+                    # In-window, and NOT the owner — so this is not self-activity.
+                    _rc("bystander", "2026-08-06T02:00:00Z", "+1 to that"),
+                ]
+            },
+            threads={_PULL: {"user": {"login": "outsider"}, "created_at": "2026-08-04T00:00:00Z"}},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "outsider"
+    assert items[0]["ping"] is False  # reported, not re-pinged
+
+
 async def test_notifications_classification_unresolved_surfaces(db, monkeypatch):
     """If bot-classification can't be determined, surface + ping the item rather
     than drop or hold — never freeze the lane on a classification blip."""
     mon, _ = _mon(db)
-    pages = [[_notif(reason="mention", tid="m")]]
+    pages = [[_notif(reason="author", tid="m")]]
     monkeypatch.setattr(
         "genesis.recon.account_activity.run_gh_checked",
         _fake_notif_gh(pages, actor="human1"),
@@ -1475,7 +1611,7 @@ async def test_notifications_discussion_recorded_digest_only(db, monkeypatch):
     mon._is_automation = _human
     disc = _notif(reason="mention", tid="disc")
     disc["subject"]["type"] = "Discussion"
-    pages = [[disc, _notif(reason="mention", tid="iss")]]
+    pages = [[disc, _notif(reason="author", tid="iss")]]
     monkeypatch.setattr(
         "genesis.recon.account_activity.run_gh_checked",
         _fake_notif_gh(pages, actor="human1"),

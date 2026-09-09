@@ -903,7 +903,7 @@ class AccountActivityMonitor:
                 # GraphQL-only actor — record for the digest, no ping (follow-up).
                 items.append({**base, "actor": "", "ping": False})
                 continue
-            actor = await self._resolve_notification_actor(
+            actor, fresh = await self._resolve_notification_actor(
                 subject,
                 owner,
                 mention=c["reason"] in _MENTION_REASONS,
@@ -926,7 +926,11 @@ class AccountActivityMonitor:
             if auto is True:
                 logger.debug("github steward: dropping automation actor %s", actor)
                 continue  # bot / org (None → can't tell → surface rather than drop)
-            items.append({**base, "actor": actor, "ping": True})
+            # `fresh` is False for a mention this window did not carry — the thread
+            # was merely bumped. Report it, never re-ping: the contributor already
+            # heard about it, and pinging again on every later update is the same
+            # noise complaint pointed at someone else.
+            items.append({**base, "actor": actor, "ping": fresh})
 
         # Advance the cursor. Clean sweep → wm. Truncation → the newest processed
         # timestamp STRICTLY BEFORE the first deferred item (tie-safe: advancing to
@@ -947,7 +951,7 @@ class AccountActivityMonitor:
         mention: bool,
         since: str,
         until: str,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """Best-effort resolve of who ACTED on a notification's thread.
 
         The feed carries no actor inline, so this reads the thread's comments and
@@ -995,24 +999,52 @@ class AccountActivityMonitor:
             # caller DROPS an item whose actor is a bot, so a half-read thread
             # that surfaces an old bot comment would discard a human mention the
             # unread half was holding. Returning None keeps it as a digest row.
-            return None
-        in_window = [r for r in rows if since < (r.get("created_at") or "") <= until]
+            return None, False
 
         if mention:
-            pattern = _mention_re(owner)
-            named = [r for r in in_window if pattern.search(r.get("body") or "")]
-            if login := _newest_comment_login(named):
-                logger.debug("github steward: actor %s via mention-author", login)
-                return login
+            # ORIGIN, at any age — the mention that made this a mention thread.
+            # Deliberately NOT windowed: the window decides whether to PING, and
+            # who triggered it decides whether it is worth reporting at all. A
+            # thread the owner merely bumped still has a knowable trigger, and
+            # if that trigger was a bot the item is noise however recently the
+            # owner typed in it.
+            origin = await self._mention_origin(subject, owner, rows, until)
+            if origin is None:
+                # No identifiable mention anywhere: an @org/team mention, or a
+                # comment since edited or deleted. The latest commenter is NOT
+                # evidence about who mentioned the owner, so do not let it stand
+                # in — an owner reply here would otherwise read as self-activity
+                # and discard a real external mention.
+                return None, False
+            login = (origin.get("user") or {}).get("login") or None
+            fresh = since < (origin.get("created_at") or "") <= until
+            if not fresh:
+                # The mention predates this update, so something ELSE bumped the
+                # thread. If nobody but the owner acted in the window, that
+                # something was the owner: report it as their own activity so it
+                # drops, rather than re-listing a months-old mention every time
+                # they reply. Anyone else in the window and it stays reportable.
+                in_window = [r for r in rows if since < (r.get("created_at") or "") <= until]
+                others = [
+                    r
+                    for r in in_window
+                    if ((r.get("user") or {}).get("login") or "").lower() != owner.lower()
+                ]
+                if not others:
+                    logger.debug("github steward: stale mention, owner-only window")
+                    return owner, True
+            logger.debug("github steward: actor %s via mention-origin (fresh=%s)", login, fresh)
+            return login, fresh
 
+        in_window = [r for r in rows if since < (r.get("created_at") or "") <= until]
         if login := _newest_comment_login(in_window):
             logger.debug("github steward: actor %s via latest-comment", login)
-            return login
+            return login, True
 
         lcu = subject.get("latest_comment_url")
         if lcu and not _THREAD_URL_RE.search(lcu) and (login := await self._login_at(lcu)):
             logger.debug("github steward: actor %s via latest_comment_url", login)
-            return login
+            return login, True
 
         subject_url = subject.get("url") or ""
         if subject_url:
@@ -1020,32 +1052,80 @@ class AccountActivityMonitor:
             # Not `owner`: the owner is the thread's AUTHOR here, not its actor.
             if login and login.lower() != owner.lower():
                 logger.debug("github steward: actor %s via thread-author", login)
-                return login
-        return None
+                return login, True
+        return None, False
+
+    async def _mention_origin(
+        self, subject: dict, owner: str, rows: list[dict], until: str
+    ) -> dict | None:
+        """The newest thing that actually MENTIONS ``owner`` — comment or thread body.
+
+        Searched at any age, deliberately. Who triggered a mention thread is a
+        different question from whether it happened in this window, and conflating
+        them is what loses signal in both directions: windowing the search alone
+        re-attributes stale threads to the wrong person, while refusing to look
+        outside the window leaves an owner reply looking like self-activity.
+
+        The thread BODY is a real mention surface and the comment endpoints do not
+        return it — an outside contributor opening a pull request that says
+        "@owner does this look right?" has mentioned the owner without commenting
+        at all. Returns a comment-shaped dict (``user``/``created_at``) or None
+        when nothing identifiable names the owner: an ``@org/team`` mention, whose
+        text never equals a personal login, or a comment since edited or deleted.
+        """
+        pattern = _mention_re(owner)
+        # Capped at `until`: a comment written AFTER this notification cannot be
+        # what it is about, and letting one in would re-date the attribution
+        # every time someone else typed between the poll and the resolve.
+        named = [
+            r
+            for r in rows
+            if pattern.search(r.get("body") or "") and (r.get("created_at") or "") <= until
+        ]
+
+        subject_url = subject.get("url") or ""
+        if subject_url:
+            ok, out = await run_gh_checked("gh", "api", subject_url, timeout=_GH_TIMEOUT)
+            if ok:
+                try:
+                    thread = json.loads(out)
+                except Exception:
+                    thread = None
+                if (
+                    isinstance(thread, dict)
+                    and pattern.search(thread.get("body") or "")
+                    and (thread.get("created_at") or "") <= until
+                ):
+                    named.append(thread)
+        if not named:
+            return None
+        return max(named, key=lambda r: r.get("created_at") or "")
 
     async def _thread_comments(self, subject: dict) -> tuple[list[dict], bool]:
         """Every comment on a notification's thread, and whether the read is WHOLE.
 
-        A pull request carries TWO disjoint comment surfaces — inline review
-        comments under ``/pulls/{n}/comments`` and conversation comments under
-        ``/issues/{n}/comments`` — and the flagship deep-poll reads only the
-        second (VERIFIED: the two id spaces do not intersect). Both are read here,
-        so a review-comment mention has an actor at all.
+        A pull request carries THREE disjoint text surfaces — inline review
+                comments under ``/pulls/{n}/comments``, conversation comments under
+                ``/issues/{n}/comments``, and review SUMMARY bodies under
+                ``/pulls/{n}/reviews`` — and the flagship deep-poll reads only the second
+                (VERIFIED: those two id spaces do not intersect). All three are read here,
+                so a mention written in any of them has an actor at all.
 
-        Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
-        return OLDEST first and ignore ``direction`` on the conversation surface,
-        so a single-page read of a busy thread would silently return the oldest
-        100 comments and hand back a stale author with total confidence.
+                Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
+                return OLDEST first and ignore ``direction`` on the conversation surface,
+                so a single-page read of a busy thread would silently return the oldest
+                100 comments and hand back a stale author with total confidence.
 
-        Returns ``(rows, complete)``. ``complete`` is False when any surface failed
-        to read, so the caller can decline to answer rather than answering from
-        half the evidence.
+                Returns ``(rows, complete)``. ``complete`` is False when any surface failed
+                to read, so the caller can decline to answer rather than answering from
+                half the evidence.
         """
         subject_url = subject.get("url") or ""
         urls: list[str] = []
         if "/pulls/" in subject_url:
             urls.append(f"{subject_url}/comments")  # inline review comments
             urls.append(f"{_pull_url_to_issue_url(subject_url)}/comments")
+            urls.append(f"{subject_url}/reviews")  # review SUMMARY bodies
         elif "/issues/" in subject_url:
             urls.append(f"{subject_url}/comments")
         if not urls:
@@ -1060,7 +1140,13 @@ class AccountActivityMonitor:
             if not ok:
                 complete = False  # never holds the cursor; only withholds an answer
                 continue
-            rows.extend(_parse_paged(out))
+            for row in _parse_paged(out):
+                # A review carries `submitted_at` where a comment carries
+                # `created_at`. Normalise so one recency rule covers all three
+                # surfaces; a PENDING review has neither and sorts to the back.
+                if "created_at" not in row and (ts := row.get("submitted_at")):
+                    row = {**row, "created_at": ts}
+                rows.append(row)
         return rows, complete
 
     async def _login_at(self, url: str) -> str | None:
