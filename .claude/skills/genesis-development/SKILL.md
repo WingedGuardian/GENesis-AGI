@@ -239,12 +239,20 @@ repo bounds exactly that at a few MiB (`autonomy/executor/deterministic.py`
 2026-09-04). Losing the tail of a log beats losing the process. The obligation
 there is not to keep the bytes, it is to be LOUD about the cut — say the output
 was bounded and roughly by how much, so nobody reads a clipped log as a
-complete one. That cited cap does NOT yet meet this bar: `_read_limited`
-returns only the retained bytes with no truncation flag, and its caller reports
-the retained length as the total — a 3 MiB stream reads as "2097152 bytes
-total". The cap is right; its silence is the improvable half, cited here as a
-counterexample to "never cut", not as a model of declaring. A silent lossy cap
-is still the defect; a declared one is a resource guard doing its job. This
+complete one. That cited cap has since been fixed AT THE READ and is no longer
+the silent-cut example it was: `_read_limited` drains the whole stream while
+retaining only `limit` bytes and returns `(retained, total_size)`, so the caller
+appends `... (truncated, N bytes total)` with N the TRUE drained total (PR
+#1796; verified in `autonomy/executor/deterministic.py` 2026-09-08).
+**It is still not a worked example of a loud cut, and the reason generalises:
+a declaration has to survive the CONSUMERS, not just be emitted.** That marker
+is appended at character 50,000 of the result field, and all six onward paths
+head-slice it at 200-2000 characters — including the one that feeds the next
+step's prompt — so the declaration is unreachable in every direction it
+travels, and the slice that removes it declares nothing itself (MEASURED
+2026-09-08). When you fix a silent cut, check the READERS of the field you just
+made honest; otherwise you have moved the silence one layer out. A silent lossy
+cap is still the defect; a declared one is a resource guard doing its job. This
 section is about the remaining case.
 
 **A handle that does not resolve is a separate defect, and do not conflate the
@@ -669,6 +677,60 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
   and report the conflict instead. The cleanest way to avoid the window entirely
   is to mutate inside an isolated worktree nobody else is editing.
+- **A RED for the WRONG REASON is not a verify-RED — read WHICH assertion
+  fired, never just that one did.** The six causes above all ask why an
+  expected RED came back GREEN. This is the mirror, and the dangerous half of
+  it passes review: the run failed, so the checklist is satisfied and the test
+  is trusted, but it failed on something other than the defect. **The tell is
+  any failure line you have not actually read.** Two shapes, and they cost
+  differently:
+  1. **The PRIMARY assertion fired, but on a condition the FIXTURE created**
+     rather than the defect — a leftover competing candidate, an unaged file,
+     stale state from setup. This one goes green on the fix, because the fix's
+     side effects remove the condition, so it passes review and pins nothing.
+     This is the expensive one.
+  2. **A guard-the-guard / precondition assertion fired FIRST**, which proves
+     the fixture never built the hazard at all. This one does NOT go green on
+     the fix — the fixture is unchanged, so it fails again and says so. It
+     costs a round, not a false green, and the guard is doing exactly its job
+     (see the vacuous-shapes bullet below, which prescribes adding one).
+     Repair the fixture and re-run before recording a RED.
+  MEASURED twice in one session on the same PR: a fileless-session test whose
+  file was not yet aged past the 60-second window, and a selection test with a
+  competing candidate still in the tree — each reported a textbook RED while
+  exercising nothing. Name the assertion that fired and confirm its message
+  describes the defect. A RED you have not read is a GREEN you have not earned.
+- **A fixture must create the shape its docstring claims — and the check is the
+  guard-the-guard assert, not a re-read.** This is the same obligation as the
+  vacuous-shapes bullet below; the addition here is WHERE the shape most often
+  goes wrong, which is a contract between two components. Two ways to break it,
+  both MEASURED in one session, and both PASS against the unfixed code — which
+  is the only way they are caught: a **hand-written intermediate** (the test fed
+  the consumer a value the real producer never emits, so the arity mismatch it
+  claimed to pin was never present) and an **inlined copy of the fix** (the test
+  ran the corrected logic as a snippet instead of invoking the real script, so
+  it graded its own copy and the shipped file never executed). If the defect
+  lives in the seam between a producer and a consumer, drive the REAL producer
+  into the REAL consumer; anything typed by hand in the middle is the bug's
+  hiding place, and anything inlined is a second copy of the code under test.
+- **Two reviewers pushing OPPOSITE values for the same constant, one review
+  pass apart, is a signal about the DEPENDENCY, not about the value.** (Review
+  passes here, not the cross-model *rounds* the escalation cap counts — see
+  that section for the reserved sense.) The instinct is to adjudicate: measure
+  the box, pick the winner, move on. That answers the pass and leaves the
+  mechanism, because both reviewers are usually right about the environment
+  each has in mind — which means the code depends on something that is not
+  invariant. MEASURED: one reviewer moved a parse to field `$4`, the next moved
+  it to `$5`, and both were correct, for different releases of the tool being
+  parsed. The value was never the defect; depending on column POSITION was.
+  Remove the dependency — match the field by what it IS, derive the index, or
+  read a named output format — which is usually cheaper than a third pass of
+  picking a number. **Scope: this applies where the constant names a POSITION
+  or a shape in something external** (a field index, a column offset, an offset
+  into a format you do not control). It does NOT apply to a threshold or a
+  timeout: there the disagreement is about which failure mode each reviewer has
+  in mind, and the Timeout Policy above governs — name the failure mode, and
+  the value follows from it.
 - **Vacuous-test shapes to check for by name** (a list of the common ones, not a
   definition). The most frequent in practice is the one that never ran at all: a
   test SKIPPED by a marker, or deselected by a `-k` filter or a wrong path, which
@@ -682,6 +744,15 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   exec-replaces itself and loses the marker from its argv — add a
   guard-the-guard assert that the fixture really has the property). Ask of every
   new test: *would this still pass if the mechanism it names were deleted?*
+  When the DISTINGUISHING fact is produced by a lane the assertion cannot see,
+  asking every test to assert it is a convention, and conventions decay — the
+  merge gate's own suite carried that request in a fixture docstring and 3 tests
+  had already drifted from it. `tests/test_hooks/conftest.py`'s `offdiff_lock` is
+  the worked chokepoint: it fails any IN-PROCESS hook test whose finding was
+  silently discounted as outside the diff, so a forgotten allowlist entry can no
+  longer turn a not-block assertion green for the wrong reason. It fails OPEN,
+  so its own self-tests are the load-bearing part — a lock nobody checks is the
+  convention it replaced.
 - **Contested/subtle specs: write the expectations first.** When what-should-
   happen is itself under discussion (which keys count, which states clear an
   alarm), enumerate the expectation table as failing tests BEFORE implementing
@@ -2180,6 +2251,77 @@ closing-shaped work (answering, merging green PRs, the handoff row). What
 this rule removes is only the WATCHING — unprompted gate-polling and
 review-soliciting between a push and the next external event. When you do
 merge, the Pre-Merge Gate below governs unchanged.
+
+### Never RETIRE a PR you are not the one reviving (standing user rule, 2026-09-08)
+
+Terminology first, because the section above already uses "closing" to mean
+merging: **RETIRING** is `gh pr close` — abandoning a PR unmerged. This rule is
+about that, and only that. Merging a green PR is unaffected.
+
+**A reviewer session retires nothing.** When a PR turns out to be wrong at the
+premise — the mechanism cannot work, the design is contested, the fix belongs on
+a different event — the disposition is `needs-architecture-session` **on the PR**,
+carrying the evidence, and the PR stays OPEN. Retiring it belongs to the session
+that actually takes up its revival, at the moment it takes it up.
+
+Why the split, since "it's clearly dead, just close it" is the rationalization
+this rule exists to stop:
+
+- **A reviewer has read the diff, not the intent.** You can establish that a
+  mechanism does not work. You cannot establish that nothing in the branch is
+  worth reviving, that the author holds no context you lack, or that the right
+  successor design does not reuse most of it.
+- **An open PR carrying an evidence-bearing comment is a live handoff; a closed
+  one is an archaeology task.** The next session finds an open PR by listing the
+  queue. It finds a closed one only if someone remembers it existed.
+- **Retiring costs the review record its addressability.** Threads on a closed
+  PR stop being where the conversation happens, so the reasoning that just cost
+  a review round stops being read.
+
+So: post the finding, flag it, leave it open, and let the reviving session
+decide — including deciding to retire it in favour of a successor, which is that
+session's call to make and to justify.
+
+The same holds for a superseded PR: name the successor in a comment and leave it
+open. If you believe a PR should be retired and nobody is picking it up, that is
+a question for the user, not a judgment call for the review station.
+
+### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
+
+**A review session's job is to get THAT PR merged.** Reviews routinely surface
+bugs that are real, pre-existing on `main`, and nothing to do with the diff in
+front of you. Those do not belong in the PR and they must not hold it up.
+
+Route every finding by ONE question — **does the PR work without this fixed?**
+
+- **No, the PR is broken without it** → fix it in this PR. The builder session
+  should have caught it, and shipping a PR that cannot function is not a merge.
+- **Yes, the PR works** → **file a GitHub issue and merge the PR.** Do not grow
+  the diff, do not open a discussion, do not park it in a reply and move on.
+
+**Standing approval to file, for this class only.** The user has granted
+blanket, ongoing approval to open GitHub issues for adjacent non-blocking bugs
+discovered during review. Do NOT ask per instance — asking each time was the
+friction this rule removes. That standing approval is scoped to exactly this
+case: an adjacent, non-blocking, already-existing defect found while reviewing.
+Every other public post still needs explicit per-instance approval.
+
+**The exception that is NEVER waived: a security defect is not filed publicly
+before it is fixed.** An unpatched bypass, a credential exposure, anything
+exploitable — that goes to a private record under `~/.genesis/output/` plus a
+`follow_up_create` row, and nothing about it reaches a public surface, this
+standing approval included. If a finding is both adjacent and a live bypass,
+the security rule wins.
+
+Write the issue while the context is in your head — the measurement, the
+file:line, the falsifier, and why it was out of scope for the PR. An issue that
+merely names a symptom costs the next session the whole investigation again, and
+you already did it.
+
+Why this is the rule: a review that widens into every adjacent defect stops
+being a review and becomes an unbounded refactor, which is how a two-finding PR
+turns into a six-round loop. The PR is the unit of work. The queue is the place
+the rest of it goes.
 
 ## Pre-Merge Gate
 

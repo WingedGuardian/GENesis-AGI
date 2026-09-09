@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.test_hooks.conftest import OffDiffLock
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_pr_files(monkeypatch):
@@ -1502,17 +1504,24 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
 
-    def test_coderabbit_major_on_doc_path_does_not_block(self, guard_module):
+    def test_coderabbit_major_on_doc_path_does_not_block(self, guard_module, capsys):
         """Same doc-path treatment the Codex path already gets.
 
         Without this the two reviewers are inconsistent: a finding on CHANGELOG.md
         would block from one and not the other, for no stated reason.
+
+        The lane marker is asserted, not just the not-block: the OFF-DIFF lane
+        also yields ``not block``, so on its own ``assert not block`` would pass
+        whether the doc exemption fired or the path merely fell out of
+        ``_FINDING_PATHS``. The conftest lock catches that too; this assertion
+        states which lane the test is actually about.
         """
         with self._mock(
             guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="CHANGELOG.md")]
         ):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc CodeRabbit Critical/Major]" in capsys.readouterr().err
 
     # ── the body is a CODE-BEARING document, so the severity read is anchored ──
     #
@@ -2132,17 +2141,23 @@ class TestCheckInlineReviewFindings:
         assert not block
         assert "[doc P1]" in capsys.readouterr().err
 
-    def test_inline_p1_on_a_changelog_fragment_does_not_block(self, guard_module):
+    def test_inline_p1_on_a_changelog_fragment_does_not_block(self, guard_module, capsys):
         # changelog.d/ holds one changelog entry per file — the same prose that
         # would otherwise be a bullet in CHANGELOG.md. Covered by the general
         # Markdown rule rather than by a rule of its own; pinned here because a
         # PR carrying a fragment must never be blocked by a wording nit.
+        #
+        # THIS TEST IS WHY THE CONFTEST LOCK EXISTS. Measured on PR #1690: with
+        # the fragment path absent from _FINDING_PATHS it passed through the
+        # OFF-DIFF lane and proved nothing about the doc exemption it names.
+        # The `[doc P1]` assertion is what distinguishes the two lanes here.
         with self._mock(
             guard_module,
             [self._codex(1, _P1_BODY, path="changelog.d/20260904210000-fixed-thing.md")],
         ):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     def test_inline_p1_on_a_non_markdown_file_in_changelog_d_still_blocks(
         self, guard_module
@@ -2383,8 +2398,19 @@ class TestDiffScopedInlineFindings:
     fixture pins the changed-file set to ``src/benign.py``, the in-diff control.
     """
 
-    def test_off_diff_coderabbit_major_not_scored(self, guard_module, capsys):
+    # The off-diff vacuity lock (tests/test_hooks/conftest.py) is declared PER
+    # TEST below, never once for the class. A class-level blanket was written
+    # first and rejected in review: it exempted all 11 tests including future
+    # ones, and it was already covering a real instance of the very defect the
+    # lock exists for — `test_off_diff_codex_p2_pair_not_scored` asserted only
+    # `not block`, with nothing to distinguish "the P2s were correctly
+    # unscored" from "the P2 pattern stopped matching and there were no
+    # findings at all". Declaring per test keeps each exemption attached to the
+    # test that earned it.
+
+    def test_off_diff_coderabbit_major_not_scored(self, guard_module, capsys, offdiff_lock):
         """RED before the fix: an off-diff Major blocked at full weight."""
+        offdiff_lock.expected()
         with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
             block, msg = guard_module._check_inline_review_findings("100")
         assert not block, f"off-diff CodeRabbit Major was scored: {msg}"
@@ -2432,15 +2458,25 @@ class TestDiffScopedInlineFindings:
         assert block, "unreadable file set must keep the old scoring, not skip it"
         assert "diff scoping unavailable" in capsys.readouterr().err
 
-    def test_off_diff_codex_p1_not_scored(self, guard_module, capsys):
+    def test_off_diff_codex_p1_not_scored(self, guard_module, capsys, offdiff_lock):
         """Codex findings get the same scoping — the mechanism is reviewer-agnostic."""
+        offdiff_lock.expected()
         with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/other.py")]):
             block, msg = guard_module._check_inline_review_findings("100")
         assert not block, f"off-diff Codex P1 was scored: {msg}"
         assert "outside this PR's diff" in capsys.readouterr().err
 
-    def test_off_diff_codex_p2_pair_not_scored(self, guard_module):
-        """Two off-diff P2s would sum to the 1.0 threshold — neither may score."""
+    def test_off_diff_codex_p2_pair_not_scored(self, guard_module, capsys, offdiff_lock):
+        """Two off-diff P2s would sum to the 1.0 threshold — neither may score.
+
+        The `[off-diff P2]` assertion is load-bearing, not decoration: without
+        it, `not block` holds just as well when `_INLINE_P2_RE` stops matching
+        `_P2_BODY` and there are no findings at all. That is the vacuity this
+        file's lock exists to catch, and this test was a live instance of it
+        until a review round 2026-09-08 found it hiding under a class-wide
+        exemption.
+        """
+        offdiff_lock.expected()
         comments = [
             _codex_c(1, _P2_BODY, path="src/other.py"),
             _codex_c(2, _P2_BODY, path="src/third.py"),
@@ -2448,6 +2484,7 @@ class TestDiffScopedInlineFindings:
         with _mock_inline(guard_module, comments):
             block, msg = guard_module._check_inline_review_findings("100")
         assert not block, f"off-diff P2 pair reached the threshold: {msg}"
+        assert "[off-diff P2]" in capsys.readouterr().err
 
     def test_maintainer_replied_off_diff_excluded_silently(self, guard_module, capsys):
         """Engagement is checked FIRST: a replied off-diff finding is already
@@ -2540,7 +2577,7 @@ class TestDiffScopedInlineFindings:
         "src/genesis/session_awareness/repo_pulse_gh.py",
     ]
 
-    def test_acceptance_replay_pr1541(self, guard_module, capsys, monkeypatch):
+    def test_acceptance_replay_pr1541(self, guard_module, capsys, monkeypatch, offdiff_lock):
         """Replay #1728's measured defect: base-branch Majors drop from the
         score, in-diff Majors still block.
 
@@ -2548,6 +2585,7 @@ class TestDiffScopedInlineFindings:
         none replied) the pre-fix score is 8.0; scoped, it is 3.0 — still a
         block, on exactly the findings that are this PR's to answer.
         """
+        offdiff_lock.expected()  # 5 of the 8 Majors route off-diff by design
         monkeypatch.setenv(
             "_TEST_GH_PR_FILES",
             "\n".join(
@@ -2568,6 +2606,185 @@ class TestDiffScopedInlineFindings:
         err = capsys.readouterr().err
         assert "5 CodeRabbit" in err and "outside this PR's diff" in err
         assert "0088_ego_intentions_origin" in err
+
+
+class TestOffDiffLockItself:
+    """The lock is test infrastructure, so it needs its own lock.
+
+    ``OffDiffLock.MARKER`` is a string copied out of the guard's stderr format.
+    If that label is ever reworded, the lock stops matching and goes SILENTLY
+    blind — every vacuous test it exists to catch starts passing again, with no
+    failure anywhere to say so. That is the same class of silent-blindness the
+    lock was built to close, one layer up, so it is pinned against the guard's
+    REAL output rather than against a hand-copied literal.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _this_class_drives_the_off_diff_lane_on_purpose(self, offdiff_lock):
+        offdiff_lock.expected()
+
+    # EVERY discount lane, not just one. `_check_inline_review_findings` has
+    # three `_off_diff(...) -> continue` sites feeding three lists, each with
+    # its own printed label. A drift test that exercises only one proves
+    # `MARKER` matches THAT lane and says nothing about the others — so
+    # rewording the CodeRabbit label alone (the HIGHEST-weight lane, 1.0 each
+    # against a 1.0 block threshold) would leave the test green while the lock
+    # went blind exactly where it matters most. Found in review 2026-09-08.
+    @pytest.mark.parametrize(
+        ("comment_factory", "label"),
+        [
+            (lambda: _cr_c(1, _CR_MAJOR_BODY, path="src/not_in_the_diff.py"),
+             "[off-diff CodeRabbit Critical/Major]"),
+            (lambda: _codex_c(1, _P1_BODY, path="src/not_in_the_diff.py"), "[off-diff P1]"),
+            (lambda: _codex_c(1, _P2_BODY, path="src/not_in_the_diff.py"), "[off-diff P2]"),
+        ],
+        ids=["coderabbit_major", "codex_p1", "codex_p2"],
+    )
+    def test_marker_matches_the_guard_s_real_off_diff_output(
+        self, guard_module, capsys, comment_factory, label
+    ):
+        """Drift guard: run each real lane, match the real bytes.
+
+        RED if anyone rewords an `[off-diff …]` label without updating MARKER.
+        """
+        with _mock_inline(guard_module, [comment_factory()]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block, "precondition: an off-diff finding is not scored"
+
+        err = capsys.readouterr().err
+        assert label in err, f"lane label drifted: {label!r} is no longer printed"
+        probe = OffDiffLock()
+        probe.record(err)
+        assert probe.routed_off_diff, (
+            f"OffDiffLock.MARKER no longer covers the {label} lane — "
+            "the lock is blind there and every vacuous test now passes silently"
+        )
+
+    def test_an_in_diff_finding_trips_nothing(self, guard_module, capsys):
+        """Negative control: without it, a MARKER of '' would pass the test above."""
+        with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/benign.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, "precondition: an in-diff P1 blocks"
+
+        probe = OffDiffLock()
+        probe.record(capsys.readouterr().err)
+        assert not probe.routed_off_diff
+
+    def test_declaring_is_what_separates_intent_from_accident(self):
+        """The opt-in is a declaration, and nothing else sets it."""
+        probe = OffDiffLock()
+        probe.record("  [off-diff P1] something (src/x.py)")
+        assert probe.routed_off_diff
+        assert not probe.declared, "a lock must not declare itself"
+        probe.expected()
+        assert probe.declared
+
+    # ── Does the lock actually FAIL a run? Only an exit code proves that. ──
+    #
+    # Every assertion above grades the lock's BOOKKEEPING. None of them would
+    # notice if the `pytest.fail` were deleted, because a disarmed lock leaves
+    # this whole suite green — which is the exact shape ("green while the thing
+    # it claims is false") the lock exists to stop. So the enforcement is proved
+    # the only way it can be: run pytest as a child process over a throwaway
+    # test and read the exit code.
+
+    @staticmethod
+    def _run_child_pytest(tmp_path, body: str) -> subprocess.CompletedProcess:
+        """Run one generated test under a COPY of the real conftest.
+
+        The env is SCRUBBED of this suite's own seams: the conftest fixtures set
+        ``_TEST_*`` via ``monkeypatch.setenv``, which mutates ``os.environ`` in
+        this process, and a plain ``subprocess.run`` would hand the child a
+        parent-state inheritance nobody chose. ``PYTEST_ADDOPTS`` goes too — CI
+        sets it, and a child that silently picks up extra options is a child
+        that can pass or fail for a reason the test never states.
+        """
+        conftest_src = Path(__file__).resolve().parent / "conftest.py"
+        (tmp_path / "conftest.py").write_text(conftest_src.read_text())
+        (tmp_path / "test_generated.py").write_text(body)
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("_TEST_") and k != "PYTEST_ADDOPTS"
+        }
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            # MEASURED 0.63-0.77s per child. 120s is ~160x that: headroom for a
+            # loaded shared box, not a guess about how long pytest takes.
+            timeout=120,
+            cwd=str(tmp_path),
+            env=env,
+        )
+
+    def test_an_undeclared_off_diff_test_actually_fails(self, tmp_path):
+        """The load-bearing one: a vacuous test must NOT come out green."""
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_looks_fine():\n"
+            "    print('  [off-diff P1] x (src/a.py)', file=sys.stderr)\n"
+            "    assert True  # the bare not-block assertion, in miniature\n",
+        )
+        assert result.returncode != 0, (
+            "the lock did not fail an undeclared off-diff test — it is DISARMED\n"
+            f"stdout:\n{result.stdout}"
+        )
+        assert "OFF-DIFF lane" in result.stdout
+
+    def test_it_fails_even_when_the_test_drains_its_own_stderr(self, tmp_path):
+        """The drain case — this is why the mechanism is what it is.
+
+        ~20 of the exposed tests call ``capsys.readouterr()`` in the body, which
+        EMPTIES the buffer. A teardown-only read sees nothing in exactly those
+        tests, and a ``sys.stderr`` wrapper installed at fixture-setup time is
+        discarded when pytest reinstalls capture for the call phase (MEASURED: 0
+        chunks recorded). Wrapping ``readouterr`` is what survives a drain, and
+        this test is what would go RED if someone "simplified" it back.
+        """
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_drains_its_own_stderr(capsys):\n"
+            "    print('  [off-diff P1] x (src/a.py)', file=sys.stderr)\n"
+            "    assert '[off-diff' in capsys.readouterr().err\n",
+        )
+        assert result.returncode != 0, (
+            "a test that drained its own stderr slipped the lock — the recording "
+            f"mechanism no longer survives readouterr()\nstdout:\n{result.stdout}"
+        )
+        # A nonzero exit alone is NOT enough: a conftest that stops importing in
+        # the copied tmp_path exits 4, which satisfies `!= 0` while this test
+        # silently stops discriminating the readouterr wrap from a sys.stderr
+        # wrap — the single thing it exists to pin.
+        assert "OFF-DIFF lane" in result.stdout, (
+            f"the child failed for some reason other than the lock firing:\n{result.stdout}"
+        )
+
+    def test_a_declared_off_diff_test_passes(self, tmp_path):
+        """Control: the opt-in must actually let a legitimate test through.
+
+        Without this, a lock that failed EVERY test would satisfy the case above.
+        """
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_off_diff_is_my_subject(offdiff_lock):\n"
+            "    offdiff_lock.expected()\n"
+            "    print('  [off-diff P1] x (src/a.py)', file=sys.stderr)\n",
+        )
+        assert result.returncode == 0, f"the opt-in did not clear the lock\n{result.stdout}"
+
+    def test_a_clean_test_passes(self, tmp_path):
+        """Second control: the lock must be inert on ordinary tests."""
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_ordinary():\n"
+            "    print('nothing off-diff here', file=sys.stderr)\n",
+        )
+        assert result.returncode == 0, f"the lock fired on a clean test\n{result.stdout}"
 
 
 class TestResolvePrNumber:

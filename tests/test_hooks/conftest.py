@@ -96,6 +96,130 @@ def _hermetic_base_advance(monkeypatch):
     yield
 
 
+class OffDiffLock:
+    """Per-test record of whether a review finding was DISCOUNTED as off-diff.
+
+    ``expected()`` is the opt-in for a test whose subject IS off-diff routing.
+    """
+
+    #: The one prefix that means "this finding was silently not scored".
+    #: All three of ``_check_inline_review_findings``' discount lanes print it —
+    #: CodeRabbit Critical/Major, Codex P1, Codex P2. Line numbers are
+    #: deliberately omitted: they rot, and the lane LABELS are the durable
+    #: anchor. ``TestOffDiffLockItself`` parametrizes over all three against the
+    #: guard's real output, so a reworded label fails there rather than here.
+    #:
+    #: Deliberately NOT `[outside-diff `: that label belongs to the review-body
+    #: channel on PR #1847, which is OPEN and unmerged as of 2026-09-08, and it
+    #: prints for in-diff Majors too. (Checked on that branch: it adds no new
+    #: `[off-diff ` lane, so this marker stays complete once it lands.) Also NOT
+    #: the scoping-unavailable NOTE, whose path SCORES everything — the stricter
+    #: direction, so it cannot manufacture a passing not-block assertion.
+    MARKER = "[off-diff "
+
+    def __init__(self) -> None:
+        self._chunks: list[str] = []
+        self._declared = False
+
+    def expected(self) -> None:
+        """Declare that off-diff routing is what this test is FOR."""
+        self._declared = True
+
+    def record(self, err: str) -> None:
+        self._chunks.append(err)
+
+    @property
+    def declared(self) -> bool:
+        return self._declared
+
+    @property
+    def routed_off_diff(self) -> bool:
+        return self.MARKER in self.captured
+
+    @property
+    def captured(self) -> str:
+        """Everything the guard wrote to stderr during this test."""
+        return "".join(self._chunks)
+
+
+@pytest.fixture(autouse=True)
+def offdiff_lock(capsys, monkeypatch):
+    """FAIL a hook test that silently discounted a finding as outside the diff.
+
+    THE DEFECT THIS EXISTS FOR. The merge gate scores a review finding only when
+    its path is in the PR's changed-file set; a finding on any other path is
+    routed to the off-diff lane, surfaced as a NOTE and never scored
+    (``_off_diff``, checked BEFORE the doc-path lever on both the P1 branch and
+    the P2 branch). Tests pin that changed-file set with a FIXED allowlist
+    (``_TEST_GH_PR_FILES``). So a test anchoring a finding on a path the
+    allowlist forgot does not fail — it quietly routes off-diff, and a bare
+    ``assert not block`` then passes VACUOUSLY, proving nothing about the
+    exemption it is named for. Measured live on PR #1690.
+
+    Until this fixture, the only defence was PROSE — a fixture docstring and a
+    standing comment asking every not-block test to also assert its lane marker
+    — and 3 tests already did not. A rule every call site must REMEMBER is a
+    convention; this makes forgetting fail.
+
+    MECHANISM, and why it is this one. The lane writes to stderr, and
+    ``_check_inline_review_findings`` returns only ``(should_block, message)``,
+    so the routing is invisible to the assertion. Reading ``capsys`` after
+    ``yield`` does NOT work: ~20 of the exposed tests call ``readouterr()`` in
+    the body, which DRAINS the buffer. Wrapping ``sys.stderr`` does not work
+    either — MEASURED at 0 of 4 chunks recorded, because pytest reinstalls
+    ``sys.stdout``/``sys.stderr`` per test PHASE, discarding a fixture-setup
+    wrap before the call phase runs. Wrapping ``readouterr`` itself is what
+    survives both: every drain is recorded, and a final drain at teardown
+    catches what a test never read.
+
+    THREE LIMITS, stated rather than papered over — and note the first is the
+    only one that fails SILENTLY, which is why it is first:
+
+    * **It fails OPEN.** A ``MARKER`` that no longer matches the guard's labels,
+      or a pytest change that breaks the ``readouterr`` wrap, makes this fixture
+      pass everything and say nothing — the exact shape it exists to stop, one
+      layer up. That is the right trade (failing closed would break every hook
+      test on any capture hiccup), but it means the lock's value rests entirely
+      on ``TestOffDiffLockItself`` in test_merge_review_gate.py staying honest.
+      Treat those tests as load-bearing machinery, not as coverage: they are all
+      that stands between this fixture working and this fixture being inert.
+    * It cannot see a guard run in a CHILD process — ``_run_guard``'s subprocess
+      tests capture the child's stderr into a ``CompletedProcess``, which never
+      passes through ``capsys``. No path-anchored finding lives there today, so
+      the gap is currently empty; it is a gap all the same. Fails closed in the
+      sense that matters: those tests are simply not covered, not wrongly passed.
+    * Requesting ``capsys`` here makes it active for EVERY hook test, and pytest
+      refuses ``capsys`` and ``capfd`` in one test — loudly, as a setup ERROR.
+      Measured 0 uses of ``capfd``/``capsysbinary`` in all of ``tests/`` when
+      this landed, so a future test needing ``capfd`` is what will collide, and
+      the fix then is to narrow this fixture's scope, not to delete the opt-in.
+    """
+    lock = OffDiffLock()
+    original = capsys.readouterr
+
+    def _recording():
+        result = original()
+        lock.record(result.err)
+        return result
+
+    monkeypatch.setattr(capsys, "readouterr", _recording)
+    yield lock
+    # Whatever the test never drained is still the guard's output. Read it
+    # through the ORIGINAL, which is valid whether or not the patch is undone.
+    lock.record(original().err)
+    if lock.routed_off_diff and not lock.declared:
+        pytest.fail(
+            "A review finding was routed to the OFF-DIFF lane, so it was never "
+            "scored — any 'does not block' assertion in this test passed for "
+            "that reason, not for the one the test is named for.\n"
+            "  * If the finding is meant to be IN the PR's diff: add its path to "
+            "the changed-file allowlist this test uses (_TEST_GH_PR_FILES).\n"
+            "  * If off-diff routing IS this test's subject: call "
+            "`offdiff_lock.expected()`.\n"
+            f"stderr carrying the marker:\n{lock.captured.strip()}"
+        )
+
+
 def _load_settings() -> dict:
     """Load .claude/settings.json from the repo root."""
     here = Path(__file__).resolve()
