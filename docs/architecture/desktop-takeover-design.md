@@ -70,7 +70,7 @@ exist yet; it is listed in §13, not claimed here.
 
 ### 2.1 What the session grant is, concretely
 
-A grant is a row in `approval_requests` that clears six independent bars. Each
+A grant is a row in `approval_requests` that clears eight independent bars. Each
 exists because its absence was a defect found in review, not because it seemed
 prudent.
 
@@ -86,22 +86,40 @@ hold satisfies the grant predicate exactly, so approving one click grants the
 whole session with a fresh expiry. That was measured on the first implementation
 before it was fixed.
 
-**It must be for this window.** The grant names the target window the operator
-was shown, and the action must be in it, compared case- and
-whitespace-insensitively. An absent or empty window on either side is a refusal
-rather than a wildcard, mirroring the rule the device applies to a target it
-cannot resolve — a grant naming no window is not a narrower grant, it is an
-unbounded one. Review caught this bar missing: `window_title` was carried in the
-grant and read back to the operator on the consent card while nothing compared
-it, so a grant for a text editor authorised actions in an unrelated chat or
-banking window. Carrying a scope field without comparing it is worse than not
-carrying it, because the card makes a promise the code does not keep.
+**It must carry a wire format this version knows.** The context blob is
+versioned, and an unrecognised version is refused rather than best-effort
+parsed. A blob written by a different consent path is one whose field meanings
+are not established, and reading it optimistically is precisely how a field ends
+up carried without being compared.
 
-Window titles are not stable identifiers — a document name changes the title of
-the same window — so this is a strict bar by choice. A title that drifts refuses
-and the loop re-asks against the window the operator can actually see named. A
-stable window identity carried from the resolve step is the better long-term
-answer and belongs with the loop that resolves it.
+**It must be for this window** — identified by `(window handle, process id)`,
+never by title. An absent or empty value on either side is a refusal rather than
+a wildcard, mirroring the rule the device applies to a target it cannot resolve:
+a grant naming no window is not a narrower grant, it is an unbounded one. Review
+caught this bar missing entirely: the window was carried in the grant and read
+back to the operator on the consent card while nothing compared it, so a grant
+for a text editor authorised actions in an unrelated chat or banking window.
+Carrying a scope field without comparing it is worse than not carrying it,
+because the card makes a promise the code does not keep.
+
+The title cannot be that identifier, in either direction. It is not unique — two
+browser tabs are both called "New Tab", so a title bar authorises the wrong
+window while looking strict — and it is not stable, since a document name
+changes the title of the same window, so the right window stops matching the
+grant it was given and the operator is re-asked for a window they never left. A
+handle alone is not enough either: Windows reuses a handle once its window
+closes, so the PAIR is what names one live window. The title is still carried,
+because the consent card names it back to the operator; it is display, not
+identity.
+
+**It must be for this mission.** The grant carries the mission's id and the
+action must be under it, so consent given for one piece of work does not cover
+whatever the loop decides to do next. The bar compares the ID and never the
+mission PROSE: the text is model-generated and gets rewritten on every re-plan,
+so binding it would reproduce the title failure one level up — a re-worded plan
+would revoke its own grant, while a differently-worded mission would slip
+through. The prose still rides on the row, because that is what the consent card
+reads aloud.
 
 **It must be approved and unconsumed.** Consumption *will be* how a session's
 grant is retired at teardown; the teardown is part of the unbuilt loop, so today
@@ -171,28 +189,65 @@ it believes it is about to do, and the gate classifies that description — so t
 gate's coverage depends on the loop's own honesty about its intent. That is a
 real weakness, and it is the same weakness a prompt-level gate has.
 
-**The gate does not do that.** Its inputs are the target the actuator
-*resolved*: element name, control type and the password flag as read from the
-machine's accessibility tree, plus the window title and any text to be typed. A
-loop that means to click "Save" and resolves "Delete account" is classified on
-what it resolved. Nothing the model writes about its own plan reaches the
-classifier.
+**The gate does not do that.** Its inputs are the action the actuator
+*resolved*: the operation it is about to perform, the key chord if it is a
+keypress, the target window's handle and process id, and the element name,
+control type and password flag as read from the machine's accessibility tree,
+plus the window title and any text to be typed. A loop that means to click
+"Save" and resolves "Delete account" is classified on what it resolved. Nothing
+the model writes about its own plan reaches the classifier.
 
-Which input feeds which bar is a decision rather than an oversight:
+**The operation is half of the answer, and the first version did not carry it.**
+A control's name describes the thing being operated; it says nothing about the
+operating. Clicking "Message" and typing into "Message" are the same label and
+different acts, and `Ctrl+Enter` in a mail composer sends the mail while
+producing no element name at all. That was not a gap in the pattern lists — the
+information was absent from the input type, and no amount of pattern-adding puts
+it back. Review found three separate defects that were all this one absence.
 
-- **Identity** reads the control — window, element name, control type. Clicking
-  "Send" is the identity act; typing the word is not. A gate that holds the most
-  ordinary desktop action there is teaches people to wave it through.
-- **Financial** additionally reads the typed text, and matches card, IBAN and
-  SSN *shapes* rather than only labels. "Reads the typed text" was an empty
-  promise while every pattern was label-shaped: a real card number typed into a
-  field labelled "Confirmation" matched nothing.
-- **Password** matches the resolved target alone, never the window title, so a
-  window called "Password Manager" does not make its controls unreachable. It
-  does not trust the accessibility flag by itself, because custom controls
-  routinely do not set it, and it covers the whole secret-field family rather
-  than the single word "password" — one-time codes and security answers are
-  credentials too.
+Risk is therefore the highest of four independent signals, not the verdict of
+one:
+
+- **The label patterns.** Identity reads the control — window, element name,
+  control type. Clicking "Send" is the identity act; typing the word is not. A
+  gate that holds the most ordinary desktop action there is teaches people to
+  wave it through. Financial additionally reads the typed text, and matches
+  card, IBAN and SSN *shapes* rather than only labels — "reads the typed text"
+  was an empty promise while every pattern was label-shaped, so a real card
+  number typed into a field labelled "Confirmation" matched nothing. The IBAN is
+  validated by its ISO 7064 checksum rather than its shape, because a
+  country-code pattern alone held roughly one git commit hash in every hundred
+  and ten, and holding on commit hashes is hold fatigue rather than safety.
+- **The reversibility verdict.** `Pay` and `Remove account` appear on neither
+  desktop label list, while the codebase's own reversibility classifier has
+  always called both irreversible. Two classifiers disagreed about the same
+  control and only one of them fed the risk. It is computed over the CONTROL and
+  never the typed text — folding the text in would make typing "please delete
+  the old draft" an irreversible action and hold it, destroying the protection
+  the identity bar was deliberately built to give.
+- **The operation.** A drag acts on coordinates, so no label describes its
+  effect: dropping a folder onto another folder moves it, and the accessibility
+  tree reports what it reports for dragging a scrollbar. It holds rather than
+  being guessed at.
+- **The key chord**, checked against an ALLOWLIST of chords that only navigate
+  or edit text. An unrecognised chord holds. The polarity is the point: a
+  denylist of dangerous shortcuts has misses that are vulnerabilities, because
+  nobody finishes enumerating every application's send key, while this list's
+  misses cost one hold each.
+
+**Password** sits outside that gradient entirely — it is a refusal with no
+approval path. It matches the resolved target alone, never the window title, so
+a window called "Password Manager" does not make its controls unreachable. It
+does not trust the accessibility flag by itself, because custom controls
+routinely do not set it, and it covers the whole secret-field family rather than
+the single word "password" — one-time codes and security answers are credentials
+too.
+
+**A call that cannot be classified is refused, not held.** Missing an operation,
+a key chord for a keypress, a window handle, a session or a mission is a CALLER
+defect, and a click with no resolved element or control type at all is a blind
+click at coordinates that neither the classifier nor the operator can see.
+Holding those would ask the operator to approve an action nobody can describe.
 
 **The limit, stated at its real size.** Identity and financial classification
 are keyword matchers over text the screen supplies, and in this threat model the
@@ -227,6 +282,24 @@ blocked click every tick would leave one permanent approval row per attempt.
 Harmless while nothing calls the gate; the loop must either back off on a hold
 or reuse the existing content-stable approval key.
 
+**And approving a hold currently authorizes nothing — deliberately.** The row is
+written and no surface can resolve it: desktop rows are withheld from the
+dashboard queue, refused by the per-item resolve path, and excluded from the
+batch approve, because desktop consent is meant to arrive through the
+purpose-built path that names the target window back to the operator, and that
+path lands with the loop. The gate also does not call `mark_consumed`.
+
+This is a deferred decision rather than an oversight, and the reason is worth
+recording. "Queues nothing" settles that no STALE action is replayed. It does
+not settle what the freshly re-planned equivalent is allowed to do — and
+whatever carries authorization across that boundary IS a new authorization
+surface, needing the same binding discipline as the grant itself. Bound loosely,
+"approve one click on Delete" quietly becomes "any identity action in this
+window for the next N minutes", which is the defect this section's own window
+bar exists to prevent. The decision belongs with the consent path that will
+carry it, not ahead of it, and until then the honest statement is that the hold
+branch records an owner decision and stops there.
+
 ---
 
 ## 5. The arming lever
@@ -241,11 +314,33 @@ invalid mode degrades to shadow, which is observable, rather than to off, which
 is silent. And the environment kill switch is read *before* any configuration is
 parsed, so a file the process cannot read is not a way past the stop.
 
+One degradation path deliberately goes the other way, and the asymmetry is the
+argument. A damaged BASE config still degrades to shadow, because the tracked
+base holds only values the built-in defaults already reproduce — falling back
+loses nothing the operator wrote. A damaged OVERLAY forces `off`, because the
+overlay is gitignored and is the only home for operator settings: the base ships
+`enabled: true`, so a disable can exist nowhere else, and degrading to defaults
+would quietly re-enable a capability that had been switched off while reporting
+a clean load. This is not the "silent off" the rule above warns against — it
+warns on every read and names the file. It costs no capability either, since
+neither `off` nor `shadow` can act; the choice between them is purely about
+honouring the last intent that was legible.
+
 The shipped default is shadow: classify, record the capability cell, log the
 full verdict including a missing grant, and refuse. That last clause matters
 more than it looks. An observer that only reports on sessions already holding a
 grant observes nothing at all, because a shadow install has no grants — nobody
 asks for keyboard consent for a capability that cannot act.
+
+**Shadow reports the live verdict; it does not recompute one.** Both modes call
+the same policy function, and shadow's answer is that function's answer. The
+first implementation hand-copied the live decision into the shadow branch —
+three terms that had to be kept in step by whoever edited the gate next, with
+every new bar meaning the policy was written twice. Shadow is the mode installs
+actually run, so it is the only thing telling an operator what live would do; a
+copy that silently disagrees is worse than having no shadow at all. The one
+place shadow deliberately diverges is that it creates no approval row: it must
+not put buttons in front of the owner for a capability that cannot act.
 
 ---
 
@@ -477,7 +572,7 @@ originate outside the container.
 
 ## 11. What this design does not guarantee
 
-Three limits, each stated because the obvious reading of the sections above is
+Four limits, each stated because the obvious reading of the sections above is
 stronger than the truth.
 
 **The grant predicate is not a complete authorization boundary.** Every bar in
@@ -502,6 +597,13 @@ recorded here so that whoever wires the first caller does not mistake the
 predicate for a boundary.
 
 **The classifier is not a boundary against adversarial UI** (§3).
+
+**Approving a held action does not yet authorize anything** (§4). The hold
+branch records an owner decision and stops there: no surface can resolve a
+desktop row, and the gate does not consume one. What an approval should BUY is
+an authorization surface in its own right, and it is deferred to the consent
+path rather than guessed at here. Anyone reading §4's "a hold queues nothing"
+as "approve and the action proceeds" has the wrong model of what ships today.
 
 **The capability cell can deny but never grant.** A desktop cell is permanently
 non-promotable: no amount of banked evidence converts session consent into
