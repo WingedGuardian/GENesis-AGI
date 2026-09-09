@@ -127,6 +127,19 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
 SETUP_WARNINGS=0
+# Every setter of SETUP_WARNINGS goes through setup_warn, so the flag can name
+# its own causes. The flag alone made a strict-mode failure undiagnosable: the
+# exit line said only "SETUP_WARNINGS=1" while eight separate sites can set it,
+# several of which print no "WARNING:" text at all — so identifying the cause
+# meant grepping the script for setters and cross-reading a 900-line CI log.
+# A newline-joined string rather than an array: nothing else in this script uses
+# arrays, and an empty-array expansion under `set -u` is a bash-version trap.
+SETUP_WARNING_LOG=""
+setup_warn() {
+    SETUP_WARNINGS=1
+    SETUP_WARNING_LOG="${SETUP_WARNING_LOG}${SETUP_WARNING_LOG:+
+}    • $1"
+}
 TOTAL_STEPS=14
 
 echo ""
@@ -689,7 +702,7 @@ if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PA
     if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
         echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12+"
         echo "    Install Python 3.12 and re-run this script."
-        SETUP_WARNINGS=1
+        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12+"
     fi
 fi
 
@@ -776,11 +789,18 @@ echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
 
 # Auto-cd to genesis on login so Claude Code finds the project (slash
 # commands, hooks, .claude/settings.json all depend on cwd = project root)
-if ! grep -q 'cd ~/genesis' "$HOME/.bashrc" 2>/dev/null; then
+# Guard on the comment, not on the path: the written line now carries the ACTUAL
+# repo directory, so a path-based guard would append a duplicate on every re-run
+# of an install that lives anywhere but ~/genesis. The comment is also what
+# existing installs already have, so this stays idempotent for them.
+if ! grep -q '# Auto-cd to Genesis project on login' "$HOME/.bashrc" 2>/dev/null; then
     echo '' >> "$HOME/.bashrc"
     echo '# Auto-cd to Genesis project on login' >> "$HOME/.bashrc"
-    echo '[ -d ~/genesis ] && cd ~/genesis' >> "$HOME/.bashrc"
-    echo "    + Auto-cd to ~/genesis on login"
+    # $REPO_DIR, not a hardcoded ~/genesis: the installer already knows where it
+    # was cloned, and a clone anywhere else got a login hook pointing at a
+    # directory that does not exist.
+    echo "[ -d '$REPO_DIR' ] && cd '$REPO_DIR'" >> "$HOME/.bashrc"
+    echo "    + Auto-cd to $REPO_DIR on login"
 fi
 
 # Enable Genesis CC hooks on first launch. Without this flag,
@@ -836,7 +856,7 @@ if [ -d "$VENV_PATH" ]; then
         *)
             echo "    FAIL  pip install completed but Genesis is not importable."
             echo "    Re-run with verbose output: $VENV_PATH/bin/pip install -e $REPO_DIR --verbose"
-            SETUP_WARNINGS=1
+            setup_warn "Genesis is not importable after the editable install step"
             ;;
     esac
 else
@@ -859,7 +879,7 @@ if [ -f "$_cc_env" ]; then
     unset CC_SUPPRESSION_STATE
     if ! cc_ensure_local; then
         echo "    (will finalize at step 12; manual: npm install -g @anthropic-ai/claude-code@${CC_VERSION})"
-        SETUP_WARNINGS=1
+        setup_warn "Claude Code could not be installed/aligned before service generation"
     fi
     # cc_ensure_local's return code carries only the VERSION outcome; suppression
     # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
@@ -910,10 +930,16 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         if [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
         else
+            # __AZ_ROOT__ (agent-zero.service.template's WorkingDirectory) was
+            # absent from this list, so that unit shipped with a literal
+            # placeholder where an absolute path belongs — systemd rejects it, and
+            # nothing noticed because install.sh never enables agent-zero. Default
+            # matches scripts/vendor_assets.sh's own AZ_ROOT default.
             sed -e "s|__HOME__|$HOME|g" \
                 -e "s|__VENV__|$VENV_PATH|g" \
                 -e "s|__REPO_DIR__|$REPO_DIR|g" \
                 -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+                -e "s|__AZ_ROOT__|${AZ_ROOT:-$HOME/agent-zero}|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
@@ -1002,15 +1028,16 @@ if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
     if [ "$qdrant_ver" = "unknown" ]; then
         echo "    WARNING: Port 6333 responds but doesn't look like Qdrant"
         echo "    Another service may be using this port."
-        SETUP_WARNINGS=1
+        setup_warn "port 6333 responds but does not look like Qdrant (another service?)"
     else
         echo "    . Qdrant reachable at $QDRANT_URL (v${qdrant_ver})"
     fi
 elif command -v qdrant &>/dev/null; then
     echo "    . Qdrant binary found but not running"
-    SETUP_WARNINGS=1
+    setup_warn "Qdrant binary is present but not running"
 else
     echo "    Qdrant not found — attempting install (v${QDRANT_VERSION})..."
+    _qdrant_installed=0
     _qdrant_arch="x86_64"
     [ "$(uname -m)" = "aarch64" ] && _qdrant_arch="aarch64"
     _qdrant_url="https://github.com/qdrant/qdrant/releases/download/v${QDRANT_VERSION}/qdrant-${_qdrant_arch}-unknown-linux-musl.tar.gz"
@@ -1025,6 +1052,7 @@ else
                 export PATH="$HOME/.local/bin:$PATH"
                 echo "    + Qdrant ${QDRANT_VERSION} installed to ~/.local/bin/"
             fi
+            _qdrant_installed=1
             rm -f /tmp/qdrant.tar.gz
             # Create data dir and config
             mkdir -p "$HOME/.qdrant/storage"
@@ -1049,8 +1077,18 @@ QDCONF
     else
         echo "    WARNING: Could not download Qdrant from $_qdrant_url"
     fi
-    echo "    Genesis REQUIRES Qdrant for vector storage."
-    SETUP_WARNINGS=1
+    # Only a FAILED install warns. This used to warn unconditionally at the end
+    # of the branch, so a perfectly successful install printed "+ Qdrant
+    # installed" and then "Genesis REQUIRES Qdrant" — advice contradicting the
+    # line above it — and left SETUP_WARNINGS set. Invisible on every developer
+    # box, because a box that already has Qdrant takes the first branch and never
+    # reaches here; only a genuinely fresh machine does, which is why 12 weeks of
+    # installer changes went by without anyone seeing it. Found by the first run
+    # of the fresh-install CI check this PR adds.
+    if [ "$_qdrant_installed" != "1" ]; then
+        echo "    Genesis REQUIRES Qdrant for vector storage."
+        setup_warn "Qdrant install failed — Genesis requires it for vector storage"
+    fi
 fi
 
 # Ollama (optional)
@@ -1224,9 +1262,17 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
     systemctl --user enable genesis-server 2>/dev/null && \
         echo "    + genesis-server.service enabled" || true
     if ! systemctl --user is-active --quiet genesis-server 2>/dev/null; then
-        systemctl --user start genesis-server 2>/dev/null && \
-            echo "    + genesis-server started" || \
+        if systemctl --user start genesis-server 2>/dev/null; then
+            echo "    + genesis-server started"
+        else
+            # A dead primary service is the definition of a broken install, and
+            # this used to print and move on without touching either strict-mode
+            # counter — so a fresh-install check could pass with the server
+            # stopped, which is a false green of exactly the kind the check
+            # exists to prevent.
             echo "    WARNING: could not start genesis-server"
+            setup_warn "genesis-server did not start (journalctl --user -u genesis-server)"
+        fi
     fi
 fi
 
@@ -1306,17 +1352,21 @@ echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 unset CC_SUPPRESSION_STATE
 if ! cc_ensure_local; then
     echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
-    SETUP_WARNINGS=1
+    setup_warn "Claude Code could not be installed/aligned to the pin"
 fi
 cc_shadow_scan || true
 
 # Genesis wrapper — lets users type 'genesis' from anywhere inside the container
 # to launch Claude Code in the right directory with all hooks/MCP active.
 if [ ! -f /usr/local/bin/genesis ]; then
-    sudo tee /usr/local/bin/genesis >/dev/null <<'WRAPPER'
+    # Unquoted heredoc so $REPO_DIR is baked in at install time — the previous
+    # quoted form hardcoded ~/genesis, so on any clone elsewhere the `genesis`
+    # command was installed dead and every assertion about it still passed.
+    # "$@" is escaped so it survives to the generated script.
+    sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER
 #!/bin/bash
-cd ~/genesis 2>/dev/null || { echo "Genesis repo not found at ~/genesis"; exit 1; }
-exec claude "$@"
+cd '$REPO_DIR' 2>/dev/null || { echo "Genesis repo not found at $REPO_DIR"; exit 1; }
+exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis
     echo "    + genesis command installed (/usr/local/bin/genesis)"
@@ -1366,7 +1416,7 @@ else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
     echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
-    SETUP_WARNINGS=1
+    setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 
 # Login guidance (interactive only)
@@ -1657,7 +1707,11 @@ echo "  ────────────────────────
 if [ "$SMOKE_FAIL" -gt 0 ]; then
     echo "  Setup complete (with failures — see above)."
 elif [ "${SETUP_WARNINGS:-0}" = "1" ]; then
-    echo "  Setup complete (with warnings — see above)."
+    echo "  Setup complete (with warnings):"
+    # "see above" was the whole problem: the warning can be several hundred lines
+    # up a scrolling install, and two of the setters print no "WARNING:" text to
+    # scroll back and find. Restate them here, where the reader already is.
+    echo "$SETUP_WARNING_LOG"
 else
     echo "  Setup complete!"
 fi
@@ -1712,5 +1766,13 @@ echo ""
 if [ "${GENESIS_INSTALL_STRICT:-0}" = "1" ] \
    && { [ "${SMOKE_FAIL:-0}" -gt 0 ] || [ "${SETUP_WARNINGS:-0}" = "1" ]; }; then
     echo "  STRICT: smoke failures=${SMOKE_FAIL:-0}, SETUP_WARNINGS=${SETUP_WARNINGS:-0} — exiting nonzero." >&2
+    if [ -n "$SETUP_WARNING_LOG" ]; then
+        # Name the causes. Without this the CI failure is a bare flag, and
+        # finding out which of eight setters fired means grepping the script and
+        # cross-reading the full job log — which is exactly what the first run of
+        # this workflow cost.
+        echo "  Setup warnings behind this exit:" >&2
+        echo "$SETUP_WARNING_LOG" >&2
+    fi
     exit 1
 fi

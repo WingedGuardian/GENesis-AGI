@@ -33,12 +33,23 @@ on:
       - "src/genesis/identity/*.example"
       - ".claude/mcp/run-codebase-memory"
       - ".github/workflows/install-test.yml"
+      # The installer installs the source tree and imports GenesisRuntime
+      # (scripts/lib/venv_setup.sh), and treats .claude/settings.json as a
+      # smoke-test requirement — so both are genuine inputs. The first filter
+      # omitted them, which meant a PR could break a clean install without ever
+      # running this check. Including src/genesis/** makes this run on most PRs;
+      # that is the honest cost of the claim, and the job is a few minutes.
+      - "src/genesis/**"
+      - ".claude/settings.json"
   workflow_dispatch:
   schedule:
     - cron: "0 7 * * 1"  # weekly Mon 07:00 UTC — catch drift even without install-path commits
 
 concurrency:
-  group: install-test-${{ github.head_ref || github.ref }}
+  # Key on the PR NUMBER, not the branch name. Two forked PRs whose source
+  # branches share a name — `main` is the common case — collide on head_ref, so
+  # one contributor's push would cancel another contributor's unrelated run.
+  group: install-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -87,9 +98,43 @@ jobs:
           # WARNs about, plus rendered-template integrity it never checks.
           test -f ~/.config/systemd/user/genesis-server.service
           grep -q "$PWD" ~/.config/systemd/user/genesis-server.service
-          ! grep -q '__[A-Z_]*__' ~/.config/systemd/user/genesis-server.service
+
+          # The primary service must be RUNNING, not merely rendered. A unit with a
+          # bad ExecStart or a missing runtime dep renders fine and fails to start;
+          # asserting the file exists cannot tell those apart, which is a green
+          # install test over a dead server.
+          systemctl --user is-active --quiet genesis-server
+
+          # EVERY rendered unit, not just genesis-server. The installer renders all
+          # templates through one loop, so a placeholder introduced in any other
+          # template shipped a broken unit that a genesis-server-only check
+          # accepted — which is exactly how agent-zero.service went out with a
+          # literal __AZ_ROOT__ (fixed in this PR).
+          for _unit in ~/.config/systemd/user/genesis-*.service \
+                       ~/.config/systemd/user/genesis-*.timer \
+                       ~/.config/systemd/user/agent-zero.service \
+                       ~/.config/systemd/user/qdrant.service; do
+            [ -f "$_unit" ] || continue
+            if grep -q '__[A-Z_]*__' "$_unit"; then
+              echo "::error::unsubstituted placeholder in $_unit:"
+              grep -n '__[A-Z_]*__' "$_unit"
+              exit 1
+            fi
+          done
+
+          # The user-facing artifacts that hardcoded ~/genesis until this PR: both
+          # must point at where the repo ACTUALLY is, or they are installed dead on
+          # any clone that is not at ~/genesis.
+          grep -qF "$PWD" /usr/local/bin/genesis
+          grep -qF "$PWD" ~/.bashrc
+
           test -f .mcp.json
           ! grep -q '{{' .mcp.json
+          # PARSE it. Placeholder-free is not the same as valid: a trailing comma
+          # in the template renders clean and Claude Code then rejects the file,
+          # leaving every MCP server unavailable behind a green install.
+          python3 -c "import json,sys; json.load(open('.mcp.json'))"
+
           command -v claude
           . scripts/lib/cc_version.sh
           claude --version | grep -q "$CC_VERSION"
