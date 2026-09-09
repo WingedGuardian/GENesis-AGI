@@ -292,3 +292,38 @@ async def test_close_refuses_an_empty_reason(db, bad):
             db, repo=REPO, pr_number=40, reason=bad, evidence="x", now=NOW
         )
     assert (await _row(db, 40))["status"] == "open", "the row must be untouched"
+
+
+# ── retention window: a sub-1-day window would delete the whole closed set ────
+#
+# `prune_closed` computes `cutoff = now - timedelta(days=older_than_days)`, so a
+# NEGATIVE window subtracts a negative and puts the cutoff in the FUTURE — at
+# which point `closed_at < cutoff` matches EVERY closed row and the "retention"
+# pass empties the table it exists to bound. The guard lives in the CRUD, not
+# only at the CLI, because the caller that gets this wrong is the one that never
+# thought about it. Mirrors `prune_merge_journal` (crud/entities.py), which names
+# the same class for the entity journal.
+
+
+@pytest.mark.parametrize("bad", [0, -1, -180])
+async def test_prune_closed_refuses_a_sub_one_day_window(db, bad):
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=90, pr_title="closed", merged_at=OLD, now=OLD,
+        closed_reason="docs-only",
+    )
+
+    with pytest.raises(ValueError, match="retention window must be >= 1 day"):
+        await verif_crud.prune_closed(db, older_than_days=bad, now=NOW)
+
+    # The row it would have destroyed is still there — the guard refuses, it
+    # does not partially delete.
+    assert (await verif_crud.counts(db)).get("closed", 0) == 1
+
+
+async def test_prune_closed_still_accepts_a_one_day_window(db):
+    """The boundary stays OPEN: >= 1 is valid, so the guard cannot over-refuse."""
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=91, pr_title="closed", merged_at=OLD, now=OLD,
+        closed_reason="docs-only",
+    )
+    assert await verif_crud.prune_closed(db, older_than_days=1, now=NOW) == 1

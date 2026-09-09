@@ -47,10 +47,21 @@ def _print_verification_backlog(db_path: str | None) -> None:
 
     resolved = db_path or str(genesis_db_path())
 
+    if not Path(resolved).exists():
+        # mode=ro below refuses to create the file, which is the point — but a
+        # bare failure would read as a defect rather than "not set up yet".
+        print(f"pr_verifications: no database at {resolved}")
+        return
+
     async def _read() -> tuple[list[dict], dict]:
         import aiosqlite
 
-        async with aiosqlite.connect(resolved, timeout=10) as db:
+        # mode=ro, not a plain path: this command only REPORTS. A read-write
+        # handle would create an empty database when pointed at a wrong path and
+        # then truthfully report it as empty. `mode=ro` (not `immutable=1`) is
+        # the WAL-aware read-only form — `immutable` ignores the -wal file and
+        # would miss rows the worker committed moments earlier.
+        async with aiosqlite.connect(f"file:{resolved}?mode=ro", uri=True, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             return await verif_crud.list_open(db), await verif_crud.counts(db)
@@ -62,10 +73,19 @@ def _print_verification_backlog(db_path: str | None) -> None:
     for row in rows:
         title = (row.get("pr_title") or "").strip()
         print(f"OPEN  PR #{row['pr_number']}  merged {str(row['merged_at'])[:10]}  {title[:80]}")
-    print(
-        f"pr_verifications: {histogram.get('open', 0)} open, "
-        f"{histogram.get('closed', 0)} closed ({resolved})"
-    )
+    # `list_open` has its own row cap, so the lines above can be a SUBSET while
+    # the histogram below reports the true total — printing both without saying
+    # so lets the two numbers disagree in silence, and a reader who counts the
+    # lines gets a wrong answer that looks complete. The omission is stated with
+    # both numbers, which are known exactly here.
+    open_total = histogram.get("open", 0)
+    if len(rows) < open_total:
+        print(
+            f"  <listed the {len(rows)} oldest of {open_total} open row(s); "
+            f"{open_total - len(rows)} not shown — close some, or query "
+            f"pr_verifications directly for the full set>"
+        )
+    print(f"pr_verifications: {open_total} open, {histogram.get('closed', 0)} closed ({resolved})")
 
 
 def main() -> None:

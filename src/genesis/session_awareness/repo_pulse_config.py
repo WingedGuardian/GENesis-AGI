@@ -113,7 +113,7 @@ def effective_mode() -> str:
     off, never a silent absorb).
     """
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    if not knob_bool(cfg, "enabled"):
         return "off"
     mode = cfg.get("mode")
     if mode is False:
@@ -133,6 +133,34 @@ def knob_int(cfg: dict[str, Any], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return int(DEFAULTS[key])
     return value
+
+
+def knob_bool(cfg: dict[str, Any], key: str) -> bool:
+    """Master-switch knob: a REAL bool, or the default plus a WARNING.
+
+    The bare ``cfg.get(key, True)`` this replaces is a truthiness test, and the
+    values an operator actually mistypes are truthy strings — ``"false"``,
+    ``"no"``, ``"off"`` in quotes all read as ENABLED, so the switch silently
+    does the opposite of what was asked and says nothing. (Unquoted ``off`` is
+    the lucky case: YAML 1.1 parses it as a real ``False``.)
+
+    Degrades to the DEFAULT rather than to off, because this file's stated rule
+    is "never a silent off" — an unrecorded obligation is a worse failure than a
+    noisy one. What changes is the SILENCE: a mistyped switch now says so in the
+    log, which is the part that made this a defect rather than a preference.
+    """
+    value = cfg.get(key)
+    if isinstance(value, bool):
+        return value
+    if key in cfg:
+        logger.warning(
+            "repo_pulse %s is %r, not a boolean — using the default %r "
+            "(quote-wrapped 'false'/'no'/'off' are truthy strings, not booleans)",
+            key,
+            value,
+            DEFAULTS[key],
+        )
+    return bool(DEFAULTS[key])
 
 
 def knob_float01(cfg: dict[str, Any], key: str) -> float:

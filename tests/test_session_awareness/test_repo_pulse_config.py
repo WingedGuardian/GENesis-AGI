@@ -3,6 +3,7 @@ domain registration/validator (session-manager PR-4a, ledger_shadow lineage)."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -186,3 +187,38 @@ def test_validator_rejects_bad_open_pr_knobs():
     assert _validate_repo_pulse({"open_pr_stale_days": True})  # bool is not a valid int
     assert _validate_repo_pulse({"max_open_prs": 0})  # must be positive
     assert _validate_repo_pulse({"open_pr_max_surface": -1})
+
+
+# ── knob_bool: a mistyped master switch must not fail SILENTLY ───────────────
+#
+# The bare `cfg.get(key, True)` this replaces is a truthiness test, and the
+# values an operator actually mistypes are truthy STRINGS: quoted "false", "no"
+# and "off" all read as ENABLED, so the switch does the opposite of what was
+# asked and says nothing at all. The fix is not to guess the intent — it is to
+# stop being silent, matching this module's stated rule for an invalid `mode`
+# ("degrades ... never silently off").
+
+
+def test_knob_bool_passes_real_booleans_through():
+    assert rpc.knob_bool({"verification_enabled": False}, "verification_enabled") is False
+    assert rpc.knob_bool({"verification_enabled": True}, "verification_enabled") is True
+
+
+@pytest.mark.parametrize("truthy_string", ["false", "no", "off", "0", "None"])
+def test_knob_bool_warns_instead_of_silently_enabling(truthy_string, caplog):
+    """THE defect: every one of these is truthy, so the old check enabled the lane."""
+    assert bool(truthy_string) is True, "precondition: the mistyped value IS truthy"
+
+    with caplog.at_level(logging.WARNING):
+        result = rpc.knob_bool({"verification_enabled": truthy_string}, "verification_enabled")
+
+    assert result is rpc.DEFAULTS["verification_enabled"]
+    assert "not a boolean" in caplog.text, "a mistyped master switch must say so"
+    assert truthy_string in caplog.text, "the warning must quote the offending value"
+
+
+def test_knob_bool_is_silent_when_the_key_is_absent(caplog):
+    """An unset knob is not a mistake — only a PRESENT wrong-typed one warns."""
+    with caplog.at_level(logging.WARNING):
+        assert rpc.knob_bool({}, "verification_enabled") is True
+    assert "not a boolean" not in caplog.text, "an absent key must not warn on every run"

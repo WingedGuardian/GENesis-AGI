@@ -60,6 +60,7 @@ from genesis.session_awareness.repo_pulse import (
 )
 from genesis.session_awareness.repo_pulse_config import (
     effective_mode,
+    knob_bool,
     knob_int,
     load_config,
 )
@@ -602,7 +603,7 @@ async def _run_locked(
     # NEVER touches the cursor and writes only the fetch cache. A failure is
     # surfaced on the run row's detail (this module reports via DB telemetry, not
     # logging).
-    if cfg.get("open_pr_enabled", True):
+    if knob_bool(cfg, "open_pr_enabled"):
         try:
             open_listing = await list_open_prs(limit=knob_int(cfg, "max_open_prs"))
             if "error" in open_listing:
@@ -1064,7 +1065,7 @@ async def _run_locked(
     # visible in detail and the rows self-heal on the next tick that sees the
     # same PRs; PRs the cursor has passed are backfilled by nothing, which is
     # why the failure note matters.
-    if cfg.get("verification_enabled", True):
+    if knob_bool(cfg, "verification_enabled"):
         verif_complete = True
         try:
             n_verif_open, n_verif_autoclosed, verif_complete = await _verification_lane(

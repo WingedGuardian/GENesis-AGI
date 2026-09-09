@@ -211,7 +211,22 @@ async def prune_closed(
     advancing the cursor past PRs it could not record, so a gap is a signal
     rather than routine) while bounding growth at ~11 merges/day ≈ 2k retained closed rows; flagged
     as a reviewable number, not derived from a hard budget. ``now`` injected.
+
+    Rejects a sub-1-day retention window, mirroring ``prune_merge_journal``
+    (crud/entities.py) which names this exact class: with ``older_than_days <= 0``
+    the cutoff lands at or in the FUTURE relative to ``now`` (subtracting a
+    negative pushes it forward), so ``closed_at < cutoff`` would match EVERY
+    closed row. The guard lives HERE rather than only at the CLI because the
+    caller that gets it wrong is the one that never thought about it — the CLI
+    validates too, for a readable error instead of a traceback.
     """
+    if older_than_days < 1:
+        raise ValueError(
+            f"prune_closed: retention window must be >= 1 day, got "
+            f"{older_than_days!r}; a sub-1 window sets the cutoff at/after now and "
+            f"would delete EVERY closed verification row, destroying the "
+            f"gap-detection window that makes a missing row a signal."
+        )
     if not await _tables_available(db):
         return 0
     from datetime import datetime, timedelta

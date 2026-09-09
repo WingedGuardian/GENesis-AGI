@@ -42,17 +42,39 @@ async def _prune(days: int, verification_days: int) -> tuple[int, int]:
         return pulse_deleted, verif_deleted
 
 
+def _retention_days(raw: str) -> int:
+    """An argparse type for a retention window: a whole number of days >= 1.
+
+    A bare ``type=int`` accepts a NEGATIVE window, and every prune here computes
+    its cutoff as ``now - timedelta(days=N)`` — so a negative N subtracts a
+    negative and puts the cutoff in the FUTURE, at which point "older than the
+    cutoff" matches EVERY row and the prune deletes the whole table instead of
+    trimming it. Both flags below take this type rather than only the one a
+    review happened to name: they share the arithmetic, so they share the bug.
+    """
+    try:
+        days = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number of days, got {raw!r}") from None
+    if days < 1:
+        raise argparse.ArgumentTypeError(
+            f"retention window must be >= 1 day, got {days}; a sub-1 window puts "
+            f"the cutoff at or after now and would delete every row it is meant to keep"
+        )
+    return days
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--days",
-        type=int,
+        type=_retention_days,
         default=45,
         help="retention window in days (rows older than this are deleted)",
     )
     ap.add_argument(
         "--verification-days",
-        type=int,
+        type=_retention_days,
         default=180,
         help="retention for CLOSED pr_verifications rows (open rows are the "
         "obligation and are never pruned)",
