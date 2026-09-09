@@ -369,6 +369,36 @@ class TestAnsiCDecode:
         segs = sp.analyze(f'echo "$\'{PUSH}\'"')
         assert all(sp.git_subcommand(s.argv) != PUSH for s in segs)
 
+    def test_unterminated_ansic_span_is_not_decoded(self):
+        """An unterminated ``$'...`` is INVALID bash — there is no verb bash
+        runs, so the decode must not manufacture one. Recording the remainder
+        as a span turned ``--$'no-verify`` into a real ``--no-verify`` token,
+        which hands a hard policy verdict to a command that never executes;
+        the command must stay untokenizable and route to the ask/blind-spot
+        net instead. RED without the ``j >= n`` guard in ``_ansi_c_spans``."""
+        # the flag form, with the closing apostrophe absent.
+        cmd = f"{GIT} {COMMIT} --$'{NV[2:]}"
+        assert sp._ansi_c_spans(cmd) == []
+        assert sp._decode_escape_free_ansi_c(cmd) == cmd
+        # the flag must NOT resolve — the command is unparseable, not permitted
+        assert not any(sp.commit_skips_hooks(seg.argv) for seg in sp.analyze(cmd))
+        assert sp.untokenizable(cmd) is True
+
+    def test_unterminated_ansic_verb_is_not_decoded(self):
+        """Same for a verb: ``git $'push`` is invalid bash, so no push segment
+        may be synthesised out of it."""
+        cmd = f"{GIT} $'{PUSH}"
+        assert sp._ansi_c_spans(cmd) == []
+        assert not any(sp.git_subcommand(seg.argv) == PUSH for seg in sp.analyze(cmd))
+        assert sp.untokenizable(cmd) is True
+
+    def test_terminated_span_before_an_unterminated_one_still_scans(self):
+        """The ``break`` on an unterminated opener must not discard spans found
+        BEFORE it — a regression guard on the scan's early exit."""
+        cmd = f"{GIT} $'{PUSH}' && {GIT} {COMMIT} --$'{NV[2:]}"
+        spans = sp._ansi_c_spans(cmd)
+        assert len(spans) == 1 and spans[0][2] == PUSH
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # git_push_guard — decoded ANSI-C reaches the ORDINARY gate verdict (BLOCK),
