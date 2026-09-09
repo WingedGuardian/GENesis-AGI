@@ -486,6 +486,35 @@ class TestEscalationGate:
         cmd = 'gh pr comment $n --body "@codex review"  # escalation-ack'
         assert _check(cmd)[0] is True
 
+    def test_body_starting_with_a_repo_flag_is_not_a_repo(self, monkeypatch):
+        """A body's TEXT must never be read as argv structure.
+
+        `--body "-Request ..."` matched the glued `-R<value>` branch, so the
+        body was mistaken for a repository and the identity check blocked a
+        valid request. `_comment_positional` already skipped value-flag values
+        via `_COMMENT_VALUE_FLAGS`; `_comment_repo_value` did not, and that
+        divergence is the exact parse-drift class
+        test_value_flag_consistency.py's docstring names as the bypass that
+        motivated it — same shape, opposite direction (false block, not a
+        bypass), because this gate fails closed."""
+        argv = ["gh", "pr", "comment", "1372", "--body", "-Request @codex review"]
+        assert _mod._comment_repo_value(argv) is None
+
+    def test_body_file_value_is_not_a_repo(self, monkeypatch):
+        argv = ["gh", "pr", "comment", "1372", "-F", "-Ro/rogue"]
+        assert _mod._comment_repo_value(argv) is None
+
+    def test_a_real_repo_flag_after_a_body_still_parses(self, monkeypatch):
+        """The skip must not swallow a genuine --repo that FOLLOWS a body."""
+        argv = ["gh", "pr", "comment", "1372", "--body", "-R fake", "--repo", "o/r"]
+        assert _mod._comment_repo_value(argv) == "o/r"
+
+    def test_body_with_repo_flag_does_not_block_a_valid_request(self, monkeypatch):
+        """End to end through the gate: below the cap this must ALLOW."""
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP - 1)))
+        cmd = 'gh pr comment 1372 --body "-Request @codex review"'
+        assert _check(cmd) == (False, "")
+
     def test_api_error_fails_open(self, monkeypatch):
         monkeypatch.delenv("_TEST_GH_CODEX_REVIEWS", raising=False)
 

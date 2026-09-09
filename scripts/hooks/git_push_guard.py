@@ -2473,10 +2473,28 @@ def _comment_repo_value(argv: list[str]) -> str | None:
     branch below matches) reads as no flag at all.
     """
     val: str | None = None
+    skip_next = False
     for i, tok in enumerate(argv):
-        if tok in ("--repo", "-R") and i + 1 < len(argv):
-            val = argv[i + 1]
-        elif tok.startswith("--repo="):
+        # A value-taking flag's VALUE is not argv structure — it is text the
+        # caller wrote, and it must not be re-read as a flag. Without this,
+        # `--body "-Request @codex review"` matched the glued `-R<value>` branch
+        # below and the body was mistaken for a repository, blocking a valid
+        # request. `_comment_positional` already skips these via the same set;
+        # this function did not, and that divergence IS the parse-drift class
+        # tests/test_hooks/test_value_flag_consistency.py exists to prevent —
+        # the separated `-R` form is named in its docstring as the bypass that
+        # motivated it.
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _COMMENT_VALUE_FLAGS:
+            # --repo/-R are themselves value flags: read their value, then skip
+            # it so the same token cannot also be scanned as a flag.
+            if tok in ("--repo", "-R") and i + 1 < len(argv):
+                val = argv[i + 1]
+            skip_next = True
+            continue
+        if tok.startswith("--repo="):
             val = tok.split("=", 1)[1]
         elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
             val = tok[2:]
