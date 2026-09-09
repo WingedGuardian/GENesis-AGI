@@ -1,7 +1,9 @@
-### Changed
-
-- A reviewer session now flags a premise-level defect with
-  `needs-architecture-session` and leaves the PR open, rather than retiring it.
-  Retiring a PR (`gh pr close`) belongs to the session that takes up its
-  revival. An open PR carrying the evidence is a live handoff; a closed one is
-  an archaeology task.
+- **A review session no longer closes a pull request it is not reviving.** When
+  a PR turns out to be wrong at the premise rather than in its details, it now
+  gets a `needs-architecture-session` comment carrying the evidence and stays
+  open; closing it belongs to whoever picks up the redesign, at the moment they
+  pick it up. An open PR with the reasoning attached is found by listing the
+  queue, and its review threads stay where the conversation is happening — a
+  closed one is found only if somebody remembers it existed. If a PR should be
+  closed and nobody is picking it up, that is a question for the maintainer
+  rather than a call the review station makes on its own.
