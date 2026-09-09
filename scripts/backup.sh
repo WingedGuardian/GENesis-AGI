@@ -697,12 +697,23 @@ if [ -d "$_OVERRIDE_STORE" ]; then
     if ! $_AUDIT_LISTED; then
         log "WARNING: could not list $_OVERRIDE_STORE — mirror prune SKIPPED (existing backup copies kept)"
     else
+        # Reconcile the two name sets in ONE pass. This used to run a fresh `grep`
+        # for every mirrored file, each rescanning the whole live-name string —
+        # quadratic in a store that is one file per flush, and the advertised 5 MB
+        # bound still holds tens of thousands of these small records. The cost
+        # arrived precisely at the boundary the store is supposed to support, and
+        # it delays the scheduled backup there (Codex P2, PR #1609).
+        declare -A _AUDIT_LIVE_SET=()
+        while IFS= read -r _ln; do
+            [ -n "$_ln" ] && _AUDIT_LIVE_SET["$_ln"]=1
+        done <<< "$_AUDIT_LIVE"
         while IFS= read -r -d '' _b; do
             _bbase="$(basename "$_b")"
-            if ! printf '%s' "$_AUDIT_LIVE" | grep -qxF "$_bbase"; then
+            if [ -z "${_AUDIT_LIVE_SET[$_bbase]:-}" ]; then
                 rm -f "$_b" && _AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))
             fi
         done < <(find audit/merge_overrides -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+        unset _AUDIT_LIVE_SET
     fi
     # Sweep any staging scrap a KILLED EARLIER run left behind, so the mirror cannot
     # grow a second, invisible store beside itself. Dot-prefixed, so the `*.jsonl`

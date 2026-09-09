@@ -820,7 +820,41 @@ else
     log "Overlays: no backup directory"
 fi
 
-# ── 6d. Hook audit stores ────────────────────────────────────────────
+# ── 7. Secrets ───────────────────────────────────────────────────────
+log "--- Secrets ---"
+SECRETS_SRC="$BACKUP_DIR/secrets/secrets.env.gpg"
+if [ ! -f "$SECRETS_SRC" ]; then
+    while IFS= read -r _d; do
+        [ -n "$_d" ] && [ -f "$_d/secrets/secrets.env.gpg" ] || continue
+        SECRETS_SRC="$_d/secrets/secrets.env.gpg"
+        log "Secrets: Tier-1 clone payload absent — using host-side mirror $SECRETS_SRC"
+        break
+    done < <(_cred_fallback_sources)
+fi
+if [ -f "$SECRETS_SRC" ]; then
+    if [ -f "$SECRETS_FILE" ] && ! $FORCE; then
+        log "Secrets: $SECRETS_FILE already exists — skipping (use --force to overwrite)"
+    else
+        if $DRY_RUN; then
+            log "Secrets: would decrypt → $SECRETS_FILE"
+        elif confirm "Decrypt secrets → $SECRETS_FILE?"; then
+            mkdir -p "$(dirname "$SECRETS_FILE")"
+            if decrypt_file "$SECRETS_SRC" "$SECRETS_FILE"; then
+                chmod 0600 "$SECRETS_FILE"
+                _SECRETS_RESTORED=true
+                log "Secrets: decrypted → $SECRETS_FILE (chmod 0600)"
+            else
+                warn "Secrets: decrypt failed"
+            fi
+        else
+            log "Secrets: skipped (user declined)"
+        fi
+    fi
+else
+    log "Secrets: no backup payload at $SECRETS_SRC"
+fi
+
+# ── 7b. Hook audit stores ───────────────────────────────────────────
 # NEVER overwrite a live record, even under --force. Restoring is purely ADDITIVE
 # and that is a property of the store's shape rather than a rule we enforce: each
 # file is named from the writing instant plus pid, so a backup file and a live one
@@ -834,6 +868,19 @@ _AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
 # the hardcoded default put an install with a custom GENESIS_MERGE_OVERRIDE_DIR
 # back together with its audit trail in a directory nothing reads (Codex P2,
 # PR #1609).
+# The resolver reads the ENVIRONMENT, and a custom store is normally configured
+# only in secrets.env — which this script restores, and which on the disaster this
+# backup exists for does not exist until it has. So load it first, and note that
+# this whole section runs AFTER "Secrets" for exactly that reason: resolving before
+# then put the records in the default directory while the writers went on using the
+# configured one, leaving the recovered audit trail orphaned (Codex P2, PR #1609).
+if [ -f "$SECRETS_FILE" ] && [ -z "${GENESIS_MERGE_OVERRIDE_DIR:-}" ]; then
+    # shellcheck source=scripts/lib/load_secrets.sh
+    source "$_SCRIPT_DIR/lib/load_secrets.sh" 2>/dev/null || true
+    if declare -F load_secrets_file >/dev/null 2>&1; then
+        load_secrets_file "$SECRETS_FILE" || true
+    fi
+fi
 _AUDIT_DST="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
     || printf '%s' "$HOME/.genesis/merge_overrides")"
 if [ ! -d "$_AUDIT_SRC" ]; then
@@ -868,40 +915,6 @@ else
         fi
     done < <(find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
     log "Audit stores: $_AUDIT_RESTORED file(s) restored → $_AUDIT_DST (existing left untouched)"
-fi
-
-# ── 7. Secrets ───────────────────────────────────────────────────────
-log "--- Secrets ---"
-SECRETS_SRC="$BACKUP_DIR/secrets/secrets.env.gpg"
-if [ ! -f "$SECRETS_SRC" ]; then
-    while IFS= read -r _d; do
-        [ -n "$_d" ] && [ -f "$_d/secrets/secrets.env.gpg" ] || continue
-        SECRETS_SRC="$_d/secrets/secrets.env.gpg"
-        log "Secrets: Tier-1 clone payload absent — using host-side mirror $SECRETS_SRC"
-        break
-    done < <(_cred_fallback_sources)
-fi
-if [ -f "$SECRETS_SRC" ]; then
-    if [ -f "$SECRETS_FILE" ] && ! $FORCE; then
-        log "Secrets: $SECRETS_FILE already exists — skipping (use --force to overwrite)"
-    else
-        if $DRY_RUN; then
-            log "Secrets: would decrypt → $SECRETS_FILE"
-        elif confirm "Decrypt secrets → $SECRETS_FILE?"; then
-            mkdir -p "$(dirname "$SECRETS_FILE")"
-            if decrypt_file "$SECRETS_SRC" "$SECRETS_FILE"; then
-                chmod 0600 "$SECRETS_FILE"
-                _SECRETS_RESTORED=true
-                log "Secrets: decrypted → $SECRETS_FILE (chmod 0600)"
-            else
-                warn "Secrets: decrypt failed"
-            fi
-        else
-            log "Secrets: skipped (user declined)"
-        fi
-    fi
-else
-    log "Secrets: no backup payload at $SECRETS_SRC"
 fi
 
 # ── 8. Critical credential & wiring files → staging (non-destructive) ─

@@ -318,3 +318,34 @@ def test_the_backup_mirror_prune_is_gated_on_a_successful_listing():
     assert "_AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))" in guard[1], (
         "the mirror-delete loop is not inside the successful-listing branch"
     )
+
+
+def test_the_mirror_reconciliation_is_one_pass_not_one_grep_per_file():
+    """Reconciling the mirror against the live store must not rescan per file.
+
+    The loop ran a fresh `grep -qxF` for every mirrored record, each one rescanning
+    the entire live-name string. That is quadratic in a store whose whole shape is
+    one file per flush — and the advertised 5 MB bound still holds tens of
+    thousands of these small records, so the cost arrives exactly at the boundary
+    the store is documented to support, delaying the scheduled backup there
+    (Codex P2, PR #1609).
+
+    A STRUCTURAL check, in the same spirit as the gating test above and said just
+    as plainly: driving the real cost needs the full backup harness for one loop.
+    What it pins is that the per-file rescan is gone and a single-pass membership
+    set replaced it — the semantics are unchanged, so a behavioural test would pass
+    against both shapes and prove nothing about the thing that was wrong.
+    """
+    body = (_REPO / "scripts" / "backup.sh").read_text()
+    section = body.split("Backing up hook audit stores", 1)[-1].split("--- 7.", 1)[0]
+    assert section, "the audit-store section could not be located"
+    assert 'grep -qxF "$_bbase"' not in section, (
+        "the per-file rescan is back: every mirrored record re-greps the whole "
+        "live-name string"
+    )
+    assert "declare -A _AUDIT_LIVE_SET" in section, (
+        "no single-pass membership set — reconciliation is not linear"
+    )
+    assert '${_AUDIT_LIVE_SET[$_bbase]:-}' in section, (
+        "the delete decision does not consult the membership set"
+    )
