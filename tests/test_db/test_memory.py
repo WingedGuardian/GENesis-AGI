@@ -1,5 +1,6 @@
 """Tests for memory CRUD (FTS5-based)."""
 
+import logging
 import sqlite3
 
 import pytest
@@ -79,6 +80,35 @@ async def test_search_is_and_only_no_fallback(db):
     assert await memory.search(db, query="alpha nonexistentword") == []
     # A fully-present query still hits (basic AND path intact).
     assert [r["memory_id"] for r in await memory.search(db, query="alpha beta")] == ["p1"]
+
+
+async def test_search_ranked_degrades_on_unparseable_boolean_query(db, caplog):
+    """An FTS5-invalid boolean expression must DEGRADE, never raise.
+
+    Every known producer now sanitises its terms before joining, so this path is
+    reached only by a future producer emitting something malformed. It used to
+    escape as sqlite3.OperationalError and surface as HTTP 500 from the recall
+    endpoint. The retry drops to bare terms: expansion is an optimisation, and
+    losing its precision beats losing the query.
+    """
+    await memory.create(db, memory_id="d1", content="alpha beta gamma")
+    # Parenthesis-BALANCED but structurally invalid — the exact shape a
+    # punctuation-only term used to leave behind. Balance is why the old
+    # paren-counting check waved it through.
+    bad = "(alpha) OR (beta OR )"
+    with caplog.at_level(logging.WARNING, logger="genesis.db.crud.memory"):
+        results = await memory.search_ranked(db, query=bad, boolean=True)
+    assert [r["memory_id"] for r in results] == ["d1"]
+    assert "FTS5 rejected a composed boolean query" in caplog.text
+
+
+async def test_search_ranked_real_db_error_still_raises(db):
+    """The backstop is narrowed to fts5 SYNTAX errors — it must not swallow a
+    genuine database failure into a silent empty result. Querying a table that
+    does not exist is an OperationalError that is NOT an fts5 syntax error.
+    """
+    with pytest.raises(sqlite3.OperationalError):
+        await db.execute_fetchall("SELECT 1 FROM no_such_table_xyz WHERE x MATCH ?", ["a"])
 
 
 async def test_search_ranked_or_fallback_on_partial_terms(db):
