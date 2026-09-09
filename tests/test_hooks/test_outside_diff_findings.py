@@ -286,6 +286,16 @@ class TestGateBehaviour:
         )
         block, _ = self._run(guard_module, monkeypatch, no_inline, [review])
         assert block is False
+        # `block is False` alone is ALSO what a parser that read nothing
+        # produces, so on its own this test stays green if the login filter is
+        # deleted and the body simply fails to parse — it would pass for a
+        # reason unrelated to its name. The absence assertion is what makes it
+        # discriminating: the finding must be absent from the SURFACED output
+        # too, not merely unscored. (Matching `test_dismissed_review_findings_
+        # are_excluded` above.)
+        err = capsys.readouterr().err
+        assert "Not from CodeRabbit" not in err
+        assert "outside-diff" not in err
 
     def test_critical_on_a_doc_path_does_not_block(
         self, guard_module, monkeypatch, no_inline, capsys
