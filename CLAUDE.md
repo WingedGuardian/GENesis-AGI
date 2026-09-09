@@ -507,6 +507,11 @@ every emitter's arithmetic, so this class cannot go quiet again.
   3 silently discards steps 1 and 2 while the error text mentions only step 3.
   Never chain a state-changing step (`cd`, heredoc, file write,
   restore-from-backup) with one a guard can block (test run, commit, push).
+  Most guards now append a note saying the whole command went whenever the
+  command had more than one step — a REMINDER, never a report: it names nothing
+  and cannot tell you which step mattered, so it does not replace the check. The
+  shell blockers (`bash_safety_hook.sh` and the inline `settings.json` one) do
+  NOT carry it yet, so its ABSENCE never means the command was single-step.
   After any block, run `pwd` and re-check the file you believed you wrote —
   never assume the earlier half ran. Prefer `git -C <literal path>` and
   `$ROOT/scripts/…` over a persistent `cd`, so a lost `cd` cannot silently

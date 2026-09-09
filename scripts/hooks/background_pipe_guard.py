@@ -16,6 +16,7 @@ is a reworked command, never a bypass.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -23,6 +24,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, tool_input  # noqa: E402
 from shell_parse import has_top_level_pipe  # noqa: E402
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the command RUNS.
+    discarded_write = None  # type: ignore[assignment]
 
 
 def _is_background(value: object) -> bool:
@@ -40,6 +47,9 @@ def main() -> None:
     if not _is_background(ti.get("run_in_background")):
         return
     cmd = ti.get("command")
+    if discarded_write is not None:
+        with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+            discarded_write.remember(cmd)
     if not isinstance(cmd, str) or not cmd:
         return
     if has_top_level_pipe(cmd):
@@ -50,6 +60,9 @@ def main() -> None:
             "`bash that_script.sh`.",
             file=sys.stderr,
         )
+        if discarded_write is not None:
+            with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                discarded_write.warn()
         sys.exit(2)
 
 
