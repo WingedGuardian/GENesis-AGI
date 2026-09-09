@@ -195,6 +195,88 @@ _STOCK_TASKSMAX_FRACTION = 0.33
 _RAISED_TASKSMAX_MARGIN = 1.05
 
 
+def _oom_score_adj_declared_ok(
+    proc_root: Path, unit_dir: Path | None = None
+) -> bool | None:
+    """Whether this unit's EFFECTIVE ``oom_score_adj`` matches what it DECLARES.
+
+    Generalised from a specific defect on purpose. The narrow question ("is
+    ``-500`` applied?") is now retired — a user manager can never apply a negative
+    value — but the CLASS is what went unnoticed for as long as the line existed:
+    ``OOMScoreAdjust`` is written by the manager at exec, and when the write is
+    refused it fails **SILENTLY**. No journal entry, no start failure, and
+    ``systemctl show`` keeps reporting the DECLARED value, so every surface agrees
+    with the unit file while the kernel disagrees with all of them. MEASURED
+    2026-09-08: declared ``-500``, effective ``100``.
+
+    Comparing declared against effective would have caught it the day it shipped,
+    and it catches the next one whatever the value is.
+
+    Read entirely from files this process can always reach, which is what makes it
+    work IN-SERVER rather than only in a shell: ``/proc/self/oom_score_adj`` is the
+    process's own (no ptrace gate, unlike ``/proc/<other>/environ``), the unit name
+    comes from ``/proc/self/cgroup``, and the rendered unit file is world-readable
+    — ``ProtectSystem=strict`` makes the filesystem read-only, it does not block
+    reads.
+
+    True when they agree, False ONLY on a genuine divergence, None when the
+    question does not apply or cannot be answered (not under a systemd unit, not a
+    genesis unit, nothing declared, or anything unreadable/malformed) — the posture
+    check treats None as silent, per the explicit-False-only contract.
+    """
+    effective_raw = _read(proc_root / "self/oom_score_adj")
+    if effective_raw is None:
+        return None
+    try:
+        effective = int(effective_raw)
+    except ValueError:
+        return None
+
+    cgroup = _read(proc_root / "self/cgroup")
+    if not cgroup:
+        return None
+    unit = ""
+    for line in cgroup.splitlines():
+        # cgroup v2: a single "0::<path>" line; the unit is the last .service
+        # component (a .scope leaf sits under its service in some layouts).
+        for part in reversed(line.rpartition("::")[2].split("/")):
+            if part.endswith(".service"):
+                unit = part
+                break
+        if unit:
+            break
+    # Only judge OUR OWN units. A non-genesis unit's declaration is not ours to
+    # police, and reporting on it would make the posture check noisy on shared
+    # boxes.
+    if not unit.startswith("genesis-"):
+        return None
+
+    if unit_dir is None:
+        unit_dir = Path.home() / ".config/systemd/user"
+    unit_text = _read(unit_dir / unit)
+    if unit_text is None:
+        return None
+
+    # systemd semantics: the LAST assignment wins, and an empty value RESETS to
+    # unset. Ignore comment lines so the explanatory block above a value cannot be
+    # mistaken for a declaration.
+    declared_raw: str | None = None
+    for line in unit_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() == "OOMScoreAdjust":
+            declared_raw = value.strip()
+    if not declared_raw:
+        return None  # nothing declared (or explicitly reset) — nothing to diverge
+    try:
+        declared = int(declared_raw)
+    except ValueError:
+        return None
+    return declared == effective
+
+
 def _pid_ceiling_effective_ok(sys_root: Path, uid: int | None = None) -> bool | None:
     """Whether the per-user systemd slice's EFFECTIVE PID/task ceiling is raised
     above systemd's stock 33% default (user-.slice.d/10-defaults.conf).
@@ -444,6 +526,7 @@ async def collect_memory(
     facts["cgroup_memory_swap_max"] = _read_cgroup_memory_swap_max(sys_root)
     facts["oomd_user_slice_kill"] = _oomd_user_slice_kill(etc_root)
     facts["pid_ceiling_effective_ok"] = _pid_ceiling_effective_ok(sys_root)
+    facts["oom_score_adj_declared_ok"] = _oom_score_adj_declared_ok(proc_root)
 
     meminfo = _read(proc_root / "meminfo") or ""
     mem: dict[str, int] = {}
