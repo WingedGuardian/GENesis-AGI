@@ -173,6 +173,16 @@ DESKTOP_HOLD_KIND = "desktop_action_hold"
 #: the defect class this whole rewrite exists to close.
 SESSION_GRANT_VERSION = 2
 
+#: Wire-format version of a per-action HOLD context blob.
+#:
+#: Same discipline as :data:`SESSION_GRANT_VERSION`, and it exists for the same
+#: reason: the hold blob is written NOW for a reader that lands with the consent
+#: path, so it is a forward-compatibility commitment — and a commitment with no
+#: version is one the future reader cannot refuse. The moment that reader adds
+#: or re-means a field, rows written by this version become indistinguishable
+#: from rows written by the new one.
+DESKTOP_HOLD_VERSION = 1
+
 #: Resolver prefixes that may mint a desktop SESSION GRANT. A deliberate
 #: narrowing of :data:`HUMAN_RESOLVER_PREFIXES`, not a reuse of it.
 #:
@@ -248,7 +258,10 @@ def _display(value: str) -> str:
     derived from the Unicode database rather than hand-enumerated; the log
     calls in this module already get the same protection from ``%r``.
     """
-    cleaned = strip_control_chars(value or "")
+    # `str()` first: this is screen-supplied metadata, and an actuator payload
+    # carrying a JSON number reached `strip_control_chars` as an int and raised
+    # TypeError — on the path that builds the consent card a human reads.
+    cleaned = strip_control_chars(str(value) if value is not None else "")
     if len(cleaned) <= _DISPLAY_LIMIT:
         return cleaned
     return f"{cleaned[:_DISPLAY_LIMIT]}… <{len(cleaned) - _DISPLAY_LIMIT} more chars>"
@@ -317,6 +330,11 @@ class SessionGrant:
     window_handle: str
     process_id: int
     window_nonce: str
+    #: DISPLAY ONLY — carried for the consent card that names the window and the
+    #: mission back to the operator, and deliberately never compared. Called out
+    #: because this module's own rule is that a field carried and not compared is
+    #: a broken promise, and without this note a reader applying that rule would
+    #: conclude these two are the defect rather than the reason the blob exists.
     window_title: str
     mission: str
     resolved_by: str
@@ -419,6 +437,30 @@ class SessionGrant:
         """
         return not self.mismatch(action, session_id=session_id, mission_id=mission_id)
 
+    def is_live(self, ttl: timedelta, *, now: datetime | None = None) -> bool:
+        """Whether this grant is still inside its TTL, against an INJECTED clock.
+
+        Bounded on BOTH sides. A future-dated resolution gives a negative age,
+        which ``age <= ttl`` alone accepts forever — a backwards clock step or a
+        hand-edited row would mint a permanent grant.
+
+        A METHOD rather than an inline comparison because it is checked twice:
+        once when the grant is selected, and again after the cell-classification
+        write, which is an await long enough for a grant with seconds left to
+        lapse in the middle of its own authorization. Two copies of a
+        liveness rule is how they drift apart.
+
+        ``now`` is a PARAMETER so that `_verdict` stays pure and directly
+        testable — reading the wall clock in here made the one function that
+        holds the whole policy untestable without a DB, a sleep and a race.
+        It defaults to the real clock for the selection-time caller.
+        """
+        if self.resolved_at is None:
+            # Un-ageable, so unbounded. Treated as expired.
+            return False
+        now = now if now is not None else datetime.now(UTC)
+        return timedelta(0) <= (now - self.resolved_at) <= ttl
+
     def mismatch(
         self, action: DesktopAction, *, session_id: str, mission_id: str
     ) -> str:
@@ -466,6 +508,13 @@ class DesktopGateDecision:
     #: without ever acting, and makes "shadow refused" distinguishable from
     #: "the gate would have refused anyway".
     would_allow: bool = False
+    #: Shadow only: WHY live would have decided that — `_verdict`'s own reason,
+    #: which `reason` cannot carry because it is pinned to "shadow". Without it
+    #: a shadow install can see THAT it would have refused but not which bar
+    #: refused, which is most of what shadow is for; and a parity test can only
+    #: compare booleans, so a bar that turns an allow into a HOLD rather than a
+    #: refusal — the same fork, one notch over — looks identical to agreement.
+    would_reason: str = ""
 
 
 class DesktopTakeoverGate:
@@ -516,8 +565,17 @@ class DesktopTakeoverGate:
         Classification is pure and therefore runs early, so a refusal names the
         real reason instead of the first tripwire.
         """
+        # ONE read of the clock and ONE of the lever, threaded from here to
+        # every bar that needs them. The liveness RULE was unified into
+        # `_verdict`; its INPUT was forked in the same commit — selection read
+        # the TTL at :818 and the verdict re-read it at the call site, so an
+        # operator editing config mid-check could get a grant selected under
+        # one TTL and judged under another. `load_config()` is also uncached by
+        # documented design (~3ms of synchronous file I/O and YAML per call)
+        # and this runs inside `async def`, so each extra read blocks the loop.
         now = datetime.now(UTC)
         mode = effective_mode()
+        grant_ttl = timedelta(minutes=grant_ttl_minutes())
 
         # 1. Not armed at all — a refusal, never a hold. An unarmed capability
         #    must not queue work for the owner to approve later.
@@ -561,7 +619,8 @@ class DesktopTakeoverGate:
         #    to report what live would have decided, and "would it have had a
         #    grant?" is most of that answer.
         grant, grant_reason = await self._live_session_grant(
-            action, session_id=session_id, mission_id=mission_id, now=now
+            action, session_id=session_id, mission_id=mission_id,
+            now=now, grant_ttl=grant_ttl,
         )
 
         # 6. Shadow observes and refuses. It records the cell and logs the full
@@ -580,9 +639,18 @@ class DesktopTakeoverGate:
         #    posture of every install running it.
         if mode != "live":
             state = await self._classify_cell(domain, verb, risk, now)
+            # A FRESH clock read, deliberately NOT the `now` taken at the top
+            # of check(). The whole point of this bar is that time passed
+            # during the awaited cell write above; comparing against the
+            # pre-await timestamp gives the same answer selection already
+            # gave, so the re-check would silently never fire. Purity lives
+            # in _verdict taking `now` as an argument, not in reusing a
+            # stale one. (MEASURED: threading the stale value makes an
+            # expired grant allow AND collect a fresh device TTL.)
             would_allow, reason = _verdict(
                 classification=classification, grant=grant,
                 grant_reason=grant_reason, cell_state=state,
+                now=datetime.now(UTC), grant_ttl=grant_ttl,
             )
             logger.info(
                 "Desktop gate SHADOW: would %s %s:%s:%s (window=%r, element=%r)",
@@ -599,6 +667,7 @@ class DesktopTakeoverGate:
                 cell=(domain, verb, risk),
                 mode=mode,
                 would_allow=would_allow,
+                would_reason=reason,
             )
 
         # ── live from here ───────────────────────────────────────────────
@@ -618,17 +687,21 @@ class DesktopTakeoverGate:
         #    this, ever", and it outranks a live session grant.
         state = await self._classify_cell(domain, verb, risk, now)
 
-        # 9. One policy, one place.
+        # 9. One policy, one place — INCLUDING the liveness re-check, which
+        #    `_classify_cell` above makes necessary and which must not live out
+        #    here where shadow cannot see it.
         allow, reason = _verdict(
             classification=classification, grant=grant,
             grant_reason=grant_reason, cell_state=state,
+            now=datetime.now(UTC), grant_ttl=grant_ttl,
         )
         if not allow:
             if reason == "held":
                 # Above STANDARD, session consent is not enough. Crossing the
                 # identity bar or touching money is its own decision, every time.
                 return await self._hold(
-                    classification, action, session_id, mission_id, mode
+                    classification, action, session_id, mission_id, mode,
+                    grant_ttl=grant_ttl,
                 )
             logger.warning(
                 "Desktop gate REFUSED %s:%s:%s — %s", domain, verb, risk, reason
@@ -685,7 +758,23 @@ class DesktopTakeoverGate:
                 origin_class="first_party",
             )
         cell = await cg.get_cell(self._db, domain, verb, risk)
-        return CellState(cell["state"]) if cell else CellState.ASK
+        if not cell:
+            return CellState.ASK
+        try:
+            return CellState(cell["state"])
+        except ValueError:
+            # The ninth member of the coercion class, and the only one whose
+            # guard lives OUTSIDE the code: a schema CHECK constraint that
+            # currently enumerates exactly the four CellState members. That
+            # makes it invisible to a grep-based enumeration of this file, and
+            # a restored old backup or a migration that widens the CHECK
+            # without widening the enum turns it into a crash on the hot path.
+            # ASK is the fail-closed direction — the cell can deny, never grant.
+            logger.warning(
+                "Desktop cell %s:%s:%s has an unknown state %r — treating as ASK",
+                domain, verb, risk, cell["state"], exc_info=True,
+            )
+            return CellState.ASK
 
     async def _live_session_grant(
         self,
@@ -694,6 +783,7 @@ class DesktopTakeoverGate:
         session_id: str,
         mission_id: str,
         now: datetime,
+        grant_ttl: timedelta,
     ) -> tuple[SessionGrant | None, str]:
         """The owner's live grant for this session, mission AND window.
 
@@ -759,7 +849,7 @@ class DesktopTakeoverGate:
         if not rows:
             return None, "no_session_grant"
 
-        ttl = timedelta(minutes=grant_ttl_minutes())
+        ttl = grant_ttl
         saw_parsed = False
         saw_allowlisted = False
         # The most specific near-miss seen, so the reason names the bar that
@@ -796,11 +886,7 @@ class DesktopTakeoverGate:
             # grant that lapsed during that work would still authorize.
             # That is the fail-OPEN direction, on the one bar whose job
             # is to make a forgotten grant die on its own.
-            age = datetime.now(UTC) - grant.resolved_at
-            # Bounded on BOTH sides. A future-dated resolution gives a negative
-            # age, which `age <= ttl` alone accepts forever — a backwards clock
-            # step or a hand-edited row would mint a permanent grant.
-            if timedelta(0) <= age <= ttl:
+            if grant.is_live(ttl):
                 return grant, "session_grant"
 
         # Ordered so the reason names the FIRST bar that failed. Each is a
@@ -822,6 +908,8 @@ class DesktopTakeoverGate:
         session_id: str,
         mission_id: str,
         mode: str,
+        *,
+        grant_ttl: timedelta,
     ) -> DesktopGateDecision:
         """Record an owner decision for one above-STANDARD action.
 
@@ -845,6 +933,7 @@ class DesktopTakeoverGate:
                 # DESKTOP_GATE_ACTION_TYPE, which no reader ever looks for, so
                 # the hold path was write-only: a row nothing could find.
                 "kind": DESKTOP_HOLD_KIND,
+                "version": DESKTOP_HOLD_VERSION,
                 "cell": [domain, verb, risk],
                 "session_id": session_id,
                 # The IDENTITY triple, recorded for the same reason the grant
@@ -855,10 +944,23 @@ class DesktopTakeoverGate:
                 # approved hold authorizes will need exactly these fields, and
                 # rows written before then would be unbindable.
                 "mission_id": mission_id,
-                "window_handle": action.window_handle,
-                "process_id": action.process_id,
-                "window_nonce": action.window_nonce,
+                # NORMALIZED, because this is what a future reader will COMPARE.
+                # The read side strips and coerces (see SessionGrant.parse and
+                # .mismatch, and the docstring there about `4312 == "4312"`);
+                # writing the raw caller value here would hand that same
+                # fail-closed-but-undiagnosable mismatch to whoever binds on
+                # these rows. The lesson was applied to one direction of the
+                # field and not the other.
+                "window_handle": str(action.window_handle or "").strip(),
+                "process_id": _coerce_pid(action.process_id),
+                "window_nonce": str(action.window_nonce or "").strip(),
                 "operation": str(action.operation),
+                # The chord and the control type DETERMINED this hold, so they
+                # belong on the row: for a KEY action there is no element name,
+                # and without the chord neither the card nor any later reader
+                # can say what is being held.
+                "key_chord": action.key_chord,
+                "control_type": action.control_type,
                 "window_title": action.window_title,
                 "element_name": action.element_name,
                 "sub_class": classification.sub_class,
@@ -882,16 +984,45 @@ class DesktopTakeoverGate:
             description=(
                 f"Desktop {classification.sub_class} action.\n"
                 f"Control: {_display(action.element_name) or 'an unnamed control'}\n"
-                f"Window: {_display(action.window_title) or 'an unnamed window'}\n"
+                # A KEY action has no element name by construction, so without
+                # this line the card for `ctrl+enter` reads "an unnamed control"
+                # and never names the thing that will send the mail. The module
+                # holds every OTHER surface to "a card that cannot say what it
+                # is granting must not be the thing that asks".
+                + (f"Key: {_display(action.key_chord)}\n" if action.key_chord else "")
+                + f"Window: {_display(action.window_title) or 'an unnamed window'}\n"
                 "Approving lets the session re-plan from a fresh capture; "
                 "it does not replay this action."
             ),
             context=context,
-            # Wait for the owner — never auto-approve, never auto-drop. This
-            # holds only while DESKTOP_GATE_ACTION_TYPE is absent from the
-            # timeout tables (a null timeout is what makes expire_timed_out
-            # skip the row); test_desktop_gate pins that.
-            timeout_seconds=None,
+            # BOUNDED, and this was `None`. Never auto-APPROVED — an expiry
+            # resolves to `expired`, never to `approved` — but a hold that can
+            # never leave `pending` is a row nothing in the system can clear:
+            # the generic resolver refuses desktop rows, the batch approve
+            # excludes them, the voice resolvers allowlist around them, both
+            # dashboard surfaces filter them out, and `expire_timed_out` skips
+            # anything with a null `timeout_at`. That is every path.
+            #
+            # The consequence was not just unbounded growth. `list_pending` is
+            # oldest-first and the morning report RENDERS the oldest five, so a
+            # loop retrying one blocked click would permanently occupy the
+            # operator's daily report and push every real approval out of it.
+            #
+            # The grant TTL is the bound, and it is DELIBERATELY generous: the
+            # hold's clock starts now, while the grant's started at its
+            # resolved_at, so a hold always outlives its grant by that grant's
+            # already-elapsed age — up to a full TTL. An earlier version of this
+            # comment claimed the opposite ("can never outlive the grant"),
+            # which the arithmetic never produced. The generous bound is the
+            # better behaviour, because a hold raised one second before its
+            # grant lapses still leaves the operator a usable window to answer
+            # in; it is the unbounded row that was the defect, not this slack.
+            # Note this bounds a hold flood's DURATION, not its RATE — `_hold`
+            # has no dedup (see its docstring), so a retrying loop still keeps
+            # rows alive for as long as it runs. This does NOT put the action
+            # type in the timeout tables —
+            # test_desktop_action_type_has_no_configured_timeout still holds.
+            timeout_seconds=int(grant_ttl.total_seconds()),
         )
         await self._emit_held(classification, action.window_title, action.element_name)
         logger.info(
@@ -1007,6 +1138,22 @@ def _validate_call(
     except ValueError:
         return "unknown_operation"
 
+    # The TEXTUAL fields must actually be text. Every check below stringifies
+    # its input, so a JSON number arriving where a string was declared passes
+    # validation and then reaches `len()` inside the classifier as an int,
+    # raising TypeError out of `check()`. A malformed external payload has to
+    # fail CLOSED with a reason, not crash the loop — and this is the boundary
+    # that owns that, which is why it is here and not only in the classifier.
+    for field in ("window_handle", "window_nonce", "window_title",
+                  "element_name", "control_type", "key_chord", "text"):
+        # Default None, NOT "": with "" an object MISSING one of these
+        # attributes passes the type check and then hits AttributeError in
+        # `_bounded` — the crash this block exists to prevent. Unreachable
+        # while the caller is the frozen DesktopAction; reachable the moment
+        # PR-3 hands the gate an adapter or a duck-typed object.
+        if not isinstance(getattr(action, field, None), str):
+            return f"malformed_action:{field}"
+
     if not str(action.window_handle or "").strip():
         return "malformed_action:window_handle"
 
@@ -1035,8 +1182,17 @@ def _verdict(
     grant: SessionGrant | None,
     grant_reason: str,
     cell_state: CellState,
+    now: datetime,
+    grant_ttl: timedelta,
 ) -> tuple[bool, str]:
-    """The whole allow/hold/refuse policy, in ONE place. Pure.
+    """The whole allow/hold/refuse policy, in ONE place. PURE.
+
+    Pure in the strict sense: it reads no clock, no config and no database.
+    Every input arrives as an argument, ``now`` included. That is deliberate
+    and was briefly untrue — a liveness bar added here read
+    ``datetime.now(UTC)`` transitively, which is what left the one function
+    holding the entire policy with no direct test, reachable only through
+    ``check()``, a DB fixture and a real sleep.
 
     This function is the deliverable of the shadow/live de-duplication. Shadow
     used to recompute the live verdict by hand — three terms that had to be
@@ -1047,9 +1203,23 @@ def _verdict(
 
     ``"held"`` is a verdict, not an outcome — the caller decides whether that
     means writing an approval row (live) or simply reporting it (shadow).
+
+    LIVENESS IS CHECKED HERE, and that placement is the point. It was added on
+    the LIVE path only, outside this function — which re-forked the very policy
+    this function exists to unify, one commit after the de-duplication landed.
+    A shadow install would then have reported ``would_allow=True`` for a grant
+    that live refuses as expired: wrong, in the fail-open direction, on the one
+    bar whose job is to make a forgotten grant die on its own. Any bar added
+    outside this function re-creates that divergence, whatever its own merits.
     """
     if grant is None:
         return False, grant_reason
+    # Re-checked against the caller's `now`, which was taken BEFORE the awaited
+    # cell write. A grant with seconds left can lapse across that await, and
+    # the action would otherwise be authorized AND stamped with a fresh device
+    # TTL — extending an expired consent rather than ending it.
+    if not grant.is_live(grant_ttl, now=now):
+        return False, "grant_expired"
     if cell_state == CellState.DENIED_PERMANENT:
         return False, "denied_permanent"
     # `!=`, never `is not`: RiskClass is a StrEnum (see classification.py).
@@ -1069,8 +1239,13 @@ def _parse_ts(raw: object) -> datetime | None:
     """
     if not isinstance(raw, str) or not raw.strip():
         return None
+    # The NORMALIZATION is inside the try, not just the parse. A syntactically
+    # valid extreme-offset timestamp ("9999-12-31T23:59:59-23:59") parses fine
+    # and then raises OverflowError in astimezone — so one malformed approved
+    # row would crash every lookup for that session instead of being treated as
+    # the un-ageable grant it is.
     try:
         parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-    except ValueError:
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except (ValueError, OverflowError, OSError):
         return None
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)

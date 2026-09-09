@@ -225,15 +225,35 @@ class ActionClassifier:
             for k, v in timeouts.items():
                 if v is None:
                     parsed[str(k)] = None
-                else:
-                    try:
-                        parsed[str(k)] = int(v)
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Invalid timeout value %r for %r — skipping",
-                            v,
-                            k,
-                        )
+                    continue
+                # FOUR guards, matching `_coerce_pid` and `_positive_int`. The
+                # first pass here took only OverflowError — the least
+                # consequential of them — while claiming the class was
+                # enumerated. This is the widest site of the three: the
+                # classifier is shared with the email gate and is the default
+                # timeout source for EVERY approval type, so a bad value here
+                # reaches far more than one gate.
+                #
+                #   bool: `autonomous_cli_fallback: true` -> int(True) == 1, a
+                #     ONE-SECOND window on the owner's approval, expired by the
+                #     60s poller before any channel renders it.
+                #   non-integral float: int() TRUNCATES rather than refusing.
+                #   <= 0: a timeout already in the past, same outcome as bool.
+                #   OverflowError: `.inf` is valid YAML; unlike its sibling
+                #     this branch IS reachable, there being no float guard above
+                #     it that catches infinity first.
+                if isinstance(v, bool) or (isinstance(v, float) and not v.is_integer()):
+                    logger.warning("Invalid timeout value %r for %r — skipping", v, k)
+                    continue
+                try:
+                    seconds = int(v)
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning("Invalid timeout value %r for %r — skipping", v, k)
+                    continue
+                if seconds <= 0:
+                    logger.warning("Non-positive timeout %r for %r — skipping", v, k)
+                    continue
+                parsed[str(k)] = seconds
             self._approval_timeouts.update(parsed)
         elif timeouts is not None:
             logger.warning("approval_timeouts is not a mapping — using defaults")
@@ -902,8 +922,15 @@ _CLASSIFIER_FIELD_LIMIT = 8192
 
 
 def _bounded(value: str, field: str) -> str:
-    """Screen text, bounded for the classifier. Never silently."""
-    text = value or ""
+    """Screen text, bounded for the classifier. Never silently.
+
+    Coerces first. These fields come off an actuator payload, and a JSON number
+    arriving where a string was declared reached `len()` as an int and raised
+    TypeError out of the classifier. The gate refuses non-string metadata at its
+    boundary; this is the second layer, because the classifier is also called
+    directly by tests and by whatever comes after PR-3.
+    """
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
     if len(text) <= _CLASSIFIER_FIELD_LIMIT:
         return text
     logger.warning(

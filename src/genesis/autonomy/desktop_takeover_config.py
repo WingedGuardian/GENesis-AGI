@@ -287,9 +287,19 @@ def _positive_int(cfg: dict[str, Any], key: str) -> int:
     raw = cfg.get(key, DEFAULTS[key])
     if isinstance(raw, bool):  # bool is an int subclass; `true` is not a duration
         raw = None
+    # `.inf` is valid YAML and PyYAML yields a float infinity, on which `int()`
+    # raises OverflowError — not in this tuple before, so both TTL readers could
+    # crash a gate check instead of returning their documented safe default. And
+    # a non-integral float has to go before the conversion, because `int()`
+    # TRUNCATES rather than refusing: 30.9 minutes would silently become 30.
+    # The upper bound below cannot help with either, since it is only reached
+    # once the conversion has already succeeded.
+    if isinstance(raw, float) and not raw.is_integer():
+        logger.warning("desktop_takeover %s=%r is not a whole number — using default", key, raw)
+        return int(DEFAULTS[key])
     try:
         value = int(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         logger.warning("desktop_takeover %s=%r is not an integer — using default", key, raw)
         return int(DEFAULTS[key])
     if value <= 0:

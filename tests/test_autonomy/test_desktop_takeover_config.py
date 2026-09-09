@@ -335,3 +335,37 @@ def test_an_unrecognised_kill_switch_value_stops_the_capability(config_dirs, mon
     base.write_text("enabled: true\nmode: live\nlive_opt_in: true\n")
     monkeypatch.setenv(dtc.DISABLE_ENV, "maybe")
     assert dtc.effective_mode() == "off"
+
+
+def test_a_non_finite_ttl_falls_back_rather_than_crashing(config_dirs):
+    """`.inf` is valid YAML and PyYAML yields a float infinity, on which `int()`
+    raises OverflowError — which was not in the handler's tuple, so BOTH TTL
+    readers could crash a gate check instead of returning their documented safe
+    default. The upper bound added last round cannot help: it is only reached
+    once the conversion has already succeeded.
+
+    Same class as the pid and timestamp coercions elsewhere in this change —
+    found by enumerating every `int()` over an external value, after the
+    previous round patched one member and left the rest."""
+    base, _ = config_dirs
+    base.write_text("grant_ttl_minutes: .inf\naction_ttl_seconds: -.inf\n")
+    assert dtc.grant_ttl_minutes() == dtc.DEFAULTS["grant_ttl_minutes"]
+    assert dtc.action_ttl_seconds() == dtc.DEFAULTS["action_ttl_seconds"]
+
+    base.write_text("grant_ttl_minutes: .nan\naction_ttl_seconds: .nan\n")
+    assert dtc.grant_ttl_minutes() == dtc.DEFAULTS["grant_ttl_minutes"]
+    assert dtc.action_ttl_seconds() == dtc.DEFAULTS["action_ttl_seconds"]
+
+
+def test_a_fractional_ttl_is_refused_rather_than_truncated(config_dirs):
+    """`int()` TRUNCATES, so 30.9 minutes would silently become 30 — a duration
+    the operator did not write, from a value that was malformed."""
+    base, _ = config_dirs
+    base.write_text("grant_ttl_minutes: 30.9\naction_ttl_seconds: 45.5\n")
+    assert dtc.grant_ttl_minutes() == dtc.DEFAULTS["grant_ttl_minutes"]
+    assert dtc.action_ttl_seconds() == dtc.DEFAULTS["action_ttl_seconds"]
+
+    # The control: an integral float is a legitimate spelling of a duration.
+    base.write_text("grant_ttl_minutes: 45.0\naction_ttl_seconds: 20.0\n")
+    assert dtc.grant_ttl_minutes() == 45
+    assert dtc.action_ttl_seconds() == 20

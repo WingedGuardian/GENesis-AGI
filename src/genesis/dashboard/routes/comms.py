@@ -192,7 +192,10 @@ async def unified_comms():
         # ENUMERATION, so a new surface that forgets it re-opens the path and
         # no allowlist catches that. The other readers are safe for their own
         # reasons — `hydrate_delivery_map` matches on a `delivery_id` a desktop
-        # row does not carry, and the morning report counts rather than offers.
+        # row does not carry. The morning report is NOT one of them: it renders
+        # the oldest five descriptions, not just a count. It offers no button,
+        # so it is not an approval surface — but the row's own lifetime is what
+        # bounds it there, which is why desktop holds now carry a TTL.
         pending_approvals = [
             r for r in pending_approvals
             if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE

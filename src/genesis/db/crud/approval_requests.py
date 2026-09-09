@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 
 # ── Resolver-origin classification ───────────────────────────────────────────
@@ -277,16 +279,31 @@ async def find_approved_unconsumed(
     Used by the resume mechanism: when an approval is granted (via Telegram
     or dashboard), the blocked action can resume on the next tick.
     """
+    # The cutoff is computed in PYTHON, not as datetime('now','-24 hours').
+    # `resolved_at` is written by `ApprovalManager.resolve` as
+    # `datetime.now(UTC).isoformat()` -> "2026-09-08T05:22:44.814096+00:00",
+    # while SQLite renders its own threshold as "2026-09-08 21:22:44". The
+    # comparison is lexicographic, and 'T' (0x54) > ' ' (0x20), so ANY row
+    # sharing the threshold's DATE compared greater regardless of its time —
+    # MEASURED: a 40-hour-old approval passed a window documented as 24 hours
+    # (a 70-hour-old one did not, so the window stretched to ~48h rather than
+    # opening entirely). Fail-open on a staleness guard. Binding a Python-side
+    # ISO cutoff puts both sides in the writer's format; the same fix is
+    # recorded at observations.py:733, and approval_gate.py:616-624 already
+    # does this comparison correctly in Python.
+    cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
     cursor = await db.execute(
         """SELECT * FROM approval_requests
            WHERE status = 'approved'
              AND consumed_at IS NULL
-             AND json_extract(context, '$.subsystem') = ?
-             AND json_extract(context, '$.policy_id') = ?
-             AND resolved_at > datetime('now', '-24 hours')
+             AND (CASE WHEN json_valid(context)
+                       THEN json_extract(context, '$.subsystem') END) = ?
+             AND (CASE WHEN json_valid(context)
+                       THEN json_extract(context, '$.policy_id') END) = ?
+             AND resolved_at > ?
            ORDER BY resolved_at DESC
            LIMIT 1""",
-        (subsystem, policy_id),
+        (subsystem, policy_id, cutoff),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None

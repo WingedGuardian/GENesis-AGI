@@ -16,13 +16,17 @@ import pytest
 
 from genesis.autonomy import desktop_gate as dg
 from genesis.autonomy.approval import ApprovalManager
-from genesis.autonomy.classification import DesktopAction, DesktopOperation
+from genesis.autonomy.classification import (
+    DesktopAction,
+    DesktopActionClassification,
+    DesktopOperation,
+)
 from genesis.autonomy.desktop_gate import (
     DESKTOP_GATE_ACTION_TYPE,
     DesktopTakeoverGate,
     build_session_grant_context,
 )
-from genesis.autonomy.types import CellEvent, CellState
+from genesis.autonomy.types import ActionClass, CellEvent, CellState, RiskClass
 from genesis.db.crud import approval_requests as ar
 from genesis.db.crud import capability_grants as cg
 from genesis.db.schema import create_all_tables
@@ -763,12 +767,28 @@ async def test_a_hold_queues_nothing_resumable(db, live):
     )
     row = await ar.get_by_id(db, decision.request_id)
     assert row["action_type"] == DESKTOP_GATE_ACTION_TYPE
-    # A held desktop action waits forever for the owner — never auto-approved,
-    # never auto-dropped. expire_timed_out skips NULL timeout_at rows.
-    assert row["timeout_at"] is None
+
+    # The invariant is NEVER AUTO-APPROVED, which is not the same as never
+    # expiring — and this test used to assert the second, by pinning
+    # `timeout_at is None`. That made the row immortal: every resolution path
+    # refuses or excludes desktop rows, and `expire_timed_out` skips a null
+    # timeout, so nothing in the system could move it out of `pending`. Since
+    # `list_pending` is oldest-first and the morning report renders the oldest
+    # five, a retrying loop would have occupied the operator's daily report
+    # permanently.
+    assert row["timeout_at"] is not None, "a hold must be able to lapse"
+
     n = await ar.expire_timed_out(db, now=(datetime.now(UTC) + timedelta(days=365)).isoformat())
-    assert n == 0
-    assert (await ar.get_by_id(db, decision.request_id))["status"] == "pending"
+    assert n == 1
+    lapsed = await ar.get_by_id(db, decision.request_id)
+    assert lapsed["status"] == "expired", "lapsed, NOT approved — the safety half"
+    assert lapsed["status"] != "approved"
+
+    # And the original point still holds: nothing was queued for replay.
+    assert decision.request_id is not None
+    assert await ar.find_approved_unconsumed(
+        db, subsystem="desktop", policy_id="whatever"
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -1152,6 +1172,10 @@ def test_desktop_action_type_has_no_configured_timeout():
     )
 
     assert DESKTOP_GATE_ACTION_TYPE not in _DEFAULT_APPROVAL_TIMEOUTS
+    # BOTH tables, as the docstring says. `get_timeout` is a `dict.get`, so it
+    # returns None for "banana" too — asserting it alone cannot tell absent from
+    # present-with-an-explicit-null, which is the distinction being claimed.
+    assert DESKTOP_GATE_ACTION_TYPE not in ActionClassifier()._approval_timeouts
     assert ActionClassifier().get_timeout(DESKTOP_GATE_ACTION_TYPE) is None
 
 
@@ -1281,6 +1305,12 @@ async def test_a_nonpositive_process_id_is_refused(db, live):
     [
         "granted_standard", "granted_identity", "granted_financial",
         "no_grant", "wrong_window", "wrong_mission", "denied_cell",
+        # The scenario that caught a REAL divergence: a liveness bar was added
+        # on the live path only, outside `_verdict`. Every case above uses a
+        # fresh grant, so all seven agreed while shadow reported would_allow on
+        # a grant live refused as expired. A parity test whose scenarios never
+        # exercise a bar cannot see that bar being forked.
+        "lapsed_during_authorization",
     ],
 )
 async def test_shadow_reports_exactly_what_live_decides(db, monkeypatch, scenario):
@@ -1307,6 +1337,24 @@ async def test_shadow_reports_exactly_what_live_decides(db, monkeypatch, scenari
         kw["window_handle"] = "0xNOPE"
     elif scenario == "wrong_mission":
         kw["mission_id"] = "mis-other"
+    elif scenario == "lapsed_during_authorization":
+        # ~0.8s of life against a 1-minute TTL, expired by a slow cell write.
+        monkeypatch.setattr(dg, "grant_ttl_minutes", lambda: 1)
+        await db.execute(
+            "UPDATE approval_requests SET resolved_at = ? WHERE action_type = ?",
+            ((datetime.now(UTC) - timedelta(seconds=59.2)).isoformat(),
+             DESKTOP_GATE_ACTION_TYPE),
+        )
+        await db.commit()
+        real_cc = dg.DesktopTakeoverGate._classify_cell
+
+        async def _slow(self, domain, verb, risk, now):
+            import asyncio
+
+            await asyncio.sleep(1.5)
+            return await real_cc(self, domain, verb, risk, now)
+
+        monkeypatch.setattr(dg.DesktopTakeoverGate, "_classify_cell", _slow)
     elif scenario == "denied_cell":
         # CLASSIFY first: DENY_PERMANENT is illegal from NOT_DETERMINED, so a
         # cell has to exist before the owner can stand on it.
@@ -1322,9 +1370,14 @@ async def test_shadow_reports_exactly_what_live_decides(db, monkeypatch, scenari
     monkeypatch.setattr(dg, "effective_mode", lambda: "live")
     live_d = await _check(db, **kw)
 
-    assert shadow_d.would_allow == live_d.allow, (
+    # BOTH halves. Comparing only the boolean samples the policy rather than
+    # pinning it: every non-allow outcome collapses to False, so a bar added on
+    # one path that turns an allow into a HOLD rather than a REFUSAL — the same
+    # fork this test exists to catch, one notch over — would read as agreement.
+    assert (shadow_d.would_allow, shadow_d.would_reason) == (live_d.allow, live_d.reason), (
         f"{scenario}: shadow says would_allow={shadow_d.would_allow} "
-        f"but live decided allow={live_d.allow} ({live_d.reason})"
+        f"({shadow_d.would_reason!r}) but live decided allow={live_d.allow} "
+        f"({live_d.reason!r})"
     )
 
 
@@ -1630,7 +1683,12 @@ def test_desktop_rows_never_reach_the_unified_comms_feed():
     `approval_requests.list_pending` rather than by fixing the one that was
     reported. The other readers are safe for their own reasons:
     `hydrate_delivery_map` matches on a `delivery_id` a desktop row does not
-    carry, and the morning report counts rather than offers.
+    carry. The morning report is NOT one of them — it renders the oldest five
+    descriptions, not just a count. It offers no button, so it is not an
+    approval surface; but "it only counts" was WRONG, and the correction is
+    recorded here as well as in the code, because a false claim in permanent
+    record is what the next reader builds on. What bounds it there is the row's
+    own lifetime, which is why desktop holds now carry a TTL.
 
     Same hazard as the approvals queue: the feed renders a pending row as a
     generic approval card, and a card that cannot say it is handing over the
@@ -1802,3 +1860,412 @@ async def test_a_stored_grant_with_a_non_finite_pid_does_not_crash_lookup(db, li
     d = await _check(db, element_name="Text Area", control_type="Edit")
     assert d.allow is False
     assert d.reason == "grant_malformed", "refused, not raised"
+
+
+# ═══════════ _verdict, directly — the policy with nothing around it ═══════════
+#
+# `_verdict` holds the ENTIRE allow/hold/refuse policy and had no direct test:
+# every assertion about it arrived through check(), a DB fixture and the real
+# clock. That is why its liveness bar could only be tested with a sleep, and why
+# that test can go quiet on a loaded box (see the vacuity guard above).
+#
+# It is pure — no clock, no config, no DB — so the whole policy is a table.
+
+
+def _classification(risk: RiskClass, *, is_password: bool = False):
+    return DesktopActionClassification(
+        domain="desktop", verb="control", risk_class=risk,
+        sub_class="input", is_password=is_password,
+        identity_bar=risk is not RiskClass.STANDARD,
+        action_class=ActionClass.REVERSIBLE,
+    )
+
+
+def _grant_resolved_at(dt):
+    return dg.SessionGrant(
+        row_id="r1", session_id="s1", mission_id="m1", window_handle="0xA1",
+        process_id=4312, window_nonce="n1", window_title="W",
+        mission="do a thing", resolved_by="telegram:owner", resolved_at=dt,
+    )
+
+
+_T0 = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+_TTL = timedelta(minutes=30)
+
+
+@pytest.mark.parametrize(
+    ("label", "grant", "grant_reason", "cell_state", "risk", "now", "expected"),
+    [
+        ("no grant refuses with the selection reason",
+         None, "no_session_grant", CellState.NOT_DETERMINED, RiskClass.STANDARD, _T0,
+         (False, "no_session_grant")),
+        ("a live grant on a STANDARD action allows",
+         _grant_resolved_at(_T0), "", CellState.NOT_DETERMINED, RiskClass.STANDARD, _T0,
+         (True, "session_grant")),
+        ("expired by one second refuses",
+         _grant_resolved_at(_T0), "", CellState.NOT_DETERMINED, RiskClass.STANDARD,
+         _T0 + _TTL + timedelta(seconds=1), (False, "grant_expired")),
+        ("exactly at the TTL is still live — the bound is inclusive",
+         _grant_resolved_at(_T0), "", CellState.NOT_DETERMINED, RiskClass.STANDARD,
+         _T0 + _TTL, (True, "session_grant")),
+        ("a future-dated grant refuses, never mints a permanent one",
+         _grant_resolved_at(_T0), "", CellState.NOT_DETERMINED, RiskClass.STANDARD,
+         _T0 - timedelta(seconds=1), (False, "grant_expired")),
+        ("an un-ageable grant is treated as expired",
+         _grant_resolved_at(None), "", CellState.NOT_DETERMINED, RiskClass.STANDARD, _T0,
+         (False, "grant_expired")),
+        ("DENIED_PERMANENT outranks a live grant",
+         _grant_resolved_at(_T0), "", CellState.DENIED_PERMANENT, RiskClass.STANDARD, _T0,
+         (False, "denied_permanent")),
+        ("above STANDARD holds even under a live grant",
+         _grant_resolved_at(_T0), "", CellState.NOT_DETERMINED, RiskClass.IDENTITY, _T0,
+         (False, "held")),
+        ("financial holds too",
+         _grant_resolved_at(_T0), "", CellState.NOT_DETERMINED, RiskClass.FINANCIAL, _T0,
+         (False, "held")),
+        # ORDER matters: an expired grant on a DENIED cell must name the grant,
+        # because liveness is checked before the cell. Pins the sequence, not
+        # just the set, of bars.
+        ("expiry is reported before the cell verdict",
+         _grant_resolved_at(_T0), "", CellState.DENIED_PERMANENT, RiskClass.STANDARD,
+         _T0 + _TTL + timedelta(seconds=1), (False, "grant_expired")),
+    ],
+)
+def test_verdict_is_a_pure_table(label, grant, grant_reason, cell_state, risk, now, expected):
+    """The whole policy, with no DB, no sleep and no race.
+
+    This is the guard the liveness fix actually needs: the integration test for
+    it depends on wall clock and can therefore stop testing without failing.
+    This one cannot."""
+    assert dg._verdict(
+        classification=_classification(risk), grant=grant, grant_reason=grant_reason,
+        cell_state=cell_state, now=now, grant_ttl=_TTL,
+    ) == expected, label
+
+
+def test_verdict_reads_no_clock_of_its_own():
+    """Purity, asserted rather than documented. The same inputs must give the
+    same answer regardless of when it is called — which is what makes the table
+    above meaningful, and what a re-added `datetime.now()` inside `_verdict`
+    would silently break."""
+    kw = dict(
+        classification=_classification(RiskClass.STANDARD),
+        grant=_grant_resolved_at(_T0), grant_reason="",
+        cell_state=CellState.NOT_DETERMINED, grant_ttl=_TTL,
+    )
+    # A `now` far in the past and far in the future, both outside the TTL.
+    assert dg._verdict(now=_T0 - timedelta(days=365), **kw) == (False, "grant_expired")
+    assert dg._verdict(now=_T0 + timedelta(days=365), **kw) == (False, "grant_expired")
+    # And inside it, twice, with real time passing between the calls.
+    assert dg._verdict(now=_T0, **kw) == (True, "session_grant")
+    assert dg._verdict(now=_T0, **kw) == (True, "session_grant")
+
+
+# ═══ Codex round 5 — ONE class, enumerated rather than patched instance-wise ═══
+#
+# Three of the four findings were the same shape: an externally-supplied value
+# coerced with a guard that does not cover every way the coercion fails. The pid
+# fix in the previous round closed ONE member and I did not enumerate the rest,
+# which is why this round found more. Enumerating `int(` / `len(` / datetime
+# conversion across the three files found SIX members — two of which were not
+# reported, and are covered below.
+
+
+@pytest.mark.asyncio
+async def test_a_grant_that_lapses_during_authorization_does_not_authorize(db, live, monkeypatch):
+    """`_classify_cell` is a SQLite write between selecting the grant and acting
+    on it. A grant with seconds left can lapse across that await, after which
+    the action would still be allowed AND stamped with a fresh device TTL —
+    extending an expired consent rather than ending it. Small window,
+    fail-OPEN direction, which is the combination that does not announce
+    itself."""
+    import asyncio
+
+    # A ONE-MINUTE TTL and a grant with ~0.8s of life left, so real elapsed time
+    # is what expires it. Mutating the stored row would not work: `resolved_at`
+    # is read into the frozen SessionGrant at parse time, so the re-check would
+    # compare the clock against the same value it already saw. The thing under
+    # test is the CLOCK moving, so the clock has to move.
+    monkeypatch.setattr(dg, "grant_ttl_minutes", lambda: 1)
+    rid = await _grant(db)
+    await db.execute(
+        "UPDATE approval_requests SET resolved_at = ? WHERE id = ?",
+        ((datetime.now(UTC) - timedelta(seconds=59.2)).isoformat(), rid),
+    )
+    await db.commit()
+
+    real = dg.DesktopTakeoverGate._classify_cell
+
+    async def _slow(self, domain, verb, risk, now):
+        # A slow SQLite write. Bounded and short; it is the elapsed time itself
+        # that is under test, not a condition to poll for.
+        await asyncio.sleep(1.5)
+        return await real(self, domain, verb, risk, now)
+
+    monkeypatch.setattr(dg.DesktopTakeoverGate, "_classify_cell", _slow)
+
+    # This test depends on ~0.8s of real time NOT elapsing before the grant is
+    # selected. If it does, the grant is already expired at SELECTION, the
+    # re-check under test is never reached, and every assertion below still
+    # holds — the test would go quiet while the mechanism was gone. So record
+    # what `is_live` actually saw and fail LOUDLY on that instead.
+    calls: list[bool] = []
+    real_is_live = dg.SessionGrant.is_live
+
+    def _recording(self, ttl, *, now=None):
+        result = real_is_live(self, ttl, now=now)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(dg.SessionGrant, "is_live", _recording)
+
+    d = await _check(db, element_name="Text Area", control_type="Edit")
+
+    assert calls, "is_live was never called — the grant never reached a liveness bar"
+    assert calls[0] is True, (
+        "VACUOUS: the grant had already expired at SELECTION, so the re-check "
+        "under test never ran. This is a slow/contended box, not a regression — "
+        "but the assertions below would have passed with the mechanism deleted."
+    )
+    assert len(calls) >= 2, "the re-check inside _verdict was never reached"
+    assert calls[-1] is False, "the re-check should have found the grant expired"
+
+    assert d.allow is False, "an expired grant must not authorize, however it expired"
+    assert d.reason == "grant_expired"
+    assert d.expires_at is None, "and must not receive a fresh device TTL"
+
+
+def test_an_extreme_offset_timestamp_is_unageable_not_a_crash():
+    """`datetime.fromisoformat` accepts "9999-12-31T23:59:59-23:59" and
+    `astimezone(UTC)` then raises OverflowError. `_parse_ts` caught only the
+    PARSE-time ValueError, so one malformed approved row would take down every
+    lookup for that session instead of being the un-ageable grant it is."""
+    assert dg._parse_ts("9999-12-31T23:59:59-23:59") is None
+    assert dg._parse_ts("0001-01-01T00:00:00+23:59") is None
+    # Controls: ordinary timestamps still parse, in both spellings.
+    assert dg._parse_ts("2026-06-21T00:00:00+00:00") is not None
+    assert dg._parse_ts("2026-06-21T00:00:00Z") is not None
+    assert dg._parse_ts("2026-06-21T00:00:00") is not None  # naive -> UTC
+
+
+@pytest.mark.asyncio
+async def test_non_string_screen_metadata_is_refused_not_raised(db, live):
+    """Every validation check stringifies its input, so a JSON number arriving
+    where a string was declared passed validation and then hit `len()` inside
+    the classifier as an int. A malformed external payload must fail CLOSED with
+    a reason, not crash the loop."""
+    await _grant(db)
+    for field in ("window_title", "element_name", "control_type", "text",
+                  "window_handle", "window_nonce", "key_chord"):
+        d = await _check(db, **{field: 12345})
+        assert d.allow is False, field
+        assert d.reason == f"malformed_action:{field}", field
+
+
+def test_the_display_and_classifier_helpers_survive_a_non_string():
+    """The second layer, and the two members of this class that were NOT
+    reported. `_display` feeds the consent card a human reads, and reached
+    `strip_control_chars` as an int; `_bounded` reached `len()` the same way.
+    Both are reachable from tests and from whatever calls the classifier after
+    PR-3, so neither relies on the gate boundary alone."""
+    assert dg._display(12345) == "12345"
+    assert dg._display(None) == ""
+    from genesis.autonomy.classification import _bounded
+
+    assert _bounded(12345, "element_name") == "12345"
+    assert _bounded(None, "element_name") == ""
+
+
+# ═══ fresh-context audit: the hold blob is a forward commitment to PR-3 ═══
+
+
+@pytest.mark.asyncio
+async def test_the_hold_blob_is_versioned_normalized_and_complete(db, live):
+    """The hold context is written NOW for a reader that lands with the consent
+    path, which makes it a forward-compatibility commitment. Three things it
+    was missing, each the same defect this PR closed elsewhere:
+
+    VERSION — the grant blob refuses an unknown version precisely so a field
+    cannot be carried without being compared. The hold blob had none, so the
+    future reader would have no way to refuse a blob whose meanings it did not
+    establish.
+
+    NORMALIZATION — the read side strips and coerces (see SessionGrant.parse and
+    .mismatch), because `4312 == "4312"` is False and fail-closed-but-
+    undiagnosable. The write side stored the raw caller value, handing that same
+    mismatch to whoever binds on these rows.
+
+    COMPLETENESS — for a KEY action there is no element name, so without the
+    chord neither the card nor any later reader can say what is being held."""
+    import json
+
+    # The grant carries the CANONICAL identity; the action carries the padded,
+    # stringified spelling an actuator would actually hand back. They must match
+    # (the read side normalizes both), so the hold is reached and its blob can
+    # be inspected.
+    await _grant(db, window_handle="0xPAD", process_id=4312, window_nonce="n-pad")
+    d = await _check(
+        db, operation=DesktopOperation.KEY, key_chord="ctrl+enter",
+        element_name="", control_type="",
+        window_handle="  0xPAD  ", process_id="4312", window_nonce="  n-pad  ",
+    )
+    assert d.reason == "held" and d.request_id
+
+    row = await ar.get_by_id(db, d.request_id)
+    ctx = json.loads(row["context"])
+
+    assert ctx["version"] == dg.DESKTOP_HOLD_VERSION
+    assert ctx["window_handle"] == "0xPAD", "stored as it will be compared"
+    assert ctx["process_id"] == 4312, "an int, not the string the caller sent"
+    assert ctx["window_nonce"] == "n-pad"
+    assert ctx["key_chord"] == "ctrl+enter", "the thing that caused the hold"
+    assert "control_type" in ctx
+    # ONE fact, ONE name. The risk class is already `cell[2]` (cell_key is
+    # literally (domain, verb, str(risk_class))), and a separate "risk_class"
+    # key carried the identical string. In a VERSIONED blob a future reader
+    # will compare, two spellings of one fact is how a later writer makes them
+    # disagree — the same reasoning that put a version on this blob.
+    assert ctx["cell"] == ["desktop", "control", "identity"]
+    assert "risk_class" not in ctx, "dropped as a duplicate of cell[2]"
+
+    # And the card can name it, which it could not before: a KEY action has no
+    # element name, so the card said "an unnamed control" and stopped.
+    assert "Key: ctrl+enter" in row["description"]
+
+
+@pytest.mark.asyncio
+async def test_one_malformed_row_does_not_break_the_resume_lookup(db):
+    """`find_approved_unconsumed` had the bare `json_extract` this PR's own new
+    query documents as measured-fatal, 60 lines away in the same file: an
+    unguarded extract raises "malformed JSON" on ONE invalid row and takes the
+    whole query with it.
+
+    That query is the awareness loop's resume path, so the same corrupt row that
+    would have broken the desktop lookup also broke reflection resume. The class
+    was identified, measured and guarded in one member while its only sibling
+    sat unfixed in the file being edited."""
+    mgr = ApprovalManager(db=db)
+    rid = await mgr.request_approval(
+        action_type="reflection_resume", action_class="reversible",
+        description="resume", context='{"subsystem": "awareness", "policy_id": "p1"}',
+        timeout_seconds=None,
+    )
+    await mgr.resolve(rid, status="approved", resolved_by="telegram:1")
+    # A hand-edited / corrupted sibling row, which is all it takes.
+    await db.execute(
+        "INSERT INTO approval_requests (id, action_type, action_class, description,"
+        " context, status, created_at) VALUES (?,?,?,?,?,?,?)",
+        ("broken", "other", "reversible", "d", "{not json", "approved", _TS),
+    )
+    await db.commit()
+
+    found = await ar.find_approved_unconsumed(db, subsystem="awareness", policy_id="p1")
+    assert found is not None, "one malformed row must not take down the lookup"
+    assert found["id"] == rid
+
+
+@pytest.mark.asyncio
+async def test_the_resume_lookups_24_hour_window_is_actually_24_hours(db):
+    """MEASURED, and it was ~48. `resolved_at` is written by Python as
+    "2026-09-08T05:22:44.814096+00:00"; `datetime('now','-24 hours')` renders as
+    "2026-09-08 21:22:44". The comparison is lexicographic and 'T' (0x54) beats
+    ' ' (0x20), so ANY row sharing the threshold's DATE compared greater no
+    matter its time of day — a 40-hour-old approval passed a window documented
+    as 24 hours, while a 70-hour-old one did not.
+
+    Fail-OPEN on a staleness guard, on the awareness loop's resume path.
+    Pre-existing; found while auditing the predicate this PR rewrote."""
+    mgr = ApprovalManager(db=db)
+
+    async def _aged(hours: float, policy: str) -> str:
+        rid = await mgr.request_approval(
+            action_type="reflection_resume", action_class="reversible",
+            description="resume", timeout_seconds=None,
+            context=f'{{"subsystem": "awareness", "policy_id": "{policy}"}}',
+        )
+        await mgr.resolve(rid, status="approved", resolved_by="telegram:1")
+        await db.execute(
+            "UPDATE approval_requests SET resolved_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(hours=hours)).isoformat(), rid),
+        )
+        await db.commit()
+        return rid
+
+    fresh = await _aged(2, "fresh")
+    await _aged(40, "stale40")   # the case that used to pass
+    await _aged(70, "stale70")   # excluded even before, by the DATE differing
+
+    assert (await ar.find_approved_unconsumed(
+        db, subsystem="awareness", policy_id="fresh"))["id"] == fresh, (
+        "a 2-hour-old approval is inside the window and must still resume")
+    assert await ar.find_approved_unconsumed(
+        db, subsystem="awareness", policy_id="stale40") is None, (
+        "a 40-hour-old approval is outside a 24-hour window")
+    assert await ar.find_approved_unconsumed(
+        db, subsystem="awareness", policy_id="stale70") is None
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_row_does_not_break_the_cli_approval_probe(db):
+    """The third member of the class, and the reason the enumeration was
+    re-scoped: `json_extract` over `approval_requests.context` is a COLUMN-level
+    class, not a file-level one. Guarding the two queries in
+    `approval_requests.py` left `ego.has_pending_cli_approval` — the probe the
+    ego cadence uses to ask whether an autonomous-CLI approval is already
+    pending — reading the same column unguarded."""
+    from genesis.db.crud import ego as ego_crud
+
+    mgr = ApprovalManager(db=db)
+    rid = await mgr.request_approval(
+        action_type="autonomous_cli_fallback", action_class="reversible",
+        description="dispatch", timeout_seconds=None,
+        context='{"policy_id": "cadence-1"}',
+    )
+    assert rid
+    await db.execute(
+        "INSERT INTO approval_requests (id, action_type, action_class, description,"
+        " context, status, created_at) VALUES (?,?,?,?,?,?,?)",
+        ("broken-cli", "autonomous_cli_fallback", "reversible", "d",
+         "{not json", "pending", _TS),
+    )
+    await db.commit()
+
+    assert await ego_crud.has_pending_cli_approval(db, "cadence-1") is True
+    assert await ego_crud.has_pending_cli_approval(db, "no-such-policy") is False
+
+
+@pytest.mark.asyncio
+async def test_an_object_MISSING_a_textual_field_is_refused_not_crashed(db, live):
+    """The type loop defaulted `getattr(action, field, "")`, so an object with
+    the attribute ABSENT satisfied `isinstance(..., str)` and sailed through —
+    then hit `_bounded(action.text)` and raised AttributeError out of `check()`.
+    That is the exact crash the block's own comment forbids, re-opened for one
+    input shape by the default it was given.
+
+    Unreachable while the caller is the frozen `DesktopAction`, which always has
+    all ten fields. It becomes reachable the moment PR-3 hands the gate an
+    adapter or a duck-typed object — the same reasoning that justified the
+    second coercion layer inside `_bounded`."""
+    await _grant(db)
+
+    class _PartialAction:
+        """Everything a DesktopAction has, except `text`."""
+
+        operation = DesktopOperation.CLICK
+        window_handle = "0xAAA1"
+        process_id = 4312
+        window_nonce = "nonce-1"
+        window_title = "Untitled - Notepad"
+        element_name = "Save"
+        control_type = "Button"
+        key_chord = ""
+        is_password = False
+
+    gate = DesktopTakeoverGate(db=db, approval_manager=ApprovalManager(db=db))
+    d = await gate.check(_PartialAction(), session_id=_SESSION, mission_id=_MISSION_ID)
+
+    assert d.allow is False
+    assert d.reason == "malformed_action:text", (
+        "a missing field must be REFUSED with a reason, not crash the loop"
+    )
+    assert d.request_id is None, "a refusal must not queue an approval row"
