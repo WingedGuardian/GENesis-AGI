@@ -29,4 +29,14 @@ jobs:
           # An unlabelled pull request is a missing annotation, not a broken
           # build: this workflow is deliberately NOT among the required checks,
           # and a failure here must never be able to block a merge.
-          sync-labels: true
+          #
+          # ADD-ONLY. `sync-labels: true` also REMOVES a managed label when its
+          # globs stop matching, and the labels this file manages are ordinary
+          # names a person may apply by hand — `documentation` most obviously.
+          # Stripping a human's label to keep a machine's annotation tidy is a
+          # side effect nobody asked for, and this file's whole premise is that
+          # the labels decide nothing. A stale label is cosmetic; a deleted one
+          # destroys intent. (Measured 2026-09-09: no open PR carries any label
+          # this config manages, so nothing is stripped TODAY — the setting is
+          # about the first time someone does.)
+          sync-labels: false
