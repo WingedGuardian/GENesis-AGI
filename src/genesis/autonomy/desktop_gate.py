@@ -23,7 +23,7 @@ Four properties are load-bearing, each independently tested:
 2. **Authority is per SESSION, MISSION and WINDOW, and must arrive from OUTSIDE
    this box.** A grant is an approved, unconsumed ``approval_requests`` row
    carrying this session's id, this mission's id, the target window's
-   ``(handle, pid)`` and this module's ``kind``, resolved through
+   ``(handle, pid, lifetime nonce)`` and this module's ``kind``, resolved through
    :data:`DESKTOP_GRANT_RESOLVER_PREFIXES`.
 
    Every one of those is COMPARED, which is the point. The grant previously
@@ -31,8 +31,12 @@ Four properties are load-bearing, each independently tested:
    both called "New Tab" shared one grant, a renamed document stopped matching
    its own window, and consent given for one mission covered any later one. A
    field carried and not compared is a promise the consent card makes and the
-   code does not keep. That set is deliberately narrower
-   than ``classify_resolver``'s "human" class: `dashboard` is stamped by a route
+   code does not keep. The nonce is there because `(handle, pid)` repeats that
+   mistake on the TIME axis rather than the space one: a recycled HWND in a
+   still-live process is a different window wearing the same identity.
+
+   The RESOLVER set is deliberately narrower than ``classify_resolver``'s
+   "human" class: `dashboard` is stamped by a route
    any local process can reach with the internal token, and `user` is just a
    default. Neither proves a person acted, so neither can mint a grant here.
    A foreground CC conversation cannot mint one either — which is the point.
@@ -167,7 +171,7 @@ DESKTOP_HOLD_KIND = "desktop_action_hold"
 #: consent path is a blob whose field meanings are not established — reading it
 #: optimistically is how a field gets carried without being compared, which is
 #: the defect class this whole rewrite exists to close.
-SESSION_GRANT_VERSION = 1
+SESSION_GRANT_VERSION = 2
 
 #: Resolver prefixes that may mint a desktop SESSION GRANT. A deliberate
 #: narrowing of :data:`HUMAN_RESOLVER_PREFIXES`, not a reuse of it.
@@ -257,6 +261,7 @@ def build_session_grant_context(
     mission: str,
     window_handle: str,
     process_id: int,
+    window_nonce: str,
     window_title: str,
 ) -> dict[str, object]:
     """The ``context`` payload of a desktop session-grant approval row.
@@ -290,6 +295,7 @@ def build_session_grant_context(
         "mission": mission,
         "window_handle": window_handle,
         "process_id": process_id,
+        "window_nonce": window_nonce,
         "window_title": window_title,
     }
 
@@ -310,6 +316,7 @@ class SessionGrant:
     mission_id: str
     window_handle: str
     process_id: int
+    window_nonce: str
     window_title: str
     mission: str
     resolved_by: str
@@ -362,24 +369,19 @@ class SessionGrant:
 
         # `bool` is an int subclass, so `process_id: true` would otherwise
         # become pid 1 — a real pid on every Linux box.
-        raw_pid = ctx.get("process_id")
-        if isinstance(raw_pid, bool):
-            return None
-        try:
-            process_id = int(raw_pid)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
-        if process_id <= 0:
+        process_id = _coerce_pid(ctx.get("process_id"))
+        if process_id is None:
             return None
 
         session_id = str(ctx.get("session_id") or "").strip()
         mission_id = str(ctx.get("mission_id") or "").strip()
         window_handle = str(ctx.get("window_handle") or "").strip()
+        window_nonce = str(ctx.get("window_nonce") or "").strip()
         # Blank is a REFUSAL, never a wildcard. In SQLite `'' = ''` is true, so
         # a grant with an empty session id authorises a caller with an empty
         # session id — the shape that looks safe because an ABSENT key extracts
         # NULL and never matches anything.
-        if not (session_id and mission_id and window_handle):
+        if not (session_id and mission_id and window_handle and window_nonce):
             return None
 
         return cls(
@@ -388,6 +390,7 @@ class SessionGrant:
             mission_id=mission_id,
             window_handle=window_handle,
             process_id=process_id,
+            window_nonce=window_nonce,
             window_title=str(ctx.get("window_title") or ""),
             mission=str(ctx.get("mission") or ""),
             resolved_by=str(row.get("resolved_by") or ""),
@@ -433,7 +436,11 @@ class SessionGrant:
             return "grant_mission_mismatch"
         if self.window_handle != str(action.window_handle or "").strip():
             return "grant_window_mismatch"
-        if self.process_id != int(action.process_id):
+        if self.process_id != _coerce_pid(action.process_id):
+            return "grant_window_mismatch"
+        # The lifetime half of window identity. Without it the two bars
+        # above identify a handle SLOT, not the window that occupies it.
+        if self.window_nonce != str(action.window_nonce or "").strip():
             return "grant_window_mismatch"
         return ""
 
@@ -711,12 +718,18 @@ class DesktopTakeoverGate:
           so comparing it would reproduce the window-title failure one level up:
           consent given for one mission would stop matching the mission it was
           given for, while a differently-worded mission would slip through;
-        - **this WINDOW** — ``(window_handle, process_id)``, not the title. Two
-          browser tabs are both called "New Tab", so a title bar authorises the
-          wrong window while looking strict; and a handle alone is reused after
-          its window closes, so the PAIR is what names one live window. The
-          title is still carried, for the consent card that names it back to
-          the operator;
+        - **this WINDOW** — ``(window_handle, process_id, window_nonce)``, not
+          the title. Two browser tabs are both called "New Tab", so a title bar
+          authorises the wrong window while looking strict. But the handle and
+          pid together are not enough either, and the reason is the SAME defect
+          one level down: they are not unique OVER TIME. A Windows HWND is
+          valid for a window's lifetime and is then recycled, and the pid does
+          not save it — a browser keeps one process alive across many windows,
+          so a new window can receive a closed window's handle and inherit its
+          still-live grant. The pair names a handle SLOT; the nonce is what
+          names the window occupying it, and the actuator guarantees it changes
+          when that window is replaced. The title is still carried, for the
+          consent card that names it back to the operator;
         - **approved and unconsumed** — consumption is how a session's grant is
           retired, so a consumed row is a finished session, not a live one;
         - **resolved through an allowlisted channel** —
@@ -844,6 +857,7 @@ class DesktopTakeoverGate:
                 "mission_id": mission_id,
                 "window_handle": action.window_handle,
                 "process_id": action.process_id,
+                "window_nonce": action.window_nonce,
                 "operation": str(action.operation),
                 "window_title": action.window_title,
                 "element_name": action.element_name,
@@ -935,6 +949,33 @@ class DesktopTakeoverGate:
             logger.error("Failed to emit autonomy.gate_held", exc_info=True)
 
 
+def _coerce_pid(value: object) -> int | None:
+    """A process id as a positive int, or ``None`` if it is not one.
+
+    One home for the conversion, because there were two — the caller validator
+    and ``SessionGrant.parse`` — and both got it wrong the same way.
+
+    ``int()`` is not a validator here. It raises ``OverflowError`` on infinity,
+    which neither site caught, so a payload carrying ``1e999`` (valid JSON that
+    Python and SQLite both parse as ``inf``) crashed ``check()`` instead of
+    being refused; one malformed stored grant row could do the same to the
+    lookup. And it TRUNCATES ``4312.7`` to 4312 — silently inventing a real pid
+    from a malformed one, which is worse than refusing, because the grant then
+    matches a process nobody named.
+    """
+    # bool is an int subclass, so `True` would otherwise become pid 1.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        # Covers inf and nan too: neither is_integer().
+        return None
+    try:
+        pid = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return pid if pid > 0 else None
+
+
 def _validate_call(
     action: DesktopAction, *, session_id: str, mission_id: str
 ) -> str:
@@ -969,15 +1010,12 @@ def _validate_call(
     if not str(action.window_handle or "").strip():
         return "malformed_action:window_handle"
 
+    if not str(action.window_nonce or "").strip():
+        return "malformed_action:window_nonce"
+
     # `bool` is an int subclass, so `process_id=True` would pass an int check
     # and become pid 1.
-    if isinstance(action.process_id, bool):
-        return "malformed_action:process_id"
-    try:
-        process_id = int(action.process_id)
-    except (TypeError, ValueError):
-        return "malformed_action:process_id"
-    if process_id <= 0:
+    if _coerce_pid(action.process_id) is None:
         return "malformed_action:process_id"
 
     if operation == DesktopOperation.KEY and not str(action.key_chord or "").strip():

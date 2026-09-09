@@ -35,6 +35,10 @@ _TS = "2026-06-21T00:00:00+00:00"
 _HANDLE = "0x000A1B2C"
 _PID = 4242
 _MISSION_ID = "mis-0001"
+#: The LIFETIME half of window identity. A handle is recycled when its
+#: window closes, and the pid does not help when the process outlives the
+#: window — so the pair names a handle SLOT, not the window in it.
+_NONCE = "win-nonce-0001"
 
 
 @pytest.fixture
@@ -75,6 +79,7 @@ def _action(**kw) -> DesktopAction:
     kw.setdefault("operation", DesktopOperation.CLICK)
     kw.setdefault("window_handle", _HANDLE)
     kw.setdefault("process_id", _PID)
+    kw.setdefault("window_nonce", _NONCE)
     kw.setdefault("window_title", _WINDOW)
     kw.setdefault("element_name", "")
     kw.setdefault("control_type", "Button")
@@ -120,6 +125,7 @@ async def _grant(
     window_title: str = _WINDOW,
     window_handle: str = _HANDLE,
     process_id: int = _PID,
+    window_nonce: str = _NONCE,
     mission_id: str = _MISSION_ID,
     mission: str = "tidy up",
     context: dict | None = None,
@@ -141,6 +147,7 @@ async def _grant(
             mission=mission,
             window_handle=window_handle,
             process_id=process_id,
+            window_nonce=window_nonce,
             window_title=window_title,
         )
     )
@@ -522,7 +529,7 @@ async def test_a_grant_with_a_BLANK_window_is_malformed_not_merely_mismatched(db
     rid = await _grant(db)
     ctx = build_session_grant_context(
         session_id=_SESSION, mission_id=_MISSION_ID, mission="m",
-        window_handle="", process_id=_PID, window_title=_WINDOW,
+        window_handle="", process_id=_PID, window_nonce=_NONCE, window_title=_WINDOW,
     )
     await db.execute(
         "UPDATE approval_requests SET context = ? WHERE id = ?", (json.dumps(ctx), rid)
@@ -580,7 +587,7 @@ async def test_a_blank_session_id_does_not_match_a_blank_grant(db, live):
             json.dumps(
                 build_session_grant_context(
                     session_id="", mission_id=_MISSION_ID, mission="m",
-                    window_handle=_HANDLE, process_id=_PID, window_title=_WINDOW,
+                    window_handle=_HANDLE, process_id=_PID, window_nonce=_NONCE, window_title=_WINDOW,
                 )
             ),
             rid,
@@ -605,7 +612,7 @@ async def test_a_pending_request_is_not_a_grant(db, live):
         context=json.dumps(
             build_session_grant_context(
                 session_id=_SESSION, mission_id=_MISSION_ID, mission="tidy up",
-                window_handle=_HANDLE, process_id=_PID, window_title=_WINDOW,
+                window_handle=_HANDLE, process_id=_PID, window_nonce=_NONCE, window_title=_WINDOW,
             )
         ),
         timeout_seconds=None,
@@ -1365,7 +1372,7 @@ async def test_an_unknown_grant_version_is_refused(db, live):
     rid = await _grant(db)
     ctx = build_session_grant_context(
         session_id=_SESSION, mission_id=_MISSION_ID, mission="m",
-        window_handle=_HANDLE, process_id=_PID, window_title=_WINDOW,
+        window_handle=_HANDLE, process_id=_PID, window_nonce=_NONCE, window_title=_WINDOW,
     )
     ctx["version"] = dg.SESSION_GRANT_VERSION + 1
     await db.execute(
@@ -1697,3 +1704,101 @@ def test_a_pin_verb_is_not_a_secret_field():
         assert _classify(element_name=credential, control_type="Edit").is_password is True, (
             credential
         )
+
+
+# ═══════════ Codex round 4, each locked ══════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_a_recycled_window_handle_does_not_inherit_the_grant(db, live):
+    """`(handle, pid)` is not unique OVER TIME, which is the same defect the
+    title had in space.
+
+    A Windows HWND is valid for a window's lifetime and is then RECYCLED, and
+    the pid does not save it: a browser or editor keeps one process alive across
+    many windows, so a newly created window can receive a closed window's handle
+    while the 30-minute grant is still live. Under a handle+pid bar alone, that
+    new window — which the operator never saw named — inherits consent.
+
+    The nonce is the actuator's guarantee that the window occupying the handle
+    is the same one. The gate cannot observe window lifetimes, so it REQUIRES
+    the information rather than inferring it."""
+    await _grant(db, window_handle="0xRECYC", process_id=7000,
+                 window_nonce="gen-1")
+
+    same = await _check(db, window_handle="0xRECYC", process_id=7000,
+                        window_nonce="gen-1", element_name="Text Area",
+                        control_type="Edit")
+    assert same.allow is True, "positive control: the granted window still works"
+
+    # Same handle, same LIVE process, new window.
+    recycled = await _check(db, window_handle="0xRECYC", process_id=7000,
+                            window_nonce="gen-2", element_name="Text Area",
+                            control_type="Edit")
+    assert recycled.allow is False
+    assert recycled.reason == "grant_window_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_window_nonce_is_a_malformed_call(db, live):
+    """Required, like every other identity field: absent information must be a
+    caller error rather than an empty string that compares equal to another
+    empty string."""
+    await _grant(db)
+    d = await _check(db, window_nonce="", element_name="Text Area")
+    assert d.allow is False
+    assert d.reason == "malformed_action:window_nonce"
+
+
+@pytest.mark.asyncio
+async def test_a_non_finite_process_id_is_refused_not_raised(db, live):
+    """`int()` is not a validator. It raises OverflowError on infinity — which
+    neither conversion site caught — so a payload carrying `1e999` (valid JSON
+    that Python and SQLite both parse as inf) crashed `check()` instead of being
+    refused. `nan` is the same shape.
+
+    And it TRUNCATES 4312.7 to 4312, silently inventing a real pid from a
+    malformed one, so the grant then matches a process nobody named. Refusing
+    is the only honest answer to both."""
+    await _grant(db)
+    for pid in (float("inf"), float("-inf"), float("nan"), 4312.7, -0.5):
+        d = await _check(db, process_id=pid, element_name="Text Area")
+        assert d.allow is False, pid
+        assert d.reason == "malformed_action:process_id", pid
+
+    # The control: a float that IS integral is a legitimate spelling of a pid.
+    ok = await _check(db, process_id=float(_PID), element_name="Text Area",
+                      control_type="Edit")
+    assert ok.allow is True, "an integral float is still a pid"
+
+
+@pytest.mark.asyncio
+async def test_a_stored_grant_with_a_non_finite_pid_does_not_crash_lookup(db, live):
+    """The same incomplete conversion existed in `SessionGrant.parse`, so ONE
+    malformed approved row could break the lookup for every action in the
+    session — including actions whose own grant was fine.
+
+    A FRACTIONAL pid, not infinity, and the difference matters. The review named
+    `1e999`, but `json.dumps(inf)` emits the bare token `Infinity`, which is not
+    valid JSON — and the SQL lookup guards on `json_valid`, so such a row is
+    filtered out before `parse` ever sees it. `4312.7` IS valid JSON, does reach
+    parse, and was silently truncated to 4312 there: a malformed row inventing a
+    real pid, which then matches a process nobody named. The reported mechanism
+    was wrong; the underlying defect was real."""
+    import json
+
+    rid = await _grant(db)
+    ctx = build_session_grant_context(
+        session_id=_SESSION, mission_id=_MISSION_ID, mission="m",
+        window_handle=_HANDLE, process_id=_PID, window_nonce=_NONCE,
+        window_title=_WINDOW,
+    )
+    ctx["process_id"] = 4312.7
+    await db.execute(
+        "UPDATE approval_requests SET context = ? WHERE id = ?", (json.dumps(ctx), rid)
+    )
+    await db.commit()
+
+    d = await _check(db, element_name="Text Area", control_type="Edit")
+    assert d.allow is False
+    assert d.reason == "grant_malformed", "refused, not raised"

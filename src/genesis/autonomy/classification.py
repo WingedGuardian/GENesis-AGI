@@ -834,6 +834,25 @@ class DesktopAction:
     operation: DesktopOperation
     window_handle: str
     process_id: int
+    #: A token the ACTUATOR guarantees changes when the window it identifies is
+    #: destroyed and another takes its place.
+    #:
+    #: Required because `(handle, pid)` is not enough, and the reason is the
+    #: same one that disqualified the title: it is not unique OVER TIME. A
+    #: Windows HWND is valid for a window's lifetime and is then RECYCLED, and
+    #: the pid does not save it — a browser or editor keeps one process alive
+    #: across many windows, so a newly created window in that process can
+    #: receive the closed window's handle and inherit its still-live grant.
+    #: A 30-minute grant is long enough for that in an application that opens
+    #: and closes windows.
+    #:
+    #: The gate does not care HOW it is produced — only that the actuator, which
+    #: owns the resolve step, mints a fresh value whenever it resolves a window
+    #: it has not seen alive continuously. A per-resolution GUID invalidated when
+    #: `IsWindow` goes false is the obvious construction. This is stated as a
+    #: CONTRACT rather than computed here because the gate cannot observe window
+    #: lifetimes; requiring the information is the whole design of this module.
+    window_nonce: str
     window_title: str
     element_name: str
     control_type: str

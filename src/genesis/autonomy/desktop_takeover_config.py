@@ -40,12 +40,7 @@ from typing import Any
 
 import yaml
 
-# `_resolve_overlay_path` is private, and imported rather than re-derived on
-# purpose: the overlay location is user-dir-first with a repo-relative
-# fallback, and a local copy of that rule would drift. Drift here means
-# checking a file nobody wrote, which reports "clean" for a damaged overlay —
-# the exact failure this import exists to detect.
-from genesis._config_overlay import _resolve_overlay_path, merge_local_overlay
+from genesis._config_overlay import merge_local_overlay
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -169,6 +164,17 @@ def load_config() -> dict[str, Any]:
     the desktop capability it means losing the operator's off switch and
     reporting success.
     """
+    # LAZY, not module-level. `_resolve_overlay_path` is private and imported
+    # rather than re-derived on purpose — the overlay location is user-dir-first
+    # with a repo-relative fallback, and a local copy of that rule would drift,
+    # which here means probing a file nobody wrote and reporting "clean" for a
+    # damaged overlay. But a module-level alias binding of it trips the
+    # user-config-binding guard (tests/test_config_overlay.py): such a binding
+    # can outlive a test's patch of the canonical name. Importing inside the
+    # function keeps one source of truth AND leaves the name resolvable at call
+    # time, which is what the guard's own comment sanctions.
+    from genesis._config_overlay import _resolve_overlay_path
+
     merged = copy.deepcopy(DEFAULTS)
     base_path = _base_path()
     base: dict[str, Any] = {}
