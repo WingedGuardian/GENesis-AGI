@@ -1530,7 +1530,13 @@ _CR_FILE_HEADER_RE = re.compile(r"<summary>([^<>]+?)\s+\((\d+)\)</summary>")
 # severity header on the SAME line (unlike the inline form, where the header
 # occupies its own line). Example:
 #   `169-174`: _🗄️ Data Integrity_ | _🟠 Major_ | _🏗️ Heavy lift_
-_CR_ENTRY_RE = re.compile(r"`(\d+(?:-\d+)?)`:\s*(.+)")
+# Anchored to line START (modulo whitespace): CodeRabbit emits the entry line
+# as its own line, and an UNanchored search also matched entry-shaped text
+# inside a finding's PROSE ("the source contains `99`: _cat_ | _🔴 Critical_"),
+# manufacturing a phantom finding (Codex P2, PR #1847). If the live format ever
+# gains a leading bullet this stops matching — and the declared-count
+# reconciliation then blocks LOUDLY on the shortfall rather than degrading.
+_CR_ENTRY_RE = re.compile(r"^\s*`(\d+(?:-\d+)?)`:\s*(.+)")
 # The <details> depth at which each role occurs. MEASURED over 23 live bodies
 # carrying an outside-diff section: every section summary sits at depth 1 and
 # every one of 113 file summaries at depth 2, with no exceptions.
@@ -1556,6 +1562,64 @@ _CR_BLOCKQUOTE_RE = re.compile(r"^(?:\s*>)+ ?")
 # <summary> to be the first child of its <details>, so this adjacency is what
 # separates real structure from a tag's text appearing in prose.
 _CR_DETAILS_OPEN_TAIL_RE = re.compile(r"<details[^<>]*>\s*$")
+
+# A backtick code span: a run of backticks closed by an equal run. CommonMark
+# lets a span contain a newline (it terminates at a blank line, not at a line
+# end), so `[^`]` deliberately does NOT exclude "\n" — an earlier revision did,
+# and a span broken across two lines then went entirely unmasked, re-opening
+# the depth-poisoning this mask exists to close. Masking is applied
+# paragraph-wise for the same reason.
+#
+# The failure direction of a mis-sized span is OVER-masking, which costs a
+# missed finding that the declared-count reconciliation then blocks on — never
+# a tag silently honoured.
+_CR_INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
+
+
+def _cr_mask_inline_code_lines(lines: list[str]) -> list[str]:
+    """``lines`` with backtick code spans blanked, LENGTH- AND LINE-PRESERVING.
+
+    A renderer treats ```</details>``` as text, not as a closing tag — but
+    ``str.count`` does not, so a finding whose PROSE quotes a tag in inline
+    code moved the document's depth. Everything after it then read at the
+    wrong level: the next genuine file header failed its depth test,
+    ``current_file`` kept the previous path, and a Critical on a real source
+    file was misattributed to a doc path and skipped — with declared ==
+    parsed, so the shortfall canary stayed quiet (Codex P1, PR #1847).
+
+    Spans become spaces of the same length rather than being removed, so every
+    index computed on a masked line (``find("<summary")`` positions, head
+    slices) still addresses the original text. Only the tag-structure readers
+    (`_cr_details_depths`, `_cr_summary_structural`) consume this — the ENTRY
+    regex depends on backticks (`` `169-174`: … ``) and keeps reading raw.
+
+    Masks over each BLANK-LINE-DELIMITED paragraph rather than per line,
+    because a code span may span a newline. Splitting first and masking each
+    line alone cannot see such a span at all, so it left the quoted tag inside
+    it live (adversarial-audit SHOULD-FIX, PR #1847). Line count and every
+    line's length are preserved, so all downstream indices still address the
+    original text.
+    """
+    masked: list[str] = []
+    para: list[str] = []
+
+    def flush() -> None:
+        if not para:
+            return
+        block = _CR_INLINE_CODE_RE.sub(
+            lambda m: re.sub(r"[^\n]", " ", m.group(0)), "\n".join(para)
+        )
+        masked.extend(block.split("\n"))
+        para.clear()
+
+    for line in lines:
+        if line.strip():
+            para.append(line)
+        else:
+            flush()
+            masked.append(line)
+    flush()
+    return masked
 
 
 def _cr_normalize_review_body(body: str) -> str:
@@ -1596,15 +1660,21 @@ def _cr_details_depths(lines: list[str], fence_mask: list[bool]) -> list[int]:
 
     Tags inside a fence are quoted content and move nothing — otherwise an
     author could shift the document's depth from inside a suggestion block and
-    relocate every role by one level.
+    relocate every role by one level. Tags inside INLINE CODE are quoted
+    content too, at a smaller granularity the fence mask cannot see — masked
+    per line by ``_cr_mask_inline_code`` for the same reason.
     """
+    # Casefold + mask ONCE, over the whole list, so a code span that crosses a
+    # newline is seen (a per-line mask cannot close one) and every index below
+    # still addresses the original text.
+    lines = _cr_mask_inline_code_lines([ln.casefold() for ln in lines])
     depths: list[int] = []
     depth = 0
     for line, quoted in zip(lines, fence_mask, strict=True):
         if quoted:
             depths.append(depth)
             continue
-        low = line.casefold()
+        low = line
         cut = low.find("<summary")
         head = low if cut < 0 else low[:cut]
         depths.append(depth + head.count("<details"))
@@ -1628,10 +1698,13 @@ def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[boo
     attributed to a doc path, silently doc-skipped, and did not block, with
     declared == parsed so the shortfall canary stayed quiet too.
     """
+    # Same mask as `_cr_details_depths`, for the same reason and applied the
+    # same way — the two readers must never disagree about what is quoted.
+    lines = _cr_mask_inline_code_lines([ln.casefold() for ln in lines])
     structural: list[bool] = []
     prev_opener = False  # the previous non-blank unfenced line ENDS with a <details> opener
     for line, quoted in zip(lines, fence_mask, strict=True):
-        low = line.casefold()
+        low = line
         cut = -1 if quoted else low.find("<summary")
         if cut < 0:
             structural.append(False)
@@ -1647,11 +1720,18 @@ def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[boo
     return structural
 
 
-def _cr_outside_diff_entries(body: str) -> tuple[list[tuple[str, str, str, str]], int]:
+def _cr_outside_diff_entries(
+    body: str,
+) -> tuple[list[tuple[str, str, str, str]], int, bool]:
     """Findings from the 'Outside diff range comments' sections of ONE review body.
 
-    Returns ``(entries, declared)`` — the parsed findings, and the total this
-    body's own section headers SAY it carries. The format states its own counts
+    Returns ``(entries, declared, declared_known)`` — the parsed findings, the
+    total this body's own section headers SAY it carries, and whether EVERY
+    matched section header actually stated a count. ``declared_known`` is what
+    licenses the SURPLUS comparison: with any count absent, ``declared`` is an
+    underestimate, so parsed-exceeds-declared would fire on well-formed input.
+    The shortfall comparison needs no such licence — an underestimate can only
+    make it more lenient, never false-positive. The format states its own counts
     ("Outside diff range comments (3)"), which is the one closed-set fact
     available about a third-party document nobody controls: it turns "did I
     parse everything?" from an unanswerable question into a comparison. Reading
@@ -1687,6 +1767,7 @@ def _cr_outside_diff_entries(body: str) -> tuple[list[tuple[str, str, str, str]]
     """
     out: list[tuple[str, str, str, str]] = []
     declared = 0
+    declared_known = True
     body = _cr_normalize_review_body(body)
     lines = body.split("\n")
     # FENCE half only. A review body is a code-bearing document: it quotes diffs
@@ -1724,6 +1805,8 @@ def _cr_outside_diff_entries(body: str) -> tuple[list[tuple[str, str, str, str]]
                 count = _CR_SECTION_COUNT_RE.search(section.group(0))
                 if count:
                     declared += int(count.group(1))
+                else:
+                    declared_known = False
             continue
         if not in_section:
             continue
@@ -1756,24 +1839,9 @@ def _cr_outside_diff_entries(body: str) -> tuple[list[tuple[str, str, str, str]]
                     title = bold.group(1).strip()[:120]
                     break
             out.append((current_file, entry.group(1), severity or "", title))
-    return out, declared
+    return out, declared, declared_known
 
 
-# The severity header on an outside-diff entry is INLINE (`… | _🟠 Major_ | …`),
-# not a whole line, so `_cr_severity`'s anchored `^_…_$` field matcher cannot
-# read it. Same closed vocabulary, different anchoring.
-#
-# The boundaries are ASCII-letter lookarounds, NOT ``\b``: the header's own
-# delimiter is ``_``, which IS a regex word character, so ``Major\b`` never
-# matches inside ``_🟠 Major_`` — every severity would read as unknown and every
-# finding would land in the canary. MEASURED: 0 of 27 live findings classified
-# with ``\b``, 27 of 27 with these lookarounds.
-_CR_INLINE_SEVERITY_RE = re.compile(
-    r"_[^_\n]*?(?<![A-Za-z])("
-    + "|".join(sorted(_CR_SEVERITIES))
-    + r")(?![A-Za-z])[^_\n]*?_",
-    re.IGNORECASE,
-)
 _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 # Severity ORDER, for merging one finding restated across several reviews.
 # A dedupe that assigns (`seen[key] = severity`) is last-write-wins, and reviews
@@ -1791,15 +1859,39 @@ _CR_SEVERITY_RANK = {"": 0, "info": 1, "trivial": 2, "minor": 3, "major": 4, "cr
 def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     """Severity from an inline `… | _🟠 Major_ | …` header. (level, header_seen).
 
-    Mirrors ``_cr_severity``'s contract — an unrecognised level yields ``None``
-    so it lands in the caller's unknown-severity canary rather than being
-    guessed into a weight — but matches the severity as an inline span rather
-    than as a whole anchored field.
+    Mirrors ``_cr_severity``'s contract — the SAME field discipline and the
+    SAME ambiguity adjudication, not just the same vocabulary. An earlier
+    revision searched the whole text for the first severity-looking italic
+    span, and first-match-wins read `_Business Critical_ | _🟡 Minor_` as
+    Critical (a false block), while a category field containing `Major` could
+    demote a later real Critical to the non-blocking lane (Codex P2, PR #1847
+    — the exact shape `_cr_severity`'s own docstring already adjudicates).
+
+    So: split on `|`, accept only chunks that are COMPLETE italic fields
+    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    field's LAST word, and adjudicate as `_cr_severity` does — exactly one
+    DISTINCT level wins (unanimous duplicates included); two distinct levels
+    are a format this code cannot adjudicate and land in the caller's
+    unknown-severity canary rather than being guessed into a weight.
+
+    One deliberate divergence from the anchored parser: a chunk that is NOT a
+    complete italic field is skipped rather than invalidating the whole read,
+    because an inline header can share its line with trailing prose the
+    whole-line parser never sees — requiring all-italic here would push every
+    such finding into the canary and weaken the channel, the fail-open
+    direction for a merge gate.
     """
-    match = _CR_INLINE_SEVERITY_RE.search(text)
-    if not match:
-        return None, bool(text.strip())
-    return match.group(1).lower(), True
+    hits: list[str] = []
+    for chunk in text.split("|"):
+        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
+        if not fld:
+            continue
+        words = fld.group(1).split()
+        if words and words[-1].casefold() in _CR_SEVERITIES:
+            hits.append(words[-1].casefold())
+    if hits and len(set(hits)) == 1:
+        return hits[0], True
+    return None, bool(text.strip())
 
 
 def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, bool]:
@@ -2257,7 +2349,33 @@ def _check_inline_review_findings(
             continue
         if (review.get("login") or "") not in _CODERABBIT_LOGINS:
             continue
-        parsed, declared = _cr_outside_diff_entries(review.get("body") or "")
+        parsed, declared, declared_known = _cr_outside_diff_entries(review.get("body") or "")
+        if declared_known and len(parsed) > declared:
+            # The OTHER direction of the same reconciliation: more entries than
+            # the body's own headers declare means prose was mis-parsed as a
+            # finding — the phantom-Critical shape (Codex P2, PR #1847). We
+            # cannot tell WHICH entries are phantoms, so the read is unreliable
+            # rather than merely noisy, and it blocks as unreadable exactly
+            # like the shortfall — an explained stop beats a false block that
+            # names a finding nobody wrote. Only licensed when every section
+            # header stated its count (`declared_known`).
+            outside_shortfall.append(
+                f"outside-diff section declares {declared} finding(s) but "
+                f"{len(parsed)} were parsed — surplus entries indicate prose "
+                f"mis-read as findings"
+            )
+            # QUARANTINE the batch rather than merging it. Without this the
+            # entries still reached the score, and a phantom Critical among
+            # them returned the ordinary block message NAMING it as a real
+            # finding — the score branch returns before the shortfall check —
+            # so this check's own explained stop never surfaced in exactly the
+            # case it was written for. Both directions still block; what this
+            # buys is that the message is true. The asymmetry with the
+            # shortfall branch below is deliberate: an UNDER-parse's entries
+            # were read correctly and should still block on their own terms,
+            # while a SURPLUS means some entry in this batch is fictional and
+            # nothing here can say which.
+            continue
         if declared > len(parsed):
             # The body's own header says it carries more than this parser found,
             # so the read is INCOMPLETE — and an incomplete finding scan blocks
@@ -2448,14 +2566,34 @@ def _check_inline_review_findings(
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
             + [f"  [outside-diff Critical] {t}" for t, _p in outside_block[:5]]
         )
+        # The remedy line names BOTH dispositions because the channels differ:
+        # inline findings have a comment thread a maintainer reply can clear;
+        # an outside-diff finding lives in a review BODY with no thread, so its
+        # only dispositions are fixing it, the reviewer dismissing the review,
+        # or the logged override. Telling an operator to "reply in-thread" to a
+        # threadless finding was an impossible instruction (Codex P2, #1847) —
+        # and the count line below must include outside_block for the same
+        # reason: a summary claiming zero findings above a blocking score reads
+        # as the gate malfunctioning.
+        remedy = (
+            "Fix and reply in-thread, or append '# review-override' to the "
+            "merge command to acknowledge and proceed."
+            if not outside_block
+            else (
+                "Fix the findings (inline ones can instead be answered by a "
+                "maintainer reply in-thread; outside-diff ones have NO thread — "
+                "their dispositions are a fix, a dismissal of the carrying "
+                "review, or the override), or append '# review-override' to "
+                "the merge command to acknowledge and proceed."
+            )
+        )
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
             f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
             f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
             f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
-            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
-            f"Fix and reply in-thread, or append '# review-override' "
-            f"to the merge command to acknowledge and proceed."
+            f"Critical/Major + {len(outside_block)} outside-diff Critical "
+            f"finding(s), none maintainer-replied:\n{listing}\n{remedy}"
         )
     # No unresolved P1 among what we read. If the read is INCOMPLETE (a later page
     # failed), a P1 could exist on an unread page — fail per _scan_unreadable rather
