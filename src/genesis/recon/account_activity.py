@@ -1201,8 +1201,8 @@ def _mention_re(login: str) -> re.Pattern[str]:
 
     The right-hand guard stops `@owner` matching `@owner-ci` or `@ownerBot`;
     a bare ``\\b`` would accept both, since `-` ends a word boundary. The
-    left-hand guard stops an email local-part or a longer handle
-    (`dev@owner.com`, `foo@owner`) reading as a mention.
+    left-hand guard stops a longer handle or an address local-part
+    (`foo@owner`, `a.b@owner`) reading as a mention.
     """
     return re.compile(rf"(?<![A-Za-z0-9._%+-])@{re.escape(login)}(?![A-Za-z0-9-])", re.IGNORECASE)
 

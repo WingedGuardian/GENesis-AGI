@@ -1183,8 +1183,8 @@ async def test_issue_subject_reads_its_comment_surface(db, monkeypatch):
 
 
 async def test_mention_match_needs_a_left_boundary_too(db, monkeypatch):
-    """An email local-part or a longer handle must not read as a mention:
-    `dev@me.com` and `foo@me` are not mentions of `me`."""
+    """A longer handle or an address local-part must not read as a mention:
+    neither `foo@me` nor `a.b@me` is a mention of `me`."""
     mon, _ = _mon(db)
     mon._is_automation = _human
     pages = [
@@ -1205,7 +1205,7 @@ async def test_mention_match_needs_a_left_boundary_too(db, monkeypatch):
             url_actors={_PULL: "me"},
             review_comments={
                 _PULL: [
-                    _rc("wrong", "2026-08-06T03:00:00Z", "reach me at dev@me.com or foo@me"),
+                    _rc("wrong", "2026-08-06T03:00:00Z", "not a mention: foo@me nor a.b@me"),
                     _rc("right", "2026-08-06T01:00:00Z", "cc @me please"),
                 ]
             },
