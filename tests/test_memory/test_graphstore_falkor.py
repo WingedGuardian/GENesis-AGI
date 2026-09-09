@@ -943,6 +943,50 @@ async def test_a_timed_out_connect_does_not_burn_a_thread_per_attempt(tmp_path):
     )
 
 
+async def test_an_abandoned_connect_cannot_block_process_exit(tmp_path):
+    """A connect we gave up on must not keep the process alive.
+
+    `asyncio.to_thread` puts its worker in the loop's DEFAULT executor, and
+    `asyncio.run` JOINS that executor during teardown. So bounding the connect
+    stopped a wedged engine from blocking the TRAVERSAL and started it blocking
+    process EXIT instead: `python -m genesis.memory.graphstore_project` would
+    print its error and then hang forever with nothing left to do.
+
+    A daemon thread is not joined at interpreter exit, so the cost of an
+    abandoned connect is a parked thread until the process ends, rather than a
+    process that cannot end.
+    """
+    import threading as _threading
+
+    started = _threading.Event()
+    release = _threading.Event()
+    seen: dict = {}
+
+    class _SlowClient:
+        def __init__(self, *a, **k):
+            seen["thread"] = _threading.current_thread()
+            started.set()
+            release.wait(timeout=5)
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    try:
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", _SlowClient),
+            patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+            pytest.raises(GraphUnavailableError),
+        ):
+            await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+        assert started.wait(timeout=2), "the constructor must actually have run"
+        assert seen["thread"].daemon, (
+            "the connect thread must be a daemon — a non-daemon one is joined at "
+            "interpreter exit and turns a wedged engine into a process that cannot quit"
+        )
+    finally:
+        release.set()
+
+
 async def test_every_network_operation_goes_through_the_bounded_chokepoint():
     """Guard-the-guard: no call site may reach the socket unbounded.
 

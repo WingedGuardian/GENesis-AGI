@@ -48,6 +48,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -171,6 +172,53 @@ RETURN id, depth, best.strength AS strength, best.link_type AS link_type
 _PROJECT_LOCKS: dict[str, asyncio.Lock] = {}
 
 
+def _connect_in_daemon_thread(fn: Any, **kwargs: Any) -> asyncio.Future[Any]:
+    """Run a blocking constructor off-loop on a thread that cannot outlive us.
+
+    `asyncio.to_thread` would be the obvious call, and it is what this used to
+    do — but its worker lives in the loop's DEFAULT executor, and `asyncio.run`
+    JOINS that executor during teardown. So a constructor that never returns
+    stopped blocking the traversal (the deadline handles that) and started
+    blocking process EXIT instead: the projector CLI would print its error and
+    then hang forever with nothing left to do.
+
+    A daemon thread is not joined at interpreter exit, so an abandoned connect
+    costs a parked thread until the process ends rather than preventing the
+    process from ending. That is the right trade for a construction we have
+    already given up on — and it only ever happens once per store, because the
+    in-flight future is cached and shielded.
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+
+    def _settle(setter: Any, value: Any) -> None:
+        # The awaiting side may have been cancelled by its deadline while this
+        # thread was still blocked; settling a done future raises.
+        if not fut.done():
+            setter(value)
+
+    def _deliver(setter: Any, value: Any) -> None:
+        # The loop may be CLOSED by the time an abandoned connect finally
+        # returns — which is the normal end of the case this helper exists for,
+        # since the process was already tearing down. `call_soon_threadsafe`
+        # raises RuntimeError then, inside a daemon thread with nobody to catch
+        # it, so it surfaces as an unhandled-thread-exception with no reader.
+        # There is nothing left to deliver to; dropping it is the answer.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_settle, setter, value)
+
+    def _work() -> None:
+        try:
+            result = fn(**kwargs)
+        except BaseException as exc:  # noqa: BLE001 - handed to the future verbatim
+            _deliver(fut.set_exception, exc)
+        else:
+            _deliver(fut.set_result, result)
+
+    threading.Thread(target=_work, name="falkordb-connect", daemon=True).start()
+    return fut
+
+
 def _project_lock(graph_key: str) -> asyncio.Lock:
     """The lock guarding projections of ``graph_key``.
 
@@ -234,8 +282,8 @@ class FalkorGraphStore:
             if self._connecting is None:
                 # No await between the test and the assignment, so two coroutines
                 # cannot both start one on a single-threaded loop.
-                self._connecting = asyncio.ensure_future(
-                    asyncio.to_thread(_FalkorDB, unix_socket_path=self._socket_path)
+                self._connecting = _connect_in_daemon_thread(
+                    _FalkorDB, unix_socket_path=self._socket_path
                 )
             try:
                 self._db = await asyncio.shield(self._connecting)
