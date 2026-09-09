@@ -2217,7 +2217,7 @@ verified: f24c15e9 2026-09-05
     the unchanged selector preserves and the widened one destroys. The answer is
     not a narrower glob: RED should not INFER the live set from mtimes when it is
     directly observable, and this file already enumerates listening CC sockets.
-    That is a redesign of the nuclear tier's preserve rule, tracked separately so
+    That is a redesign of the nuclear tier's preserve rule, tracked in issue #1878 so
     it cannot ride along in a change about reaping sessions instead of projects.
 
   Deliberately NOT done: relocating the sockets out of cc-tmp. That is the real

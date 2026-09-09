@@ -496,7 +496,7 @@ clean_cc_red() {
     # live from filesystem mtimes at all, when the live set is directly
     # observable (this file already enumerates listening CC sockets in
     # `check_control_plane`). That is a redesign of the nuclear tier's preserve
-    # rule and is tracked separately — it must not ride along in a change about
+    # rule, tracked in issue #1878 — it must not ride along in a change about
     # reaping sessions instead of projects.
     #
     # KNOWN LIMITATION, carried from main unchanged: depth 2 is the PROJECT
