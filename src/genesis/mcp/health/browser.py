@@ -126,6 +126,10 @@ _VNC_DISPLAY = ":99"
 #: small delta is normal; a large one is the signature of a coordinate-space
 #: mismatch rather than jitter.
 _POINTER_DRIFT_TOLERANCE_PX = 3
+#: Pointer readback probe timeout. Generous — xdotool answers in
+#: milliseconds against a healthy X server, so exceeding this means the
+#: server is wedged, not that the probe was slow.
+_POINTER_PROBE_TIMEOUT_S = 5
 _VNC_PASSWORD = os.environ.get("GENESIS_VNC_PASSWORD", "genesis")
 # vncdotool server format: display-number notation (display 99 = port 5999).
 # "localhost::5999" causes Connection Lost due to IPv6 resolution.
@@ -1543,6 +1547,70 @@ def vnc_click_target(
     return click_x, click_y
 
 
+async def _kill_and_reap(proc) -> None:
+    """Kill a subprocess and collect it.
+
+    ``asyncio.wait_for`` cancels the WAIT, never the child. MEASURED: a
+    process whose ``communicate()`` was cancelled by ``wait_for`` is still
+    running afterwards, with ``returncode is None``. Every timeout path that
+    does not do this leaks the process for as long as it chooses to run —
+    which, for a probe against a wedged X server, is unbounded.
+    """
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return  # already gone; nothing to reap
+    with contextlib.suppress(Exception):
+        await proc.wait()
+
+
+async def _read_pointer_position(
+    *, timeout_s: float = _POINTER_PROBE_TIMEOUT_S,
+) -> tuple[int, int] | None:
+    """Read the X pointer's ACTUAL position, or ``None`` if it cannot be read.
+
+    Best-effort by contract: every failure returns ``None`` rather than
+    raising, because a click must not be blocked by an unavailable
+    measurement. It is still LOGGED — an absent readback must never read as a
+    clean one. The ``OSError`` catch is load-bearing beyond tidiness: a
+    missing ``xdotool`` raises ``FileNotFoundError`` here, and the caller's
+    outer handler for that exception reports a missing ``vncdo`` and abandons
+    the click.
+    """
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "xdotool", "getmouselocation", "--shell",
+            env={**os.environ, "DISPLAY": _VNC_DISPLAY},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        return None
+
+    try:
+        probe_out, _ = await asyncio.wait_for(probe.communicate(), timeout=timeout_s)
+    except TimeoutError:
+        await _kill_and_reap(probe)
+        _ts_log.info("VNC: pointer readback unavailable (TimeoutError)")
+        return None
+    except OSError as exc:
+        await _kill_and_reap(probe)
+        _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        return None
+
+    try:
+        probe_vals = dict(
+            line.split("=", 1)
+            for line in probe_out.decode().splitlines()
+            if "=" in line
+        )
+        return int(probe_vals["X"]), int(probe_vals["Y"])
+    except (KeyError, ValueError, UnicodeDecodeError) as exc:
+        _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        return None
+
+
 async def _vnc_click_turnstile(page) -> bool:
     """Click the Turnstile checkbox via VNC trusted input (fallback).
 
@@ -1566,7 +1634,14 @@ async def _vnc_click_turnstile(page) -> bool:
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "DISPLAY": _VNC_DISPLAY},
             )
-            xdo_out, _ = await asyncio.wait_for(xdo.communicate(), timeout=3)
+            try:
+                xdo_out, _ = await asyncio.wait_for(xdo.communicate(), timeout=3)
+            except TimeoutError:
+                # Same leak as the pointer probe below: the wait is cancelled,
+                # the process is not. Reap it, then fall through to the (0,0)
+                # default via the enclosing handler.
+                await _kill_and_reap(xdo)
+                raise
             xdo_text = xdo_out.decode()
             # Parse "Position: X,Y (screen: 0)\n  Geometry: WxH"
             import re
@@ -1705,31 +1780,15 @@ async def _vnc_click_turnstile(page) -> bool:
         #
         # Best-effort: a readback failure must not block the click, but it IS
         # reported rather than swallowed, so "unknown" never reads as "fine".
-        actual_x = actual_y = None
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                "xdotool", "getmouselocation", "--shell",
-                env={**os.environ, "DISPLAY": _VNC_DISPLAY},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            probe_out, _ = await asyncio.wait_for(probe.communicate(), timeout=5)
-            probe_vals = dict(
-                line.split("=", 1)
-                for line in probe_out.decode().splitlines()
-                if "=" in line
-            )
-            actual_x = int(probe_vals["X"])
-            actual_y = int(probe_vals["Y"])
-        except (TimeoutError, KeyError, ValueError, OSError) as exc:
-            _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        pointer = await _read_pointer_position()
 
-        if actual_x is None:
+        if pointer is None:
             _ts_log.info(
                 "VNC LANDED: unknown — pointer readback failed; "
                 "intended=(%d,%d)", click_x, click_y,
             )
         else:
+            actual_x, actual_y = pointer
             drift = abs(actual_x - click_x) + abs(actual_y - click_y)
             _ts_log.info(
                 "VNC LANDED: (%d,%d) intended=(%d,%d) drift=%d dpr=%.2f",
