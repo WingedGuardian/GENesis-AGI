@@ -841,3 +841,90 @@ class TestSigilRunRegression:
         # token into _KNOWN_SIGILS left all 146 tests in this file passing.
         unqueried = sorted(set(sp._KNOWN_SIGILS) - set(queried))
         assert not unqueried, f"declared in _KNOWN_SIGILS but no guard queries it: {unqueried}"
+
+
+class TestHeredocBodiesAreNotCommands:
+    """A heredoc BODY is stdin data — bash never executes it.
+
+    The splitter used to emit every body LINE as its own executed segment, which
+    cost twice: guards blocked on text that would never run (a false positive on
+    a BLOCKING gate), and a quote character in body prose corrupted the splitter's
+    quote state so the real command AFTER the heredoc was swallowed into the body
+    segment and became invisible to every guard.
+
+    MEASURED over 45,763 unique real commands harvested from this install's
+    transcripts (2026-09-09): 6,690 contain `<<`; 6,019 of those had their body
+    lines emitted as executed segments, and 997 additionally had a following
+    command absorbed. Zero of the 39,073 heredoc-free commands change.
+    """
+
+    def test_a_body_line_is_not_an_executed_segment(self):
+        cmd = "cat <<'EOF'\ngit push --force\nEOF"
+        assert [s.exe for s in sp.analyze(cmd)] == ["cat"]
+
+    def test_a_command_after_the_heredoc_is_still_seen(self):
+        cmd = "cat <<'EOF'\nbody\nEOF\nrm -rf /tmp/x"
+        assert "rm" in [s.exe for s in sp.analyze(cmd)]
+
+    def test_an_apostrophe_in_body_prose_no_longer_hides_the_next_command(self):
+        """The fail-OPEN half: an unbalanced quote inside body text used to open a
+        quote span that ran to end-of-input, absorbing the following command."""
+        cmd = "cat <<'EOF'\nit's a body line\nEOF\nrm -rf /tmp/x"
+        exes = [s.exe for s in sp.analyze(cmd)]
+        assert "rm" in exes, f"the command after the heredoc was hidden: {exes}"
+
+    def test_an_unterminated_heredoc_does_not_swallow_the_rest(self):
+        """FAIL-CLOSED by choice. Bash treats the remainder as body, but matching
+        that would let a heredoc with no closing delimiter hide every following
+        command from the guards — worse than the over-reading it removes."""
+        cmd = "cat <<'EOF'\nbody\nrm -rf /tmp/x"
+        assert "rm" in [s.exe for s in sp.analyze(cmd)]
+
+    def test_a_herestring_is_not_a_heredoc(self):
+        cmd = "cat <<<'text'\nrm -rf /tmp/x"
+        assert "rm" in [s.exe for s in sp.analyze(cmd)]
+
+    def test_dash_form_matches_a_tab_indented_delimiter(self):
+        cmd = "cat <<-EOF\n\tbody\n\tEOF\nrm -rf /tmp/x"
+        assert [s.exe for s in sp.analyze(cmd)] == ["cat", "rm"]
+
+    def test_a_plain_heredoc_is_not_closed_by_an_indented_delimiter(self):
+        """Only `<<-` dedents. For a plain `<<`, an indented delimiter is body."""
+        cmd = "cat <<EOF\n  EOF\nEOF\nrm -rf /tmp/x"
+        assert [s.exe for s in sp.analyze(cmd)] == ["cat", "rm"]
+
+    def test_two_heredocs_on_one_line_consume_both_bodies(self):
+        cmd = "cat <<A <<B\na1\nA\nb1\nB\nrm -rf /tmp/x"
+        assert [s.exe for s in sp.analyze(cmd)] == ["cat", "rm"]
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "echo '<<EOF'\nrm -rf /tmp/x",
+            'echo "<<EOF"\nrm -rf /tmp/x',
+        ],
+    )
+    def test_a_quoted_heredoc_marker_is_literal_text(self, cmd):
+        assert "rm" in [s.exe for s in sp.analyze(cmd)]
+
+    @pytest.mark.parametrize(
+        ("target", "expected"),
+        [
+            ("EOF", ("EOF", False)),
+            ("'EOF'", ("EOF", False)),
+            ('"EOF"', ("EOF", False)),
+            ("\\EOF", ("EOF", False)),
+            ("-EOF", ("EOF", True)),
+            ("-'EOF'", ("EOF", True)),
+        ],
+    )
+    def test_delimiter_quoting_is_stripped(self, target, expected):
+        """Bash strips quoting from the delimiter itself; it only decides whether
+        the body is expanded, which is moot when the body is not a command."""
+        assert sp._heredoc_delimiter(target) == expected
+
+    def test_a_hidden_verb_in_a_real_command_is_still_caught(self):
+        """Guard the guard: the heredoc skip must not blunt the ANSI-C decoding
+        this PR exists for — a verb hidden in a REAL command still resolves."""
+        segs = sp.analyze("git $'push' origin main --force")
+        assert segs[0].argv[:2] == ["git", "push"]

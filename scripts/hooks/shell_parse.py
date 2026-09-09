@@ -280,6 +280,78 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     return j
 
 
+def _heredoc_delimiter(target: str) -> tuple[str, bool]:
+    """The delimiter word a ``<<`` redirect target names, and whether it is ``<<-``.
+
+    Bash strips quoting from the delimiter itself (``<<'EOF'``, ``<<"EOF"`` and
+    ``<<\\EOF`` all end at a line reading ``EOF``); the quoting only decides whether
+    the BODY is expanded, which is irrelevant here because the body is not a command
+    either way. A leading ``-`` selects tab-dedent matching on the closing line.
+    """
+    dedent = target.startswith("-")
+    word = target[1:] if dedent else target
+    out: list[str] = []
+    q: str | None = None
+    k = 0
+    while k < len(word):
+        ch = word[k]
+        if q:
+            if ch == q:
+                q = None
+            else:
+                out.append(ch)
+            k += 1
+            continue
+        if ch in ("'", '"'):
+            q = ch
+            k += 1
+            continue
+        if ch == "\\" and k + 1 < len(word):
+            out.append(word[k + 1])
+            k += 2
+            continue
+        out.append(ch)
+        k += 1
+    return "".join(out), dedent
+
+
+def _skip_heredoc_bodies(command: str, i: int, n: int, pending: list[tuple[str, bool]]) -> int:
+    """Index just past the bodies of the heredocs opened on the line ending at ``i``.
+
+    A heredoc BODY is data handed to a command's stdin — bash never executes it. This
+    splitter used to emit each body LINE as its own executed segment, so every guard
+    reading ``analyze()`` saw commands the shell would never run. MEASURED
+    (2026-09-09): a ``cat`` heredoc whose body held a destructive-looking git line
+    produced that line as a real executed segment, with its own resolved exe and argv.
+    That is a false positive on BLOCKING guards, and it is why decoding ANSI-C spans
+    inside a body could turn inert text into a blocked command.
+
+    FAIL-CLOSED on a malformed heredoc: if no closing delimiter line exists, this
+    returns ``i`` unchanged and the body is split exactly as before. Bash would treat
+    the remainder of the input as body, but matching that here would let an
+    UNTERMINATED heredoc swallow every following command and hide it from the guards —
+    a fail-OPEN hole strictly worse than the over-reading it removes.
+    """
+    pos = i
+    for delim, dedent in pending:
+        found = False
+        scan = pos
+        while scan < n:
+            eol = command.find("\n", scan)
+            line_end = n if eol == -1 else eol
+            line = command[scan:line_end]
+            if (line.lstrip("\t") if dedent else line) == delim:
+                pos = line_end + 1 if eol != -1 else n
+                found = True
+                break
+            if eol == -1:
+                break
+            scan = eol + 1
+        if not found:
+            return i  # unterminated — leave the input alone (see docstring)
+    return pos
+
+
 def parse_segments(command: str) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
@@ -312,6 +384,9 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
+    # Heredocs opened on the line currently being scanned; their bodies are consumed
+    # at the newline that ends that line (see _skip_heredoc_bodies).
+    pending_heredocs: list[tuple[str, bool]] = []
     i, n = 0, len(command)
     quote: str | None = None
     while i < n:
@@ -370,6 +445,8 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             if j < n and t not in _TARGET_STOP:
                 j = _redirect_target_end(command, j0, n)
             target = command[j0:j]
+            if op_len == 2 and c == "<" and target:
+                pending_heredocs.append(_heredoc_delimiter(target))
             if "$" in target or "`" in target:
                 # Expansion-carrying target: KEEP in raw (nested command stays visible
                 # to the destructive guard via _substitutions), EXCLUDE from argv_src so
@@ -387,6 +464,9 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
+            if c == "\n" and pending_heredocs:
+                i = _skip_heredoc_bodies(command, i, n, pending_heredocs)
+                pending_heredocs = []
             continue
         raw_buf.append(c)
         argv_buf.append(c)
@@ -627,10 +707,20 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
     quoted text. MEASURED to matter (author, 2026-09-04, over a corpus of 38,140
     real Bash commands harvested from this install's CC transcripts): a naive
     ``$'`` scan flagged 89, dq-awareness cut that to 45, and the residue is
-    almost entirely heredoc bodies — which this segment-level path never
-    tokenizes as commands anyway. The counts are provenance for the design
-    choice, not a runtime invariant; the invariant is the dq/sq/backslash state
-    machine below, which a security review verified against bash's own rules.
+    almost entirely heredoc bodies.
+
+    An earlier version of this docstring added "which this segment-level path
+    never tokenizes as commands anyway" and rested the decode's safety on it.
+    That was FALSE and untested: bodies WERE tokenized, so decoding one turned
+    inert text into a blocked command. The claim is true now only because
+    ``parse_segments`` consumes heredoc bodies (see ``_skip_heredoc_bodies``),
+    and ``TestHeredocBodiesAreNotCommands`` fails if that stops being so — which
+    is the point: a docstring asserting "never" needs a test that breaks when it
+    turns into "sometimes".
+
+    The counts are provenance for the design choice, not a runtime invariant;
+    the invariant is the dq/sq/backslash state machine below, which a security
+    review verified against bash's own rules.
     """
     spans: list[tuple[int, int, str, bool]] = []
     i, n = 0, len(text)
