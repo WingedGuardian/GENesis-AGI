@@ -239,12 +239,20 @@ repo bounds exactly that at a few MiB (`autonomy/executor/deterministic.py`
 2026-09-04). Losing the tail of a log beats losing the process. The obligation
 there is not to keep the bytes, it is to be LOUD about the cut — say the output
 was bounded and roughly by how much, so nobody reads a clipped log as a
-complete one. That cited cap does NOT yet meet this bar: `_read_limited`
-returns only the retained bytes with no truncation flag, and its caller reports
-the retained length as the total — a 3 MiB stream reads as "2097152 bytes
-total". The cap is right; its silence is the improvable half, cited here as a
-counterexample to "never cut", not as a model of declaring. A silent lossy cap
-is still the defect; a declared one is a resource guard doing its job. This
+complete one. That cited cap has since been fixed AT THE READ and is no longer
+the silent-cut example it was: `_read_limited` drains the whole stream while
+retaining only `limit` bytes and returns `(retained, total_size)`, so the caller
+appends `... (truncated, N bytes total)` with N the TRUE drained total (PR
+#1796; verified in `autonomy/executor/deterministic.py` 2026-09-08).
+**It is still not a worked example of a loud cut, and the reason generalises:
+a declaration has to survive the CONSUMERS, not just be emitted.** That marker
+is appended at character 50,000 of the result field, and all six onward paths
+head-slice it at 200-2000 characters — including the one that feeds the next
+step's prompt — so the declaration is unreachable in every direction it
+travels, and the slice that removes it declares nothing itself (MEASURED
+2026-09-08). When you fix a silent cut, check the READERS of the field you just
+made honest; otherwise you have moved the silence one layer out. A silent lossy
+cap is still the defect; a declared one is a resource guard doing its job. This
 section is about the remaining case.
 
 **A handle that does not resolve is a separate defect, and do not conflate the
@@ -669,6 +677,60 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
   and report the conflict instead. The cleanest way to avoid the window entirely
   is to mutate inside an isolated worktree nobody else is editing.
+- **A RED for the WRONG REASON is not a verify-RED — read WHICH assertion
+  fired, never just that one did.** The six causes above all ask why an
+  expected RED came back GREEN. This is the mirror, and the dangerous half of
+  it passes review: the run failed, so the checklist is satisfied and the test
+  is trusted, but it failed on something other than the defect. **The tell is
+  any failure line you have not actually read.** Two shapes, and they cost
+  differently:
+  1. **The PRIMARY assertion fired, but on a condition the FIXTURE created**
+     rather than the defect — a leftover competing candidate, an unaged file,
+     stale state from setup. This one goes green on the fix, because the fix's
+     side effects remove the condition, so it passes review and pins nothing.
+     This is the expensive one.
+  2. **A guard-the-guard / precondition assertion fired FIRST**, which proves
+     the fixture never built the hazard at all. This one does NOT go green on
+     the fix — the fixture is unchanged, so it fails again and says so. It
+     costs a round, not a false green, and the guard is doing exactly its job
+     (see the vacuous-shapes bullet below, which prescribes adding one).
+     Repair the fixture and re-run before recording a RED.
+  MEASURED twice in one session on the same PR: a fileless-session test whose
+  file was not yet aged past the 60-second window, and a selection test with a
+  competing candidate still in the tree — each reported a textbook RED while
+  exercising nothing. Name the assertion that fired and confirm its message
+  describes the defect. A RED you have not read is a GREEN you have not earned.
+- **A fixture must create the shape its docstring claims — and the check is the
+  guard-the-guard assert, not a re-read.** This is the same obligation as the
+  vacuous-shapes bullet below; the addition here is WHERE the shape most often
+  goes wrong, which is a contract between two components. Two ways to break it,
+  both MEASURED in one session, and both PASS against the unfixed code — which
+  is the only way they are caught: a **hand-written intermediate** (the test fed
+  the consumer a value the real producer never emits, so the arity mismatch it
+  claimed to pin was never present) and an **inlined copy of the fix** (the test
+  ran the corrected logic as a snippet instead of invoking the real script, so
+  it graded its own copy and the shipped file never executed). If the defect
+  lives in the seam between a producer and a consumer, drive the REAL producer
+  into the REAL consumer; anything typed by hand in the middle is the bug's
+  hiding place, and anything inlined is a second copy of the code under test.
+- **Two reviewers pushing OPPOSITE values for the same constant, one review
+  pass apart, is a signal about the DEPENDENCY, not about the value.** (Review
+  passes here, not the cross-model *rounds* the escalation cap counts — see
+  that section for the reserved sense.) The instinct is to adjudicate: measure
+  the box, pick the winner, move on. That answers the pass and leaves the
+  mechanism, because both reviewers are usually right about the environment
+  each has in mind — which means the code depends on something that is not
+  invariant. MEASURED: one reviewer moved a parse to field `$4`, the next moved
+  it to `$5`, and both were correct, for different releases of the tool being
+  parsed. The value was never the defect; depending on column POSITION was.
+  Remove the dependency — match the field by what it IS, derive the index, or
+  read a named output format — which is usually cheaper than a third pass of
+  picking a number. **Scope: this applies where the constant names a POSITION
+  or a shape in something external** (a field index, a column offset, an offset
+  into a format you do not control). It does NOT apply to a threshold or a
+  timeout: there the disagreement is about which failure mode each reviewer has
+  in mind, and the Timeout Policy above governs — name the failure mode, and
+  the value follows from it.
 - **Vacuous-test shapes to check for by name** (a list of the common ones, not a
   definition). The most frequent in practice is the one that never ran at all: a
   test SKIPPED by a marker, or deselected by a `-k` filter or a wrong path, which
