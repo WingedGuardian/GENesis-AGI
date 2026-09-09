@@ -284,12 +284,34 @@ class StandaloneAdapter:
                         # Entering a stall episode — warn once, then suppress
                         # per-sample noise until it clears.
                         lagging = True
+                        # Report the MEASUREMENT, not a diagnosis. This line used
+                        # to assert "background work is starving the loop; recall
+                        # 503s correlate here" on every episode. Nothing measured
+                        # that correlation, and it fires at a 250ms default
+                        # threshold — an order of magnitude under the 4.5s recall
+                        # budget — so it named a cause it could not have observed.
+                        # It cost a real investigation: the claim was taken as
+                        # evidence, and recall timeouts turned out to be
+                        # read-pool checkout contention, unrelated to loop lag.
+                        #
+                        # `workers` is len(executor._threads) — threads ever
+                        # CREATED, which never shrinks. It is NOT an occupancy
+                        # gauge, and once the pool has touched its cap it reads
+                        # cap-forever, identically at rest and under load.
+                        # `pending` is the only saturation signal, so label it
+                        # rather than dumping a dict a reader will misread.
+                        pending = (executor or {}).get("pending")
                         logger.warning(
-                            "event-loop lag %.0fms (interval %.0fms) — background "
-                            "work is starving the loop; recall 503s correlate here; "
-                            "executor=%s (further lag suppressed until it clears)",
+                            "event-loop lag %.0fms (interval %.0fms) — a "
+                            "synchronous frame held the loop; executor "
+                            "queue-depth(pending)=%s of max_workers=%s "
+                            "[pending>0 means to_thread work is backing up; "
+                            "workers= is threads-ever-created, not busy count] "
+                            "%s (further lag suppressed until it clears)",
                             drift_ms,
                             interval * 1000,
+                            "unknown" if pending is None else pending,
+                            (executor or {}).get("max_workers", "unknown"),
                             executor,
                         )
                 elif lagging:

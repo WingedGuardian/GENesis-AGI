@@ -107,8 +107,14 @@ does the least work needed to build the response and defers the rest:
   behind the whole server's writes under concurrent sessions. The pool gives
   them genuinely-parallel readers off that lock. It is an **optional value-add**:
   any pool miss or error falls back to the shared connection, so recall is never
-  worse than without it. Size: `GENESIS_RECALL_READ_POOL_SIZE` (default 4); kill
-  switch `GENESIS_RECALL_READ_POOL_OFF=1`. The query-embed call-site heartbeat
+  worse than without it. Size: `GENESIS_RECALL_READ_POOL_SIZE`; the default is
+  DERIVED from the host's CPU count, clamped to 4..12 (`derive_read_pool_size`),
+  because the pool size is a hard concurrency ceiling — the (size+1)th
+  simultaneous recall **blocks on checkout**, so a pool smaller than the number
+  of sessions each firing a per-prompt recall converts into request-budget
+  timeouts. MEASURED: with a fixed pool of 4, 503s appeared exactly past 4
+  concurrent recalls (0 at 1/2/4, 1/16 at 6, 7/16 at 8). Kill switch
+  `GENESIS_RECALL_READ_POOL_OFF=1`. The query-embed call-site heartbeat
   is also fired off the hot path, so `embed` no longer blocks on that write.
 
 ## Related

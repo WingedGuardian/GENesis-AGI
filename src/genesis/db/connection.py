@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -44,10 +45,53 @@ CACHE_SIZE_KIB = -262144
 # pool cheap on small installs (64 MiB × a few connections stays comfortable).
 RO_CACHE_SIZE_KIB = -65536  # 64 MiB per read-only connection
 
-# Default read-pool size. Sized for the common "several concurrent CC sessions"
-# workload — reads are sub-second, so a handful of parallel readers clears the
-# checkout queue fast. Overridable via config; floor of 1 enforced in the pool.
-DEFAULT_READ_POOL_SIZE = 4
+# Default read-pool size — DERIVED from the host, not a fixed number.
+#
+# The previous fixed 4 was justified as "reads are sub-second, so a handful of
+# parallel readers clears the checkout queue fast". MEASURED 2026-09-08 on a live
+# install, that premise is false: reads are NOT sub-second under concurrency (the
+# recall stage alone reached ~2.4s at 6 concurrent recalls), and because the
+# (size+1)th recall BLOCKS ON CHECKOUT — designed backpressure, documented on
+# ReadConnectionPool below, not a defect — the request-budget timeout rate tracked
+# the pool size exactly — 0 timeouts at 1, 2 and 4 concurrent, 1/16 at 6, 7/16 at
+# 8, against a 4.5s route budget. Several concurrent sessions each firing a
+# per-prompt recall sit right on that knee, so the shipped default was the
+# binding constraint rather than a comfortable margin.
+#
+# Each connection is one genuinely-parallel reader backed by one OS thread, so
+# CPU count is the honest driver: more readers than cores buys queueing, not
+# parallelism. Both bounds are explicit rather than implied:
+#   floor 4    — the previously shipped value, so a low-core box never REGRESSES.
+#   ceiling 12 — bounds the worst-case page cache (12 x RO_CACHE_SIZE_KIB =
+#                768 MiB) and covers observed session concurrency with headroom.
+#
+# The ceiling reads alarming next to the "a read pool multiplies the cache by its
+# size" note above, so the resident cost was MEASURED rather than assumed:
+# SQLite's cache_size is a LAZY ceiling, not an allocation. Against a ~88k-row
+# database driving real recall-shaped queries at full concurrency, a connection
+# costs ~0.65 MiB to open and ~5 MiB resident after sustained traffic — so 8
+# connections cost ~40 MiB, not 512 MiB. A much larger database or a wider scan
+# could push nearer the ceiling, which is why the ceiling exists at all.
+#
+# Overridable per install via GENESIS_RECALL_READ_POOL_SIZE; floor of 1 enforced
+# in the pool itself.
+MIN_READ_POOL_SIZE = 4
+MAX_READ_POOL_SIZE = 12
+
+
+def derive_read_pool_size(cpu_count: int | None) -> int:
+    """Clamp a host's CPU count into the read-pool bounds above.
+
+    A function rather than an inline expression so the derivation has a testable
+    seam: ``DEFAULT_READ_POOL_SIZE`` is evaluated at import time, so a test that
+    monkeypatches ``os.cpu_count`` and re-reads the constant measures nothing
+    (the module is already cached). ``cpu_count`` is passed in for the same
+    reason. ``None`` (an unknowable count) takes the floor, never 1.
+    """
+    return max(MIN_READ_POOL_SIZE, min(cpu_count or MIN_READ_POOL_SIZE, MAX_READ_POOL_SIZE))
+
+
+DEFAULT_READ_POOL_SIZE = derive_read_pool_size(os.cpu_count())
 
 # Schema migrations run rarely (deploy / server startup) but must win the write
 # lock even when other processes (concurrent CC-session MCP servers) are writing.

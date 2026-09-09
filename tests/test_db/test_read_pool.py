@@ -194,6 +194,48 @@ async def test_size_floored_at_one(db_path):
     assert ReadConnectionPool(db_path, size=-3).size == 1
 
 
+def test_default_pool_size_is_derived_within_explicit_bounds():
+    """The shipped default is DERIVED from the host, never a fixed number.
+
+    Generalizability gate: a fixed 4 was the binding constraint that produced
+    recall request-budget timeouts once several sessions each ran a per-prompt
+    recall. It must scale with the host while staying inside bounds that are
+    stated rather than implied.
+    """
+    from genesis.db.connection import (
+        DEFAULT_READ_POOL_SIZE,
+        MAX_READ_POOL_SIZE,
+        MIN_READ_POOL_SIZE,
+    )
+
+    assert MIN_READ_POOL_SIZE <= DEFAULT_READ_POOL_SIZE <= MAX_READ_POOL_SIZE
+    # The floor is the previously shipped value: a low-core host must not regress.
+    assert MIN_READ_POOL_SIZE == 4
+
+
+@pytest.mark.parametrize(
+    ("cpus", "expected"),
+    [
+        pytest.param(1, 4, id="single-core-gets-the-floor-not-1"),
+        pytest.param(4, 4, id="at-the-floor"),
+        pytest.param(8, 8, id="tracks-cpu-count-in-range"),
+        pytest.param(64, 12, id="many-cores-capped"),
+        pytest.param(None, 4, id="unknown-cpu-count-falls-back-to-floor"),
+    ],
+)
+def test_default_pool_size_derivation_across_hosts(cpus, expected):
+    """Both directions of the derivation, so neither bound can silently rot.
+
+    Calls the real ``derive_read_pool_size`` with the count INJECTED. Patching
+    ``os.cpu_count`` and re-reading ``DEFAULT_READ_POOL_SIZE`` would measure
+    nothing (the constant is computed at import time and the module is cached),
+    and recomputing the clamp here would only test this test's own arithmetic.
+    """
+    from genesis.db.connection import derive_read_pool_size
+
+    assert derive_read_pool_size(cpus) == expected
+
+
 def test_recall_read_pool_size_env(monkeypatch):
     """The size env-reader parses an int and falls back to the default on a
     missing/blank/non-integer value (a bad env value must never crash boot)."""
