@@ -1,0 +1,32 @@
+# Applies .github/labeler.yml — path-glob → label — on pull-request open and
+# push. The labels are ANNOTATIONS; nothing gates on them (see labeler.yml).
+name: Labeler
+
+on:
+  # `pull_request_target` runs the workflow from the BASE branch with a token
+  # that can write labels, which `pull_request` cannot do for a fork PR. That
+  # makes it privileged, so the job below checks out NOTHING and runs no code
+  # from the pull request — the action reads the changed-file list through the
+  # API. Never add a checkout of `github.event.pull_request.head.sha` here, and
+  # never run a build step: that is the documented path by which this trigger
+  # leaks a write token to untrusted code.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit sha, not a tag: a tag is mutable, and this job holds
+      # a token that can write to pull requests.
+      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          configuration-path: .github/labeler.yml
+          # An unlabelled pull request is a missing annotation, not a broken
+          # build: this workflow is deliberately NOT among the required checks,
+          # and a failure here must never be able to block a merge.
+          sync-labels: true

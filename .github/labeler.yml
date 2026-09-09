@@ -1,0 +1,73 @@
+# Path-glob → label, applied by .github/workflows/labeler.yml on PR open/sync.
+#
+# WHY LABELS AT ALL. The gate-fix lane (genesis-development skill) applies to a
+# pull request whose diff touches the enforcement-hook surface, and today every
+# session derives that membership by hand — reading the diff, remembering the
+# constants, judging. A label makes the same fact visible on the pull request
+# itself, to a reader who has not read the skill, before anyone opens a file.
+#
+# THESE LABELS DECIDE NOTHING. Nothing gates on them: not the merge gate, not
+# CI, not a ruleset. They are an annotation. The authority for lane membership
+# remains `_is_hook_surface_path` in scripts/hooks/git_push_guard.py, which the
+# gate actually calls — and if this file and that function ever disagree, the
+# function is right and this file is a stale mirror. Never reason from the
+# label; reason from the gate's own report (`--check-pr`) and treat the label
+# as the thing that made you look.
+#
+# The globs deliberately mirror `_HOOK_SURFACE_PREFIXES` / `_HOOK_SURFACE_FILES`
+# in prefix form, for the same reason CODEOWNERS does: a prefix keeps matching
+# when a new hook lands where an enumerated list quietly stops.
+
+gate-surface:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'scripts/hooks/**'
+          - '.claude/hooks/**'
+          - 'config/behavioral_rules/**'
+          - '.claude/settings.json'
+          - 'config/protected_paths.yaml'
+          - 'config/repo_topology.yaml'
+          - 'scripts/bash_safety_hook.sh'
+          - 'scripts/behavioral_linter.py'
+          - 'scripts/check_stale_pending.py'
+          - 'scripts/content_safety_hook.py'
+          - 'scripts/contribution_offer_hook.py'
+          - 'scripts/edit_failure_sensor.py'
+          - 'scripts/file_context_hook.py'
+          - 'scripts/file_modification_audit_hook.py'
+          - 'scripts/genesis_precompact.py'
+          - 'scripts/genesis_session_context.py'
+          - 'scripts/genesis_session_end.py'
+          - 'scripts/genesis_stop_hook.py'
+          - 'scripts/genesis_urgent_alerts.py'
+          - 'scripts/plan_bookmark_hook.py'
+          - 'scripts/pretool_check.py'
+          - 'scripts/proactive_memory_hook.py'
+          - 'scripts/procedure_advisor.py'
+          - 'scripts/review_enforcement_commit.py'
+          - 'scripts/review_enforcement_prompt.py'
+          - 'scripts/review_invalidate_on_commit.py'
+          - 'scripts/review_scope.py'
+          - 'scripts/review_state.py'
+          - 'scripts/surface_open_prs.py'
+          - 'scripts/surface_pr_updates.py'
+
+# CI and repository configuration: not hook surface, but a change here can
+# disable a required check as effectively as editing a gate.
+ci-config:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+
+# Documentation-only, in the sense the merge gate's `_is_doc_path` uses: this
+# is the shape whose post-merge verification row is auto-closed deterministically
+# (issue #1718). The label is informational — the exemption is computed from the
+# diff at merge time, never read from here.
+documentation:
+  - changed-files:
+      - all-globs-to-all-files:
+          - '!scripts/**'
+          - '!src/**'
+          - '!tests/**'
+          - '!.github/**'
+          - '!config/**'

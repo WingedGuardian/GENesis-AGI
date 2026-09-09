@@ -1,0 +1,26 @@
+{
+  "name": "Genesis Required Checks",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "test" },
+          { "context": "leak-detector" },
+          { "context": "lint" }
+        ]
+      }
+    }
+  ]
+}
