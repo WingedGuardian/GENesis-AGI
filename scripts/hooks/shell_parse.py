@@ -32,6 +32,18 @@ at its own boundary — the parser degrades gracefully, each gate decides for
 itself what an unverifiable command means. Callers must probe the RAW command:
 normalizing text before a blind-spot probe can only ever delete the evidence
 the probe looks for.
+
+There is a SECOND blind spot, and it does not look like one, which is why it
+needed its own rule. ``untokenizable`` answers "did the parse fail". It cannot
+answer "did the parse succeed at the wrong thing" — and shlex, which implements
+no shell expansion at all, resolves a word that carries one into a token bash
+would never run. When such a word sits in VERB POSITION, the module returns a
+clean parse naming an operation nobody asked for, and every gate searching for a
+real operation finds none. :func:`_verb_unresolved` marks those segments, and
+:func:`analyze_checked` reports the half of them whose cost was measured and
+found affordable, so a verb the parser cannot ESTABLISH is treated as
+unestablished rather than as absent. The other half, and the number that decided
+it, are written out beside :data:`_BLIND_UNRESOLVED_VERB`.
 """
 
 from __future__ import annotations
@@ -134,6 +146,11 @@ class Segment:
     redirects: list[str] = field(
         default_factory=list
     )  # expansion redirect targets excised from argv
+    #: The words choosing WHICH operation this segment runs carry a shell
+    #: expansion, so ``exe``/``argv`` name something other than what bash runs.
+    #: See :func:`_verb_unresolved`. A guard must not read a False verdict off
+    #: this segment's verb; :func:`analyze_checked` reports it as a blind spot.
+    verb_unresolved: bool = False
 
 
 def _redirect_operator_len(command: str, i: int) -> int | None:
@@ -1024,6 +1041,15 @@ class BlindSpot(NamedTuple):
     tokenization failed", and a consumer that forgot it kept the old behaviour with
     no signal. Removing it makes every stale comparison an AttributeError at test
     time — loud, at the one moment a silent fail-open is affordable to catch.
+
+    AND :data:`_BLIND_UNRESOLVED_VERB` DID NOT GET ONE EITHER. It looked as though
+    it needed a field: one guard must treat that cause differently, because its
+    engage-test is the operation's NAME in the raw text and this is the one cause
+    that removes the name. A field here would have made every consumer choose
+    again, silently, which is the generator this class already paid for once. The
+    fact lives on :attr:`Segment.verb_unresolved` instead, and the guard that needs
+    it reads that against its OWN list of gated programs. Which programs are gated
+    is the guard's to say; why the parse is blind is ours.
     """
 
     cause: str
@@ -1070,6 +1096,63 @@ _BLIND_OVER_LONG = BlindSpot(
     ),
 )
 
+#: The parse SUCCEEDED and resolved a verb that is not the one bash runs. That is a
+#: different failure from the other three, and worse than any of them: the others
+#: leave the caller with nothing, this one leaves it with a confident wrong answer.
+#: A gate reading it sees "no gated operation" and cannot tell that reading apart
+#: from a command that genuinely has none.
+#:
+#: ``bounds_induced`` is False, and the reason is the same one it is False for
+#: :data:`_BLIND_UNTOKENIZABLE`: that flag means "a bound cut this parse short", and
+#: no bound fired here. The consumers that key on it exist to restore what a bound
+#: took away, so claiming a bound to reach them would be a hard block wearing the
+#: costume of a bounds regression — the exact substitution the ``refuse`` flag was
+#: removed for. Consumers that ask a broader question (``blind is not None``) net
+#: this cause as they net any other, which is an ASK where a human is present.
+_BLIND_UNRESOLVED_VERB = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        "picks the operation it performs with a name the shell builds rather than "
+        "one written out, so the guard cannot establish which operation that is"
+    ),
+    hint=(
+        "write the subcommand out literally — a variable or a substitution belongs "
+        "in an argument, where it does not decide which operation runs"
+    ),
+)
+
+#: THE OTHER HALF OF VERB POSITION IS DELIBERATELY NOT REPORTED, and the reason is
+#: measurement rather than oversight. When the PROGRAM ITSELF is built by the shell
+#: (``$PY x.py``, ``$SSH host …``), nothing about the segment is established — not
+#: the operation, not even which executable performs it. :attr:`Segment.verb_unresolved`
+#: records it, because it is true; :func:`analyze_checked` stays quiet about it,
+#: because reporting it does not pay.
+#:
+#: MEASURED end to end — parse diff over 129,179 unique real commands harvested from
+#: this install's transcripts, then the actual guards run over every candidate in
+#: both trees, counting VERDICT changes rather than parse changes:
+#:
+#:     dispatcher verb unreadable   14 commands   13 push + 10 commit allow->ask
+#:     program name unreadable   1,845 commands  203 push + 206 commit allow->ask,
+#:                                                 5 path blocks, and ONE block->allow
+#:
+#: The last cell is the decisive one. `protected_paths_guard` answers a non-bounds
+#: blind spot by REPLACING its precise segment scan with a substring fallback that
+#: its own comment calls strictly weaker — so a newly-reported blind spot on a
+#: command it used to refuse turned that refusal into an allow. That is a defect in
+#: the guard rather than in this rule (any new non-bounds cause trips it, and it is
+#: filed separately), but it means reporting a cause with this volume moves verdicts
+#: in the fail-open direction, which is not a trade a security fix gets to make. The
+#: 200-odd extra prompts alone would also put the change an order of magnitude past
+#: the cost the narrow rule pays.
+#:
+#: The residual that leaves, stated so it is not mistaken for coverage: a command
+#: that names its program with a variable is read exactly as it is today, whether or
+#: not it spells the operation. Closing it needs a way to tell such a command apart
+#: from the 1,845 — an interpreter or a remote shell held in a variable is ordinary
+#: work here — which this rule does not have, and guessing at one is how a net
+#: becomes an outage.
+
 #: Every blind spot this module can report. Exported so a test can enforce the
 #: invariant `refuse ⟹ bounds_induced` over the WHOLE domain rather than over the
 #: examples a test author happened to think of.
@@ -1079,7 +1162,12 @@ _BLIND_OVER_LONG = BlindSpot(
 #: which the hook contract reads as NON-BLOCKING, so the invariant check would itself
 #: become a fail-open. The enforcement point for an invariant is a test, which fails
 #: loudly at the one moment nothing is at stake.
-_ALL_BLIND_SPOTS = (_BLIND_UNTOKENIZABLE, _BLIND_OVER_NESTED, _BLIND_OVER_LONG)
+_ALL_BLIND_SPOTS = (
+    _BLIND_UNTOKENIZABLE,
+    _BLIND_OVER_NESTED,
+    _BLIND_OVER_LONG,
+    _BLIND_UNRESOLVED_VERB,
+)
 
 
 def over_nested(command: str) -> bool:
@@ -1159,6 +1247,14 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     command flipped three guards from BLOCK to ALLOW, because an apostrophe in a
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
     2 of 45,956 real commands a reclassification and no change of verdict.
+
+    :data:`_BLIND_UNRESOLVED_VERB` is reported LAST, which means it is reported only
+    where this function previously returned None. That is a property worth stating
+    rather than a rank: every command that already had a blind spot keeps the exact
+    cause and hint it had, so the rule can only add net coverage and can never
+    reword or re-rank an existing refusal. It also makes the change measurable — the
+    flips it causes are exactly the commands moving from "clean parse" to "blind",
+    with nothing else shifting underneath them.
     """
     segments, reason = _analyze_bounded(command)
     if reason == "length":
@@ -1167,6 +1263,8 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_OVER_NESTED
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
+    if any(_dispatcher_verb_unresolved(s) for s in segments):
+        return segments, _BLIND_UNRESOLVED_VERB
     return segments, None
 
 
@@ -1284,6 +1382,123 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     return result
 
 
+#: Characters that make a shell WORD mean something other than what it spells.
+#: shlex implements quote removal and backslash escapes faithfully and implements
+#: NO expansion whatsoever, so a word carrying one of these tokenizes CLEANLY into
+#: a token that is not the word bash finally runs. That is the whole shape of the
+#: problem this module cannot otherwise see: :func:`untokenizable` answers "did the
+#: parse fail", and here the parse SUCCEEDS while resolving something else.
+#:
+#: An ALLOWLIST, deliberately, and stated as one because the polarity is the entire
+#: safety argument. The set below is not "the spellings we have thought of" — it is
+#: the two characters that OPEN a substitution in bash's word grammar (parameter,
+#: command, arithmetic, and every quoting form layered over them), so a word free of
+#: both is one shlex and bash agree on, whatever else it contains. Enumerating the
+#: spellings instead (which quoting form, which encoding) is a denylist, and a
+#: denylist on a safety boundary is a treadmill whose every miss is a hole: the
+#: residual this rule closes was itself the second such spelling found, after a
+#: docstring had already called the first one "the one residual".
+#:
+#: TWO OTHER EXPANSIONS ARE EXCLUDED, and neither is an oversight. TILDE expansion
+#: applies only at the start of a word and only up to the first ``/``, which is
+#: strictly ahead of the basename :func:`_basename` reads — ``~/venv/bin/python``
+#: is ``python`` under every value of HOME, so flagging it would cost the common
+#: shape and buy nothing. PATHNAME expansion (``*?[``) is a real residual rather
+#: than a safe one: a glob resolves against FILENAMES, so ``git pu*`` only becomes
+#: a verb if a file of that name exists in the working directory, and otherwise
+#: stays the literal word git rejects. Closing it means flagging every ordinary
+#: ``ls *.py``-shaped word in verb position for a hazard that needs a planted file
+#: as well, which is a worse trade than saying so here.
+_EXPANSION_MARKS = ("$", "`")
+
+#: Programs whose FIRST WORDS choose the operation, so the verb is not argv[0].
+#: Per exe: (global options that consume the FOLLOWING token as a value, the
+#: first-words that dispatch a FURTHER verb). ``git push`` is one word; ``gh pr
+#: merge`` is two, because ``pr`` is a group rather than an operation.
+#:
+#: MIRRORS THE CONSUMERS — :func:`git_subcommand` and :func:`gh_pr_subcommand` —
+#: rather than modelling each CLI's grammar, and the difference is not cosmetic. A
+#: generic "the verb is the first N bare words" rule reads one word too far for
+#: every gh command that is not ``gh pr``: MEASURED over 129,179 real commands, it
+#: flagged 1,830 ``gh api <endpoint>`` invocations, whose endpoint is an ARGUMENT
+#: that routinely interpolates an issue number or a sha. A verb rule that reads an
+#: argument is not a stricter verb rule, it is a different and wrong one.
+_VERB_DISPATCHERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "git": (frozenset(_GIT_OPTS_WITH_ARG), frozenset()),
+    "gh": (frozenset({"-R", "--repo"}), frozenset({"pr"})),
+}
+
+
+def _word_is_literal(token: str) -> bool:
+    """Whether *token* means, to bash, exactly the characters it spells."""
+    return not any(mark in token for mark in _EXPANSION_MARKS)
+
+
+def _verb_unresolved(argv: list[str]) -> bool:
+    """Whether this argv's VERB — the words that decide WHICH operation runs —
+    carries a shell expansion, so the parse cannot establish what it is.
+
+    Two positions qualify, and only these two:
+
+    * the executable's BASENAME. Only the basename, because that is what
+      :func:`_basename` reads and what a gate compares: ``$HOME/bin/git`` and
+      ``~/venv/bin/python`` resolve to ``git`` and ``python`` no matter what the
+      leading component expands to, so flagging them would be a pure over-block
+      with no hazard behind it. ``/usr/bin/$X`` does NOT resolve, and is flagged.
+    * for a multi-verb dispatcher, the words that select the subcommand — plus any
+      option word passed on the way to it, because an unreadable option can shift
+      which word lands in the verb slot.
+
+    An ARGUMENT is deliberately out of scope. ``git commit -m "$msg"``,
+    ``rm "$f"``, ``echo $PATH`` are ordinary work; a gate that asked about every
+    variable in every argument would be turned off within a week, and the failure
+    this closes is specifically that the OPERATION is unestablished while the
+    parse reports success. What an unresolved argument costs a path or flag gate
+    is a different question with a different answer, and is not answered here.
+
+    Returns False for an empty argv — nothing executes, so there is no verb.
+    """
+    if not argv:
+        return False
+    if not _word_is_literal(_basename(argv[0])):
+        return True
+    spec = _VERB_DISPATCHERS.get(_basename(argv[0]))
+    if spec is None:
+        return False
+    value_flags, groups = spec
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if not _word_is_literal(tok):
+            return True  # the verb itself, or an option that decides where it sits
+        if tok in value_flags:
+            i += 2  # the value is not verb position — skip it unread
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if tok in groups:
+            groups = frozenset()  # a group name: the NEXT bare word is the verb
+            i += 1
+            continue
+        return False  # the verb, read plainly
+    return False  # ran out of words before the verb was complete — nothing to hide
+
+
+def _dispatcher_verb_unresolved(seg: Segment) -> bool:
+    """The narrower half of :attr:`Segment.verb_unresolved`: the PROGRAM resolved,
+    and it is one whose first words select the operation — but those words did not.
+
+    This is the half a guard may act on WITHOUT first looking for the operation's
+    name in the raw text, because here that name is exactly what is missing. The
+    other half — the program itself unreadable — is recorded on the Segment and
+    deliberately NOT reported as a blind spot; the measurement that decided that,
+    and the residual it leaves, are written out beside
+    :data:`_BLIND_UNRESOLVED_VERB`.
+    """
+    return bool(seg.verb_unresolved and seg.argv and _basename(seg.argv[0]) in _VERB_DISPATCHERS)
+
+
 def analyze(command: str) -> list[Segment]:
     """Parse a Bash command into executed Segments (nested scripts flattened).
 
@@ -1352,7 +1567,14 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         argv = _strip_wrappers(_argv(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
-            Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
+            Segment(
+                exe=exe,
+                argv=argv,
+                override=override,
+                raw=raw,
+                redirects=list(seg.redirects),
+                verb_unresolved=_verb_unresolved(argv),
+            )
         )
         nested = []
         if exe in _NESTED:
@@ -1386,6 +1608,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                         raw=inner.raw,
                         depth=inner.depth + 1,
                         redirects=inner.redirects,
+                        verb_unresolved=inner.verb_unresolved,
                     )
                 )
     return out, ("depth" if truncated else None)
