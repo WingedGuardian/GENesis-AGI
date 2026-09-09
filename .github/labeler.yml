@@ -65,9 +65,13 @@ ci-config:
 # diff at merge time, never read from here.
 documentation:
   - changed-files:
+      # POSITIVE matching, mirroring what the merge gate's `_is_doc_path`
+      # actually accepts: prose extensions, and the conventional root document
+      # names. An exclusion-only rule labelled anything that dodged the negated
+      # globs — `.claude/settings.json`, a hook, `pyproject.toml` — as
+      # documentation, so a hook change could carry BOTH `gate-surface` and
+      # `documentation` (Codex P3, PR #1907). The label is an annotation and
+      # decides nothing; it should still not say the opposite of the classifier
+      # it names.
       - all-globs-to-all-files:
-          - '!scripts/**'
-          - '!src/**'
-          - '!tests/**'
-          - '!.github/**'
-          - '!config/**'
+          - '**/*.{md,rst,txt}'

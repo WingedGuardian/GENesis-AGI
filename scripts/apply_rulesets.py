@@ -98,7 +98,19 @@ def _live_definitions(repo: str) -> dict[str, dict]:
     comparison against the list view alone would silently pass a ruleset whose
     every rule had been deleted.
     """
-    listing = _gh_json(["api", f"repos/{repo}/rulesets"])
+    # `--paginate`: a repo with more than one page of rulesets would otherwise
+    # report a declared ruleset on page 2 as ABSENT, and `--apply` would try to
+    # CREATE a duplicate of something that already exists.
+    # `includes_parents=false`: for an org-owned repo this endpoint also returns
+    # inherited ORG rulesets by default. One of those sharing a name with a
+    # local definition would be treated as repo-owned — a drifted match then
+    # PUT through the repo endpoint (which cannot reconcile it), or an exact
+    # match suppressing creation of the repo ruleset we actually declared.
+    # This repo is user-owned so neither bites here; other installs are the
+    # point (Codex P2 ×2, PR #1907).
+    listing = _gh_json(
+        ["api", "--paginate", f"repos/{repo}/rulesets?includes_parents=false"]
+    )
     live: dict[str, dict] = {}
     for row in listing or []:
         if row.get("target") != "branch":
@@ -116,7 +128,15 @@ def _normalise(value: object) -> object:
     cry wolf until nobody reads its output.
     """
     if isinstance(value, dict):
-        return {k: _normalise(v) for k, v in sorted(value.items())}
+        # Keys the SERVER adds with a null value are dropped. GitHub echoes
+        # optional fields it did not receive (`integration_id: null` on a
+        # status-check entry is the reported one), and comparing them against a
+        # local file that simply omits the key makes a freshly-applied ruleset
+        # read as drifted forever: every dry run exits 1 and every apply repeats
+        # the same PUT that changes nothing (Codex P2, PR #1907). Safe in both
+        # directions because a local definition never declares a null — an
+        # explicit null on our side would be dropped from both sides equally.
+        return {k: _normalise(v) for k, v in sorted(value.items()) if v is not None}
     if isinstance(value, list):
         return sorted((_normalise(v) for v in value), key=lambda v: json.dumps(v, sort_keys=True))
     return value
@@ -155,8 +175,22 @@ def main() -> int:
     # error message talked only about the create. Adding protection before
     # removing it makes the worst case a DUPLICATE rule — briefly stricter —
     # instead of a gap.
-    absent = [(n, d) for n, d in local.items() if n not in live]
-    present = [(n, d) for n, d in local.items() if n in live]
+    # WITHIN each phase, a ruleset that grants NO bypass goes first. Filename
+    # order put the approvals update — which REMOVES the old combined
+    # status-check rule — ahead of the checks update, so on a repo where both
+    # already exist a failure between the two PUTs left required checks
+    # enforced nowhere: the very gap the create-first ordering was added to
+    # close, reached by the other path (Codex P1, PR #1907). Ordering by
+    # bypass-emptiness is not a heuristic about filenames — it is the same test
+    # that decides which ruleset a rule belongs in, so the strengthening write
+    # always lands before the weakening one.
+    def _protection_first(item: tuple[str, dict]) -> tuple[int, str]:
+        name, definition = item
+        return (1 if definition.get("bypass_actors") else 0, name)
+
+    ordered = sorted(local.items(), key=_protection_first)
+    absent = [(n, d) for n, d in ordered if n not in live]
+    present = [(n, d) for n, d in ordered if n in live]
     drift = bool(absent)
 
     for name, definition in absent:

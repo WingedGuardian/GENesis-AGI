@@ -26,6 +26,22 @@ without recreating the self-approval deadlock. This is the whole point of the
 split: before it, a single ruleset with one bypass entry made *every* rule in it
 advisory for the merging actor, so the required check was decoration.
 
+## Which rules go in which, and the test that decides
+
+One question settles it: **does the rule need approval semantics?** Only
+`pull_request` does — it asks a human to approve, and a sole maintainer cannot
+approve their own PR, so it needs the bypass to be usable at all. Nothing else
+does. `deletion` and `non_fast_forward` are pure prohibitions: nobody
+"approves" deleting `main` or force-pushing over its history, so leaving them
+in the bypassed set made them decoration for the one actor most likely to
+administer the branch — the same defect as a bypassed required check, one rule
+over (Codex P1, PR #1907). They live in the checks ruleset, where they bind.
+
+`update` and `creation` stay in the approvals ruleset. They are already
+bypassed today, so leaving them is the status quo rather than a regression, and
+direct pushes to `main` are refused by the checks ruleset anyway (below) plus
+the local push guard.
+
 ## What is required, and why exactly these three
 
 `test`, `leak-detector`, `lint` — all contexts of the `CI` workflow, matched by

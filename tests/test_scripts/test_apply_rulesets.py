@@ -59,6 +59,33 @@ def test_the_checks_ruleset_requires_exactly_the_agreed_contexts():
     )
 
 
+def test_destructive_rules_live_where_they_bind():
+    """VERIFY-RED: move `deletion` or `non_fast_forward` back into the
+    approvals ruleset and this fails.
+
+    The test that decides which ruleset a rule belongs in is: does it need
+    APPROVAL semantics? Only `pull_request` does. Nobody approves deleting
+    `main` or force-pushing over its history, so leaving those in the bypassed
+    set made them decoration for the actor most likely to administer the branch
+    — the same defect as a bypassed required check, one rule over (Codex P1,
+    PR #1907).
+    """
+    approvals = json.loads((_RULESET_DIR / "approvals.json").read_text())
+    checks = json.loads((_RULESET_DIR / "checks.json").read_text())
+    destructive = {"deletion", "non_fast_forward"}
+    assert destructive <= {r["type"] for r in checks["rules"]}, (
+        "destructive-history rules must sit in the ruleset with NO bypass"
+    )
+    assert not (destructive & {r["type"] for r in approvals["rules"]})
+
+
+def test_only_the_approval_rule_needs_the_bypassed_ruleset():
+    """The converse, so the split cannot quietly grow. Anything beyond the
+    known-bypassed set appearing here is a decision, not a tidy-up."""
+    approvals = json.loads((_RULESET_DIR / "approvals.json").read_text())
+    assert {r["type"] for r in approvals["rules"]} == {"pull_request", "update", "creation"}
+
+
 def test_the_approvals_ruleset_keeps_its_bypass():
     """The asymmetry is the design, so it is pinned from both sides.
 
@@ -293,7 +320,7 @@ def test_the_live_read_fetches_each_ruleset_in_full(mod, monkeypatch):
     def fake(args):
         url = args[-1]
         calls.append(url)
-        if url.endswith("/rulesets"):
+        if "/rulesets?" in url or url.endswith("/rulesets"):
             return [{"id": 7, "name": "Genesis Required Checks", "target": "branch"}]
         return {
             "id": 7,
@@ -307,7 +334,48 @@ def test_the_live_read_fetches_each_ruleset_in_full(mod, monkeypatch):
 
     monkeypatch.setattr(mod, "_gh_json", fake)
     live = mod._live_definitions("owner/name")
-    assert calls == ["repos/owner/name/rulesets", "repos/owner/name/rulesets/7"], (
+    assert len(calls) == 2, f"expected a listing then a by-id fetch, got {calls}"
+    assert calls[0].startswith("repos/owner/name/rulesets"), calls[0]
+    assert "includes_parents=false" in calls[0], (
+        "the listing must exclude inherited org rulesets"
+    )
+    assert calls[1] == "repos/owner/name/rulesets/7", (
         "each ruleset must be re-fetched by id, not read from the list view"
     )
     assert live["Genesis Required Checks"]["rules"], "the full read must carry `rules`"
+
+
+def test_a_no_bypass_ruleset_is_applied_before_a_bypassed_one(mod):
+    """Protection is added before anything that can remove it.
+
+    VERIFY-RED: sort by name instead and this fails, because "Genesis Main
+    Ruleset" precedes "Genesis Required Checks" alphabetically — which is
+    exactly the order that left required checks enforced NOWHERE when a PUT
+    failed between the two (Codex P1, PR #1907).
+    """
+    local = mod._local_definitions()
+    ordered = sorted(
+        local.items(),
+        key=lambda item: (1 if item[1].get("bypass_actors") else 0, item[0]),
+    )
+    names = [name for name, _ in ordered]
+    assert names[0] == "Genesis Required Checks", (
+        f"the no-bypass ruleset must be reconciled first; got {names}"
+    )
+
+
+def test_server_added_nulls_are_not_drift(mod):
+    """GitHub echoes optional fields it was not given (`integration_id: null`).
+    Comparing those against a local file that omits the key would make a
+    freshly-applied ruleset read as drifted forever."""
+    local = {"rules": [{"type": "required_status_checks", "parameters": {"a": 1}}]}
+    live = {"rules": [{"type": "required_status_checks", "parameters": {"a": 1, "b": None}}]}
+    assert mod._differences(local, live) == []
+
+
+def test_a_real_value_still_differs_from_an_absent_one(mod):
+    """The negative control for the rule above: dropping NULLs must not also
+    drop a key whose value is real, or the comparison stops detecting drift."""
+    local = {"rules": [{"type": "x"}]}
+    live = {"rules": [{"type": "x", "parameters": {"b": 5}}]}
+    assert "rules" in mod._differences(local, live)
