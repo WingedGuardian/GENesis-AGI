@@ -334,13 +334,26 @@ def session_read_pool_size() -> int:
     """
     from genesis.db.connection import DEFAULT_SESSION_READ_POOL_SIZE
 
-    raw = os.environ.get("GENESIS_SESSION_READ_POOL_SIZE", "").strip()
-    if not raw:
-        return DEFAULT_SESSION_READ_POOL_SIZE
-    try:
-        return int(raw)
-    except ValueError:
-        return DEFAULT_SESSION_READ_POOL_SIZE
+    # Precedence: the new per-session knob, then the LEGACY one, then the default.
+    #
+    # The legacy fallback is a compatibility obligation, not politeness. Before
+    # the role split this process honoured GENESIS_RECALL_READ_POOL_SIZE, so an
+    # install that set it to CONSTRAIN per-session resource use — say 1 — would
+    # otherwise be silently RAISED to the new default on upgrade, in every live
+    # MCP child at once. That is the opposite of what such an operator asked for,
+    # and nothing would report it.
+    for var in ("GENESIS_SESSION_READ_POOL_SIZE", "GENESIS_RECALL_READ_POOL_SIZE"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            # A malformed value in the PREFERRED variable must not silently fall
+            # through to the legacy one — that would let a typo change which knob
+            # is in effect. Take the default, as the server-side reader does.
+            return DEFAULT_SESSION_READ_POOL_SIZE
+    return DEFAULT_SESSION_READ_POOL_SIZE
 
 
 # SQLite busy_timeout default (ms). Defined HERE, not in db/connection.py: it is

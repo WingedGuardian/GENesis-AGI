@@ -359,6 +359,32 @@ def test_session_pool_is_sized_by_ROLE_not_by_the_host(monkeypatch):
     assert env.session_read_pool_size() == DEFAULT_SESSION_READ_POOL_SIZE
 
 
+def test_session_pool_honours_the_legacy_knob_on_upgrade(monkeypatch):
+    """An install that CONSTRAINED the child via the old variable must stay
+    constrained after the role split.
+
+    Before the split this process honoured GENESIS_RECALL_READ_POOL_SIZE. An
+    operator who set it to 1 to limit per-session resource use would otherwise be
+    silently RAISED to the new default on upgrade, in every live MCP child at
+    once — the opposite of what they asked for, with nothing reporting it.
+    """
+    from genesis import env
+    from genesis.db.connection import DEFAULT_SESSION_READ_POOL_SIZE
+
+    monkeypatch.delenv("GENESIS_SESSION_READ_POOL_SIZE", raising=False)
+    monkeypatch.setenv("GENESIS_RECALL_READ_POOL_SIZE", "1")
+    assert env.session_read_pool_size() == 1, "legacy constraint silently lifted"
+
+    # The NEW variable wins when both are set — the split still has to work.
+    monkeypatch.setenv("GENESIS_SESSION_READ_POOL_SIZE", "6")
+    assert env.session_read_pool_size() == 6
+
+    # A malformed PREFERRED value takes the default rather than falling through
+    # to the legacy one; a typo must not change which knob is in effect.
+    monkeypatch.setenv("GENESIS_SESSION_READ_POOL_SIZE", "oops")
+    assert env.session_read_pool_size() == DEFAULT_SESSION_READ_POOL_SIZE
+
+
 def test_session_pool_knob_reaches_the_mcp_child():
     """A knob the MCP child READS must also be in its env ALLOWLIST, or it is inert.
 
