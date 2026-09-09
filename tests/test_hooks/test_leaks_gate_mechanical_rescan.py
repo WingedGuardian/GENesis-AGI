@@ -648,6 +648,22 @@ class TestSupersededConcurrencyCancels:
         msg = _gate()
         assert msg and "leaks" in msg
 
+    def test_equal_timestamp_cancel_blocks_relief(self, monkeypatch):
+        """The tie rule AT THE GATE, not only at the primitive. This is the cell Codex's
+        P1 named: a genuine cancellation in the same second as a success would, under
+        `>=`, let an OLD leaks review be carried forward while the latest scanner
+        attempt was in fact cancelled."""
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv(
+            "_TEST_GH_ROLLUP_WITH_HEAD",
+            _rollup_entries(
+                _run("CANCELLED", completed_at=SUCCESS_AT),
+                _run("SUCCESS", completed_at=SUCCESS_AT),
+            ),
+        )
+        msg = _gate()
+        assert msg and "leaks" in msg
+
     def test_cancel_survives_when_the_pair_is_entirely_dropped(self, monkeypatch):
         """A rollup whose ONLY scanner entry is a droppable cancel is impossible by
         construction (a drop implies a SUCCESS sibling), but the reader must still
@@ -697,6 +713,17 @@ class TestBothConsumersAgree:
         )
         assert (ci_state, scanner) == ("red", False)
 
+    def test_equal_timestamp_cancel_is_red_to_both(self, monkeypatch):
+        """The tie rule must be the SAME rule on both sides. If a future edit relaxed
+        the boundary in one consumer only, this is where the two would part company —
+        which is the exact failure class this PR exists to remove."""
+        ci_state, scanner = self._both(
+            monkeypatch,
+            _run("CANCELLED", completed_at=SUCCESS_AT),
+            _run("SUCCESS", completed_at=SUCCESS_AT),
+        )
+        assert (ci_state, scanner) == ("red", False)
+
     def test_failure_beside_a_dropped_cancel_is_red_to_both(self, monkeypatch):
         ci_state, scanner = self._both(
             monkeypatch,
@@ -720,9 +747,24 @@ class TestDropSupersededCancelsUnit:
         other = _run("FAILURE", name="lint", completed_at=LATER_AT)
         assert _mod._drop_superseded_cancels([cancel, success, other]) == [success, other]
 
-    def test_equal_timestamps_drop(self):
-        """AT OR AFTER: a success completing in the same second supersedes."""
+    def test_equal_timestamps_do_not_drop(self):
+        """STRICTLY AFTER: an EQUAL second-precision timestamp orders nothing, so it is
+        not evidence the success came second — and on a real supersession the successful
+        run starts when the cancel fires and finishes a whole job later, so a tie is not
+        even the shape this drop recognises. Unprovable ordering fails CLOSED.
+
+        (Codex P1. The `>=` was INHERITED from the working CI path, where 'at or after'
+        was deliberate wording; the extraction gave it a second caller — the relief
+        path — where the consequence is granting relief, and under `# ci-override` that
+        relief is the only remaining check of the mechanical layer.)"""
         cancel = _run("CANCELLED", completed_at=SUCCESS_AT)
+        success = _run("SUCCESS", completed_at=SUCCESS_AT)
+        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success]
+
+    def test_strictly_later_success_still_drops(self):
+        """CONTROL for the tie rule: tightening the boundary must not blind the drop.
+        One second later is still a supersession (the #1839 pair was 60s apart)."""
+        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
         success = _run("SUCCESS", completed_at=SUCCESS_AT)
         assert _mod._drop_superseded_cancels([cancel, success]) == [success]
 
@@ -771,6 +813,89 @@ class TestDropSupersededCancelsUnit:
         before = json.dumps(entries)
         _mod._drop_superseded_cancels(entries)
         assert json.dumps(entries) == before
+
+
+class TestWorkflowDisplayNameIsUniqueProvenance:
+    """Codex P1: `(name, workflowName)` is only unique provenance while no two workflow
+    FILES share one display name — and GitHub does not require that.
+
+    ESTABLISHED, not assumed. GitHub's workflow-syntax reference documents `name:` as
+    "The name of the workflow. GitHub displays the names of your workflows under your
+    repository's Actions tab. If you omit name, GitHub displays the workflow file path
+    relative to the root of the repository." No uniqueness constraint is stated
+    anywhere on that page, so two files CAN both declare `name: CI`.
+
+    Why that matters HERE specifically: a decoy file named `CI` publishing a job named
+    `leak-detector` would share the scanner's tuple, so its SUCCESS could supersede the
+    real scanner's CANCELLED in `_drop_superseded_cancels` AND then satisfy the pin in
+    `_mechanical_scan_is_green`. Before this PR the relief path had no drop at all, so
+    both entries were collected and the cancel blocked; the extraction is what makes a
+    decoy able to erase a real cancellation. That widening is real and it is why this
+    guard exists.
+
+    Unique provenance DOES exist in GitHub's GraphQL schema —
+    `checkSuite.workflowRun.workflow.databaseId` and `checkSuite.workflowRun.file.path`
+    — but `gh pr view --json statusCheckRollup` does NOT expose it. MEASURED: a rollup
+    entry carries exactly `__typename, completedAt, conclusion, detailsUrl, name,
+    startedAt, status, workflowName`. `detailsUrl` embeds a RUN id, which is unique per
+    run but does not identify the workflow FILE — two runs of the same file also differ
+    — so it cannot separate a decoy from a legitimate re-run without a second API call.
+    Pinning on real provenance therefore means abandoning `gh pr view --json` for a raw
+    GraphQL query: a rewrite of this gate's read path, not a fix inside this PR.
+
+    So this guard closes the PRECONDITION instead of the consequence, which is cheap and
+    complete for the reachable case: `workflowName` is populated only for GitHub Actions
+    check-runs, and Actions check-runs on this repo's commits come from this repo's own
+    workflow files. A non-Actions app's check-run has no workflowName, so `_ci_identity`
+    returns None and it can never be a sibling. Note `.github/workflows/` is NOT on the
+    hook surface (`_HOOK_SURFACE_PREFIXES`), so a new workflow file gets no extra review
+    — this test is the only thing that would catch the collision."""
+
+    _WORKFLOW_DIR = _WORKTREE / ".github" / "workflows"
+
+    def _display_names(self) -> dict[str, list[str]]:
+        import yaml
+
+        names: dict[str, list[str]] = {}
+        for path in sorted(self._WORKFLOW_DIR.glob("*.y*ml")):
+            try:
+                doc = yaml.safe_load(path.read_text()) or {}
+            except yaml.YAMLError as exc:  # a malformed workflow is its own failure
+                pytest.fail(f"{path.name} is not parseable YAML: {exc}")
+            # An omitted `name:` makes GitHub display the file path, which is unique by
+            # construction — so those cannot collide and are not tracked.
+            declared = doc.get("name") if isinstance(doc, dict) else None
+            if isinstance(declared, str) and declared.strip():
+                names.setdefault(declared.strip(), []).append(path.name)
+        return names
+
+    def test_workflow_dir_exists_and_has_named_workflows(self):
+        """Guard-the-guard: a glob that matches nothing would make every assertion below
+        vacuously true, and this test would then pass while proving nothing."""
+        assert self._WORKFLOW_DIR.is_dir(), f"{self._WORKFLOW_DIR} missing"
+        assert self._display_names(), "no workflow declares a `name:` — guard is vacuous"
+
+    def test_no_two_workflow_files_share_a_display_name(self):
+        collisions = {n: f for n, f in self._display_names().items() if len(f) > 1}
+        assert not collisions, (
+            "Two workflow files share one display name, so `(name, workflowName)` is no "
+            "longer unique provenance and a job in one can supersede a same-named job "
+            f"in the other inside the merge gate: {collisions}. Rename one, or teach "
+            "_mechanical_scan_is_green to pin on real provenance (GraphQL "
+            "checkSuite.workflowRun.file.path) instead of the display name."
+        )
+
+    def test_the_pinned_scanner_workflow_resolves_to_exactly_one_file(self):
+        """The pin is a display NAME. Assert it names exactly one file, for every kind
+        in _MECHANICAL_RESCAN_BY_KIND — so adding a kind cannot skip this check."""
+        names = self._display_names()
+        assert _mod._MECHANICAL_RESCAN_BY_KIND, "no kinds pinned — guard is vacuous"
+        for kind, (check_name, workflow) in _mod._MECHANICAL_RESCAN_BY_KIND.items():
+            files = names.get(workflow, [])
+            assert len(files) == 1, (
+                f"kind {kind!r} pins check {check_name!r} to workflow {workflow!r}, "
+                f"which resolves to {files or 'NO file'} — the pin must name exactly one."
+            )
 
 
 class TestCandidateSelection:

@@ -715,8 +715,10 @@ _CI_PENDING_STATES = {"PENDING", "EXPECTED"}
 # almost always by a `concurrency: cancel-in-progress` supersession, which leaves
 # the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
 # in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
-# (name + workflowName, see _ci_identity) concluded SUCCESS at-or-after it on this
-# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks).
+# (name + workflowName, see _ci_identity) concluded SUCCESS STRICTLY AFTER it on this
+# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks, and so does
+# an EQUAL second-precision timestamp, which orders nothing — see
+# _drop_superseded_cancels for why an unprovable ordering fails closed).
 # Deliberately scoped to CANCELLED alone: FAILURE/TIMED_OUT/ACTION_REQUIRED/
 # STARTUP_FAILURE carry real verdicts and always block, even with a success sibling.
 _CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
@@ -764,8 +766,21 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
 def _drop_superseded_cancels(checks: list) -> list:
     """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
     removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
-    ``(name, workflowName)`` identity completed AT OR AFTER it; every other entry is
+    ``(name, workflowName)`` identity completed STRICTLY AFTER it; every other entry is
     returned unchanged, in order.
+
+    STRICTLY after, not at-or-after. ``completedAt`` is second-precision, so an EQUAL
+    timestamp does not order the two runs at all — it says only that they finished in
+    the same second, which is not evidence that the success came second. On a
+    supersession the successful run STARTS when the cancel fires and finishes a whole
+    job later, so a tie is not even the shape this drop exists to recognise; a tie is
+    far likelier to be two unrelated runs, or a genuinely-cancelled latest attempt.
+    An unprovable ordering therefore fails CLOSED, like every other unresolvable case
+    below. MEASURED before tightening (the Actions runs API over 400 runs / 2 days,
+    30 real cancelled jobs on 25 shas): 18/30 had a strictly-later success, 12/30 had
+    none, and **0/30 turned on a tie** — so this costs nothing observed, and 30 is a
+    small denominator, which is precisely why the direction matters more than the
+    rate: being wrong here over-blocks, it cannot wrong-green.
 
     THE ONE home of that rule. It had two: ``_pr_ci_status`` (which has always
     applied it) and ``_mechanical_scan_is_green`` (added later, which re-derived a
@@ -803,13 +818,17 @@ def _drop_superseded_cancels(checks: list) -> list:
 
     THE ASSUMPTION THAT COMPARE RESTS ON, stated so a future reader knows what would
     invalidate it: GitHub's GraphQL ``completedAt`` is emitted as second-precision
-    UTC with a literal ``Z`` (OBSERVED on real rollups, e.g. ``2026-09-09T16:20:59Z``;
-    not verified against GitHub's schema docs). Lexicographic ordering equals
-    chronological ordering only while EVERY value shares that one format. Two shapes
-    would break it — a ``+00:00`` offset instead of ``Z``, and fractional seconds
-    (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` would compare as at-or-after
-    a cancel at ``:00.9Z`` and wrongly drop it). Both are unobserved here. If either
-    ever appears, normalise in BOTH passes before comparing — do not patch one.
+    UTC with a literal ``Z`` (MEASURED 2017/2017 entries across 122 PR rollups — every
+    one ``Z``-suffixed with no fractional part). That is an OBSERVATION, not a
+    contract: GitHub's schema documents the ``DateTime`` scalar only as "An ISO-8601
+    encoded UTC date string", which constrains neither sub-second precision nor the
+    offset spelling. Lexicographic ordering equals chronological ordering only while
+    EVERY value shares one format. Two shapes would break it — a ``+00:00`` offset
+    instead of ``Z``, and fractional seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS
+    at ``:00Z`` would compare as later than a cancel at ``:00.9Z`` and wrongly drop
+    it). Neither is observed here. If either ever appears, PARSE both sides and
+    compare datetimes — in BOTH passes; do not patch one, and do not paper over it
+    with more string rules.
     """
     # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
     success_latest: dict[tuple[str, str], str] = {}
@@ -829,7 +848,7 @@ def _drop_superseded_cancels(checks: list) -> list:
         if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
             ident = _ci_identity(c)
             cts = (c.get("completedAt") or "").strip()
-            if ident is not None and cts and success_latest.get(ident, "") >= cts:
+            if ident is not None and cts and success_latest.get(ident, "") > cts:
                 continue
         kept.append(c)
     return kept
@@ -841,9 +860,9 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
       * ``"red"``     — at least one check failed/timed-out, or was cancelled
-                        with NO same-identity SUCCESS completing at-or-after it.
+                        with NO same-identity SUCCESS completing STRICTLY AFTER it.
                         A CANCELLED CheckRun that a same (name, workflowName)
-                        SUCCESS completed at-or-after is a superseded
+                        SUCCESS completed strictly after is a superseded
                         `concurrency: cancel-in-progress` duplicate and is dropped
                         by the SHARED _drop_superseded_cancels helper (see
                         _ci_identity) — strict identity, terminal completedAt
@@ -919,7 +938,7 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
 
     # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
     # primitive (_drop_superseded_cancels — read its docstring for the strict
-    # identity + at-or-after rule and every fail-closed case). Filtering here rather
+    # identity + strictly-after rule and every fail-closed case). Filtering here rather
     # than branching inside the classify loop is behaviour-identical: a drop implies
     # a same-identity SUCCESS in this very list, and that sibling sets
     # `saw_recognized` and contributes the same casefolded `workflowName` to
@@ -4173,6 +4192,25 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # travel with a clone rather than describing one install. A suite named differently
 # simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
 # the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+#
+# THE WORKFLOW HALF IS A DISPLAY NAME, AND A DISPLAY NAME IS NOT UNIQUE PROVENANCE.
+# GitHub does not require `name:` to be unique across workflow files (its workflow-syntax
+# reference states no such constraint; an OMITTED name falls back to the file path, which
+# is unique — an explicit one is not). So a second file declaring `name: CI` with a job
+# named `leak-detector` would share this tuple, and its SUCCESS could both supersede the
+# real scanner's CANCELLED in _drop_superseded_cancels and satisfy the pin below.
+# Real provenance exists in GraphQL (checkSuite.workflowRun.workflow.databaseId, or
+# checkSuite.workflowRun.file.path) but `gh pr view --json statusCheckRollup` does NOT
+# expose it — a rollup entry carries only __typename/completedAt/conclusion/detailsUrl/
+# name/startedAt/status/workflowName, and detailsUrl's RUN id cannot separate a decoy
+# from a legitimate re-run of the same file. Pinning on provenance therefore means
+# replacing this gate's read path with a raw GraphQL query.
+# Until then the PRECONDITION is closed instead of the consequence:
+# TestWorkflowDisplayNameIsUniqueProvenance fails CI if two workflow files ever share a
+# display name, or if this pin stops resolving to exactly one file. That is complete for
+# the reachable case — workflowName is populated only for Actions check-runs, and those
+# come from this repo's own workflow files; a non-Actions check-run has no workflowName,
+# so _ci_identity returns None and it is never a sibling.
 _MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
@@ -4932,7 +4970,7 @@ def _mechanical_scan_is_green(
         return False  # an unpinned kind can never be established -> fail closed
     # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
     # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
-    # (name, workflowName) identity, a SUCCESS completing at-or-after, fail-closed on
+    # (name, workflowName) identity, a SUCCESS completing STRICTLY AFTER, fail-closed on
     # every unresolvable case). This path used to have no cancel handling at all, so a
     # doubled workflow dispatch — which leaves every check-run as a success+cancelled
     # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
