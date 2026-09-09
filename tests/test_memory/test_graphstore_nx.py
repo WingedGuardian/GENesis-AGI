@@ -13,9 +13,12 @@ Each property here was probed against WAL + aiosqlite before being designed on
 
 from __future__ import annotations
 
+import contextlib
+
 import aiosqlite
 import pytest
 
+from genesis.memory.graphstore import GraphUnavailableError
 from genesis.memory.graphstore_nx import NetworkxGraphStore
 
 pytestmark = pytest.mark.asyncio
@@ -474,5 +477,63 @@ async def test_both_paths_refuse_to_traverse_from_a_hidden_root(tmp_path):
             )
         assert {n.memory_id for n in nx_live} == {"child"}
         assert {n.memory_id for n in cte_live.nodes} == {"child"}
+    finally:
+        await db.close()
+
+
+async def test_a_database_failure_during_the_load_is_unavailable_not_a_raw_error(tmp_path):
+    """The seam's contract is that a store which cannot reach its backend RAISES
+    GraphUnavailableError — and this store honoured it for exactly one cause.
+
+    `_ensure_graph` reads SQLite twice (the invalid-id set, then memory_links)
+    and neither read was wrapped, so a locked, closed or corrupt connection came
+    out of `traverse()` as `aiosqlite.OperationalError`. `graph.py` catches only
+    GraphUnavailableError, so that escaped the facade's whole degrade chain — no
+    fallback to the CTE, no warning, just the raw error at whatever called
+    `graph.traverse()`. `memory/drift.py` and `memory/dream_centrality.py` are
+    the exposed readers; `mcp/memory/core.py` survives on a bare `except`.
+
+    Both entry points are asserted, because they reach the same unguarded reads.
+    """
+    from genesis.memory import graph as graph_mod
+
+    path = tmp_path / "g.db"
+    await _seed(path, [("a", "b")])
+    db = await aiosqlite.connect(str(path))
+    try:
+        await db.close()  # the real shape: a connection that went away under us
+
+        store = NetworkxGraphStore()
+        with pytest.raises(GraphUnavailableError, match="cannot be read"):
+            await store.traverse(db, "a", max_depth=1, min_strength=0.0)
+
+        store = NetworkxGraphStore()
+        with pytest.raises(GraphUnavailableError, match="cannot be read"):
+            await store.centrality(db, None)
+
+        # THROUGH THE FACADE, which is where a caller actually stands. Fixing
+        # the store alone only moved the leak: `graph.traverse` catches the
+        # store's typed error and retries the recursive CTE on the SAME dead
+        # connection, whose raw error then escaped in its place. MEASURED before
+        # this was closed: a bare `ValueError: no active connection` reached the
+        # caller, after a log line claiming a fallback had happened.
+        with pytest.raises(GraphUnavailableError, match="both failed"):
+            await graph_mod.traverse(db, "a", max_depth=1, min_strength=0.0)
+    finally:
+        with contextlib.suppress(Exception):
+            await db.close()
+
+
+async def test_a_healthy_database_still_answers(tmp_path):
+    """Control for the test above. Without it, a store that raised
+    GraphUnavailableError unconditionally would pass and prove nothing.
+    """
+    path = tmp_path / "ok.db"
+    await _seed(path, [("a", "b")])
+    db = await aiosqlite.connect(str(path))
+    try:
+        nodes = await NetworkxGraphStore().traverse(db, "a", max_depth=1, min_strength=0.0)
+        assert {n.memory_id for n in nodes} == {"b"}
+        assert await NetworkxGraphStore().centrality(db, None) is not None
     finally:
         await db.close()

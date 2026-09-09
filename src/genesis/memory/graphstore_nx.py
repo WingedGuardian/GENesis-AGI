@@ -259,15 +259,35 @@ class NetworkxGraphStore:
         #    an edge committed between them is filtered against an invalid-set
         #    read just before it. Self-healing — pre_load_version is stamped
         #    ahead of BOTH, so the next read rebuilds.
-        invalid = await invalid_memory_ids(db)
-        cursor = await db.execute(
-            "SELECT source_id, target_id, link_type, strength FROM memory_links"
-        )
-        rows = [
-            row
-            for row in await cursor.fetchall()
-            if row[0] not in invalid and row[1] not in invalid
-        ]
+        # The two DB reads are wrapped TOGETHER, and only they. The seam's
+        # contract says a store that cannot reach its backend raises
+        # GraphUnavailableError — and this store honoured that for exactly one
+        # cause, a missing NetworkX. Everything else escaped raw: a locked,
+        # closed or corrupt connection came out of `traverse()` as an aiosqlite
+        # error, or (measured) a bare `ValueError: no active connection`.
+        # `graph.py` catches only GraphUnavailableError, so those bypassed the
+        # facade's entire degrade chain — no fallback to the CTE, no warning,
+        # the raw error surfacing at whatever called `traverse()`. `drift.py`
+        # and `dream_centrality.py` are the exposed readers; `mcp/memory/core.py`
+        # survives only on a bare `except`.
+        #
+        # Scoped to the READS on purpose. A failure in the graph BUILD below is
+        # a defect in this module, not an unreachable backend, and laundering it
+        # into "unavailable" would send a caller to a fallback for a bug that
+        # the fallback shares. `_data_version` guards itself already and
+        # degrades to None rather than raising, which is its own documented
+        # choice and is left alone.
+        try:
+            invalid = await invalid_memory_ids(db)
+            cursor = await db.execute(
+                "SELECT source_id, target_id, link_type, strength FROM memory_links"
+            )
+            fetched = await cursor.fetchall()
+        except Exception as exc:
+            raise GraphUnavailableError(
+                f"the memory database cannot be read — the graph cannot be built: {exc}"
+            ) from exc
+        rows = [row for row in fetched if row[0] not in invalid and row[1] not in invalid]
 
         # MultiDiGraph, not DiGraph: memory_links' primary key is
         # (source_id, target_id, link_type), so one pair may legitimately carry

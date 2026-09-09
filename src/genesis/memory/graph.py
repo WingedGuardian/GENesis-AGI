@@ -126,7 +126,23 @@ async def traverse(
             "Graph store %r unavailable — falling back to the recursive CTE: %s",
             getattr(_store, "name", "?"), exc, exc_info=True,
         )
-        nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
+        try:
+            nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
+        except Exception as cte_exc:
+            # The fallback reads the SAME connection the store just failed on,
+            # so every non-transient cause — a closed handle, a missing table, a
+            # corrupt file — fails it identically. Without this, making the
+            # store raise properly only moved the leak one layer: the store's
+            # error was caught here and the CTE's raw one escaped in its place.
+            # MEASURED against this facade on a closed connection: `traverse()`
+            # raised a bare `ValueError: no active connection` at the caller,
+            # after logging a line that said it was falling back.
+            #
+            # The one cause the fallback genuinely rescues is a transient
+            # `database is locked`, which is why it still runs first.
+            raise GraphUnavailableError(
+                f"the graph store and its SQL fallback both failed: {cte_exc}"
+            ) from cte_exc
 
     elapsed_ms = (time.monotonic() - start) * 1000
 
