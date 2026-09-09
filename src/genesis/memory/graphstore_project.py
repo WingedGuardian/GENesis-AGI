@@ -44,11 +44,12 @@ async def build(graph_key: str = GRAPH_KEY) -> dict[str, int]:
     # would silently open `.../memory` instead — the wrong file, with no error.
     # `safe="/"` keeps the separators. Same shape as `inbox/writer.py`.
     #
-    # NOTE for a class sweep, not this PR: `connect(f"file:{path}?mode=ro")`
-    # without quoting is the prevailing pattern in this repo (~20 sites across
-    # db/data_migrations, attention, channels/voice, db/crud and eval, measured
-    # 2026-09-08). This fixes the instance this PR introduced rather than
-    # shipping a new member of a known class; the sweep is its own change.
+    # The sweep is issue #1872, not this PR: `connect(f"file:{path}?mode=ro")`
+    # without quoting is the prevailing pattern here — MEASURED 2026-09-08, 34
+    # sites in `src/genesis/` across 24 files, plus 12 in `scripts/`. (An
+    # earlier revision of this comment said "~20", read off a truncated grep;
+    # the count above is the full one.) This fixes the instance this PR
+    # introduced rather than shipping a new member of a known class.
     db = await aiosqlite.connect(f"file:{quote(str(db_path), safe='/')}?mode=ro", uri=True)
     try:
         return await store.project(db)
