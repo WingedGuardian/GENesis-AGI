@@ -24,6 +24,7 @@ Blocked:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -37,6 +38,12 @@ from shell_parse import (  # noqa: E402
     has_trailing_override,
     is_pytest_invocation,
 )
+
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the full suite RUNS.
+    discarded_write = None  # type: ignore[assignment]
 
 _OVERRIDE = "full-suite-ok"
 
@@ -126,6 +133,9 @@ def _targets_specific_test(args: list[str]) -> bool:
 
 def main() -> None:
     cmd = field(read_payload(), "command")
+    if discarded_write is not None:
+        with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+            discarded_write.remember(cmd)
     if not cmd:
         return
     try:
@@ -159,6 +169,9 @@ def main() -> None:
             f"'# full-suite-ok' still works on the parsed path.",
             file=sys.stderr,
         )
+        if discarded_write is not None:
+            with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                discarded_write.warn()
         sys.exit(2)
 
     pytest_segs = [s for s in segments if is_pytest_invocation(s)]
@@ -179,6 +192,9 @@ def main() -> None:
         f"local full run, append '# {_OVERRIDE}' to the command.",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+            discarded_write.warn()
     sys.exit(2)
 
 

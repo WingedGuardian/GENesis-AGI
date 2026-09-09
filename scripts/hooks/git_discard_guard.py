@@ -115,6 +115,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 from shell_parse import analyze_checked, has_trailing_override  # noqa: E402
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the clean/checkout RUNS.
+    discarded_write = None  # type: ignore[assignment]
+
 #: The chokepoint, parsed ONCE per process. `main` reaches three consumers that each
 #: analyse the SAME command string (_clean_violation, _submodule_recurse_violation,
 #: _record_snapshots), and the parse is a pure function of that string — so three
@@ -636,6 +642,9 @@ def main() -> int:
         cmd = field(payload, "command")
     except Exception:
         return 0  # unreadable payload — nothing to act on; fail OPEN
+    if discarded_write is not None:
+        with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+            discarded_write.remember(cmd)
     if not cmd or "git" not in cmd:
         return 0
     if not any(s in cmd for s in _TRIGGER_SUBSTRINGS):
@@ -659,6 +668,9 @@ def main() -> int:
             # and, on the direct wiring, downgrade exit 1 to non-blocking).
             with contextlib.suppress(OSError):
                 print(block_msg, file=sys.stderr)
+            if discarded_write is not None:
+                with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                    discarded_write.warn()
             return 2
 
     # Phase 1b — submodule-RECURSIVE overwrite is UNRECOVERABLE by the superproject
@@ -675,6 +687,9 @@ def main() -> int:
             if sub_msg:
                 with contextlib.suppress(OSError):
                     print(sub_msg, file=sys.stderr)
+                if discarded_write is not None:
+                    with contextlib.suppress(Exception):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                        discarded_write.warn()
                 return 2
 
     # Phase 2 — the snapshot recovery net (ADVISORY → fail OPEN).

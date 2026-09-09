@@ -33,6 +33,15 @@ from shell_parse import (  # noqa: E402
     split_segments,
 )
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED ON PURPOSE. An unguarded import that
+    # failed would abort this module's load → exit 1 → which CC reads as a
+    # NON-blocking error → the commit RUNS. A cosmetic note must never be able to
+    # fail this gate open. Sentinel + null-check is the house pattern
+    # (git_push_guard.py's push_allowlist).
+    discarded_write = None  # type: ignore[assignment]
+
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
 # a variable/command-substitution, a subshell, or a commit nested at depth>0).
 # Fail closed on it — treat as main (block Rule 1) and do NOT take the docs skip.
@@ -641,6 +650,10 @@ def main() -> None:
     # Parse tool input
     payload = read_payload()
     command = field(payload, "command")
+    # Hand the command over ONCE, here, where it is already extracted: stdin is
+    # consumed by read_payload, so nothing further down can read it again.
+    if discarded_write is not None:
+        discarded_write.remember(command)
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 
@@ -1285,8 +1298,14 @@ def main() -> None:
 
 
 def _deny(message: str) -> None:
-    """Output denial message and block the tool via exit code 2."""
+    """Output denial message and block the tool via exit code 2.
+
+    Every refusal in this file funnels through here, so the discarded-command
+    note is emitted once, at the single chokepoint, rather than at 15 call sites.
+    """
     print(message, file=sys.stderr)
+    if discarded_write is not None:
+        discarded_write.warn()
     sys.exit(2)
 
 
@@ -1299,6 +1318,13 @@ def _ask(reason: str) -> None:
     self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
     stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
     """
+    # A prompt has NOT discarded anything yet, so it warns about what DECLINING
+    # costs — a different tense from the refusal note, and the one an operator
+    # reading the dialog actually needs.
+    if discarded_write is not None:
+        extra = discarded_write.prompt_note()
+        if extra:
+            reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {
