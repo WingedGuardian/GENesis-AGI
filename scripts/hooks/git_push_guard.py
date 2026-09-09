@@ -761,6 +761,80 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
     return None
 
 
+def _drop_superseded_cancels(checks: list) -> list:
+    """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
+    removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
+    ``(name, workflowName)`` identity completed AT OR AFTER it; every other entry is
+    returned unchanged, in order.
+
+    THE ONE home of that rule. It had two: ``_pr_ci_status`` (which has always
+    applied it) and ``_mechanical_scan_is_green`` (added later, which re-derived a
+    naive ``all(c == "SUCCESS")`` and never handled a cancel at all). A doubled
+    workflow dispatch — two ``pull_request`` runs for one sha, leaving EVERY
+    check-run as a success+cancelled pair — made the two disagree about one payload
+    inside ONE process: ``ci: green`` alongside "'leak-detector' is not green at
+    this head", a message that sends the reader to inspect a job that is green.
+    Deterministic for as long as that head stands, not a flake. Any FUTURE consumer
+    of check-run conclusions calls this rather than re-deriving it a third time.
+
+    Every condition below fails CLOSED — a cancel that cannot be PROVEN superseded
+    is returned, and the caller's own red/not-green logic then sees it:
+
+    * Only GitHub Actions CheckRuns with a resolvable identity AND a ``completedAt``
+      may serve as the superseding sibling (``_ci_identity`` → None for a legacy
+      StatusContext or a non-Actions check; a timestampless SUCCESS is skipped). So
+      a StatusContext SUCCESS can never drop a same-named CheckRun cancel.
+    * A cancel with no identity, no ``completedAt``, or no qualifying success STAYS.
+      That includes SUCCESS-then-cancel on an unchanged head: the latest attempt
+      never passed, so nothing supersedes the cancel.
+    * ONLY ``_CI_CANCEL_CONCLUSIONS`` (deliberately ``{"CANCELLED"}`` alone) is
+      droppable. FAILURE / TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE / STALE
+      carry real verdicts and are never dropped, whatever completed beside them —
+      so this can never widen into "ignore anything that is not SUCCESS".
+    * Non-terminal entries (an in-flight re-run) are not conclusions and are never
+      touched; the caller still counts them PENDING.
+    * Entries that are not dicts are passed through untouched, so a caller's own
+      shape checks still see the payload it was given.
+
+    Comparison is a lexicographic string compare of two ISO-8601 ``completedAt``
+    values, both sides terminal COMPLETED runs that always carry one. This is NOT
+    the pulled #1420 finding-magnet, which sorted the WHOLE set (including QUEUED
+    runs with a null ``startedAt``) to pick a global "latest".
+
+    THE ASSUMPTION THAT COMPARE RESTS ON, stated so a future reader knows what would
+    invalidate it: GitHub's GraphQL ``completedAt`` is emitted as second-precision
+    UTC with a literal ``Z`` (OBSERVED on real rollups, e.g. ``2026-09-09T16:20:59Z``;
+    not verified against GitHub's schema docs). Lexicographic ordering equals
+    chronological ordering only while EVERY value shares that one format. Two shapes
+    would break it — a ``+00:00`` offset instead of ``Z``, and fractional seconds
+    (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` would compare as at-or-after
+    a cancel at ``:00.9Z`` and wrongly drop it). Both are unobserved here. If either
+    ever appears, normalise in BOTH passes before comparing — do not patch one.
+    """
+    # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
+    success_latest: dict[tuple[str, str], str] = {}
+    for c in checks:
+        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+            continue
+        ident = _ci_identity(c)
+        ts = (c.get("completedAt") or "").strip()
+        if ident is None or not ts:
+            continue
+        if ts > success_latest.get(ident, ""):
+            success_latest[ident] = ts
+
+    # Pass 2: drop only the cancels pass 1 proves superseded.
+    kept: list = []
+    for c in checks:
+        if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
+            ident = _ci_identity(c)
+            cts = (c.get("completedAt") or "").strip()
+            if ident is not None and cts and success_latest.get(ident, "") >= cts:
+                continue
+        kept.append(c)
+    return kept
+
+
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
@@ -771,8 +845,9 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                         A CANCELLED CheckRun that a same (name, workflowName)
                         SUCCESS completed at-or-after is a superseded
                         `concurrency: cancel-in-progress` duplicate and is dropped
-                        (see _ci_identity + success_latest) — strict identity,
-                        terminal completedAt comparison only, fail-closed.
+                        by the SHARED _drop_superseded_cancels helper (see
+                        _ci_identity) — strict identity, terminal completedAt
+                        comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
                         exist, i.e. CI has NOT run. A DEFINITE fact, not a read
@@ -842,26 +917,21 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
-    # First pass: for each strict identity (name, workflowName), the latest
-    # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
-    # a superseded concurrency-cancel duplicate ONLY if a SUCCESS of the same
-    # identity completed AT OR AFTER it (see the drop branch). Only GitHub Actions
-    # CheckRuns with a resolvable identity AND a completedAt contribute; legacy
-    # StatusContexts, non-Actions checks, and timestampless successes never serve
-    # as siblings. This is NOT the #1420 finding-magnet: that sorted the WHOLE set
-    # (incl. QUEUED runs with null startedAt) to pick a global "latest"; here both
-    # sides of the comparison are terminal COMPLETED runs that always carry a
-    # completedAt, and every unresolvable case fails CLOSED (stays red).
-    success_latest: dict[tuple[str, str], str] = {}
-    for c in checks:
-        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
-            continue
-        ident = _ci_identity(c)
-        ts = (c.get("completedAt") or "").strip()
-        if ident is None or not ts:
-            continue
-        if ts > success_latest.get(ident, ""):
-            success_latest[ident] = ts
+    # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
+    # primitive (_drop_superseded_cancels — read its docstring for the strict
+    # identity + at-or-after rule and every fail-closed case). Filtering here rather
+    # than branching inside the classify loop is behaviour-identical: a drop implies
+    # a same-identity SUCCESS in this very list, and that sibling sets
+    # `saw_recognized` and contributes the same casefolded `workflowName` to
+    # `workflows_ran` on its own. A cancel that is NOT dropped falls through to the
+    # red branch below, because CANCELLED is also in _CI_RED_CONCLUSIONS.
+    #
+    # Deliberately AFTER the empty-rollup "absent" return above, which reads the
+    # RAW payload: "zero checks exist" must stay a fact about what GitHub reported,
+    # never an artefact of our own filtering. (The filter cannot empty a non-empty
+    # list anyway — a drop requires a surviving SUCCESS sibling — but the ordering
+    # makes that independent of this helper's behaviour.)
+    checks = _drop_superseded_cancels(checks)
 
     red: list[str] = []
     pending: list[str] = []
@@ -883,30 +953,16 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
-        if conclusion in _CI_CANCEL_CONCLUSIONS:
-            ident = _ci_identity(c)
-            cts = (c.get("completedAt") or "").strip()
-            if ident is not None and cts and success_latest.get(ident, "") >= cts:
-                # Superseded concurrency-cancel duplicate: a SUCCESS of this EXACT
-                # identity (name + workflowName) completed AT OR AFTER this cancel,
-                # so the cancelled entry is a `cancel-in-progress` leftover with no
-                # verdict of its own — drop it. Wrong-green-impossible:
-                # FAILURE/TIMED_OUT are not in _CI_CANCEL_CONCLUSIONS (still red);
-                # an in-flight re-run is a non-terminal entry that still counts
-                # pending below; and a cancel with no identity, no completedAt, or
-                # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
-                # on an unchanged head) falls through and stays red.
-                saw_recognized = True
-                # A superseded duplicate implies a same-identity SUCCESS exists on
-                # this head, so the workflow demonstrably ran.
-                workflows_ran.add(wf_key)
-                continue
+        # Any CANCELLED entry still present here was NOT superseded (the shared
+        # filter above proved it, or could not) and falls through to the red branch,
+        # because CANCELLED is in _CI_RED_CONCLUSIONS. The dropped ones need no arm
+        # of their own: each implies a same-identity SUCCESS in this list, which
+        # sets saw_recognized and adds the identical workflowName to workflows_ran.
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
-            # The ONLY branch (besides the superseded-cancel drop above, which implies
-            # a green sibling) that feeds workflows_ran: the required-identity check
+            # The ONLY branch that feeds workflows_ran: the required-identity check
             # runs only when nothing is red/pending (those return first, and already
             # block), so only PASSING verdicts can vouch that a required workflow ran.
             # A COMPLETED run with a null conclusion (the benign ignore below) carries
@@ -4817,9 +4873,13 @@ def _mechanical_scan_is_green(
     class this file already documents at _ci_identity, and the whole point of
     this relief is that the mechanical layer really ran.
 
+    Superseded ``concurrency: cancel-in-progress`` duplicates are dropped first, by
+    the SHARED ``_drop_superseded_cancels`` — the same primitive ``_pr_ci_status``
+    uses, so the two gates cannot disagree about one rollup.
+
     Returns False on ANY doubt: a gh error, an unparseable payload, a head that
-    does not match, no entry with that identity, or any conclusion other than
-    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    does not match, no entry with that identity, or any surviving conclusion other
+    than SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
     ambiguous scan must never read as a pass.
 
     Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
@@ -4870,6 +4930,20 @@ def _mechanical_scan_is_green(
     wanted_workflow = (workflow or "").strip().lower()
     if not wanted_workflow:
         return False  # an unpinned kind can never be established -> fail closed
+    # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
+    # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
+    # (name, workflowName) identity, a SUCCESS completing at-or-after, fail-closed on
+    # every unresolvable case). This path used to have no cancel handling at all, so a
+    # doubled workflow dispatch — which leaves every check-run as a success+cancelled
+    # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
+    # "'leak-detector' is not green at this head", pointing the reader at a green job
+    # while relief stayed unreachable for as long as that head stood.
+    #
+    # Note what the drop does NOT do, because this is where it would be dangerous: it
+    # removes ONLY cancels proven superseded. FAILURE/TIMED_OUT/STALE and an
+    # unsuperseded cancel all survive into `conclusions` and still contradict SUCCESS,
+    # so the guarantee below is intact.
+    rollup = _drop_superseded_cancels(rollup)
     # Collect EVERY same-identity entry, never the first match. One head can carry
     # several runs of one job (a re-run after a ruleset change, a superseded
     # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
