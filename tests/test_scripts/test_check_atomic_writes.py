@@ -246,6 +246,139 @@ def test_a_durable_first_operand_is_not_an_atomic_write(src):
     assert _verdicts(src) == []
 
 
+_ATTR_TEMP_DURABLE_SIBLING = """
+class Store:
+    def rotate(self, path, dest):
+        self.staging = path.with_suffix(".tmp")
+        self.live_file = path
+        # DURABLE. The real file is being moved aside; the correct remediation
+        # is nothing at all. It shares only the `self` root with the temp above.
+        self.live_file.replace(dest)
+"""
+
+_ATTR_TEMP_ITSELF_LEAKS = """
+class Store:
+    def commit(self, path, dest):
+        self.staging = path.with_suffix(".tmp")
+        try:
+            self.staging.write_text("x")
+            self.staging.replace(dest)
+        except OSError:
+            return
+"""
+
+
+_INTERPOLATED_TEMP_LEAKS = """
+import os
+
+
+def restore(target, data):
+    tmp = target.with_name(f".{target.name}.restore-tmp-{os.getpid()}")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    except OSError:
+        return
+"""
+
+_INTERPOLATED_NEAR_MISS = """
+import os
+
+
+def publish(target, data):
+    # `whats-new-` is ordinary prose that happens to end in a scratch stem. It is
+    # NOT a temp, and the relaxed f-string rule must not claim it.
+    page = target.with_name(f"whats-new-{target.name}")
+    try:
+        page.write_bytes(data)
+        os.replace(page, target)
+    except OSError:
+        return
+"""
+
+
+def test_a_temp_marker_followed_by_interpolation_is_still_a_temp():
+    """The end-anchored suffix test made a whole site INVISIBLE, not merely
+    misjudged. `f".{name}.restore-tmp-{os.getpid()}"` puts the marker before a
+    unique component, so `.endswith(_TEMP_SUFFIXES)` failed and the site produced
+    no row at all -- which is why the error surfaced in the published DENOMINATOR
+    (58 sites, actually 59) rather than in any verdict. Its live instance is
+    guardian/cred_integrity.py restore_file, and it reads CLEANS_UP."""
+    assert _verdicts(_INTERPOLATED_TEMP_LEAKS) == ["LEAKS"]
+
+
+def test_prose_ending_in_a_scratch_stem_is_not_a_temp():
+    """PRECISION control, and the reason the relaxation is scoped to f-strings
+    with a separator before the stem. Matching a stem anywhere would admit
+    `.partition`, `foo.parts` and this fixture -- and a false temp is a false
+    LEAK row whose printed remediation says to unlink a durable file."""
+    assert _verdicts(_INTERPOLATED_NEAR_MISS) == []
+
+
+_ATTR_TEMP_VIA_DERIVED_PATH = """
+import os
+import tempfile
+
+
+class Store:
+    def commit(self, dest):
+        self.handle = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            self.handle.write(b"x")
+            os.replace(self.handle.name, dest)
+        except OSError:
+            return
+"""
+
+
+def test_an_attribute_temp_reached_through_a_derived_path_is_still_a_temp():
+    """The false CLEAN that binding whole paths created, and the reason the
+    prefix rung exists.
+
+    `self.handle` is bound to a temp maker; the rename names `self.handle.name`.
+    Neither the full path nor the bare root (`self`, deliberately no longer
+    bound) matches, so before the prefix rung this produced NO ROW -- invisible
+    and absent from the debt ledger, which `_unlinks` calls strictly worse than a
+    false flag. MEASURED across the change: LEAKS before the binding fix, [] with
+    the binding fix alone, LEAKS again with the prefix rung.
+
+    This is also the only test that pins the root fallback the comment above
+    `_born_in`'s return insists must stay: an audit showed reducing that line to
+    `temp_expr in temps` alone left the whole suite green."""
+    assert _verdicts(_ATTR_TEMP_VIA_DERIVED_PATH) == ["LEAKS"]
+
+
+def test_an_attribute_temp_does_not_make_its_SIBLINGS_temps():
+    """FIXTURE-PINNED, because this fix is behaviourally NULL on this repo today.
+
+    `_bound_names` walked to every `ast.Name` beneath an assignment target, so
+    `self.staging = path.with_suffix(".tmp")` recorded **`self`** as a temp. Any
+    later `self.<anything>.replace(dst)` then shared that root and was reported
+    as a leak -- carrying this guard's own "unlink the temp" remediation, aimed
+    at a durable file. That is the same durable-operand trap the born-here rule
+    exists to prevent, re-entered through the BINDING side rather than the
+    operand side.
+
+    MEASURED before landing: the live tree reads 59 sites / 28 clean / 31 dirty
+    both with and without the fix, so no current file exercises this shape. A
+    scan-count control would therefore have proved nothing, and only a synthetic
+    fixture can fail if the walk-to-every-Name behaviour returns.
+
+    The fixture binds and uses inside ONE method on purpose. A first draft put
+    the binding in `__init__` and the move in another method, which the guard
+    does not span by design -- so it returned [] with and without the fix, and
+    would have passed as a control while measuring nothing at all."""
+    assert _verdicts(_ATTR_TEMP_DURABLE_SIBLING) == []
+
+
+def test_an_attribute_temp_is_still_a_temp():
+    """RECALL control for the test above -- the half that a precision-only fix
+    silently breaks. Narrowing the binding must not stop the attribute path
+    ITSELF being recognised, or the fix trades a false flag for a false clean,
+    which is strictly worse: the leak becomes invisible AND leaves the ledger."""
+    assert _verdicts(_ATTR_TEMP_ITSELF_LEAKS) == ["LEAKS"]
+
+
 def test_a_temp_bound_two_hops_away_is_still_a_temp():
     """RECALL control for the fix above. Requiring the temp to be born here
     initially LOST a real leak whose temp comes from `with NamedTemporaryFile(...)
@@ -643,6 +776,25 @@ def test_the_published_counts_match_the_tree():
     dirty = [r for r in rows if r["verdict"] in ("LEAKS", "NO_HANDLER")]
     doc = _json.loads((_REPO / "config" / "atomic_write_baseline.json").read_text())
     readme = " ".join(doc["_README"])
-    assert f"{len(rows)} atomic-write sites across {len({r['file'] for r in rows})}" in readme
+    files = len({r["file"] for r in rows})
+    assert f"{len(rows)} atomic-write sites across {files}" in readme
     assert f"{len(dirty)} across {len({r['file'] for r in dirty})} files are dirty" in readme
     assert len(doc["known"]) == len(dirty)
+
+    # THE OTHER TWO SURFACES. This test's docstring named three from the day it
+    # was written and its assertions read one, so a correction that landed on the
+    # README and the guard docstring left the CI comment quoting the old
+    # denominator -- a stale number in permanent record, under a test whose whole
+    # purpose was to prevent exactly that. Normalise whitespace first: both
+    # surfaces wrap their prose, so the counts straddle a newline.
+    def _flat(text: str) -> str:
+        return " ".join(text.split())
+
+    guard = _flat((_REPO / "scripts" / "check_atomic_writes.py").read_text())
+    assert f"{len(rows)} atomic-write sites across {files} files, {len(dirty)} of them dirty" in guard, (
+        "the guard docstring quotes a count the tree no longer produces"
+    )
+    ci = _flat((_REPO / ".github" / "workflows" / "ci.yml").read_text())
+    assert f"{len(rows)} sites, {len(dirty)} dirty" in ci, (
+        "the CI job comment quotes a count the tree no longer produces"
+    )

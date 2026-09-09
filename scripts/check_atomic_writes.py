@@ -9,8 +9,13 @@ both halves -- the leak happens, and nothing sweeps that directory
 (`disk_hygiene.sh` roots every find at a named SUBdirectory; `tmp_watchgod.sh`
 covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
 
-WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-07: 58 atomic-write sites across
-51 files, 31 of them dirty. Fixing 31 instances of a recurring pattern leaves
+WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09: 59 atomic-write sites
+across 52 files, 31 of them dirty. (Was published as 58/51: the temp-name
+test was anchored to the END of a string literal, so
+`f".{name}.restore-tmp-{getpid()}"` at guardian/cred_integrity.py produced
+NO ROW at all -- the site was invisible rather than misjudged, which is why
+the error showed up in the DENOMINATOR and not in any verdict. It reads
+CLEANS_UP, so the dirty count is unchanged.) Fixing 31 instances of a recurring pattern leaves
 nothing to stop instance 32. This is the prose-to-gate move: the rule was "clean
 up your temp", carried by convention, and conventions are what reviewers find one
 instance of at a time.
@@ -81,6 +86,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -135,6 +141,20 @@ def _enclosing_func(tree: ast.AST, lineno: int):
 _TEMP_MAKERS = ("mkstemp", "NamedTemporaryFile", "mkdtemp")
 _TEMP_SUFFIXES = (".tmp", ".new", ".partial", ".part", ".swp", ".writing")
 
+#: Scratch stems matched where an f-string's interpolation follows the marker.
+#:
+#: A SEPARATOR is required before the stem, so `.partition` and `foo.parts` cannot
+#: match. That alone was not enough: a first version reused the full suffix list
+#: and claimed `f"whats-new-{name}"` as a temp, because the ambiguity lives in the
+#: STEM, not the separator. `new` and `part` are ordinary English words that
+#: appear mid-name; `tmp`, `temp`, `partial` and `swp` are not. `writing` was in
+#: this list and came out: it is plainly ordinary English in a repo that generates
+#: content, and an AST sweep of every f-string piece under src/ and scripts/ found
+#: zero live sites relying on it, so it was pure risk. `.new`, `.part` and
+#: `.writing` all keep working in the strict end-anchored test above, where a
+#: TRAILING marker really is a suffix rather than a word in a sentence.
+_INTERPOLATED_TEMP_RE = re.compile(r"[._-](tmp|temp|partial|swp)[._-]*$")
+
 
 def _born_in(func: ast.AST, temp_expr: str) -> bool:
     """Is ``temp_expr`` bound in this function to something that MAKES a temp?
@@ -155,9 +175,35 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
     if not temp_expr:
         return False
     root = temp_expr.split(".")[0].split("[")[0].strip()
+    # Whole-path match FIRST. The root fallback below still has to exist -- a
+    # NamedTemporaryFile temp is renamed as `tmp.name`, whose root `tmp` is what
+    # the `with` binding recorded -- but it must never be the ONLY test, or an
+    # attribute temp anywhere on an object marks every sibling attribute as a
+    # temp too.
 
     def _bound_names(target) -> list[str]:
-        return [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+        """The names a target BINDS -- as whole paths, not every Name beneath it.
+
+        Walking to every `ast.Name` was wrong in the dangerous direction. For
+        `self.staging = path.with_suffix(".tmp")` it recorded **`self`** as a
+        temp, so a later durable `self.live_file.replace(dst)` matched on the
+        shared root and was reported as a leak WITH the unlink remediation --
+        the exact durable-operand trap the born-here rule exists to prevent,
+        re-entered through the binding side. An attribute or subscript target
+        binds ONE path; only a tuple/list target binds several.
+        """
+        if isinstance(target, (ast.Tuple, ast.List)):
+            out: list[str] = []
+            for el in target.elts:
+                out.extend(_bound_names(el))
+            return out
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Attribute, ast.Subscript)):
+            return [_unparse(target)]
+        if isinstance(target, ast.Starred):
+            return _bound_names(target.value)
+        return []
 
     temps: set[str] = set()
     # Seed: `with tempfile.NamedTemporaryFile(...) as tmp:` and friends.
@@ -183,12 +229,23 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
             pairs.append((names, value))
 
     def _makes_temp(value: ast.AST) -> bool:
-        """A temp-maker call, or a STRING LITERAL ending in a scratch suffix.
+        """A temp-maker call, or a STRING LITERAL carrying a scratch suffix.
 
         Anchored to the literal's END rather than matched anywhere in the
         unparsed text: `path.with_suffix(".tmp")` makes a temp, while a variable
         merely named `tmp_dir_listing` does not, and a substring test cannot tell
-        them apart."""
+        them apart.
+
+        F-STRINGS RELAX THAT ANCHOR, and only f-strings. A unique component is
+        routinely appended AFTER the marker -- `f".{name}.restore-tmp-{getpid()}"`
+        at guardian/cred_integrity.py -- so the marker is mid-literal and the
+        end-anchored test produced NO ROW AT ALL for the site, which is worse than
+        a wrong verdict because it also left the published site count wrong.
+        Inside an f-string a following interpolation EXPLAINS a trailing
+        separator, so `-tmp-` there is a scratch marker; in a plain literal it is
+        not, and `whats-new-` must keep reading as ordinary text. Hence the
+        relaxation is scoped to JoinedStr pieces rather than applied globally.
+        """
         for n in ast.walk(value):
             if isinstance(n, ast.Call):
                 fn = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
@@ -197,6 +254,13 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
             if (isinstance(n, ast.Constant) and isinstance(n.value, str)
                     and n.value.endswith(_TEMP_SUFFIXES)):
                 return True
+            if isinstance(n, ast.JoinedStr):
+                for piece in n.values:
+                    if not (isinstance(piece, ast.Constant)
+                            and isinstance(piece.value, str)):
+                        continue
+                    if _INTERPOLATED_TEMP_RE.search(piece.value):
+                        return True
         return False
 
     for names, value in pairs:
@@ -208,14 +272,36 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
         for names, value in pairs:
             # Propagate through the RHS's IDENTIFIERS, not its text: a name that
             # merely CONTAINS a known temp's name is a different variable.
+            # Attribute paths are compared WHOLE for the same reason `_bound_names`
+            # binds them whole -- `self.staging` is a temp, `self` is not.
             refs = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
+            refs |= {
+                _unparse(n) for n in ast.walk(value) if isinstance(n, ast.Attribute)
+            }
             if (refs & temps) and not set(names) <= temps:
                 temps.update(names)
                 grew = True
         if not grew:
             break
 
-    return root in temps
+    # Whole path, then any PROPER PREFIX of it, then the bare root.
+    #
+    # The prefix rung is what makes the attribute case symmetric with the name
+    # case. Binding whole paths fixed a false FLAG (`self` is not a temp), but on
+    # its own it created a false CLEAN, which is strictly worse: for
+    # `self.handle = NamedTemporaryFile(...)` renamed as `self.handle.name`,
+    # neither the full path (`self.handle.name`) nor the bare root (`self`, no
+    # longer bound) matched, so the site produced NO ROW -- invisible AND absent
+    # from the debt ledger. MEASURED: that shape read LEAKS before the binding
+    # change and [] after it.
+    #
+    # Prefixes stop SHORT of the bare root on purpose. Including it would restore
+    # exactly the sibling bug this fix removed, since every `self.x` shares the
+    # root `self`. The root disjunct stays for the case it was written for -- a
+    # temp bound as a bare NAME and renamed as `tmp.name`.
+    parts = temp_expr.split(".")
+    prefixes = {".".join(parts[:i]) for i in range(2, len(parts))}
+    return temp_expr in temps or root in temps or bool(prefixes & temps)
 
 
 def _handlers_covering(func: ast.AST, lineno: int) -> list:
