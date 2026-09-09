@@ -47,7 +47,13 @@ def _make_repo(tmp_path: Path, *, worktree: bool = False) -> Path:
 
 
 def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
-    """Fake codebase-memory-mcp + gitnexus that record args and ulimit -v."""
+    """Fake codebase-memory-mcp + gitnexus recording args, ulimit -v, oom adj.
+
+    The tool logs its OWN inherited ``oom_score_adj`` because that is the actual
+    invariant for the kill-order change: the script self-writes the value, and
+    what has to be true is that the INDEXER inherits it (through the scope), not
+    merely that the script wrote something.
+    """
     bindir.mkdir(exist_ok=True)
     for name in ("codebase-memory-mcp", "gitnexus"):
         _write_exec(
@@ -55,6 +61,7 @@ def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
             "#!/usr/bin/env bash\n"
             f'echo "{name} ARGS:$*" >> "{log}"\n'
             f'echo "{name} ULIMIT_V:$(ulimit -v)" >> "{log}"\n'
+            f'echo "{name} OOM_ADJ:$(cat /proc/self/oom_score_adj 2>/dev/null || echo NA)" >> "{log}"\n'
             + (f"sleep {sleep}\n" if sleep else ""),
         )
 
@@ -345,7 +352,7 @@ def test_scope_path_passes_all_properties(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=2G" in calls
+    assert "MemoryMax=4G" in calls  # measured default (#1776), not 2G
     assert "MemorySwapMax=0" in calls
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
@@ -381,7 +388,7 @@ def test_probe_failure_falls_back_to_rlimit(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     assert slog.read_text().count("\n") == 1  # probe attempted exactly once
-    assert "ULIMIT_V:2097152" in log.read_text()  # 2G in KB
+    assert "ULIMIT_V:4194304" in log.read_text()  # 4G in KB (measured default)
 
 
 def test_no_systemd_fallback_applies_rlimit(tmp_path):
@@ -391,7 +398,83 @@ def test_no_systemd_fallback_applies_rlimit(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
     assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in log.read_text()
+    assert "ULIMIT_V:4194304" in log.read_text()  # 4G in KB
+
+
+# ── 3b. OOM kill-order preference ─────────────────────────────────────────
+# The larger measured MemoryMax makes this job a bigger consumer, so it must
+# also become the kernel's PREFERRED victim — otherwise a bigger cap makes a
+# container-wide OOM more likely to take the server or a CC session instead.
+# Raising oom_score_adj needs no privilege on Linux (only LOWERING does, gated
+# by oom_score_adj_min / CAP_SYS_RESOURCE), so these assert the raised value
+# directly rather than hedging on the environment.
+
+
+def test_oom_score_adj_reaches_the_indexer(tmp_path):
+    """The INDEXER must inherit the raised value, not merely the script.
+
+    `-p OOMScoreAdjust=` is invalid on `systemd-run --scope` (a scope does not
+    exec, so Exec properties do not apply), so the mechanism is a self-write
+    plus inheritance. What has to hold is that the tool actually sees it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:500" in log.read_text()
+    # And NOT passed as a scope property, which systemd would reject outright.
+    assert "OOMScoreAdjust" not in slog.read_text()
+
+
+def test_oom_score_adj_override_reaches_the_indexer(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:321" in log.read_text()
+
+
+def test_oom_score_adj_non_numeric_warns_and_still_indexes(tmp_path):
+    """A bad lever value must never cost the INDEX — only the preference.
+
+    The direction control for the cell above: without it, a guard that refused
+    every value would pass that test's sibling and silently disable the feature.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "not-a-number"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "ignoring non-numeric" in res.stdout
+    assert "codebase-memory-mcp ARGS:" in log.read_text()  # index still ran
+    assert "OOM_ADJ:0" in log.read_text()  # left at the inherited default
+
+
+def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
+    """A negative value is unachievable from a user manager anyway (measured:
+    -1 and -500 both land on the manager's own value), so the guard rejects it
+    at the lever rather than writing and failing.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "-500"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "ignoring non-numeric" in res.stdout
+    assert "OOM_ADJ:0" in log.read_text()
 
 
 # ── 4. pressure watchdog ──────────────────────────────────────────────────

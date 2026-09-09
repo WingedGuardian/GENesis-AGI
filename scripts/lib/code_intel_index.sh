@@ -42,7 +42,8 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
-#   CODE_INTEL_INDEX_MEMORY_MAX   default 2G     (per systemd scope)
+#   CODE_INTEL_INDEX_MEMORY_MAX   default 4G     (per systemd scope; measured)
+#   CODE_INTEL_INDEX_OOM_SCORE_ADJ default 500    (this job dies FIRST; raise-only)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -66,12 +67,79 @@ REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-2G}"
+# Cap sized FROM A MEASUREMENT, not a guess (closes #1776).
+#
+# The old 2G default was ~40% BELOW what the job actually needs, so the indexer
+# was killed for being correctly sized against a wrong limit. MEASURED
+# 2026-09-08: a clean codebase-memory fast-index of this repo peaks at
+# 2,836 MB RSS (48,986 nodes / 302,236 edges, artifact written, rc=0, run under
+# a deliberately generous 8G cap). Every observed kill was
+# constraint=CONSTRAINT_MEMCG inside a code-intel-* scope sitting on its own 2G
+# limit at anon-rss ~2,084,000 kB — i.e. the cap was the killer, not container
+# pressure and not a leak. 4G is that measurement plus ~40% headroom.
+#
+# Note CBM_MEM_BUDGET_MB is NOT the lever for this: pinned to 1500 the index
+# still died at 2.03G, so it does not bound the index path.
+#
+# DELIBERATELY ABSOLUTE, and this is the one place the "never a fixed GB" rule
+# does not apply — so the exemption is stated rather than left to be "fixed"
+# later. The indexer's requirement scales with the REPO being indexed, not with
+# the host: a percentage-of-RAM cap would be 8G here and 2G on an 8 GiB box,
+# which REPRODUCES this exact bug on small installs. A measured floor is the
+# correct shape; admission control (code_intel_runner.sh) is what keeps a
+# generous cap safe on a small box by not starting a job that cannot fit.
+#
+# A percentage would also be actively unsafe here: the rlimit fallback below
+# parses only <int>[.frac]G|M, so "25%" falls through to "running
+# memory-uncapped" — failing OPEN to something worse than the bug.
+# (Percentages DO work on a systemd scope, e.g. cc/invoker.py — but only on the
+# scope path, and the fallback is the trap.)
+#
+# .claude/mcp/run-codebase-memory keeps 2G on purpose; see the matching comment
+# there. It caps a long-lived SERVER against an upstream leak, not a batch job
+# whose size is set by the repo. The divergence is a decision, not drift.
+MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-4G}"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
+
+# Make this job the kernel's PREFERRED victim under CONTAINER-wide memory
+# pressure — the safety counterpart of the larger cap above. A bigger cap means
+# a bigger consumer, and the thing that must never be killed instead of this one
+# is a CC session holding a user's in-flight work.
+#
+# Mechanics, all MEASURED 2026-09-08 rather than assumed:
+#  * RAISING oom_score_adj needs no privilege; LOWERING it is refused
+#    (oom_score_adj_min is 0, inherited from init), so 500 applies and a
+#    negative value never would. Only non-negative values are accepted below.
+#  * `-p OOMScoreAdjust=` is INVALID on `systemd-run --scope` ("Unknown
+#    assignment") because a scope does not exec, so Exec properties do not
+#    apply. A self-write is the mechanism that works while KEEPING --scope,
+#    which is load-bearing here (it keeps the job a child of this script so the
+#    watchdog's pgid isolation and stdio survive).
+#  * The value is INHERITED across fork/exec and survives
+#    `systemd-run --user --scope` (verified: child reads 500), and systemd does
+#    not reset it for a scope, so writing it once here covers the indexer.
+#  * On the 32 GiB reference host each 100 of adj is worth ~3.2 GB of
+#    oom_badness, so 500 puts this job far ahead of anything else long-lived.
+_apply_oom_score_adj() {
+    local want="${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-500}"
+    case "$want" in
+        '' | *[!0-9]*)
+            _log "WARNING: ignoring non-numeric CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' — kill order unchanged"
+            return 0
+            ;;
+    esac
+    if printf '%s\n' "$want" > /proc/self/oom_score_adj 2>/dev/null; then
+        _log "oom_score_adj=$want (this job is killed before the server or a CC session)"
+    else
+        # Not fatal: an unwritable /proc (odd sandbox) costs kill-order
+        # preference, never the index itself.
+        _log "WARNING: could not raise oom_score_adj — kill order unchanged"
+    fi
+}
 
 # Shared load/iowait sampler for the pressure watchdog. Best-effort: if it's
 # missing (older checkout), the watchdog degrades to a wall-clock cap only.
@@ -147,6 +215,11 @@ else
 fi
 
 # ── 3. Resource-capped runner ───────────────────────────────────────────
+# Raise the kill-order preference BEFORE the probe, so every descendant this
+# script goes on to create — probe, scope, indexer — inherits it. Doing it after
+# the probe would leave the first scope at the default.
+_apply_oom_score_adj
+
 # Probe systemd-run exactly like .claude/mcp/run-codebase-memory does: the
 # probe must create a real scope, because CC-spawned / hook-spawned contexts
 # sometimes cannot reach the user manager even when systemd-run exists.
