@@ -348,6 +348,176 @@ def test_an_attribute_temp_reached_through_a_derived_path_is_still_a_temp():
     assert _verdicts(_ATTR_TEMP_VIA_DERIVED_PATH) == ["LEAKS"]
 
 
+_KWARG_MOVE_LEAKS = """
+import os
+import tempfile
+
+
+def commit(dest, data):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        os.replace(src=tmp, dst=dest)
+    except OSError:
+        return
+"""
+
+_IMPORTED_MOVE_LEAKS = """
+import tempfile
+from os import replace
+
+
+def commit(dest, data):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        replace(tmp, dest)
+    except OSError:
+        return
+"""
+
+_IMPORTED_DATACLASS_REPLACE = """
+import tempfile
+from dataclasses import replace
+
+
+def bump(dest):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        return replace(tmp, dest)
+    except OSError:
+        return None
+"""
+
+_MULTI_ARG_PATH_JOIN = """
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+
+def commit(dest):
+    tmpdir = tempfile.mkdtemp()
+    try:
+        Path(tmpdir, "payload").replace(dest)
+    except OSError:
+        shutil.rmtree(tmpdir)
+        os.unlink(tmpdir)
+"""
+
+
+_RECEIVER_KWARG_MOVE = """
+import tempfile
+from pathlib import Path
+
+
+def commit(dest, data):
+    fd, tmp = tempfile.mkstemp()
+    try:
+        Path(tmp).write_bytes(data)
+        Path(tmp).replace(target=dest)
+    except OSError:
+        return
+"""
+
+_SHADOWED_IMPORT_NAME = """
+import tempfile
+from os import replace
+
+
+def apply(mapping, dest):
+    # `replace` here is a LOCAL, not the os function. Matching the imported name
+    # without scope analysis produced a row for it.
+    replace = mapping["fn"]
+    fd, tmp = tempfile.mkstemp()
+    try:
+        return replace(tmp, dest)
+    except OSError:
+        return None
+"""
+
+
+def test_a_receiver_form_keyword_move_is_not_invisible():
+    """`Path(tmp).replace(target=dest)` has zero positional args.
+
+    The keyword-aware resolution was added, but the ARITY TEST that runs before
+    it still counted positional args only -- so this form was dropped one line
+    earlier and the resolver's `"target"` branch was dead code. An audit found
+    the resolver's own docstring promising resolution happens "before any arity
+    test", which was false for exactly this branch."""
+    assert _verdicts(_RECEIVER_KWARG_MOVE) == ["LEAKS"]
+
+
+def test_a_locally_rebound_import_name_is_not_a_move():
+    """PRECISION control for the directly-imported allowlist.
+
+    The allowlist matched by NAME with no scope analysis, so a local
+    `replace = mapping["fn"]`, a parameter called `move`, or a nested
+    `def replace` all produced rows in a file that happened to import the real
+    one. Latent -- no file in this tree imports these names directly -- but a
+    false LEAK row carries this guard's "unlink the temp" remediation, so it is
+    a booby-trapped work item rather than noise."""
+    assert _verdicts(_SHADOWED_IMPORT_NAME) == []
+
+
+def test_a_keyword_only_move_is_not_invisible():
+    """`os.replace(src=..., dst=...)` has NO positional args, so an arity test
+    read it as "not a filesystem move" and the site produced no row -- silent,
+    and invisible in every published count. Operands are now resolved by
+    position OR keyword before any arity check."""
+    assert _verdicts(_KWARG_MOVE_LEAKS) == ["LEAKS"]
+
+
+def test_a_directly_imported_move_is_not_invisible():
+    """`from os import replace` binds a bare NAME, which the attribute-call rule
+    excluded along with `dataclasses.replace`. The names an os/shutil import
+    actually binds are now allowlisted, so the real move is seen."""
+    assert _verdicts(_IMPORTED_MOVE_LEAKS) == ["LEAKS"]
+
+
+def test_a_directly_imported_dataclasses_replace_is_still_not_a_move():
+    """PRECISION control, and the reason the attribute rule is narrowed rather
+    than dropped. `from dataclasses import replace` binds the SAME bare name and
+    touches no filesystem; admitting it was the largest false-positive class this
+    guard ever had (16 of 49 rows on the first baseline).
+
+    THE FIXTURE IS DELIBERATELY SHAPED TO MAKE THE ALLOWLIST LOAD-BEARING, and
+    the first version was not. It called `replace(record, path=dest)`, which the
+    guard drops for reasons that have nothing to do with the import: the
+    destination never resolves (`path=` is not `dst=`) and `record` is a
+    parameter, so `_born_in` rejects it. An audit deleted the allowlist entirely
+    and this test stayed green -- a precision control that survives deletion of
+    the mechanism it names is decoration, which is the exact defect this PR
+    exists to remove, committed in the test written to prevent it.
+
+    So the call is now `replace(tmp, dest)` with `tmp` from `mkstemp` and both
+    operands positional -- structurally identical to a real `os.replace` leak.
+    The ONLY thing standing between it and a LEAKS row is that `replace` was
+    bound by `dataclasses`, not by `os`."""
+    import ast as _ast
+
+    # The barrier itself, asserted rather than inferred from the verdict.
+    assert chk._directly_imported_moves(_ast.parse(_IMPORTED_DATACLASS_REPLACE)) == {}
+    assert _verdicts(_IMPORTED_DATACLASS_REPLACE) == []
+
+
+def test_a_multi_argument_path_join_is_not_reduced_to_its_directory():
+    """A multi-arg `Path()` is a JOIN, not a transparent wrapper.
+
+    Stripping it to its first argument recorded `tmpdir` as the temp, so a
+    handler removing `tmpdir` was credited with cleaning up a CHILD it never
+    unlinked and the site read CLEANS_UP -- a false clean, which hides the leak
+    AND keeps it out of the debt ledger.
+
+    Stated precisely, because this is an improvement rather than a full fix: the
+    join is now left intact, so the site is UNMATCHED rather than wrongly
+    cleared. `_born_in` looks up the temp expression and a joined path is not a
+    name it has seen bound, which is the documented limit on complex operands.
+    Unmatched is the safe direction; the test asserts the false CLEANS_UP is gone
+    rather than claiming a verdict the guard does not produce."""
+    assert "CLEANS_UP" not in _verdicts(_MULTI_ARG_PATH_JOIN)
+
+
 def test_an_attribute_temp_does_not_make_its_SIBLINGS_temps():
     """FIXTURE-PINNED, because this fix is behaviourally NULL on this repo today.
 

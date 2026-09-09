@@ -52,6 +52,13 @@ WHAT THIS GUARD CANNOT SEE, stated rather than discovered later:
     reads as a leak. Baseline it with the reason; do not widen the detector to
     guess, because a detector that accepts an unexamined indirection accepts
     everything.
+  * A temp named by a MULTI-ARGUMENT join -- `Path(tmpdir, "payload")`. A
+    one-argument `Path(x)` is a transparent wrapper and is resolved to `x`; a
+    join names a CHILD, and reducing it to its first argument used to record the
+    DIRECTORY as the temp, which let a handler removing the directory read as
+    cleaning up a child it never touched. Joins are now left intact, so such a
+    site is UNMATCHED rather than wrongly cleared -- the safe direction, and a
+    real blind spot rather than a fix.
   * Whether the destination directory is swept. A leaked temp under `/tmp` is
     collected by the OS; one under `~/.genesis` is not. The guard treats them
     alike -- prioritisation belongs to the human reading the report.
@@ -326,10 +333,20 @@ _TRANSPARENT = ("Path", "str", "os.fspath", "pathlib.Path")
 
 
 def _strip_wrappers(expr: ast.AST) -> ast.AST:
-    """Remove path-neutral wrappers: Path(x), str(x), x.expanduser()/resolve()."""
+    """Remove path-neutral wrappers: Path(x), str(x), x.expanduser()/resolve().
+
+    A wrapper is only transparent when it takes ONE argument. `Path(x)` names the
+    same path as `x`; `Path(tmpdir, "payload")` names a CHILD of `tmpdir`, and
+    reducing it to its first argument recorded the DIRECTORY as the temp. That
+    matters in the dangerous direction: a handler unlinking `tmpdir` was then
+    credited with cleaning up a child it never removed, so a leak read CLEANS_UP.
+    Multi-argument joins are left intact, which at worst makes the site unmatched
+    rather than wrongly cleared.
+    """
     node = expr
     for _ in range(8):  # bounded; nesting deeper than this is not real code
-        if isinstance(node, ast.Call) and _unparse(node.func) in _TRANSPARENT and node.args:
+        if (isinstance(node, ast.Call) and _unparse(node.func) in _TRANSPARENT
+                and len(node.args) == 1 and not node.keywords):
             node = node.args[0]
             continue
         if isinstance(node, ast.Attribute) and node.attr in ("expanduser", "resolve", "absolute"):
@@ -441,9 +458,81 @@ def _unlinks(nodes: list, temp_expr: str, func: ast.AST | None = None) -> bool:
     return False
 
 
+def _operand(call: ast.Call, index: int, *names: str) -> ast.AST | None:
+    """The operand at `index`, or under any of `names` if passed by keyword.
+
+    Indexing `call.args` alone dropped the entire keyword form: `os.replace(
+    src=tmp, dst=target)` has NO positional arguments, so an arity test read it
+    as "not a filesystem move" and the site produced no row. Silent, and
+    invisible in every count.
+    """
+    if len(call.args) > index:
+        return call.args[index]
+    for kw in call.keywords:
+        if kw.arg in names:
+            return kw.value
+    return None
+
+
+def _locally_rebound(func: ast.AST | None, name: str) -> bool:
+    """Does this function bind `name` itself, shadowing the module-level import?
+
+    Matching an imported name with no scope analysis let a local
+    `replace = mapping["fn"]`, a parameter called `move`, and a nested
+    `def replace` all produce rows. Latent -- no file in this tree imports these
+    names directly -- but a false LEAK row is a booby-trapped work item whose
+    printed remediation says to unlink a durable file, so this is cheap
+    insurance rather than a response to a live sighting.
+    """
+    if func is None:
+        return False
+    for n in ast.walk(func):
+        if isinstance(n, ast.arg) and n.arg == name:
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+            return True
+        if isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in n.targets
+        ):
+            return True
+        if (
+            isinstance(n, (ast.AnnAssign, ast.NamedExpr))
+            and isinstance(n.target, ast.Name)
+            and n.target.id == name
+        ):
+            return True
+    return False
+
+
+def _directly_imported_moves(tree: ast.AST) -> dict[str, str]:
+    """Names bound by `from os import replace` and friends, mapped to a module.
+
+    The guard required an ATTRIBUTE call, which is what excludes
+    `dataclasses.replace`'s bare form -- but it also excluded a genuine
+    `from os import replace; replace(tmp, target)`. The fix is not to drop the
+    attribute rule (that class of false positive is the largest this guard has
+    had) but to allowlist the names an `os`/`shutil` import actually binds.
+
+    The value is the MODULE, so `from shutil import move` keeps shutil semantics
+    downstream instead of being flattened to "os" -- correct today only because
+    one later condition happens to be spelled defensively, which is not a thing
+    to rely on. Only MODULE-LEVEL imports count: one inside a function or a
+    `try:` fallback binds a name whose scope this guard does not model, and
+    guessing there is exactly how a false row gets made.
+    """
+    out: dict[str, str] = {}
+    for n in getattr(tree, "body", []):
+        if isinstance(n, ast.ImportFrom) and n.module in ("os", "shutil"):
+            for alias in n.names:
+                if alias.name in ("replace", "rename", "move"):
+                    out[alias.asname or alias.name] = n.module
+    return out
+
+
 def analyse_source(src: str, rel: str) -> list[dict]:
     """Every atomic-write site in one file, classified. Pure; no I/O."""
     tree = ast.parse(src)
+    imported_moves = _directly_imported_moves(tree)
     rows: list[dict] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -451,15 +540,25 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         # A filesystem move is ALWAYS an attribute call. A bare `replace(x, ...)`
         # is dataclasses.replace -- the largest false-positive class this guard
         # had, and nothing about it touches a filesystem.
-        if not isinstance(node.func, ast.Attribute):
+        if isinstance(node.func, ast.Name):
+            # Bare call: ONLY the names an os/shutil import actually bound. A
+            # bare `replace(rec, f=1)` is dataclasses and must stay excluded.
+            if node.func.id not in imported_moves:
+                continue
+            if _locally_rebound(_enclosing_func(tree, node.lineno), node.func.id):
+                continue
+            owner, receiver = imported_moves[node.func.id], None
+        elif isinstance(node.func, ast.Attribute):
+            if node.func.attr not in ("replace", "rename", "move"):
+                continue
+            owner, receiver = _unparse(node.func.value), node.func.value
+        else:
             continue
-        if node.func.attr not in ("replace", "rename", "move"):
-            continue
-        owner = _unparse(node.func.value)
         # `shutil.move(src, dst)` is the same operation and was a straight blind
         # spot: MEASURED 5 live call sites, one of them three lines above a
         # baselined leak in the same function.
-        if node.func.attr == "move" and owner != "shutil":
+        verb = getattr(node.func, "attr", None) or getattr(node.func, "id", "")
+        if verb == "move" and owner != "shutil" and receiver is not None:
             continue
         # BOTH dataclasses forms have to be excluded, and only one of them was.
         # The bare `replace(x, ...)` (7 files import it) is excluded by the
@@ -470,13 +569,24 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         if owner in ("dataclasses", "dc"):
             continue
         # str.replace(old, new) takes >=2 args; Path.replace(target) exactly one;
-        # os.replace(src, dst) two but is named unambiguously.
-        if owner != "os" and node.func.attr != "move" and len(node.args) != 1:
+        # os.replace(src, dst) two but is named unambiguously. COUNT THE KEYWORD
+        # too: `Path(tmp).replace(target=dest)` has zero positional args, so a
+        # purely positional test dropped it HERE, before the resolution below
+        # ever ran -- which made that branch's "target" name dead code and made
+        # _operand's "before any arity test" promise false for it.
+        if owner not in ("os", "shutil") and (
+            len(node.args) + sum(1 for k in node.keywords if k.arg == "target")
+        ) != 1:
             continue
-        # A kwarg-only call (`os.replace(src=a, dst=b)`) has no positional args;
-        # falling through would set temp = "os" and then credit ANY os.unlink in
-        # a handler as cleanup.
-        if owner in ("os", "shutil") and len(node.args) < 2:
+        # Resolve both operands by POSITION OR KEYWORD: the kwarg-only spelling
+        # has no positional args and used to fall through to `temp = "os"`,
+        # crediting any os.unlink in a handler as cleanup.
+        if owner in ("os", "shutil"):
+            src_expr = _operand(node, 0, "src")
+            dst_expr = _operand(node, 1, "dst")
+        else:
+            src_expr, dst_expr = receiver, _operand(node, 0, "target")
+        if src_expr is None or dst_expr is None:
             continue
         # WHICH OPERAND IS THE TEMP depends on the form. Getting this wrong
         # silently checks the DESTINATION for cleanup instead of the temp.
@@ -486,11 +596,7 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         # NO ROW at all. `_born_in` looks up a bare NAME, and `Path(tmp_path)` is
         # not one, so the site was silently dropped rather than judged. Strip
         # first, then take the temp.
-        temp = (
-            _unparse(_strip_wrappers(node.args[0]))
-            if owner in ("os", "shutil")
-            else _unparse(_strip_wrappers(node.func.value))
-        )
+        temp = _unparse(_strip_wrappers(src_expr))
         func = _enclosing_func(tree, node.lineno)
         # THE OPERAND MUST BE A TEMP THIS FUNCTION CREATED. Anchoring on the verb
         # alone was wrong by a third: `rename`/`replace` also covers move-aside,
