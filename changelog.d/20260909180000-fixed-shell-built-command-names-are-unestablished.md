@@ -13,6 +13,8 @@
   too. Two further constructs are named in the code as deliberately uncovered,
   with the reason for each, because the recurring mistake on this file is
   claiming a set is complete. Measured against 129,179 real commands from this
-  install's history, 14 change how they are read; ordinary work that
-  interpolates a variable into an argument, a path, or a `gh api` endpoint is
-  untouched.
+  install's history, 15 change how they are read, every one of them from a
+  silent allow to a prompt; ordinary work that interpolates a variable into an
+  argument, a path, or a `gh api` endpoint is untouched. A sibling guard that
+  answered an unreadable command by falling back to a weaker check now runs both,
+  because the weaker check cannot see the most destructive shapes.

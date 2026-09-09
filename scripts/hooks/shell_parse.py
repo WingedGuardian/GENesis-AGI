@@ -1463,34 +1463,65 @@ def _has_brace_expansion(token: str) -> bool:
     intact. VERIFIED against bash itself through a shim that prints its own argv,
     rather than reasoned about — the two forms look alike and behave differently,
     and the difference is the whole severity of the case.
+
+    ONE LEFT-TO-RIGHT PASS, and that is a security property rather than a matter of
+    taste. The first version of this scan restarted an inner walk at every ``{``,
+    so a token of unterminated openers cost O(n^2): MEASURED on this function,
+    0.014s at 500 characters, 5.5s at 8,000, and 173s at
+    :data:`MAX_COMMAND_CHARS` — against guards registered with a 10-second wall
+    clock. The hook contract is explicit that a timed-out hook does not block the
+    tool call, so a guard that runs out of clock PERMITS, and this module feeds
+    nine of them: one crafted word would have disengaged the lot. A stack of
+    per-group flags answers the same question without ever re-reading a character,
+    because a ``{`` already passed can only ever be the group the next ``}``
+    closes.
+
+    The stack entry is that group's own "saw a top-level comma or range" flag, so
+    the innermost open group is the one a separator belongs to — which is exactly
+    the nesting rule above, expressed without a second traversal.
     """
+    stack: list[bool] = []
     i, n = 0, len(token)
     while i < n:
-        if token[i] != "{":
-            i += 1
-            continue
-        depth = 1
-        expandable = False
-        j = i + 1
-        while j < n:
-            c = token[j]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            elif depth == 1:
-                if c == ",":
-                    expandable = True
-                elif c == "." and j + 1 < n and token[j + 1] == ".":
-                    expandable = True
-                    j += 1
-            j += 1
-        if j < n and depth == 0 and expandable:
-            return True
-        i += 1  # unterminated or literal group — bash leaves it alone, so do we
-    return False
+        c = token[i]
+        if c == "{":
+            stack.append(False)
+        elif c == "}":
+            if stack and stack.pop():
+                return True  # this group expands, so the whole word does
+        elif stack:  # a separator belongs to the INNERMOST open group
+            if c == ",":
+                stack[-1] = True
+            elif c == "." and i + 1 < n and token[i + 1] == ".":
+                stack[-1] = True
+                i += 1
+        i += 1
+    return False  # openers never closed — bash leaves them alone, so do we
+
+
+#: Longest verb-position WORD this module will read before giving up on it.
+#:
+#: A second line of defence, not the primary one: the scans this bounds are all
+#: linear now, and a linear pass over even a :data:`MAX_COMMAND_CHARS` word costs
+#: microseconds. It exists because the primary defence is "every scanner here stays
+#: linear", which is an invariant a future edit can break silently — and the way it
+#: broke once already was a nested loop that looked perfectly ordinary. A bound
+#: cannot be forgotten the way a complexity argument can.
+#:
+#: FAILS CLOSED, which is the whole point of putting it here rather than making it
+#: a truncation. An over-long word is one this module has declined to establish, and
+#: this PR's own principle is that a verb it cannot establish is unestablished
+#: rather than absent — so :func:`_word_is_literal` says "not literal" and the word
+#: routes to the blind-spot net. Truncating and judging the prefix would be the
+#: opposite: a confident answer about a word nobody read.
+#:
+#: DERIVED, not chosen. MEASURED over 129,179 real commands from this install's
+#: transcripts, the longest word ever reaching :func:`_word_is_literal` is 3,176
+#: characters (a line of prose inside a here-doc body, not a verb anyone typed);
+#: 481 words exceed 1,024. The cap sits above the observed maximum with headroom,
+#: so it costs zero flips on observed traffic — verified in the same two-stage
+#: measurement as the rest of this change.
+_MAX_VERB_WORD_CHARS = 4096
 
 
 def _word_is_literal(token: str) -> bool:
@@ -1498,7 +1529,13 @@ def _word_is_literal(token: str) -> bool:
 
     Covers the constructs named beside :data:`_EXPANSION_MARKS`, and only those.
     Tilde and pathname expansion are deliberately out, with reasons recorded there.
+
+    An over-long word is NOT literal — see :data:`_MAX_VERB_WORD_CHARS`. That is
+    the fail-closed direction: this module declined to read the word, and declining
+    to read is not evidence that the word is harmless.
     """
+    if len(token) > _MAX_VERB_WORD_CHARS:
+        return False
     if any(mark in token for mark in _EXPANSION_MARKS):
         return False
     return not _has_brace_expansion(token)

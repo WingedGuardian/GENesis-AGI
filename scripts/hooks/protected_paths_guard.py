@@ -266,11 +266,31 @@ def main() -> int:
                 f"an rm command that {blind.cause}, so its real targets cannot be "
                 f"resolved. To proceed: {blind.hint}"
             )
-        # `untokenizable` keeps the pre-existing substring fallback, unchanged. It is
-        # not a bound this change introduced, and widening it here would newly refuse
-        # ordinary work under cover of a regression fix.
+        # The substring fallback ADDS to the precise scan below; it does not replace
+        # it, and the missing `else` here used to be a fail-open.
+        #
+        # The comment this replaces said the fallback was kept "unchanged" so as not
+        # to "newly refuse ordinary work". True of the fallback itself, and it missed
+        # what the early RETURN did: any non-bounds blind spot skipped the segment
+        # scan entirely, downgrading this guard to a test the comment 25 lines above
+        # already calls STRICTLY WEAKER — precisely on the ANCESTOR and GLOB shapes
+        # it lists, which a substring test structurally cannot see.
+        #
+        # That was latent while `untokenizable` was the only non-bounds cause. It
+        # stopped being latent when shell_parse gained a second one: MEASURED
+        # base-vs-branch through this guard, `<a command whose verb the shell
+        # builds> && rm -rf ~/genesis` — the PARENT of the protected production
+        # database — went BLOCK -> ALLOW, because the concealed verb raised a blind
+        # spot and the blind spot skipped the scan that catches an ancestor.
+        #
+        # Falling through is safe in the direction that matters: the scan can only
+        # ADD refusals, and it runs on segments that tokenized fine (the bounds
+        # branch above has already returned for the case where there are none).
+        # MEASURED over 129,179 real commands: 1,697 mention rm, 68 of those reach
+        # this branch at all, and 0 change verdict.
         reason = _legacy_substring_block(cmd, dirs, f"that {blind.cause}. To proceed: {blind.hint}")
-        return _block(reason) if reason else 0
+        if reason:
+            return _block(reason)
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     for seg in segs:
