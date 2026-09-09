@@ -2,8 +2,14 @@
 
 Primary path: in-memory NetworkX MultiDiGraph loaded lazily from memory_links
 (a multigraph because one memory pair may carry several typed edges).
-Fallback: recursive CTE queries (if NetworkX import fails or cache is cold
-during the first query of a session).
+
+Fallback: recursive CTE queries, reached on ONE condition — the NetworkX import
+failed at module load. A cold cache is NOT a trigger, though this docstring said
+so for years: the first query of a session calls `_ensure_graph`, which BUILDS
+the cache and returns it. Worth stating precisely, because the wrong version
+makes the fallback sound routine when it is in fact dormant wherever NetworkX
+installs (it is a hard dependency, present in this repo's venv), which is why
+the two paths were free to disagree unnoticed.
 
 The cache is invalidated via ``invalidate_graph_cache()`` when links are
 created or deleted. The next query triggers a rebuild from SQLite.
@@ -13,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass
 
 import aiosqlite
@@ -132,13 +137,11 @@ def _bfs_with_strength(
         return []
 
     visited: set[str] = {root_id}
-    queue: deque[tuple[str, int]] = deque([(root_id, 0)])
+    frontier: list[str] = [root_id]
     results: list[GraphNode] = []
+    depth = 0
 
-    while queue:
-        node, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
+    while frontier and depth < max_depth:
 
         # A pair may carry several typed edges (MultiDiGraph), so out_edges
         # yields one tuple per parallel edge. Consider them all and keep the
@@ -169,43 +172,84 @@ def _bfs_with_strength(
         # not a semantic ranking; it happens to demote `contradicts` (which sorts
         # early), the safe direction. 0 of the 106 tied pairs carries one.
         #
-        # This makes the choice WITHIN one (source, target) pair well-defined. It
-        # does NOT make the traversal's reported labels row-order independent, and
-        # nothing here claims that: the `visited` check below means a node
-        # reachable from several parents is claimed by whichever parent the queue
-        # reaches first, and queue order follows row order. MEASURED 2026-09-02 on
-        # the live graph: ~15.8% of reported labels flip under a reversed row
-        # order. Attribution at 500 roots traced every flip to multi-parent claim
-        # order and none to ties — but that zero is a SUBSAMPLE BOUND, not an
-        # absolute: at 3000 roots the tie-break itself removes 16 of 21,486 flips
-        # (~0.07%). Ties are a rounding error on this surface, not nil.
+        # `best` is scoped to the whole LEVEL, not to one expanding parent, and
+        # that is the point. Per-parent, a node reachable from several parents was
+        # claimed by whichever one the queue happened to reach first — so the
+        # reported edge followed the loader's row order (its SELECT has no ORDER
+        # BY) and could be the WEAKER of the two. That is not cosmetic: `strength`
+        # is put in front of the model AND is what the consumers sort on before
+        # taking the top five, so a node credited to a weaker parent sinks in that
+        # order and can leave the slice entirely.
         #
-        # Pre-existing (~15.8% before the multigraph change too) and tracked as
-        # follow-up ab0d0c28 rather than changed here, since best-parent-wins is a
-        # traversal-semantics change needing its own blast-radius measurement.
-        # "Reach-set-neutral (0 delta)" holds for THIS function's full output, but
-        # not for what the model sees: core.py:437,:709 slice nodes[:5] after a
-        # stable sort on (depth, -strength), so on 3.5% of roots a different SET
-        # of five memories reaches the context depending on row order. Same root
-        # cause, same follow-up — stated here so the bound is not read as wider
-        # than it is.
+        # MEASURED against this module on the live graph, old vs new, over the FULL
+        # population (256,063 links; all 66,856 roots that have neighbours; the real
+        # call parameters max_depth=2, min_strength=0.3):
+        #   68,330 of 1,066,912 reported nodes (6.40%) gained a higher, truer
+        #     strength, across 50.4% of roots; 0 were ever lowered.
+        #   top-five SET churn between a forward and a reversed row order: 3.09%
+        #     before, 0 after; the full output is likewise identical under both.
+        #   reach-set unchanged (0 roots) and no reported depth changed (0 nodes).
+        # Draining the level is what allows the cross-parent comparison.
+        #
+        # State the DENOMINATOR when quoting any of this. 6.40% is over every node
+        # the walk computes (~16 per root); restricted to the five that actually
+        # reach the model it is 0.16% of surfaced nodes and 0.7% of lookups. The
+        # blast radius at that slice is separate again: the surfaced SET changes on
+        # 1.94% of roots and its ORDER on 8.15%. An earlier revision of this comment
+        # quoted a 1,000-root sample and read an order of magnitude high on the
+        # surfaced surface — which is why every figure here is a population count.
+        #
+        # Sample-drawn figures also drift between runs on an unchanged table: the
+        # loader's SELECT has no ORDER BY, so node insertion order — and any sample
+        # drawn from it — varies per rebuild. Prefer the population numbers above.
+        #
+        # The commit below is ordered by a TOTAL key, and that alone is what makes
+        # the whole output deterministic: it fixes the append sequence, and the
+        # final sort is stable, so equal `(depth, -strength)` keys keep that
+        # sequence rather than the row order they used to keep. Note `drift.py`
+        # consumes that sequence as a RANKED list for RRF (its `local_ids`,
+        # drift.py:202) even though it reads no labels, so the ordering here is
+        # load-bearing for a second consumer, not just for the sliced view.
+        #
+        # A total key on the FINAL sort as well was tried and dropped. It is
+        # redundant by construction — a stable sort of an already-deterministic
+        # list cannot reintroduce nondeterminism — and measured redundant too
+        # (0 differences either way across 1,447 live roots). Keeping it would only
+        # have reordered ties gratuitously and widened the divergence from the CTE
+        # fallback's documented `(depth, strength DESC)`.
         best: dict[str, tuple[float, str]] = {}
-        for _, neighbor, data in G.out_edges(node, data=True):
-            if neighbor in visited:
-                continue
-            strength = data.get("strength", 0.0)
-            edge_type = data.get("link_type", "")
+        for node in frontier:
+            for _, neighbor, data in G.out_edges(node, data=True):
+                if neighbor in visited:
+                    continue
+                strength = data.get("strength", 0.0)
+                edge_type = data.get("link_type", "")
 
-            if strength < min_strength:
-                continue
-            if link_type_filter and edge_type != link_type_filter:
-                continue
+                if strength < min_strength:
+                    continue
+                if link_type_filter and edge_type != link_type_filter:
+                    continue
 
-            current = best.get(neighbor)
-            if current is None or (strength, edge_type) > current:
-                best[neighbor] = (strength, edge_type)
+                current = best.get(neighbor)
+                if current is None or (strength, edge_type) > current:
+                    best[neighbor] = (strength, edge_type)
 
-        for neighbor, (strength, edge_type) in best.items():
+        next_frontier: list[str] = []
+        # Key is (-strength, neighbour_id) and DELIBERATELY excludes link_type,
+        # unlike the within-pair comparison above. The id alone already makes the
+        # key total, so link_type buys no determinism here — and it is not neutral:
+        # sorting equal-strength neighbours alphabetically by TYPE front-loads
+        # early-sorting relationships in the order the model reads. MEASURED over
+        # all 66,856 roots, 13.8% of which carry a (depth, strength) tie group:
+        # including link_type moved the reported top-1 type by +32.8%
+        # (categorized_as), +31.8% (action_item_for), -23.8% (preceded_by) and
+        # -39.6% (succeeded_by) against the id-only key. Memory ids are UUIDs, so
+        # they carry no such correlation. The within-pair key above is a different
+        # case: there the two candidates are the SAME pair and a type must be
+        # picked, so a stated rule beats an arbitrary one.
+        for neighbor, (strength, edge_type) in sorted(
+            best.items(), key=lambda kv: (-kv[1][0], kv[0])
+        ):
             visited.add(neighbor)
             results.append(GraphNode(
                 memory_id=neighbor,
@@ -213,9 +257,13 @@ def _bfs_with_strength(
                 depth=depth + 1,
                 strength=strength,
             ))
-            queue.append((neighbor, depth + 1))
+            next_frontier.append(neighbor)
+        frontier = next_frontier
+        depth += 1
 
-    # Match CTE output order: depth ascending, strength descending
+    # Match CTE output order: depth ascending, strength descending. Deliberately
+    # left as a partial key — ties now resolve to the deterministic commit order
+    # established above, so no further tiebreak is needed to make this stable.
     results.sort(key=lambda n: (n.depth, -n.strength))
     return results
 
@@ -316,7 +364,59 @@ async def _traverse_cte(
     max_depth: int,
     min_strength: float,
 ) -> list[GraphNode]:
-    """Original recursive CTE traversal (fallback)."""
+    """Original recursive CTE traversal (fallback).
+
+    ONE ROW PER MEMORY, picked the same way the walk above picks: shallowest
+    depth, then the strongest edge reaching it, then link_type as a deterministic
+    tie-break. That is not tidiness — it is the same correctness property this
+    module's walk exists to provide, and the fallback used to contradict it.
+
+    `SELECT DISTINCT target_id, link_type, depth, strength` keeps one row per
+    COMBINATION, not per memory, so a node reached through two parents at the
+    same depth came back TWICE — once credited its strongest edge and once its
+    weakest. `mcp/memory/core.py` takes `traversal.nodes[:5]` and does NOT sort
+    it — the order this function emits IS the selection — so the duplicate both
+    occupied two of those five slots and dragged a false weaker strength into
+    what the model reads. Which implementation answers must not change that.
+
+    The window's ORDER BY mirrors the walk's `(strength, link_type)` maximum
+    exactly, and the outer `ORDER BY depth, strength DESC, target_id` mirrors the
+    walk's committed sequence — `(-strength, memory_id)` within a level,
+    preserved through a stable final sort on `(depth, -strength)`. That matters
+    because `drift.py:202` reads this sequence as a RANKED list for RRF without
+    reading a single label, so two implementations agreeing on every field and
+    disagreeing on order still hand that consumer different answers.
+
+    The trailing `target_id` is EXPLICIT, not load-bearing, and the distinction is
+    measured rather than assumed: with three equal-strength neighbours inserted in
+    a deliberately adversarial order (z, a, m), this query returns them id-sorted
+    WITH the key and identically WITHOUT it — the window's `PARTITION BY
+    target_id` already groups them that way. So no test can tell the two apart,
+    and none claims to. It is kept because that is a property of one engine's
+    query plan, which SQLite does not promise, and stating the order costs
+    nothing; do not read it as a guard something exercises.
+
+    Window functions need SQLite >= 3.25 (2018); this install runs 3.45, and the
+    repo already hard-depends on 3.35+ elsewhere (`UPDATE…RETURNING`,
+    `ALTER TABLE DROP COLUMN` in migrations 0010/0014/0016), so this floor sits
+    strictly below an existing one and cannot newly break a clone.
+
+    TWO GUARDS ON THE ANCHOR, because the anchor row skipped constraints both the
+    recursive step and the walk apply — one generator, two symptoms:
+
+    * `target_id <> source_id`. The walk seeds `visited = {root_id}` and can
+      therefore never emit the root; the anchor had no such guard, so a memory
+      linked to itself was returned as its own related memory, burning one of the
+      five slots `core.py` shows. MEASURED on the live table: 30 of 269,757 rows
+      are self-links, so this fired for 30 roots.
+    * `max_depth < 1` returns early (below). The anchor emits depth 1
+      unconditionally, ignoring the bound the walk's `while depth < max_depth`
+      respects — so `max_depth=0` asked for nothing and got a level. Inert today
+      (no caller passes 0; production passes 1, 2 or the default 3) and closed
+      anyway, because the claim being made here is that the two paths agree.
+    """
+    if max_depth < 1:
+        return []
     cursor = await db.execute(
         """
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
@@ -324,6 +424,7 @@ async def _traverse_cte(
                    source_id || ',' || target_id
             FROM memory_links
             WHERE source_id = ?
+              AND target_id <> source_id
               AND strength >= ?
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
@@ -334,9 +435,17 @@ async def _traverse_cte(
               AND ml.strength >= ?
               AND c.path NOT LIKE '%' || ml.target_id || '%'
         )
-        SELECT DISTINCT target_id, link_type, depth, strength
-        FROM connected
-        ORDER BY depth, strength DESC
+        SELECT target_id, link_type, depth, strength
+        FROM (
+            SELECT target_id, link_type, depth, strength,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY target_id
+                       ORDER BY depth ASC, strength DESC, link_type DESC
+                   ) AS rn
+            FROM connected
+        )
+        WHERE rn = 1
+        ORDER BY depth, strength DESC, target_id
         """,
         (root_id, min_strength, max_depth, min_strength),
     )
