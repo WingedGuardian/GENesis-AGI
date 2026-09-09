@@ -37,9 +37,28 @@ Fixing 30 instances of a recurring pattern leaves nothing to stop instance 31.
 This is the prose-to-gate move: the rule was "clean up your temp", carried by
 convention, and conventions are what reviewers find one instance of at a time.
 
-WHAT THIS GUARD CLAIMS, PRECISELY: a temp created IN THIS FUNCTION and renamed
-into place, whose exception path does not unlink it. The "created in this
-function" half is load-bearing and was learned expensively. A first version
+WHAT THIS GUARD CLAIMS, PRECISELY: a temp created IN THIS SCOPE, written, and
+renamed into place, where some reachable path out leaves it on disk. Three parts
+of that sentence were narrower until a review round widened them, and each was
+wrong in a way worth stating:
+
+  * SCOPE, not function. Module level is a scope too. Skipping the born-here
+    test there and stamping NO_HANDLER made a module-level move-aside produce a
+    dirty row for a DURABLE operand while a module-level write that DOES clean up
+    still read dirty.
+  * WRITTEN, not just renamed. A handler wrapped around only the rename leaves
+    the temp when the WRITE fails, which is the class this guard is named for.
+    Creation is deliberately NOT the trigger -- if `mkstemp` itself fails there
+    is nothing on disk -- and getting that backwards flags util/atomic.py, the
+    reference implementation this guard tells people to adopt.
+  * SOME REACHABLE PATH, not "no unlink anywhere". Crediting any syntactic
+    unlink in the collected handlers let `except ValueError: unlink(tmp)` clear a
+    rename that raises OSError. Requiring EVERY collected handler to unlink is
+    wrong the other way, because handlers nest: an inner one that unlinks and
+    re-raises means the outer never sees the temp. Handlers resolve innermost
+    first, and a covering `finally` that unlinks dominates all of them.
+
+The "created in this scope" half is load-bearing and was learned expensively. A first version
 anchored on the verb alone, and `rename`/`replace` also covers move-aside,
 claim-by-rename, rotate and quarantine -- shapes whose first operand is DURABLE.
 That shipped a 49-row ledger at 67% precision, and because this guard PRINTS a
@@ -89,6 +108,22 @@ WHAT THIS GUARD CANNOT SEE, stated rather than discovered later:
     rather than added, and excluding it is a limitation to record, not a verdict
     about the shape. MEASURED across ten such verbs: zero live instances where
     the published operand is a born-here temp, so the count stands.
+  * A CLEANUP IN ANOTHER SCOPE. `_born_in` stopped crossing scope boundaries
+    (a binding in a nested def is a different variable) but `_unlinks` still
+    walks freely, so an unlink inside a nested `def _rollback():` that nothing
+    calls credits CLEANS_UP. Pre-existing, and the asymmetry is stated here
+    rather than left for a reader to find.
+  * A `nonlocal` temp created in a nested def and moved in the outer one. The
+    own-scope rule drops it -- a recall loss taken deliberately, because the
+    alternative reintroduces the cross-scope false positives it exists to stop.
+  * A conditional finalizer. `finally: if enabled: tmp.unlink()` reads
+    CLEANS_UP. Left alone on purpose: the overwhelmingly common form is
+    `if tmp.exists()`, where crediting it is correct.
+  * PYTHON UNDER A DOT-DIRECTORY, e.g. `.github/scripts/`. The scanned roots and
+    the test that pins them both skip dot-directories. Zero such files today, so
+    this is latent rather than live. `Path.rglob` also does not follow symlinked
+    directories, so a symlinked subtree inside a scanned root is invisible and
+    the completeness test cannot see it either.
   * Whether the destination directory is swept. A leaked temp under `/tmp` is
     collected by the OS; one under `~/.genesis` is not. The guard treats them
     alike -- prioritisation belongs to the human reading the report.
@@ -200,8 +235,50 @@ _TEMP_SUFFIXES = (".tmp", ".new", ".partial", ".part", ".swp", ".writing")
 _INTERPOLATED_TEMP_RE = re.compile(r"[._-](tmp|temp|partial|swp)[._-]*$")
 
 
+_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+#: Calls whose ARGUMENTS can legitimately carry the scratch marker for the path
+#: being assigned. Everything else is opaque: a constant buried in an unrelated
+#: call's arguments describes that call, not the assigned path.
+_PATH_BUILDERS = frozenset(
+    {"with_suffix", "with_name", "with_stem", "joinpath", "join", "format", "fspath"}
+)
+
+#: ONE-ARGUMENT wrappers that name the same path -- the same set `_TRANSPARENT`
+#: already treats as pass-through on the operand side. Omitting them from the
+#: builder set did not merely narrow the marker test, it made every
+#: `tmp = Path(str(p) + ".tmp")` and even `tmp = Path(mkstemp()[1])` produce NO
+#: ROW AT ALL: invisible, and absent from the ledger, which is this guard's own
+#: worst outcome. Transparency is gated on ARITY, not on the name, so
+#: `Path(tmpdir, "child")` stays opaque -- that is the documented multi-argument
+#: join blind spot, and enforcing it by arity keeps the single-argument form.
+_PATH_WRAPPERS = frozenset({"Path", "PurePath", "str"})
+
+
+def _own_scope(node: ast.AST):
+    """Walk ``node`` WITHOUT descending into a nested function or class scope.
+
+    `ast.walk` crosses scope boundaries, so a nested `def` that happens to bind
+    `tmp` made the OUTER function's durable `tmp` look born-here. A binding in
+    another scope is a different variable; treating it as the same one is how a
+    durable operand acquires this guard's "unlink the temp" remediation.
+    """
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        for child in ast.iter_child_nodes(cur):
+            # Prune the CHILD when it opens a new scope; the root is always
+            # descended into, which is what makes this work when `node` is
+            # itself the FunctionDef being analysed.
+            if isinstance(child, _NESTED_SCOPES):
+                continue
+            stack.append(child)
+
+
 def _born_in(func: ast.AST, temp_expr: str,
-             module_consts: dict[str, str] | None = None) -> bool:
+             module_consts: dict[str, str] | None = None,
+             before_lineno: int | None = None) -> bool:
     """Is ``temp_expr`` bound in this function to something that MAKES a temp?
 
     Deliberately conservative, and TRANSITIVE, because the real pattern is two
@@ -256,24 +333,43 @@ def _born_in(func: ast.AST, temp_expr: str,
             return _bound_names(target.value)
         return []
 
+    def _reaches(n: ast.AST) -> bool:
+        """Does this binding actually precede the move it would explain?
+
+        A whole-function walk marked a name born-here from an assignment LATER
+        in the body, so `os.replace(tmp, dst)` followed by
+        `tmp = dst.with_suffix('.tmp')` reported the DURABLE first operand as an
+        unguarded write -- with the unlink remediation pointed at live data.
+        Textual order is an approximation of reaching-definitions (a loop can
+        execute a later line first), and it is the SAFE approximation: it can
+        only DROP a row, never invent one, and this guard's own history says a
+        false row in a debt ledger is worse than a missed one.
+        """
+        if before_lineno is None:
+            return True
+        return getattr(n, "lineno", 0) <= before_lineno
+
     temps: set[str] = set()
     # Seed: `with tempfile.NamedTemporaryFile(...) as tmp:` and friends.
-    for n in ast.walk(func):
+    for n in _own_scope(func):
         if (
             isinstance(n, ast.withitem)
             and n.optional_vars is not None
+            and _reaches(n.context_expr)
             and any(m in _unparse(n.context_expr) for m in _TEMP_MAKERS)
         ):
             temps.update(_bound_names(n.optional_vars))
 
     # Assignments, iterated to a fixpoint so a derived name is reached.
     pairs: list[tuple[list[str], ast.AST]] = []
-    for n in ast.walk(func):
+    for n in _own_scope(func):
         if isinstance(n, ast.Assign):
             targets, value = n.targets, n.value
         elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and n.value:
             targets, value = [n.target], n.value
         else:
+            continue
+        if not _reaches(n):
             continue
         names = [nm for t in targets for nm in _bound_names(t)]
         if names:
@@ -297,7 +393,35 @@ def _born_in(func: ast.AST, temp_expr: str,
         not, and `whats-new-` must keep reading as ordinary text. Hence the
         relaxation is scoped to JoinedStr pieces rather than applied globally.
         """
-        for n in ast.walk(value):
+        def _path_expr(root: ast.AST):
+            """Descend, but NOT into the arguments of a call that does not build
+            a path. Walking every descendant made
+            `record = load_record(excluded_suffix=".tmp")` mark `record` itself
+            a temp, so a later one-argument `record.replace(other)` was reported
+            as an unguarded write and carried the unlink remediation to a
+            non-path object. A marker has to describe the path being ASSIGNED.
+            """
+            stack = [root]
+            while stack:
+                cur = stack.pop()
+                yield cur
+                if isinstance(cur, ast.Call):
+                    fn = getattr(cur.func, "attr", None) or getattr(
+                        cur.func, "id", None
+                    )
+                    stack.append(cur.func)  # the receiver chain is still ours
+                    transparent = (
+                        fn in _PATH_WRAPPERS
+                        and len(cur.args) == 1
+                        and not cur.keywords
+                    )
+                    if fn in _PATH_BUILDERS or fn in _TEMP_MAKERS or transparent:
+                        stack.extend(cur.args)
+                        stack.extend(k.value for k in cur.keywords)
+                    continue
+                stack.extend(ast.iter_child_nodes(cur))
+
+        for n in _path_expr(value):
             if isinstance(n, ast.Call):
                 fn = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
                 if fn in _TEMP_MAKERS:
@@ -366,20 +490,132 @@ def _born_in(func: ast.AST, temp_expr: str,
     return temp_expr in temps or root in temps or bool(prefixes & temps)
 
 
-def _handlers_covering(func: ast.AST, lineno: int) -> list:
-    """Every except-handler and finally-body whose TRY BODY contains lineno.
+_TRY_NODES: tuple = (
+    (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
+)
 
-    Deliberately the try BODY, not the whole Try node: a rename sitting inside an
-    `except:` block is not protected by that same handler."""
-    out: list = []
+
+def _handlers_covering(func: ast.AST, lineno: int) -> list[tuple[list, list | None]]:
+    """Handlers and finalizers that actually run if the move at ``lineno`` raises.
+
+    The two suites have DIFFERENT reach, and collapsing them was the bug:
+
+    * ``except`` handlers catch only what the try BODY raises. A rename sitting
+      inside an ``except:`` block is not protected by that same handler, which is
+      why this tests ``n.body`` rather than the whole Try node.
+    * ``finally`` runs if the move raises ANYWHERE in the statement -- body,
+      an ``except`` suite, or the ``else`` suite. Testing only ``n.body`` meant a
+      move in an ``else:`` with ``finally: tmp.unlink(missing_ok=True)`` was
+      reported NO_HANDLER while the cleanup demonstrably runs.
+
+    ``ast.TryStar`` (except*) is the same statement for this purpose and was
+    invisible to an isinstance test naming only ``ast.Try``.
+    """
+
+    def _spans(suite: list) -> bool:
+        return any(c.lineno <= lineno <= (c.end_lineno or c.lineno) for c in suite)
+
+    found: list = []
     for n in ast.walk(func):
-        if isinstance(n, ast.Try) and any(
-            c.lineno <= lineno <= (c.end_lineno or c.lineno) for c in n.body
-        ):
-            out.extend(n.handlers)
-            if n.finalbody:
-                out.append(n.finalbody)
-    return out
+        if not isinstance(n, _TRY_NODES):
+            continue
+        in_body = _spans(n.body)
+        excepts = list(n.handlers) if in_body else []
+        # The finalizer covers the body, the handlers and the else suite alike.
+        final = (
+            n.finalbody
+            if n.finalbody
+            and (in_body or _spans(n.orelse) or any(_spans(h.body) for h in n.handlers))
+            else None
+        )
+        if excepts or final:
+            span = (n.end_lineno or n.lineno) - n.lineno
+            found.append((span, excepts, final))
+    # INNERMOST FIRST. Nesting is not a flat pool of handlers: an inner
+    # `except BaseException:` that unlinks and re-raises means the OUTER handler
+    # never sees the move exception with the temp still on disk. Treating every
+    # enclosing try as an equally applicable path reported four genuinely clean
+    # live sites as LEAKS -- exactly the false-flag noise that makes a debt
+    # ledger stop being read.
+    found.sort(key=lambda t: t[0])
+    return [(e, f) for _, e, f in found]
+
+
+#: Calls that put BYTES IN the temp. Creation (`mkstemp`, `NamedTemporaryFile`)
+#: is deliberately absent: if creation itself fails there is nothing on disk to
+#: leak, so an uncovered creation is not the risk window -- an uncovered WRITE
+#: is. Getting that distinction wrong flags util/atomic.py, the repo's own
+#: reference implementation, whose mkstemp sits outside the try while the write
+#: it protects sits inside.
+_WRITE_CALLS = frozenset(
+    {"write_text", "write_bytes", "write", "writelines", "writerow", "writerows",
+     "fdopen", "open", "copy", "copy2", "copyfile", "copyfileobj", "dump",
+     "safe_dump"}
+)
+
+
+#: A filesystem move raises OSError. A handler naming a class that cannot catch
+#: one does not protect the move at all; a handler naming a SUBCLASS protects
+#: only part of it. Both distinctions were missing, so `except ValueError:
+#: unlink(tmp)` credited cleanup for a rename that raises OSError -- a FALSE
+#: CLEAN, which hides the leak AND keeps it out of the ledger.
+_FULLY_CATCHES = frozenset(
+    {"OSError", "IOError", "EnvironmentError", "Exception", "BaseException"}
+)
+
+
+def _handler_classes(handler: ast.ExceptHandler) -> list[str]:
+    """The exception names a handler catches; empty list means a bare except."""
+    t = handler.type
+    if t is None:
+        return []
+    parts = t.elts if isinstance(t, ast.Tuple) else [t]
+    return [_unparse(x).rsplit(".", 1)[-1] for x in parts]
+
+
+def _fully_catches_move(handler: ast.ExceptHandler) -> bool:
+    """Does this handler catch EVERY error a move can raise?"""
+    names = _handler_classes(handler)
+    return not names or any(n in _FULLY_CATCHES for n in names)
+
+
+#: Every class a move can actually raise, plus the superclasses that catch them.
+#: ALLOWLIST, NOT DENYLIST -- the house rule, and it is load-bearing here. The
+#: first version asked "does this name end in Error and miss a 12-entry denylist"
+#: and called anything matching APPLICABLE. Combined with the all-applicable rule
+#: below, a sibling `except RuntimeError: raise` next to an `except OSError:` that
+#: unlinks correctly turned the whole site LEAKS. MEASURED on this tree: 296 try
+#: statements carry two or more handlers, and 590 handler occurrences name an
+#: *Error the denylist admitted that cannot catch an os.replace -- RuntimeError
+#: 35, CancelledError 32, YAMLError 14, OperationalError 14, SubprocessError 14.
+#: The generosity argument holds for ONE handler and does not survive `all(...)`.
+#: An absent name is safe in both directions: it makes the handler non-applicable,
+#: which continues the outward walk rather than crediting cleanup.
+_CATCHES_MOVE = _FULLY_CATCHES | {
+    "FileNotFoundError", "FileExistsError", "PermissionError", "IsADirectoryError",
+    "NotADirectoryError", "TimeoutError", "InterruptedError", "BlockingIOError",
+    "ProcessLookupError", "ChildProcessError", "ConnectionError", "BrokenPipeError",
+    "SameFileError", "SpecialFileError",
+}
+
+
+def _reraises(handler: ast.ExceptHandler) -> bool:
+    """Does this handler end by re-raising, so an OUTER handler still runs?
+
+    Only a BARE `raise` counts. `raise SomethingElse` propagates a different
+    class, which an enclosing `except OSError` would not catch, so treating it
+    as pass-through would credit cleanup that never happens.
+    """
+    return any(
+        isinstance(n, ast.Raise) and n.exc is None
+        for n in _own_scope(ast.Module(body=handler.body, type_ignores=[]))
+    )
+
+
+def _can_catch_move(handler: ast.ExceptHandler) -> bool:
+    """Could this handler catch SOMETHING a move raises? Subclasses count."""
+    names = _handler_classes(handler)
+    return not names or any(n in _CATCHES_MOVE for n in names)
 
 
 #: Wrappers that do not change WHICH path is meant, so `Path(tmp)`, `str(tmp)`
@@ -501,10 +737,31 @@ def _unlinks(nodes: list, temp_expr: str, func: ast.AST | None = None) -> bool:
                 fn = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
                 if fn not in ("unlink", "remove"):
                     continue
+                # `remove` DELETES A FILE only on os/shutil. A list's
+                # `.remove(x)` drops an ELEMENT, and crediting it as cleanup made
+                # a genuinely leaking site read CLEANS_UP -- the false-clean
+                # direction this function's docstring calls strictly worse, since
+                # the leak is then invisible AND excluded from the ledger.
+                # `unlink` needs no such test: no builtin container has one.
+                # A bare `from os import remove` is deliberately NOT credited --
+                # that costs a false FLAG, which is the direction this function
+                # is allowed to be wrong in.
+                if fn == "remove" and not (
+                    isinstance(n.func, ast.Attribute)
+                    and _unparse(n.func.value) in ("os", "shutil")
+                ):
+                    continue
                 targets: set[str] = set()
                 for a in n.args:
                     targets.add(_core_name(a))
                     targets.add(_resolve(a, aliases))
+                # KEYWORD form too: `os.unlink(path=tmp)` cleans up exactly as
+                # the positional spelling does, and reading only n.args reported
+                # the protected site as LEAKS.
+                for kw in n.keywords:
+                    if kw.arg in (None, "path"):
+                        targets.add(_core_name(kw.value))
+                        targets.add(_resolve(kw.value, aliases))
                 if isinstance(n.func, ast.Attribute):
                     targets.add(_core_name(n.func.value))
                     targets.add(_resolve(n.func.value, aliases))
@@ -705,22 +962,132 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         # work item. Narrowing here TIGHTENS the allowlist rather than loosening
         # it: a temp created in a CALLER is not claimed, which is the documented
         # cross-function limitation, not a new hole.
-        if func is not None and not _born_in(func, temp, module_consts):
+        # MODULE SCOPE IS A SCOPE. This used to skip the born-here test whenever
+        # `func` was None and then stamp NO_HANDLER unconditionally, which was
+        # wrong in BOTH directions at once: a module-level move-aside like
+        # `os.replace(target, aside)` produced a dirty row for a DURABLE first
+        # operand -- printing "unlink the temp" at live data, the booby-trap this
+        # guard exists not to make -- while a module-level atomic write that DOES
+        # unlink in except/finally still read NO_HANDLER. Both `_born_in` and
+        # `_handlers_covering` take any AST node, so the module tree is simply
+        # the enclosing scope. Found independently by two reviewers, which is
+        # what moved it from "known limitation" to defect.
+        scope = func if func is not None else tree
+        if not _born_in(scope, temp, module_consts, before_lineno=node.lineno):
             continue
-        if func is None:
-            rows.append({"file": rel, "line": node.lineno, "func": "<module>",
-                         "temp": temp, "verdict": "NO_HANDLER"})
-            continue
-        handlers = _handlers_covering(func, node.lineno)
-        if not handlers:
-            verdict = "NO_HANDLER"
-        elif _unlinks(handlers, temp, func):
+        # EVERY APPLICABLE PATH, not ANY handler node -- but resolved by NESTING,
+        # innermost first. Crediting a site because one syntactic unlink appeared
+        # anywhere in the collected handlers let `except ValueError: unlink(tmp)`
+        # clear a rename that raises OSError, and let a multi-handler try pass
+        # when only ONE handler unlinked. Flattening every enclosing try instead
+        # is wrong the other way: an inner handler that unlinks and re-raises
+        # means the outer one never sees the temp. So walk outward and stop at
+        # the first try that actually decides the move's fate.
+        covering = _handlers_covering(scope, node.lineno)
+        # A COVERING `finally` THAT UNLINKS DOMINATES EVERYTHING BENEATH IT, so
+        # it is tested across all enclosing levels BEFORE any handler reasoning.
+        # Walking innermost-first and concluding from handlers alone reported
+        # inbox/writer.py's `_allocate_and_link` as a leak: its inner
+        # `except FileExistsError: continue` does not unlink, but the outer
+        # try/finally unlinks on every path out, so the temp never survives.
+        verdict = "NO_HANDLER"
+        saw_applicable = False
+        if any(f is not None and _unlinks([f], temp, scope) for _, f in covering):
             verdict = "CLEANS_UP"
-        else:
+            covering = []
+        for excepts, _final in covering:
+            applicable = [h for h in excepts if _can_catch_move(h)]
+            saw_applicable = saw_applicable or bool(applicable)
+            if not applicable:
+                # A finalizer that does not unlink DECIDES NOTHING -- an
+                # enclosing handler can still clean up, and the dominance check
+                # above already proved no covering finalizer unlinks. Concluding
+                # LEAKS here abandoned the outward walk and flagged the idiomatic
+                # `try: write; move; finally: lock.release()` wrapped in an outer
+                # `except OSError: tmp.unlink()` as a leak.
+                continue                    # this try cannot decide the move
+
+            # A handler that RE-RAISES has not finished the job: the exception
+            # keeps propagating and an enclosing handler still runs. So
+            # `except OSError: log.warning(...); raise` decides nothing and the
+            # walk continues outward, rather than reading as a leak because this
+            # particular handler did not unlink. A handler that unlinks AND
+            # re-raises HAS finished the job and still decides -- reading the
+            # bare `raise` alone excluded session_cache.py's
+            # `except BaseException: unlink(tmp); raise`, whose outer handler
+            # does not unlink, and flagged a correct live site.
+            deciding = [
+                h for h in applicable
+                if _unlinks([h.body], temp, scope) or not _reraises(h)
+            ]
+            if not deciding:
+                continue
+            cleaned = all(_unlinks([h.body], temp, scope) for h in deciding)
+            if not cleaned:
+                verdict = "LEAKS"           # some catchable path leaves the temp
+                break
+            if any(_fully_catches_move(h) for h in deciding):
+                verdict = "CLEANS_UP"       # nothing escapes this try uncleaned
+                break
+            # Partial cover that DOES unlink: keep looking outward for the rest.
             verdict = "LEAKS"
+
+        # A walk that ran out of enclosing trys without deciding still SAW a
+        # handler. NO_HANDLER would be the wrong label -- both are dirty, so the
+        # guard catches it either way, but the ledger and its reader deserve the
+        # accurate one. This is the `except OSError: unlink(other); raise` shape:
+        # a handler exists, it just never cleans up this temp.
+        if verdict == "NO_HANDLER" and saw_applicable:
+            verdict = "LEAKS"
+
+        # THE WHOLE SEQUENCE, not just the rename. A handler wrapped around only
+        # the move leaves the temp on disk when the WRITE fails -- disk-full, an
+        # encoding error, a short write -- which is the very class this guard is
+        # named for. MEASURED 2026-09-09: no live site is reclassified by this,
+        # so it is coverage rather than churn.
+        if verdict == "CLEANS_UP":
+            # IDENTITY, not containment, and EVERY write, not the earliest.
+            # `root in _unparse(n)` was the substring defect `_unlinks` already
+            # documents, re-introduced on the write side: an uncovered
+            # `tmp_sidecar.write_text(...)` downgraded a clean `tmp` site. And
+            # checking only min(writes) let a covered first write followed by an
+            # UNCOVERED append read CLEANS_UP -- the false-clean direction.
+            #
+            # STATED LIMITATION: the coverage test here is existence of a
+            # covering try, not the full applicability/unlink reasoning above.
+            # A write wrapped in `except ValueError: pass` therefore counts as
+            # covered. Closing that means factoring the verdict loop into a
+            # helper, which is a larger change than this belongs in.
+            want_node = ast.parse(temp, mode="eval").body
+            aliases = _alias_map(scope)
+            wants = {_core_name(want_node), _resolve(want_node, aliases)}
+            for n in ast.walk(scope):
+                if not isinstance(n, ast.Call) or n.lineno > node.lineno:
+                    continue
+                fn = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+                if fn not in _WRITE_CALLS:
+                    continue
+                operands: set[str] = set()
+                for a in list(n.args) + [k.value for k in n.keywords]:
+                    operands.add(_core_name(a))
+                    operands.add(_resolve(a, aliases))
+                if isinstance(n.func, ast.Attribute):
+                    operands.add(_core_name(n.func.value))
+                    operands.add(_resolve(n.func.value, aliases))
+                if (wants & operands) and not _handlers_covering(scope, n.lineno):
+                    verdict = "LEAKS"
+                    break
         rows.append({"file": rel, "line": node.lineno,
-                     "func": _qualname(tree, func), "temp": temp,
-                     "verdict": verdict})
+                     # `_qualname` dereferences node.name, so module scope keeps
+                     # its literal label rather than being passed None. The old
+                     # early-return supplied this; folding module scope into the
+                     # normal path removed that and left an AttributeError that
+                     # no LIVE file triggers -- there is no module-level atomic
+                     # write in the tree today, so the guard stayed green while
+                     # carrying a crash for the first one anybody adds.
+                     "func": _qualname(tree, func) if func is not None
+                     else "<module>",
+                     "temp": temp, "verdict": verdict})
     return rows
 
 
@@ -730,9 +1097,28 @@ def key(row: dict) -> str:
     return f"{row['file']}::{row['func']}::{row['temp']}"
 
 
+#: Top-level trees that SHIP EXECUTABLE PYTHON and are therefore scanned.
+#: `az_plugins/` was missed for exactly the reason a hardcoded list gets things
+#: wrong -- it did not exist when the list was written. MEASURED 2026-09-09: it
+#: holds 11 modules and produces ZERO rows, so adding it moves no count; the gap
+#: was in COVERAGE, not in the verdicts. `_UNSCANNED_ROOTS` records the
+#: deliberate exclusions, and a test pins that every top-level tree with Python
+#: in it appears in one list or the other -- so the next tree cannot be missed
+#: silently the way this one was.
+SCAN_ROOTS = ("src", "scripts", "az_plugins")
+
+#: Excluded ON PURPOSE, with the reason, because absence teaches nothing.
+UNSCANNED_ROOTS = {
+    "tests": "fixtures create and abandon temp files BY DESIGN; every row would "
+             "be noise, and a debt ledger full of noise stops being read",
+}
+
+
 def scan(repo: Path) -> tuple[list[dict], list[str]]:
     rows, errors = [], []
-    for base in ("src", "scripts"):
+    for base in SCAN_ROOTS:
+        if not (repo / base).is_dir():
+            continue
         for path in sorted((repo / base).rglob("*.py")):
             rel = str(path.relative_to(repo))
             if any(s in rel for s in _SKIP):

@@ -277,9 +277,9 @@ _STAGING_SUFFIX = ".part"
 def write_batch(dir_path, stem, payload):
     staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
     path = os.path.join(dir_path, f"{stem}.jsonl")
-    with open(staging, "w") as fh:
-        fh.write(payload)
     try:
+        with open(staging, "w") as fh:
+            fh.write(payload)
         os.link(staging, path)
     except OSError:
         return None
@@ -295,9 +295,9 @@ _STAGING_SUFFIX = ".part"
 def write_batch(dir_path, stem, payload):
     staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
     path = os.path.join(dir_path, f"{stem}.jsonl")
-    with open(staging, "w") as fh:
-        fh.write(payload)
     try:
+        with open(staging, "w") as fh:
+            fh.write(payload)
         os.link(staging, path)
     except OSError:
         os.unlink(staging)
@@ -1215,3 +1215,696 @@ def test_the_published_counts_match_the_tree():
         f"instance {n + 1} cannot arrive silently FROM A NEW FUNCTION while "
         f"the existing {n} are fixed"
     ) in ci_prose, "the CI comment's derived dirty count drifted"
+# ---------------------------------------------------------------------------
+# ORIGIN PRECISION. Both of these make DURABLE data read as a temp, and the row
+# they produce carries this guard's "unlink the temp" remediation.
+# ---------------------------------------------------------------------------
+
+_LATER_ASSIGNMENT_IS_NOT_AN_ORIGIN = """
+import os
+
+
+def rotate(dst):
+    os.replace(tmp, dst)
+    tmp = dst.with_suffix('.tmp')
+"""
+
+_NESTED_SCOPE_BINDING_IS_A_DIFFERENT_NAME = """
+import os
+
+
+def rotate(live, dst):
+
+    def helper():
+        live = dst.with_suffix('.tmp')
+        return live
+
+    os.replace(live, dst)
+"""
+
+_UNRELATED_KWARG_CONSTANT_IS_NOT_A_MARKER = """
+def publish(other):
+    record = load_record(excluded_suffix='.tmp')
+    record.replace(other)
+"""
+
+_BUILDER_KWARG_MARKER_IS_A_TEMP = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix(suffix='.tmp')
+    tmp.write_bytes(data)
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        return
+"""
+
+
+def test_an_assignment_after_the_move_is_not_an_origin():
+    """A whole-function walk has no sense of ORDER, so a name assigned a temp
+    LATER marked the durable operand of an EARLIER move as born-here. The row
+    that produced pointed "unlink the temp" at live data.
+
+    Textual order only approximates reaching-definitions -- a loop can execute a
+    later line first -- and it is the SAFE approximation: it can only drop a row,
+    never invent one."""
+    assert _verdicts(_LATER_ASSIGNMENT_IS_NOT_AN_ORIGIN) == []
+
+
+def test_a_binding_in_a_nested_scope_is_a_different_variable():
+    """`ast.walk` crosses scope boundaries, so a nested `def` that happens to
+    bind the same name made the OUTER function's durable operand look born-here.
+    A binding in another scope is a different variable."""
+    assert _verdicts(_NESTED_SCOPE_BINDING_IS_A_DIFFERENT_NAME) == []
+
+
+def test_a_constant_in_an_unrelated_call_is_not_a_temp_marker():
+    """The marker has to describe the path being ASSIGNED. Walking every
+    descendant string literal made `load_record(excluded_suffix='.tmp')` mark
+    `record` a temp, so a later one-argument `record.replace(other)` was reported
+    as an unguarded write -- with unlink remediation aimed at a non-path object.
+
+    The fix descends only into calls that BUILD a path, which is why the recall
+    control below still has to pass."""
+    assert _verdicts(_UNRELATED_KWARG_CONSTANT_IS_NOT_A_MARKER) == []
+
+
+def test_a_marker_in_a_path_builder_keyword_is_still_a_temp():
+    """RECALL half of the control above: `with_suffix(suffix='.tmp')` is a path
+    builder, so its keyword argument DOES carry the marker. A precision fix that
+    stopped descending into every call would silently lose this."""
+    assert _verdicts(_BUILDER_KWARG_MARKER_IS_A_TEMP) == ["LEAKS"]
+
+
+# ---------------------------------------------------------------------------
+# CLEANUP CREDITING. A false CLEAN is strictly worse than a false flag here:
+# the leak is invisible AND excluded from the ledger, so nothing revisits it.
+# ---------------------------------------------------------------------------
+
+_LIST_REMOVE_IS_NOT_A_FILE_DELETE = """
+import os
+
+
+def write(dst, data, pending_paths):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except OSError:
+        pending_paths.remove(tmp)
+"""
+
+_OS_REMOVE_IS_A_FILE_DELETE = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except OSError:
+        os.remove(tmp)
+"""
+
+_KEYWORD_UNLINK_TARGET_IS_CLEANUP = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except OSError:
+        os.unlink(path=tmp)
+"""
+
+
+def test_a_list_removal_is_not_cleanup():
+    """`pending_paths.remove(tmp)` drops an ELEMENT; it does not delete a file.
+    Crediting it made a genuinely leaking site read CLEANS_UP -- invisible and
+    off the ledger. `remove` now counts only on os/shutil; `unlink` needs no such
+    test because no builtin container has one."""
+    assert _verdicts(_LIST_REMOVE_IS_NOT_A_FILE_DELETE) == ["LEAKS"]
+
+
+def test_os_remove_is_still_cleanup():
+    """RECALL half: scoping `remove` to filesystem owners must not lose the real
+    thing."""
+    assert _verdicts(_OS_REMOVE_IS_A_FILE_DELETE) == ["CLEANS_UP"]
+
+
+def test_a_keyword_unlink_target_is_cleanup():
+    """`os.unlink(path=tmp)` removes the temp exactly as the positional spelling
+    does. Reading only `n.args` reported the PROTECTED site as LEAKS -- a false
+    flag, whose cost is a developer sent to 'fix' code that is already correct."""
+    assert _verdicts(_KEYWORD_UNLINK_TARGET_IS_CLEANUP) == ["CLEANS_UP"]
+
+
+# ---------------------------------------------------------------------------
+# WHICH PATHS ACTUALLY RUN. Handlers, finalizers, and their nesting.
+# ---------------------------------------------------------------------------
+
+_FINALLY_COVERS_THE_ELSE_SUITE = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+    except OSError:
+        return
+    else:
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+"""
+
+_A_HANDLER_THAT_CANNOT_CATCH_THE_MOVE = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    tmp.write_bytes(data)
+    try:
+        os.replace(tmp, dst)
+    except ValueError:
+        os.unlink(tmp)
+"""
+
+_ONE_OF_TWO_HANDLERS_UNLINKS = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        os.unlink(tmp)
+"""
+
+_BOTH_HANDLERS_UNLINK = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except FileNotFoundError:
+        os.unlink(tmp)
+    except OSError:
+        os.unlink(tmp)
+"""
+
+_AN_INNER_HANDLER_DECIDES_BEFORE_AN_OUTER_ONE = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+        except OSError:
+            os.unlink(tmp)
+            raise
+    except OSError:
+        return None
+"""
+
+_AN_OUTER_FINALLY_DOMINATES_AN_INNER_HANDLER = """
+import os
+
+
+def allocate(base, data):
+    tmp = base.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        for _ in range(3):
+            try:
+                os.replace(tmp, base)
+            except FileExistsError:
+                continue
+            return base
+    finally:
+        tmp.unlink(missing_ok=True)
+"""
+
+
+def test_a_finalizer_covers_the_else_suite():
+    """`finally` runs if the move raises ANYWHERE in the statement -- body,
+    handler, or `else`. Testing only `n.body` reported a move in an `else:` as
+    NO_HANDLER while the cleanup demonstrably runs."""
+    assert _verdicts(_FINALLY_COVERS_THE_ELSE_SUITE) == ["CLEANS_UP"]
+
+
+def test_a_handler_that_cannot_catch_the_move_is_not_cleanup():
+    """`except ValueError:` cannot catch what `os.replace` raises, so its unlink
+    never runs. Crediting any syntactic unlink anywhere in the collected handlers
+    let this pass CI."""
+    assert _verdicts(_A_HANDLER_THAT_CANNOT_CATCH_THE_MOVE) == ["NO_HANDLER"]
+
+
+def test_every_applicable_handler_must_clean_up():
+    """A multi-handler try used to pass when only ONE handler unlinked.
+
+    FileNotFoundError is a genuine OSError SUBCLASS, so it is applicable and its
+    path leaves the temp behind. The distinction is subclass-vs-superclass, not
+    handler order -- an earlier version of this docstring said "tried first",
+    which reads as an ordering rule and is not what decides it."""
+    assert _verdicts(_ONE_OF_TWO_HANDLERS_UNLINKS) == ["LEAKS"]
+    assert _verdicts(_BOTH_HANDLERS_UNLINK) == ["CLEANS_UP"]
+
+
+def test_an_outer_finally_dominates_an_inner_handler():
+    """PRECISION, and the reason handlers are resolved by NESTING rather than
+    pooled. Requiring every collected handler to unlink reported four genuinely
+    clean LIVE sites as leaks, including inbox/writer.py's `_allocate_and_link`:
+    its inner `except FileExistsError: continue` does not unlink, but the outer
+    try/finally unlinks on every path out, so the temp never survives.
+
+    A covering finalizer that unlinks therefore dominates everything beneath it
+    and is tested across all enclosing levels BEFORE any handler reasoning."""
+    assert _verdicts(_AN_OUTER_FINALLY_DOMINATES_AN_INNER_HANDLER) == ["CLEANS_UP"]
+
+
+def test_the_innermost_handler_decides_the_moves_fate():
+    """Nesting ORDER is load-bearing, separately from the finalizer rule. The
+    inner `except OSError:` unlinks and re-raises; the outer one only swallows.
+    Resolved outermost-first the site reads LEAKS -- a false flag on correct
+    code, because the outer handler never sees the temp still on disk.
+
+    The outer-finally fixture cannot pin this: that check runs BEFORE the loop
+    and does not depend on ordering, so reversing the sort survived it. MEASURED:
+    with the sort reversed this fixture flips CLEANS_UP -> LEAKS."""
+    assert _verdicts(_AN_INNER_HANDLER_DECIDES_BEFORE_AN_OUTER_ONE) == ["CLEANS_UP"]
+
+
+# ---------------------------------------------------------------------------
+# COVERAGE WINDOW: module scope, and the whole write sequence.
+# ---------------------------------------------------------------------------
+
+_MODULE_LEVEL_MOVE_ASIDE_IS_DURABLE = """
+import os
+
+os.replace(target, aside)
+"""
+
+_MODULE_LEVEL_ATOMIC_WRITE_CLEANS_UP = """
+import os
+
+tmp = dest.with_suffix('.tmp')
+try:
+    tmp.write_bytes(b'x')
+    os.replace(tmp, dest)
+except OSError:
+    os.unlink(tmp)
+"""
+
+_UNPROTECTED_WRITE_BEFORE_THE_MOVE = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    tmp.write_text(data)
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        os.unlink(tmp)
+"""
+
+_THE_WRITE_IS_INSIDE_THE_TRY = """
+import os
+
+
+def write(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_text(data)
+        os.replace(tmp, dst)
+    except OSError:
+        os.unlink(tmp)
+"""
+
+_CREATION_OUTSIDE_BUT_WRITE_INSIDE = """
+import contextlib
+import os
+import tempfile
+
+
+def write(path, content):
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+"""
+
+
+def test_module_scope_gets_the_born_here_test_too():
+    """Module scope used to skip `_born_in` and stamp NO_HANDLER unconditionally,
+    wrong in BOTH directions at once: a module-level move-aside produced a dirty
+    row for a DURABLE first operand, and a module-level atomic write that DOES
+    clean up still read NO_HANDLER. Both `_born_in` and `_handlers_covering`
+    accept any AST node, so the module tree is simply the enclosing scope.
+
+    Found independently by two reviewers, which is what moved it from a known
+    limitation to a defect."""
+    assert _verdicts(_MODULE_LEVEL_MOVE_ASIDE_IS_DURABLE) == []
+    assert _verdicts(_MODULE_LEVEL_ATOMIC_WRITE_CLEANS_UP) == ["CLEANS_UP"]
+
+
+def test_the_window_is_the_sequence_not_the_rename():
+    """A handler wrapped around only the move leaves the temp on disk when the
+    WRITE fails -- disk-full, an encoding error, a short write -- which is the
+    very class this guard is named for.
+
+    MEASURED before landing: zero live sites are reclassified by this, so it is
+    coverage rather than churn, and only a synthetic fixture can fail if the
+    window narrows back to the rename statement."""
+    assert _verdicts(_UNPROTECTED_WRITE_BEFORE_THE_MOVE) == ["LEAKS"]
+    assert _verdicts(_THE_WRITE_IS_INSIDE_THE_TRY) == ["CLEANS_UP"]
+
+
+def test_creation_outside_the_try_is_not_the_risk_window():
+    """PRECISION control for the rule above, and it names a REAL site: this is
+    the shape of src/genesis/util/atomic.py, the repo's own reference
+    implementation. `mkstemp` sits outside the try while the write it protects
+    sits inside.
+
+    Counting creation as the materialising event flagged that file. It is wrong:
+    if creation itself fails there is nothing on disk to leak. The risk window
+    opens at the WRITE.
+
+    HONEST ABOUT WHAT THIS PINS: the guard attributes NO write to `tmp` in this
+    fixture at all -- `os.fdopen(fd, "w")` and `f.write(content)` name a
+    descriptor and a handle, not the temp -- so it is clean because nothing was
+    detected, not because a detected write was covered. That half is carried by
+    `test_the_window_is_the_sequence_not_the_rename`. What this control does pin
+    is the creation exclusion: it dies the moment `mkstemp` joins
+    `_WRITE_CALLS`."""
+    assert _verdicts(_CREATION_OUTSIDE_BUT_WRITE_INSIDE) == ["CLEANS_UP"]
+
+
+def test_every_python_bearing_tree_is_scanned_or_documented():
+    """`az_plugins/` shipped 11 executable modules that this guard never looked
+    at, for the reason a hardcoded root list always fails: the tree did not exist
+    when the list was written. Adding it moved no count (MEASURED: it produces
+    zero rows), so the gap was COVERAGE, not verdicts.
+
+    This is the bidirectional-registry pattern: every top-level tree carrying
+    Python is either scanned or documented as excluded WITH a reason, so the next
+    one cannot be missed silently."""
+    known = set(chk.SCAN_ROOTS) | set(chk.UNSCANNED_ROOTS)
+    present = {
+        d.name
+        for d in _REPO.iterdir()
+        if d.is_dir() and not d.name.startswith(".") and any(d.rglob("*.py"))
+    }
+    assert present <= known, (
+        f"top-level tree(s) with Python that this guard neither scans nor "
+        f"documents as excluded: {sorted(present - known)}"
+    )
+    for name, reason in chk.UNSCANNED_ROOTS.items():
+        assert reason.strip(), f"{name} is excluded with no stated reason"
+# ---------------------------------------------------------------------------
+# Controls added after an adversarial audit found two BLOCKERs in the fixes
+# above. Both were in this guard's two worst directions at once.
+# ---------------------------------------------------------------------------
+
+_A_PATH_WRAPPED_MARKER_IS_STILL_A_TEMP = """
+import os
+from pathlib import Path
+
+
+def save(path, data):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+"""
+
+_A_PATH_WRAPPED_TEMP_MAKER_IS_STILL_A_TEMP = """
+import os
+import tempfile
+from pathlib import Path
+
+
+def save(path, data):
+    tmp = Path(tempfile.mkstemp()[1])
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+"""
+
+_A_MULTI_ARG_PATH_JOIN_STAYS_OPAQUE = """
+import os
+from pathlib import Path
+
+
+def save(tmpdir, path):
+    tmp = Path(tmpdir, "payload.tmp")
+    os.replace(tmp, path)
+"""
+
+_A_NON_OS_SIBLING_HANDLER_DOES_NOT_MAKE_IT_DIRTY = """
+import os
+
+
+class ConfigError(Exception):
+    pass
+
+
+def save(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except ConfigError:
+        raise
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+"""
+
+_AN_IRRELEVANT_FINALIZER_DOES_NOT_DECIDE = """
+import os
+
+
+def save(dst, data, lock):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+        finally:
+            lock.release()
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+"""
+
+_A_RERAISING_HANDLER_DOES_NOT_DECIDE = """
+import logging
+import os
+
+log = logging.getLogger(__name__)
+
+
+def save(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+        except OSError:
+            log.warning("boom")
+            raise
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+"""
+
+_A_SIDECAR_WRITE_IS_NOT_THIS_TEMPS_WRITE = """
+import os
+
+
+def save(dst, other, data):
+    tmp = dst.with_suffix('.tmp')
+    tmp_sidecar = other.with_suffix('.meta')
+    tmp_sidecar.write_text("x")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+"""
+
+_EVERY_WRITE_MUST_BE_COVERED = """
+import os
+
+
+def save(dst, hdr, body):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_text(hdr)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    with open(tmp, "a") as fh:
+        fh.write(body)
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+"""
+
+_EXCEPT_STAR_IS_STILL_A_HANDLER = """
+import os
+
+
+def save(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except* OSError:
+        tmp.unlink(missing_ok=True)
+"""
+
+_PARTIAL_COVER_ALONE_IS_NOT_ENOUGH = """
+import os
+
+
+def save(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except FileNotFoundError:
+        tmp.unlink(missing_ok=True)
+"""
+
+_PARTIAL_COVER_PLUS_AN_OUTER_FULL_CATCH = """
+import os
+
+
+def save(dst, data):
+    tmp = dst.with_suffix('.tmp')
+    try:
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+        except FileNotFoundError:
+            tmp.unlink(missing_ok=True)
+            raise
+    except OSError:
+        tmp.unlink(missing_ok=True)
+"""
+
+
+def test_a_one_argument_path_wrapper_is_transparent():
+    """BLOCKER, and a REGRESSION the previous version did not have. Pruning the
+    marker walk at every non-builder call made `Path(...)` and `str(...)` opaque
+    -- the two commonest path constructors in this repo -- so
+    `tmp = Path(str(p) + '.tmp')` and even `tmp = Path(mkstemp()[1])` produced NO
+    ROW AT ALL. Invisible and absent from the ledger is this guard's own worst
+    outcome, and a precision fix bought it.
+
+    Transparency is gated on ARITY, not on the name, so the multi-argument join
+    stays opaque -- that is the documented blind spot, and enforcing it by arity
+    is what lets the single-argument form keep its row.
+
+    The join fixture carries a REAL marker (`"payload.tmp"`) on purpose. With a
+    markerless second argument the case cannot tell the arity rule from its
+    absence, and the mutation that deletes that rule survives. So this is a
+    deliberate, stated RECALL LOSS: a multi-argument join names a CHILD, and
+    reducing it to its first argument once recorded the DIRECTORY as the temp,
+    which let a handler removing the directory read as cleaning up a child it
+    never touched. Unmatched beats wrongly-cleared."""
+    assert _verdicts(_A_PATH_WRAPPED_MARKER_IS_STILL_A_TEMP) == ["NO_HANDLER"]
+    assert _verdicts(_A_PATH_WRAPPED_TEMP_MAKER_IS_STILL_A_TEMP) == ["NO_HANDLER"]
+    assert _verdicts(_A_MULTI_ARG_PATH_JOIN_STAYS_OPAQUE) == []
+
+
+def test_a_sibling_handler_for_an_unrelated_error_is_not_applicable():
+    """BLOCKER. Applicability was a DENYLIST -- any name ending in `Error` and
+    missing from a 12-entry list counted as possibly-OS. Combined with the
+    every-applicable-handler rule, one sibling `except ConfigError: raise` beside
+    a correct `except OSError:` turned the whole site LEAKS.
+
+    MEASURED live exposure: 296 try statements here carry two or more handlers,
+    and 590 handler occurrences name an *Error that denylist admitted but that
+    cannot catch an os.replace (RuntimeError 35, CancelledError 32, YAMLError 14,
+    OperationalError 14, SubprocessError 14). Now an ALLOWLIST, the house rule --
+    and safe in both directions, since a name absent from it makes the handler
+    non-applicable, which continues the outward walk rather than crediting
+    cleanup."""
+    assert _verdicts(_A_NON_OS_SIBLING_HANDLER_DOES_NOT_MAKE_IT_DIRTY) == ["CLEANS_UP"]
+
+
+def test_a_try_that_cannot_decide_does_not_end_the_walk():
+    """Two shapes, one cause: a try that decides NOTHING about the temp used to
+    terminate the outward walk and produce LEAKS on correct code.
+
+    A finalizer that does not unlink decides nothing -- an enclosing handler can
+    still clean up -- so `try: write; move; finally: lock.release()` inside an
+    outer `except OSError: tmp.unlink()` is clean. So is a handler that logs and
+    RE-RAISES: the exception keeps propagating and the outer handler runs.
+
+    Only a BARE `raise` counts as pass-through; `raise SomethingElse` propagates
+    a class the outer `except OSError` would not catch. And a handler that
+    unlinks AND re-raises HAS finished the job, so it still decides -- reading
+    the bare raise alone flagged session_cache.py's
+    `except BaseException: unlink(tmp); raise`, a correct live site."""
+    assert _verdicts(_AN_IRRELEVANT_FINALIZER_DOES_NOT_DECIDE) == ["CLEANS_UP"]
+    assert _verdicts(_A_RERAISING_HANDLER_DOES_NOT_DECIDE) == ["CLEANS_UP"]
+
+
+def test_write_coverage_is_by_identity_and_covers_every_write():
+    """The write-coverage rule reintroduced, on the write side, the exact
+    substring defect `_unlinks` documents: `root in _unparse(call)` matched any
+    call merely MENTIONING a name containing the temp's root, so an uncovered
+    `tmp_sidecar.write_text(...)` downgraded a clean `tmp` site.
+
+    And checking only the EARLIEST write let a covered first write followed by an
+    uncovered append read CLEANS_UP -- the false-clean direction, which is the
+    worse one."""
+    assert _verdicts(_A_SIDECAR_WRITE_IS_NOT_THIS_TEMPS_WRITE) == ["CLEANS_UP"]
+    assert _verdicts(_EVERY_WRITE_MUST_BE_COVERED) == ["LEAKS"]
+
+
+def test_except_star_is_still_a_handler():
+    """`ast.TryStar` is the same statement for this purpose and was invisible to
+    an isinstance test naming only `ast.Try`. The suite contained zero `except*`
+    anywhere, so the widening shipped unpinned: dropping TryStar back out of
+    `_TRY_NODES` killed no test."""
+    assert _verdicts(_EXCEPT_STAR_IS_STILL_A_HANDLER) == ["CLEANS_UP"]
+
+
+def test_partial_cover_needs_a_full_catch_somewhere():
+    """The distinction between "every applicable handler unlinks" and "and one of
+    them catches everything". A lone `except FileNotFoundError:` that unlinks
+    leaves every other OSError escaping with the temp on disk, so it is not
+    enough by itself -- but it IS enough when an enclosing handler catches the
+    rest and also cleans up.
+
+    Both halves shipped unpinned: flipping the partial-cover branch's verdict
+    killed no test."""
+    assert _verdicts(_PARTIAL_COVER_ALONE_IS_NOT_ENOUGH) == ["LEAKS"]
+    assert _verdicts(_PARTIAL_COVER_PLUS_AN_OUTER_FULL_CATCH) == ["CLEANS_UP"]
