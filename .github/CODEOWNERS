@@ -25,6 +25,17 @@
 # lands, where a copied file list silently stops. Over-matching costs a review
 # request nobody needed; under-matching costs the notification entirely.
 
+# ON A FORK OR A SEPARATE INSTALL, RE-POINT THE HANDLE BELOW. GitHub requires
+# a code owner to have write access, so an upstream handle in someone else's
+# repository is INERT — no review is requested and nothing breaks or warns. The
+# file cannot be generated out of this problem either: GitHub only reads a
+# TRACKED `.github/CODEOWNERS`, so the handle has to be committed by whoever
+# owns the repository. Change it in one place, here, and the entries below
+# follow. (Reviewed as a deliberate exception to the rule against committing
+# install-specific values, 2026-09-09: the value cannot live in generated
+# config and still function, and its failure mode elsewhere is silence rather
+# than breakage.)
+
 # Everything, as the backstop — a single-maintainer repo has one owner, so the
 # specific entries below exist to DOCUMENT the surface rather than to change
 # who is asked.
