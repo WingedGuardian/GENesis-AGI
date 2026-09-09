@@ -1771,12 +1771,24 @@ async def _vnc_click_turnstile(page) -> bool:
 
         # WHERE DID THE POINTER ACTUALLY GO? Read it back before clicking.
         #
-        # Everything above is a COMPUTATION. It can be wrong for reasons the
-        # computation cannot see: a coordinate-space mismatch, a window that
-        # moved between measuring and acting, a VNC move that reported success
-        # and did nothing. Logging only the intended coordinate records what we
-        # meant, never what happened — and a click on the wrong thing is
-        # exactly the failure that needs a forensic trail afterwards.
+        # Be precise about what this can and cannot catch, because the two are
+        # easy to conflate. It compares the pointer against the coordinate we
+        # ASKED FOR, so it detects a DELIVERY failure: a `vncdo move` that
+        # reported success and did nothing, a server that clamped the position,
+        # a pointer grabbed by something else.
+        #
+        # It CANNOT detect a wrong coordinate. If the computation above picked
+        # the wrong pixel — a coordinate-space mismatch, a window that moved
+        # after it was measured, a spoofed dpr — the move delivers the pointer
+        # to exactly that wrong pixel and drift is ZERO. Reading the position
+        # answers "did the pointer go where we said", never "was where we said
+        # correct"; only hit-testing what is under the pointer would answer
+        # that, and this path has no element handle to test against.
+        #
+        # It still earns its place: without it the log records only intent, and
+        # a click on the wrong thing is exactly the failure that needs a
+        # forensic trail afterwards. The dpr is logged alongside so the
+        # coordinate can be recomputed later from the record.
         #
         # Best-effort: a readback failure must not block the click, but it IS
         # reported rather than swallowed, so "unknown" never reads as "fine".
@@ -1795,11 +1807,14 @@ async def _vnc_click_turnstile(page) -> bool:
                 actual_x, actual_y, click_x, click_y, drift, dpr,
             )
             if drift > _POINTER_DRIFT_TOLERANCE_PX:
-                # Loud, because this is the signature of a coordinate-space
-                # bug and it would otherwise look like an ordinary miss.
+                # Loud, because the pointer is NOT where we put it — the click
+                # about to be sent lands somewhere we never chose. That is a
+                # different failure from aiming wrong, and it would otherwise
+                # look like an ordinary miss.
                 logger.warning(
                     "VNC pointer drift %dpx: intended=(%d,%d) actual=(%d,%d) "
-                    "dpr=%.2f — clicking anyway, but the target may be wrong",
+                    "dpr=%.2f — clicking anyway, but the pointer is not where "
+                    "it was placed",
                     drift, click_x, click_y, actual_x, actual_y, dpr,
                 )
 
