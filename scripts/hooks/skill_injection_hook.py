@@ -307,16 +307,21 @@ def main() -> None:
             desc = skill.get("description", "")
 
             # Degrade through forms that stay CORRECT rather than truncating the
-            # identifier: the tier's own form, else the /skill command, else a
-            # form carrying no identifier at all. `_MAX_NUDGE_LINE` bounds each,
-            # and `named` records whether an identifier actually survived.
+            # identifier: the tier's own form, else the /skill command if IT
+            # fits, else a path-only Read that drops the NAME but keeps the PATH,
+            # else a form carrying no identifier at all. `_MAX_NUDGE_LINE` bounds
+            # each, and `named` records whether an identifier actually survived.
+            # Keep this list in step with the rungs below -- an audit caught it
+            # naming three when the code had four, in the very commit that added
+            # the fourth.
             named = True
+            path = skill.get("path")
             if tier == 1:
                 line = f"[Skill] The '{name}' skill is relevant here. {desc[:80]}"
-            elif skill.get("path"):
+            elif path:
                 line = (
                     f"[Skill] The '{name}' skill matches this task. "
-                    f"Read {skill['path']}/SKILL.md. {desc[:60]}"
+                    f"Read {path}/SKILL.md. {desc[:60]}"
                 )
             else:
                 line = (
@@ -324,10 +329,29 @@ def main() -> None:
                     f"Load with /skill {name}. {desc[:60]}"
                 )
             if len(line) > _MAX_NUDGE_LINE:
-                line = (
+                # Try the /skill form FIRST, and only fall to the path if it does
+                # not fit. Order matters: /skill carries BOTH the name and an
+                # invocation, so it is strictly more informative when it fits.
+                # MEASURED -- a 1-char name with a 284-char path overflows the
+                # Read form at 401 while /skill is 121, so checking the path rung
+                # first silently anonymised a nudge that could have kept its name.
+                skill_form = (
                     f"[Skill] The '{name}' skill matches this task. "
                     f"Load with /skill {name}. {desc[:60]}"
                 )
+                if len(skill_form) <= _MAX_NUDGE_LINE:
+                    line = skill_form
+                elif path:
+                    # It is the NAME that overflows, not the path. Drop the name
+                    # and keep the path: a path is an actionable identifier on its
+                    # own, and a Read that works beats a notice naming nothing.
+                    # The first ladder went straight to /skill here, which REPEATS
+                    # the long name twice, so it overflowed again and threw away a
+                    # perfectly usable path on the way to an unnamed line.
+                    line = (
+                        f"[Skill] A skill matches this task. "
+                        f"Read {path}/SKILL.md. {desc[:60]}"
+                    )
             if len(line) > _MAX_NUDGE_LINE:
                 # The identifier itself is pathological. Say so rather than emit
                 # a cut one: a wrong path costs a failed Read, and a cut /skill

@@ -307,6 +307,112 @@ def test_main_long_path_never_emits_a_cut_read_instruction(tmp_path, monkeypatch
         assert "/skill stealth-browser" in out, "degraded without a usable fallback"
 
 
+def test_main_a_long_path_does_not_cost_the_NAME(tmp_path, monkeypatch, capsys):
+    """When BOTH degraded forms fit, prefer the one that keeps the name.
+
+    The path-only rung was checked before the /skill rung, so it won whenever it
+    fit -- even where /skill also fit and carried strictly more (the name AND an
+    invocation). MEASURED by audit: a 1-char name with a 284-char path overflows
+    the Read form at 401 chars while /skill is 121, so a nudge that could have
+    named its skill was silently anonymised. Not a correctness bug, both forms
+    being actionable, but a worse choice in a cell the fix never meant to touch.
+    """
+    # Sized from the rendered forms, not by eye: a first draft picked a path
+    # length that did not actually overflow, so the base form fired and the test
+    # failed for a reason that had nothing to do with the ordering it exists to
+    # pin. Build the path until the Read form exceeds the cap while /skill fits.
+    import skill_injection_hook as _hook
+
+    desc = "Browser automation"
+    long_path = "src/genesis/skills/" + "/".join(["deeply-nested-package"] * 17)
+    read_form = f"[Skill] The 'sel' skill matches this task. Read {long_path}/SKILL.md. {desc}"
+    skill_form = f"[Skill] The 'sel' skill matches this task. Load with /skill sel. {desc}"
+    assert len(read_form) > _hook._MAX_NUDGE_LINE, "fixture does not overflow Read"
+    assert len(skill_form) <= _hook._MAX_NUDGE_LINE, "fixture must let /skill fit"
+    skill = {
+        "name": "sel",
+        "description": "Browser automation",
+        "keywords": ["selenium"],
+        "tier": 2,
+        "path": long_path,
+    }
+    catalog_file = tmp_path / "skill_catalog.json"
+    _write_catalog(catalog_file, tier2=[skill])
+
+    out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
+    assert "/skill sel" in out, "the name was dropped while /skill still fitted"
+    assert "too long to print" not in out
+
+
+def test_main_a_long_tier1_name_degrades_to_its_path(tmp_path, monkeypatch, capsys):
+    """Tier 1 is INSIDE the ladder, and the boundary needs its own test.
+
+    test_main_tier1_nudge_text_unchanged asserts "SKILL.md" is absent, which is
+    true only below a name length of ~282; above it the tier-1 line overflows and
+    degrades like any other. That degrade is correct -- the path is real and
+    loadable -- but the older test's phrasing reads as an unconditional
+    invariant, so this pins what actually happens at the boundary rather than
+    leaving the two in apparent contradiction."""
+    import skill_injection_hook as _hook
+
+    long_name = "browser-" + "z" * 420
+    path = ".claude/skills/example"
+    tier1_form = f"[Skill] The '{long_name}' skill is relevant here. Browser automation"
+    assert len(tier1_form) > _hook._MAX_NUDGE_LINE, (
+        "fixture must actually overflow the tier-1 form, or this pins nothing"
+    )
+    skill = {
+        "name": long_name,
+        "description": "Browser automation",
+        "keywords": ["selenium"],
+        "tier": 1,
+        "path": path,
+    }
+    catalog_file = tmp_path / "skill_catalog.json"
+    _write_catalog(catalog_file, tier1=[skill])
+
+    out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
+    assert "too long to print" not in out, "degraded past a form that still worked"
+    assert (f"Read {path}/SKILL.md" in out) or (f"/skill {long_name}" in out), (
+        "a tier-1 skill with a long name lost every usable identifier"
+    )
+
+
+def test_main_a_long_name_does_not_cost_a_usable_path(tmp_path, monkeypatch, capsys):
+    """A long NAME must not throw away a short, valid PATH.
+
+    The first degradation ladder fell straight from the full form to the /skill
+    form, which repeats the name TWICE -- so a 350-char name with a 28-char path
+    overflowed again and landed on the unnamed notice, discarding a Read line
+    that would have worked. Worse, the unnamed notice records no nudge, so the
+    same unactionable line recurs on every matching prompt and occupies a catalog
+    slot each time.
+    """
+    long_name = "selenium-" + "x" * 350
+    short_path = "src/genesis/skills/example"
+    skill = {
+        "name": long_name,
+        "description": "Browser automation",
+        "keywords": ["selenium"],
+        "tier": 2,
+        "path": short_path,
+    }
+    catalog_file = tmp_path / "skill_catalog.json"
+    _write_catalog(catalog_file, tier2=[skill])
+
+    import skill_injection_hook as hook
+
+    saved: list[str] = []
+    monkeypatch.setattr(
+        hook, "_save_session_nudge", lambda _sid, name: saved.append(name)
+    )
+    out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
+
+    assert f"Read {short_path}/SKILL.md" in out, "a usable path was discarded"
+    assert "too long to print" not in out, "degraded past a form that still worked"
+    assert saved, "an actionable nudge was not recorded, so it will recur forever"
+
+
 def test_main_long_name_is_recorded_whole_so_it_cannot_re_nudge(
     tmp_path, monkeypatch, capsys
 ):

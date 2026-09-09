@@ -34,8 +34,12 @@ surface, not a settled fact. And the table stays SMALL on purpose — every row 
 a place the gate stops looking, which is why routing a hook through the writer
 is always preferred over adding it here.
 
-SCOPE. Only ``SessionStart`` and ``UserPromptSubmit`` put a hook's BARE STDOUT in
-front of the model. Every other event reaches it through JSON
+SCOPE. Only ``SessionStart``, ``UserPromptSubmit`` and ``UserPromptExpansion``
+put a hook's BARE STDOUT in front of the model. ``_BARE_STDOUT_EVENTS`` is
+DERIVED from ``scripts/hooks/hook_output.py``'s own ``BARE_STDOUT_EVENTS`` by
+AST, so this file keeps no copy to drift. Note the published hooks reference also
+names ``PostModelSwitch``, which is deliberately NOT gated -- the reason is
+recorded beside that constant. Every other event reaches it through JSON
 ``additionalContext``/``systemMessage``, which runs through the same persistence
 path but has a different failure mode — an oversized advisory must lose prose,
 never its ``permissionDecision``, which is what ``print_json_bounded`` protects.
@@ -72,7 +76,33 @@ _SETTINGS = _REPO / ".claude" / "settings.json"
 #: wired to the third would have passed an allowlist whose entire guarantee is
 #: that a newly wired model-facing hook fails by construction. The list is
 #: therefore taken FROM that docstring rather than restated from memory.
-_BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit", "UserPromptExpansion")
+def _load_bare_stdout_events() -> tuple[str, ...]:
+    """DERIVE the gated set from the writer, rather than keeping a copy here.
+
+    A hand-maintained copy is what this gate exists to outlaw. The first version
+    of this module restated the list and omitted `UserPromptExpansion`, so a hook
+    wired to it would have passed an allowlist whose entire guarantee is that a
+    newly wired model-facing hook fails by construction. Fixing that by editing
+    the copy left the SAME defect one level up -- an adversarial audit pointed at
+    the sentence promising the list was "taken from hook_output.py" and showed it
+    was a literal in two places, with a one-way containment test that could never
+    notice a fourth event. So the list now genuinely lives in one file.
+    """
+    src = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "BARE_STDOUT_EVENTS"
+            for t in node.targets
+        ):
+            return tuple(
+                e.value
+                for e in node.value.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            )
+    raise AssertionError("hook_output.py no longer declares BARE_STDOUT_EVENTS")
+
+
+_BARE_STDOUT_EVENTS = _load_bare_stdout_events()
 
 #: Hooks whose model-facing output CANNOT reach the cap by construction, so how
 #: they print does not matter.
@@ -520,12 +550,26 @@ def test_every_bare_stdout_event_is_gated() -> None:
     hook wired to the third passes an allowlist whose whole guarantee is that a
     newly wired model-facing hook fails by construction.
     """
-    doc = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(encoding="utf-8")
-    for event in ("SessionStart", "UserPromptSubmit", "UserPromptExpansion"):
-        assert event in doc, f"{event} is no longer named by the writer's docstring"
-        assert event in _BARE_STDOUT_EVENTS, (
-            f"{event} carries bare stdout per hook_output.py but is not gated"
+    src = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(encoding="utf-8")
+    doc = ast.get_docstring(ast.parse(src)) or ""
+    assert _BARE_STDOUT_EVENTS, "the writer no longer declares any bare-stdout event"
+    for event in _BARE_STDOUT_EVENTS:
+        assert event in doc, (
+            f"{event} is gated but the writer's own docstring no longer names it"
         )
+
+    # THE HOLE, made checkable rather than left silent. hook_output.py's docstring
+    # records that the published hooks reference ALSO names `PostModelSwitch`,
+    # which this gate does not cover. That asymmetry is a deliberate call on
+    # weaker evidence, and an audit found it documented nowhere -- so the reason
+    # must exist next to the constant, where someone changing the tuple will read
+    # it, and this assertion fails if it is ever quietly deleted.
+    assert "PostModelSwitch" not in _BARE_STDOUT_EVENTS, (
+        "PostModelSwitch is now gated; update the note beside BARE_STDOUT_EVENTS"
+    )
+    assert "PostModelSwitch" in src, (
+        "the note explaining why PostModelSwitch is excluded has gone missing"
+    )
 
 
 # ---------------------------------------------------------------------------

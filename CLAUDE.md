@@ -446,7 +446,9 @@ the wrapper itself as the signal, never a byte count.
 **route any new model-facing stdout through it.** That instruction is now
 ENFORCED rather than advisory: `tests/test_scripts/test_hook_output_contract.py`
 enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
-`UserPromptSubmit` — the two events whose bare stdout the model reads — and fails
+`UserPromptSubmit` / `UserPromptExpansion` — the three events whose bare stdout
+the model reads, DERIVED by AST from `hook_output.py`'s own `BARE_STDOUT_EVENTS`
+so the gate keeps no copy to drift — and fails
 unless each one either routes through the writer or carries a stated, measured
 reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
 with unbounded output fails by construction, which a known-bad-pattern scan could
