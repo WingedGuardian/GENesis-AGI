@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
 from datetime import UTC, datetime
 
 # The cache is only ever as fresh as the worker's last successful run. A snapshot
@@ -78,9 +79,17 @@ def main() -> None:
 
         stale_days = pulse_cfg.knob_int(cfg, "open_pr_stale_days")
         resurface = pulse_cfg.knob_int(cfg, "open_pr_resurface_days")
-        # Clamped in CODE — see the note in surface_pr_updates.py; knob_int has no
-        # upper bound and a .local.yaml overlay can raise the configured value.
-        max_surface = min(pulse_cfg.knob_int(cfg, "open_pr_max_surface"), 20)
+        # Clamped in CODE — see the fuller note in surface_pr_updates.py; knob_int
+        # has no upper bound and a .local.yaml overlay can raise the configured
+        # value. OPEN_PR_MAX_SURFACE_CAP is the SHARED constant, so this clamp and
+        # the settings validator cannot drift apart. It is NOT a promise that an
+        # over-cap value never arrives: the validator guards settings_update, and
+        # a hand-edited overlay reaches load_config unvalidated, where this line
+        # silently reduces it. MEASURED at 5000 -> 20.
+        max_surface = min(
+            pulse_cfg.knob_int(cfg, "open_pr_max_surface"),
+            pulse_cfg.OPEN_PR_MAX_SURFACE_CAP,
+        )
 
         # Namespace the seen-map by the cache's live repo slug so a PR number from a
         # DIFFERENT repo (a re-pointed remote / fork) can't collide with an aged-out
@@ -116,7 +125,11 @@ def main() -> None:
             print(text)
             sys.stdout.flush()
     except Exception:
-        return  # Never block session start.
+        # Fail open -- see the note in surface_pr_updates.py. STDERR is not
+        # model-facing, so naming the failure costs the session nothing and stops
+        # a version skew reading as "nothing to report".
+        traceback.print_exc(file=sys.stderr)
+        return
 
 
 if __name__ == "__main__":

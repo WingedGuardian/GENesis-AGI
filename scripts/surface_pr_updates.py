@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 from datetime import UTC, datetime
 
 
@@ -47,11 +48,25 @@ def main() -> None:
         now = datetime.now(UTC)
         lookback = pr_watch_config.knob_int(cfg, "lookback_days")
         resurface = pr_watch_config.knob_int(cfg, "resurface_days")
-        # Clamped in CODE, not left to the config default: knob_int (pr_watch_config.py:84)
+        # Clamped in CODE, not left to the config default: pr_watch_config.knob_int
         # has no upper bound and load_config merges a .local.yaml overlay, so the "5"
         # in DEFAULTS is a default, not a structural bound. An exemption may only
         # cite a bound configuration cannot change.
-        max_surface = min(pr_watch_config.knob_int(cfg, "max_surface"), 20)
+        #
+        # MAX_SURFACE_CAP is the SHARED constant, which stops this clamp and the
+        # settings validator drifting apart. It is NOT a promise that an over-cap
+        # value never reaches this line, and an earlier revision of this comment
+        # said it was. The file has two doors: settings_update runs the validator
+        # and REFUSES an over-cap write, but a hand-edited .local.yaml reaches
+        # load_config with no validation at all. MEASURED: an overlay carrying
+        # max_surface: 5000 arrives here as 5000 and this line silently reduces it
+        # to 20. So the clamp is load-bearing, not belt-and-braces --
+        # pr_watch.select_to_surface applies whatever it is handed, which makes
+        # this line the ONLY enforcement of the ceiling.
+        max_surface = min(
+            pr_watch_config.knob_int(cfg, "max_surface"),
+            pr_watch_config.MAX_SURFACE_CAP,
+        )
 
         notifs = pr_watch.read_steward_notifications(pr_watch.db_path(), lookback, now)
         if not notifs:
@@ -70,7 +85,13 @@ def main() -> None:
             print(text)
             sys.stdout.flush()
     except Exception:
-        return  # Never block session start.
+        # Fail open -- never block session start. But name it on STDERR, which is
+        # not model-facing and so costs the session nothing: this block sits
+        # downstream of module attribute reads, so a genesis/src version skew
+        # turns the whole surface into a silent no-op that is indistinguishable
+        # from "nothing to report". Two lines of trace beat an invisible outage.
+        traceback.print_exc(file=sys.stderr)
+        return
 
 
 if __name__ == "__main__":

@@ -79,34 +79,44 @@ _BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit", "UserPromptExpansion"
 #:
 #: THE RULE, and it is the one this table got wrong first: an exemption may only
 #: cite a bound that CONFIGURATION CANNOT CHANGE. A default in a config module is
-#: not a bound — `knob_int` (pr_watch_config.py:84) has no upper clamp and
+#: not a bound — `pr_watch_config.knob_int` has no upper clamp and
 #: `load_config` merges a `.local.yaml` overlay, so `max_surface: 5000` in either
 #: file would have produced ~410 KB of output through two rows of this table that
 #: read as verified. Adversarial review caught it. Cite a hardcoded slice or an
 #: in-code clamp, never a DEFAULTS entry.
 _STRUCTURALLY_BOUNDED = {
     "scripts/surface_pr_updates.py": (
-        "min(..., 20) clamp in scripts/surface_pr_updates.py:54 — in CODE, so a "
-        "config overlay cannot raise it; clause bodies clipped [:71] by "
-        "render_clause; joined into ONE line at pr_watch.py:204"
+        "min(..., pr_watch_config.MAX_SURFACE_CAP) clamp in main() of "
+        "scripts/surface_pr_updates.py — in CODE, so a config overlay cannot "
+        "raise it; clause bodies clipped [:71] by render_clause; joined into ONE "
+        "line at pr_watch.select_to_surface. Cites SYMBOLS, not line numbers: "
+        "this row first cited :54, a reflow moved it to :56, and nothing caught "
+        "the rot"
     ),
     "scripts/surface_open_prs.py": (
-        "min(..., 20) clamp in scripts/surface_open_prs.py:83 — in CODE, not the "
-        "config default; each clause synthesised from ints (#1379 (12d, draft)); "
-        "joined into ONE line at pr_watch.py:204"
+        "min(..., repo_pulse_config.OPEN_PR_MAX_SURFACE_CAP) clamp in main() of "
+        "scripts/surface_open_prs.py — in CODE, not the config default; each "
+        "clause synthesised from ints (#1379 (12d, draft)); joined into ONE line "
+        "at pr_watch.select_to_surface"
     ),
     ".claude/hooks/cbm-session-reminder.sh": (
         "621 bytes TOTAL, a single quoted heredoc (cat << 'REMINDER') with zero "
         "'$' anywhere in the file — the file size is its hard output ceiling"
     ),
     "scripts/hooks/skill_injection_hook.py": (
-        "_MAX_CATALOG_NUDGES = 2 (:31) applied at :278, plus at most 2 literal "
-        "process nudges from _check_process_discipline (:179-226). EVERY "
-        "user-authored field is sliced in code: name [:80], path [:120], "
-        "description [:80]/[:60]. The row previously cited only the description "
-        "slices, which made the claim false -- name and path come from skill "
-        "frontmatter that generate_skill_catalog.py accepts unsliced, so a long "
-        "name alone could carry this exempt hook past the cap"
+        "_MAX_CATALOG_NUDGES = 2 catalog nudges, each held to "
+        "_MAX_NUDGE_LINE = 400 chars by a degradation ladder (not by a slice at "
+        "the print), plus at most 2 literal process nudges from "
+        "_check_process_discipline, which interpolate nothing. Worst case is "
+        "asserted against HOOK_STDOUT_CAP by the test below rather than argued "
+        "here -- an earlier version of that test checked only that the constants "
+        "were truthy, and an audit raised the per-line ceiling 125x with the "
+        "suite still green. The ceiling is on the rendered LINE, never on the "
+        "identifiers in it: name and path come from skill frontmatter that "
+        "generate_skill_catalog.py accepts unsliced, and slicing THEM bounded "
+        "the output by emitting a /skill argument and a Read path that pointed "
+        "nowhere. Identifiers are emitted whole or the line degrades to a form "
+        "carrying none"
     ),
     "scripts/contribution_offer_hook.py": (
         "one fixed f-string; sha[:12] and subject[:200] (:63) are its only "
@@ -574,12 +584,41 @@ def test_the_surfacing_caps_are_one_constant_shared_by_clamp_and_validator() -> 
     from genesis.session_awareness.repo_pulse_config import OPEN_PR_MAX_SURFACE_CAP
 
     # The hooks must clamp to the CONSTANT, not a literal that can drift from it.
-    for script, const_name in (
-        ("surface_pr_updates.py", "MAX_SURFACE_CAP"),
-        ("surface_open_prs.py", "OPEN_PR_MAX_SURFACE_CAP"),
+    #
+    # Checked on the AST, never as a substring of the file. The substring form
+    # shipped first, and an adversarial audit demonstrated the near-miss: the
+    # commit that fixed the clamp ALSO wrote the constant's name into the comment
+    # above it, so reverting the code to a bare literal while keeping the comment
+    # left this assertion green. A test that a comment can satisfy is measuring
+    # prose. Verified RED against exactly that mutation before landing.
+    for script, const_name, cap in (
+        ("surface_pr_updates.py", "MAX_SURFACE_CAP", MAX_SURFACE_CAP),
+        ("surface_open_prs.py", "OPEN_PR_MAX_SURFACE_CAP", OPEN_PR_MAX_SURFACE_CAP),
     ):
-        body = (_REPO / "scripts" / script).read_text(encoding="utf-8")
-        assert const_name in body, f"{script} no longer clamps to the shared constant"
+        tree = ast.parse((_REPO / "scripts" / script).read_text(encoding="utf-8"))
+        clamps = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "min"
+        ]
+        assert clamps, f"{script} no longer clamps max_surface at all"
+        assert [
+            c
+            for c in clamps
+            if any(isinstance(a, ast.Attribute) and a.attr == const_name for a in c.args)
+        ], f"{script} min() no longer names {const_name}"
+        # The literal must be GONE, not merely accompanied: a surviving
+        # `min(knob, 20)` beside the fixed one would re-open the drift.
+        for c in clamps:
+            for a in c.args:
+                # `cap`, not MAX_SURFACE_CAP: comparing both scripts against
+                # pr_watch's constant is right only while the two happen to be
+                # equal, which is precisely the drift this test exists to catch.
+                assert not (isinstance(a, ast.Constant) and a.value == cap), (
+                    f"{script} still clamps to a bare literal beside the constant"
+                )
 
     assert _validate_pr_watch({"max_surface": MAX_SURFACE_CAP + 1}), "over-cap accepted"
     assert not _validate_pr_watch({"max_surface": MAX_SURFACE_CAP}), "at-cap rejected"
@@ -587,13 +626,116 @@ def test_the_surfacing_caps_are_one_constant_shared_by_clamp_and_validator() -> 
     assert not _validate_repo_pulse({"open_pr_max_surface": OPEN_PR_MAX_SURFACE_CAP})
 
 
-def test_the_skill_exemption_bounds_every_user_authored_field() -> None:
-    """The row claimed structural boundedness while citing only the description
-    slices. `name` and `path` come from user-authored frontmatter that the
-    catalog accepts unsliced, so a long name alone could carry this exempt hook
-    past the cap -- and the gate skips scanning an exempt hook entirely."""
-    body = (_REPO / "scripts" / "hooks" / "skill_injection_hook.py").read_text(
+def test_the_skill_exemption_bounds_the_line_not_the_identifiers() -> None:
+    """The bound must sit on the rendered LINE, never on the identifiers in it.
+
+    Two revisions of this row were wrong in opposite directions. The first cited
+    only the description slices, so `name` and `path` -- user-authored frontmatter
+    the catalog accepts unsliced -- could carry this exempt hook past the cap while
+    the gate skipped scanning it. The second sliced them, which kept the cap claim
+    true by emitting a `/skill` argument and a `Read <path>/SKILL.md` that pointed
+    nowhere, and by saving a truncated name as nudge state that could never match
+    the full name again, so the same skill re-nudged forever.
+
+    The invariant that survives both: `_MAX_CATALOG_NUDGES * _MAX_NUDGE_LINE`
+    bounds the output, and no identifier is ever emitted cut."""
+    import ast as _ast
+
+    src = (_REPO / "scripts" / "hooks" / "skill_injection_hook.py").read_text(
         encoding="utf-8"
     )
-    assert 'skill.get("name", "")[:80]' in body, "the skill name is unbounded again"
-    assert "[:120]" in body, "the skill path is unbounded again"
+    tree = _ast.parse(src)
+    consts = {
+        t.id: n.value.value
+        for n in _ast.walk(tree)
+        if isinstance(n, _ast.Assign)
+        and isinstance(n.value, _ast.Constant)
+        and isinstance(n.value.value, int)
+        for t in n.targets
+        if isinstance(t, _ast.Name)
+    }
+    per_line = consts.get("_MAX_NUDGE_LINE")
+    nudges = consts.get("_MAX_CATALOG_NUDGES")
+    assert per_line, "the per-line ceiling is gone"
+    assert nudges, "the nudge-count ceiling is gone"
+
+    # THE ARITHMETIC, asserted rather than asserted-about. The first version of
+    # this test checked only that the two constants were TRUTHY, and an audit
+    # raised _MAX_NUDGE_LINE from 400 to 50_000 with the whole suite still green
+    # -- a 100_000-char worst case against a 10_000 cap, on a hook the gate skips
+    # scanning because it is exempt. Checking that a bound EXISTS is the same
+    # mistake as checking that a comment mentions a constant.
+    #
+    # _PROCESS_NUDGE_ALLOWANCE covers _check_process_discipline's at-most-two
+    # literal f-strings (MEASURED 802 chars, no interpolation, so they cannot
+    # grow at runtime) plus headroom for the trailing newlines.
+    # Read the cap from its single home rather than restating it, and by AST
+    # rather than by import: this file already avoids mutating sys.path where it
+    # can, and the constant is version-volatile by design.
+    cap_src = (_REPO / "scripts" / "hooks" / "hook_output.py").read_text(
+        encoding="utf-8"
+    )
+    hook_caps = {
+        t.id: n.value.value
+        for n in _ast.walk(_ast.parse(cap_src))
+        if isinstance(n, _ast.Assign)
+        and isinstance(n.value, _ast.Constant)
+        and isinstance(n.value.value, int)
+        for t in n.targets
+        if isinstance(t, _ast.Name)
+    }
+    HOOK_STDOUT_CAP = hook_caps.get("HOOK_STDOUT_CAP")
+    assert HOOK_STDOUT_CAP, "hook_output.py no longer defines HOOK_STDOUT_CAP"
+
+    _PROCESS_NUDGE_ALLOWANCE = 1024
+    worst_case = nudges * (per_line + 1) + _PROCESS_NUDGE_ALLOWANCE
+    assert worst_case <= HOOK_STDOUT_CAP, (
+        f"the skill hook's own ceiling ({nudges} x {per_line} + process nudges = "
+        f"{worst_case}) exceeds HOOK_STDOUT_CAP ({HOOK_STDOUT_CAP}); its "
+        f"exemption from this gate is no longer true"
+    )
+    # The exemption's PROSE quotes the ceiling, so it can rot away from the code
+    # exactly like the line numbers two rows above did.
+    assert str(per_line) in _STRUCTURALLY_BOUNDED[
+        "scripts/hooks/skill_injection_hook.py"
+    ], "the exemption row quotes a ceiling the code no longer uses"
+
+    # No identifier may be sliced -- checked STRUCTURALLY. The textual form of
+    # this assertion ('skill.get("name", "")[:80]' not in src) was defeated by
+    # splitting the same slice across two statements: `name = skill.get(...)`
+    # then `label = name[:80]`. A rename beats any substring test.
+    emit = next(
+        n
+        for n in _ast.walk(tree)
+        if isinstance(n, _ast.FunctionDef) and n.name == "main"
+    )
+    for node in _ast.walk(emit):
+        if isinstance(node, _ast.Subscript) and isinstance(node.value, _ast.Name):
+            assert node.value.id != "name", (
+                "the skill name is sliced again; a cut name is a broken /skill "
+                "argument and a nudge-state key that can never match"
+            )
+        if isinstance(node, _ast.Subscript):
+            target = _ast.unparse(node.value)
+            assert "path" not in target, (
+                f"the skill path is sliced again ({target}); a cut path makes "
+                f"the Read instruction point at nothing"
+            )
+
+    # State is keyed on the WHOLE name, so dedup cannot desync from the filter.
+    saves = [
+        n
+        for n in _ast.walk(tree)
+        if isinstance(n, _ast.Call)
+        and isinstance(n.func, _ast.Name)
+        and n.func.id == "_save_session_nudge"
+    ]
+    assert saves, "nothing records nudge state any more"
+    # A literal (the two process nudges pass a fixed string) is fine; a SLICE is
+    # the defect -- `name[:80]` here is what desynced state from the filter.
+    for call in saves:
+        for arg in call.args[1:]:
+            assert not isinstance(arg, _ast.Subscript), (
+                "nudge state must be keyed on the whole name; a sliced key can "
+                "never match the unsliced name the candidate filter tests"
+            )

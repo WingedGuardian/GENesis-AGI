@@ -30,6 +30,17 @@ _MIN_SCORE = 2
 # own separate budget and never compete for these slots.
 _MAX_CATALOG_NUDGES = 2
 
+#: Hard ceiling on ONE rendered nudge line. The bound belongs on the LINE, not on
+#: the identifiers inside it -- an earlier revision sliced `name` to 80 and `path`
+#: to 120, which kept the cap claim true by emitting a `/skill` argument and a
+#: `Read <path>/SKILL.md` that pointed nowhere. A truncated label is a cosmetic
+#: loss; a truncated IDENTIFIER is a wrong instruction, and this hook exists to
+#: hand the model something it can act on. So: identifiers are emitted WHOLE or
+#: not at all, and the line degrades through forms that stay correct.
+#: _MAX_CATALOG_NUDGES * _MAX_NUDGE_LINE is the structural ceiling the
+#: hook-output contract test's exemption cites.
+_MAX_NUDGE_LINE = 400
+
 # --- Process Discipline Detection ---
 # Superpowers skills aren't in the Genesis catalog but need nudges
 # when their workflow context is detected.
@@ -276,33 +287,63 @@ def main() -> None:
         # Catalog budget is independent of process nudges — process nudges
         # keep their own slots and never crowd out skill suggestions.
         for _score, skill in candidates[:_MAX_CATALOG_NUDGES]:
-            # Bounded IN CODE, because the exemption this hook holds in
-            # tests/test_scripts/test_hook_output_contract.py claims it cannot
-            # reach the harness cap by construction -- and that was only true of
-            # the description. `name` and `path` come from a user-authored skill
-            # frontmatter, which `generate_skill_catalog.py` accepts unsliced, so
-            # a long name alone could push this exempt hook past the cap while
-            # the gate skipped scanning it. The bound is a DISPLAY bound on a
-            # label rendered next to a hard external cap, not a storage decision:
-            # the catalog keeps the full value, this line only shows one.
-            name = skill.get("name", "")[:80]
+            # `name` stays WHOLE. It is this skill's identity in three places:
+            # the `already_nudged` membership test above, the state written by
+            # _save_session_nudge below, and the `/skill` argument the model is
+            # told to type. Slicing it to 80 broke all three -- a name longer
+            # than 80 was saved truncated and so never matched the full name on
+            # the next prompt, re-nudging the same skill forever.
+            #
+            # There is deliberately NO display copy. A first fix kept `label =
+            # name[:80]` for the quoted part and an adversarial audit showed the
+            # tier-1 branch, which has no path or /skill fallback, then emitted a
+            # CUT name as the only identifier on its line -- the same defect,
+            # surviving in the one branch that was not part of the ladder. The
+            # name a tier-1 nudge quotes IS how the model invokes that skill, so
+            # it is an identifier too, not decoration. Every branch below emits
+            # `name` whole, and length is handled by degrading the LINE.
+            name = skill.get("name", "")
             tier = skill.get("tier", "?")
             desc = skill.get("description", "")
 
+            # Degrade through forms that stay CORRECT rather than truncating the
+            # identifier: the tier's own form, else the /skill command, else a
+            # form carrying no identifier at all. `_MAX_NUDGE_LINE` bounds each,
+            # and `named` records whether an identifier actually survived.
+            named = True
             if tier == 1:
-                print(f"[Skill] The '{name}' skill is relevant here. {desc[:80]}")
+                line = f"[Skill] The '{name}' skill is relevant here. {desc[:80]}"
             elif skill.get("path"):
-                print(
+                line = (
                     f"[Skill] The '{name}' skill matches this task. "
-                    f"Read {str(skill['path'])[:120]}/SKILL.md. {desc[:60]}"
+                    f"Read {skill['path']}/SKILL.md. {desc[:60]}"
                 )
             else:
-                print(
+                line = (
                     f"[Skill] The '{name}' skill matches this task. "
                     f"Load with /skill {name}. {desc[:60]}"
                 )
+            if len(line) > _MAX_NUDGE_LINE:
+                line = (
+                    f"[Skill] The '{name}' skill matches this task. "
+                    f"Load with /skill {name}. {desc[:60]}"
+                )
+            if len(line) > _MAX_NUDGE_LINE:
+                # The identifier itself is pathological. Say so rather than emit
+                # a cut one: a wrong path costs a failed Read, and a cut /skill
+                # argument costs a failed command.
+                named = False
+                line = (
+                    f"[Skill] A matching skill's identifier is too long to "
+                    f"print ({len(name)} chars); see the skill catalog."
+                )
+            print(line)
 
-            _save_session_nudge(session_id, name)
+            # Only record a nudge the model can act on. Recording the unnamed
+            # fallback would suppress this skill for the rest of the session on
+            # the strength of a line that never told anyone which skill it was.
+            if named:
+                _save_session_nudge(session_id, name)
 
         sys.stdout.flush()
     except Exception:

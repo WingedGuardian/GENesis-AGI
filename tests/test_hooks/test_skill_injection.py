@@ -279,6 +279,68 @@ def test_main_tier2_nudge_says_read_skill_md(tmp_path, monkeypatch, capsys):
     assert "/skill stealth-browser" not in out
 
 
+def test_main_long_path_never_emits_a_cut_read_instruction(tmp_path, monkeypatch, capsys):
+    """A path over the old 120-char slice must not produce an unreadable Read line.
+
+    The first bound on this hook sliced `path` to 120 chars and then appended
+    "/SKILL.md", so any deeper skill got an instruction pointing at a file that
+    does not exist -- a cost paid on every prompt, silently, because a failed
+    Read looks like the model's mistake. The bound now sits on the LINE: either
+    the whole path is emitted, or the line degrades to the /skill form.
+    """
+    deep = "src/genesis/skills/" + "/".join(["nested-package"] * 9) + "/stealth-browser"
+    assert len(deep) > 120, "fixture must exceed the slice this test exists to forbid"
+    skill = {
+        "name": "stealth-browser",
+        "description": "Browser automation",
+        "keywords": ["selenium"],
+        "tier": 2,
+        "path": deep,
+    }
+    catalog_file = tmp_path / "skill_catalog.json"
+    _write_catalog(catalog_file, tier2=[skill])
+
+    out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
+    if "SKILL.md" in out:
+        assert f"Read {deep}/SKILL.md" in out, "the Read path was cut mid-way"
+    else:
+        assert "/skill stealth-browser" in out, "degraded without a usable fallback"
+
+
+def test_main_long_name_is_recorded_whole_so_it_cannot_re_nudge(
+    tmp_path, monkeypatch, capsys
+):
+    """Nudge state keys on the WHOLE name, so a long name is nudged once.
+
+    Slicing the name to 80 for display also sliced the key written to nudge
+    state, while the candidate filter tested the full name -- so a skill whose
+    name exceeded 80 chars never matched its own record and was re-nudged on
+    every prompt, forever.
+    """
+    long_name = "selenium-" + "x" * 100
+    assert len(long_name) > 80, "fixture must exceed the slice this test forbids"
+    skill = {
+        "name": long_name,
+        "description": "Browser automation",
+        "keywords": ["selenium"],
+        "tier": 2,
+        "path": "src/genesis/skills/stealth-browser",
+    }
+    catalog_file = tmp_path / "skill_catalog.json"
+    _write_catalog(catalog_file, tier2=[skill])
+
+    import skill_injection_hook as hook
+
+    saved: list[str] = []
+    monkeypatch.setattr(
+        hook, "_save_session_nudge", lambda _sid, name: saved.append(name)
+    )
+    _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
+
+    assert saved, "nothing was recorded, so the dedup path is untested"
+    assert long_name in saved, "state recorded a CUT name; it can never match again"
+
+
 def test_main_tier1_nudge_text_unchanged(tmp_path, monkeypatch, capsys):
     """Tier-1 skills keep the 'is relevant here' phrasing (no Read line)."""
     catalog_file = tmp_path / "skill_catalog.json"
