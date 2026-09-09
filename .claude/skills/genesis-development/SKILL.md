@@ -1774,7 +1774,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   secondary" rather than failing a check. And add it under the EXISTING `merge_gate:`
   block: a SECOND `merge_gate:` block trips the duplicate-key scan that
   `_required_ci_workflows` / `_required_scheduled_review_kinds` / `_doc_findings_mode`
-  all share, and all three then fail closed to their defaults at once. The rule below
+  all share, and all three then discard your configured value and take their DEFAULT.
+  Say "default", not "fail closed" — the directions differ, which is the whole reason
+  it matters. The first two default to the stricter reading; `_doc_findings_mode`
+  defaults to `skip` (`git_push_guard.py:1143`), which scores FEWER findings, so a
+  duplicate key silently LOOSENS that one (Codex P2, #1903). The rule below
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
@@ -1832,7 +1836,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   step-back happened — appending it without doing the work is the same
   violation as falsifying `--clean`.
 - **GATE-FIX LANE — a hook-surface PR gets a wider round 1 and a hard stop at 2
-  (standing user rule, 2026-09-09).** The gate's strictest path points at the gate
+  (standing user rule, 2026-09-09).** "Two" counts DISCOVERY rounds — reviews run
+  to find defects. The confirming review of a terminal push (rule 4) is a gate
+  requirement rather than a discovery round and never counts toward it; without that
+  exemption stated HERE, where the cap is, the two rules read as a contradiction and
+  a session fixing a floor-class finding cannot satisfy both (Codex P2, #1903). The gate's strictest path points at the gate
   itself: a PR changing the rules must pass the rules it is changing, every fix moves
   the head, and each moved head costs another manual review request. READ (#1824): four rounds spent to RELAX a gate. Meanwhile the fixes those PRs carry are what unblock
   everything behind them, so a slow lane here is not a safe lane — it is a queue that
@@ -1840,9 +1848,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `_HOOK_SURFACE_PREFIXES` + `_HOOK_SURFACE_FILES` in `scripts/hooks/git_push_guard.py`.
-  Read those constants; do not copy them here (they are kept exhaustive by
-  `TestWiredHooksFenceGuardrail`, and a hand-copied list is wrong the moment a hook is
-  wired). This lane is a STRICTER-REVIEW, FEWER-ROUNDS trade on that surface. It does
+  Read those constants; do not copy them here — a hand-copied list is wrong the moment
+  a hook is wired. `TestWiredHooksFenceGuardrail` keeps the WIRED-HOOK half exhaustive
+  by parsing `.claude/settings.json`; it cannot do the same for the tracked CONFIGS the
+  hooks read, because settings.json lists hooks and not the files they consume. Those
+  entries are maintained by hand, so adding a config a hook's behaviour depends on means
+  adding it to `_HOOK_SURFACE_FILES` deliberately (Codex P2, #1903). This lane is a STRICTER-REVIEW, FEWER-ROUNDS trade on that surface. It does
   not apply anywhere else, and applying it to an ordinary PR doubles review spend for
   nothing. The test is MECHANICAL and deliberately wider than the rationale — the
   surface includes hook wiring and the tracked configs the hooks read, so a PR that only
