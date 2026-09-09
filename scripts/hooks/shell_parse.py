@@ -1389,26 +1389,39 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #: problem this module cannot otherwise see: :func:`untokenizable` answers "did the
 #: parse fail", and here the parse SUCCEEDS while resolving something else.
 #:
-#: An ALLOWLIST, deliberately, and stated as one because the polarity is the entire
-#: safety argument. The set below is not "the spellings we have thought of" — it is
-#: the two characters that OPEN a substitution in bash's word grammar (parameter,
-#: command, arithmetic, and every quoting form layered over them), so a word free of
-#: both is one shlex and bash agree on, whatever else it contains. Enumerating the
-#: spellings instead (which quoting form, which encoding) is a denylist, and a
-#: denylist on a safety boundary is a treadmill whose every miss is a hole: the
-#: residual this rule closes was itself the second such spelling found, after a
-#: docstring had already called the first one "the one residual".
+#: An ALLOWLIST over SUBSTITUTION, deliberately, and scoped in that word because
+#: the scope is the part that keeps being overstated. These two characters open a
+#: substitution in bash's word grammar — parameter, command, arithmetic, and every
+#: quoting form layered over them — so a word free of both is a word shlex and bash
+#: agree on AS FAR AS SUBSTITUTION GOES. Enumerating spellings instead (which
+#: quoting form, which encoding) would be a denylist, and a denylist on a safety
+#: boundary is a treadmill whose every miss is a hole.
 #:
-#: TWO OTHER EXPANSIONS ARE EXCLUDED, and neither is an oversight. TILDE expansion
-#: applies only at the start of a word and only up to the first ``/``, which is
-#: strictly ahead of the basename :func:`_basename` reads — ``~/venv/bin/python``
-#: is ``python`` under every value of HOME, so flagging it would cost the common
-#: shape and buy nothing. PATHNAME expansion (``*?[``) is a real residual rather
-#: than a safe one: a glob resolves against FILENAMES, so ``git pu*`` only becomes
-#: a verb if a file of that name exists in the working directory, and otherwise
-#: stays the literal word git rejects. Closing it means flagging every ordinary
-#: ``ls *.py``-shaped word in verb position for a hazard that needs a planted file
-#: as well, which is a worse trade than saying so here.
+#: THIS IS NOT THE COMPLETE SET OF WORD-GENERATING CONSTRUCTS, and saying otherwise
+#: is the specific mistake this file keeps repeating. #1686's docstring called a
+#: hex-encoded verb "the one residual" and was already wrong when written. An
+#: earlier revision of THIS comment claimed the two characters covered the class
+#: and was falsified in review by BRACE expansion, which generates words without
+#: either of them. So the honest statement is the constructs COVERED, each named,
+#: and the ones deliberately left, each with its reason:
+#:
+#:   COVERED  substitution        here, via these two characters
+#:   COVERED  brace expansion     :func:`_has_brace_expansion` — ``{a,b}``, ``{a..b}``
+#:   LEFT     tilde expansion     applies only at the start of a word and only up to
+#:                                the first ``/``, which is strictly ahead of the
+#:                                basename :func:`_basename` reads. ``~/venv/bin/python``
+#:                                is ``python`` under every value of HOME, so flagging
+#:                                it would cost the common shape and buy nothing.
+#:   LEFT     pathname expansion  (``*?[``) a REAL residual, not a safe one. A glob
+#:                                resolves against FILENAMES, so ``git pu*`` becomes a
+#:                                verb only if a file of that name already exists in the
+#:                                working directory, and otherwise stays the literal word
+#:                                git rejects. Closing it means flagging every ordinary
+#:                                ``ls *.py``-shaped word in verb position for a hazard
+#:                                that also needs a planted file.
+#:
+#: A construct absent from both columns is UNEXAMINED, not covered. Add it to a
+#: column rather than assuming the columns are exhaustive.
 _EXPANSION_MARKS = ("$", "`")
 
 #: Programs whose FIRST WORDS choose the operation, so the verb is not argv[0].
@@ -1429,9 +1442,66 @@ _VERB_DISPATCHERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 }
 
 
+def _has_brace_expansion(token: str) -> bool:
+    """Whether *token* carries a bash BRACE EXPANSION — ``{a,b}`` or ``{a..b}``.
+
+    Brace expansion generates words with no substitution character anywhere, so it
+    is invisible to :data:`_EXPANSION_MARKS` and needed its own check. shlex keeps
+    the braces verbatim, which is one more way a token can tokenize cleanly into
+    something bash never runs.
+
+    A brace group expands only when its top level holds a COMMA or a ``..`` range —
+    ``{a}`` and ``{}`` are literal to bash, and treating them as expansion would
+    flag ordinary text. Nesting is tracked so the comma of an INNER group does not
+    make an outer literal group look expandable, matching bash, which expands
+    ``{{a,b}}`` via the inner group.
+
+    THE RANGE FORM IS WHY THIS IS A RULE AND NOT A FOOTNOTE. A comma list always
+    emits at least two words, so it lands an extra argument next to the verb and
+    corrupts the rest of argv — real, but self-limiting. A range with identical
+    endpoints emits exactly ONE word: ``pus{h..h}`` is a single ``push``, argv
+    intact. VERIFIED against bash itself through a shim that prints its own argv,
+    rather than reasoned about — the two forms look alike and behave differently,
+    and the difference is the whole severity of the case.
+    """
+    i, n = 0, len(token)
+    while i < n:
+        if token[i] != "{":
+            i += 1
+            continue
+        depth = 1
+        expandable = False
+        j = i + 1
+        while j < n:
+            c = token[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif depth == 1:
+                if c == ",":
+                    expandable = True
+                elif c == "." and j + 1 < n and token[j + 1] == ".":
+                    expandable = True
+                    j += 1
+            j += 1
+        if j < n and depth == 0 and expandable:
+            return True
+        i += 1  # unterminated or literal group — bash leaves it alone, so do we
+    return False
+
+
 def _word_is_literal(token: str) -> bool:
-    """Whether *token* means, to bash, exactly the characters it spells."""
-    return not any(mark in token for mark in _EXPANSION_MARKS)
+    """Whether *token* means, to bash, exactly the characters it spells.
+
+    Covers the constructs named beside :data:`_EXPANSION_MARKS`, and only those.
+    Tilde and pathname expansion are deliberately out, with reasons recorded there.
+    """
+    if any(mark in token for mark in _EXPANSION_MARKS):
+        return False
+    return not _has_brace_expansion(token)
 
 
 def _word_continues(token: str) -> bool:

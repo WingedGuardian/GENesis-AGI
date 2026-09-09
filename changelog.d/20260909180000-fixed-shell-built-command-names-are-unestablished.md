@@ -7,8 +7,12 @@
   the same answer they give for a command that gates nothing at all. The parser
   now marks such a segment and reports it, so an operation it cannot establish
   routes to the existing "ask a human" path instead of a confident all-clear.
-  The rule is stated as what it accepts rather than as a list of the forms that
-  fool it, so spellings nobody has thought of are covered too. Measured against
-  129,179 real commands from this install's history, 14 change how they are
-  read; ordinary work that interpolates a variable into an argument, a path, or
-  a `gh api` endpoint is untouched.
+  Two word-generating constructs are covered — substitution and brace expansion
+  — and the rule for each is stated as what it accepts rather than as a list of
+  the spellings that fool it, so spellings nobody has thought of are covered
+  too. Two further constructs are named in the code as deliberately uncovered,
+  with the reason for each, because the recurring mistake on this file is
+  claiming a set is complete. Measured against 129,179 real commands from this
+  install's history, 14 change how they are read; ordinary work that
+  interpolates a variable into an argument, a path, or a `gh api` endpoint is
+  untouched.

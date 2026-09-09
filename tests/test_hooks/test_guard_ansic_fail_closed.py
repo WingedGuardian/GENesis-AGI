@@ -1060,6 +1060,14 @@ _HIDDEN_GIT_VERB = [
     # shlex, so the option's value is only the head of a word and the walk lands
     # on its tail — an ordinary-looking literal with the real verb behind it.
     ("split_option_value", f"{GIT} -C $(echo a) {PUSH} origin main"),
+    # BRACE EXPANSION generates words with no substitution character anywhere, so
+    # the two-character rule above is blind to it on its own. The RANGE form is the
+    # one that matters: a comma list emits at least two words and corrupts the rest
+    # of argv, while identical range endpoints emit exactly ONE — argv intact.
+    # Both are held here so a later narrowing to "only the comma form" fails.
+    ("brace_range_single_word", f"{GIT} pus{{h..h}} origin main"),
+    ("brace_range_split", f"{GIT} p{{u..u}}s{{h..h}} origin main"),
+    ("brace_list", f"{GIT} pu{{s,s}}h origin main"),
 ]
 _HIDDEN_GH_VERB = [
     ("gh_group", f'gh $"pr" {MERGE} 5'),
@@ -1085,6 +1093,11 @@ _BENIGN_EXPANSIONS = [
     # Parentheses that are DATA, not syntax. A rule reading every paren as a
     # substitution boundary would flag this ordinary formatting string.
     ("format_string_parens", f'{GIT} for-each-ref --format="%(refname)" refs/heads'),
+    # Braces that bash does NOT expand. A group needs a top-level comma or range to
+    # expand at all, so these are literal text — and a rule that flagged every brace
+    # would flag ordinary work while claiming to be about word generation.
+    ("literal_brace_no_comma", f"{GIT} log --format={{short}} -1"),
+    ("brace_outside_verb_position", f"{GIT} checkout -- src/{{a,b}}.py"),
 ]
 
 
@@ -1158,6 +1171,32 @@ class TestVerbPositionIsUnestablished:
         segs, blind = sp.analyze_checked("$PY -m pytest tests/x.py")
         assert any(s.verb_unresolved for s in segs), "the fact must still be recorded"
         assert blind is None, f"reporting this cause was measured too expensive: {blind}"
+
+    @pytest.mark.parametrize(
+        "word,expands",
+        [
+            ("{a,b}", True),
+            ("{a..b}", True),
+            ("{a..a}", True),  # ONE word out — the argv-intact form
+            ("{,}", True),
+            ("{{a,b}}", True),  # the INNER group expands, so bash expands the word
+            ("{a}", False),  # no comma, no range: literal to bash
+            ("{}", False),
+            ("a{b}c", False),
+            ("{a", False),  # unterminated
+            ("a}", False),
+            ("--format=%(refname)", False),
+        ],
+    )
+    def test_the_brace_detector_matches_bash(self, word, expands):
+        """Each expectation was VERIFIED against bash itself, not reasoned about.
+
+        The two brace forms look alike and behave differently, and a detector
+        tuned to the wrong half is the failure this case exists to prevent. A
+        rule that flagged every brace would also flag ordinary text, so the
+        negative rows carry as much weight as the positive ones.
+        """
+        assert sp._has_brace_expansion(word) is expands
 
     def test_a_bound_still_outranks_the_new_cause(self):
         """Precedence, at the intersection where it can be wrong.
