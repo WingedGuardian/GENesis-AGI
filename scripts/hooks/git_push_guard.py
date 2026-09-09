@@ -6689,7 +6689,19 @@ def _main_with_note() -> int:
     ONLY on a refusal; every other verdict is passed through untouched, and the
     return value is never altered.
     """
-    rc = main()
+    try:
+        rc = main()
+    except BaseException:
+        # An EXCEPTION is also a refusal here: `run_guard` converts it to exit 2,
+        # so the whole command is discarded just as deliberately as on a `return
+        # 2` — but the reader only sees "GUARD ERROR ... failing CLOSED" and is
+        # told nothing about the write two steps earlier. MEASURED: a crash
+        # injected after the command is remembered gave rc=2 with the note
+        # ABSENT. `finally` would run on the allow path too, so the note is
+        # emitted here, on the raising path only.
+        if discarded_write is not None:
+            discarded_write.warn()
+        raise
     if rc == 2 and discarded_write is not None:
         discarded_write.warn()
     return rc

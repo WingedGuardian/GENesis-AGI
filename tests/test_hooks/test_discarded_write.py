@@ -85,6 +85,38 @@ def test_the_note_is_conditional_so_a_pure_pipeline_is_not_overclaimed():
     assert "did NOT run" not in text  # the flat, overclaiming phrasing
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Nested inside an interpreter: split_segments sees ONE outer segment.
+        "bash -c 'echo hi > /tmp/x && git clean -fd'",
+        # A redirection-only first step: parse_segments removes the redirect
+        # operator AND its target, so the segment has nothing left and is dropped.
+        "> /tmp/x && git clean -fd",
+    ],
+)
+def test_two_shapes_are_KNOWN_and_MEASURED_misses(cmd):
+    """Both are refused by a guard with an earlier write, and both stay SILENT.
+
+    This is a DECISION, pinned so it cannot become a surprise. Catching either
+    needs `analyze` — the recursive parser — which is the machinery whose
+    argv-and-nesting semantics generated ~24 review findings on the predecessor
+    of this change, and which would additionally pull this module into the
+    bare-analyze allowlist and back under a cost bound.
+
+    The fail direction is SILENCE, i.e. exactly the behaviour before this change
+    existed, so the miss costs nothing that was previously working. MEASURED over
+    2,659 real commands: a redirection-only first step occurs 0 times (0.00%),
+    and single-segment commands carrying an interpreter `-c` with inner
+    separators occur 25 times (0.94%) — an UPPER bound, since inspection shows
+    most are `python3 -c` where the `;` is Python syntax, not a shell step.
+
+    If that rate ever climbs, the answer is still not `analyze`: it is to ask
+    whether the note belongs at the refusal point at all.
+    """
+    assert dw.note(cmd) is None
+
+
 def test_the_prompt_note_warns_about_DECLINING_not_about_a_discard():
     text = dw.prompt_note(f"cd /x && {_PUSH}")
     assert text is not None and "Declining" in text
@@ -481,6 +513,47 @@ def test_live_a_poisoned_helper_can_never_fail_a_guard_open(tmp_path, script, re
         "CC treats any non-2 exit as non-blocking, so the refused command would RUN. "
         f"stderr: {proc.stderr[-600:]}"
     )
+
+
+def test_live_an_exception_generated_refusal_still_carries_the_note(tmp_path):
+    """`run_guard` turns an exception into exit 2 — a refusal like any other.
+
+    The reader sees only "GUARD ERROR ... failing CLOSED" and is told nothing
+    about the write two steps earlier. MEASURED before the fix: a crash injected
+    after the command is remembered gave rc=2 with the note ABSENT.
+
+    Residual, stated: the other run_guard-wrapped guards emit at their own
+    return-2 sites, so their exception paths still lack the note. Covering those
+    means emitting from `run_guard` itself, in `hook_input` — a stdlib-only
+    module bare-imported by 19 files, and already owned by the import-time
+    fail-closed work rather than by this change.
+    """
+    sandbox = tmp_path / "hooks"
+    sandbox.mkdir()
+    for f in _HOOKS.glob("*.py"):
+        shutil.copy2(f, sandbox / f.name)
+    guard = sandbox / "git_push_guard.py"
+    src = guard.read_text()
+    anchor = "        if discarded_write is not None:\n            discarded_write.remember(cmd)\n"
+    assert src.count(anchor) == 1, "anchor drifted — this test would inject nothing"
+    guard.write_text(src.replace(anchor, anchor + '        raise RuntimeError("injected")\n', 1))
+
+    proc = subprocess.run(
+        [sys.executable, str(guard)],
+        input=json.dumps(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi > /tmp/dw_probe && git " + "push"},
+                "cwd": str(_REPO),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO),
+        timeout=120,
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stderr[-400:])
+    assert "ENTIRE command was discarded" in proc.stderr, proc.stderr[-600:]
 
 
 def test_live_the_ask_path_carries_the_prompt_note():
