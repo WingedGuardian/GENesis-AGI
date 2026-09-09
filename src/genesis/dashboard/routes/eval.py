@@ -46,6 +46,33 @@ def detect_series_break(
         prev_defn = defn
     return None
 
+
+def latest_definition_segment(series: list[dict]) -> list[dict]:
+    """The trailing run of series points that share one metric definition.
+
+    Naming the break is not enough: the trend below averages a first half
+    against a second half, so a window straddling a redefinition reports the
+    redefinition as movement. The ego's approval_rate v2 raises the rate by
+    construction (a smaller denominator, `failed` in the numerator), which
+    would render as `trend: up`, `trend_good: true` on a week nobody judged
+    anything differently.
+
+    Points carry `definition` (None for dimensions with no registered marker),
+    so a dimension that has never been redefined yields the whole series and
+    the trend is bit-identical to the unsegmented one.
+
+    Series must be in chronological order.
+    """
+    if not series:
+        return []
+    latest = series[-1].get("definition")
+    cut = len(series)
+    for i in range(len(series) - 1, -1, -1):
+        if series[i].get("definition") != latest:
+            break
+        cut = i
+    return series[cut:]
+
 _HEADLINE_METRIC = {
     "memory": "precision_at_5",
     "system": "composite_score",
@@ -144,10 +171,15 @@ async def metrics_compounding():
             "weeks_of_data": len(series),
         }
 
-    # Compute trend direction for each dimension
+    # Compute trend direction for each dimension — WITHIN one definition only.
+    # A trend read across a redefinition measures the redefinition; when the
+    # newest definition has too few points to compare, that is honestly
+    # insufficient data rather than a direction borrowed from the old one.
     for _dim, data in dimensions.items():
+        segment = latest_definition_segment(data["series"])
+        data["trend_basis_weeks"] = len(segment)
         values = [
-            p["value"] for p in data["series"]
+            p["value"] for p in segment
             if p["value"] is not None
         ]
         if len(values) >= 2:

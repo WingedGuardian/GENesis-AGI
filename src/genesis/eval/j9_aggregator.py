@@ -90,6 +90,24 @@ async def _compute_cognitive_drift(
     return metrics, total
 
 
+def factors_with_reason(grade_info: dict) -> dict:
+    """Return a grader's factors with its top-level `reason` folded in.
+
+    Graders return `reason` alongside `factors`, but `eval_subsystem_grades`
+    has no `reason` column and the dashboard reads `factors["reason"]`
+    (dashboard/routes/eval.py), so every withheld grade rendered a blank
+    explanation. This is the single chokepoint where the fold happens — named
+    so the persist call below and its test exercise the same code, rather than
+    a test re-implementing the fold and passing whatever production does.
+
+    A grader that already put `reason` in its own factors keeps it.
+    """
+    factors = dict(grade_info.get("factors") or {})
+    if grade_info.get("reason") and "reason" not in factors:
+        factors["reason"] = grade_info["reason"]
+    return factors
+
+
 async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
     """Compute and store weekly snapshots for all eval dimensions.
 
@@ -156,14 +174,9 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
     ]:
         try:
             grade_info = await grade_fn(db, period_start, period_end, results)
-            # Graders return `reason` at the top level, but the row has no
-            # `reason` column and the dashboard reads factors["reason"]
-            # (dashboard/routes/eval.py) — so every withheld grade rendered a
-            # blank explanation. Fold it in HERE, at the one persist call, so
-            # no future grader has to remember to.
-            grade_factors = dict(grade_info["factors"])
-            if grade_info.get("reason") and "reason" not in grade_factors:
-                grade_factors["reason"] = grade_info["reason"]
+            # Fold `reason` into factors HERE, at the one persist call, so no
+            # future grader has to remember to. See factors_with_reason.
+            grade_factors = factors_with_reason(grade_info)
             await j9_eval.insert_subsystem_grade(
                 db,
                 period_start=period_start,
@@ -1338,6 +1351,13 @@ async def _grade_procedural(
 
     Factors: success_rate (50%), mean_confidence (25%),
     invocation_activity (25% — normalized by total procedures).
+
+    `sample_count` is the OUTCOME count on every return path, withheld or
+    graded. It is the population the dominant factor (success_rate, 50%) is
+    measured over and the one the gate below withholds on, so it is the number
+    that says how much the grade rests on. Reporting invocations here was how
+    a grade computed from ONE outcome came back labelled `sample_count 435`.
+    Both counts stay in `factors`.
     """
     metrics = dimension_results.get("procedure", {})
     success = metrics.get("success_rate")
@@ -1364,7 +1384,7 @@ async def _grade_procedural(
 
     if invocations < _MIN_SAMPLES["procedural"]:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": invocations,
+                "sample_count": outcomes,
                 "reason": f"insufficient data ({invocations} invocations, need {_MIN_SAMPLES['procedural']})"}
 
     # Primary factor gate: success_rate is the most important signal (50%).
@@ -1372,7 +1392,7 @@ async def _grade_procedural(
     # alone is misleading, so withhold rather than invent a letter.
     if success is None:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": invocations,
+                "sample_count": outcomes,
                 "reason": "primary metric (success_rate) not yet measurable"}
     if outcomes < _MIN_SAMPLES["procedural"]:
         return {"grade": None, "score": None, "factors": factors,
@@ -1384,11 +1404,11 @@ async def _grade_procedural(
     score = _score_available_factors(available, max_absent=1)
     if score is None:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": invocations,
+                "sample_count": outcomes,
                 "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
-            "factors": factors, "sample_count": invocations}
+            "factors": factors, "sample_count": outcomes}
 
 
 async def _grade_awareness(

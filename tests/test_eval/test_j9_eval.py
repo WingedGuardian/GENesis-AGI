@@ -1659,6 +1659,38 @@ async def test_procedural_grade_gated_on_the_outcome_population(db):
     result = await _grade_procedural(db, "2026-05-01", "2026-05-08", dimension_results)
     assert result["grade"] is None, result
     assert "outcomes" in result.get("reason", ""), result
+    # sample_count must describe the population the grade rests on. Reporting
+    # invocations here is how "graded on 1 outcome" came back as n=435.
+    assert result["sample_count"] == 1, result
+    assert result["factors"]["invocation_count"] == 435   # still legible
+
+
+async def test_procedural_sample_count_is_one_population_on_every_path(db):
+    """Withheld and graded rows must not report different populations.
+
+    sample_count lands in one column and one sparkline; if the withheld path
+    counts outcomes and the graded path counts invocations, the series changes
+    meaning between adjacent weeks. _grade_ego reports its judged population on
+    every path — procedural now matches.
+    """
+    base = {"success_rate": 0.8, "mean_confidence": 0.7,
+            "invocation_count": 435, "outcome_count": 40,
+            "total_procedures": 2334}
+    graded = await _grade_procedural(
+        db, "2026-05-01", "2026-05-08", {"procedure": base})
+    assert graded["grade"] is not None, graded
+    assert graded["sample_count"] == 40, graded
+
+    # Withheld on the invocation gate, and withheld on the missing primary
+    # factor — both report the same population as the graded path.
+    few = await _grade_procedural(
+        db, "2026-05-01", "2026-05-08",
+        {"procedure": {**base, "invocation_count": 2, "outcome_count": 1}})
+    assert few["grade"] is None and few["sample_count"] == 1, few
+    no_primary = await _grade_procedural(
+        db, "2026-05-01", "2026-05-08",
+        {"procedure": {**base, "success_rate": None}})
+    assert no_primary["grade"] is None and no_primary["sample_count"] == 40, no_primary
 
 
 async def test_awareness_and_reflection_scoring_is_unchanged(db):
@@ -1764,8 +1796,16 @@ async def test_withheld_grade_reason_reaches_the_dashboard_key(db):
     dashboard/routes/eval.py reads factors["reason"], so every grader's
     explanation was silently dropped. This fix makes the withheld path — now
     the common path for ego — legible instead of blank.
+
+    It calls the production fold (`factors_with_reason`, the named chokepoint
+    run_weekly_aggregation uses) rather than a copy of it, so deleting the fold
+    fails this test instead of leaving it green.
     """
-    from genesis.eval.j9_aggregator import _compute_ego_quality, _grade_ego
+    from genesis.eval.j9_aggregator import (
+        _compute_ego_quality,
+        _grade_ego,
+        factors_with_reason,
+    )
 
     await _seed_window_proposals(db, [("pending", 0.7, False)] * 6)
     since, until = "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00"
@@ -1773,10 +1813,36 @@ async def test_withheld_grade_reason_reaches_the_dashboard_key(db):
     info = await _grade_ego(db, since, until, {"ego": metrics})
 
     assert info["grade"] is None
-    grade_factors = dict(info["factors"])
-    if info.get("reason") and "reason" not in grade_factors:
-        grade_factors["reason"] = info["reason"]          # the persist chokepoint
+    grade_factors = factors_with_reason(info)             # the persist chokepoint
     assert "judged" in grade_factors["reason"], grade_factors["reason"]
+    # A grader that already carries its own `reason` in factors keeps it.
+    assert factors_with_reason(
+        {"factors": {"reason": "mine"}, "reason": "outer"})["reason"] == "mine"
+    # No reason at all leaves factors untouched (graded path).
+    assert factors_with_reason({"factors": {"a": 1}}) == {"a": 1}
+
+
+async def test_withheld_reason_survives_the_persist_call(db):
+    """The fold must be WIRED, not merely available.
+
+    Asserting the helper alone would stay green if run_weekly_aggregation
+    stopped calling it, so this reads the row the dashboard reads: every
+    withheld grade persisted by a full aggregation must carry its reason in
+    factors_json.
+    """
+    from genesis.db.crud import j9_eval as j9_crud
+    from genesis.eval.j9_aggregator import run_weekly_aggregation
+
+    await run_weekly_aggregation(db)          # empty window -> all withheld
+
+    rows = await j9_crud.get_latest_subsystem_grades(db)
+    assert rows, "aggregation persisted no subsystem grades"
+    withheld = [r for r in rows if r["grade"] is None]
+    assert withheld, [r["subsystem"] for r in rows]
+    for row in withheld:
+        assert row["factors"].get("reason"), row["subsystem"]
+    ego = [r for r in rows if r["subsystem"] == "ego"]
+    assert ego and "judged" in ego[0]["factors"]["reason"], ego
 
 
 async def test_a_failed_execution_still_counts_as_an_approval(db):
