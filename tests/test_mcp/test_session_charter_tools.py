@@ -424,7 +424,7 @@ async def test_missing_own_charter_is_permanent_and_names_the_right_spine(
     with patch.object(tools, "_get_db", return_value=db):
         res = await tools._impl_session_charter(SID)
     err = res["error"]
-    assert "no charter will ever appear here" in err, err
+    assert "never be re-injected into THIS session" in err, err
     # It may still point an AUTONOMOUS session at task_states, but never
     # unconditionally: a channel conversation must be told it has no such row.
     assert "task_states" in err, err
@@ -441,7 +441,7 @@ async def test_missing_charter_uncertain_when_the_caller_has_no_id(
         res = await tools._impl_session_charter(SID)
     err = res["error"]
     assert "could NOT be determined" in err, err
-    assert "no charter will ever appear here" not in err, err
+    assert "THIS dispatched/channel session's own id" not in err, err
 
 
 # --- Rewrite/reopen of a legacy inert row (Codex P2, PR #1617) --------------
@@ -568,7 +568,7 @@ async def test_the_read_path_agrees_with_the_write_path_on_a_short_prefix(
     with patch.object(tools, "_get_db", return_value=db):
         read = await tools._impl_session_charter(SID[:8])
         write = await tools._impl_session_ledger_add(SID[:8], "a promise")
-    assert "no charter will ever appear here" in read["error"], read
+    assert "THIS dispatched/channel session's own id" in read["error"], read
     assert "never re-injected" in write["error"].lower(), write
 
 
@@ -603,3 +603,185 @@ async def test_with_no_own_id_nothing_is_claimed_as_self(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     assert tools._resolves_to_own(SID[:8]) is False
     assert tools._resolves_to_own(SID) is False
+
+
+# --- Round-3 Codex P2s ------------------------------------------------------
+# Three findings against 14ce4e64c, all on the same theme: the gate's CLAIMS
+# were wider than the mechanism behind them.
+
+
+async def test_own_missing_charter_promises_no_reinjection_not_absolute_absence(
+    db, sessions_dir, monkeypatch
+):
+    """The claim is caller-relative, so it may not be stated as absolute.
+
+    "no charter will ever appear here" was false: the cross-session write path
+    this PR deliberately preserves lets ANY foreground session — and, per the
+    residual gap named in `_self_write_unreadable_error`, any OTHER dispatched
+    session — create this very charter through session_charter_update /
+    session_ledger_add. What is actually guaranteed is that it never reaches
+    THIS session's windows, because the SessionStart reader, the PreCompact
+    maintainer and the drift tag all skip GENESIS_CC_SESSION=1.
+    """
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_charter(SID)
+    err = res["error"]
+    assert "never be re-injected into THIS session" in err, err
+    # The overreaching absolute claim must be gone.
+    assert "no charter will ever appear here" not in err, err
+    # ...and the reason it is gone must be stated, not merely omitted: the
+    # supported cross-session path is why absence cannot be promised.
+    assert "another" in err.lower() and "cross-session" in err.lower(), err
+
+
+async def test_unknown_own_id_suffix_does_not_claim_writes_are_refused(
+    db, sessions_dir, monkeypatch
+):
+    """The fail-open branch contradicted itself.
+
+    With no own id, `_resolves_to_own` returns False, so
+    `_self_write_unreadable_error` returns None and the write LANDS — yet the
+    suffix told the caller "both writes are refused". The same missing id that
+    makes the target unknowable is what disarms the gate.
+    """
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_charter(SID)
+        # Ground truth for the claim: the write really is allowed here.
+        wrote = await tools._impl_session_ledger_add(SID, "fail-open write")
+    err = res["error"]
+    assert "error" not in wrote, wrote
+    assert "could NOT be determined" in err, err
+    assert "fail OPEN" in err, err
+    assert "writes are refused" not in err, err
+
+
+async def test_terminal_row_text_correction_allowed_on_own_charter(
+    db, sessions_dir, monkeypatch
+):
+    """A text edit that leaves the row DONE creates no promise (Codex P2).
+
+    Promise-creating is a property of the resulting row, not of which fields the
+    call names — refusing a correction to an already-closed row contradicted the
+    tool's own guarantee that closure and cleanup stay available.
+    """
+    item_id = await _seed_legacy_inert_row(db)
+    await crud.ledger_update(db, item_id, status="done")
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_ledger_update(item_id, text="closed: shipped in #1617")
+    assert "error" not in res, res
+    row = await crud.get_ledger_item(db, item_id)
+    assert row["text"] == "closed: shipped in #1617", row
+    assert row["status"] == "done", row
+
+
+async def test_text_plus_closure_in_one_call_allowed_on_own_charter(
+    db, sessions_dir, monkeypatch
+):
+    """Atomically refining text WHILE closing leaves a terminal row — allowed."""
+    item_id = await _seed_legacy_inert_row(db)
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_ledger_update(
+            item_id, text="what it actually was", status="absorbed"
+        )
+    assert "error" not in res, res
+    row = await crud.get_ledger_item(db, item_id)
+    assert row["status"] == "absorbed", row
+    assert row["text"] == "what it actually was", row
+
+
+async def test_text_edit_that_leaves_a_row_live_is_still_refused(
+    db, sessions_dir, monkeypatch
+):
+    """CONTROL for the widening above: relaxing to "resulting row" must not
+    reopen the hole. A text swap on an OPEN row still mints a live promise, and
+    so does text + an explicit reopen of a closed row."""
+    item_id = await _seed_legacy_inert_row(db)  # status 'open'
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        live_swap = await tools._impl_session_ledger_update(item_id, text="a brand new promise")
+        await crud.ledger_update(db, item_id, status="done")
+        reopen_with_text = await tools._impl_session_ledger_update(
+            item_id, text="back from the dead", status="open"
+        )
+    for res in (live_swap, reopen_with_text):
+        assert "Refusing this edit" in res.get("error", ""), res
+    assert (await crud.get_ledger_item(db, item_id))["text"] == "legacy inert row"
+
+
+async def test_own_prefix_that_resolves_to_a_FOREIGN_id_is_still_self(
+    db, sessions_dir, monkeypatch
+):
+    """The guard saw only the RESOLVED id, so resolution could rename the caller.
+
+    `crud.resolve_session_id` LIKE-matches a short id against
+    session_charters.session_id / cc_sessions.cc_session_id. Our own
+    GENESIS_SESSION_ID is a cc_sessions.id — in NEITHER column — so a prefix of
+    it that uniquely matches one unrelated row is rewritten to that row's full
+    transcript id. `_resolves_to_own` then answered False and the self-write was
+    accepted as cross-session, landing on a stranger's charter.
+    """
+    foreign = SID[:8] + "-9999-8888-7777-666655554444"
+    assert foreign != SID and foreign.startswith(SID[:8])
+    await crud.upsert_stub(db, foreign)
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        # Sanity: resolution really does rename the caller's own prefix.
+        assert await crud.resolve_session_id(db, SID[:8]) == foreign
+        write = await tools._impl_session_ledger_add(SID[:8], "survives to Friday")
+        update = await tools._impl_session_charter_update(SID[:8], mission="m")
+    assert "never re-injected" in write["error"].lower(), write
+    assert "never re-injected" in update["error"].lower(), update
+    # Nothing landed on the stranger's charter.
+    assert await crud.ledger_counts(db, foreign) == {}
+    assert (await crud.get(db, foreign)).get("mission") is None
+
+
+async def test_read_path_agrees_when_an_own_prefix_resolves_to_a_FOREIGN_id(
+    db, sessions_dir, monkeypatch
+):
+    """Same rename, on the read path (session_charter_tools.py:309 in the finding).
+
+    Seeded through cc_sessions rather than a charter row so the target is
+    charterless and the suffix branch is reached: the resolved id is a
+    stranger's, but the caller named ITSELF, so the response must not tell it a
+    write would create the charter.
+    """
+    foreign = SID[:8] + "-9999-8888-7777-666655554444"
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, started_at,"
+        " last_activity_at, cc_session_id)"
+        " VALUES ('g-foreign', 'foreground', 'test-model',"
+        " '2026-07-13T00:00:00+00:00', '2026-07-13T00:00:00+00:00', ?)",
+        (foreign,),
+    )
+    await db.commit()
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        assert await crud.resolve_session_id(db, SID[:8]) == foreign
+        read = await tools._impl_session_charter(SID[:8])
+    assert "THIS dispatched/channel session's own id" in read["error"], read
+
+
+async def test_a_foreign_prefix_is_not_made_self_by_the_raw_check(
+    db, sessions_dir, monkeypatch
+):
+    """CONTROL. Checking the raw input must not swallow the ambient path: a
+    prefix of ANOTHER session is still a legitimate cross-session write."""
+    await crud.upsert_stub(db, OTHER_SID)
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", TRANSCRIPT_SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_ledger_add(OTHER_SID[:8], "for the foreground session")
+    assert "error" not in res, res
+    assert res["session_id"] == OTHER_SID, res

@@ -149,7 +149,31 @@ def _resolves_to_own(sid: str) -> bool:
     return any(o.startswith(sid) for o in own)
 
 
-def _self_write_unreadable_error(sid: str) -> dict | None:
+def _names_own_session(sid: str, raw_id: str | None = None) -> bool:
+    """Does the caller's request name THIS session — BEFORE or AFTER resolution?
+
+    ``crud.resolve_session_id`` (db/crud/session_charters.py:126-155) rewrites a
+    short id to whichever single ``session_charters.session_id`` or
+    ``cc_sessions.cc_session_id`` row it happens to LIKE-match. Our own
+    ``GENESIS_SESSION_ID`` is a ``cc_sessions.id``, which is in NEITHER of those
+    columns, so a prefix of our own id that collides with one unrelated row
+    comes back as somebody ELSE's full transcript id. An identity check that
+    sees only the resolved value then reads the caller's own id as a
+    cross-session target and lets the write through (Codex P2, PR #1617).
+
+    So classify the RAW input too, and let self-ness WIN when the two answers
+    disagree — they can only disagree when resolution silently changed who the
+    caller named, and in that state the honest answer is "this may be you",
+    which on a truthfulness gate means refuse rather than promise. Rare (an
+    8-hex-char collision against ~200 rows), but the cost of checking is a
+    string comparison against at most two ids and no query at all.
+    """
+    if _resolves_to_own(sid):
+        return True
+    return raw_id is not None and _resolves_to_own(raw_id.strip())
+
+
+def _self_write_unreadable_error(sid: str, raw_id: str | None = None) -> dict | None:
     """Refuse a charter/ledger write a DISPATCHED session makes to ITS OWN charter.
 
     The charter system is foreground-only: the reader
@@ -191,13 +215,15 @@ def _self_write_unreadable_error(sid: str) -> dict | None:
     this. A truthfulness gate, not a security boundary.
 
     ``_impl_session_ledger_update`` applies this same predicate, but only to the
-    PROMISE-CREATING mutations (a ``text`` replacement, or a status back to
-    open/in_progress): those rewrite an existing row into a new live-looking
-    commitment just as effectively as an insert (db/crud/session_charters.py
-    ledger_update takes arbitrary text and any VALID_LEDGER_STATUS, Codex P2 on
-    PR #1617). Closing a legacy inert row — done/absorbed/dropped, or an
-    evidence write — stays allowed, so this never traps a session with rows it
-    cannot clean up.
+    PROMISE-CREATING mutations — those that leave the row LIVE and either
+    replace its ``text`` or move its status back to open/in_progress. Those
+    rewrite an existing row into a new live-looking commitment just as
+    effectively as an insert (db/crud/session_charters.py ledger_update takes
+    arbitrary text and any VALID_LEDGER_STATUS, Codex P2 on PR #1617). Anything
+    that leaves the row TERMINAL — closing it done/absorbed/dropped, correcting
+    the text of an already-closed row, or refining text and closing in one call
+    — stays allowed, so this never traps a session with rows it cannot clean up
+    or correct.
 
     One thing this deliberately does NOT do: a refused session could route
     around it by passing a fabricated 32-char id (``upsert_stub`` is a bare
@@ -207,7 +233,7 @@ def _self_write_unreadable_error(sid: str) -> dict | None:
     """
     if not _is_dispatched():
         return None
-    if not _resolves_to_own(sid):
+    if not _names_own_session(sid, raw_id):
         return None
     return {
         "error": "Refusing the write: this is a dispatched/channel session "
@@ -225,7 +251,7 @@ def _self_write_unreadable_error(sid: str) -> dict | None:
     }
 
 
-def _missing_charter_suffix(sid: str) -> str:
+def _missing_charter_suffix(sid: str, raw_id: str | None = None) -> str:
     """Extra guidance appended to the read path's "no charter" error.
 
     Keyed on the SAME predicate as the write gate, not on "am I dispatched"
@@ -237,22 +263,35 @@ def _missing_charter_suffix(sid: str) -> str:
     false claim of absence, so the "will never appear" wording is confined to
     the caller's OWN charter.
 
-    Three states, mirroring the write gate: own charter (permanently absent),
-    own id unknown (uncertain — say so), everything else (no suffix; the base
-    message is already correct).
+    Three states, mirroring the write gate: own charter (nothing will ever
+    re-inject it HERE), own id unknown (uncertain — say so), everything else
+    (no suffix; the base message is already correct).
+
+    What the own-charter branch may NOT say is that the charter can never
+    APPEAR (Codex P2, PR #1617). The claim is caller-relative, and this PR's
+    own premise is that a cross-session write is legitimate and supported —
+    so any foreground session, and any OTHER dispatched session (the residual
+    gap named in ``_self_write_unreadable_error``), can create this very row
+    through ``session_charter_update`` / ``session_ledger_add``. The claim that
+    IS sound, and the one the caller actually needs, is about re-injection into
+    THIS session: the SessionStart reader, the PreCompact maintainer and the
+    per-turn drift tag all skip ``GENESIS_CC_SESSION=1``, so no charter — this
+    one or one somebody else creates later — ever reaches this session's
+    windows.
     """
     if not _is_dispatched():
         return ""
     own = _own_session_ids()
-    if _resolves_to_own(sid):
+    if _names_own_session(sid, raw_id):
         # The caller's own charter — by the SAME predicate the write gate uses,
-        # short prefix included, so the two calls cannot contradict each other.
-        # Both write routes are refused and the PreCompact maintainer returns
-        # early on GENESIS_CC_SESSION=1, so nothing can ever create it.
+        # short prefix and pre-resolution spelling included, so the two calls
+        # cannot contradict each other.
         return (
-            " NOTE: that is THIS dispatched/channel session's own id — neither"
-            " route fires for it (compaction skips this session class and both"
-            " writes are refused), so no charter will ever appear here."
+            " NOTE: that is THIS dispatched/channel session's own id — nothing"
+            " THIS session can do will create it (compaction skips this session"
+            " class and both write routes are refused here), and even if another"
+            " session creates it through the supported cross-session write path,"
+            " it will never be re-injected into THIS session's windows."
             " Continuity for a dispatched session depends on which kind it is:"
             " an autonomous task session has its task_states row (created by"
             " the task dispatcher / task_submit, autonomy/dispatcher.py:188 and"
@@ -262,13 +301,18 @@ def _missing_charter_suffix(sid: str) -> str:
             " and otherwise this session's final output."
         )
     if not own:
-        # Fail-open: with no id of our own, we cannot tell whether sid is us.
+        # Fail-open: with no id of our own we cannot tell whether sid is us —
+        # and in that state the write gate does NOT fire either, so this branch
+        # must not repeat the own-charter branch's "both writes are refused".
+        # Saying so was self-contradictory: the same missing id that makes the
+        # target unknowable is what lets the write through (Codex P2, #1617).
         return (
             " NOTE: this is a dispatched/channel session and its own id is"
-            " unknown here, so whether that charter can ever appear could NOT"
-            " be determined — if it is this session's own id, it never will"
-            " (compaction skips this session class and both writes are"
-            " refused)."
+            " unknown here, so whether that is this session's OWN charter could"
+            " NOT be determined. Writes are not refused in this state — they"
+            " fail OPEN and would land — but if it IS this session's own id,"
+            " nothing written there is ever re-injected into this session"
+            " (compaction skips this session class)."
         )
     return ""
 
@@ -313,7 +357,7 @@ async def _impl_session_charter(session_id: str) -> dict:
                 "error": f"No charter for session '{session_id}'. A charter row "
                 "appears at the session's first compaction, or on the first "
                 "session_charter_update / session_ledger_add call."
-                + _missing_charter_suffix(sid)
+                + _missing_charter_suffix(sid, session_id)
             }
         ledger = await crud.ledger_list(db, sid)
         counts = await crud.ledger_counts(db, sid)
@@ -366,7 +410,7 @@ async def _impl_session_charter_update(
         # write would then land, which for this session's own charter it never
         # will. Answering the id form first costs the caller a round trip to
         # fetch an id that is about to be refused anyway.
-        if err := _self_write_unreadable_error(sid):
+        if err := _self_write_unreadable_error(sid, session_id):
             return err
         if err := _unresolved_short_id_error(sid):
             return err
@@ -422,7 +466,7 @@ async def _impl_session_ledger_add(
         # write would then land, which for this session's own charter it never
         # will. Answering the id form first costs the caller a round trip to
         # fetch an id that is about to be refused anyway.
-        if err := _self_write_unreadable_error(sid):
+        if err := _self_write_unreadable_error(sid, session_id):
             return err
         if err := _unresolved_short_id_error(sid):
             return err
@@ -502,8 +546,13 @@ async def _impl_session_ledger_update(
     arbitrary replacement ``text`` and any VALID_LEDGER_STATUS including a
     reopen, so on an install that already carries a legacy inert row — exactly
     the population this gate protects — rewrite-plus-reopen mints a live-looking
-    promise just as effectively as an insert would. Closure (done / absorbed /
-    dropped) and evidence writes stay open so legacy rows remain cleanable.
+    promise just as effectively as an insert would.
+
+    "Promise-creating" is judged on the RESULTING row, not on which fields the
+    call names: an edit that leaves the row terminal (done / absorbed /
+    dropped) creates no promise, so closure, evidence writes, correcting the
+    text of an already-closed row, and text-plus-closure in one call all stay
+    open — legacy rows stay both cleanable and correctable.
     """
     db = _get_db()
     if db is None:
@@ -521,21 +570,35 @@ async def _impl_session_ledger_update(
         existing = await crud.get_ledger_item(db, item_id)
         if existing is None:
             return {"error": f"No ledger item with id '{item_id}'"}
-        # Promise-creating = a text replacement, or a status that leaves the row
-        # LIVE. Derived as the complement of the terminal set against the crud
-        # allow-list rather than a positive literal, so a status added upstream
-        # is gated by default instead of silently slipping past — and so an
-        # INVALID status still falls through to crud.ledger_update's ValueError
-        # rather than being answered with a confusing refusal.
+        # Promise-creating is a property of the row this edit LEAVES BEHIND, not
+        # of the fields it touches (Codex P2, PR #1617). Judging `text is not
+        # None` on its own refused two edits that create no promise at all: a
+        # correction to the text of an already done/absorbed/dropped row, and a
+        # text refinement applied atomically WITH status="done". Both leave a
+        # terminal row, which the charter injection excludes and which nobody can
+        # read as a live commitment — and refusing them contradicts the tool's
+        # own promise that closure stays available.
+        #
+        # So: resolve the RESULTING status first (an omitted status leaves the
+        # existing one), and only then ask whether the edit mints a live
+        # promise. The live set is still derived as the complement of the
+        # terminal set against the crud allow-list rather than a positive
+        # literal, so a status added upstream is gated by default instead of
+        # silently slipping past — and an INVALID status still falls through to
+        # crud.ledger_update's ValueError rather than a confusing refusal.
         live_statuses = crud.VALID_LEDGER_STATUSES - _TERMINAL_LEDGER_STATUSES
-        creates_a_promise = text is not None or status in live_statuses
+        resulting_status = status if status is not None else existing["status"]
+        leaves_the_row_live = resulting_status not in _TERMINAL_LEDGER_STATUSES
+        creates_a_promise = leaves_the_row_live and (text is not None or status in live_statuses)
         if creates_a_promise and (err := _self_write_unreadable_error(existing["session_id"])):
             err["error"] = (
-                "Refusing this edit: rewriting the text of, or reopening, a "
-                "row on this dispatched session's OWN charter creates a new "
-                "live-looking promise on a charter nothing re-injects. "
-                "Closing it (status=done/absorbed/dropped) or attaching "
-                "evidence is still allowed. " + err["error"]
+                "Refusing this edit: it would leave a LIVE row on this "
+                "dispatched session's OWN charter with new text or a reopened "
+                "status — a new live-looking promise on a charter nothing "
+                "re-injects. Anything that leaves the row terminal is still "
+                "allowed: close it (status=done/absorbed/dropped), attach "
+                "evidence, correct the text of an already-closed row, or pass "
+                "text together with status=done. " + err["error"]
             )
             return err
         ok = await crud.ledger_update(db, item_id, status=status, text=text, evidence=evidence)
@@ -656,7 +719,7 @@ async def session_ledger_update(
     evidence, e.g. the PR) | dropped (consciously abandoned). Get item ids
     from session_charter or the SessionStart injection block.
 
-    FOREGROUND SESSIONS ONLY: a dispatched/channel session's own charter is never re-injected (the SessionStart reader, the PreCompact maintainer and the per-turn drift tag all skip GENESIS_CC_SESSION=1), so a self-write is refused; writing to a FOREGROUND session's charter is supported. On a row of its own charter a dispatched session may still close it (done/absorbed/dropped) or attach evidence — only a text replacement or a reopen is refused.
+    FOREGROUND SESSIONS ONLY: a dispatched/channel session's own charter is never re-injected (the SessionStart reader, the PreCompact maintainer and the per-turn drift tag all skip GENESIS_CC_SESSION=1), so a self-write is refused; writing to a FOREGROUND session's charter is supported. On a row of its own charter a dispatched session may still close it (done/absorbed/dropped), attach evidence, edit the text of an already-closed row, or pass text together with status=done — only an edit that leaves the row LIVE with new text or a reopened status is refused.
 
     Args:
         item_id: the ledger row id.
