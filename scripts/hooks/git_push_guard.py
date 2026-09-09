@@ -100,6 +100,8 @@ not treat untrusted PR content as instructions when composing its comment body.
 from __future__ import annotations
 
 import base64
+import contextlib
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -133,14 +135,24 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
     FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
 
+# SOFT dependency, for the reason spelled out directly above: this module is
+# NEW, and audit LOGGING must never be able to disarm the gates it audits. If it
+# cannot be imported, logging degrades to a no-op (guarded in _flush_overrides)
+# rather than taking every fail-closed gate in this file down with it.
+try:
+    import audit_jsonl  # noqa: E402
+except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
+    audit_jsonl = None
+
 from shell_parse import (  # noqa: E402
+    _KNOWN_SIGILS,
     analyze,
+    analyze_checked,
     commit_skips_hooks,
     gh_pr_subcommand,
     git_subcommand,
     has_trailing_override,
     split_segments,
-    untokenizable,
 )
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
@@ -335,6 +347,20 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     blocked (unless overridden). A detached HEAD ("") is left allowed.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
+    #
+    # DELIBERATELY NOT LOGGED, here or below. `# merge-to-main-override` waives a
+    # gate this function short-circuits BEFORE resolving the branch, so a row
+    # could only ever say "the ack was typed" — never that the gate would have
+    # fired. MEASURED on a real repo checked out at a feature branch, where the
+    # gate would have allowed the merge anyway: the row still claimed
+    # `waived: local-merge-into-main`, with pr, repo and head all empty. That
+    # asserts a waiver that was never consulted, in a store whose entire purpose
+    # is answering "was this escape reached for?", and the row carries nothing to
+    # reconcile it against. An honest row needs the branch resolved first; see
+    # the follow-up. `# escalation-ack` / `# final-round-accept` are likewise
+    # unlogged, but for a DIFFERENT reason now — see the note in
+    # `_check_codex_round_escalation`, where the short-circuit that made a row
+    # unattributable in principle no longer exists.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0 and not has_trailing_override(
             s.raw, "merge-to-main-override"
@@ -2233,6 +2259,119 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
     return ids[-1] if ids else None
 
 
+# Value-taking flags whose SEPARATED value must not be read as the positional
+# target — a PR URL inside a `--body` text would otherwise redirect the gate to
+# an unrelated repo (#1385 round-5). Glued forms (`--body=…`, `-b…`, `-R…`,
+# `--repo=…`) are single `-`-prefixed tokens already skipped by the dash branch.
+# ONE copy, walked ONCE: the target scan and the identity check used to carry
+# their own copies of this loop, and two copies of a walk are two answers to
+# "which token is the target" waiting to disagree.
+_COMMENT_VALUE_FLAGS = frozenset({"-b", "--body", "-F", "--body-file", "-R", "--repo"})
+# The short letters of those value flags, for the GLUED spellings (`-bTEXT`,
+# `-F-`, `-Ro/r`, `-R=o/r`), which carry their value inside one token.
+_COMMENT_VALUE_SHORTS = frozenset("bFR")
+# gh pr comment's remaining flags — the ones that take NO value — from
+# `gh pr comment --help` (its own flags plus the inherited `--help`; `-R/--repo`
+# is inherited and lives in the value set above). This is a closed set for the
+# same reason the target forms are: see `_comment_positional`.
+_COMMENT_BOOL_FLAGS = frozenset(
+    {
+        "-e",
+        "--editor",
+        "-w",
+        "--web",
+        "--create-if-none",
+        "--delete-last",
+        "--edit-last",
+        "--yes",
+        "--help",
+    }
+)
+
+
+def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
+    """``(target, unreadable_flag)`` for a ``gh pr comment`` segment's argv.
+
+    ``target`` is the FIRST positional token after ``comment`` — gh documents
+    exactly ONE (``[<number> | <url> | <branch>]``), so the first bare word IS
+    the whole target and a later one is not a second candidate to fall back on.
+    None means the request carries no positional at all
+    (``gh pr comment --body …``, which resolves the PR from the checked-out
+    branch); that keeps its documented fail-open, since there is no target to
+    count against.
+
+    ``unreadable_flag`` is a dash token this walk does not model, encountered
+    BEFORE any positional. It matters because an allowlist on the target's VALUE
+    is only as good as the walk that decides WHICH token the target is, and that
+    walk is the part that can still be a list of spellings. Its failure is
+    silent and in the wrong direction: gh's own parser bundles short flags, so
+    `-ewR o/r <target>` passes `o/r` to ``--repo`` and leaves the real target
+    two tokens later — while a walk that merely SKIPS the unrecognised `-ewR`
+    hands back `o/r`, an innocuous literal, and never looks at the target at
+    all. So an unmodelled flag makes the identity unreadable rather than being
+    skipped; the sibling precedent is `full_suite_guard`'s "an unlisted
+    value-flag falls back to a safe BLOCK, never a fail-open".
+
+    Measured 2026-09-08 against `gh pr comment --help`: no bundle containing
+    `-R` can both parse AND post (every companion short flag either conflicts
+    with the body source or swallows the rest of the bundle as its own value),
+    so this is a divergence with no reachable exploit TODAY — closed here
+    because the next gh flag is what makes it one, and because the walk should
+    not be the soft half of an allowlist design.
+    """
+    try:
+        idx = argv.index("comment")
+    except ValueError:
+        return None, None
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _COMMENT_VALUE_FLAGS:
+            skip_next = True
+            continue
+        # A bare `-` is not a flag: gh takes it as the positional, and so do we
+        # (it resolves to no pull request, which is gh's problem, not the cap's).
+        if tok.startswith("-") and tok != "-":
+            if tok == "--" or tok in _COMMENT_BOOL_FLAGS:
+                continue
+            # Glued value forms carry their own value in one token.
+            if tok.startswith("--") and "=" in tok:
+                continue
+            if not tok.startswith("--") and len(tok) > 2 and tok[1] in _COMMENT_VALUE_SHORTS:
+                continue
+            return None, tok
+        return tok, None
+    return None, None
+
+
+# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` keeps its original
+# shape (trailing context tolerated, e.g. a `#issuecomment-…` fragment) because
+# it reads the number and OWNER/REPO out of a URL.
+_PR_NUMBER_RE = re.compile(r"#?([0-9]+)\Z")
+_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
+
+# ALLOWLIST patterns — what the gate accepts as unambiguously LITERAL. See
+# `_unresolvable_identity` for why these are allowlists and not screens.
+# A PR URL every character of which is inert to the shell. The trailing group
+# admits what a browser actually copies — `/files`, `/commits/<sha>`, a
+# `#issuecomment-…` deep link — none of which the shell acts on (`#` opens a
+# comment only at word start). It stops short of `?query`, because `?` is a
+# glob metacharacter and the shell WOULD act on it.
+_LITERAL_URL_RE = re.compile(
+    r"(?:[a-z]+://[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
+    r"(?:[/#][A-Za-z0-9._/#-]*)?\Z"
+)
+# A branch name in characters that are both legal in a git ref and inert to the
+# shell. `git check-ref-format` already excludes space ~ ^ : ? * [ and \; this
+# set additionally excludes every character the shell acts on — $ ` ! & ; | ( )
+# < > # { } ' " — so a token matching it expands to itself, quoted or not.
+_LITERAL_BRANCH_RE = re.compile(r"[A-Za-z0-9._/+,=%@-]+\Z")
+# `[HOST/]OWNER/REPO` in GitHub's own owner/repo character set.
+_LITERAL_REPO_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){1,2}\Z")
+
+
 def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     """(pr_number, repo) from a ``gh pr comment`` segment's argv.
 
@@ -2241,56 +2380,163 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     produce a wrong count and a FALSE block — Codex round-1 finding). An
     explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
     target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+
+    Reads the FIRST positional only (``_comment_positional``), where this used
+    to scan every one of them for something number-shaped. gh accepts at most
+    one positional — `gh pr comment my-branch 1372` exits with "accepts at most
+    1 arg(s), received 2" — so a second bare word never named the PR that would
+    be commented on, and resolving one was reading an identity out of a command
+    that cannot run.
     """
+    tok, _ = _comment_positional(argv)
     pr_num: str | None = None
     url_repo: str | None = None
-    try:
-        idx = argv.index("comment")
-    except ValueError:
-        return None, None
-    # Value-taking flags whose SEPARATED value must not be read as the positional
-    # target — a PR URL inside a `--body` text would otherwise redirect the gate
-    # to an unrelated repo (#1385 round-5). Glued forms (`--body=…`, `-b…`,
-    # `-R…`, `--repo=…`) are single `-`-prefixed tokens already skipped below.
-    _VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
-    skip_next = False
-    for tok in argv[idx + 1 :]:
-        if skip_next:
-            skip_next = False
-            continue
-        if tok in _VALUE_FLAGS:
-            skip_next = True
-            continue
-        if tok.startswith("-"):
-            continue
-        if pr_num is None and tok.isdigit():
-            pr_num = tok
-        elif pr_num is None and tok.startswith("#") and tok[1:].isdigit():
-            pr_num = tok[1:]
-        elif pr_num is None:
-            url = re.match(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b", tok)
+    if tok is not None:
+        num = _PR_NUMBER_RE.match(tok)
+        if num:
+            pr_num = num.group(1)
+        else:
+            url = _PR_URL_RE.match(tok)
             if url:
                 url_repo, pr_num = url.group(1), url.group(2)
     return pr_num, _comment_repo(argv) or url_repo
 
 
-def _comment_repo(argv: list[str]) -> str | None:
-    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
+def _unresolvable_identity(argv: list[str]) -> str | None:
+    """The first identity-bearing value on a ``gh pr comment`` segment that is
+    not unambiguously literal, or None when the gate can read every identity it
+    needs.
 
-    Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, and glued
-    ``-Ro/r`` forms. A host-qualified ``HOST/OWNER/REPO`` is reduced to its
-    OWNER/REPO tail (the REST path shape this gate queries).
+    THE CLASS, not a list of spellings. The cap counts rounds on ONE pull
+    request in ONE repository, so exactly two values decide what it counts: the
+    positional target, and the repository (an explicit ``--repo``/``-R``, or the
+    OWNER/REPO carried inside a URL target). A PreToolUse hook sees the command
+    BEFORE the shell runs, so a value carrying an expansion is not a value yet —
+    and screening for the expansions one can name is a losing shape: ``$n`` is
+    one spelling; ``$@``, ``$*``, ``${!v}``, ``${#v}``, ``$$``, ``$!``, ``$?``,
+    ``$#``, ``$-``, ``$(…)``, backticks and legacy ``$[…]`` are eleven more, and
+    the next round's finding is whichever one nobody enumerated.
+
+    So this ALLOWLISTS, per the house rule that a contract guard names what is
+    PERMITTED rather than what it imagined being attacked. gh documents the
+    target as ``[<number> | <url> | <branch>]`` and the repo as
+    ``[HOST/]OWNER/REPO``; each is accepted only when spelled in characters that
+    are inert to the shell, so it expands to itself. Every other spelling —
+    present and future — is refused by construction, without this function
+    knowing anything about shell expansion syntax.
+
+    Two fail-opens are DELIBERATELY kept, both documented and both locked by
+    tests: a request with NO positional at all (nothing to count against), and a
+    literal branch target (resolvable by anyone who cares to look it up).
+
+    The cost, stated plainly because it is real: ``shell_parse._argv`` runs
+    ``shlex.split`` first, so quoting is already gone by the time argv exists,
+    and a branch LITERALLY named ``$PR`` — legal per ``git check-ref-format``,
+    written ``'$PR'`` — is indistinguishable here from a live expansion and is
+    refused. Recovering it means deciding expandability from raw quoting, i.e.
+    hand-written shell-quote analysis inside the guard, whose failure direction
+    is a reopened bypass rather than a rewrite. One rewrite with a literal PR
+    number is the cheaper side of that trade, and the refusal names the remedy.
+
+    MEASURED 2026-09-08 — why a BLOCK and not an advisory: writing the request
+    as ``for n in 1625 1576 1609; do gh pr comment $n --body "@codex review";
+    done`` posted round requests on two PRs already at or past
+    ``ESCALATION_ROUND_CAP`` with no ``# escalation-ack`` and none of the
+    step-back triage the block exists to force. The cap is itself a block, so an
+    unreadable identity leaves only fail-open or fail-closed; an advisory would
+    not have stopped it.
+    """
+    tok, unreadable_flag = _comment_positional(argv)
+    # A flag the walk does not model comes FIRST: until we know whether it eats
+    # the following word, we do not know which token the target is, so the
+    # target's own allowlist has nothing trustworthy to judge.
+    if unreadable_flag is not None:
+        return unreadable_flag
+    if tok is not None and not (
+        _PR_NUMBER_RE.match(tok) or _LITERAL_URL_RE.match(tok) or _LITERAL_BRANCH_RE.match(tok)
+    ):
+        return tok
+    # The repo is identity-bearing too, and is read on a path the target check
+    # cannot cover: with a LITERAL number and `--repo "$REPO"`, the number
+    # resolves, the query goes to the literal path `repos/$REPO/…`, the API
+    # errors, and the error fails OPEN — the cap skipped by a different door.
+    # Checked against the value AS WRITTEN, before the host reduction, so an
+    # expansion in the host position cannot be dropped on the way in.
+    repo = _comment_repo_value(argv)
+    if repo is None and tok is not None:
+        url = _PR_URL_RE.match(tok)
+        repo = url.group(1) if url else None
+    if repo is not None and not _LITERAL_REPO_RE.match(repo):
+        return repo
+    return None
+
+
+def _unresolvable_identity_advisory(token: str) -> str:
+    return (
+        f"BLOCKED: '{token}' does not name a pull request this hook can read, so "
+        "the Codex round cap cannot be checked.\n"
+        "This hook runs BEFORE the shell expands anything, so the PR target and "
+        "the --repo value are readable only when they are written out. The gate "
+        "accepts what gh documents, spelled literally; anything else is refused "
+        "rather than counted against the wrong pull request, or against none.\n"
+        "Re-run with the identity written out — a number, #N or a PR URL, and "
+        "OWNER/REPO for the repo — one command per PR:\n"
+        '  gh pr comment 1234 --body "@codex review"\n'
+        "If that PR is already at the cap you will get the step-back advisory, "
+        "which is the point."
+    )
+
+
+def _comment_repo_value(argv: list[str]) -> str | None:
+    """The explicit ``--repo``/``-R`` value AS WRITTEN, or None if absent.
+
+    Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, glued
+    ``-Ro/r`` and ``-R=o/r`` forms. The value is otherwise unnormalised — the
+    identity check needs it as the user typed it, host part included — with one
+    exception: an EMPTY value reads as absent. Both empty spellings are commands
+    gh rejects outright, and treating them alike keeps ``--repo=`` from being
+    refused with an empty-quoted token in the message while ``-R=`` (which no
+    branch below matches) reads as no flag at all.
     """
     val: str | None = None
+    skip_next = False
     for i, tok in enumerate(argv):
-        if tok in ("--repo", "-R") and i + 1 < len(argv):
-            val = argv[i + 1]
-        elif tok.startswith("--repo="):
+        # A value-taking flag's VALUE is not argv structure — it is text the
+        # caller wrote, and it must not be re-read as a flag. Without this,
+        # `--body "-Request @codex review"` matched the glued `-R<value>` branch
+        # below and the body was mistaken for a repository, blocking a valid
+        # request. `_comment_positional` already skips these via the same set;
+        # this function did not, and that divergence IS the parse-drift class
+        # tests/test_hooks/test_value_flag_consistency.py exists to prevent —
+        # the separated `-R` form is named in its docstring as the bypass that
+        # motivated it.
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _COMMENT_VALUE_FLAGS:
+            # --repo/-R are themselves value flags: read their value, then skip
+            # it so the same token cannot also be scanned as a flag.
+            if tok in ("--repo", "-R") and i + 1 < len(argv):
+                val = argv[i + 1]
+            skip_next = True
+            continue
+        if tok.startswith("--repo="):
             val = tok.split("=", 1)[1]
         elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
             val = tok[2:]
         elif tok.startswith("-R=") and len(tok) > 3:
             val = tok[3:]
+    return val or None
+
+
+def _comment_repo(argv: list[str]) -> str | None:
+    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
+
+    A host-qualified ``HOST/OWNER/REPO`` is reduced to its OWNER/REPO tail (the
+    REST path shape this gate queries); see ``_comment_repo_value`` for the
+    flag forms and for the unreduced value.
+    """
+    val = _comment_repo_value(argv)
     if val and val.count("/") >= 2:
         val = "/".join(val.split("/")[-2:])
     return val
@@ -2412,8 +2658,13 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         short-circuit could never see the count it needed to be bounded by.
       rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
         escalation-ack here is deliberately not enough)
-      numberless/branch target (no PR number)     → that segment allows;
+      no positional / literal branch target       → that segment allows;
         SCANNING CONTINUES (an allowed segment must not shield a later one)
+      identity not written literally (target OR
+        repo)                                     → BLOCK. The one fail-CLOSED
+        leg, and the ack does not clear it: `acked` is command-wide, so one
+        sigil on a loop would license a round on every PR it touches. See
+        `_unresolvable_identity` for why the accepted forms are an ALLOWLIST
       gh/API/parse error (ids is None)            → that segment allows, scan on
       rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
       cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
@@ -2432,6 +2683,28 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         # reads only that sleeping local counter, so it inherited the same blind
         # spot: a review/fix loop driven entirely through cloud rounds never
         # reached it.
+        #
+        # NEITHER SIGIL IS LOGGED to the override audit store this PR adds, and
+        # that is an OPEN scope question rather than a settled no. Both are
+        # resolved here with any() over every segment, and `escalation-ack` is
+        # SHARED with the commit gate (review_enforcement_commit.py prints it on
+        # `git commit` too), so the sigil's presence alone says nothing about
+        # which gate consulted it. Under the older BARE short-circuit — which
+        # returned here before any counting — a row was unattributable in
+        # principle: it fired for any Bash command carrying the ack and claimed a
+        # cap was waived that was never reached. The restructure above removes
+        # that objection, but only partly, and the remainder is worth stating
+        # rather than rounding off. Both sigils are now honoured only inside the
+        # scan loop below, at a segment whose PR NUMBER and real round count are
+        # resolved — so a row written AT THE HONOUR POINT would name a waiver that
+        # actually happened, which the old shape could not. `repo` is the part that
+        # is still not resolved there: `_comment_target` returns it only when the
+        # command carries `--repo`/`-R` or a PR URL, and a bare `gh pr comment 1234`
+        # — the form this gate's OWN advisory prints — yields None and counts
+        # against the hook cwd's repo. That is the same blank-`repo` case
+        # `_note_override`'s call site documents rather than papers over. Whether
+        # the audit store should carry ack-class sigils at all is a scope decision
+        # this PR does not take — see the follow-up.
         acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
         final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
         # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
@@ -2463,8 +2736,16 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
                 continue
             if not any("@codex review" in tok.lower() for tok in seg.argv):
                 continue
+            # BEFORE resolving the number, not after: a literal number with an
+            # unreadable `--repo` resolves fine and still counts the wrong repo,
+            # so a check gated on `not pr_num` would never see it.
+            unresolvable = _unresolvable_identity(seg.argv)
+            if unresolvable is not None:
+                return True, _unresolvable_identity_advisory(unresolvable)
             pr_num, repo = _comment_target(seg.argv)
             if not pr_num:
+                # A missing positional or a literal branch target keeps its
+                # documented fail-open; every other spelling was refused above.
                 continue
             # Count ALL Codex review rounds — including DISMISSED, which still
             # ran and consumed the budget (#1385 round-5). Freshness uses the
@@ -2672,6 +2953,312 @@ _MIN_OVERRIDE_EVIDENCE_CHARS = 200
 # Bound the read on the merge-gate hot path (the floor is 200 chars; any real review
 # fits easily) so an oversized file in the evidence dir can't be slurped into memory.
 _MAX_OVERRIDE_EVIDENCE_READ = 65536
+
+
+#: Retention is NOT here. It is a size bound over the whole store, applied by
+#: ``scripts/prune_hook_audit_logs.py`` on the daily ``disk_hygiene.sh`` timer, which
+#: is where every other store in this repo bounds itself. An earlier version pruned
+#: in-hook, on the merge path, and that retention engine was the source of most of
+#: this feature's defects. An age window is deliberately gone too: at roughly three
+#: flushes a day the store answers "has this escape decayed into the routine path?"
+#: only over YEARS, and a 90-day window deleted exactly the signal it exists to hold.
+#: The row's field set is CLOSED, and the writer builds rows from THIS tuple — a
+#: caller cannot add a field by passing one. See the no-free-text constraint on
+#: ``_note_override``. ``base`` is deliberately absent: no gate on this path
+#: returns the base ref without a second API read, and a field that is empty on
+#: every real call is worse than no field (pr + repo resolve it after the fact).
+_OVERRIDE_LOG_FIELDS = ("ts", "sigil", "outcome", "waived", "pr", "repo", "head", "actor")
+#: Outcomes a row can carry. The log records override ATTEMPTS, tagged with what
+#: the command actually did — a sigil appended to a command that was then blocked
+#: by a DIFFERENT gate is a real signal (it says the escape was reached for), but
+#: it is not an override that took effect, and conflating the two would inflate
+#: every count drawn from this file.
+#:
+#: WHAT IT IS NOT: `outcome` is the GUARD'S OVERALL VERDICT on the command, not a
+#: statement that the sigil waived anything. A gate handed `force=True` returns
+#: without evaluating its condition, so a sigil that was not needed — e.g.
+#: `# scheduled-review-override` when every scheduled review is already present —
+#: produces a row identical to one that bypassed a failing gate. Counting
+#: "allowed" rows therefore counts commands that were allowed, and OVERSTATES how
+#: often an escape actually did work. Recording per-gate effectiveness needs each
+#: gate to report what it observed rather than short-circuit, which costs API
+#: calls on a budgeted path; that is filed as a follow-up, not approximated here.
+#:
+#: "asked" is NOT a spelling of "allowed". ``_ask`` returns 0 while emitting a
+#: permissionDecision the HUMAN may still deny, so the exit code alone cannot say
+#: whether the command ran; recording it as "allowed" would have the log assert a
+#: merge that may never have happened — the same conflation this field exists to
+#: prevent, one level down. "error" is the fail-closed wrapper's path.
+#:
+#: "asked" IS reachable, and an earlier version of this note claimed otherwise —
+#: wrongly, on the reasoning that the merge arm never asks. It does not ask, but it
+#: does not RETURN either: it falls through to the deferred approval prompt, and
+#: `gh pr create` is deliberately exempt from the "multiple publish/merge
+#: operations" refusal. MEASURED:
+#:   gh pr merge N --squash --admin --match-head-commit <sha>  # ci-override
+#:     && gh pr create --title x --body y
+#: emits an "ask" and writes the ci-override row with outcome "asked".
+#: Treat an "asked" row as a real, expected state — the command was handed to the
+#: user and may have been denied — not as an anomaly.
+#:
+#: ENFORCED, not just documented: ``_flush_overrides`` drops a row whose outcome
+#: is outside this tuple, the way ``sigil`` is checked against ``_KNOWN_SIGILS``.
+_OVERRIDE_OUTCOMES = ("allowed", "asked", "blocked", "error")
+
+#: Shapes a stored value may take. A row is metadata, so every field is either a
+#: closed set or matches one of these — see ``_note_override``. Without them
+#: ``head`` is whatever followed ``--match-head-commit`` on the command line,
+#: which is arbitrary text, which makes the no-free-text guarantee false.
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_REPO_RE = re.compile(r"^[\w.-]{1,100}/[\w.-]{1,100}$")
+#: ``waived`` names the gate CLASS a sigil targets. Every producer is a literal in
+#: this file (plus ``ci-status`` refined to ``ci:<state>``), so it is a closed set
+#: — enforced, because "the field set is closed" was only ever true of NAMES:
+#: MEASURED, a 311-character ``waived`` carrying quotes and a token-shaped string
+#: was written to the row while the docstring claimed every field was shape-checked.
+_WAIVED_RE = re.compile(r"^[a-z][a-z0-9:+-]{0,63}$")
+#: `pr` was the one field with no bound, and `str.isdigit()` was the wrong check
+#: twice over: it accepts non-ASCII digits (MEASURED: Arabic-Indic "١٢٣٤٥٦٧٨٩"
+#: stored verbatim) and imposes no length, so a PR token read off the command line
+#: could write an arbitrarily long row. ASCII digits, and no more than a PR number
+#: could plausibly be.
+_PR_RE = re.compile(r"^[0-9]{1,12}$")
+
+#: Rows noted during this invocation, flushed once the gate's verdict is known.
+#: Module-level because detection is spread across the merge gate while the
+#: outcome is only known at the end; ``main`` clears it on entry, so a second
+#: call in the same process (the tests, and only the tests) cannot inherit rows.
+_PENDING_OVERRIDES: list[dict] = []
+
+#: Set by :func:`_ask` when the guard hands the decision to the user. Read by the
+#: flush to tell an ask from an allow — both exit 0. Cleared by ``main`` on entry.
+_ASK_EMITTED = False
+
+
+def _actor() -> str:
+    """Who ran the command, from the passwd database — NOT from the environment.
+
+    ``getpass.getuser()`` is the obvious choice and is WRONG here: it consults
+    ``$LOGNAME``/``$USER``/``$LNAME``/``$USERNAME`` FIRST and only falls back to
+    passwd. MEASURED: with ``LOGNAME`` set, ``getpass.getuser()`` returned that
+    value — so an audited command could forge its own attribution
+    (``LOGNAME=someone-else gh pr merge … # ci-override``) in the one field whose
+    entire job is saying who did it. ``os.getuid()`` cannot be set by the command
+    being guarded.
+    """
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:  # noqa: BLE001 — attribution is best-effort, never fatal.
+        return str(os.getuid())
+
+
+def _override_log_dir() -> str:
+    """Directory holding the merge-gate override records, one file per flush.
+
+    Deliberately NOT inside ``_override_evidence_dir()``: that directory is a store
+    the gate READS AND VALIDATES (>=200 chars, must cite the head), so an audit row
+    living there could satisfy an evidence check, and a retention sweep there would
+    delete evidence the gate still needs. Kept separate, beside the discard guard's
+    own store, with which it shares its writer.
+
+    A RELATIVE override is refused in favour of the default: it would resolve
+    against the hook's cwd — the repo — putting durable audit files inside the
+    working tree, where they can be committed. That is the accident this guards.
+
+    It is NOT a guarantee that the store cannot land in the tree: an ABSOLUTE path
+    inside the repo is accepted as given. Refusing those would mean deciding which
+    absolute paths are "in a repo", which is a worse problem than the one being
+    solved, and an operator who spells out such a path has chosen it. The default is
+    what ``test_the_live_default_path_is_outside_any_repo`` keeps honest."""
+    # ONE resolver, shared with the other guard and the pruner. This rule
+    # was written out three times and the pruner's copy omitted the
+    # absolute-path refusal, so it trimmed an unrelated directory while the
+    # real store grew unbounded (Codex P2, PR #1609). See
+    # audit_jsonl.resolve_store_dir.
+    from audit_jsonl import resolve_store_dir
+
+    return resolve_store_dir("GENESIS_MERGE_OVERRIDE_DIR")
+
+
+def _note_override(
+    sigil: str,
+    *,
+    waived: str,
+    pr: str = "",
+    repo: str | None = None,
+    head: str | None = None,
+    **_ignored: object,
+) -> None:
+    """Note that an override sigil was invoked. METADATA ONLY; never raises.
+
+    The gate's own messages promise the operator that an override is "(logged)".
+    Until this existed that claim was false on every surface — no writer anywhere
+    under ``scripts/`` or ``src/genesis/``, and nothing on disk. A gate promising an
+    audit trail it does not keep is worse than one promising nothing: it invites use
+    of the escape on the belief that it is recorded.
+
+    The row is HELD until :func:`_flush_overrides` learns the gate's verdict, because
+    "the sigil was appended" and "the sigil let a merge through" are different facts
+    and only the second one is an override. Both are kept, distinguished by
+    ``outcome`` — see ``_OVERRIDE_OUTCOMES``.
+
+    NO COMMAND OR COMMENT TEXT EVER REACHES THIS ROW, and there is no "reason" field
+    to add. The constraint is inherited, not invented — ``git_discard_guard.py``'s
+    ``_record_snapshots`` refuses to persist the command because "the Bash payload can
+    carry credentials (``curl -H 'Authorization: …' && git checkout``) and this log is
+    durable". An override sigil IS a trailing comment on a Bash command, so the only
+    free text available here is command-line text, from a segment that may carry a
+    token. ``**_ignored`` exists so a caller cannot smuggle text in by passing an extra
+    keyword: the row is built from ``_OVERRIDE_LOG_FIELDS`` and nothing else.
+
+    ``sigil`` is validated against ``shell_parse._KNOWN_SIGILS`` — a closed set, never
+    free text. An unrecognised sigil notes nothing rather than persisting the caller's
+    string.
+
+    EVERY OTHER FIELD IS SHAPE-CHECKED for the same reason, because "the closed field
+    tuple stops free text" was only true of the field NAMES. ``head`` arrives as
+    whatever token followed ``--match-head-commit`` on the command line — arbitrary
+    text, of arbitrary length, which the operator typed — so it is stored only if it
+    looks like a sha, and ``repo`` only if it looks like ``owner/name``. Anything else
+    becomes empty: an unattributed row is a small loss, an arbitrary string written
+    durably to a file beside secrets is not.
+    """
+    if sigil not in _KNOWN_SIGILS:
+        return
+    head = (head or "").strip().lower()
+    repo = (repo or "").strip()
+    _PENDING_OVERRIDES.append(
+        {
+            "sigil": sigil,
+            "waived": waived if _WAIVED_RE.match(waived or "") else "",
+            # Digits-only by construction at every current producer, but bounded
+            # anyway — the docstring above claims EVERY field is shape-checked,
+            # and `pr` is the field a future caller is most likely to feed from a
+            # branch name. It is also the field that made an unbounded row (and
+            # therefore a log-erasing trim) reachable.
+            "pr": pr_s if _PR_RE.match(pr_s := str(pr or "")) else "",
+            "repo": repo if _REPO_RE.match(repo) else "",
+            "head": head if _SHA_RE.match(head) else "",
+            "actor": _actor(),
+        }
+    )
+
+
+def _valid_waived(value: str) -> str:
+    """``value`` if it matches the closed shape, else the empty string.
+
+    The single place `waived` is judged. Both writers of that field route through
+    the flush, so putting the check here means a future third writer cannot bypass
+    it the way `_amend_note` bypassed the check on `_note_override`.
+    """
+    return value if _WAIVED_RE.match(value or "") else ""
+
+
+def _amend_note(sigil: str, *, waived: str) -> None:
+    """Refine a noted row's ``waived`` once the gate knows more than the sigil did.
+
+    Sigils are noted BEFORE the gates run, so their ``waived`` starts as the gate
+    CLASS. A gate that then learns something specific (CI was red rather than
+    merely pending) says so here. If the command blocked before that gate ran,
+    the row simply keeps the class — which is the honest record, since the
+    specific fact was never established.
+    """
+    for row in _PENDING_OVERRIDES:
+        if row["sigil"] == sigil:
+            row["waived"] = waived
+
+
+def _flush_overrides(outcome: str) -> None:
+    """Write the noted rows with the verdict THIS GUARD returned.
+
+    Not "what the command actually got", which an earlier version of this line
+    claimed and the code does not deliver: ``outcome`` is derived solely from this
+    guard's own return, and several PreToolUse matchers are wired for Bash, plus
+    the harness's own permission prompt. Any of them can stop a command this guard
+    recorded as ``allowed``. So a row asserts "the sigil was accepted HERE", never
+    "the merge happened" — a distinction that matters precisely because this field
+    exists to separate overrides that took effect from overrides merely attempted,
+    and it only separates them within this guard's own chain.
+
+    Best-effort by contract: this runs on the merge path and a logging failure must
+    never break a merge, so nothing here propagates. It is NOT silent, though — the
+    shared writer reports failures on stderr. A logger that fails quietly is
+    indistinguishable from one that was never wired, which is the state this whole
+    change found the gate in.
+
+    NO OFF SWITCH, deliberately, and said out loud because the Generalizability
+    Gate asks every autonomous writer for an operator lever. This one ships a PATH
+    knob (``GENESIS_MERGE_OVERRIDE_DIR``) and no way to disable it: a gate whose
+    audit trail the same session can turn off records nothing an auditor can rely
+    on, and the write is a few hundred bytes on a path a human already chose to
+    take. The sibling discard store is the same by the same reasoning. Move the
+    store, or prune it harder; do not silence it.
+
+    Retention ships WITH the store (New-Store Gate) rather than as a follow-up —
+    which is how the existing unpruned stores under ``~/.genesis/`` got that way —
+    but it ships as a size bound on the daily timer
+    (``scripts/prune_hook_audit_logs.py``), NOT here. Pruning on the merge path was
+    the previous design, and its retention engine caused most of this feature's
+    defects; a verdict path should not also be doing file maintenance.
+    """
+    rows, _PENDING_OVERRIDES[:] = list(_PENDING_OVERRIDES), []
+    if not rows:
+        return
+    if audit_jsonl is None:
+        # Degraded, but NOT silent: the gate is still printing "(logged)" to the
+        # operator, and a quiet no-op here is indistinguishable from the
+        # never-wired state this whole change exists to end. Cannot use
+        # audit_jsonl.warn — that is the module we do not have.
+        #
+        # SUPPRESSED, and that matters: this runs in main()'s `finally`, so an
+        # unwritable stderr raising here escapes into run_guard, which fails
+        # CLOSED and converts it to exit 2 — turning an ALLOW into a BLOCK. The
+        # sibling guard wraps its own block print for exactly this reason.
+        with contextlib.suppress(Exception):
+            print(
+                f"[audit-log] audit_jsonl unavailable — {len(rows)} row(s) NOT recorded",
+                file=sys.stderr,
+            )
+        return
+    if outcome not in _OVERRIDE_OUTCOMES:
+        # The tuple is a contract, not a comment. A row whose verdict is outside
+        # it would be uncountable, and silently so.
+        audit_jsonl.warn(f"refusing {len(rows)} row(s) with unknown outcome {outcome!r}")
+        return
+    try:
+        ts = _dt.datetime.now(_dt.UTC).isoformat()
+        # ONE file for the whole flush, so a multi-sigil merge is one atomic record
+        # rather than N rows that a crash could split. Rows are built from the CLOSED
+        # field tuple, so an extra key on a noted row (or a future caller's stray
+        # kwarg) cannot reach disk.
+        #
+        # `waived` is re-validated HERE, at the chokepoint every row passes through,
+        # not only where it is first set. It has two writers — `_note_override` and
+        # `_amend_note` — and validating per call site is precisely the pattern that
+        # produced this feature's round-over-round defects: the shape check was added
+        # to the first writer and the second one silently bypassed it, so an
+        # unbounded string could still reach a durable row.
+        audit_jsonl.write_batch(
+            _override_log_dir(),
+            [
+                {
+                    k: _valid_waived(v) if k == "waived" else v
+                    for k, v in (
+                        (k, {"ts": ts, "outcome": outcome, **noted}.get(k, ""))
+                        for k in _OVERRIDE_LOG_FIELDS
+                    )
+                }
+                for noted in rows
+            ],
+            sort_keys=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — logging must never break a merge.
+        # Reported, not swallowed: audit_jsonl converts OSError, so anything
+        # reaching here is a bug in THIS function, and a silent one would look
+        # exactly like the no-writer state this change exists to end.
+        audit_jsonl.warn(f"override rows not written ({exc!r})")
 
 
 def _override_evidence_dir() -> str:
@@ -2993,6 +3580,295 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
 
 
+def _pr_contribution(
+    base_sha: str, tip_sha: str, repo: str | None
+) -> tuple[str, str, list] | None:
+    """``(merge_base_sha, status, files)`` for what ``tip`` contributes over ``base``.
+
+    ``compare/base...tip`` is three-dot, so GitHub computes it from the MERGE
+    BASE of the two — which is what makes this the PR's own work rather than a
+    commit range. **That merge base is returned, not discarded, because it is
+    load-bearing**: it is the LEFT-hand side of the diff, it MOVES when the
+    branch catches up, and a file's blob sha is only the RIGHT-hand side. Two
+    diffs with the same right side and different left sides are different
+    diffs. The caller needs the left side to know whether it may compare them
+    at all.
+
+    Returns None on any error — including a returncode, unparseable JSON, or an
+    exit-0 with an EMPTY payload. An empty stdout is not an empty diff: reading
+    it as ``[]`` would manufacture positive evidence of "unchanged" out of a
+    degraded response.
+
+    Tests inject via ``_TEST_GH_CONTRIBUTION`` — a JSON object keyed
+    ``"<base12>..<tip12>"`` whose value is ``{"mb": <sha>, "files": [...]}``.
+    """
+    raw = os.environ.get("_TEST_GH_CONTRIBUTION")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(f"{base_sha[:12]}..{tip_sha[:12]}")
+        except Exception:
+            return None
+        if not isinstance(got, dict) or not isinstance(got.get("files"), list):
+            return None
+        mb, st = got.get("mb"), got.get("status")
+        if not (isinstance(mb, str) and mb) or not isinstance(st, str) or not st:
+            return None
+        return (mb, st, got["files"])
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/compare/{base_sha}...{tip_sha}",
+                "--jq",
+                '{mb: .merge_base_commit.sha, status: .status, '
+                'files: [.files[]? | {filename, sha, additions, deletions, status, '
+                'previous_filename, has_patch: has("patch")}]}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        # No `or "[]"` fallback: an exit-0 with an EMPTY payload must not become an
+        # empty diff. json.loads("") raises, which the except below turns into
+        # None — a degraded response reads as unreadable, never as "unchanged".
+        parsed = json.loads(result.stdout)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("files"), list):
+        return None
+    mb, st = parsed.get("mb"), parsed.get("status")
+    if not (isinstance(mb, str) and mb) or not isinstance(st, str) or not st:
+        return None
+    return (mb, st, parsed["files"])
+
+
+def _classify_base_advance_delta(
+    reviewed_sha: str, head_sha: str, base_sha: str, repo: str | None
+) -> str | None:
+    """Re-judge a "substantial" delta as what the BRANCH actually changed.
+
+    A branch that merges its base to catch up acquires every commit the base
+    contributed. The raw ``reviewed...head`` compare cannot tell that from a
+    force-push and reports all of it as unreviewed, so the gate demands a fresh
+    review of code that was already reviewed on its own PR — MEASURED on this
+    repo: PR #1847 showed 28 files / 7 commits after merging main, of which the
+    branch's own change was 2 files. #1690 made catching up MANDATORY for every
+    branch carrying a changelog entry, so this stopped being incidental.
+
+    The question this asks instead: did the PR's OWN contribution change? Both
+    sides are the PR's diff over its base — at review time and now — compared by
+    file identity. It returns ``"inline"`` for exactly ONE finding: the two
+    contributions are IDENTICAL. It never sizes a residual change, so its only
+    two answers are "provably a pure base-advance" and None.
+
+    That is a deliberate narrowing over a version that DID size the residual
+    (Codex P1, #1849): the records available here are base-relative, so a
+    contribution that SHRANK between the review and head presents small counts
+    while the reviewed...head delta is large, and the sizing read as trivial. See
+    the ``if changed:`` block below.
+
+    NARROWING, so uncertainty fails CLOSED at every point it can be SEEN: a
+    failing fetch returns None (the caller blocks), an unreadable identity
+    withdraws the claim, an unreadable base move withdraws it, and a file the base
+    touched that the branch ALSO touches is a collision rather than an advance.
+
+    The one uncertainty it CANNOT see is file MODE, which the compare record does
+    not carry at all. That is why the enforcement surface is declined outright
+    rather than trusted to the identity — see the block above the hook-surface
+    loop. On a NON-hook path a mode-only change still rides through as unchanged,
+    and this docstring says so rather than claiming a closure the code does not
+    have.
+    """
+    got_before = _pr_contribution(base_sha, reviewed_sha, repo)
+    got_after = _pr_contribution(base_sha, head_sha, repo)
+    if got_before is None or got_after is None:
+        return None
+    before_mb, _before_status, before = got_before
+    after_mb, _after_status, after = got_after
+    if not before and not after:
+        # Two empty lists are not evidence of "unchanged" — they are evidence of
+        # nothing. The sibling path already fails closed on an empty `files`
+        # (Codex P2, #1373: "an empty files would read as inline and permit a
+        # STALE review to bind the merge on a delta that was never verified");
+        # a narrowing built on the same shape must not read it the other way.
+        return None
+    if len(before) >= 300 or len(after) >= 300:
+        # GitHub caps compare `files` at 300. The cap must be checked on the
+        # FETCHED lists, not on the changed subset derived from them — a subset
+        # is always under the cap, so checking it there tests nothing. MEASURED
+        # on this repo: a wide compare reports 300 files against 1293 real ones,
+        # so the invisible remainder could hold the very change being claimed
+        # unchanged.
+        return None
+    def _identities(records: list) -> dict[str, tuple[str, object, str | None]] | None:
+        """filename -> (blob sha, status, rename source), or None if unreadable.
+
+        Blob sha alone is CONTENT identity, not file identity: it encodes bytes
+        and not mode, so a script that becomes executable keeps its blob and
+        would drop out of the changed set. `status` is folded in because it is
+        what the compare record actually offers. This does NOT fully close the
+        mode question — GitHub's compare record carries no mode field at all —
+        and saying so here is the point: the earlier docstring claimed "exact
+        content identity" and was read as exact FILE identity, which it is not.
+
+        ``previous_filename`` is folded in for the same reason, and it is the
+        half an earlier version omitted (Codex P1, #1849). A rename is a diff
+        with two endpoints, and the compare record reports only the DESTINATION
+        as ``filename``; the blob is the destination's bytes. So a contribution
+        that renames ``A -> B`` and one that renames ``D -> B`` present the same
+        filename, the same blob and the same ``renamed`` status while deleting
+        DIFFERENT files. MEASURED on this code before the fix: those two compared
+        equal, the file dropped out of the changed set, and the branch's changed
+        rename read as a base-advance.
+
+        A record MISSING its ``sha`` must not compare EQUAL to another missing
+        one. MEASURED on this code before the check: two absent shas matched, the
+        file dropped out of the changed set, and a genuinely modified file read as
+        a base-advance — a stale review allowed on changed code, which is the one
+        outcome this refinement must never produce. Triviality is an exception
+        granted on POSITIVE evidence; an identity that cannot be read is not it,
+        so the whole claim is withdrawn rather than made on partial data.
+        """
+        out: dict[str, tuple[str, object, str | None]] = {}
+        for f in records:
+            if not isinstance(f, dict):
+                return None
+            name, blob = f.get("filename"), f.get("sha")
+            if not isinstance(name, str) or not name:
+                return None
+            if not isinstance(blob, str) or not blob:
+                return None
+            prev = f.get("previous_filename")
+            if prev is not None and (not isinstance(prev, str) or not prev):
+                return None  # present but unreadable — cannot compare honestly
+            if name in out:
+                return None  # duplicate filename — cannot compare honestly
+            out[name] = (blob, f.get("status"), prev)
+        return out
+
+    a, b = _identities(before), _identities(after)
+    if a is None or b is None:
+        return None
+    changed = {name for name in set(a) | set(b) if a.get(name) != b.get(name)}
+    # Every path the PR's contribution touches, on EITHER side — destinations AND
+    # rename SOURCES. The source is a path this branch changes (it deletes it), so
+    # a base that touches it is a base change to a file the branch touches. Folding
+    # only destinations here is the same omission as in the identity above, one
+    # scope out: the overlap test below would compare the base's moved set against
+    # destinations alone and miss the collision entirely (Codex P1, #1849).
+    touched = set(a) | set(b) | {p for (_blob, _st, p) in (*a.values(), *b.values()) if p}
+    moved_names: set[str] = set()  # what the BASE changed, when it moved
+    if before_mb != after_mb:
+        # THE MERGE BASE MOVED, which is the normal case here — catching up is
+        # what advances it. A file's blob sha is only the RIGHT-hand side of the
+        # diff; the merge base is the LEFT. So identical blobs across a moved
+        # base do NOT mean an identical diff, and treating them as such is a
+        # fail-open with a specific, routine trigger: resolve a catch-up conflict
+        # with `--ours` and the merge silently REVERTS what the base contributed
+        # while every tip blob stays put. Codex reviewed `F1 -> X`; what ships is
+        # `F2 -> X`, which it never saw.
+        #
+        # So ask what the base itself changed across the move, and refuse the
+        # claim if it overlaps the files this PR touches. A genuine base-advance
+        # — the base moving in files the branch does not touch — has an empty
+        # intersection and is still allowed.
+        moved = _pr_contribution(before_mb, after_mb, repo)
+        if moved is None:
+            return None
+        _mb, moved_status, moved_files = moved
+        if moved_status != "ahead":
+            # The base must have moved FORWARD for "the base advanced" to mean
+            # anything. MEASURED: a three-dot compare of a base that moved
+            # BACKWARDS reports status "behind" with ZERO files, so the overlap
+            # test below would find nothing and wave the claim through. Only a
+            # genuine advance qualifies; behind / diverged / identical fail closed.
+            return None
+        if not moved_files:
+            # The base MOVED, so it changed something — a compare that reports
+            # ZERO files is a degraded read, not an empty advance. The jq at
+            # `_pr_contribution` is `.files[]?`, and `?` swallows a MISSING or
+            # null `files` key, so an upstream response without it arrives here
+            # as `[]`, indistinguishable from a real empty diff.
+            #
+            # It is also self-contradictory: this refinement runs only when the
+            # RAW range classified `substantial`, and an empty compare `files`
+            # classifies `inline` (review_scope.classify_compare_substantiality:
+            # "An empty / None list means no reviewable delta"). So a base that
+            # advanced while changing nothing could not have produced the
+            # substantial raw verdict that got us here. No evidence, no claim —
+            # the same rule the two contribution lists already get above.
+            return None
+        if len(moved_files) >= 300:
+            return None  # truncated: cannot rule out an overlap
+        # Rename SOURCES count on BOTH sides of this intersection — here for the
+        # base's moved set, and in `touched` above for the branch's, matching
+        # `classify_compare_substantiality` and `_pr_changed_files`. A file the
+        # base renamed out from under the branch is a change to that path, and so
+        # is a file the branch renamed away.
+        for f in moved_files:
+            name = f.get("filename") if isinstance(f, dict) else None
+            if not isinstance(name, str) or not name:
+                return None  # malformed record — cannot establish the overlap
+            moved_names.add(name)
+            prev = f.get("previous_filename")
+            if prev is not None:
+                if not isinstance(prev, str) or not prev:
+                    return None
+                moved_names.add(prev)
+        if moved_names & touched:
+            return None
+    # THE HOOK SURFACE IS NEVER RESCUED, whatever the blobs say.
+    #
+    # This refinement RECONSTRUCTS "what changed" from two base-relative
+    # snapshots plus a synthetic identity, where the raw path diffs the two
+    # commits directly. That reconstruction loses whatever the identity does not
+    # carry — and GitHub's compare record carries no file MODE at all. So a
+    # content-preserving `chmod +x` on a guard keeps its blob AND its status,
+    # never enters `changed`, and the teeth that exist to catch "any touch to the
+    # enforcement surface, however small" never run. The raw path would have
+    # caught it, so this is a REGRESSION the refinement introduces rather than a
+    # limitation it inherits.
+    #
+    # Rather than chase an identity rich enough to be safe, decline the rescue
+    # outright when the enforcement surface is anywhere in view. A hook-surface
+    # PR forgoing a stale-review allowance is exactly the trade the surrounding
+    # gate already makes everywhere else.
+    for name in touched | moved_names:
+        if _is_hook_surface_path(name):
+            return None
+    if changed:
+        # ANY change to the branch's own contribution withdraws the claim. The
+        # ONLY thing this refinement establishes is "byte-identical contribution";
+        # it does not, and must not, try to SIZE a residual change.
+        #
+        # An earlier version sized it, by handing the changed subset's `after`
+        # records to the shared substantiality classifier — and that was a
+        # fail-open with a mundane trigger (Codex P1, #1849). Those records are
+        # BASE-relative, not reviewed-relative: a file the review saw as a 100-line
+        # addition that head trims back to 3 lines presents an `after` record of 3
+        # lines, classifies `inline`, and lets a ~97-line unreviewed rewrite bind a
+        # stale review. MEASURED on this code before the fix: before=100 additions,
+        # after=3 additions returned "inline" (the growing direction, 3 -> 100,
+        # correctly returned "substantial" — so the leak was one-directional and
+        # invisible from the side anyone would test).
+        #
+        # Reconstructing the true reviewed...head size from two base-relative
+        # snapshots is exactly the argv->effect reconstruction the guard doctrine
+        # says not to build: any bound would rest on the diff algorithm's
+        # minimality, which is not a guarantee GitHub makes. So the residual is not
+        # sized at all — it blocks, and the fresh review the gate would have
+        # demanded anyway is the answer. Nothing is lost against the status quo:
+        # without this refinement the raw range read `substantial` and blocked too.
+        return None
+    # The branch contributes byte-identical content over its base, and the base
+    # did not touch any path the branch touches. Everything new since the review
+    # came from the base, and was reviewed there.
+    return "inline"
+
+
 def _check_codex_reviewed_head(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
@@ -3092,7 +3968,34 @@ def _check_codex_reviewed_head(
         )
     if reviewed != head:
         level = _classify_post_review_delta(reviewed, head, repo)
+        base_advance = False
+        if level == "substantial":
+            # The raw range says substantial. Ask the narrower question before
+            # blocking: did the BRANCH change, or did its base just advance
+            # underneath it? Only a definite "substantial" is re-judged — a None
+            # (API/parse failure) is the fail-closed state and must not be
+            # rescued by a second read that could itself be degraded.
+            base_sha = _pr_base_sha(pr_num, repo=repo)
+            # COST guard, not a correctness one — say so, because a mutation that
+            # deletes it is behaviourally NULL and will survive any sweep: without
+            # a base the refinement already declines (its fetches cannot resolve a
+            # revision, so it returns None and the block stands). What this saves
+            # is two doomed `gh` round-trips against the 45s merge budget.
+            if base_sha:
+                refined = _classify_base_advance_delta(reviewed, head, base_sha, repo)
+                if refined == "inline":
+                    level, base_advance = "inline", True
         if level == "inline":
+            if base_advance:
+                print(
+                    f"NOTE: Codex's review on PR #{pr_num} is on {reviewed[:12]} (head "
+                    f"{head[:12]}), but the branch's own contribution over its base is "
+                    f"UNCHANGED since — the delta is a base-advance (commits the base "
+                    f"contributed, each reviewed on its own PR) — allowing. Inspect: "
+                    f"git log {reviewed[:12]}..{head[:12]} --oneline",
+                    file=sys.stderr,
+                )
+                return False, "", head
             # The unreviewed delta is provably review-trivial — allow, but still
             # bind the merge to THIS head (TOCTOU): the triviality claim is about
             # exactly this reviewed...head range, not any later push.
@@ -4807,6 +5710,33 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
 #: together and fails the moment either moves.
 _E2E_CUTOFF_FALLBACK = "2026-09-08T00:00:00Z"
 
+# The remedy, for the degraded path where scripts/e2e_declaration.py could not be
+# loaded and its GUIDANCE is therefore unreachable. Deliberately short: the full
+# version lives in the module, and a second long copy here would be a replica to
+# drift. Both forms, because an author who can only copy the `none` line gets the
+# one answer that creates no obligation.
+_E2E_GUIDANCE_FALLBACK = (
+    "Add an E2E: line to the PR body — one of:\n"
+    "  E2E: <one-line plan for the post-merge verification>\n"
+    "  E2E: none — <reason there is no runtime surface to verify>"
+)
+
+
+def _e2e_undeclared(pr_num: str, detail: str, mod) -> tuple[bool, str]:
+    """Build an `undeclared` verdict that ALWAYS carries the remedy.
+
+    Structural, not a convention: the callers open with "Declaring one takes 10
+    seconds:" and then print this whole string, so a return that omits the forms
+    answers a colon-promise with a restatement of the problem. Three of the four
+    undeclared returns used to do exactly that while a docstring two functions up
+    claimed the tail was always GUIDANCE — the claim was true only of the path
+    someone happened to check (fresh-context audit, 2026-09-06). Routing every
+    return through here makes the property hold by construction; the docstring
+    now describes the code instead of hoping for it.
+    """
+    tail = mod.GUIDANCE if mod is not None else _E2E_GUIDANCE_FALLBACK
+    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{tail}"
+
 #: Last-resort matcher for the E2E declaration, used ONLY when
 #: scripts/e2e_declaration.py cannot be imported. Same shape as that module's
 #: _MARKER_RE (markdown wrappers, horizontal whitespace, case-insensitive) with one
@@ -4881,33 +5811,46 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
 
 
 def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
-    """Block a merge whose PR body never DECIDED about a post-merge E2E (§8.12).
+    """Report whether a PR body DECIDED about its post-merge E2E (§8.12).
 
-    Returns (should_block, message). The obligation is one line in the PR body —
-    either a plan or an explicit reasoned ``none`` (see scripts/e2e_declaration.py
-    for the full convention and why its parsing is what it is).
+    Returns ``(undeclared, message)``. ``undeclared`` is a FINDING, not a
+    verdict: no caller blocks on it. The merge arm prints an advisory NOTE and
+    proceeds; ``--check-pr`` prints an ``advisory`` row that never counts toward
+    `failures`. Keeping the severity in the CALLERS is what let this become
+    advisory without touching a line of the classification below.
 
     GUARD AXIOMS, stated because every gate change owes them:
-      * VERDICT: block, at MERGE time only. The push arm never calls this — a
-        body is written and revised while a PR is open, so demanding it at push
-        would gate the wrong moment.
-      * AUDIENCE: the agent. The message names both valid forms verbatim.
-      * BACKGROUND: none. Background sessions cannot merge PRs by design, so this
-        cannot impede one.
+      * VERDICT: **advisory** (owner decision 2026-09-06, reversing the
+        2026-09-05 hard-fail). A block only guaranteed that a SENTENCE EXISTS,
+        never that it was true, so it added no determinism to the judgment —
+        while taxing every merge on an n=2 justification. The obligation is
+        MEANT to be carried by a per-merge row from the repo-pulse worker; that
+        row is UNBUILT (issue #1718, half B), so in the interim this advisory is
+        the only record. See the merge-arm comment.
+      * AUDIENCE: the agent — and both callers print the WHOLE message, whose
+        tail is the remedy (both valid forms plus, when the parser loaded,
+        copyable examples). Printing only its first line silently drops that.
+        Every ``undeclared`` return is built by ``_e2e_undeclared``, which
+        appends the remedy, so this is a property of the code rather than a
+        claim about it — the earlier wording asserted the tail was always
+        GUIDANCE while three of the four returns omitted it.
+      * BACKGROUND: none — background sessions cannot merge PRs by design.
 
-    Fail directions, each chosen rather than inherited:
-      * body UNREADABLE → BLOCK. This gate guards EVERY merge, so an unreadable
-        body is an unanswered question, not a pass. (The pin gate fails open on
-        the same read because it guards only the rare pin-bump path — the
-        divergence is deliberate, not an oversight.)
-      * createdAt UNREADABLE → BLOCK, naming the cause. Treating it as "old"
-        would turn the transition window into a permanent hole.
+    "Fail direction" now means which way an UNREADABLE input is REPORTED, since
+    nothing blocks:
+      * body UNREADABLE → reported undeclared. An unread body is an unanswered
+        question, not a pass — the row will still be opened post-merge.
+      * createdAt UNREADABLE, parser LOADED → reported undeclared, naming the
+        cause, rather than assuming the pre-convention exemption.
+      * createdAt UNREADABLE *and* parser MISSING → neither the exemption nor the
+        stripping can be established, so this returns whatever the bare presence
+        scan below finds: a body carrying an ``E2E:`` line is reported declared
+        (degraded), one without it undeclared. Stating that exception here because
+        the line above read as unconditional and is not (Kimi P3, 2026-09-06).
       * parser module MISSING → the body is still scanned for a bare ``E2E:``
-        line and a NOTE says the comment/fence stripping was unavailable. Losing
-        the invisibility defence must not lose the whole gate.
+        line and a NOTE says the comment/fence stripping was unavailable.
 
-    NO OVERRIDE SIGIL, deliberately: ``E2E: none — <reason>`` IS the auditable
-    escape hatch, and it costs one honest sentence. Mirrors the pin gate's stance.
+    No override sigil exists because there is nothing to override.
     """
     # The cutoff is checked FIRST and in BOTH modes. An earlier revision consulted
     # it only when the parser had loaded, which blocked a PRE-CUTOFF PR whenever the
@@ -4927,10 +5870,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
                 file=sys.stderr,
             )
         else:
-            return True, (
-                f"E2E obligation: could not read PR #{pr_num}'s createdAt, so the "
-                f"pre-convention exemption cannot be established. Re-run; if it "
-                f"persists, the gh read is failing."
+            return _e2e_undeclared(
+                pr_num,
+                "could not read the PR's createdAt, so the pre-convention "
+                "exemption cannot be established. Re-run; if it persists, the "
+                "gh read is failing",
+                mod,
             )
     else:
         if mod is not None:
@@ -4942,10 +5887,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
 
     body = _pr_body_text(pr_num, repo)
     if body is None:
-        return True, (
-            f"E2E obligation: PR #{pr_num}'s body is unreadable, so the declaration "
-            f"cannot be confirmed. This gate guards every merge — an unread body is "
-            f"an unanswered question, not a pass."
+        return _e2e_undeclared(
+            pr_num,
+            "the PR body is unreadable, so the declaration cannot be confirmed. "
+            "Reported undeclared rather than assumed declared — an unread body is "
+            "an unanswered question, not a pass",
+            mod,
         )
 
     if mod is None:
@@ -4969,9 +5916,10 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
                 file=sys.stderr,
             )
             return False, "ok (degraded: parser unavailable)"
-        return True, (
-            f"E2E obligation: no E2E: line found in PR #{pr_num}'s body (parser "
-            f"unavailable, presence-only scan)."
+        return _e2e_undeclared(
+            pr_num,
+            "no E2E: line found in the body (parser unavailable, presence-only scan)",
+            mod,
         )
 
     result = mod.parse_e2e(body)
@@ -4986,7 +5934,7 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
         return False, f"ok ({label})"
 
     detail = result.get("detail") or "no E2E: line in the PR body"
-    return True, f"E2E obligation not declared for PR #{pr_num}: {detail}\n{mod.GUIDANCE}"
+    return _e2e_undeclared(pr_num, detail, mod)
 
 
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -5937,7 +6885,12 @@ def _ask(reason: str) -> int:
     permission prompt and runs the tool only on explicit approval — a gate the
     agent cannot self-satisfy. Verified to render in a wrapped child session
     2026-07-27.
+
+    Records that the decision was DEFERRED, so the override log does not report a
+    still-undecided command as allowed — see ``_OVERRIDE_OUTCOMES``.
     """
+    global _ASK_EMITTED
+    _ASK_EMITTED = True
     print(
         json.dumps(
             {
@@ -6072,6 +7025,36 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
 
 
 def main() -> int:
+    """Run the guard, then record any override sigils with the verdict they got.
+
+    The override log's rows are written HERE rather than where each sigil is
+    detected, because "the sigil was appended" is known early and "what the
+    command actually did" is only known at the end. One flush point covers every
+    return above — including the fail-closed conversion in ``run_guard``, which
+    reaches this wrapper as an exception.
+
+    ONE path is not covered, and an audit store owes it a sentence rather than a
+    silence: the ~60s hook wall-clock. A SIGKILL runs no ``finally``, so every
+    pending row is lost with no notice anywhere — the same overrun the merge-path
+    budget note below is built to avoid, seen from the logging side. That is the
+    single hole in "every override attempt leaves a row", and it fails in the
+    direction of a MISSING record, never a false one.
+    """
+    global _ASK_EMITTED
+    _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
+    _ASK_EMITTED = False
+    outcome = "error"
+    try:
+        rc = _run_merge_and_push_gates()
+        # rc == 0 is THREE states, not two: allowed outright, or handed to the
+        # user as a permission prompt they may yet deny.
+        outcome = "blocked" if rc == 2 else ("asked" if _ASK_EMITTED else "allowed")
+        return rc
+    finally:
+        _flush_overrides(outcome)
+
+
+def _run_merge_and_push_gates() -> int:
     try:
         payload = read_payload()
         cmd = field(payload, "command")
@@ -6082,7 +7065,10 @@ def main() -> int:
         # like sudo/env and /path/to/git stripped, nested `bash -c` recursed,
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
-        segs = analyze(cmd)
+        # `blind` is this same parse reporting whether it could read the WHOLE
+        # command. An empty segment list means "no gated op here" only when it does
+        # not also mean "I stopped reading", and one call cannot disagree with itself.
+        segs, blind = analyze_checked(cmd)
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
@@ -6128,24 +7114,43 @@ def main() -> int:
         blind_spot_reason: str | None = None
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-            and untokenizable(cmd)
+            and blind is not None
             and _mentions_gated_op(cmd)
         ):
+            if blind.bounds_induced:
+                # The DEPTH bound refuses outright, interactive or not, and the
+                # asymmetry between the two bounds is measured rather than felt.
+                # Across this install's history the deepest real nesting is 4
+                # against a bound of 5 — see the distribution recorded with
+                # `shell_parse.MAX_SUBSTITUTION_DEPTH`, which is the one place it
+                # is derived. Nothing legitimate reaches the bound, and a command
+                # that does is not a shape ordinary work produces. It is also the
+                # axis the decoy attacks use: a visible benign `git push` with a
+                # force push buried past the bound, which reaches an approval
+                # prompt describing the decoy. A human approving what looks like an
+                # ordinary push is not a gate on the operation actually hidden
+                # there. Length still asks — a long here-doc IS ordinary work.
+                print(
+                    f"BLOCKED: this command {blind.cause} and names a gated "
+                    "operation, so the guard cannot see every publish it would "
+                    "run. A command can carry a second, hidden one past the point "
+                    "the parser stops — approving the visible one would approve "
+                    f"that too.\nTo proceed: {blind.hint}.",
+                    file=sys.stderr,
+                )
+                return 2
             if _is_dispatched():
                 # No human is present to answer a prompt, and an unverifiable
                 # gated command must not proceed unattended. Mirrors the
                 # dispatched deny legs on the push / pr-create asks below.
                 print(
-                    "BLOCKED: this command cannot be parsed safely (e.g. "
-                    "ANSI-C $'...' quoting) and names a gated operation. "
-                    "Autonomous sessions cannot proceed on an unverifiable "
-                    "command.\n"
-                    "To proceed: if you are WRITING TEXT (a commit message, a "
-                    "plan, review notes) whose content merely mentions push or "
-                    "merge, use the Write tool instead of a here-doc — the "
-                    "apostrophe in ordinary prose is what makes this "
-                    "unparseable, and no amount of re-quoting a here-doc fixes "
-                    "it. If you are RUNNING a git command, rewrite it in a "
+                    f"BLOCKED: this command {blind.cause} and names a gated "
+                    "operation. Autonomous sessions cannot proceed on an "
+                    "unverifiable command.\n"
+                    f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                    "message, a plan, review notes) whose content merely mentions "
+                    "push or merge, use the Write tool instead of a here-doc. If "
+                    "you are RUNNING a git command, rewrite it in a "
                     "directly-parseable form (plain quotes, or -F <file>).",
                     file=sys.stderr,
                 )
@@ -6158,13 +7163,12 @@ def main() -> int:
                 # directly-parseable form") does not apply to it.
                 return 2
             blind_spot_reason = (
-                "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                "quoting) and mentions a gated operation (push / merge / "
-                "gh pr create / --force / --no-verify / --admin), so the guard "
-                "cannot verify "
-                "what it would actually run. Approve only if you are sure. To "
-                "avoid the prompt, rewrite it in a directly-parseable form "
-                "(plain quotes, or -F <file>)."
+                f"This command {blind.cause} and mentions a gated operation "
+                "(push / merge / gh pr create / --force / --no-verify / --admin), "
+                "so the guard cannot verify what it would actually run. Approve "
+                f"only if you are sure. To avoid the prompt: {blind.hint}, or "
+                "rewrite it in a directly-parseable form (plain quotes, or "
+                "-F <file>)."
             )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
@@ -6472,6 +7476,66 @@ def main() -> int:
                 )
                 return 2
             if pr_num:
+                # The head an override row is ABOUT. Read from the command's own
+                # `--match-head-commit` (the cluster-safe parser the TOCTOU binding
+                # uses) rather than an extra API call on a budgeted path: GitHub
+                # enforces that value server-side, so when the merge succeeds it IS
+                # the merged sha. Empty when the merge is unbound — which the gates
+                # below then refuse anyway, except under a sigil that waives the
+                # binding, and "unbound" is itself the honest record for that row.
+                merge_head = _merge_match_head(merge_seg.argv) or ""
+                # Note every sigil on the merge segment HERE — before the first
+                # gate that can `return 2`. Noting at each gate's own site
+                # recorded nothing when an EARLIER gate blocked, which silently
+                # dropped exactly the attempts the log exists to count (MEASURED:
+                # a CONFLICTING mergeable with three sigils appended wrote zero
+                # rows). The verdict is attached later, by the flush.
+                #
+                # The three `return 2`s ABOVE this point are deliberately not
+                # covered: they fire when the command has no --admin, or when the
+                # repo or PR cannot be resolved at all. Those are malformed
+                # commands rather than override events, and a row could not name
+                # which PR it was about.
+                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                stale_override = has_trailing_override(merge_seg.raw, "stale-review-override")
+                sched_override = has_trailing_override(
+                    merge_seg.raw, "scheduled-review-override"
+                )
+                # The FINDINGS waiver, read off the parsed segment rather than via
+                # has_trailing_override — which is why enumerating that helper's
+                # call sites missed the one sigil SKILL.md documents as logged.
+                force_override = merge_seg.override
+                for _sigil, _present, _waives in (
+                    ("ci-override", ci_override, "ci-status"),
+                    ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
+                    ("review-override", force_override, "review-body+inline-findings"),
+                    ("scheduled-review-override", sched_override, "scheduled-claude-review"),
+                ):
+                    if _present:
+                        # `repo` is BLANK on one path, deliberately: a legacy
+                        # payload with no cwd leaves merge_repo None (see the
+                        # resolution block above — there is nothing to derive
+                        # from), and the gates then ran against the HOOK's own
+                        # cwd repo. Filling it in would mean calling
+                        # _derive_repo_from_cwd, which shells out to `gh repo
+                        # view` — a NETWORK call on the very path whose budget
+                        # note below says an overrun SIGKILLs the hook mid-gate
+                        # and disengages every merge gate at once. Spending that
+                        # on an audit field would trade a fail-OPEN for a
+                        # log nicety. Deriving it locally from `origin` instead
+                        # is cheap but resolves differently from gh on a fork,
+                        # and a row naming the WRONG repo is worse than one
+                        # naming none. So it stays blank here and the ambiguity
+                        # is recorded rather than papered over. Follow-up: fill
+                        # it from a repo already resolved earlier in the run,
+                        # which costs nothing extra.
+                        _note_override(
+                            _sigil,
+                            waived=_waives,
+                            pr=pr_num,
+                            repo=merge_repo,
+                            head=merge_head,
+                        )
                 # ── Merge-path gh TIMEOUT BUDGET ──────────────────────────
                 # This hook runs under a 60s CC wall-clock (settings.json). A
                 # wall-clock overrun SIGKILLs the hook MID-GATE, which "fails
@@ -6542,7 +7606,11 @@ def main() -> int:
                 # or dropped pull_request trigger can't slip an un-CI'd merge through
                 # (handled just below).
                 ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
-                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                # ci_override was detected and noted above, before any gate could
+                # return — see the note block after merge_head. Now that the CI
+                # verdict is known, record WHICH state was waived.
+                if ci_override:
+                    _amend_note("ci-override", waived=f"ci:{ci_state}")
                 if ci_state in ("red", "pending") and not ci_override:
                     print(
                         f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
@@ -6616,15 +7684,15 @@ def main() -> int:
                         file=sys.stderr,
                     )
 
-                force_override = merge_seg.override
-                # The review-CONTEXT waiver (freshness + base gates) is a SEPARATE
-                # sigil from # review-override: the freshness gate is the
-                # high-traffic one (Codex never auto-re-reviews a push), and if its
-                # escape also waived the P1 finding scans, the path of least
-                # resistance would systematically disarm P1 enforcement (Codex P1 +
-                # architect SHOULD-FIX on #1366). One trailing comment may carry
-                # both sigils when both waivers are genuinely intended.
-                stale_override = has_trailing_override(merge_seg.raw, "stale-review-override")
+                # force_override / stale_override were detected and noted above,
+                # before any gate could return. The review-CONTEXT waiver
+                # (freshness + base gates) is a SEPARATE sigil from
+                # # review-override: the freshness gate is the high-traffic one
+                # (Codex never auto-re-reviews a push), and if its escape also
+                # waived the P1 finding scans, the path of least resistance would
+                # systematically disarm P1 enforcement (Codex P1 + architect
+                # SHOULD-FIX on #1366). One trailing comment may carry both
+                # sigils when both waivers are genuinely intended.
 
                 # Base-branch invariant: a PR retargeted AFTER Codex reviewed it
                 # keeps the SAME head oid, so head-freshness alone can't see the
@@ -6685,20 +7753,60 @@ def main() -> int:
                     # above records as measured (architect SHOULD-FIX, 2026-09-06).
                     print(receipts_msg, file=sys.stderr)
 
-                # E2E obligation (§8.12). Sits beside the pin gate because it is
-                # the same KIND of check — a merge-time read of the PR body, which
-                # stays mutable after any CI run — and because both are cheap
-                # reads that should fail before the expensive finding scans.
-                # Like the pin gate it carries NO override sigil: `E2E: none —
-                # <reason>` is the escape hatch, and it costs one honest sentence.
-                should_block, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
-                if should_block:
+                # E2E obligation (§8.12) — ADVISORY, never blocking (owner
+                # decision 2026-09-06, reversing the 2026-09-05 hard-fail call).
+                #
+                # The gate never made the JUDGMENT deterministic: whether a change
+                # needs an E2E is an LLM call either way, and a block only
+                # guarantees that a SENTENCE EXISTS, not that it is true —
+                # `E2E: none — docs only` on a code PR passes and the gate cannot
+                # tell. Worse, a mandatory field produces compliance text: a line
+                # typed to get past a gate is the cheapest thing that passes, which
+                # is lower-quality signal than a line written because the author
+                # had something to say. Against that, the block's measured
+                # justification was 1-of-2 merges (n=2) — far under this repo's own
+                # bar for escalating past advisory — while binding EVERY merge
+                # forever, including external contributors who have never heard of
+                # the convention.
+                #
+                # What WILL close the obligation is a durable row: a follow-on PR
+                # (issue #1718, half B) teaches the repo-pulse worker to open one
+                # per merged PR, auto-closed with the reason recorded when the diff
+                # is documentation-only. **UNBUILT as of this commit** — MEASURED as
+                # zero occurrences of `parse_e2e`, `e2e_declaration` or the row's
+                # dedup key anywhere under src/, and repo_pulse_gh.PR_FIELDS still
+                # lacks the `createdAt` the lane needs. (Stated that way on purpose:
+                # the earlier phrasing counted "repo_pulse modules", a denominator
+                # three reviewers agreed on and none of us had measured — it is 4 or
+                # 6 depending on whether you count the crud and scripts modules. A
+                # grep for the thing itself does not depend on how you count.)
+                # Until it lands, this NOTE is the
+                # only thing that remembers, which is a deliberate and tracked gap,
+                # not a covered one. Say so rather than implying coverage: the
+                # measured miss rate the block was justified by is unmitigated in
+                # the interim, and a message claiming otherwise is worse than
+                # silence.
+                #
+                # Branch on the RETURNED FLAG, never on the message text. Both arms
+                # must apply the same predicate to the same value or "report and
+                # enforcement share a function so they cannot disagree" stops being
+                # true — sharing the call while re-deriving severity from a string
+                # prefix is the divergence wearing the invariant's clothes.
+                undeclared, e2e_msg = _check_e2e_plan(pr_num, repo=merge_repo)
+                if undeclared:
                     print(
-                        f"BLOCKED: PR #{pr_num} — no post-merge E2E decision in the PR body.",
+                        f"NOTE: PR #{pr_num} — no post-merge E2E decision in the PR "
+                        f"body. Not blocking. The obligation row that will carry this "
+                        f"automatically is NOT built yet (issue #1718), so right now "
+                        f"this NOTE is the only record. Declaring one takes 10 seconds:",
                         file=sys.stderr,
                     )
+                    # The WHOLE message: its tail is GUIDANCE, which carries both
+                    # valid forms and two copyable examples. Printing only line 0
+                    # ended a colon-promise with a restatement of the problem and
+                    # dropped the remedy — an advisory minus its remedy is noise,
+                    # which is the strongest argument for ignoring it.
                     print(e2e_msg, file=sys.stderr)
-                    return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -6785,7 +7893,8 @@ def main() -> int:
                 # merge-gate deadline BLOCKS at whichever gate hits its 1s floor first —
                 # never a silent pass. Uses verified_head from the Codex gate (None under
                 # # stale-review-override → re-read).
-                sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
+                # sched_override was detected and noted above, before any gate
+                # could return.
                 # Provision-or-surface: the scheduled gate no-ops off the configured
                 # public repo (by design). A SILENT no-op would hide a drifted
                 # genesis.yaml (canonical != the real public repo) disarming the gate
@@ -6984,14 +8093,20 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
     failures += 1 if blocked else 0
-    # E2E obligation (§8.12), same tier and same reason as pin-receipts: a
-    # merge-time read of a mutable body, so CI could never be its authority.
-    blocked, msg = _check_e2e_plan(pr_num, repo=repo)
-    print(f"e2e-plan       : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
-    if blocked:
+    # E2E obligation (§8.12) — ADVISORY. Reported so the declaration is visible
+    # at merge time, but it NEVER contributes to `failures`: the enforcement arm
+    # does not block on it either, and a report row that counted a gate the gate
+    # does not enforce would be the report and the enforcement disagreeing —
+    # the one property this whole report rests on not doing.
+    undeclared, msg = _check_e2e_plan(pr_num, repo=repo)
+    if undeclared:
+        print(f"e2e-plan       : advisory — {msg.splitlines()[0]}")
+        # Indented tail, the same idiom pin-receipts and scheduled-review use —
+        # the remedy is the point of an advisory.
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
-    failures += 1 if blocked else 0
+    else:
+        print(f"e2e-plan       : {msg.splitlines()[0]}")
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]
