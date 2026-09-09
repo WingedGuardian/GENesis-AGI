@@ -493,7 +493,10 @@ async def _compute_ego_quality(
 
     if not total:
         return {"approval_rate": None, "execution_success_rate": None,
-                "confidence_calibration": {}, "total_proposals": 0}, 0
+                "confidence_calibration": {}, "total_proposals": 0,
+                # A quiet week is still computed under the CURRENT definition;
+                # without the marker it reads to detect_series_break as a break.
+                "approval_rate_defn": _EGO_APPROVAL_RATE_DEFN}, 0
 
     # Approval rate — JUDGED proposals only.
     #

@@ -1869,3 +1869,35 @@ async def test_a_failed_execution_still_counts_as_an_approval(db):
     assert metrics["approval_rate"] == 0.75, metrics
     # The failure is still counted, in the metric that measures execution.
     assert metrics["execution_success_rate"] == 0.5, metrics
+
+
+async def test_a_quiet_week_is_not_a_definition_break(db):
+    """A week with no proposals must still carry the definition marker.
+
+    The marker is what detect_series_break / latest_definition_segment read.
+    An empty week that omits it looks like a REDEFINITION sitting between two
+    v2 weeks: the trend segment is cut to the single newest point and the
+    dashboard reports `insufficient_data` on a series whose definition never
+    changed. The week WAS computed under v2 rules, so it must say so.
+    """
+    from genesis.dashboard.routes.eval import latest_definition_segment
+    from genesis.eval.j9_aggregator import (
+        _EGO_APPROVAL_RATE_DEFN,
+        _compute_ego_quality,
+    )
+
+    metrics, sample = await _compute_ego_quality(
+        db,
+        "2026-09-01T00:00:00+00:00",
+        "2026-09-08T00:00:00+00:00",
+    )
+    assert sample == 0 and metrics["total_proposals"] == 0, metrics
+    assert metrics.get("approval_rate_defn") == _EGO_APPROVAL_RATE_DEFN, metrics
+
+    # v2 -> quiet week -> v2 is ONE segment: the trend keeps both real points.
+    series = [
+        {"definition": _EGO_APPROVAL_RATE_DEFN, "value": 0.5},
+        {"definition": metrics.get("approval_rate_defn"), "value": None},
+        {"definition": _EGO_APPROVAL_RATE_DEFN, "value": 0.9},
+    ]
+    assert len(latest_definition_segment(series)) == 3, series
