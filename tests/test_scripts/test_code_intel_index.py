@@ -66,6 +66,17 @@ def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
         )
 
 
+def _inherited_oom_adj() -> str:
+    """This process's own oom_score_adj — what a child INHERITS absent a write.
+
+    Asserting a literal "0" was wrong: it is true on a developer box and NOT on a
+    GitHub runner, which is the reference "different install" the install-agnostic
+    test rule points at (it failed there, 2 cells, while the mechanism itself
+    passed). The invariant is "the value did not CHANGE", not "the value is zero".
+    """
+    return Path("/proc/self/oom_score_adj").read_text().strip()
+
+
 def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None:
     """Fake systemd-run: logs argv, then execs the command after ``--``."""
     bindir.mkdir(exist_ok=True)
@@ -457,7 +468,8 @@ def test_oom_score_adj_non_numeric_warns_and_still_indexes(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "ignoring non-numeric" in res.stdout
     assert "codebase-memory-mcp ARGS:" in log.read_text()  # index still ran
-    assert "OOM_ADJ:0" in log.read_text()  # left at the inherited default
+    # unchanged from what this process would pass down — not a literal 0
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()
 
 
 def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
@@ -474,7 +486,7 @@ def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
     )
     assert res.returncode == 0, res.stderr
     assert "ignoring non-numeric" in res.stdout
-    assert "OOM_ADJ:0" in log.read_text()
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()  # unchanged
 
 
 # ── 4. pressure watchdog ──────────────────────────────────────────────────
