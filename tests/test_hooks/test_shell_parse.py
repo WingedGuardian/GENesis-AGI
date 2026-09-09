@@ -923,6 +923,23 @@ class TestHeredocBodiesAreNotCommands:
         the body is expanded, which is moot when the body is not a command."""
         assert sp._heredoc_delimiter(target) == expected
 
+
+    def test_an_unterminated_ansi_c_span_is_not_decoded(self):
+        """Bash rejects `$'` with no closing apostrophe as a syntax error, so
+        there is no value to decode. Decoding one INVENTS valid argv from invalid
+        input, and a guard then issues a policy block — in the wrong words — for
+        a command the shell was never going to run."""
+        segs = sp.analyze("git commit --$'no-verify")
+        assert segs, "expected a segment"
+        assert "--no-verify" not in segs[0].argv, (
+            f"an unterminated span was decoded into a real flag: {segs[0].argv}"
+        )
+
+    def test_a_terminated_span_is_still_decoded(self):
+        """Guard the guard: the unterminated case must not blunt the ordinary one."""
+        segs = sp.analyze("git commit --$'no-verify' -m x")
+        assert "--no-verify" in segs[0].argv, segs[0].argv
+
     def test_a_hidden_verb_in_a_real_command_is_still_caught(self):
         """Guard the guard: the heredoc skip must not blunt the ANSI-C decoding
         this PR exists for — a verb hidden in a REAL command still resolves."""

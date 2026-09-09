@@ -759,7 +759,16 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
                     continue
                 content.append(text[j])
                 j += 1
-            end = j + 1 if j < n else n
+            if j >= n:
+                # UNTERMINATED `$'...` — no closing apostrophe. Bash rejects the
+                # whole command as a syntax error, so there is no value to decode
+                # and decoding one INVENTS valid argv out of invalid input: a
+                # guard would then issue a policy block for a command the shell
+                # was never going to run, and say so in the wrong words. Leave
+                # the text alone and let bash produce its own error.
+                i = n
+                continue
+            end = j + 1
             spans.append((i, end, "".join(content), has_escape))
             i = end
             continue
