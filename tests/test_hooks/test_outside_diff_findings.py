@@ -184,7 +184,7 @@ class TestSectionParsing:
                 _entry("src/b.py", "3-4", "🔴 Critical", "Nitpick, not ours"), name="Nitpick"
             )
         )
-        entries, _declared, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _declared, _, _ = guard_module._cr_outside_diff_entries(body)
         assert [e[0] for e in entries] == ["src/a.py"]
 
     def test_entry_without_a_file_header_is_dropped(self, guard_module):
@@ -203,7 +203,7 @@ class TestSectionParsing:
             "`2-2`: _cat_ | _🟠 Major_ | _x_\n\n**Second finding title**\n\n"
             "</blockquote></details>"
         )
-        entries, _declared, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _declared, _, _ = guard_module._cr_outside_diff_entries(body)
         titles = {lines: title for _p, lines, _s, title in entries}
         assert titles["2-2"] == "Second finding title"
         assert titles["1-1"] == "", "an untitled finding must stay untitled, not borrow"
@@ -378,7 +378,7 @@ class TestQuotedContent:
             "`10-12`: _cat_ | _🔴 Critical_ | _e_\n\n**Real critical**\n\n"
             "</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "10-12", "critical", "Real critical")]
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
@@ -400,7 +400,7 @@ class TestQuotedContent:
             "</blockquote></details>"
         )
         second = _entry("src/a.py", "3-4", "🔴 Critical", "Real critical")
-        entries, _, _ = guard_module._cr_outside_diff_entries(_section(first + "\n\n" + second))
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(_section(first + "\n\n" + second))
         assert entries == [
             ("docs/a.md", "1-2", "minor", "First"),
             ("src/a.py", "3-4", "critical", "Real critical"),
@@ -416,7 +416,7 @@ class TestQuotedContent:
             "```suggestion\n`99-99`: _cat_ | _🔴 Critical_ | _e_\n```\n\n"
             "</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "1-2", "minor", "Real minor")]
 
     def test_the_title_search_is_bounded_in_content_lines(self, guard_module):
@@ -431,7 +431,7 @@ class TestQuotedContent:
             + "\n".join(f"filler line {i}" for i in range(8))
             + "\n\n**Unrelated bold far below**\n\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries[0][3] == "", "a distant bold line is not this finding's title"
 
     def test_a_quoted_bold_line_is_not_borrowed_as_a_title(self, guard_module):
@@ -441,7 +441,7 @@ class TestQuotedContent:
             "```md\n**Quoted heading, not the title**\n```\n\n"
             "**The real title**\n\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries[0][3] == "The real title"
 
 
@@ -464,7 +464,7 @@ class TestStructuralAttribution:
             "The source contains `99`: _cat_ | _🔴 Critical_ | _e_ in a string.\n\n"
             "</blockquote></details>\n\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "1-2", "minor", "Real")]
 
     def test_unfenced_summary_in_prose_does_not_reassign_the_file(self, guard_module):
@@ -479,7 +479,7 @@ class TestStructuralAttribution:
             "`50-60`: _c_ | _🔴 Critical_ | _e_\n\n**Real critical**\n\n"
             "</blockquote></details>\n</blockquote></details>"
         )
-        entries, declared, _ = guard_module._cr_outside_diff_entries(body)
+        entries, declared, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/real.py", "50-60", "critical", "Real critical")]
         assert declared == 1
 
@@ -508,7 +508,7 @@ class TestStructuralAttribution:
             "`2-2`: _c_ | _🔴 Critical_ | _e_\n\n**Still ours**\n\n"
             "</blockquote></details>\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "2-2", "critical", "Still ours")]
 
     def test_a_file_header_nested_too_deep_is_not_honoured(self, guard_module):
@@ -526,7 +526,7 @@ class TestStructuralAttribution:
             "`2-2`: _c_ | _🔴 Critical_ | _e_\n\n**Attributed to the real file**\n\n"
             "</blockquote></details>\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "2-2", "critical", "Attributed to the real file")]
 
     def test_a_fenced_section_header_does_not_truncate_the_section(self, guard_module):
@@ -539,7 +539,7 @@ class TestStructuralAttribution:
             "`2-2`: _c_ | _🔴 Critical_ | _e_\n\n**Survives**\n\n"
             "</blockquote></details>\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "2-2", "critical", "Survives")]
 
     @pytest.mark.parametrize(
@@ -563,7 +563,7 @@ class TestStructuralAttribution:
             + "**Found anyway**\n\n"
             "</blockquote></details>\n</blockquote></details>"
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "2-2", "critical", "Found anyway")], f"{name} lost it"
 
     def test_blockquoted_bodies_are_parsed_and_masked(self, guard_module):
@@ -587,7 +587,7 @@ class TestStructuralAttribution:
                 "**Blockquoted and safe**",
             )
         )
-        entries, _, _ = guard_module._cr_outside_diff_entries(body)
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
         assert entries == [("src/a.py", "2-2", "critical", "Blockquoted and safe")]
 
 
@@ -787,7 +787,7 @@ class TestAuditResiduals:
             "</blockquote></details>"
         )
         second = _entry("src/a.py", "3-4", "🔴 Critical", "Real critical")
-        entries, _, _ = guard_module._cr_outside_diff_entries(_section(first + "\n\n" + second))
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(_section(first + "\n\n" + second))
         assert ("src/a.py", "3-4", "critical", "Real critical") in entries, (
             "a Critical must not be misattributed to the doc path by a "
             "code span the mask failed to close"
@@ -817,3 +817,181 @@ class TestAuditResiduals:
         assert "PhantomOrReal" not in msg, (
             "a quarantined batch must not be named as a real finding"
         )
+
+
+class TestRoundTwoFindings:
+    """Codex round 2. The first is a FAIL-OPEN on the floor, so it is fixed in
+    the terminal push rather than accepted; the second costs nothing to fix and
+    makes the report state what the reviewer actually said."""
+
+    def test_an_html_escaped_path_is_decoded_before_it_is_used_as_an_identity(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        # VERIFY-RED: the extracted path is compared against the RAW path
+        # GitHub returns. CodeRabbit escapes markup-significant characters
+        # inside the summary, so `docs/Q&amp;A.md` never matched `docs/Q&A.md`
+        # and the finding was routed to the non-scoring off-diff lane —
+        # a Critical read correctly, then attributed to nobody, and the merge
+        # allowed. `&` is the character this actually happens with.
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": "src/a&b.py", "previous_filename": None}),
+        )
+        # A SOURCE path deliberately: a `docs/*.md` path would be doc-skipped
+        # for a legitimate reason and the test would pass without proving the
+        # decode mattered.
+        body = _section(
+            "<details>\n<summary>src/a&amp;b.py (1)</summary><blockquote>\n\n"
+            "`1-2`: _cat_ | _🔴 Critical_ | _e_\n\n**Escaped path**\n\n"
+            "</blockquote></details>"
+        )
+        entries, _, _, _ = guard_module._cr_outside_diff_entries(body)
+        assert entries[0][0] == "src/a&b.py", "the path is an identity, not display text"
+
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
+        with no_inline:
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block is True, "an in-diff Critical must block, escaped path or not"
+        assert "off-diff" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("token", "shown"),
+        [("Info", "Info"), ("Trivial", "Trivial"), ("🟡 Minor", "Minor")],
+    )
+    def test_the_report_names_the_level_the_reviewer_gave(
+        self, guard_module, monkeypatch, no_inline, capsys, token, shown
+    ):
+        # VERIFY-RED for Info/Trivial: every below-Major level printed as
+        # "Minor". Same score (0.0) either way — but the report is an
+        # inventory, and rounding a level UP overstates the reviewer.
+        review = _review(_section(_entry("src/a.py", "1-2", token, "Low sev")))
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", review)
+        with no_inline:
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block is False
+        assert f"[outside-diff {shown}]" in capsys.readouterr().err
+
+
+class TestBlockquotedFenceInversion:
+    """A container marker is not noise — normalising it away unscopes fences.
+
+    THE DEFECT (adversarial audit, PR #1847). `_cr_normalize_review_body`
+    strips blockquote prefixes so the mask can see structure that quoting hid.
+    That is right, and it was also lossy in a way nothing noticed: a renderer
+    scopes a fence to its CONTAINER, so a `> ``` ` line inside a document-level
+    fenced block is ordinary CONTENT — the `>` is not indentation, so it cannot
+    close anything. Stripped first, it becomes a valid closer, and the mask
+    INVERTS: the fence ends early, the real closer opens a phantom one, and
+    everything to the next delimiter is masked — including the section header
+    that carries the declared count. `declared` and `parsed` are then both 0,
+    so the reconciliation backstop is blind by construction and NO canary
+    fires. Measured end-to-end: a floor-class Critical stopped blocking.
+    """
+
+    def _run(self, guard_module, monkeypatch, no_inline, body):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": "src/a.py", "previous_filename": None}),
+        )
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
+        with no_inline:
+            return guard_module._check_inline_review_findings("100")[0]
+
+    # The trailing fence is load-bearing, not decoration: without it the
+    # phantom fence never closes, the unclosed-construct recovery clears the
+    # mask, and the defect hides behind that recovery. A fixture that omits it
+    # passes with and without the fix — proving nothing.
+    _TAIL = "\n\n```\ntrailing\n```\n"
+
+    def _body(self, quoted_delimiter: bool) -> str:
+        middle = "> ```" if quoted_delimiter else "plain"
+        section = _section(_entry("src/a.py", "10-12", "🔴 Critical", "Real critical"))
+        return f"```md\n{middle}\nX\n```\n\n{section}{self._TAIL}"
+
+    def test_a_blockquoted_delimiter_does_not_close_a_document_level_fence(
+        self, guard_module, monkeypatch, no_inline
+    ):
+        # VERIFY-RED: dropping `depth == fence_bq` from the close condition
+        # makes this return False while the control below stays True.
+        assert self._run(guard_module, monkeypatch, no_inline, self._body(True)) is True, (
+            "a Critical must still block when the body quotes a fence delimiter "
+            "inside a fenced block"
+        )
+
+    def test_the_control_blocks_too(self, guard_module, monkeypatch, no_inline):
+        """The pair is the evidence: without a control that also blocks, a
+        green result cannot distinguish the fix from a fixture that never
+        exercised the mask at all."""
+        assert self._run(guard_module, monkeypatch, no_inline, self._body(False)) is True
+
+    def test_a_quoted_delimiter_leaves_the_fence_open_in_the_mask(self, guard_module):
+        """The same property one layer down, where it is directly observable:
+        the lines after the quoted delimiter stay masked."""
+        text, depths = guard_module._cr_normalize_review_body("```md\n> ```\nX\n```\nafter\n")
+        fence_mask, _ = guard_module._cr_masks(text, depths)
+        assert depths == [0, 1, 0, 0, 0, 0], "the blockquote depth must survive stripping"
+        assert fence_mask[:4] == [True, True, True, True], (
+            "the quoted delimiter is CONTENT, so the fence spans through the real closer"
+        )
+        assert fence_mask[4] is False, "and ends after it"
+
+    def test_the_mask_is_unchanged_for_callers_that_pass_no_depths(self, guard_module):
+        """`_cr_masks`'s other caller reads text no quote prefix was stripped
+        from. Depths default to zero there, which must be exactly the old
+        behaviour — a shared mask that changed under one caller would be the
+        two-implementations bug this parser already paid for once."""
+        body = "```md\nX\n```\nafter\n"
+        assert guard_module._cr_masks(body) == guard_module._cr_masks(body, None)
+
+
+class TestSectionDepthDrift:
+    """A depth pin that cannot notice when it stops holding is a vacuous green.
+
+    `_CR_SECTION_DEPTH` is a MEASURED constant of a document nobody controls
+    (23/23 live bodies put the section at depth 1). The count reconciliation
+    cannot backstop it, because `declared` is read from the SAME match that
+    licenses parsing: a section one `<details>` deeper yields declared ==
+    parsed == 0 — a clean read, silently, on every PR (adversarial audit,
+    PR #1847).
+    """
+
+    def test_a_section_nested_one_level_deeper_is_reported_not_ignored(
+        self, guard_module, monkeypatch, no_inline
+    ):
+        # VERIFY-RED: without the canary this returns block=False with an empty
+        # message — the whole channel silently switched off by third-party
+        # layout drift.
+        nested = (
+            "<details>\n<summary>Wrapper</summary><blockquote>\n\n"
+            + _section(_entry("src/a.py", "1-2", "🔴 Critical", "Hidden"))
+            + "\n\n</blockquote></details>"
+        )
+        entries, declared, _, drift = guard_module._cr_outside_diff_entries(nested)
+        assert (entries, declared) == ([], 0), "precondition: the section is not matched"
+        assert drift, "and that must be REPORTED rather than read as a clean body"
+
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(nested))
+        with no_inline:
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block is True
+        assert "unexpected" in msg or "depth" in msg
+
+    def test_a_section_at_the_expected_depth_reports_no_drift(self, guard_module):
+        """The negative control. Without it, a canary that fired on every body
+        would pass the test above while blocking every merge."""
+        body = _section(_entry("src/a.py", "1-2", "🟡 Minor", "Ordinary"))
+        entries, _, _, drift = guard_module._cr_outside_diff_entries(body)
+        assert entries and not drift
+
+    def test_a_section_name_in_prose_at_the_wrong_depth_is_not_drift(self, guard_module):
+        """The canary keys on real STRUCTURE, so prose mentioning the section
+        cannot trip it — otherwise a finding that quotes the section name would
+        block the merge on its own description."""
+        body = _section(
+            "<details>\n<summary>src/a.py (1)</summary><blockquote>\n\n"
+            "`1-2`: _cat_ | _🟡 Minor_ | _e_\n\n**Talks about it**\n\n"
+            "See the Outside diff range comments section for context.\n\n"
+            "</blockquote></details>"
+        )
+        entries, _, _, drift = guard_module._cr_outside_diff_entries(body)
+        assert entries and not drift

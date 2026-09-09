@@ -103,6 +103,7 @@ import base64
 import contextlib
 import datetime as _dt
 import hashlib
+import html
 import json
 import os
 import re
@@ -1314,7 +1315,9 @@ def _cr_markup_mask(body: str) -> list[bool]:
     return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
 
 
-def _cr_masks(body: str) -> tuple[list[bool], list[bool]]:
+def _cr_masks(
+    body: str, bq_depths: list[int] | None = None
+) -> tuple[list[bool], list[bool]]:
     """``(fence_mask, details_mask)`` per line — the two kept SEPARATE.
 
     Per line: True when it sits inside a fenced block or a ``<details>`` section.
@@ -1345,9 +1348,16 @@ def _cr_masks(body: str) -> tuple[list[bool], list[bool]]:
     fence_char: str | None = None
     fence_len = 0
     fence_opened_at: int | None = None
+    # The blockquote depth the OPEN fence was opened at. A renderer scopes a
+    # fence to its container, so only a delimiter in the SAME container can
+    # close it; `bq_depths` is None for callers reading text that never had a
+    # quote prefix stripped, and every depth is then 0, which is exactly the
+    # previous behaviour.
+    fence_bq = 0
     details_depth = 0
     details_opened_at: int | None = None
     for idx, line in enumerate(lines):
+        depth = bq_depths[idx] if bq_depths is not None and idx < len(bq_depths) else 0
         stripped = line.strip()
         # CommonMark gives fence DELIMITERS at most three leading spaces; a
         # 4+-space-indented backtick run is code CONTENT. Stripping first and
@@ -1359,7 +1369,13 @@ def _cr_masks(body: str) -> tuple[list[bool], list[bool]]:
             run, info = fence.group(1), fence.group(2).strip()
             if fence_char is None:
                 fence_char, fence_len, fence_opened_at = run[0], len(run), idx
-            elif run[0] == fence_char and len(run) >= fence_len and not info:
+                fence_bq = depth
+            elif (
+                depth == fence_bq
+                and run[0] == fence_char
+                and len(run) >= fence_len
+                and not info
+            ):
                 # CommonMark: a closing fence uses the SAME character, is at
                 # least as long as the opener, and carries NO info string.
                 # Toggling on any fence line broke on CodeRabbit's own output:
@@ -1622,22 +1638,43 @@ def _cr_mask_inline_code_lines(lines: list[str]) -> list[str]:
     return masked
 
 
-def _cr_normalize_review_body(body: str) -> str:
-    """Review-body text with line separators and blockquote prefixes normalised.
+def _cr_normalize_review_body(body: str) -> tuple[str, list[int]]:
+    """``(text, blockquote_depths)`` — separators and quote prefixes normalised.
 
     Both normalisations are STRUCTURAL — they make the document read the way a
     markdown renderer reads it — and both are applied BEFORE any mask or split,
     so every downstream index (fence mask, depths, line list) stays aligned.
 
-    This is not the "never normalise before a blind-spot probe" case: nothing
-    here deletes evidence a probe is looking for. It converts separators the
-    shell/JSON layer really emits into the one this parser splits on, and
-    removes a quoting prefix that was hiding structure FROM the safety mask —
-    the opposite direction.
+    THE DEPTHS ARE RETURNED, NOT DISCARDED, and that is the whole point of the
+    second return value. Stripping the prefix is right — it is what let the
+    mask see structure that quoting had hidden — but the prefix also carries
+    the line's CONTAINER, and a renderer scopes a fence to its container. Drop
+    that and a quoted ``> ``` `` line, which a renderer treats as ordinary
+    CONTENT inside a document-level fence (it cannot close one: the ``>`` is
+    not indentation), becomes a valid closer here. The mask then INVERTS: the
+    real closer opens a phantom fence, everything after it is masked, and the
+    masked region includes the section header carrying the declared count — so
+    ``declared`` and ``parsed`` are both 0 and NO canary fires. Verified
+    end-to-end against a control: a floor-class Critical went from blocking to
+    not blocking, silently (adversarial audit, PR #1847). Depth travels with
+    the text so `_cr_masks` can bind each delimiter to the container that
+    opened it.
+
+    This remains far from the "never normalise before a blind-spot probe" case:
+    nothing here deletes evidence a probe looks for. The lesson is narrower and
+    sharper — normalising away a CONTAINER MARKER is not free, because the
+    marker is what scopes the constructs inside it.
     """
     for sep in _CR_LINE_SEPARATORS:
         body = body.replace(sep, "\n")
-    return "\n".join(_CR_BLOCKQUOTE_RE.sub("", line) for line in body.split("\n"))
+    lines = body.split("\n")
+    depths = []
+    stripped = []
+    for line in lines:
+        prefix = _CR_BLOCKQUOTE_RE.match(line)
+        depths.append(prefix.group(0).count(">") if prefix else 0)
+        stripped.append(_CR_BLOCKQUOTE_RE.sub("", line))
+    return "\n".join(stripped), depths
 
 
 def _cr_details_depths(lines: list[str], fence_mask: list[bool]) -> list[int]:
@@ -1768,14 +1805,15 @@ def _cr_outside_diff_entries(
     out: list[tuple[str, str, str, str]] = []
     declared = 0
     declared_known = True
-    body = _cr_normalize_review_body(body)
+    depth_drift: list[str] = []
+    body, bq_depths = _cr_normalize_review_body(body)
     lines = body.split("\n")
     # FENCE half only. A review body is a code-bearing document: it quotes diffs
     # and embeds ```suggestion blocks, so a `<summary>` or an entry line inside a
     # fence is QUOTED CONTENT, not structure. The DETAILS half is deliberately
     # NOT applied — these findings sit two <details> deep by construction, so the
     # union mask would hide every real one.
-    fence_mask, _details_mask = _cr_masks(body)
+    fence_mask, _details_mask = _cr_masks(body, bq_depths)
     depths = _cr_details_depths(lines, fence_mask)
     structural = _cr_summary_structural(lines, fence_mask)
     current_file: str | None = None
@@ -1798,6 +1836,25 @@ def _cr_outside_diff_entries(
         # at depth 1 and file summaries at depth 2, without exception. Injected
         # text sits deeper, or inside a fence, and now matches neither role.
         section = _CR_SECTION_RE.search(line)
+        if (
+            section
+            and structural[pos]
+            and depths[pos] != _CR_SECTION_DEPTH
+            and section.group(1) == "Outside diff range comments"
+        ):
+            # REAL STRUCTURE at an unexpected level. The depth pin is a
+            # MEASURED constant of a document nobody controls (23/23 live
+            # bodies put a section at depth 1), and the reconciliation cannot
+            # notice when it stops holding: `declared` is read from the same
+            # match that licenses parsing, so a section one <details> deeper
+            # yields declared == parsed == 0 — a silent clean read, on every
+            # PR, forever. That is the vacuous green this whole channel exists
+            # to remove, reintroduced one layer up (adversarial audit, #1847).
+            # Reported as a shortfall so the caller BLOCKS as unreadable.
+            # Prose and fenced mentions cannot reach here: `structural` already
+            # requires a real <details> opener adjacent to the tag.
+            depth_drift.append(f"outside-diff section at <details> depth {depths[pos]}")
+            continue
         if section and structural[pos] and depths[pos] == _CR_SECTION_DEPTH:
             in_section = section.group(1) == "Outside diff range comments"
             current_file = None
@@ -1812,7 +1869,16 @@ def _cr_outside_diff_entries(
             continue
         header = _CR_FILE_HEADER_RE.search(line)
         if header and structural[pos] and depths[pos] == _CR_FILE_DEPTH:
-            current_file = header.group(1).strip()
+            # UNESCAPED, because this string is an IDENTITY, not display text:
+            # it is compared against the raw path GitHub returns, by `_off_diff`
+            # and `_is_doc_path`. A path holding a markup-significant character
+            # arrives HTML-escaped inside the summary (`docs/Q&amp;A.md`,
+            # `src/a&lt;b.py`), so the comparison failed and routed even a
+            # Critical to the non-scoring off-diff lane — a merge allowed on a
+            # finding that was read correctly and then attributed to nobody
+            # (Codex P2, PR #1847). `&` is the likely one in practice; `<` is
+            # the one that is obvious.
+            current_file = html.unescape(header.group(1).strip())
             continue
         entry = _CR_ENTRY_RE.search(line)
         if entry and current_file is not None:
@@ -1839,7 +1905,7 @@ def _cr_outside_diff_entries(
                     title = bold.group(1).strip()[:120]
                     break
             out.append((current_file, entry.group(1), severity or "", title))
-    return out, declared, declared_known
+    return out, declared, declared_known, depth_drift
 
 
 _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -2303,7 +2369,9 @@ def _check_inline_review_findings(
     # shipped: 15 Major, 12 Minor, 0 Critical.
     outside_block: list[tuple[str, str]] = []  # Critical — scores 1.0
     outside_major: list[tuple[str, str]] = []  # Major — surfaced loudly, 0.0
-    outside_minor: list[tuple[str, str]] = []  # below Major — surfaced, 0.0
+    # (label, path, severity) — the severity is carried so the report can
+    # name the level the reviewer gave rather than one bucket for all of them.
+    outside_minor: list[tuple[str, str, str]] = []  # below Major — surfaced, 0.0
     # A body that declares more findings than this parser read: an INCOMPLETE
     # scan, which blocks like any other incomplete read.
     outside_shortfall: list[str] = []
@@ -2349,7 +2417,15 @@ def _check_inline_review_findings(
             continue
         if (review.get("login") or "") not in _CODERABBIT_LOGINS:
             continue
-        parsed, declared, declared_known = _cr_outside_diff_entries(review.get("body") or "")
+        parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
+            review.get("body") or ""
+        )
+        # A section found as REAL STRUCTURE at an unexpected <details> depth is
+        # a layout change in a document we do not control. Nothing else can see
+        # it — the count reconciliation reads its numbers from the very match
+        # this drift prevents — so it blocks as unreadable rather than letting
+        # the scan report clean.
+        outside_shortfall.extend(depth_drift)
         if declared_known and len(parsed) > declared:
             # The OTHER direction of the same reconciliation: more entries than
             # the body's own headers declare means prose was mis-parsed as a
@@ -2416,7 +2492,12 @@ def _check_inline_review_findings(
         elif severity == "major":
             outside_major.append((label, path))
         else:
-            outside_minor.append((label, path))
+            # Keep the level the reviewer actually assigned. Collapsing
+            # Info and Trivial into "Minor" costs nothing in SCORE — all three
+            # are 0.0 — but the report is an inventory, and an inventory that
+            # rounds a level UP overstates the reviewer and misinforms the
+            # operator deciding what to spend time on (Codex P3, PR #1847).
+            outside_minor.append((label, path, severity))
 
     if outside_block or outside_major or outside_minor:
         blocking = len(outside_block)
@@ -2439,8 +2520,8 @@ def _check_inline_review_findings(
             print(f"  [outside-diff Critical] {label}", file=sys.stderr)
         for label, _p in outside_major[:8]:
             print(f"  [outside-diff Major] {label}", file=sys.stderr)
-        for label, _p in outside_minor[:5]:
-            print(f"  [outside-diff Minor] {label}", file=sys.stderr)
+        for label, _p, sev in outside_minor[:5]:
+            print(f"  [outside-diff {sev.capitalize() or 'Minor'}] {label}", file=sys.stderr)
 
     if unmatched_bot:
         print(
