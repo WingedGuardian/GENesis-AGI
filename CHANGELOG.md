@@ -89,6 +89,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The desktop-takeover design is now documented in the repository**
+  (`docs/architecture/desktop-takeover-design.md`), rewritten against what was
+  actually built rather than what was originally proposed. Three claims from the
+  pre-build draft are corrected in place rather than deleted, because the
+  corrections are the useful part: the three things it said "must be built, not
+  inherited" from the existing approval gate were all unnecessary once the two
+  gates' differing topologies were read; its central stated weakness — that the
+  gate must classify the loop's own description of its intent, and so depends on
+  the loop's honesty — was designed out by classifying the target the actuator
+  resolved; and its recommendation to exclude dispatched sessions with a data
+  rule described a rule that could never fire, so the invariant lives in code.
+
+  The document also states three things the design does *not* guarantee, which
+  the sections above it would otherwise imply: the grant predicate bounds the
+  application layer and not a same-uid database writer, the classifier is not a
+  boundary against adversarial UI, and the capability cell can deny but never
+  grant. Install-specific material was removed for a public tree.
+
+- **`docs/INDEX.md` no longer links to nine documents that do not exist.** It
+  advertised per-feature spec files under `docs/plans/` for every V4 and V5
+  feature; that directory has never been in this repository, so each was a 404
+  for anyone following the index. The features are specified inside the V4 and
+  V5 architecture documents, which do exist, and the index now says so. One
+  further broken link (a legacy page pointing at `CHANGELOG.md` from two
+  directories down) is fixed in the same pass. A sweep of every relative link
+  in `docs/` and `README.md` now returns zero broken.
+
 - **The desktop-takeover authorization gate, shipped before anything can call
   it.** `autonomy/desktop_gate.py` is the deterministic check that would stand
   between Genesis and the operator's own keyboard, mouse and screen. Nothing
