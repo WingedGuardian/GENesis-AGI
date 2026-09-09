@@ -222,3 +222,39 @@ def test_knob_bool_is_silent_when_the_key_is_absent(caplog):
     with caplog.at_level(logging.WARNING):
         assert rpc.knob_bool({}, "verification_enabled") is True
     assert "not a boolean" not in caplog.text, "an absent key must not warn on every run"
+
+
+# ── The bool-knob registry is a CHOKEPOINT, not a convention ────────────────
+# A lane switch shipped that `config/repo_pulse.yaml` advertised and the
+# settings API rejected as an unknown key: the validator carried its own
+# hand-written tuple of boolean names and nobody updated it (Codex P2, #1836).
+# The population fix is one shared `_BOOL_KNOBS`; these lock it, so adding a
+# bool to DEFAULTS without registering it fails HERE rather than at an
+# operator's keyboard.
+
+
+def test_every_boolean_default_is_a_registered_bool_knob():
+    """VERIFY-RED: drop any name from `_BOOL_KNOBS` and this fails."""
+    bool_defaults = {k for k, v in rpc.DEFAULTS.items() if isinstance(v, bool)}
+    assert bool_defaults == set(rpc._BOOL_KNOBS), (
+        "every boolean knob in DEFAULTS must be registered in _BOOL_KNOBS — "
+        "the settings validator derives its valid keys from it"
+    )
+
+
+def test_the_settings_validator_accepts_every_registered_bool_knob():
+    """The lever the config file advertises must be operable through the API."""
+    for knob in rpc._BOOL_KNOBS:
+        assert _validate_repo_pulse({knob: False}) == [], f"{knob} must be settable"
+        assert _validate_repo_pulse({knob: True}) == []
+
+
+def test_the_settings_validator_still_rejects_a_non_boolean():
+    """Registering a key must not weaken its TYPE check."""
+    errors = _validate_repo_pulse({"verification_enabled": "false"})
+    assert errors and "must be a boolean" in errors[0]
+
+
+def test_the_settings_validator_still_rejects_an_unknown_key():
+    errors = _validate_repo_pulse({"no_such_knob": True})
+    assert errors and "Unknown key" in errors[0]

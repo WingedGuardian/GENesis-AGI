@@ -112,10 +112,21 @@ def _read_cursor(root: Path) -> dict:
             return data
     except Exception:
         pass
-    return {"last_merged_at": None, "last_run_ts": None, "runs": 0}
+    return {
+        "last_merged_at": None,
+        "last_run_ts": None,
+        "runs": 0,
+        "verification_through": None,
+    }
 
 
-def _write_cursor(root: Path, prior: dict, *, merged_at: str | None) -> None:
+def _write_cursor(
+    root: Path,
+    prior: dict,
+    *,
+    merged_at: str | None,
+    verification_through: str | None = None,
+) -> None:
     """Update the cursor after a RECORDED run.
 
     ``last_merged_at`` holds gh's own mergedAt strings (one consistent
@@ -124,16 +135,30 @@ def _write_cursor(root: Path, prior: dict, *, merged_at: str | None) -> None:
     when ``merged_at`` is passed (ok runs); failed/no_new_prs runs update
     only ``last_run_ts`` (the debounce basis) + the run counter. ``prior``
     was read under the flock, so max() against it is race-free.
+
+    ``verification_through`` is the PR-verification lane's OWN watermark, and
+    it exists because that lane can be switched off independently while the
+    shared cursor keeps advancing (Codex P2, PR #1836). With one cursor, every
+    PR merged during a `verification_enabled: false` window fell permanently
+    behind it: the lane never saw those PRs again, so the one-row-per-merged-PR
+    invariant broke for good — silently, since nothing reports a row that was
+    never opened. It advances ONLY on a tick where the lane actually ran to
+    completion, so a disabled (or failed) lane leaves it standing while
+    ``last_merged_at`` moves on.
     """
     last = prior.get("last_merged_at")
     if merged_at is not None:
         last = max(str(last), merged_at) if last else merged_at
+    verif = prior.get("verification_through")
+    if verification_through is not None:
+        verif = max(str(verif), verification_through) if verif else verification_through
     _atomic_write_json(
         root / CURSOR_FILENAME,
         {
             "last_merged_at": last,
             "last_run_ts": _now(),
             "runs": int(prior.get("runs") or 0) + 1,
+            "verification_through": verif,
         },
     )
 
@@ -590,6 +615,16 @@ async def _run_locked(
         return {"status": "debounced"}
 
     cursor_before = cursor.get("last_merged_at")
+    # The verification lane's own watermark (see `_write_cursor`). ABSENT is
+    # deliberately NOT read as "caught up": on the first tick after this ships
+    # it leaves the lane's window at the ordinary lookback, so PRs stranded by
+    # an earlier disabled window are re-covered rather than written off. That
+    # re-coverage is free of side effects — the (repo, pr_number) unique index
+    # dedups, and the lane's `exists` pre-check skips the API call per already
+    # recorded PR — and it is bounded by `lookback_days`, so it can never walk
+    # all history. PRs stranded LONGER than the lookback stay stranded; that is
+    # a stated limit of the self-heal, not a claim it cannot happen.
+    verification_before = cursor.get("verification_through")
     now_iso = _now()
     detail_notes: list[str] = []
 
@@ -644,7 +679,18 @@ async def _run_locked(
         row.update(over)
         return row
 
-    since = _since_date(cursor_before, lookback_days or knob_int(cfg, "lookback_days"))
+    # The fetch window must cover the EARLIER of the two watermarks, or the
+    # verification lane could never see a PR the shared cursor already passed
+    # — the re-coverage above would be a window that never contains anything.
+    # When the lane is disabled its watermark is irrelevant: nothing will read
+    # those PRs, so paying for a wider gh query would be waste.
+    verification_on = knob_bool(cfg, "verification_enabled")
+    fetch_from = cursor_before
+    if verification_on and (verification_before is None or not cursor_before):
+        fetch_from = None  # fall back to the plain lookback (bounded)
+    elif verification_on and verification_before:
+        fetch_from = min(str(cursor_before), str(verification_before))
+    since = _since_date(fetch_from, lookback_days or knob_int(cfg, "lookback_days"))
     max_prs = knob_int(cfg, "max_prs")
     # Pagination on capped windows: GitHub search can't sort by mergedAt
     # ascending, so a single capped call may silently drop OLDER PRs in the
@@ -703,13 +749,33 @@ async def _run_locked(
         ),
         key=lambda p: str(p["mergedAt"]),
     )
-    if not prs:
+    # The verification lane's window, derived from ITS watermark rather than
+    # the shared cursor (see `_write_cursor`). Computed HERE, above the
+    # no-new-PRs early return, because the recovery case is precisely the one
+    # where the shared cursor has passed every fetched PR and this lane has
+    # not: returning early on `not prs` would skip the lane on exactly the
+    # ticks it exists to catch up on, leaving the fix inert.
+    verif_prs: list[dict] = []
+    if verification_on:
+        verif_prs = sorted(
+            (
+                p
+                for p in prs_by_number.values()
+                if not verification_before or str(p["mergedAt"]) > str(verification_before)
+            ),
+            key=lambda p: str(p["mergedAt"]),
+        )
+    if not prs and not verif_prs:
         recorded = await _record_run(db_path, **_base_row(status="no_new_prs", repo=repo, n_prs=0))
         if recorded:
             _write_cursor(root, cursor, merged_at=None)
         await _record_telemetry(db_path, "no_new_prs", f"repo={repo}")
         return {"status": "no_new_prs"}
-    new_max_merged = max(str(p["mergedAt"]) for p in prs)
+    # `new_max_merged` stays the SHARED cursor's advance and is therefore
+    # derived from `prs` alone — a lane-only tick (nothing new for the other
+    # lanes) must not move it. None means "do not advance", which
+    # `_write_cursor` already honours.
+    new_max_merged = max((str(p["mergedAt"]) for p in prs), default=None)
 
     open_items = await _load_open_items(db_path)
     if open_items is None:
@@ -1065,12 +1131,18 @@ async def _run_locked(
     # visible in detail and the rows self-heal on the next tick that sees the
     # same PRs; PRs the cursor has passed are backfilled by nothing, which is
     # why the failure note matters.
-    if knob_bool(cfg, "verification_enabled"):
+    verif_through: str | None = None
+    if verification_on:
         verif_complete = True
+        # `verif_prs` was derived above the no-new-PRs early return — the lane
+        # reads from its OWN watermark, not the shared cursor, and those two
+        # diverge exactly when it was off (or failed) while the cursor moved.
         try:
             n_verif_open, n_verif_autoclosed, verif_complete = await _verification_lane(
-                db_path, prs, repo, now_iso
+                db_path, verif_prs, repo, now_iso
             )
+            if verif_complete and verif_prs:
+                verif_through = max(str(p["mergedAt"]) for p in verif_prs)
             if n_verif_open or n_verif_autoclosed:
                 detail_notes.append(
                     f"verification opened={n_verif_open} auto-closed={n_verif_autoclosed}"
@@ -1172,8 +1244,13 @@ async def _run_locked(
         **_base_row(
             status="ok",
             repo=repo,
+            # `new_max_merged` is None on a lane-only tick (the verification
+            # lane had work, the other lanes did not), and max(str, None)
+            # raises — so the unchanged cursor is reported as itself.
             cursor_after=(
-                max(str(cursor_before), new_max_merged) if cursor_before else new_max_merged
+                max(str(cursor_before), new_max_merged)
+                if cursor_before and new_max_merged
+                else (new_max_merged or cursor_before)
             ),
             n_prs=len(prs),
             n_open_items=len(open_items),
@@ -1185,7 +1262,11 @@ async def _run_locked(
         annotations=annotations,
     )
     if recorded:
-        _write_cursor(root, cursor, merged_at=new_max_merged)
+        # `verif_through` is None on any tick where the lane did not run to
+        # completion over its own window — disabled, failed, or nothing new —
+        # and `_write_cursor` then leaves that watermark standing while the
+        # shared cursor advances. That asymmetry IS the fix.
+        _write_cursor(root, cursor, merged_at=new_max_merged, verification_through=verif_through)
     else:
         detail_notes.append("pulse_write_failed_cursor_preserved")
     await _record_telemetry(

@@ -180,8 +180,15 @@ def _cursor(root: Path) -> dict:
 
 def _write_cursor_file(root: Path, **data):
     root.mkdir(parents=True, exist_ok=True)
+    # `verification_through` mirrors `last_merged_at` unless a test overrides
+    # it: these tests are about the SHARED cursor, and an absent lane watermark
+    # deliberately means "re-cover the lookback" (#1836), which would otherwise
+    # make every such fixture exercise the verification lane's recovery path by
+    # accident instead of the behaviour it names. The recovery path has its own
+    # tests in test_repo_pulse_verification_lane.py.
     base = {"last_merged_at": None, "last_run_ts": None, "runs": 0}
     base.update(data)
+    base.setdefault("verification_through", base.get("last_merged_at"))
     (root / rpw.CURSOR_FILENAME).write_text(json.dumps(base))
 
 

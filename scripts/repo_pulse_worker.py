@@ -61,7 +61,16 @@ def _print_verification_backlog(db_path: str | None) -> None:
         # then truthfully report it as empty. `mode=ro` (not `immutable=1`) is
         # the WAL-aware read-only form — `immutable` ignores the -wal file and
         # would miss rows the worker committed moments earlier.
-        async with aiosqlite.connect(f"file:{resolved}?mode=ro", uri=True, timeout=10) as db:
+        #
+        # The URI is BUILT, never interpolated. `?` and `#` are legal POSIX
+        # filename characters with URI meaning, so an f-string let SQLite parse
+        # part of a real path as a query or fragment: it opened a different,
+        # shorter path — and could swallow `mode=ro` itself, turning the
+        # report-only guarantee above into a read-write handle that CREATES
+        # that unintended file, while the existence check above had validated
+        # the original path and said nothing (Codex P2, PR #1836).
+        uri = f"{Path(resolved).absolute().as_uri()}?mode=ro"
+        async with aiosqlite.connect(uri, uri=True, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             return await verif_crud.list_open(db), await verif_crud.counts(db)
@@ -72,7 +81,15 @@ def _print_verification_backlog(db_path: str | None) -> None:
         return
     for row in rows:
         title = (row.get("pr_title") or "").strip()
-        print(f"OPEN  PR #{row['pr_number']}  merged {str(row['merged_at'])[:10]}  {title[:80]}")
+        # The row's identity is (repo, pr_number), so printing the number alone
+        # is a partial key: two repos — a fork, or a rename — can both hold a
+        # PR #12, and the reader could neither tell which row was pending nor
+        # supply the `repo` argument `close_verification` requires without
+        # going to SQLite (Codex P2, PR #1836).
+        print(
+            f"OPEN  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
+            f"merged {str(row['merged_at'])[:10]}  {title[:80]}"
+        )
     # `list_open` has its own row cap, so the lines above can be a SUBSET while
     # the histogram below reports the true total — printing both without saying
     # so lets the two numbers disagree in silence, and a reader who counts the

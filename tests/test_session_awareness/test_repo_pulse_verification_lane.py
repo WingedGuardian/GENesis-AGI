@@ -401,3 +401,100 @@ async def test_a_lane_exception_also_keeps_the_cursor(pulse_root, db_path, monke
     out = await _run(db_path, monkeypatch, gh=_gh([_pr(90)]), files=boom)
     assert out["status"] == "failed"
     assert (await _cursor(pulse_root))["last_merged_at"] is None
+
+
+# ── The lane's OWN watermark ─────────────────────────────────────────────────
+# THE DEFECT (Codex P2, #1836): the lane could be switched off independently
+# while the SHARED cursor kept advancing, so every PR merged during a
+# `verification_enabled: false` window fell permanently behind it — the lane
+# never saw those PRs again and the one-row-per-merged-PR invariant broke for
+# good, silently, because nothing reports a row that was never opened. The fix
+# is a second watermark that advances only on a tick where the lane actually
+# ran. These replay the three-phase sequence end-to-end, which is the only
+# shape that exercises it: a single-run test cannot see a cursor divergence.
+
+
+@pytest.mark.asyncio
+async def test_a_pr_merged_while_the_lane_was_off_still_gets_its_row(
+    pulse_root, db_path, monkeypatch
+):
+    """ACCEPTANCE BAR — the reported defect, replayed in all three phases."""
+    cfg = dict(DEFAULTS)
+    monkeypatch.setattr(rpw, "load_config", lambda: cfg)
+
+    # Phase 1: lane ON, PR 70 merges and is recorded.
+    files = _files({70: {"files": ["src/a.py"]}})
+    assert (await _run(db_path, monkeypatch, gh=_gh([_pr(70)]), files=files))["status"] == "ok"
+    assert [r["pr_number"] for r in await _rows(db_path)] == [70]
+
+    # Phase 2: lane OFF. PR 71 merges. The SHARED cursor advances past it —
+    # that is correct for every other lane, and is exactly what used to
+    # strand this one.
+    cfg["verification_enabled"] = False
+    out = await _run(
+        db_path, monkeypatch, gh=_gh([_pr(70), _pr(71, merged="2026-09-07T10:00:00Z")]),
+        files=_files({}),
+    )
+    assert out["status"] == "ok"
+    assert [r["pr_number"] for r in await _rows(db_path)] == [70], "lane off: no new row"
+    cursor = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
+    assert cursor["last_merged_at"] == "2026-09-07T10:00:00Z", "shared cursor advanced"
+    assert cursor["verification_through"] == MERGED, "the lane's watermark did NOT"
+
+    # Phase 3: lane back ON. VERIFY-RED: with one shared cursor, PR 71 is
+    # already behind it and this run creates nothing — the permanent hole.
+    cfg["verification_enabled"] = True
+    files3 = _files({71: {"files": ["src/b.py"]}})
+    out = await _run(
+        db_path, monkeypatch,
+        gh=_gh([_pr(70), _pr(71, merged="2026-09-07T10:00:00Z")]), files=files3,
+    )
+    assert out["status"] == "ok"
+    assert [r["pr_number"] for r in await _rows(db_path)] == [70, 71], (
+        "the PR merged while the lane was off must still get its row"
+    )
+    assert files3.calls == [71], "and PR 70 must cost no second API call"
+
+
+@pytest.mark.asyncio
+async def test_the_watermark_holds_when_the_lane_cannot_complete(
+    pulse_root, db_path, monkeypatch
+):
+    """A FAILED lane must leave its watermark standing, like a disabled one.
+
+    Same hole by a different route: the run fails and keeps the shared cursor
+    today, but the watermark must not advance either, or a later successful
+    run would start past the PR that failed.
+    """
+
+    async def boom(pr_number, *, repo, runner=None):
+        raise RuntimeError("gh exploded")
+
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(72)]), files=boom)
+    assert out["status"] == "failed"
+    cursor = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
+    assert cursor.get("verification_through") is None
+    assert await _rows(db_path) == []
+
+
+@pytest.mark.asyncio
+async def test_an_absent_watermark_recovers_rather_than_writing_the_gap_off(
+    pulse_root, db_path, monkeypatch
+):
+    """First tick after this ships: the watermark is absent because the cursor
+    file predates it. Absent must NOT read as 'caught up' — the PRs stranded
+    by an earlier disabled window are inside the lookback and must be
+    re-covered."""
+    rpw._atomic_write_json(
+        pulse_root / rpw.CURSOR_FILENAME,
+        {"last_merged_at": "2026-09-07T10:00:00Z", "last_run_ts": None, "runs": 3},
+    )
+    files = _files({73: {"files": ["src/c.py"]}})
+    out = await _run(
+        db_path, monkeypatch, gh=_gh([_pr(73, merged="2026-09-06T10:00:00Z")]), files=files
+    )
+    assert out["status"] == "ok"
+    assert [r["pr_number"] for r in await _rows(db_path)] == [73], (
+        "a PR BEHIND the shared cursor must still be recorded on the first "
+        "tick, or the deploy writes off the very gap it fixes"
+    )

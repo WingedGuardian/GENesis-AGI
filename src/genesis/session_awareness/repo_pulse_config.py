@@ -65,6 +65,19 @@ DEFAULTS: dict[str, Any] = {
     "open_pr_max_surface": 5,  # max PRs shown inline per session
 }
 
+# Every BOOLEAN knob, in one place, for the same reason `_INT_KNOBS` exists:
+# the settings validator and this module must not each carry their own list.
+# They did, and a lane switch shipped that the settings API rejected as an
+# unknown key — advertised in the config file, reachable only by hand-editing
+# the yaml (Codex P2, PR #1836). Adding a bool knob to DEFAULTS without adding
+# it here is now the only way to repeat that, and the coverage test below
+# fails on exactly that.
+_BOOL_KNOBS = (
+    "enabled",
+    "open_pr_enabled",
+    "verification_enabled",
+)
+
 _INT_KNOBS = (
     "min_interval_minutes",
     "lookback_days",
