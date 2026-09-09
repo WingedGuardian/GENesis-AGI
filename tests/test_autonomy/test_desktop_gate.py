@@ -16,6 +16,7 @@ import pytest
 
 from genesis.autonomy import desktop_gate as dg
 from genesis.autonomy.approval import ApprovalManager
+from genesis.autonomy.classification import DesktopAction, DesktopOperation
 from genesis.autonomy.desktop_gate import (
     DESKTOP_GATE_ACTION_TYPE,
     DesktopTakeoverGate,
@@ -29,6 +30,11 @@ from genesis.db.schema import create_all_tables
 _SESSION = "sess-abc"
 _WINDOW = "Notepad"
 _TS = "2026-06-21T00:00:00+00:00"
+#: Window IDENTITY is the (handle, pid) pair. The title is display only — two
+#: browser tabs are both "New Tab", and a title changes when its document does.
+_HANDLE = "0x000A1B2C"
+_PID = 4242
+_MISSION_ID = "mis-0001"
 
 
 @pytest.fixture
@@ -58,16 +64,48 @@ def shadow(monkeypatch):
     monkeypatch.setattr(dg, "action_ttl_seconds", lambda: 30)
 
 
-async def _check(db, **kw):
-    """``check()`` with the fixture's session and window filled in.
+def _action(**kw) -> DesktopAction:
+    """A well-formed DesktopAction with the fixture's window filled in.
 
-    The grant is per WINDOW. A test that does not care which window it is
-    acting in must still act inside the GRANTED one — otherwise it silently
-    measures the window bar instead of the thing its name claims.
+    ``control_type`` defaults to a neutral "Button" rather than "": a click
+    with BOTH element_name and control_type blank is an unresolved target and
+    is refused, so a test leaving them empty would measure that refusal instead
+    of whatever it is named for.
     """
-    kw.setdefault("session_id", _SESSION)
+    kw.setdefault("operation", DesktopOperation.CLICK)
+    kw.setdefault("window_handle", _HANDLE)
+    kw.setdefault("process_id", _PID)
     kw.setdefault("window_title", _WINDOW)
-    return await _gate(db).check(**kw)
+    kw.setdefault("element_name", "")
+    kw.setdefault("control_type", "Button")
+    return DesktopAction(**kw)
+
+
+def _classify(**kw):
+    """``classify_desktop_action`` over a well-formed action.
+
+    The classifier takes ONE object now, so the pure tests build one too rather
+    than each re-listing the required fields — which is what let the old
+    all-defaults signature hide a caller that never said what it was doing.
+    """
+    from genesis.autonomy.classification import classify_desktop_action
+
+    return classify_desktop_action(_action(**kw))
+
+
+async def _check(db, **kw):
+    """``check()`` with the fixture's session, mission and window filled in.
+
+    The grant is per (session, mission, window). A test that does not care
+    which of those it is acting under must still act inside the GRANTED one —
+    otherwise it silently measures a scope bar instead of the thing its name
+    claims.
+    """
+    session_id = kw.pop("session_id", _SESSION)
+    mission_id = kw.pop("mission_id", _MISSION_ID)
+    return await _gate(db).check(
+        _action(**kw), session_id=session_id, mission_id=mission_id
+    )
 
 
 def _gate(db):
@@ -80,20 +118,37 @@ async def _grant(
     session_id: str = _SESSION,
     resolved_by: str = "telegram:button:1",
     window_title: str = _WINDOW,
+    window_handle: str = _HANDLE,
+    process_id: int = _PID,
+    mission_id: str = _MISSION_ID,
+    mission: str = "tidy up",
+    context: dict | None = None,
 ) -> str:
-    """Create and resolve a session grant the way the PR-3 consent path will."""
+    """Create and resolve a session grant the way the PR-3 consent path will.
+
+    *context* overrides the whole blob, for the tests that need a malformed or
+    hand-written one.
+    """
     import json
 
     mgr = ApprovalManager(db=db)
+    blob = (
+        context
+        if context is not None
+        else build_session_grant_context(
+            session_id=session_id,
+            mission_id=mission_id,
+            mission=mission,
+            window_handle=window_handle,
+            process_id=process_id,
+            window_title=window_title,
+        )
+    )
     rid = await mgr.request_approval(
         action_type=DESKTOP_GATE_ACTION_TYPE,
         action_class="irreversible",
         description=f"Desktop control of '{window_title}'",
-        context=json.dumps(
-            build_session_grant_context(
-                session_id=session_id, window_title=window_title, mission="tidy up"
-            )
-        ),
+        context=json.dumps(blob),
         timeout_seconds=None,
     )
     await mgr.resolve(rid, status="approved", resolved_by=resolved_by)
@@ -354,40 +409,69 @@ async def test_a_future_dated_grant_does_not_authorise(db, live):
 async def test_a_grant_for_one_window_does_not_authorise_another(db, live):
     """The grant NAMES a window and the consent card reads it back to the
     operator, so an uncompared field would be a promise the card makes and the
-    code does not keep. Found by review: `window_title` was carried and
-    displayed but never compared, so a grant for a text editor authorised
-    actions in an unrelated chat or banking window."""
-    await _grant(db, window_title="Notepad")
+    code does not keep. Found by review: the window was carried and displayed
+    but never compared, so a grant for a text editor authorised actions in an
+    unrelated chat or banking window."""
+    await _grant(db, window_handle="0xAAA1", process_id=100)
 
-    same = await _check(db, window_title="Notepad", element_name="Text Area",
-                        control_type="Edit")
+    same = await _check(db, window_handle="0xAAA1", process_id=100,
+                        element_name="Text Area", control_type="Edit")
     assert same.allow is True, "positive control: the granted window still works"
 
-    for other in ("Slack - #general", "Online Banking", "A Different App"):
-        d = await _check(db, window_title=other, element_name="Text Area",
-                         control_type="Edit")
-        assert d.allow is False, other
-        assert d.reason == "grant_window_mismatch", other
+    for other, pid in (("0xBBB2", 100), ("0xAAA1", 200), ("0xCCC3", 300)):
+        d = await _check(db, window_handle=other, process_id=pid,
+                         element_name="Text Area", control_type="Edit")
+        assert d.allow is False, (other, pid)
+        assert d.reason == "grant_window_mismatch", (other, pid)
 
 
 @pytest.mark.asyncio
-async def test_window_matching_ignores_case_and_surrounding_whitespace(db, live):
-    """Normalisation, and nothing more. Two titles that differ only in case or
-    padding are the same window; anything else is not."""
-    await _grant(db, window_title="Notepad")
-    d = await _check(db, window_title="  notepad  ", element_name="Text Area",
-                     control_type="Edit")
+async def test_two_windows_with_the_SAME_TITLE_do_not_share_a_grant(db, live):
+    """Window identity is (handle, pid), and the title is display only.
+
+    This replaces a retired test that asserted title matching ignored case and
+    padding. That test cannot be written against this design and, worse, it
+    PASSES vacuously here — with the title no longer compared, any title is
+    accepted, so it would go green with the mechanism it named deleted.
+
+    The real hazard the title bar could never catch: two browser tabs are both
+    called "New Tab". Under a title bar they share one grant."""
+    await _grant(db, window_handle="0xTAB1", process_id=900, window_title="New Tab")
+
+    same = await _check(db, window_handle="0xTAB1", process_id=900,
+                        window_title="New Tab", element_name="Link", control_type="Hyperlink")
+    assert same.allow is True, "positive control: the granted tab still works"
+
+    other = await _check(db, window_handle="0xTAB2", process_id=900,
+                         window_title="New Tab", element_name="Link",
+                         control_type="Hyperlink")
+    assert other.allow is False, "an identically-titled sibling tab is a DIFFERENT window"
+    assert other.reason == "grant_window_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_a_title_that_drifts_does_not_revoke_its_own_grant(db, live):
+    """The other direction, and the reason the title cannot be the bar: a
+    window's title changes when the document inside it does. Under a title bar
+    the SAME window stops matching the grant it was given, and the operator is
+    re-asked for a window they never left."""
+    await _grant(db, window_handle="0xDOC1", process_id=901, window_title="Untitled - Notepad")
+    d = await _check(db, window_handle="0xDOC1", process_id=901,
+                     window_title="report-final.txt - Notepad",
+                     element_name="Text Area", control_type="Edit")
     assert d.allow is True
 
 
 @pytest.mark.asyncio
-async def test_an_empty_window_is_a_refusal_not_a_wildcard(db, live):
+async def test_an_empty_window_handle_is_a_malformed_call(db, live):
     """The rule the device already applies to a target it cannot resolve: an
-    absent target is no grant, never every grant."""
-    await _grant(db, window_title="Notepad")
-    d = await _check(db, window_title="", element_name="Text Area")
+    absent target is no grant, never every grant. It is refused as a CALLER
+    defect rather than compared, because a blank handle would otherwise be
+    compared against a blank handle and match."""
+    await _grant(db)
+    d = await _check(db, window_handle="", element_name="Text Area")
     assert d.allow is False
-    assert d.reason == "grant_window_mismatch"
+    assert d.reason == "malformed_action:window_handle"
 
 
 @pytest.mark.asyncio
@@ -397,15 +481,115 @@ async def test_a_grant_naming_no_window_authorises_nothing(db, live):
     rather than trusted."""
     import json
 
-    rid = await _grant(db, window_title="Notepad")
+    rid = await _grant(db)
     await db.execute(
         "UPDATE approval_requests SET context = ? WHERE id = ?",
-        (json.dumps({"kind": dg.SESSION_GRANT_KIND, "session_id": _SESSION}), rid),
+        (
+            json.dumps({
+                "kind": dg.SESSION_GRANT_KIND,
+                "version": dg.SESSION_GRANT_VERSION,
+                "session_id": _SESSION,
+                "mission_id": _MISSION_ID,
+            }),
+            rid,
+        ),
     )
     await db.commit()
-    d = await _check(db, window_title="Notepad", element_name="Text Area")
+    d = await _check(db, element_name="Text Area")
     assert d.allow is False
-    assert d.reason == "grant_window_mismatch"
+    assert d.reason == "grant_malformed"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_with_a_BLANK_window_is_malformed_not_merely_mismatched(db, live):
+    """Isolates the blank-required-field check in ``SessionGrant.parse``.
+
+    The sibling test above omits ``process_id`` entirely, so ``int(None)``
+    raises and parse refuses on the PID check — the blank-field check never
+    decides anything there, and a mutation removing it survived. This fixture
+    supplies a valid pid so the blank handle is the only thing wrong.
+
+    Honest about what this is: the ACTION side of every blank is already
+    refused by ``_validate_call`` (``no_session_id`` / ``no_mission_id`` /
+    ``malformed_action:window_handle``), and a blank grant field can never
+    match a non-blank action field. So this check is defence in depth for
+    ``parse``'s own contract — constructing a SessionGrant IS the validation,
+    and the PR-3 consent path will construct them. It is not the layer holding
+    the security property; the caller-side checks are, and they have their own
+    mutations."""
+    import json
+
+    rid = await _grant(db)
+    ctx = build_session_grant_context(
+        session_id=_SESSION, mission_id=_MISSION_ID, mission="m",
+        window_handle="", process_id=_PID, window_title=_WINDOW,
+    )
+    await db.execute(
+        "UPDATE approval_requests SET context = ? WHERE id = ?", (json.dumps(ctx), rid)
+    )
+    await db.commit()
+    d = await _check(db, element_name="Text Area")
+    assert d.allow is False
+    assert d.reason == "grant_malformed", (
+        "a blank required field makes it not-a-grant, not a grant for elsewhere"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_grant_for_one_mission_does_not_authorise_another(db, live):
+    """Consent is per MISSION. Without this bar, one approval covers whatever
+    the loop decides to do next — the session grant becomes standing authority
+    for anything, which is the shape the window bar exists to prevent one level
+    down."""
+    await _grant(db, mission_id="mis-tidy")
+
+    same = await _check(db, mission_id="mis-tidy", element_name="Text Area",
+                        control_type="Edit")
+    assert same.allow is True, "positive control: the granted mission still works"
+
+    other = await _check(db, mission_id="mis-something-else",
+                         element_name="Text Area", control_type="Edit")
+    assert other.allow is False
+    assert other.reason == "grant_mission_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_the_mission_is_bound_by_ID_not_by_its_PROSE(db, live):
+    """The negative control for the bar above, and the reason it binds an id.
+
+    Mission text is model-generated and is rewritten on every re-plan. Binding
+    the prose would revoke a grant every time the loop rephrased its own plan —
+    the window-title failure, one level up."""
+    await _grant(db, mission_id="mis-tidy", mission="tidy up the desktop")
+    d = await _check(db, mission_id="mis-tidy", element_name="Text Area",
+                     control_type="Edit")
+    assert d.allow is True, "same mission id, differently-worded plan, still granted"
+
+
+@pytest.mark.asyncio
+async def test_a_blank_session_id_does_not_match_a_blank_grant(db, live):
+    """SQLite says `'' = ''`, so a grant carrying an empty session id would
+    authorise a caller carrying an empty one. An ABSENT key extracts NULL and
+    never matches, which is exactly why this looks safe and is not."""
+    import json
+
+    rid = await _grant(db)
+    await db.execute(
+        "UPDATE approval_requests SET context = ? WHERE id = ?",
+        (
+            json.dumps(
+                build_session_grant_context(
+                    session_id="", mission_id=_MISSION_ID, mission="m",
+                    window_handle=_HANDLE, process_id=_PID, window_title=_WINDOW,
+                )
+            ),
+            rid,
+        ),
+    )
+    await db.commit()
+    d = await _check(db, session_id="", element_name="Text Area")
+    assert d.allow is False
+    assert d.reason == "no_session_id"
 
 
 @pytest.mark.asyncio
@@ -420,7 +604,8 @@ async def test_a_pending_request_is_not_a_grant(db, live):
         description="Desktop control",
         context=json.dumps(
             build_session_grant_context(
-                session_id=_SESSION, window_title="Notepad", mission="tidy up"
+                session_id=_SESSION, mission_id=_MISSION_ID, mission="tidy up",
+                window_handle=_HANDLE, process_id=_PID, window_title=_WINDOW,
             )
         ),
         timeout_seconds=None,
@@ -596,7 +781,17 @@ async def test_screen_text_cannot_forge_lines_in_the_approval_the_owner_reads(db
     )
     row = await ar.get_by_id(db, decision.request_id)
     desc = row["description"]
-    assert "\n" not in desc
+    # The card is now newline-DELIMITED \u2014 one field per line \u2014 because a
+    # newline is the one separator `_display` guarantees screen text cannot
+    # contain, and an inline-quoted field could be forged with an apostrophe.
+    # So the invariant is no longer "no newlines"; it is that screen text
+    # cannot CHANGE the structure. That is strictly the stronger claim: the
+    # old assertion would pass on a card whose fields had been reordered.
+    lines = desc.split("\n")
+    assert len(lines) == 4, lines
+    assert lines[0].startswith("Desktop ") and lines[0].endswith(" action.")
+    assert len([ln for ln in lines if ln.startswith("Window: ")]) == 1
+    assert len([ln for ln in lines if ln.startswith("Control: ")]) == 1
     assert "\u202e" not in desc and "\u200b" not in desc
     assert "Send" in desc  # the legible content survives
 
@@ -674,20 +869,14 @@ def test_account_creation_crosses_the_identity_bar(name):
     It was previously held only by accident — when the button happened to read
     "Submit" or "Sign up" — which is exactly the region the classifier claims
     to cover."""
-    from genesis.autonomy.classification import classify_desktop_action
-
-    c = classify_desktop_action(element_name=name, control_type="Button")
-    assert str(c.risk_class) == "identity", name
+    assert str(_classify(element_name=name, control_type="Button").risk_class) == "identity", name
 
 
 @pytest.mark.parametrize("name", ["Create folder", "New document", "New tab"])
 def test_ordinary_create_actions_are_not_identity(name):
     """The positive control: "create" alone must not cross the bar, or every
     file operation holds and the gate teaches people to wave it through."""
-    from genesis.autonomy.classification import classify_desktop_action
-
-    c = classify_desktop_action(element_name=name, control_type="Button")
-    assert str(c.risk_class) == "standard", name
+    assert str(_classify(element_name=name, control_type="Button").risk_class) == "standard", name
 
 
 @pytest.mark.parametrize(
@@ -698,18 +887,13 @@ def test_ordinary_create_actions_are_not_identity(name):
 def test_the_secret_field_family_is_covered_not_just_the_word_password(name):
     """For anything off this list the accessibility flag is the only backstop —
     and the reason the list exists is that the flag is unreliable."""
-    from genesis.autonomy.classification import classify_desktop_action
-
-    c = classify_desktop_action(element_name=name, control_type="Edit")
-    assert c.is_password is True, name
+    assert _classify(element_name=name, control_type="Edit").is_password is True, name
 
 
 def test_ordinary_controls_are_not_treated_as_secret_fields():
     """The positive control: a list that matches everything protects nothing."""
-    from genesis.autonomy.classification import classify_desktop_action
-
     for name in ("Search", "Username", "Text Area", "Subject", "To"):
-        assert classify_desktop_action(element_name=name).is_password is False, name
+        assert _classify(element_name=name, control_type="Edit").is_password is False, name
 
 
 # ═══════════════════ the cell can deny, never grant ═══════════════════════
@@ -962,3 +1146,554 @@ def test_desktop_action_type_has_no_configured_timeout():
 
     assert DESKTOP_GATE_ACTION_TYPE not in _DEFAULT_APPROVAL_TIMEOUTS
     assert ActionClassifier().get_timeout(DESKTOP_GATE_ACTION_TYPE) is None
+
+
+# ═══════════ the input contract — what the old signature could not say ═══════
+
+
+@pytest.mark.asyncio
+async def test_a_key_chord_is_not_ordinary_typing(db, live):
+    """The finding that settled the redesign. `check()` could not carry a key
+    chord, so Ctrl+Enter in a mail composer — which SENDS — was indistinguishable
+    from typing a letter. No pattern list fixes that: the information was not in
+    the input type."""
+    await _grant(db)
+    d = await _check(db, operation=DesktopOperation.KEY, key_chord="ctrl+enter",
+                     element_name="", control_type="")
+    assert d.allow is False
+    assert d.reason == "held"
+
+
+@pytest.mark.asyncio
+async def test_an_inert_chord_is_still_ordinary(db, live):
+    """The positive control. An allowlist that holds every keystroke is a gate
+    nobody leaves armed — navigation and text editing must stay free."""
+    await _grant(db)
+    for chord in ("ctrl+c", "shift+control+z", "tab", "up", "ctrl+s", "backspace"):
+        d = await _check(db, operation=DesktopOperation.KEY, key_chord=chord,
+                         element_name="", control_type="")
+        assert d.allow is True, chord
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_key_chord_holds_rather_than_passes(db, live):
+    """ALLOWLIST polarity, which is the whole point: an unrecognised chord is
+    held. A denylist's misses are vulnerabilities; this list's are one hold."""
+    await _grant(db)
+    d = await _check(db, operation=DesktopOperation.KEY, key_chord="ctrl+alt+q",
+                     element_name="", control_type="")
+    assert d.allow is False
+    assert d.reason == "held"
+
+
+@pytest.mark.asyncio
+async def test_a_control_labelled_Pay_is_not_ordinary(db, live):
+    """`Pay` and `Remove account` are on NEITHER desktop pattern list, while
+    `classify_action` has always called both IRREVERSIBLE. Two classifiers
+    disagreed about the same control and only one of them fed the risk."""
+    await _grant(db)
+    for label in ("Pay", "Remove account"):
+        d = await _check(db, element_name=label, control_type="Button")
+        assert d.allow is False, label
+        assert d.reason == "held", label
+
+
+@pytest.mark.asyncio
+async def test_a_drag_holds_because_no_label_describes_it(db, live):
+    """A drag acts on geometry. Dropping a folder onto another folder MOVES it,
+    and the accessibility tree reports what it reports for dragging a
+    scrollbar."""
+    await _grant(db)
+    d = await _check(db, operation=DesktopOperation.DRAG, element_name="Reports",
+                     control_type="ListItem")
+    assert d.allow is False
+    assert d.reason == "held"
+
+
+@pytest.mark.asyncio
+async def test_a_blind_click_at_coordinates_is_refused(db, live):
+    """Both element_name and control_type blank is a click at raw coordinates:
+    the classifier cannot see it and the operator cannot be shown it. It used
+    to be authorised like any other ordinary action."""
+    await _grant(db)
+    d = await _check(db, element_name="", control_type="")
+    assert d.allow is False
+    assert d.reason == "unresolved_target"
+
+
+@pytest.mark.asyncio
+async def test_a_key_action_with_no_chord_is_refused(db, live):
+    """A KEY operation carrying no chord cannot be classified at all."""
+    await _grant(db)
+    d = await _check(db, operation=DesktopOperation.KEY, key_chord="",
+                     element_name="", control_type="")
+    assert d.allow is False
+    assert d.reason == "malformed_action:key_chord"
+
+
+@pytest.mark.asyncio
+async def test_an_operation_outside_the_enum_is_refused_not_classified(db, live):
+    """A CLOSED set. An operation nobody has reasoned about is the one case
+    where guessing is guaranteed wrong — whoever added it knows something the
+    risk table does not."""
+    await _grant(db)
+    d = await _check(db, operation="teleport", element_name="Save",
+                     control_type="Button")
+    assert d.allow is False
+    assert d.reason == "unknown_operation"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_mission_id_is_refused_never_held(db, live):
+    """A missing required field is a CALLER bug, not a judgement to delegate.
+    Holding would ask the operator to approve an action nobody can describe."""
+    await _grant(db)
+    d = await _check(db, mission_id="", element_name="Save")
+    assert d.allow is False
+    assert d.reason == "no_mission_id"
+    assert d.request_id is None, "a refusal must not queue an approval row"
+
+
+@pytest.mark.asyncio
+async def test_a_nonpositive_process_id_is_refused(db, live):
+    """`bool` is an int subclass, so `True` would otherwise arrive as pid 1 —
+    a real pid on every Linux box."""
+    await _grant(db)
+    for pid in (0, -1, True):
+        d = await _check(db, process_id=pid, element_name="Save")
+        assert d.allow is False, pid
+        assert d.reason == "malformed_action:process_id", pid
+
+
+# ═══════════════ shadow must not be a hand-copy of live ══════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "granted_standard", "granted_identity", "granted_financial",
+        "no_grant", "wrong_window", "wrong_mission", "denied_cell",
+    ],
+)
+async def test_shadow_reports_exactly_what_live_decides(db, monkeypatch, scenario):
+    """The deliverable of the de-duplication, asserted as an EQUALITY.
+
+    Shadow used to recompute the live verdict by hand — three terms kept in
+    step by whoever edited the gate next. Shadow is the mode installs actually
+    run, so it is the only thing reporting what live WOULD do; a copy that
+    silently disagrees is worse than no shadow at all.
+
+    Parametrised so a bar added to one path and not the other fails here rather
+    than in production."""
+    monkeypatch.setattr(dg, "grant_ttl_minutes", lambda: 30)
+    monkeypatch.setattr(dg, "action_ttl_seconds", lambda: 30)
+
+    kw: dict = {"element_name": "Text Area", "control_type": "Edit"}
+    if scenario != "no_grant":
+        await _grant(db)
+    if scenario == "granted_identity":
+        kw["element_name"] = "Delete"
+    elif scenario == "granted_financial":
+        kw |= {"element_name": "Card number", "control_type": "Edit"}
+    elif scenario == "wrong_window":
+        kw["window_handle"] = "0xNOPE"
+    elif scenario == "wrong_mission":
+        kw["mission_id"] = "mis-other"
+    elif scenario == "denied_cell":
+        # CLASSIFY first: DENY_PERMANENT is illegal from NOT_DETERMINED, so a
+        # cell has to exist before the owner can stand on it.
+        for event in (CellEvent.CLASSIFY, CellEvent.DENY_PERMANENT):
+            await cg.apply_event(
+                db, domain="desktop", verb="control", risk_class="standard",
+                event=event, updated_at=_TS, origin_class="owner",
+            )
+        await db.commit()
+
+    monkeypatch.setattr(dg, "effective_mode", lambda: "shadow")
+    shadow_d = await _check(db, **kw)
+    monkeypatch.setattr(dg, "effective_mode", lambda: "live")
+    live_d = await _check(db, **kw)
+
+    assert shadow_d.would_allow == live_d.allow, (
+        f"{scenario}: shadow says would_allow={shadow_d.would_allow} "
+        f"but live decided allow={live_d.allow} ({live_d.reason})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_writes_no_approval_row_even_when_live_would_hold(db, shadow):
+    """Shadow must not put buttons in front of the owner for a capability that
+    cannot act — the one place it deliberately DIVERGES from live."""
+    await _grant(db)
+    d = await _check(db, element_name="Delete", control_type="Button")
+    assert d.would_allow is False
+    assert d.request_id is None
+    rows = await ar.list_pending(db)
+    assert [r for r in rows if r["action_type"] == DESKTOP_GATE_ACTION_TYPE] == []
+
+
+# ═══════════════════════ the hold row's wire format ══════════════════════
+
+
+@pytest.mark.asyncio
+async def test_a_hold_row_carries_a_KIND_not_the_action_type(db, live):
+    """`_hold` wrote DESKTOP_GATE_ACTION_TYPE into the `kind` field — the
+    action_type where every reader expects a kind. The two strings differ, so
+    the row was well-formed JSON carrying a value no lookup could ever match:
+    the hold path was WRITE-ONLY."""
+    import json
+
+    await _grant(db)
+    d = await _check(db, element_name="Delete", control_type="Button")
+    assert d.reason == "held" and d.request_id
+
+    row = await ar.get_by_id(db, d.request_id)
+    ctx = json.loads(row["context"])
+    assert ctx["kind"] == dg.DESKTOP_HOLD_KIND
+    assert ctx["kind"] != DESKTOP_GATE_ACTION_TYPE, "a kind, not the action_type"
+    assert ctx["kind"] != dg.SESSION_GRANT_KIND, "and never mistakable for a grant"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_grant_version_is_refused(db, live):
+    """A blob written by a different version of the consent path is one whose
+    field meanings are not established. Reading it optimistically is how a
+    field gets carried without being compared."""
+    import json
+
+    rid = await _grant(db)
+    ctx = build_session_grant_context(
+        session_id=_SESSION, mission_id=_MISSION_ID, mission="m",
+        window_handle=_HANDLE, process_id=_PID, window_title=_WINDOW,
+    )
+    ctx["version"] = dg.SESSION_GRANT_VERSION + 1
+    await db.execute(
+        "UPDATE approval_requests SET context = ? WHERE id = ?", (json.dumps(ctx), rid)
+    )
+    await db.commit()
+    d = await _check(db, element_name="Text Area")
+    assert d.allow is False
+    assert d.reason == "grant_malformed"
+
+
+# ══════════════════════════ money, by shape ══════════════════════════════
+
+
+def test_a_letter_heavy_IBAN_is_financial_in_every_spelling():
+    """The digit-run card pattern already catches IBANs with long digit runs,
+    in any spelling. The gap is the letter-heavy ones, whose BBAN breaks the
+    run below the 13-digit floor — measured at 2 of 24 specimen spellings."""
+    for spelling in (
+        "MT84MALT011000012345MTLCAST001S",
+        "MT84 MALT 0110 0001 2345 MTLC AST0 01S",
+        "mt84 malt 0110 0001 2345 mtlc ast0 01s",
+    ):
+        c = _classify(element_name="Field", control_type="Edit", text=spelling)
+        assert str(c.risk_class) == "financial", spelling
+
+
+def test_a_commit_hash_is_not_a_bank_transfer():
+    """The negative control, and the reason the IBAN test is a CHECKSUM rather
+    than a shape. `de`, `be`, `ad`, `ae`, `ba` and `ee` are all real IBAN
+    country codes AND valid leading hex pairs, so a country-code alternation
+    alone held roughly 1 git SHA in 110. A gate that holds on commit hashes
+    teaches the operator to approve without reading."""
+    # Chosen to contain NO run of 13+ consecutive digits, so the digit-run card
+    # pattern cannot be what decides — otherwise this measures that pattern
+    # instead of the IBAN checksum it is named for. ("ee99887766554433221100aa"
+    # was here and does hold, correctly: it carries a 20-digit run, and the
+    # card pattern is supposed to catch those.)
+    for token in (
+        "de12ab34cd56ef7890ab", "ab12cdef0123456789abcdef01",
+        "be01234567890abcdef12", "eeff00aa11bb22cc33dd44ee",
+    ):
+        c = _classify(element_name="Field", control_type="Edit", text=token)
+        assert str(c.risk_class) == "standard", token
+
+
+# ═══════════ findings from the adversarial review, each locked ═══════════
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Doc AB12CDEFGHKJKLMNOP.txt",   # U+212A KELVIN SIGN
+        "Kayit AB12CDEFGHİJKLMNOP",     # U+0130 LATIN CAPITAL I WITH DOT
+    ],
+)
+def test_unicode_in_a_window_title_does_not_raise(title):
+    """`re.IGNORECASE` without `re.ASCII` let `[A-Z]` match codepoints that
+    case-fold to ASCII. Both of these are `isalpha()`, both survive `.upper()`,
+    and both make `int(ch, 36)` raise inside the IBAN checksum — an exception
+    escaping `classify_desktop_action` and `check()` entirely.
+
+    The text is a WINDOW TITLE, which this module's threat model treats as
+    hostile, so a crash here is reachable from the screen. Enumerated over all
+    0x110000 codepoints, exactly these two break the consumer."""
+    c = _classify(window_title=title, element_name="Text Area", control_type="Edit")
+    assert str(c.risk_class) == "standard"
+
+
+def test_a_chord_with_a_blank_segment_is_unreadable_not_shorter():
+    """Normalization feeds an ALLOWLIST, so every collapse runs toward "inert".
+    Dropping a blank segment mapped `ctrl+a+<space>` onto the allowlisted
+    `ctrl+a`, and a literal " " is how pyautogui's hotkey() spells space —
+    which is deliberately off the list because it activates whatever has focus."""
+    from genesis.autonomy.classification import key_chord_risk, normalize_key_chord
+
+    assert str(key_chord_risk("ctrl+a")) == "standard", "control: the real chord"
+    for bad in ("ctrl+a+", "ctrl+ +a", "ctrl+\xa0+a", "ctrl++a"):
+        # Assert the SENTINEL, not merely "!= ctrl+a". Without the explicit
+        # guard a blank segment still yields "ctrl++a", which misses the
+        # allowlist for an incidental reason — the join happens to insert a
+        # second "+". A test that only checks the risk therefore passes with
+        # the guard deleted, and the next person to re-add a tidy
+        # `[p for p in parts if p]` filter silently reopens the collapse.
+        assert normalize_key_chord(bad) == "\x00unreadable", bad
+        assert str(key_chord_risk(bad)) == "identity", bad
+
+
+@pytest.mark.asyncio
+async def test_cut_holds_because_it_moves_files_like_delete_does(db, live):
+    """`ctrl+x` inherits the argument that keeps `delete` off the inert list.
+    In a file manager `ctrl+a` selects every item, `ctrl+x` marks them for a
+    MOVE and `ctrl+v` completes it — and a KEY action produces no element name
+    for the classifier to read. Copy and paste stay inert; they are additive."""
+    await _grant(db)
+    cut = await _check(db, operation=DesktopOperation.KEY, key_chord="ctrl+x",
+                       element_name="", control_type="")
+    assert cut.allow is False and cut.reason == "held"
+    for chord in ("ctrl+c", "ctrl+z"):
+        d = await _check(db, operation=DesktopOperation.KEY, key_chord=chord,
+                         element_name="", control_type="")
+        assert d.allow is True, f"control: {chord} must stay ordinary"
+
+
+@pytest.mark.asyncio
+async def test_a_string_process_id_still_matches_its_own_grant(db, live):
+    """`parse` stores an int pid and a stripped handle; the action side is
+    whatever the caller built. An actuator returning `"4312"` from JSON or a
+    PowerShell bridge passes validation and would then fail `authorises`
+    forever — reported as `grant_scope_mismatch`, i.e. "that grant was for a
+    different window", for the window it was actually granted for. Fail-closed,
+    and the one field mismatch the reason string cannot tell you about."""
+    await _grant(db, window_handle="0xABC1", process_id=4312)
+    d = await _check(db, window_handle="  0xABC1  ", process_id="4312",
+                     element_name="Text Area", control_type="Edit")
+    assert d.allow is True, f"refused as {d.reason}"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_for_a_DIFFERENT_pid_is_still_refused(db, live):
+    """The control for the normalization above: normalizing must not make two
+    different pids compare equal. A handle is reused once its window closes,
+    which is why the pair is the identity."""
+    await _grant(db, window_handle="0xABC1", process_id=4312)
+    d = await _check(db, window_handle="0xABC1", process_id=9999,
+                     element_name="Text Area", control_type="Edit")
+    assert d.allow is False
+    assert d.reason == "grant_window_mismatch"
+
+
+def test_a_plural_money_label_is_still_a_money_label():
+    """`\\bpayment\\b` does not match "Payments" — the trailing s defeats the
+    word boundary, and "Payments" is what a real banking window is called.
+    Measured: a window titled "Chase - Payments" classified STANDARD while
+    "Online Banking" did not."""
+    for title in ("Chase - Payments", "Invoices", "Card numbers"):
+        c = _classify(window_title=title, element_name="Field", control_type="Edit")
+        assert str(c.risk_class) == "financial", title
+    for title in ("Payment", "Invoice", "Card number"):
+        c = _classify(window_title=title, element_name="Field", control_type="Edit")
+        assert str(c.risk_class) == "financial", f"control (singular): {title}"
+
+
+# ═══════════ findings from the security review, each locked ══════════════
+
+
+@pytest.mark.asyncio
+async def test_paste_cannot_be_used_to_fill_a_focused_password_box(db, live):
+    """The module claims absolutely that nothing types into a password box.
+
+    A KEY action has NO resolved target by construction, so `is_password` is
+    always False for a keypress and the secret-field refusal has nothing to
+    match. `tab` is inert, so the loop can move focus into a password field;
+    with `ctrl+v` inert too, the clipboard went in and the gate called it
+    ordinary input. That is not the stated hostile-screen limit — there is no
+    control name to have lied about.
+
+    Measured before the fix: allow=True, reason=session_grant."""
+    await _grant(db)
+    d = await _check(db, operation=DesktopOperation.KEY, key_chord="ctrl+v",
+                     element_name="", control_type="",
+                     window_title="Untitled - Notepad")
+    assert d.allow is False, "paste must not be an allowlisted chord"
+    assert d.reason == "held"
+
+
+@pytest.mark.asyncio
+async def test_chords_that_cannot_insert_stay_ordinary(db, live):
+    """The control for the line the allowlist draws. It is INSERTION, not
+    mutation: backspace and undo can disturb a focused field but cannot put
+    chosen content into one, and holding them would break ordinary typing."""
+    await _grant(db)
+    for chord in ("ctrl+c", "backspace", "ctrl+z", "ctrl+y", "tab", "ctrl+a"):
+        d = await _check(db, operation=DesktopOperation.KEY, key_chord=chord,
+                         element_name="", control_type="",
+                         window_title="Untitled - Notepad")
+        assert d.allow is True, f"{chord} must stay ordinary"
+
+
+@pytest.mark.asyncio
+async def test_screen_text_cannot_forge_the_consent_card_structure(db, live):
+    """`_display` strips control characters, so a newline cannot be forged —
+    but the card quoted its fields INLINE, and an apostrophe is purely
+    printable. An element named `Cancel' in 'Notepad` produced a card that read
+    as well-formed and named the wrong window, demoting the real one to a
+    trailing fragment.
+
+    The fix is structural: one field per LINE, using the delimiter `_display`
+    guarantees cannot appear. Stripping quotes instead would corrupt every
+    legitimate title ("Bob's Document")."""
+    import json
+
+    await _grant(db)
+    d = await _check(db, element_name="Delete' in 'Notepad - untitled",
+                     control_type="Button", window_title="Evil Bank - Payments")
+    assert d.reason == "held" and d.request_id
+    row = await ar.get_by_id(db, d.request_id)
+
+    lines = row["description"].split("\n")
+    control_lines = [ln for ln in lines if ln.startswith("Control: ")]
+    window_lines = [ln for ln in lines if ln.startswith("Window: ")]
+    assert len(control_lines) == 1, lines
+    assert len(window_lines) == 1, "screen text forged a second Window line"
+    assert window_lines[0] == "Window: Evil Bank - Payments", (
+        "the REAL window must be what the Window line names"
+    )
+    # And a legitimate apostrophe survives — the fix must not sanitise titles.
+    assert "Delete' in 'Notepad - untitled" in control_lines[0]
+
+    ctx = json.loads(row["context"])
+    for field in ("mission_id", "window_handle", "process_id", "operation"):
+        assert field in ctx, f"a hold row must be bindable to what it was about: {field}"
+
+
+@pytest.mark.asyncio
+async def test_a_mission_mismatch_does_not_report_a_window_mismatch(db, live):
+    """This module's own standard: a refusal reason must not name the wrong
+    bar. Folding session, mission and window into one boolean reported
+    `grant_scope_mismatch` — "that grant was for a different window" — for a
+    grant whose window was exactly right."""
+    await _grant(db, mission_id="mis-tidy")
+    d = await _check(db, mission_id="mis-other", element_name="Text Area",
+                     control_type="Edit")
+    assert d.allow is False
+    assert d.reason == "grant_mission_mismatch"
+
+    # The MATCHING mission, so the window bar is what fails. Without it this
+    # probe carries a mission mismatch too — which is checked first — and would
+    # report the reason it is meant to be distinguishing from.
+    other = await _check(db, mission_id="mis-tidy", window_handle="0xNOPE",
+                         element_name="Text Area", control_type="Edit")
+    assert other.reason == "grant_window_mismatch", "and the window bar keeps its own"
+
+
+def test_an_oversized_screen_field_is_bounded_and_says_so(caplog):
+    """Classification is synchronous work inside an async gate, measured at
+    ~1.2 ms/KB. An accessibility tree exposing a document as an element name
+    would block the event loop for minutes, once per action.
+
+    The bound is LOSSY, which is why it logs: content past it is not examined,
+    and a silent cut would make a card number past the boundary read as absent."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        c = _classify(element_name="A" * 50_000, control_type="Edit")
+    assert str(c.risk_class) == "standard"
+    assert any("bounded element_name" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_desktop_rows_never_reach_the_unified_comms_feed():
+    """A THIRD surface renders pending approvals, and it had no exclusion.
+
+    The desktop carve-out is maintained by ENUMERATION — there is no allowlist
+    that catches a new reader — so this was found by listing every caller of
+    `approval_requests.list_pending` rather than by fixing the one that was
+    reported. The other readers are safe for their own reasons:
+    `hydrate_delivery_map` matches on a `delivery_id` a desktop row does not
+    carry, and the morning report counts rather than offers.
+
+    Same hazard as the approvals queue: the feed renders a pending row as a
+    generic approval card, and a card that cannot say it is handing over the
+    operator's keyboard must not be the thing that asks."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from flask import Flask
+
+    from genesis.dashboard.api import blueprint
+
+    app = Flask(__name__)
+    app.register_blueprint(blueprint)
+    app.config["TESTING"] = True
+
+    rows = [
+        {"id": "desk", "action_type": DESKTOP_GATE_ACTION_TYPE, "context": "{}",
+         "description": "Desktop control", "created_at": _TS},
+        {"id": "cli", "action_type": "autonomous_cli_fallback", "context": "{}",
+         "description": "cli action", "created_at": _TS},
+    ]
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.db.crud.approval_requests.list_pending",
+              AsyncMock(return_value=rows)),
+        patch("genesis.db.crud.ego.list_pending_proposals",
+              AsyncMock(return_value=[])),
+    ):
+        MockRT.instance.return_value = mock_rt
+        resp = app.test_client().get("/api/genesis/comms")
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    ids = {r["id"] for r in resp.get_json()["pending_approvals"]}
+    assert "cli" in ids, "positive control: the feed DID render approvals"
+    assert "desk" not in ids
+
+
+def test_a_padded_card_number_does_not_walk_past_the_digit_run(db=None):
+    """`{13,19}` with a trailing `(?!\\d)` did not mean "13 to 19 digits" — it
+    meant a run of 13-19 with no digit after it, so a run of TWENTY matched
+    nothing and classified STANDARD. One padding digit was the whole evasion.
+
+    Measured cost of removing the cap: +0.10 percentage points on 20,000 random
+    git SHAs (2.54% -> 2.63%), which is 19 extra holds to close a trivial
+    bypass."""
+    for n in (13, 19, 20, 25, 40):
+        c = _classify(operation=DesktopOperation.TYPE, element_name="Field",
+                      control_type="Edit", text="4" * n)
+        assert str(c.risk_class) == "financial", f"{n} digits"
+    # The control: below the floor is still ordinary, or every long number holds.
+    c = _classify(operation=DesktopOperation.TYPE, element_name="Field",
+                  control_type="Edit", text="4" * 12)
+    assert str(c.risk_class) == "standard"
+
+
+def test_a_pin_verb_is_not_a_secret_field():
+    """A bare case-insensitive `\\bpin\\b` made "Pin to taskbar" and "Pin to
+    Start" — ordinary Windows shell actions — match as SECRET FIELDS.
+
+    That is the worst false positive this gate can produce: a secret-field
+    match is a REFUSAL with no approval path, so the operator cannot proceed at
+    all, and the reason names something the control has nothing to do with.
+    The credential senses are matched explicitly instead."""
+    for verb in ("Pin to taskbar", "Pin to Start", "Unpin from Start",
+                 "Pin this to Quick access"):
+        assert _classify(element_name=verb).is_password is False, verb
+    for credential in ("PIN", "Pin code", "Enter your PIN", "New PIN",
+                       "pin number", "Confirm PIN"):
+        assert _classify(element_name=credential, control_type="Edit").is_password is True, (
+            credential
+        )

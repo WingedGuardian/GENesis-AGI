@@ -20,10 +20,18 @@ Four properties are load-bearing, each independently tested:
 1. **Arming takes two keys.** ``mode: live`` AND ``live_opt_in: true``, neither
    reachable through ``settings_update`` or the dashboard. Default is
    ``shadow``: classify, record, refuse.
-2. **Authority is per SESSION, and must arrive from OUTSIDE this box.** A grant
-   is an approved, unconsumed ``approval_requests`` row carrying this session's
-   id and this module's ``kind``, resolved through
-   :data:`DESKTOP_GRANT_RESOLVER_PREFIXES`. That set is deliberately narrower
+2. **Authority is per SESSION, MISSION and WINDOW, and must arrive from OUTSIDE
+   this box.** A grant is an approved, unconsumed ``approval_requests`` row
+   carrying this session's id, this mission's id, the target window's
+   ``(handle, pid)`` and this module's ``kind``, resolved through
+   :data:`DESKTOP_GRANT_RESOLVER_PREFIXES`.
+
+   Every one of those is COMPARED, which is the point. The grant previously
+   bound the window by TITLE and carried no mission at all, so two browser tabs
+   both called "New Tab" shared one grant, a renamed document stopped matching
+   its own window, and consent given for one mission covered any later one. A
+   field carried and not compared is a promise the consent card makes and the
+   code does not keep. That set is deliberately narrower
    than ``classify_resolver``'s "human" class: `dashboard` is stamped by a route
    any local process can reach with the internal token, and `user` is just a
    default. Neither proves a person acted, so neither can mint a grant here.
@@ -46,6 +54,48 @@ Four properties are load-bearing, each independently tested:
 Secret fields are outside all of that: ``is_password`` (or a target that merely
 looks like a password field) is a REFUSAL with no approval path. There is no
 version of this capability that types into a password box.
+
+That last sentence is an absolute, so the thing that could falsify it is worth
+naming: a KEY action has NO resolved target by construction — it acts on
+whatever holds focus, which the gate cannot see — so ``is_password`` is always
+False for a keypress and the secret-field refusal has nothing to match against.
+The claim therefore rests on the inert-chord ALLOWLIST admitting no chord that
+can INSERT content. ``ctrl+v`` was on that list and is not any more: ``tab`` is
+inert, so the loop could reach a password box and paste into it, and the gate
+would have called it ordinary input. What a keypress can still do to a focused
+secret field is disturb it — backspace, undo — which is why the guarantee is
+written as *types into* rather than *touches*.
+
+TWO HONEST LIMITS, restated rather than quietly upgraded by this rewrite:
+
+- **The grant predicate is NOT a complete authorization boundary.**
+  ``genesis.db`` is a file writable by the uid every Genesis process runs as,
+  so anything with same-uid code execution can INSERT a row satisfying every
+  bar here. What the allowlist closes is the APP-LAYER path — a Genesis
+  component using the sanctioned approval APIs can no longer mint itself
+  desktop authority. Closing the rest needs provenance no SQL predicate can
+  express. Do not let the loop in PR-3 be written believing otherwise.
+- **The classifier is NOT a defence against adversarial UI.** IDENTITY and
+  FINANCIAL are matchers over text the SCREEN supplies, and in this threat
+  model the screen is hostile: a malicious page names its own controls and can
+  label a destructive one "Continue". Adding the operation, the key chord and
+  the reversibility verdict raises the bar on ORDINARY software — it does not
+  make this a boundary against a page that is trying. The things that do hold
+  there are the grant's own scope and the operator watching their screen.
+
+AND A THIRD, which is new and belongs to this revision:
+
+- **Approving a hold currently authorizes NOTHING.** The row is written, and
+  no surface can resolve it: it is excluded from the dashboard queue, refused
+  by ``resolve_request``, and excluded from ``approve_all_pending``, because
+  desktop consent is meant to come from the purpose-built path that names the
+  target window back to the operator — which lands with the loop in PR-3. The
+  gate also never calls ``mark_consumed``. So the hold branch records an owner
+  decision and stops there, on purpose: what an approved hold should BUY is a
+  new authorization surface and needs the same binding discipline as the grant
+  itself, and that decision belongs with the consent path that will carry it,
+  not ahead of it. Stated here so the next reader finds a deliberate gap
+  rather than what looks like a broken approve-then-act loop.
 """
 
 # GROUNDWORK(desktop-takeover-pr2): this module has no call site on purpose.
@@ -65,7 +115,10 @@ import aiosqlite
 
 from genesis.autonomy.capabilities import InvalidTransition
 from genesis.autonomy.classification import (
+    OPERATIONS_REQUIRING_TARGET,
+    DesktopAction,
     DesktopActionClassification,
+    DesktopOperation,
     classify_desktop_action,
 )
 from genesis.autonomy.desktop_takeover_config import (
@@ -96,6 +149,25 @@ DESKTOP_GATE_ACTION_TYPE = "desktop_takeover_gate"
 #: the only thing distinguishing "the owner consented to this session" from
 #: "the owner approved one click", and the grant lookup MUST filter on it.
 SESSION_GRANT_KIND = "desktop_session_grant"
+
+#: ``context.kind`` marking a per-action HOLD row.
+#:
+#: This exists because ``_hold`` used to write the ACTION_TYPE into the ``kind``
+#: field — ``"desktop_takeover_gate"`` where every reader expects a kind. The
+#: two strings are different, so the row was well-formed JSON carrying a value
+#: no lookup would ever match: the hold path was WRITE-ONLY. It is a distinct
+#: constant rather than a reuse so the grant lookup's ``kind`` filter keeps
+#: meaning what it says.
+DESKTOP_HOLD_KIND = "desktop_action_hold"
+
+#: Wire-format version of a session-grant context blob.
+#:
+#: An UNKNOWN version is refused, not best-effort parsed. A grant is the
+#: broadest authority here, and a blob written by a different version of the
+#: consent path is a blob whose field meanings are not established — reading it
+#: optimistically is how a field gets carried without being compared, which is
+#: the defect class this whole rewrite exists to close.
+SESSION_GRANT_VERSION = 1
 
 #: Resolver prefixes that may mint a desktop SESSION GRANT. A deliberate
 #: narrowing of :data:`HUMAN_RESOLVER_PREFIXES`, not a reuse of it.
@@ -181,23 +253,189 @@ def _display(value: str) -> str:
 def build_session_grant_context(
     *,
     session_id: str,
-    window_title: str,
+    mission_id: str,
     mission: str,
-) -> dict[str, str]:
+    window_handle: str,
+    process_id: int,
+    window_title: str,
+) -> dict[str, object]:
     """The ``context`` payload of a desktop session-grant approval row.
 
     Named here rather than at the future call site so the gate's reader and the
-    PR-3 writer share one definition. ``window_title`` and ``mission`` are the
-    two things the owner is actually consenting to — the spoken challenge in
-    PR-3 names the window back to them, which is what makes a "yes" specific
-    enough to be consent rather than a reflex.
+    PR-3 writer share one definition.
+
+    Two of these fields are what the owner CONSENTS to and two are what the
+    consent is COMPARED on, and conflating them was the original defect:
+
+    - ``window_title`` and ``mission`` are for the consent card. The spoken
+      challenge names the window back to the operator, which is what makes a
+      "yes" specific enough to be consent rather than a reflex. Both are
+      DISPLAY ONLY.
+    - ``window_handle`` + ``process_id`` and ``mission_id`` are the identity the
+      gate compares. A handle is reused after its window closes, so the pair is
+      what names one live window.
+
+    Why not compare the display fields. Two browser tabs are both called
+    "New Tab", so a title bar authorises the wrong window while looking strict;
+    and a title changes when the document inside it does, so the same window
+    stops matching its own grant. Mission TEXT has the same defect one level up
+    — it is model-generated and rewritten on every re-plan — which is why the
+    id is what binds and the prose is what is shown.
     """
     return {
         "kind": SESSION_GRANT_KIND,
+        "version": SESSION_GRANT_VERSION,
         "session_id": session_id,
-        "window_title": window_title,
+        "mission_id": mission_id,
         "mission": mission,
+        "window_handle": window_handle,
+        "process_id": process_id,
+        "window_title": window_title,
     }
+
+
+@dataclass(frozen=True)
+class SessionGrant:
+    """A parsed, VALIDATED session grant. Constructing one is the validation.
+
+    :meth:`parse` returns ``None`` rather than a partially-populated object, so
+    a caller cannot hold something that looks like a grant but is missing the
+    field it is about to compare. That shape is deliberate: the previous code
+    passed the raw row around and each bar re-read the fields it happened to
+    care about, which is how a field ends up carried but never compared.
+    """
+
+    row_id: str
+    session_id: str
+    mission_id: str
+    window_handle: str
+    process_id: int
+    window_title: str
+    mission: str
+    resolved_by: str
+    #: ``None`` when the stored timestamp is unparseable. The grant is still
+    #: structurally a grant — it simply cannot be AGED, and the caller refuses
+    #: it as expired. Kept nullable rather than refused at parse time so the
+    #: refusal reason stays truthful: this is not "no grant from a human".
+    resolved_at: datetime | None
+
+    @classmethod
+    def parse(cls, row: dict) -> SessionGrant | None:
+        """Parse an approval row into a grant, or ``None`` if it is not one.
+
+        Refuses: unreadable JSON, a non-mapping context, the wrong ``kind``, an
+        unknown ``version``, a blank required field, a non-positive process id,
+        and an unparseable ``resolved_at``. Every one of those is an UNBOUNDED
+        grant if waved through — an un-ageable row never expires, and a blank
+        field matches another blank field.
+        """
+        try:
+            ctx = json.loads(row.get("context") or "{}")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(ctx, dict):
+            return None
+        if ctx.get("kind") != SESSION_GRANT_KIND:
+            return None
+        if ctx.get("version") != SESSION_GRANT_VERSION:
+            logger.warning(
+                "Desktop grant %s has unsupported context version %r — refusing",
+                row.get("id"),
+                ctx.get("version"),
+            )
+            return None
+
+        # NOT a reason to return None. An unparseable timestamp is a real
+        # refusal, but it is an AGEING failure, not a structural one — the row
+        # is still recognisably this session's grant from an allowlisted
+        # resolver. Folding it in here made the caller report
+        # `grant_not_human` for a broken timestamp, sending whoever reads that
+        # after the wrong thing entirely. The caller refuses it as expired,
+        # which is what an un-ageable grant is.
+        resolved_at = _parse_ts(row.get("resolved_at"))
+        if resolved_at is None:
+            logger.warning(
+                "Desktop grant %s has unparseable resolved_at %r — refusing",
+                row.get("id"),
+                row.get("resolved_at"),
+            )
+
+        # `bool` is an int subclass, so `process_id: true` would otherwise
+        # become pid 1 — a real pid on every Linux box.
+        raw_pid = ctx.get("process_id")
+        if isinstance(raw_pid, bool):
+            return None
+        try:
+            process_id = int(raw_pid)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if process_id <= 0:
+            return None
+
+        session_id = str(ctx.get("session_id") or "").strip()
+        mission_id = str(ctx.get("mission_id") or "").strip()
+        window_handle = str(ctx.get("window_handle") or "").strip()
+        # Blank is a REFUSAL, never a wildcard. In SQLite `'' = ''` is true, so
+        # a grant with an empty session id authorises a caller with an empty
+        # session id — the shape that looks safe because an ABSENT key extracts
+        # NULL and never matches anything.
+        if not (session_id and mission_id and window_handle):
+            return None
+
+        return cls(
+            row_id=str(row.get("id") or ""),
+            session_id=session_id,
+            mission_id=mission_id,
+            window_handle=window_handle,
+            process_id=process_id,
+            window_title=str(ctx.get("window_title") or ""),
+            mission=str(ctx.get("mission") or ""),
+            resolved_by=str(row.get("resolved_by") or ""),
+            resolved_at=resolved_at,
+        )
+
+    def authorises(self, action: DesktopAction, *, session_id: str, mission_id: str) -> bool:
+        """Whether this grant covers *action* for this session and mission.
+
+        Every field compared here is one the consent card showed the operator.
+        A field carried and NOT compared is a promise the card makes and the
+        code does not keep, which is worse than not carrying it at all.
+
+        BOTH SIDES ARE NORMALIZED, and they must be. ``parse`` stores a
+        stripped handle and an ``int`` pid; the action side is whatever the
+        caller constructed. An actuator handing back ``process_id="4312"`` —
+        the natural shape out of JSON or a PowerShell bridge — passes
+        validation (``int("4312") > 0``) and would then fail here forever,
+        because ``4312 == "4312"`` is False. That is fail-CLOSED, so it is not
+        a hole; it is worse than a hole to diagnose. The gate would report
+        ``grant_scope_mismatch`` — "that grant was for a different window" —
+        for a session whose grant is for exactly that window, sending whoever
+        reads it to the consent path instead of the actuator. The refusal
+        reason is the whole diagnostic payoff of per-window binding, so it must
+        not be able to name the wrong bar.
+        """
+        return not self.mismatch(action, session_id=session_id, mission_id=mission_id)
+
+    def mismatch(
+        self, action: DesktopAction, *, session_id: str, mission_id: str
+    ) -> str:
+        """``""`` if this grant covers the action, else WHICH bar failed.
+
+        Split out because folding three comparisons into one boolean made the
+        caller report ``grant_scope_mismatch`` — "that grant was for a
+        different window" — for a MISSION mismatch. This module's own standard
+        is that a refusal reason must not be able to name the wrong bar, and it
+        was breaking it here.
+        """
+        if self.session_id != str(session_id or "").strip():
+            return "grant_session_mismatch"
+        if self.mission_id != str(mission_id or "").strip():
+            return "grant_mission_mismatch"
+        if self.window_handle != str(action.window_handle or "").strip():
+            return "grant_window_mismatch"
+        if self.process_id != int(action.process_id):
+            return "grant_window_mismatch"
+        return ""
 
 
 @dataclass(frozen=True)
@@ -239,22 +477,37 @@ class DesktopTakeoverGate:
 
     async def check(
         self,
+        action: DesktopAction,
         *,
         session_id: str,
-        window_title: str = "",
-        element_name: str = "",
-        control_type: str = "",
-        is_password: bool = False,
-        text: str = "",
+        mission_id: str,
     ) -> DesktopGateDecision:
         """Allow, hold or refuse one desktop input action.
+
+        The action arrives as ONE validated object rather than a handful of
+        optional strings. That is the substantive change: the previous
+        signature could not carry the operation, the key chord or the window
+        handle, so the gate could not tell Ctrl+Enter in a mail composer from
+        typing a letter, and could not tell two windows both called "New Tab"
+        apart. Those were not gaps in care — the information was not in the
+        input type, and no amount of pattern-matching adds information that was
+        never passed.
+
+        A call that omits a required field is REFUSED with a reason naming the
+        field, never held. A hold would ask the operator to approve an action
+        nobody can describe — "something in some window" — and a missing
+        required field is a CALLER bug, not a judgement to delegate. Nothing
+        calls this gate yet, so that refusal costs nothing today and means the
+        loop in PR-3 cannot be built wrong: it has to say what it is doing
+        before the gate will act on it.
 
         The order below is the design, not an accident. Cheap total refusals
         come first; in LIVE mode the first DB WRITE happens only after the
         session grant has been verified, so an unauthorized caller cannot make
         the gate record anything on its behalf. Shadow deliberately writes the
-        cell either way — observing is its whole job, and it can never act. Classification is pure and therefore runs early,
-        so a refusal names the real reason instead of the first tripwire.
+        cell either way — observing is its whole job, and it can never act.
+        Classification is pure and therefore runs early, so a refusal names the
+        real reason instead of the first tripwire.
         """
         now = datetime.now(UTC)
         mode = effective_mode()
@@ -264,17 +517,27 @@ class DesktopTakeoverGate:
         if mode == "off":
             return DesktopGateDecision(allow=False, reason="not_armed", mode=mode)
 
-        # 2. Classify from the RESOLVED TARGET. Pure: no reads, no writes.
-        classification = classify_desktop_action(
-            window_title=window_title,
-            element_name=element_name,
-            control_type=control_type,
-            is_password=is_password,
-            text=text,
-        )
-        domain, verb, risk = classification.cell_key
+        # 2. The call itself must be well-formed. Refused in BOTH modes with
+        #    the real reason: shadow is the mode that actually ships, so it is
+        #    where a malformed caller has to be visible. Reporting "shadow"
+        #    here would hide the one class of defect shadow exists to surface.
+        malformed = _validate_call(action, session_id=session_id, mission_id=mission_id)
+        if malformed:
+            logger.warning(
+                "Desktop gate REFUSED a malformed call (%s, operation=%r, window=%r)",
+                malformed,
+                getattr(action.operation, "value", action.operation),
+                action.window_title,
+            )
+            return DesktopGateDecision(allow=False, reason=malformed, mode=mode)
 
-        # 3. Secret field — refused outright, before any cell exists for it.
+        # 3. Classify from the RESOLVED TARGET. Pure: no reads, no writes.
+        classification = classify_desktop_action(action)
+        domain, verb, risk = classification.cell_key
+        window_title = action.window_title
+        element_name = action.element_name
+
+        # 4. Secret field — refused outright, before any cell exists for it.
         #    Not a hold: there is no approval that makes this acceptable, so
         #    the gate must not offer the owner a button that says otherwise.
         if classification.is_password:
@@ -287,14 +550,14 @@ class DesktopTakeoverGate:
                 allow=False, reason="password_field", cell=(domain, verb, risk), mode=mode
             )
 
-        # 4. Session consent. Looked up in BOTH modes: shadow's whole job is
+        # 5. Session consent. Looked up in BOTH modes: shadow's whole job is
         #    to report what live would have decided, and "would it have had a
         #    grant?" is most of that answer.
         grant, grant_reason = await self._live_session_grant(
-            session_id, window_title, now
+            action, session_id=session_id, mission_id=mission_id, now=now
         )
 
-        # 5. Shadow observes and refuses. It records the cell and logs the full
+        # 6. Shadow observes and refuses. It records the cell and logs the full
         #    verdict — including a missing grant, which is the state a shadow
         #    install is actually IN, since nobody asks for keyboard consent for
         #    a capability that cannot act. An observer that only reports on
@@ -302,24 +565,21 @@ class DesktopTakeoverGate:
         #
         #    It creates no approval row: shadow must not put buttons in front of
         #    the owner for a capability that cannot act.
+        #
+        #    The verdict comes from the SAME function live uses. It used to be
+        #    recomputed by hand here, and a hand-maintained copy of the live
+        #    policy is worse than no shadow at all: shadow is the mode that
+        #    actually ships, so a copy that silently disagrees misreports the
+        #    posture of every install running it.
         if mode != "live":
             state = await self._classify_cell(domain, verb, risk, now)
-            would_allow = (
-                grant is not None
-                and classification.risk_class == RiskClass.STANDARD
-                and state != CellState.DENIED_PERMANENT
+            would_allow, reason = _verdict(
+                classification=classification, grant=grant,
+                grant_reason=grant_reason, cell_state=state,
             )
-            if would_allow:
-                verdict = "allow"
-            elif grant is None:
-                verdict = f"refuse ({grant_reason})"
-            elif state == CellState.DENIED_PERMANENT:
-                verdict = "refuse (denied_permanent)"
-            else:
-                verdict = "hold"
             logger.info(
                 "Desktop gate SHADOW: would %s %s:%s:%s (window=%r, element=%r)",
-                verdict,
+                "allow" if would_allow else f"refuse ({reason})",
                 domain,
                 verb,
                 risk,
@@ -335,38 +595,51 @@ class DesktopTakeoverGate:
             )
 
         # ── live from here ───────────────────────────────────────────────
-        # 6. No consent, no action. Nothing is written on this path: an
+        # 7. No consent, no action. Nothing is written on this path: an
         #    unauthorized caller must not be able to make the gate record
-        #    anything on its behalf.
+        #    anything on its behalf. This is why the cell write below sits
+        #    AFTER the grant check rather than beside it in _verdict.
         if grant is None:
             return DesktopGateDecision(
                 allow=False, reason=grant_reason, cell=(domain, verb, risk), mode=mode
             )
 
-        # 7. Make the cell visible in the matrix. The cell's only authority over
+        # 8. Make the cell visible in the matrix. The cell's only authority over
         #    this gate is NEGATIVE: it can never reach GRANTED (desktop is
         #    absent from PROMOTABLE_DOMAINS), so it is never a source of
         #    permission — but DENIED_PERMANENT is the owner's standing "not
         #    this, ever", and it outranks a live session grant.
         state = await self._classify_cell(domain, verb, risk, now)
-        if state == CellState.DENIED_PERMANENT:
+
+        # 9. One policy, one place.
+        allow, reason = _verdict(
+            classification=classification, grant=grant,
+            grant_reason=grant_reason, cell_state=state,
+        )
+        if not allow:
+            if reason == "held":
+                # Above STANDARD, session consent is not enough. Crossing the
+                # identity bar or touching money is its own decision, every time.
+                return await self._hold(
+                    classification, action, session_id, mission_id, mode
+                )
             logger.warning(
-                "Desktop gate REFUSED %s:%s:%s — cell denied permanently", domain, verb, risk
+                "Desktop gate REFUSED %s:%s:%s — %s", domain, verb, risk, reason
             )
             return DesktopGateDecision(
-                allow=False, reason="denied_permanent", cell=(domain, verb, risk), mode=mode
+                allow=False, reason=reason, cell=(domain, verb, risk), mode=mode
             )
 
-        # 8. Above STANDARD, session consent is not enough. Crossing the
-        #    identity bar or touching money is its own decision, every time.
-        if classification.risk_class != RiskClass.STANDARD:
-            return await self._hold(classification, session_id, window_title, element_name, mode)
-
-        # 9. Ordinary input under a live grant — the ONE outcome that moves the
+        # 10. Ordinary input under a live grant — the ONE outcome that moves the
         #    operator's mouse, so it is also the one that must leave a trace.
         #    Everything else here logs its refusal; an allow that logged nothing
         #    would make the acted-upon case the only invisible one.
-        expires_at = (now + timedelta(seconds=action_ttl_seconds())).isoformat()
+        # Also read fresh: stamping from the pre-await capture silently
+        # shortens the window the DEVICE enforces, so an action could be
+        # refused at the machine for time it was never given.
+        expires_at = (
+            datetime.now(UTC) + timedelta(seconds=action_ttl_seconds())
+        ).isoformat()
         logger.info(
             "Desktop gate ALLOWED %s:%s:%s on %r in %r (grant=%s, expires=%s)",
             domain,
@@ -374,13 +647,13 @@ class DesktopTakeoverGate:
             risk,
             element_name,
             window_title,
-            grant.get("id"),
+            grant.row_id,
             expires_at,
         )
-        await self._emit_allowed(window_title, element_name, grant.get("id"))
+        await self._emit_allowed(window_title, element_name, grant.row_id)
         return DesktopGateDecision(
             allow=True,
-            reason="session_grant",
+            reason=reason,
             cell=(domain, verb, risk),
             expires_at=expires_at,
             mode=mode,
@@ -408,26 +681,42 @@ class DesktopTakeoverGate:
         return CellState(cell["state"]) if cell else CellState.ASK
 
     async def _live_session_grant(
-        self, session_id: str, window_title: str, now: datetime
-    ) -> tuple[dict | None, str]:
-        """The owner's live grant for this session AND window, or ``(None, reason)``.
+        self,
+        action: DesktopAction,
+        *,
+        session_id: str,
+        mission_id: str,
+        now: datetime,
+    ) -> tuple[SessionGrant | None, str]:
+        """The owner's live grant for this session, mission AND window.
 
-        Six independent bars, each of which has to hold. Every one exists
+        Eight independent bars, each of which has to hold. Every one exists
         because its absence was a defect found in review, not because it seemed
         prudent:
 
         - **this session** — the grant carries the session id and is filtered on
-          it in SQL, so one session's consent is never another's;
+          it in SQL, so one session's consent is never another's. Compared HERE
+          as well, because SQLite says ``'' = ''`` is true: a grant with a blank
+          session id would otherwise authorise a caller with a blank one. An
+          ABSENT key extracts NULL and never matches, which is exactly why this
+          looks safe and is not;
         - **a GRANT, not a hold** — both are rows of the same action_type, so
           ``kind`` is what separates "consented to this session" from "approved
           one click". Without it, approving a single held action silently became
           a full session grant with a fresh expiry;
-        - **this WINDOW** — the grant names the target window the owner was
-          shown, and the action must be in it. Carrying that name without
-          comparing it is worse than not carrying it: the consent card reads the
-          window back to the operator, so an uncompared field is a promise the
-          card makes and the code does not keep. MEASURED before this bar
-          existed — a grant for one window authorised actions in any other;
+        - **a KNOWN wire format** — an unrecognised ``version`` is refused
+          rather than read optimistically;
+        - **this MISSION** — bound to ``mission_id``, never to the mission
+          prose. The text is model-generated and is rewritten on every re-plan,
+          so comparing it would reproduce the window-title failure one level up:
+          consent given for one mission would stop matching the mission it was
+          given for, while a differently-worded mission would slip through;
+        - **this WINDOW** — ``(window_handle, process_id)``, not the title. Two
+          browser tabs are both called "New Tab", so a title bar authorises the
+          wrong window while looking strict; and a handle alone is reused after
+          its window closes, so the PAIR is what names one live window. The
+          title is still carried, for the consent card that names it back to
+          the operator;
         - **approved and unconsumed** — consumption is how a session's grant is
           retired, so a consumed row is a finished session, not a live one;
         - **resolved through an allowlisted channel** —
@@ -458,55 +747,67 @@ class DesktopTakeoverGate:
             return None, "no_session_grant"
 
         ttl = timedelta(minutes=grant_ttl_minutes())
-        target = _window_key(window_title)
+        saw_parsed = False
         saw_allowlisted = False
-        saw_this_window = False
+        # The most specific near-miss seen, so the reason names the bar that
+        # actually failed rather than a generic scope refusal.
+        scope_reason = ""
 
         for row in rows:
-            resolved_by = str(row.get("resolved_by") or "")
-            if not resolved_by.startswith(DESKTOP_GRANT_RESOLVER_PREFIXES):
+            grant = SessionGrant.parse(row)
+            # Unparseable, wrong kind, unknown version, or missing a field this
+            # is about to compare. Not a grant, so not a near-miss either.
+            if grant is None:
+                continue
+            saw_parsed = True
+            if not grant.resolved_by.startswith(DESKTOP_GRANT_RESOLVER_PREFIXES):
                 continue
             saw_allowlisted = True
 
-            granted = _window_key(_grant_window(row))
-            # An absent or empty window on EITHER side is a refusal, never a
-            # wildcard — the rule the device already applies to a target it
-            # cannot resolve. A grant naming no window is not a narrower grant;
-            # it is an unbounded one.
-            if not granted or not target or granted != target:
-                continue
-            saw_this_window = True
-
-            resolved_at = _parse_ts(row.get("resolved_at"))
-            if resolved_at is None:
-                # An approved row with an unreadable resolution time cannot be
-                # aged, and an un-ageable grant is an unbounded one. Refuse.
-                logger.warning(
-                    "Desktop grant %s has unparseable resolved_at %r — refusing",
-                    row.get("id"),
-                    row.get("resolved_at"),
-                )
+            mismatch = grant.mismatch(
+                action, session_id=session_id, mission_id=mission_id
+            )
+            if mismatch:
+                scope_reason = scope_reason or mismatch
                 continue
 
-            age = now - resolved_at
+            if grant.resolved_at is None:
+                # Un-ageable, so unbounded. Falls through to "expired", which
+                # is what a grant that can never lapse has to be treated as.
+                continue
+
+            # Read the clock HERE, not from the caller's capture. `now`
+            # was taken before `effective_mode()` read two config files
+            # off disk and before this function's own SQL round trip; a
+            # stale clock makes the grant look YOUNGER than it is, so a
+            # grant that lapsed during that work would still authorize.
+            # That is the fail-OPEN direction, on the one bar whose job
+            # is to make a forgotten grant die on its own.
+            age = datetime.now(UTC) - grant.resolved_at
             # Bounded on BOTH sides. A future-dated resolution gives a negative
             # age, which `age <= ttl` alone accepts forever — a backwards clock
             # step or a hand-edited row would mint a permanent grant.
             if timedelta(0) <= age <= ttl:
-                return row, "session_grant"
+                return grant, "session_grant"
 
+        # Ordered so the reason names the FIRST bar that failed. Each is a
+        # different thing to go and fix, and reporting the wrong one sends the
+        # reader after the wrong thing: "no grant from a human" and "the grant
+        # blob is malformed" have nothing to do with each other.
+        if not saw_parsed:
+            return None, "grant_malformed"
         if not saw_allowlisted:
             return None, "grant_not_human"
-        if not saw_this_window:
-            return None, "grant_window_mismatch"
+        if scope_reason:
+            return None, scope_reason
         return None, "grant_expired"
 
     async def _hold(
         self,
         classification: DesktopActionClassification,
+        action: DesktopAction,
         session_id: str,
-        window_title: str,
-        element_name: str,
+        mission_id: str,
         mode: str,
     ) -> DesktopGateDecision:
         """Record an owner decision for one above-STANDARD action.
@@ -527,22 +828,49 @@ class DesktopTakeoverGate:
         domain, verb, risk = classification.cell_key
         context = json.dumps(
             {
-                "kind": DESKTOP_GATE_ACTION_TYPE,
+                # A KIND, not the action_type. This wrote
+                # DESKTOP_GATE_ACTION_TYPE, which no reader ever looks for, so
+                # the hold path was write-only: a row nothing could find.
+                "kind": DESKTOP_HOLD_KIND,
                 "cell": [domain, verb, risk],
                 "session_id": session_id,
-                "window_title": window_title,
-                "element_name": element_name,
+                # The IDENTITY triple, recorded for the same reason the grant
+                # compares it: a row naming only a window TITLE cannot be tied
+                # back to the window it was about, and the title is neither
+                # unique nor stable. Written now, while the writer and the
+                # reader are one file apart — whatever a later PR decides an
+                # approved hold authorizes will need exactly these fields, and
+                # rows written before then would be unbindable.
+                "mission_id": mission_id,
+                "window_handle": action.window_handle,
+                "process_id": action.process_id,
+                "operation": str(action.operation),
+                "window_title": action.window_title,
+                "element_name": action.element_name,
                 "sub_class": classification.sub_class,
             }
         )
         request_id = await self._approval.request_approval(
             action_type=DESKTOP_GATE_ACTION_TYPE,
             action_class=str(classification.action_class),
+            # NEWLINE-delimited, one field per line, and NOT quoted inline.
+            # `_display` guarantees its output contains no newline (it runs
+            # `strip_control_chars`), so a newline is the one delimiter screen
+            # text cannot forge — whereas an apostrophe is not: an element
+            # named `Cancel' in 'Notepad - untitled` rendered a card that read
+            # as well-formed and named the WRONG window, demoting the real one
+            # to a trailing fragment. That is the same forgery `_display`
+            # exists to stop, reached with purely-printable text, which
+            # `strip_control_chars` explicitly disclaims covering.
+            #
+            # Stripping quotes instead would have corrupted every legitimate
+            # title ("Bob's Document"). Structure beats sanitisation here.
             description=(
-                f"Desktop {classification.sub_class} action on "
-                f"'{_display(element_name) or 'an unnamed control'}' in "
-                f"'{_display(window_title)}' — approving lets the session "
-                "re-plan from a fresh capture; it does not replay this action"
+                f"Desktop {classification.sub_class} action.\n"
+                f"Control: {_display(action.element_name) or 'an unnamed control'}\n"
+                f"Window: {_display(action.window_title) or 'an unnamed window'}\n"
+                "Approving lets the session re-plan from a fresh capture; "
+                "it does not replay this action."
             ),
             context=context,
             # Wait for the owner — never auto-approve, never auto-drop. This
@@ -551,14 +879,14 @@ class DesktopTakeoverGate:
             # skip the row); test_desktop_gate pins that.
             timeout_seconds=None,
         )
-        await self._emit_held(classification, window_title, element_name)
+        await self._emit_held(classification, action.window_title, action.element_name)
         logger.info(
             "Desktop gate HELD %s action (cell=%s:%s:%s, window=%r, request=%s)",
             classification.sub_class,
             domain,
             verb,
             risk,
-            window_title,
+            action.window_title,
             request_id,
         )
         return DesktopGateDecision(
@@ -607,34 +935,89 @@ class DesktopTakeoverGate:
             logger.error("Failed to emit autonomy.gate_held", exc_info=True)
 
 
-def _grant_window(row: dict) -> str:
-    """The window title a grant row was issued for, or "" if unreadable.
+def _validate_call(
+    action: DesktopAction, *, session_id: str, mission_id: str
+) -> str:
+    """``""`` if the call is well-formed, else the refusal reason.
 
-    The SQL predicate already guards `json_valid`, but a row can be valid JSON
-    and still lack the key (a hand-written row, an older wire format), so an
-    unreadable window resolves to "" — which the caller treats as a refusal
-    rather than a wildcard.
+    Every check here answers "did the caller tell us what it is doing?", and a
+    "no" is a CALLER defect rather than a decision to put in front of the
+    operator. Holding instead would ask them to approve an action nobody can
+    describe.
+
+    ``unresolved_target`` is the one worth naming out loud: a click with both
+    ``element_name`` and ``control_type`` blank is a click at raw coordinates,
+    which the classifier cannot see and the operator cannot be shown. It was
+    previously authorised like any other ordinary action. It applies only to
+    operations that HAVE a resolved target (see
+    :data:`OPERATIONS_REQUIRING_TARGET`) — a key chord acts on whatever holds
+    focus, and requiring a target it can never have would refuse every keypress.
     """
+    if not str(session_id or "").strip():
+        return "no_session_id"
+    if not str(mission_id or "").strip():
+        return "no_mission_id"
+
+    # `==`-style membership via the enum constructor, never `is`: DesktopOperation
+    # is a StrEnum, so a raw string that equals a member is a legitimate value
+    # an identity check would reject.
     try:
-        ctx = json.loads(row.get("context") or "{}")
+        operation = DesktopOperation(action.operation)
+    except ValueError:
+        return "unknown_operation"
+
+    if not str(action.window_handle or "").strip():
+        return "malformed_action:window_handle"
+
+    # `bool` is an int subclass, so `process_id=True` would pass an int check
+    # and become pid 1.
+    if isinstance(action.process_id, bool):
+        return "malformed_action:process_id"
+    try:
+        process_id = int(action.process_id)
     except (TypeError, ValueError):
-        return ""
-    return str(ctx.get("window_title") or "") if isinstance(ctx, dict) else ""
+        return "malformed_action:process_id"
+    if process_id <= 0:
+        return "malformed_action:process_id"
+
+    if operation == DesktopOperation.KEY and not str(action.key_chord or "").strip():
+        return "malformed_action:key_chord"
+
+    if operation in OPERATIONS_REQUIRING_TARGET and not (
+        str(action.element_name or "").strip() or str(action.control_type or "").strip()
+    ):
+        return "unresolved_target"
+
+    return ""
 
 
-def _window_key(value: object) -> str:
-    """Comparison key for a window title.
+def _verdict(
+    *,
+    classification: DesktopActionClassification,
+    grant: SessionGrant | None,
+    grant_reason: str,
+    cell_state: CellState,
+) -> tuple[bool, str]:
+    """The whole allow/hold/refuse policy, in ONE place. Pure.
 
-    Case- and whitespace-insensitive, and nothing more. Window titles are not
-    stable identifiers — a document name changes the title of the same window —
-    so this is a STRICT bar by choice: a title that drifts refuses, and the loop
-    re-asks against the window the operator can actually see named. The safe
-    direction for a boundary the classifier falls back on is to refuse and
-    re-ask, not to guess that two different titles mean the same window.
-    A stable window identity (a handle carried from the resolve step) is the
-    right long-term fix and belongs with the loop that resolves it.
+    This function is the deliverable of the shadow/live de-duplication. Shadow
+    used to recompute the live verdict by hand — three terms that had to be
+    kept in step with the live path by whoever edited it next. Every bar added
+    to the gate meant editing the policy twice, and a shadow that silently
+    disagrees with live is worse than no shadow, because shadow is the mode
+    installs actually run: it is the only thing reporting what live WOULD do.
+
+    ``"held"`` is a verdict, not an outcome — the caller decides whether that
+    means writing an approval row (live) or simply reporting it (shadow).
     """
-    return " ".join(str(value or "").split()).casefold()
+    if grant is None:
+        return False, grant_reason
+    if cell_state == CellState.DENIED_PERMANENT:
+        return False, "denied_permanent"
+    # `!=`, never `is not`: RiskClass is a StrEnum (see classification.py).
+    if classification.risk_class != RiskClass.STANDARD:
+        return False, "held"
+    return True, "session_grant"
 
 
 def _parse_ts(raw: object) -> datetime | None:

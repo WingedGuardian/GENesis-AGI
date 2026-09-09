@@ -117,9 +117,71 @@ def test_unquoted_yaml_bool_off_is_honoured(config_dirs):
 
 
 def test_corrupt_config_degrades_to_shadow(config_dirs):
+    """A corrupt BASE degrades to shadow — observable, never a silent off.
+
+    Correct precisely because the tracked base holds only values DEFAULTS
+    already reproduces, so falling back to them loses nothing the operator
+    wrote. Contrast the overlay cases below, where it does."""
     base, _ = config_dirs
     base.write_text("mode: live\nlive_opt_in: [unclosed\n")
     assert dtc.effective_mode() == "shadow"
+
+
+# ── a damaged OVERLAY is a different fact from a damaged base ────────────
+
+
+def test_an_unparseable_overlay_forces_off_not_shadow(config_dirs):
+    """The overlay is the ONLY home for an operator's settings, so damage there
+    discards them — and ``merge_local_overlay`` returns the base unchanged,
+    which is indistinguishable from a clean load at the call site."""
+    base, overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\n")
+    overlay.write_text("enabled: [unclosed\n")
+    assert dtc.effective_mode() == "off"
+
+
+def test_a_wrong_shape_overlay_forces_off(config_dirs):
+    """Valid YAML, wrong ROOT shape — parses fine and merges nothing. The one
+    malformed case an exception handler never sees."""
+    base, overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\n")
+    overlay.write_text("- enabled: false\n- mode: off\n")
+    assert dtc.effective_mode() == "off"
+
+
+def test_a_damaged_overlay_does_not_silently_resume_a_disabled_capability(config_dirs):
+    """The acceptance bar — the real defect this exists for.
+
+    The base ships ``enabled: true``, so an operator's disable can only live in
+    the overlay. Degrading a damaged overlay to defaults re-enables a
+    capability they switched off, and reports a healthy config while doing it."""
+    base, overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\n")
+    overlay.write_text("enabled: false\n")
+    assert dtc.effective_mode() == "off", "control: the disable is honoured while readable"
+
+    overlay.write_text("enabled: false\nmode: [unclosed\n")
+    assert dtc.effective_mode() == "off", "and is not lost when the file is damaged"
+
+
+def test_an_ABSENT_overlay_is_not_damage(config_dirs):
+    """The negative control. Absent is the common case — a fresh install has no
+    overlay at all — and a check that cannot tell it from corruption would
+    force every install to off and look like it was working."""
+    base, overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\n")
+    assert not overlay.exists()
+    assert dtc.effective_mode() == "shadow"
+
+
+def test_a_VALID_overlay_still_applies(config_dirs):
+    """The other negative control: the damage check must not swallow a healthy
+    overlay. Without this, "forces off" could be unconditional and every test
+    above would still pass."""
+    base, overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\nlive_opt_in: false\n")
+    overlay.write_text("mode: live\nlive_opt_in: true\n")
+    assert dtc.effective_mode() == "live"
 
 
 def test_env_kill_switch_beats_an_armed_config(config_dirs, monkeypatch):
@@ -174,3 +236,102 @@ def test_not_registered_as_a_settings_domain():
         getattr(d, "config_filename", "") == "desktop_takeover.yaml"
         for d in _DOMAIN_REGISTRY.values()
     )
+
+
+def test_an_overlay_that_is_a_DIRECTORY_is_damage_not_absence(config_dirs):
+    """`merge_local_overlay` tests `exists()`, so a directory takes its read
+    branch, raises IsADirectoryError, and returns base with the overlay
+    dropped. An `is_file()` check in the damage probe would answer "not
+    damaged" for that same path and report shadow on a load where every
+    operator override was discarded.
+
+    It has to be the REPO-RELATIVE sibling, not the user-dir path. A review
+    finding named the user-dir path, and it does not reproduce there:
+    `_resolve_overlay_path` tests `is_file()` itself, so a directory in the
+    user dir is diverted to the sibling and never reaches either predicate.
+    The sibling is returned by the fallback branch UNGUARDED, so it does."""
+    base, user_overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\n")
+    assert not user_overlay.exists(), "the user-dir path must stay absent"
+    (base.parent / "desktop_takeover.local.yaml").mkdir()
+    assert dtc.effective_mode() == "off"
+
+
+def test_a_directory_in_the_USER_dir_is_diverted_not_damage(config_dirs):
+    """The control for the test above, and the correction to the finding that
+    prompted it. A directory at the user-dir path means there is no overlay
+    FILE there, `_resolve_overlay_path` falls back to a sibling that does not
+    exist, and no operator setting was lost — so `shadow` is right."""
+    base, user_overlay = config_dirs
+    base.write_text("enabled: true\nmode: shadow\n")
+    user_overlay.mkdir()
+    assert dtc.effective_mode() == "shadow"
+
+
+def test_an_absurd_ttl_falls_back_rather_than_granting_the_longest_window(config_dirs):
+    """The lever is described as "bounded" and was bounded on ONE side: any
+    positive value was accepted, so a typo'd 30000 was a 20-day grant, and a
+    large enough value made `timedelta(minutes=...)` raise OverflowError out of
+    the gate rather than refuse.
+
+    It degrades to the DEFAULT rather than clamping to the ceiling, because
+    every degradation path here moves toward less authority — clamping would
+    make a mistyped duration grant the longest window the code allows."""
+    base, _ = config_dirs
+    base.write_text("grant_ttl_minutes: 30000\naction_ttl_seconds: 99999\n")
+    assert dtc.grant_ttl_minutes() == dtc.DEFAULTS["grant_ttl_minutes"]
+    assert dtc.action_ttl_seconds() == dtc.DEFAULTS["action_ttl_seconds"]
+
+    base.write_text("grant_ttl_minutes: 999999999999999999999\n")
+    assert dtc.grant_ttl_minutes() == dtc.DEFAULTS["grant_ttl_minutes"]
+
+
+def test_a_ttl_at_the_ceiling_is_still_honoured(config_dirs):
+    """The control: the bound must reject the absurd without capping the merely
+    generous."""
+    base, _ = config_dirs
+    base.write_text("grant_ttl_minutes: 1440\naction_ttl_seconds: 300\n")
+    assert dtc.grant_ttl_minutes() == 1440
+    assert dtc.action_ttl_seconds() == 300
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " y "])
+def test_the_kill_switch_honours_the_usual_truthy_spellings(config_dirs, monkeypatch, caplog, raw):
+    """It honoured the literal "1" only, so `=true` / `=yes` / `=on` disabled
+    nothing and warned about nothing — on the one control the module documents
+    as unreachable-around.
+
+    Asserts SILENCE as well as the mode, and that is what makes the test
+    isolate the truthy set. The unrecognised-value fallback also returns "off",
+    so a mutation shrinking the set back to `== "1"` still yields off for every
+    spelling here — it just does it by calling them typos. Without the
+    no-warning assertion this test passes with the thing it names deleted."""
+    import logging
+
+    base, _ = config_dirs
+    base.write_text("enabled: true\nmode: live\nlive_opt_in: true\n")
+    monkeypatch.setenv(dtc.DISABLE_ENV, raw)
+    with caplog.at_level(logging.WARNING):
+        assert dtc.effective_mode() == "off", raw
+    assert not [r for r in caplog.records if "not a recognised boolean" in r.getMessage()], (
+        f"{raw!r} is a normal spelling and must not be reported as a typo"
+    )
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off", ""])
+def test_an_explicitly_falsy_kill_switch_does_not_disable(config_dirs, monkeypatch, raw):
+    """The control. Without it, "treat unrecognised as set" could be
+    unconditional and every test above would still pass."""
+    base, _ = config_dirs
+    base.write_text("enabled: true\nmode: live\nlive_opt_in: true\n")
+    monkeypatch.setenv(dtc.DISABLE_ENV, raw)
+    assert dtc.effective_mode() == "live", raw
+
+
+def test_an_unrecognised_kill_switch_value_stops_the_capability(config_dirs, monkeypatch):
+    """Someone typed a value into the kill switch. The safe reading is that
+    they meant to stop it, and it is logged so the typo is visible."""
+    base, _ = config_dirs
+    base.write_text("enabled: true\nmode: live\nlive_opt_in: true\n")
+    monkeypatch.setenv(dtc.DISABLE_ENV, "maybe")
+    assert dtc.effective_mode() == "off"

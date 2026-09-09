@@ -40,7 +40,12 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import merge_local_overlay
+# `_resolve_overlay_path` is private, and imported rather than re-derived on
+# purpose: the overlay location is user-dir-first with a repo-relative
+# fallback, and a local copy of that rule would drift. Drift here means
+# checking a file nobody wrote, which reports "clean" for a damaged overlay —
+# the exact failure this import exists to detect.
+from genesis._config_overlay import _resolve_overlay_path, merge_local_overlay
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -68,12 +73,101 @@ def _base_path() -> Path:
     return repo_root() / "config" / _CONFIG_NAME
 
 
+#: Set on the merged config when the OVERLAY existed but could not be read.
+#:
+#: Scoped to the overlay ON PURPOSE, and the asymmetry is the whole argument.
+#: The tracked base holds only values ``DEFAULTS`` already reproduces
+#: (``enabled: true``, ``mode: shadow``, ``live_opt_in: false``, the two TTLs),
+#: so falling back to DEFAULTS when it is damaged loses NOTHING operator-
+#: specific — it lands on exactly what the file said. The overlay is gitignored
+#: and is the sanctioned home for every operator customization, including the
+#: disable: since the base ships ``enabled: true``, an ``enabled: false`` can
+#: only live in the overlay. Damage there discards the off switch and reports
+#: a clean load.
+#:
+#: This is why the module's "an invalid value degrades to shadow, never a
+#: silent off" rule is NOT contradicted here. That rule is about a value we can
+#: SEE and cannot interpret; this is about a file whose contents we never saw
+#: at all, so there is no operator intent left to degrade politely toward.
+_OVERLAY_UNREADABLE = "_overlay_unreadable"
+
+
+#: Spellings that ARM the kill switch, and the ones that explicitly do not.
+#: Anything else disables and says so — this is the one control the module
+#: documents as unreachable-around, and an operator who typed something to stop
+#: the capability meant to stop it. Honouring only the literal "1" meant
+#: ``=true`` / ``=yes`` / ``=on`` disabled nothing and warned about nothing.
+_KILL_TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
+_KILL_FALSY = frozenset({"", "0", "false", "no", "off", "n", "f"})
+
+
+def _kill_switch_set() -> bool:
+    """Whether ``GENESIS_DESKTOP_TAKEOVER_DISABLED`` says stop."""
+    raw = os.environ.get(DISABLE_ENV)
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in _KILL_TRUTHY:
+        return True
+    if value in _KILL_FALSY:
+        return False
+    logger.warning(
+        "%s=%r is not a recognised boolean — treating it as SET. Someone typed "
+        "a value into the kill switch; the safe reading is that they meant to "
+        "stop the capability.",
+        DISABLE_ENV,
+        raw,
+    )
+    return True
+
+
+def _overlay_is_damaged(path: Path) -> bool:
+    """True when the overlay exists but does not parse as a YAML mapping.
+
+    Absent is not damaged — that is the common case, and DEFAULTS are correct
+    for it. An empty file (or an explicit ``null``) is not damaged either: it
+    is a legitimately empty layer, which is how ``merge_local_overlay`` reads
+    it too.
+    """
+    # `exists()`, not `is_file()`, to match `merge_local_overlay`'s own test.
+    # It takes its `exists()` branch for a DIRECTORY, `read_text()` raises
+    # IsADirectoryError, and it warns and returns base — the overlay silently
+    # dropped. An `is_file()` check here would answer "not damaged" for that
+    # same path, so `effective_mode()` would report shadow on a load where
+    # every operator override was discarded: exactly the hole this function
+    # exists to close, reached by a path it did not test. The try/except below
+    # already handles the directory read correctly.
+    if not path.exists():
+        return False
+    try:
+        loaded = yaml.safe_load(path.read_text())
+    except Exception:
+        logger.warning("desktop_takeover overlay unreadable at %s", path, exc_info=True)
+        return True
+    if loaded is not None and not isinstance(loaded, dict):
+        logger.warning(
+            "desktop_takeover overlay %s has a %s at its root, not a mapping",
+            path,
+            type(loaded).__name__,
+        )
+        return True
+    return False
+
+
 def load_config() -> dict[str, Any]:
     """Read the merged config fresh — per call, NO cache.
 
     Deep-merges (defaults <- base yaml <- .local.yaml overlay). A missing or
-    corrupt file degrades layer-by-layer toward DEFAULTS, which are ``shadow``
+    corrupt BASE degrades layer-by-layer toward DEFAULTS, which are ``shadow``
     and un-opted-in: config damage can never arm the capability.
+
+    A corrupt OVERLAY is flagged instead of degraded, because
+    :func:`merge_local_overlay` returns *base* unchanged when the overlay will
+    not parse. It warns, so this is not silent — but the value it RETURNS is
+    indistinguishable from a clean load, and every override in that file is
+    gone. For most subsystems that fallback is right; for the arming lever of
+    the desktop capability it means losing the operator's off switch and
+    reporting success.
     """
     merged = copy.deepcopy(DEFAULTS)
     base_path = _base_path()
@@ -84,11 +178,17 @@ def load_config() -> dict[str, Any]:
             base = loaded
     except Exception:
         logger.warning("desktop_takeover base config unreadable at %s", base_path)
+
+    overlay_damaged = _overlay_is_damaged(_resolve_overlay_path(base_path))
     try:
         base = merge_local_overlay(base, base_path)
     except Exception:
         logger.warning("desktop_takeover overlay merge failed", exc_info=True)
+        overlay_damaged = True
+
     merged.update(base)
+    if overlay_damaged:
+        merged[_OVERLAY_UNREADABLE] = True
     return merged
 
 
@@ -109,9 +209,26 @@ def effective_mode() -> str:
     - any other invalid mode degrades to ``shadow`` — observable, never a
       silent ``off``, never ``live``.
     """
-    if os.environ.get(DISABLE_ENV) == "1":
+    if _kill_switch_set():
         return "off"
     cfg = load_config()
+    if cfg.get(_OVERLAY_UNREADABLE):
+        # OFF, not shadow. A damaged OVERLAY means the operator's own settings
+        # were discarded, and the one they are most likely to have written is
+        # `enabled: false` — the tracked base ships `enabled: true`, so a
+        # disable can only live there. Degrading to shadow would quietly resume
+        # recording for someone who had switched it off.
+        #
+        # Not the "silent off" the module docstring warns against: this warns
+        # on every call and names the file. And it costs no capability, since
+        # neither `off` nor `shadow` can act — the choice between them is
+        # purely about honouring the last intent that was legible. Fix the YAML
+        # and the mode returns on its own; the config is re-read per action.
+        logger.warning(
+            "desktop_takeover overlay is present but unreadable — forcing off. "
+            "Settings in that file are NOT in effect; fix the YAML."
+        )
+        return "off"
     enabled = cfg.get("enabled", True)
     if enabled is not True:
         if enabled is not False:
@@ -135,6 +252,24 @@ def effective_mode() -> str:
     return mode
 
 
+#: Upper bounds on the two windows. A lever the module calls "bounded" was
+#: bounded on one side only: `_positive_int` rejected <= 0 and accepted
+#: anything above it, so a typo'd `grant_ttl_minutes: 30000` was a 20-day grant
+#: and a large enough value made `timedelta(minutes=...)` raise OverflowError
+#: out of the gate's `check()` rather than refuse.
+#:
+#: Derived from the protocol rather than from observed values, per the rule for
+#: safety bounds: a grant is session consent for minutes of work at a keyboard,
+#: so a day is already far past "a grant nobody remembers giving must lapse on
+#: its own"; and an action TTL bounds container -> SSH -> device transit, not
+#: operator think-time, so five minutes is generous for a hop measured in
+#: hundreds of milliseconds.
+_MAXIMA: dict[str, int] = {
+    "grant_ttl_minutes": 1440,
+    "action_ttl_seconds": 300,
+}
+
+
 def _positive_int(cfg: dict[str, Any], key: str) -> int:
     """A positive int from config, or the DEFAULT — never 0 and never negative.
 
@@ -153,6 +288,19 @@ def _positive_int(cfg: dict[str, Any], key: str) -> int:
         return int(DEFAULTS[key])
     if value <= 0:
         logger.warning("desktop_takeover %s=%r is not positive — using default", key, raw)
+        return int(DEFAULTS[key])
+    ceiling = _MAXIMA.get(key)
+    if ceiling is not None and value > ceiling:
+        # The DEFAULT, not the ceiling. Every degradation path in this module
+        # moves toward LESS authority, and clamping to the maximum would make a
+        # mistyped duration grant the longest window the code allows.
+        logger.warning(
+            "desktop_takeover %s=%r exceeds the maximum of %d — using default %d",
+            key,
+            raw,
+            ceiling,
+            DEFAULTS[key],
+        )
         return int(DEFAULTS[key])
     return value
 

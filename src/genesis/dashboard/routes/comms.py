@@ -170,6 +170,7 @@ async def unified_comms():
 
     # --- Pending approvals ---
     try:
+        from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.db.crud import approval_requests
 
         raw_pending = await approval_requests.list_pending(rt.db)
@@ -179,6 +180,23 @@ async def unified_comms():
                 pending_approvals.append(dict(row))
             elif isinstance(row, dict):
                 pending_approvals.append(row)
+        # Desktop-takeover rows are withheld here for the same reason the
+        # dashboard approvals queue withholds them: this feed renders a pending
+        # row as a generic approval card, and a card that cannot say it is
+        # handing over the operator's keyboard must not be the place that asks.
+        # Desktop consent has its own surface, which names the target window
+        # back to them.
+        #
+        # Found by enumerating every reader of `approval_requests` rather than
+        # by fixing the one that was reported: the exclusion is maintained by
+        # ENUMERATION, so a new surface that forgets it re-opens the path and
+        # no allowlist catches that. The other readers are safe for their own
+        # reasons — `hydrate_delivery_map` matches on a `delivery_id` a desktop
+        # row does not carry, and the morning report counts rather than offers.
+        pending_approvals = [
+            r for r in pending_approvals
+            if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE
+        ]
         counts["pending_approvals"] = len(pending_approvals)
     except Exception:
         logger.error("Failed to fetch approvals for comms view", exc_info=True)
