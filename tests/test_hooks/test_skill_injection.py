@@ -286,7 +286,16 @@ def test_main_long_path_never_emits_a_cut_read_instruction(tmp_path, monkeypatch
     "/SKILL.md", so any deeper skill got an instruction pointing at a file that
     does not exist -- a cost paid on every prompt, silently, because a failed
     Read looks like the model's mistake. The bound now sits on the LINE: either
-    the whole path is emitted, or the line degrades to the /skill form.
+    the whole path is emitted, or the line degrades to the UNNAMED notice.
+
+    NOT to the /skill form -- this fixture is tier 2, and /skill does not resolve
+    for a tier-2 skill, so the ladder must never offer it here. See
+    test_main_a_tier2_overflow_never_offers_the_skill_command. This branch was
+    written when the ladder tried /skill first for every tier; it is dormant
+    today (MEASURED: the fixture's 169-char path renders a 258-char Read form, so
+    the base form always fits and the else never runs) but it asserted the exact
+    behaviour its neighbour now forbids -- a trap for whoever next lengthens the
+    fixture and reads the failure as a regression in the fix.
     """
     deep = "src/genesis/skills/" + "/".join(["nested-package"] * 9) + "/stealth-browser"
     assert len(deep) > 120, "fixture must exceed the slice this test exists to forbid"
@@ -304,23 +313,32 @@ def test_main_long_path_never_emits_a_cut_read_instruction(tmp_path, monkeypatch
     if "SKILL.md" in out:
         assert f"Read {deep}/SKILL.md" in out, "the Read path was cut mid-way"
     else:
-        assert "/skill stealth-browser" in out, "degraded without a usable fallback"
+        assert "cannot be named in one line" in out, (
+            "degraded without a usable fallback"
+        )
 
 
-def test_main_a_long_path_does_not_cost_the_NAME(tmp_path, monkeypatch, capsys):
-    """When BOTH degraded forms fit, prefer the one that keeps the name.
+def test_main_a_tier2_overflow_never_offers_the_skill_command(
+    tmp_path, monkeypatch, capsys
+):
+    """TIER 2 IS NOT INVOCABLE BY /skill, so the overflow ladder must not offer
+    it. Only tier-1 skills are indexed; tier-2 lives under src/genesis/skills/
+    and ~/.genesis/skill-library/ and must be READ by path (CLAUDE.md "Skill
+    Library"). The ladder tried /skill FIRST for every tier, so a tier-2 entry
+    whose Read form overflowed had a working instruction replaced by a command
+    that does not resolve -- and `named` stayed True, so `_save_session_nudge`
+    recorded it as delivered and suppressed the retry for the whole session. A
+    non-actionable nudge that also burns the one chance to send an actionable
+    one is strictly worse than saying less.
 
-    The path-only rung was checked before the /skill rung, so it won whenever it
-    fit -- even where /skill also fit and carried strictly more (the name AND an
-    invocation). MEASURED by audit: a 1-char name with a 284-char path overflows
-    the Read form at 401 chars while /skill is 121, so a nudge that could have
-    named its skill was silently anonymised. Not a correctness bug, both forms
-    being actionable, but a worse choice in a cell the fix never meant to touch.
-    """
-    # Sized from the rendered forms, not by eye: a first draft picked a path
-    # length that did not actually overflow, so the base form fired and the test
-    # failed for a reason that had nothing to do with the ordering it exists to
-    # pin. Build the path until the Read form exceeds the cap while /skill fits.
+    This is the same fixture as the tier-1 test above with `tier` flipped, which
+    is the point: identical geometry, opposite correct answer. That test used to
+    carry `tier: 2` while pinning a rationale ("/skill carries both the name and
+    an invocation") that is only true of tier 1 -- so the suite locked the
+    defect in.
+
+    The path does not fit either, so the correct outcome is the UNNAMED notice,
+    which is deliberately not recorded and leaves the skill nudgeable again."""
     import skill_injection_hook as _hook
 
     desc = "Browser automation"
@@ -328,10 +346,13 @@ def test_main_a_long_path_does_not_cost_the_NAME(tmp_path, monkeypatch, capsys):
     read_form = f"[Skill] The 'sel' skill matches this task. Read {long_path}/SKILL.md. {desc}"
     skill_form = f"[Skill] The 'sel' skill matches this task. Load with /skill sel. {desc}"
     assert len(read_form) > _hook._MAX_NUDGE_LINE, "fixture does not overflow Read"
-    assert len(skill_form) <= _hook._MAX_NUDGE_LINE, "fixture must let /skill fit"
+    assert len(skill_form) <= _hook._MAX_NUDGE_LINE, (
+        "fixture must let /skill fit, or this pins nothing -- the whole point is "
+        "that the hook declines a form that WOULD have fitted"
+    )
     skill = {
         "name": "sel",
-        "description": "Browser automation",
+        "description": desc,
         "keywords": ["selenium"],
         "tier": 2,
         "path": long_path,
@@ -340,8 +361,11 @@ def test_main_a_long_path_does_not_cost_the_NAME(tmp_path, monkeypatch, capsys):
     _write_catalog(catalog_file, tier2=[skill])
 
     out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
-    assert "/skill sel" in out, "the name was dropped while /skill still fitted"
-    assert "too long to print" not in out
+    assert "/skill sel" not in out, (
+        "offered /skill for a tier-2 skill, which is not indexed and will not "
+        "resolve"
+    )
+    assert "cannot be named in one line" in out
 
 
 def test_main_a_long_tier1_name_degrades_to_its_path(tmp_path, monkeypatch, capsys):
@@ -372,7 +396,7 @@ def test_main_a_long_tier1_name_degrades_to_its_path(tmp_path, monkeypatch, caps
     _write_catalog(catalog_file, tier1=[skill])
 
     out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
-    assert "too long to print" not in out, "degraded past a form that still worked"
+    assert "cannot be named in one line" not in out, "degraded past a form that still worked"
     assert (f"Read {path}/SKILL.md" in out) or (f"/skill {long_name}" in out), (
         "a tier-1 skill with a long name lost every usable identifier"
     )
@@ -409,7 +433,7 @@ def test_main_a_long_name_does_not_cost_a_usable_path(tmp_path, monkeypatch, cap
     out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
 
     assert f"Read {short_path}/SKILL.md" in out, "a usable path was discarded"
-    assert "too long to print" not in out, "degraded past a form that still worked"
+    assert "cannot be named in one line" not in out, "degraded past a form that still worked"
     assert saved, "an actionable nudge was not recorded, so it will recur forever"
 
 

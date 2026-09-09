@@ -121,13 +121,17 @@ _STRUCTURALLY_BOUNDED = {
         "raise it; clause bodies clipped [:71] by render_clause; joined into ONE "
         "line at pr_watch.select_to_surface. Cites SYMBOLS, not line numbers: "
         "this row first cited :54, a reflow moved it to :56, and nothing caught "
-        "the rot"
+        "the rot. The fail-open handler adds ONE more line whose only variable "
+        "part is an exception class name sliced [:40] -- fixed-format, so it "
+        "cannot approach the cap either"
     ),
     "scripts/surface_open_prs.py": (
         "min(..., repo_pulse_config.OPEN_PR_MAX_SURFACE_CAP) clamp in main() of "
         "scripts/surface_open_prs.py — in CODE, not the config default; each "
         "clause synthesised from ints (#1379 (12d, draft)); joined into ONE line "
-        "at pr_watch.select_to_surface"
+        "at pr_watch.select_to_surface. The fail-open handler adds ONE more line "
+        "whose only variable part is an exception class name sliced [:40] -- "
+        "fixed-format, so it cannot approach the cap either"
     ),
     ".claude/hooks/cbm-session-reminder.sh": (
         "621 bytes TOTAL, a single quoted heredoc (cat << 'REMINDER') with zero "

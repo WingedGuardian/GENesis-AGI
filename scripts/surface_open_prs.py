@@ -11,8 +11,11 @@ FRESH ``now``, and surfaces the age-stale ones passively inline as one line:
 Worker = fetch-only; this hook owns ALL display logic + the seen-map, so the
 surface is always computed against the current clock (never a stale snapshot's).
 Its stdout becomes context visible to Claude at session start (same contract as
-scripts/surface_pr_updates.py). The whole body is fail-open: any error, missing
-cache, stale cache, or disabled config -> print nothing, never block session start.
+scripts/surface_pr_updates.py). Fail-open: a missing cache, a stale cache, an
+unparseable one, or disabled config -> print nothing and never block session
+start. An UNEXPECTED error (in practice a genesis/src import skew) prints ONE
+fixed-format line first, so a broken surface is not read as "no open PRs", then
+returns. It still never blocks session start.
 It NEVER prints CI/review state or "ready to merge" — a visibility nudge only.
 """
 
@@ -124,10 +127,19 @@ def main() -> None:
         if text:
             print(text)
             sys.stdout.flush()
-    except Exception:
-        # Fail open -- see the note in surface_pr_updates.py. STDERR is not
-        # model-facing, so naming the failure costs the session nothing and stops
-        # a version skew reading as "nothing to report".
+    except Exception as exc:
+        # Fail open, and say so IN BAND -- see the full note in
+        # surface_pr_updates.py. The short version: stderr is not model-facing,
+        # which is why writing the diagnostic there costs nothing AND achieves
+        # nothing. Claude Code discards an exit-0 hook's stderr, so a version
+        # skew still read as "nothing to report". ONE fixed-format line, the only
+        # variable part an exception class name, sliced -- it cannot approach the
+        # hook-output cap. The traceback still goes to stderr for the debug log.
+        print(
+            f"[PRs] open-PR surfacing FAILED ({type(exc).__name__[:40]}) -- read "
+            "'no open PRs' as UNKNOWN this session, not as none. "
+            "Trace in the hook debug log."
+        )
         traceback.print_exc(file=sys.stderr)
         return
 

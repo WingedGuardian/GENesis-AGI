@@ -10,8 +10,11 @@ session as a one-line nudge:
     Ask "show PRs" to review.
 
 Its stdout becomes context visible to Claude at session start (same contract as
-scripts/check_stale_pending.py). The whole body is fail-open: any error, missing
-table, or disabled config -> print nothing, never block session start.
+scripts/check_stale_pending.py). Fail-open: a missing table, an unreadable or
+locked DB, or disabled config -> print nothing and never block session start.
+An UNEXPECTED error (in practice a genesis/src import skew) prints ONE
+fixed-format line first, so a broken surface is not read as "nothing to
+report", then returns. It still never blocks session start.
 """
 
 from __future__ import annotations
@@ -84,12 +87,28 @@ def main() -> None:
         if text:
             print(text)
             sys.stdout.flush()
-    except Exception:
-        # Fail open -- never block session start. But name it on STDERR, which is
-        # not model-facing and so costs the session nothing: this block sits
-        # downstream of module attribute reads, so a genesis/src version skew
-        # turns the whole surface into a silent no-op that is indistinguishable
-        # from "nothing to report". Two lines of trace beat an invisible outage.
+    except Exception as exc:
+        # Fail open -- never block session start. But say so IN BAND.
+        #
+        # An earlier version wrote only the traceback to stderr, reasoning that
+        # stderr "is not model-facing and so costs the session nothing". That is
+        # exactly why it also ACHIEVES nothing: Claude Code discards an exit-0
+        # hook's stderr (READ: scripts/genesis_session_context.py, which routes
+        # its own mis-wire alert in-band for this reason, and
+        # scripts/hooks/git_discard_guard.py). This block sits downstream of
+        # module attribute reads, so a genesis/src version skew turns the whole
+        # surface into a silent no-op INDISTINGUISHABLE FROM "nothing to
+        # report" -- the precise outage the diagnostic existed to expose, filed
+        # where nothing reads it.
+        #
+        # ONE fixed-format line, so this cannot approach the hook-output cap:
+        # the only variable part is an exception CLASS NAME, sliced. The
+        # traceback still goes to stderr for the debug log.
+        print(
+            f"[PRs] surfacing hook FAILED ({type(exc).__name__[:40]}) -- read "
+            "'no updates' as UNKNOWN this session, not as none. "
+            "Trace in the hook debug log."
+        )
         traceback.print_exc(file=sys.stderr)
         return
 
