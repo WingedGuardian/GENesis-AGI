@@ -363,7 +363,7 @@ def test_scope_path_passes_all_properties(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=4G" in calls  # measured default (#1776), not 2G
+    assert "MemoryMax=4096M" in calls  # measured target, emitted as M (#1776)
     assert "MemorySwapMax=0" in calls
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
@@ -435,7 +435,7 @@ def test_oom_score_adj_reaches_the_indexer(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
-    assert "OOM_ADJ:500" in log.read_text()
+    assert "OOM_ADJ:900" in log.read_text()  # ABOVE invoker.py's 500 for CC subprocesses
     # And NOT passed as a scope property, which systemd would reject outright.
     assert "OOMScoreAdjust" not in slog.read_text()
 
@@ -637,3 +637,112 @@ def test_triggers_enqueue_markers_and_do_not_spawn():
         assert "code_intel_index.sh" not in text, (
             f"{rel} must NOT spawn the entrypoint directly — enqueue a marker"
         )
+
+
+# ── 3c. cap bounded by the container, and adj normalisation ──────────────────
+# Both from Codex P1/P2 on this PR. The cap was shipped as an absolute 4G, which
+# EQUALS the container limit on a minimum install (host-setup.sh floors an
+# install at 4 GiB) — a cap equal to the whole container isolates nothing.
+
+
+def _derive_mem_max(limit_bytes: str | None, tmp_path) -> str:
+    """Run the script's own _derive_mem_max against a faked cgroup limit.
+
+    Sources the real function rather than restating its arithmetic — a test that
+    reimplements the code under test passes while production stays broken.
+    """
+    src = _ENTRYPOINT.read_text()
+    start = src.index("_CI_MEM_TARGET_MB=")
+    end = src.index("MEM_MAX=", start)
+    body = src[start:end]
+    fake_cgroup = tmp_path / "cg"
+    fake_cgroup.mkdir(exist_ok=True)
+    if limit_bytes is not None:
+        (fake_cgroup / "memory.max").write_text(limit_bytes)
+    # Point the function's first candidate path at the fake.
+    body = body.replace("/sys/fs/cgroup/memory.max", str(fake_cgroup / "memory.max"))
+    body = body.replace("/sys/fs/cgroup/memory/memory.limit_in_bytes", str(fake_cgroup / "nope"))
+    res = subprocess.run(
+        ["bash", "-c", body + "\n_derive_mem_max"], capture_output=True, text=True, timeout=30
+    )
+    assert res.returncode == 0, res.stderr
+    return res.stdout.strip()
+
+
+def test_cap_is_bounded_by_the_container_limit(tmp_path):
+    """A minimum install must not get a cap equal to its whole container."""
+    gib = 1024 * 1024 * 1024
+    # 4 GiB minimum install: the absolute 4096M target would BE the container.
+    assert _derive_mem_max(str(4 * gib), tmp_path) == "2457M"
+    # 32 GiB: the measured target is well under the bound, so it stands.
+    assert _derive_mem_max(str(32 * gib), tmp_path) == "4096M"
+    # Uncapped container ("max") or unreadable: nothing bounds us, target stands.
+    assert _derive_mem_max("max", tmp_path) == "4096M"
+    assert _derive_mem_max(None, tmp_path) == "4096M"
+
+
+def test_cap_is_emitted_as_M_so_the_rlimit_fallback_can_parse_it(tmp_path):
+    """The bound must never be expressed as a percentage.
+
+    The rlimit fallback parses only <int>[.frac]G|M; a '%' falls through to
+    "running memory-uncapped", failing OPEN to something worse than the bug.
+    """
+    gib = 1024 * 1024 * 1024
+    for limit in (str(4 * gib), str(32 * gib), "max", None):
+        out = _derive_mem_max(limit, tmp_path)
+        assert out.endswith("M"), out
+        assert "%" not in out
+
+
+def test_oom_score_adj_is_above_the_cc_subprocess_rung(tmp_path):
+    """500 would TIE with CC subprocesses, which invoker.py already sets to 500.
+
+    At equal adj the kernel falls back to memory charge, so a large session could
+    be chosen over the indexer — defeating the ordering this feature exists for.
+    """
+    invoker = (_REPO_ROOT / "src/genesis/cc/invoker.py").read_text()
+    assert "def set_oom_score_adj(pid: int, score: int = 500)" in invoker, (
+        "invoker's CC-subprocess rung moved; the index adj must stay strictly above it"
+    )
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    logged = log.read_text()
+    adj = int(re.search(r"OOM_ADJ:(\d+)", logged).group(1))
+    assert adj > 500, f"index adj {adj} does not outrank CC subprocesses at 500"
+
+
+def test_zero_padded_adj_is_not_applied_as_octal(tmp_path):
+    """MEASURED: writing '0500' makes the kernel apply 320 (base autodetection).
+
+    The old guard accepted zero-padded digits and passed the raw string through,
+    so an operator's '0500' silently WEAKENED the preference while the log echoed
+    '0500' back as if it had taken.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "0500"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:500" in log.read_text()  # 500, NOT octal 320
+    assert "oom_score_adj=500" in res.stdout  # and the log reports what was written
+
+
+def test_adj_above_the_kernel_maximum_is_refused(tmp_path):
+    """Out-of-range must be rejected at the lever, not written and misapplied."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "5000"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "exceeds the kernel maximum" in res.stdout
+    assert "codebase-memory-mcp ARGS:" in log.read_text()  # index still ran
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()  # unchanged

@@ -42,8 +42,8 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
-#   CODE_INTEL_INDEX_MEMORY_MAX   default 4G     (per systemd scope; measured)
-#   CODE_INTEL_INDEX_OOM_SCORE_ADJ default 500    (this job dies FIRST; raise-only)
+#   CODE_INTEL_INDEX_MEMORY_MAX   default: measured 4096M, BOUNDED by the container
+#   CODE_INTEL_INDEX_OOM_SCORE_ADJ default 900    (above cc/invoker.py's 500; raise-only)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -81,13 +81,10 @@ MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 # Note CBM_MEM_BUDGET_MB is NOT the lever for this: pinned to 1500 the index
 # still died at 2.03G, so it does not bound the index path.
 #
-# DELIBERATELY ABSOLUTE, and this is the one place the "never a fixed GB" rule
-# does not apply — so the exemption is stated rather than left to be "fixed"
-# later. The indexer's requirement scales with the REPO being indexed, not with
-# the host: a percentage-of-RAM cap would be 8G here and 2G on an 8 GiB box,
-# which REPRODUCES this exact bug on small installs. A measured floor is the
-# correct shape; admission control (code_intel_runner.sh) is what keeps a
-# generous cap safe on a small box by not starting a job that cannot fit.
+# NOT a percentage-of-RAM cap, and that half of the reasoning stands: the
+# indexer's requirement scales with the REPO being indexed, not with the host, so
+# a pure 25%-of-RAM cap would be 8G here and 2G on an 8 GiB box — REPRODUCING
+# this exact bug on small installs. The TARGET must come from the measurement.
 #
 # A percentage would also be actively unsafe here: the rlimit fallback below
 # parses only <int>[.frac]G|M, so "25%" falls through to "running
@@ -98,7 +95,58 @@ MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 # .claude/mcp/run-codebase-memory keeps 2G on purpose; see the matching comment
 # there. It caps a long-lived SERVER against an upstream leak, not a batch job
 # whose size is set by the repo. The divergence is a decision, not drift.
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-4G}"
+#
+# BUT the measured floor alone is not a safe cap, and shipping it as an absolute
+# 4G was wrong: scripts/host-setup.sh floors a Genesis install at 4 GiB, so on a
+# MINIMUM install MemoryMax=4G EQUALS the container limit and the scope stops
+# isolating anything — the parent cgroup reaches its own OOM before the scope
+# boundary is ever hit, taking the server or a session with it. A cap equal to
+# the whole container is not a cap.
+#
+# So: the measured need is the TARGET, and the container's real limit BOUNDS it.
+# That keeps the anti-percentage argument above intact (the target still comes
+# from a measurement, not from a fraction of whatever host we land on) while
+# guaranteeing the scope can actually fire before the container does.
+# _derive_mem_max emits an explicit <N>M value, never a percentage, so the rlimit
+# fallback below can still parse it.
+#
+# On a box too small for the bounded cap the index will still be killed at its
+# scope — that is the CORRECT failure: it protects the container instead of
+# taking it down. The real answer for such a host is not to start the job at all,
+# which is admission control and is deliberately NOT claimed here as present.
+_CI_MEM_TARGET_MB=4096   # the 2,836 MB measurement + ~40% headroom
+_CI_MEM_CONTAINER_FRACTION=60  # percent of the container limit the cap may take
+
+_derive_mem_max() {
+    # Container limit from cgroup v2, then v1. "max" (uncapped) or unreadable
+    # means nothing bounds us, so the measured target stands.
+    local limit_bytes="" f
+    for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        [ -r "$f" ] || continue
+        limit_bytes="$(cat "$f" 2>/dev/null)" || limit_bytes=""
+        break
+    done
+    case "$limit_bytes" in
+        '' | max | *[!0-9]*)
+            printf '%sM\n' "$_CI_MEM_TARGET_MB"
+            return 0
+            ;;
+    esac
+    local limit_mb=$(( limit_bytes / 1024 / 1024 ))
+    # An implausibly huge v1 "no limit" sentinel behaves like uncapped.
+    if [ "$limit_mb" -le 0 ] || [ "$limit_mb" -gt 4194304 ]; then
+        printf '%sM\n' "$_CI_MEM_TARGET_MB"
+        return 0
+    fi
+    local bounded=$(( limit_mb * _CI_MEM_CONTAINER_FRACTION / 100 ))
+    if [ "$bounded" -lt "$_CI_MEM_TARGET_MB" ]; then
+        printf '%sM\n' "$bounded"
+    else
+        printf '%sM\n' "$_CI_MEM_TARGET_MB"
+    fi
+}
+
+MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-$(_derive_mem_max)}"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
@@ -123,17 +171,41 @@ _log() { printf '[code-intel-index] %s\n' "$*"; }
 #    `systemd-run --user --scope` (verified: child reads 500), and systemd does
 #    not reset it for a scope, so writing it once here covers the indexer.
 #  * On the 32 GiB reference host each 100 of adj is worth ~3.2 GB of
-#    oom_badness, so 500 puts this job far ahead of anything else long-lived.
+#    oom_badness, so these rungs decide outcomes rather than express a taste.
+#
+# 900, NOT 500 — and this is the correction that makes the whole feature work.
+# 500 was chosen without checking what already uses it, and `cc/invoker.py`
+# ALREADY assigns every CC subprocess exactly 500 (its `set_oom_score_adj`
+# default, applied at both call sites). At EQUAL adj the kernel falls back to
+# each process's memory charge, and a CC session may be allowed far more memory
+# than this job — so "the index dies before a session" would have been false in
+# precisely the container-wide pressure it was written for. A distinctly higher
+# value is what makes the ordering real. 1000 is deliberately left unused as the
+# ceiling; nothing here needs to outrank a batch index that can simply re-run.
+#
+# Values are normalised to CANONICAL DECIMAL before the write. MEASURED: the
+# kernel parses this file with base autodetection, so a zero-padded "0500" is
+# read as OCTAL and applies 320 — silently WEAKENING the preference while the
+# log would have echoed the operator's "0500" back as if it took. Range is
+# checked too: the kernel's valid band is -1000..1000 and only non-negative
+# values are achievable here (lowering is refused), so anything above 1000 or
+# non-numeric is rejected at the lever rather than written and misapplied.
 _apply_oom_score_adj() {
-    local want="${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-500}"
+    local want="${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-900}"
     case "$want" in
         '' | *[!0-9]*)
             _log "WARNING: ignoring non-numeric CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' — kill order unchanged"
             return 0
             ;;
     esac
-    if printf '%s\n' "$want" > /proc/self/oom_score_adj 2>/dev/null; then
-        _log "oom_score_adj=$want (this job is killed before the server or a CC session)"
+    # 10# forces base-10 so "0500" means five hundred, not octal 320.
+    local canonical=$((10#$want))
+    if [ "$canonical" -gt 1000 ]; then
+        _log "WARNING: CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' exceeds the kernel maximum of 1000 — kill order unchanged"
+        return 0
+    fi
+    if printf '%s\n' "$canonical" > /proc/self/oom_score_adj 2>/dev/null; then
+        _log "oom_score_adj=$canonical (killed before a CC subprocess at 500, the server at 100, or a session at 0)"
     else
         # Not fatal: an unwritable /proc (odd sandbox) costs kill-order
         # preference, never the index itself.
