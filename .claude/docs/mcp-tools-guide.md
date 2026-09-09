@@ -115,10 +115,14 @@ another has already scanned and approved, between the scan and the post.
 
 Two things stay with you, because they are judgment, not mechanism:
 
-**Approval, every time.** A public post is irreversible;
-`contributor_issue.py` classifies it exactly that way. Channel-driven sessions run
-with `skip_permissions=True`, so no tool confirmation appears — ASK, in words, and
-get a yes, for each issue. A prior "go ahead" does not carry.
+**What goes IN it.** A public post is irreversible — `contributor_issue.py`
+classifies it exactly that way — so the gate is the CONTENT, not permission to
+file. Filing needs no per-instance approval; that mandate was the friction that
+kept adjacent bugs unfiled, and it is gone. What replaces it is the scan below,
+plus one judgement that stays yours: **borderline, in either direction? Ask.**
+Channel-driven sessions run with `skip_permissions=True`, so no tool
+confirmation appears and nothing will stop you — which is exactly why the
+scan is a habit rather than a prompt.
 
 **Privacy-scan the title AND the body.** Both egress. Technical detail only: no
 IPs, hostnames, absolute home paths, identifiers, or raw install metrics (row
