@@ -268,6 +268,137 @@ class Store:
 """
 
 
+_HARDLINK_PUBLISH_LEAKS = """
+import os
+
+_STAGING_SUFFIX = ".part"
+
+
+def write_batch(dir_path, stem, payload):
+    staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
+    path = os.path.join(dir_path, f"{stem}.jsonl")
+    with open(staging, "w") as fh:
+        fh.write(payload)
+    try:
+        os.link(staging, path)
+    except OSError:
+        return None
+    return path
+"""
+
+_HARDLINK_PUBLISH_CLEANS_UP = """
+import os
+
+_STAGING_SUFFIX = ".part"
+
+
+def write_batch(dir_path, stem, payload):
+    staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
+    path = os.path.join(dir_path, f"{stem}.jsonl")
+    with open(staging, "w") as fh:
+        fh.write(payload)
+    try:
+        os.link(staging, path)
+    except OSError:
+        os.unlink(staging)
+        return None
+    return path
+"""
+
+_NON_OS_LINK_IS_NOT_A_MOVE = """
+def publish(record, dest):
+    tmp = record.with_suffix(".tmp")
+    # NOT a filesystem move. `link` on an arbitrary object is an ORM/graph
+    # association; the receiver is not a temp being renamed into place.
+    tmp.link(dest)
+"""
+
+_MODULE_CONST_NOT_A_TEMP_MARKER = """
+import os
+
+_FINAL_SUFFIX = ".jsonl"
+
+
+def publish(dir_path, stem, payload):
+    # The module constant is a DURABLE extension, not a scratch marker. Resolving
+    # module constants must not turn every f-string built from one into a temp.
+    final = os.path.join(dir_path, f"{stem}{_FINAL_SUFFIX}")
+    with open(final, "w") as fh:
+        fh.write(payload)
+    os.replace(final, os.path.join(dir_path, "current.jsonl"))
+"""
+
+_MODULE_CONST_MARKER_VIA_REPLACE = """
+import os
+
+_STAGING_SUFFIX = ".part"
+
+
+def publish(dir_path, stem, payload):
+    staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
+    with open(staging, "w") as fh:
+        fh.write(payload)
+    try:
+        os.replace(staging, os.path.join(dir_path, f"{stem}.jsonl"))
+    except OSError:
+        return None
+"""
+
+_MODULE_CONST_SHADOWED_BY_LOCAL = """
+import os
+
+SUFFIX = ".tmp"
+
+
+def publish(dir_path, stem, payload):
+    SUFFIX = ".jsonl"
+    final = os.path.join(dir_path, f"{stem}{SUFFIX}")
+    with open(final, "w") as fh:
+        fh.write(payload)
+    os.replace(final, os.path.join(dir_path, "current.jsonl"))
+"""
+
+_MODULE_CONST_SHADOWED_BY_PARAM = """
+import os
+
+SUFFIX = ".tmp"
+
+
+def publish(dir_path, stem, payload, SUFFIX):
+    final = os.path.join(dir_path, f"{stem}{SUFFIX}")
+    with open(final, "w") as fh:
+        fh.write(payload)
+    os.replace(final, os.path.join(dir_path, "current.jsonl"))
+"""
+
+_IMPORTED_LINK_LEAKS = """
+from os import link
+
+
+def publish(final, payload):
+    staging = final + ".part"
+    with open(staging, "w") as fh:
+        fh.write(payload)
+    try:
+        link(staging, final)
+    except OSError:
+        return None
+"""
+
+_ATTRIBUTE_INTERPOLATION_IS_NOT_A_NAME = """
+import os
+
+_STAGING_SUFFIX = ".part"
+
+
+def publish(cfg, dest):
+    staging = f"{cfg.stem}{_STAGING_SUFFIX}"
+    try:
+        os.replace(staging, dest)
+    except OSError:
+        return None
+"""
+
 _INTERPOLATED_TEMP_LEAKS = """
 import os
 
@@ -302,10 +433,100 @@ def test_a_temp_marker_followed_by_interpolation_is_still_a_temp():
     misjudged. `f".{name}.restore-tmp-{os.getpid()}"` puts the marker before a
     unique component, so `.endswith(_TEMP_SUFFIXES)` failed and the site produced
     no row at all -- which is why the error surfaced in the published DENOMINATOR
-    (58 sites, actually 59) rather than in any verdict. Its live instance is
+    (published 58, actually 59 at the time) rather than in any verdict. Its live
+    instance is
     guardian/cred_integrity.py restore_file, and it reads CLEANS_UP."""
     assert _verdicts(_INTERPOLATED_TEMP_LEAKS) == ["LEAKS"]
 
+
+
+def test_publish_by_hardlink_is_an_atomic_write():
+    """RECALL. `os.link(staging, final)` publishes a temp under a durable name,
+    and the temp ALWAYS needs an explicit unlink because link -- unlike rename --
+    does not consume its source. The verb set held only replace/rename/move, so
+    the whole shape was invisible: not misjudged, ABSENT, which is the failure
+    mode that corrupts the published denominator rather than a verdict.
+
+    Found by an adversarial audit on the live tree, in scripts/hooks/audit_jsonl.py
+    -- a file main added while this branch was open, and the file that ABSORBED
+    the baseline row this PR drops. MEASURED: with both exception-path unlinks
+    deleted from the real file, the guard reported `0 NEW` and exited 0."""
+    assert _verdicts(_HARDLINK_PUBLISH_LEAKS) == ["LEAKS"]
+    assert _verdicts(_HARDLINK_PUBLISH_CLEANS_UP) == ["CLEANS_UP"]
+
+
+def test_link_on_a_non_os_receiver_is_not_a_move():
+    """PRECISION control for the verb above, and the reason `link` is scoped to
+    `os` exactly as `move` is scoped to `shutil`. For a non-os owner the guard
+    reads the RECEIVER as the temp, so an unscoped `link` would make any
+    `tmp.link(x)` a leaking atomic write and print "unlink the temp" at it.
+    `Path.hardlink_to` is excluded rather than added because it REVERSES the
+    operands: `final.hardlink_to(tmp)` is still publish-by-hardlink, but with the
+    temp as the ARGUMENT, so covering it needs a MIRRORED operand rule, not this
+    one. Reusing this rule would name the durable file as the temp. That makes it
+    unhandled, NOT out of class -- recorded in the guard's blind-spot list so the
+    next audit does not have to re-derive it."""
+    assert _verdicts(_NON_OS_LINK_IS_NOT_A_MOVE) == []
+
+
+def test_a_module_constant_can_carry_the_temp_marker():
+    """RECALL. `f"{stem}{_STAGING_SUFFIX}"` has NO ast.Constant piece at all --
+    both pieces are FormattedValue -- so every suffix test, end-anchored or
+    relaxed, looks at nothing. Relaxing the anchor for f-strings (the +1 site
+    this PR's own denominator note celebrates) could never have reached this:
+    that relaxation only helps an f-string that still carries a literal piece.
+
+    The fixture uses `os.replace`, NOT `os.link`, ON PURPOSE. A first version
+    asserted on the hardlink fixture, which needs BOTH the new verb and the
+    constant resolution to produce a row -- so deleting either mechanism killed
+    both tests, and two tests carried one control's worth of information while
+    the matrix I published claimed each mutation was caught by exactly the
+    control naming it. My own matrix output showed the two rows identical and I
+    read past it. Isolating the verb is what makes this test about constants."""
+    assert _verdicts(_MODULE_CONST_MARKER_VIA_REPLACE) == ["LEAKS"]
+
+
+def test_a_module_constant_shadowed_in_the_function_is_not_resolved():
+    """PRECISION, and the reason `_module_str_consts` collecting only at module
+    scope is NOT the safety property. The symbol table still answers for a name
+    the function has rebound, so a module `SUFFIX = ".tmp"` plus a local
+    `SUFFIX = ".jsonl"` made a DURABLE file read as a temp -- a row carrying
+    "unlink the temp", aimed at a live file. That is the booby-trapped-work-item
+    class this guard shipped 16 of once, re-entered through the symbol table.
+
+    `_locally_rebound` already existed one function away, applied to the
+    imported-move names for this exact reason and not to these. The property
+    lives at the USE site; restricting the SOURCE only feels like it does.
+
+    BOTH shapes are pinned because a hand-rolled shadow check catches the local
+    assign and misses the parameter."""
+    assert _verdicts(_MODULE_CONST_SHADOWED_BY_LOCAL) == []
+    assert _verdicts(_MODULE_CONST_SHADOWED_BY_PARAM) == []
+
+
+def test_a_directly_imported_link_is_a_move():
+    """`from os import link` binds a bare Name, so the attribute rule that
+    excludes `dataclasses.replace` also excludes it. Allowlisted alongside
+    replace/rename/move -- and pinned here because removing "link" from that
+    tuple failed ZERO tests, which is how a correct branch gets deleted by a
+    later tightening pass that sees dead code."""
+    assert _verdicts(_IMPORTED_LINK_LEAKS) == ["LEAKS"]
+
+
+def test_an_attribute_interpolation_is_not_a_constant_reference():
+    """The constant lookup requires an ast.Name, and `f"{cfg.stem}{_SUFFIX}"`
+    interpolates an Attribute. Dropping that isinstance check raises
+    AttributeError on any such f-string in a function containing an atomic
+    write -- a crash, not a wrong verdict, and no fixture pinned it."""
+    assert _verdicts(_ATTRIBUTE_INTERPOLATION_IS_NOT_A_NAME) == ["LEAKS"]
+
+
+def test_a_module_constant_that_is_not_a_scratch_marker_is_not_a_temp():
+    """PRECISION control for the constant resolution. A durable extension held
+    in a module constant must not read as a temp -- otherwise the fix for the
+    invisible-marker case would manufacture a false row wearing this guard's own
+    "unlink the temp" remediation, aimed at a live file."""
+    assert _verdicts(_MODULE_CONST_NOT_A_TEMP_MARKER) == []
 
 def test_prose_ending_in_a_scratch_stem_is_not_a_temp():
     """PRECISION control, and the reason the relaxation is scoped to f-strings
@@ -529,8 +750,9 @@ def test_an_attribute_temp_does_not_make_its_SIBLINGS_temps():
     exists to prevent, re-entered through the BINDING side rather than the
     operand side.
 
-    MEASURED before landing: the live tree reads 59 sites / 28 clean / 31 dirty
-    both with and without the fix, so no current file exercises this shape. A
+    MEASURED 2026-09-09 on the merge (60 sites / 30 clean / 30 dirty): the tree
+    read the same counts both with and without the fix, so no current file
+    exercises this shape. A
     scan-count control would therefore have proved nothing, and only a synthetic
     fixture can fail if the walk-to-every-Name behaviour returns.
 
@@ -964,7 +1186,32 @@ def test_the_published_counts_match_the_tree():
     assert f"{len(rows)} atomic-write sites across {files} files, {len(dirty)} of them dirty" in guard, (
         "the guard docstring quotes a count the tree no longer produces"
     )
-    ci = _flat((_REPO / ".github" / "workflows" / "ci.yml").read_text())
+    ci_raw = (_REPO / ".github" / "workflows" / "ci.yml").read_text()
+    ci = _flat(ci_raw)
     assert f"{len(rows)} sites, {len(dirty)} dirty" in ci, (
         "the CI job comment quotes a count the tree no longer produces"
     )
+
+    # THE DERIVED COUNTS, not just the headline ones. Each surface states the
+    # dirty count a SECOND time in prose ("fixing N ... instance N+1"), and this
+    # test read only the headline. MEASURED by an adversarial audit: with all
+    # three derived numbers replaced by nonsense (999/777/888/555/444), the full
+    # 49-test file still passed and the guard still exited 0. Same failure this
+    # test's docstring describes, one clause further down the same sentence.
+    # Comment markers are stripped so the CI sentence can rewrap freely.
+    ci_prose = " ".join(
+        ln.strip().lstrip("#").strip() for ln in ci_raw.splitlines()
+    )
+    n = len(dirty)
+    assert (
+        f"Fixing {n} instances of a recurring pattern leaves nothing to stop "
+        f"instance {n + 1}."
+    ) in guard, "the guard docstring's derived dirty count drifted"
+    assert (
+        f'"instance {n + 1} cannot arrive silently" is true only OUTSIDE the '
+        f"{n} functions already listed"
+    ) in guard, "the guard docstring's derived function count drifted"
+    assert (
+        f"instance {n + 1} cannot arrive silently FROM A NEW FUNCTION while "
+        f"the existing {n} are fixed"
+    ) in ci_prose, "the CI comment's derived dirty count drifted"

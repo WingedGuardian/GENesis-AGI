@@ -9,16 +9,33 @@ both halves -- the leak happens, and nothing sweeps that directory
 (`disk_hygiene.sh` roots every find at a named SUBdirectory; `tmp_watchgod.sh`
 covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
 
-WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09: 59 atomic-write sites
-across 52 files, 31 of them dirty. (Was published as 58/51: the temp-name
-test was anchored to the END of a string literal, so
-`f".{name}.restore-tmp-{getpid()}"` at guardian/cred_integrity.py produced
-NO ROW at all -- the site was invisible rather than misjudged, which is why
-the error showed up in the DENOMINATOR and not in any verdict. It reads
-CLEANS_UP, so the dirty count is unchanged.) Fixing 31 instances of a recurring pattern leaves
-nothing to stop instance 32. This is the prose-to-gate move: the rule was "clean
-up your temp", carried by convention, and conventions are what reviewers find one
-instance of at a time.
+WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
+branch into main: 60 atomic-write sites across 52 files, 30 of them dirty.
+That denominator moved THREE times, in both directions, and every move is worth
+recording because each was invisible in a different way:
+  * +1 site (58 -> 59). The temp-name test was anchored to the END of a string
+    literal, so `f".{name}.restore-tmp-{getpid()}"` at guardian/cred_integrity.py
+    produced NO ROW at all. The site was invisible rather than misjudged, which
+    is why the error surfaced in the DENOMINATOR and in no verdict. It reads
+    CLEANS_UP, so the dirty count was unaffected.
+  * -1 site (59 -> 58, and dirty 31 -> 30). While this branch was open, main
+    #1609 rewrote git_discard_guard._write_log_row to one file per flush,
+    deleting the size-trim that renamed a temp into place. Its baseline row went
+    stale and THIS GUARD FAILED CI until the row was dropped -- the shrink
+    mechanism working on a fix it did not author. Note the counts must be
+    re-derived against the MERGE, not the branch: a fix landing on main while a
+    PR is open makes the PR's ledger stale, by design.
+  * +2 sites (58 -> 60), found by an adversarial audit, both CLEANS_UP. Publish
+    by HARDLINK -- `os.link(staging, final)` -- was not in the verb set, and in
+    one of the two the marker lives in a MODULE CONSTANT, so
+    `f"{stem}{_STAGING_SUFFIX}"` carries no ast.Constant piece for any suffix
+    test to read. Both sites were absent, not misjudged. Note where the first
+    one is: scripts/hooks/audit_jsonl.py, the file main added in the same window
+    and the file that ABSORBED the row dropped above. MEASURED: with its two
+    exception-path unlinks deleted, the guard reported `0 NEW` and exited 0.
+Fixing 30 instances of a recurring pattern leaves nothing to stop instance 31.
+This is the prose-to-gate move: the rule was "clean up your temp", carried by
+convention, and conventions are what reviewers find one instance of at a time.
 
 WHAT THIS GUARD CLAIMS, PRECISELY: a temp created IN THIS FUNCTION and renamed
 into place, whose exception path does not unlink it. The "created in this
@@ -38,8 +55,8 @@ EXCEPTION. The baseline key excludes the line number on purpose (line numbers
 churn on every unrelated edit above them), so a SECOND unprotected write added
 inside an already-baselined function, with the same temp name, collides with the
 existing row and passes silently. Verified: no duplicate dirty keys exist today,
-so the ledger is currently honest. But "instance 32 cannot arrive silently" is
-true only OUTSIDE the 31 functions already listed, and saying it unqualified was
+so the ledger is currently honest. But "instance 31 cannot arrive silently" is
+true only OUTSIDE the 30 functions already listed, and saying it unqualified was
 an overclaim. The baseline below is a
 DEBT LEDGER, not an exemption list: every entry is a known leak awaiting a fix,
 it is expected to shrink, and the guard reports entries that no longer match so
@@ -59,6 +76,19 @@ WHAT THIS GUARD CANNOT SEE, stated rather than discovered later:
     cleaning up a child it never touched. Joins are now left intact, so such a
     site is UNMATCHED rather than wrongly cleared -- the safe direction, and a
     real blind spot rather than a fix.
+  * A MODULE ALIAS. `import os as _os` then `_os.link(tmp, dst)` produces no
+    row: the alias never reaches `owner == "os"`, so the link/move scoping
+    excludes it, and for replace/rename the two-argument arity test drops it
+    before operand resolution. MEASURED: zero `import os as` / `import shutil as`
+    in the scanned tree today, so the published count is honest -- but this is a
+    hole, not a design choice.
+  * OTHER PUBLISH SHAPES: `Path.hardlink_to`, `shutil.copy2(tmp, final)`,
+    `os.symlink`. These are UNHANDLED, not out of class. `final.hardlink_to(tmp)`
+    is publish-by-hardlink with the temp as the ARGUMENT, so covering it needs a
+    mirrored operand rule rather than the same one -- which is why it is excluded
+    rather than added, and excluding it is a limitation to record, not a verdict
+    about the shape. MEASURED across ten such verbs: zero live instances where
+    the published operand is a born-here temp, so the count stands.
   * Whether the destination directory is swept. A leaked temp under `/tmp` is
     collected by the OS; one under `~/.genesis` is not. The guard treats them
     alike -- prioritisation belongs to the human reading the report.
@@ -78,6 +108,13 @@ in different directions, and every one of them LOOKED right:
      operand shapes above; and it excluded only the BARE `replace(x, ...)` while
      the `dataclasses.replace(rec, f=1)` attribute form -- the one this repo
      actually uses, 4 sites -- sailed through into the baseline.
+  4. Anchored on the verb SET, which held only replace/rename/move. Publishing
+     by hardlink was therefore invisible -- and so was any temp whose marker sits
+     in a module constant rather than inline. Both were found by an adversarial
+     audit, not by this guard, on live code added while the guard's own PR was
+     open. The lesson is the one already stated above and re-learned anyway: an
+     enumeration is only ever a census of the shapes the detector can see, so
+     the count is the claim most likely to be wrong.
 None was caught by running it. They were caught by SAMPLING the output, by
 enumerating the shipped ledger rather than trusting its count, and by controls
 that must flip. Tightening then LOST a real leak whose temp is bound two hops
@@ -163,7 +200,8 @@ _TEMP_SUFFIXES = (".tmp", ".new", ".partial", ".part", ".swp", ".writing")
 _INTERPOLATED_TEMP_RE = re.compile(r"[._-](tmp|temp|partial|swp)[._-]*$")
 
 
-def _born_in(func: ast.AST, temp_expr: str) -> bool:
+def _born_in(func: ast.AST, temp_expr: str,
+             module_consts: dict[str, str] | None = None) -> bool:
     """Is ``temp_expr`` bound in this function to something that MAKES a temp?
 
     Deliberately conservative, and TRANSITIVE, because the real pattern is two
@@ -178,6 +216,12 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
     whose right-hand side mentions a name already known to be a temp. Anything
     still unreached -- a parameter, a field, a path built from user input -- is
     not a temp, and the site is not this guard's business.
+
+    ``module_consts`` maps MODULE-LEVEL string constants to their values, so a
+    marker held in a constant rather than spelled inline still reads as a temp.
+    Without it `f"{stem}{_STAGING_SUFFIX}"` has no ``ast.Constant`` piece at all
+    and no amount of relaxing the suffix anchor can reach it -- see the class
+    note on _makes_temp.
     """
     if not temp_expr:
         return False
@@ -263,6 +307,17 @@ def _born_in(func: ast.AST, temp_expr: str) -> bool:
                 return True
             if isinstance(n, ast.JoinedStr):
                 for piece in n.values:
+                    # A marker held in a module-level constant: the f-string has
+                    # NO Constant piece, so the suffix tests below can never see
+                    # it. End-anchored here, not _INTERPOLATED_TEMP_RE -- the
+                    # constant's own text is the whole marker, with no following
+                    # interpolation inside it to explain a trailing separator.
+                    if (isinstance(piece, ast.FormattedValue)
+                            and isinstance(piece.value, ast.Name)
+                            and not _locally_rebound(func, piece.value.id)
+                            and (module_consts or {}).get(
+                                piece.value.id, "").endswith(_TEMP_SUFFIXES)):
+                        return True
                     if not (isinstance(piece, ast.Constant)
                             and isinstance(piece.value, str)):
                         continue
@@ -504,6 +559,35 @@ def _locally_rebound(func: ast.AST | None, name: str) -> bool:
     return False
 
 
+def _module_str_consts(tree: ast.AST) -> dict[str, str]:
+    """MODULE-LEVEL ``NAME = "literal"`` bindings, for temp-marker resolution.
+
+    Module level is the SOURCE, and that alone is not the safety property.
+    Collecting only module-level names does NOT stop a name being misresolved
+    inside a function that shadows it -- a parameter, a local assign, an
+    AnnAssign, a walrus or a nested def all rebind it, and the symbol table
+    still answers with the module's value. The property lives at the USE site:
+    `_born_in` gates this table behind `_locally_rebound`, exactly as the
+    `_directly_imported_moves` call site does. That pairing is the invariant;
+    neither half is sufficient alone.
+
+    MEASURED: without the use-site gate, a module-level `SUFFIX = ".tmp"` plus
+    a local `SUFFIX = ".jsonl"` produced a LEAKS row on a DURABLE file, and so
+    did the same name arriving as a parameter -- a row whose printed remediation
+    is "unlink the temp".
+    """
+    out: dict[str, str] = {}
+    for n in getattr(tree, "body", []):
+        if not isinstance(n, ast.Assign) or not isinstance(n.value, ast.Constant):
+            continue
+        if not isinstance(n.value.value, str):
+            continue
+        for t in n.targets:
+            if isinstance(t, ast.Name):
+                out[t.id] = n.value.value
+    return out
+
+
 def _directly_imported_moves(tree: ast.AST) -> dict[str, str]:
     """Names bound by `from os import replace` and friends, mapped to a module.
 
@@ -524,7 +608,7 @@ def _directly_imported_moves(tree: ast.AST) -> dict[str, str]:
     for n in getattr(tree, "body", []):
         if isinstance(n, ast.ImportFrom) and n.module in ("os", "shutil"):
             for alias in n.names:
-                if alias.name in ("replace", "rename", "move"):
+                if alias.name in ("replace", "rename", "move", "link"):
                     out[alias.asname or alias.name] = n.module
     return out
 
@@ -533,6 +617,7 @@ def analyse_source(src: str, rel: str) -> list[dict]:
     """Every atomic-write site in one file, classified. Pure; no I/O."""
     tree = ast.parse(src)
     imported_moves = _directly_imported_moves(tree)
+    module_consts = _module_str_consts(tree)
     rows: list[dict] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -549,7 +634,7 @@ def analyse_source(src: str, rel: str) -> list[dict]:
                 continue
             owner, receiver = imported_moves[node.func.id], None
         elif isinstance(node.func, ast.Attribute):
-            if node.func.attr not in ("replace", "rename", "move"):
+            if node.func.attr not in ("replace", "rename", "move", "link"):
                 continue
             owner, receiver = _unparse(node.func.value), node.func.value
         else:
@@ -559,6 +644,15 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         # baselined leak in the same function.
         verb = getattr(node.func, "attr", None) or getattr(node.func, "id", "")
         if verb == "move" and owner != "shutil" and receiver is not None:
+            continue
+        # PUBLISH-BY-HARDLINK. `os.link(staging, final)` is the same class: a
+        # temp made here becomes the durable record under another name. It is
+        # MORE squarely in the class than rename, not less -- link does not
+        # consume its source, so the temp ALWAYS needs an explicit unlink.
+        # Scoped to `os` exactly as `move` is scoped to `shutil`: an arbitrary
+        # `obj.link(x)` would otherwise be read as receiver-is-the-temp, and
+        # `Path.hardlink_to` reverses the operands outright.
+        if verb == "link" and owner != "os":
             continue
         # BOTH dataclasses forms have to be excluded, and only one of them was.
         # The bare `replace(x, ...)` (7 files import it) is excluded by the
@@ -611,7 +705,7 @@ def analyse_source(src: str, rel: str) -> list[dict]:
         # work item. Narrowing here TIGHTENS the allowlist rather than loosening
         # it: a temp created in a CALLER is not claimed, which is the documented
         # cross-function limitation, not a new hole.
-        if func is not None and not _born_in(func, temp):
+        if func is not None and not _born_in(func, temp, module_consts):
             continue
         if func is None:
             rows.append({"file": rel, "line": node.lineno, "func": "<module>",

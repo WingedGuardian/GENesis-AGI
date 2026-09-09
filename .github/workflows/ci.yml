@@ -459,10 +459,13 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-09: 59 sites, 31 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-09-09: 60 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
-    # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 32
-    # cannot arrive silently while the existing 31 are fixed.
+    # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
+    # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
+    # -- a second unprotected write inside an already-baselined function, with
+    # the same temp name, collides with that row and passes. The guard docstring
+    # states that exception; this comment used to assert the claim unqualified.
     # See scripts/check_atomic_writes.py.
     runs-on: ubuntu-latest
     steps:
