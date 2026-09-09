@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -65,6 +66,14 @@ _SIDECAR_VERSION = 1
 # "/"), so this "/"-less sentinel can never collide with one, and gather() only
 # ever reads cursors for keys in the resolved repo list — never this one.
 _NOTIF_CURSOR_KEY = "__notifications__"
+# A notification subject URL that names the THREAD itself rather than a comment
+# on it (".../issues/12", ".../pulls/12"). GitHub sets `latest_comment_url` to
+# this spelling when the thread carries no comment it can point at, and the
+# `.user.login` there is the thread AUTHOR, not whoever acted.
+_THREAD_URL_RE = re.compile(r"/(?:issues|pulls)/\d+$")
+# Notification reasons whose ACTOR is the author of the @-mention text, not
+# whoever commented most recently on the thread.
+_MENTION_REASONS = frozenset({"mention", "team_mention"})
 
 
 def _now_z() -> str:
@@ -894,20 +903,28 @@ class AccountActivityMonitor:
                 # GraphQL-only actor — record for the digest, no ping (follow-up).
                 items.append({**base, "actor": "", "ping": False})
                 continue
-            actor = await self._resolve_notification_actor(subject)
+            actor = await self._resolve_notification_actor(
+                subject,
+                owner,
+                mention=c["reason"] in _MENTION_REASONS,
+                since=since,
+                until=c["updated"],
+            )
             if actor is None:
                 items.append({**base, "actor": "", "ping": False})  # unresolved → digest-only
                 continue
             if actor.lower() == owner.lower():
-                # The owner is the resolved (latest) actor. For author/subscribed
-                # that is self-activity on the owner's own thread → skip entirely.
-                # For a mention it means the owner is merely the latest commenter —
-                # keep the thread (digest-only), don't self-ping, don't drop it.
-                if c["reason"] not in steward_cfg.OWNED_ONLY_NOTIFICATION_REASONS:
-                    items.append({**base, "actor": "", "ping": False})
+                # The owner acted in this window — self-activity, whatever the
+                # reason. Safe to drop outright now that the search is WINDOWED:
+                # a genuine new mention by someone else falls inside the window
+                # and resolves to THEM, so nothing external is lost here. This
+                # used to keep a digest-only row for mentions, which is precisely
+                # the "notified about my own activity" report.
+                logger.debug("github steward: dropping self-activity on %s", c["repo"])
                 continue
             auto = await self._is_automation(actor, denylist)
             if auto is True:
+                logger.debug("github steward: dropping automation actor %s", actor)
                 continue  # bot / org (None → can't tell → surface rather than drop)
             items.append({**base, "actor": actor, "ping": True})
 
@@ -922,29 +939,139 @@ class AccountActivityMonitor:
         safe = [c["updated"] for c in work if c["updated"] < boundary]
         return (safe[-1] if safe else since), items
 
-    async def _resolve_notification_actor(self, subject: dict) -> str | None:
-        """Best-effort resolve of the human behind a notification (the feed carries
-        no actor inline). Tries ``latest_comment_url`` then ``subject.url``, reading
-        ``.user.login``; a gh error or malformed JSON on one URL just falls through
-        to the next. Returns the login, or ``None`` if unresolved — it NEVER signals
-        a cursor hold, so a single unresolvable item (deleted comment, discussion,
-        malformed payload) can't freeze the account-level lane. The login is a
-        best-effort label: for a mention it is the notification's latest commenter,
-        which may differ from the exact actor that triggered it."""
-        for key in ("latest_comment_url", "url"):
-            u = subject.get(key)
-            if not u:
-                continue
-            ok, out = await run_gh_checked("gh", "api", u, timeout=_GH_TIMEOUT)
-            if not ok:
-                continue  # try the next URL — do NOT hold on a per-item error
-            try:
-                login = (json.loads(out).get("user") or {}).get("login")
-            except Exception:
-                login = None
-            if login:
+    async def _resolve_notification_actor(
+        self,
+        subject: dict,
+        owner: str,
+        *,
+        mention: bool,
+        since: str,
+        until: str,
+    ) -> str | None:
+        """Best-effort resolve of who ACTED on a notification's thread.
+
+        The feed carries no actor inline, so this reads the thread's comments and
+        falls back to the pointers on the subject. Returns the login, or ``None``
+        when nothing can be attributed — it NEVER signals a cursor hold, so one
+        unresolvable item (a deleted comment, a rate-limited surface) can't freeze
+        the account-level lane.
+
+        Everything is scoped to ``since < created_at <= until``, the same window
+        the notification itself covers. That window is load-bearing, not hygiene:
+        GitHub's ``reason`` is STICKY, so a thread the owner was mentioned in once
+        keeps producing ``mention`` notifications for every later update, and an
+        unwindowed search would keep re-attributing each of them to the original
+        mentioner — re-pinging a contributor for activity they had no part in.
+
+        Sources, in order:
+
+        1. For a mention, the author of the newest in-window comment whose body
+           actually NAMES the owner. The actor of a mention is whoever wrote the
+           @-text, not whoever commented last; those differ in the ordinary case,
+           and the difference is the bug this exists to fix. MEASURED on a live
+           feed: latest-commenter said the owner on both candidates, mention-author
+           said the review bot on both. (``team_mention`` is deliberately included
+           in the mention reasons even though an ``@org/team`` string never equals
+           a personal login: the search simply finds nothing and falls through.)
+        2. The author of the newest in-window comment, whatever it says — the right
+           answer for ``author``/``subscribed``, where the actor is the responder.
+        3. ``latest_comment_url``, when it names a COMMENT. GitHub also sets this
+           to the thread's own URL, which names the thread's AUTHOR instead; that
+           spelling is deferred to step 4 rather than read as an actor.
+        4. The thread author (``subject.url``) — an actor observation ONLY when it
+           is someone other than the owner. The owner authoring their own thread
+           says nothing about who acted on it, and reporting it as the actor is
+           what made ordinary self-traffic look like a resolved event.
+
+        An INCOMPLETE comment read answers NOTHING — not even from the sources
+        that did succeed. A partial answer is worse than none here: the caller
+        drops an item whose actor is a bot, so a half-read thread that happens to
+        surface an old bot comment would discard a human mention the unread half
+        was holding. Declining leaves it as a digest row, which is recoverable.
+        """
+        rows, complete = await self._thread_comments(subject)
+        if not complete:
+            # Decline outright rather than answer from half the evidence. The
+            # caller DROPS an item whose actor is a bot, so a half-read thread
+            # that surfaces an old bot comment would discard a human mention the
+            # unread half was holding. Returning None keeps it as a digest row.
+            return None
+        in_window = [r for r in rows if since < (r.get("created_at") or "") <= until]
+
+        if mention:
+            pattern = _mention_re(owner)
+            named = [r for r in in_window if pattern.search(r.get("body") or "")]
+            if login := _newest_comment_login(named):
+                logger.debug("github steward: actor %s via mention-author", login)
+                return login
+
+        if login := _newest_comment_login(in_window):
+            logger.debug("github steward: actor %s via latest-comment", login)
+            return login
+
+        lcu = subject.get("latest_comment_url")
+        if lcu and not _THREAD_URL_RE.search(lcu) and (login := await self._login_at(lcu)):
+            logger.debug("github steward: actor %s via latest_comment_url", login)
+            return login
+
+        subject_url = subject.get("url") or ""
+        if subject_url:
+            login = await self._login_at(subject_url)
+            # Not `owner`: the owner is the thread's AUTHOR here, not its actor.
+            if login and login.lower() != owner.lower():
+                logger.debug("github steward: actor %s via thread-author", login)
                 return login
         return None
+
+    async def _thread_comments(self, subject: dict) -> tuple[list[dict], bool]:
+        """Every comment on a notification's thread, and whether the read is WHOLE.
+
+        A pull request carries TWO disjoint comment surfaces — inline review
+        comments under ``/pulls/{n}/comments`` and conversation comments under
+        ``/issues/{n}/comments`` — and the flagship deep-poll reads only the
+        second (VERIFIED: the two id spaces do not intersect). Both are read here,
+        so a review-comment mention has an actor at all.
+
+        Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
+        return OLDEST first and ignore ``direction`` on the conversation surface,
+        so a single-page read of a busy thread would silently return the oldest
+        100 comments and hand back a stale author with total confidence.
+
+        Returns ``(rows, complete)``. ``complete`` is False when any surface failed
+        to read, so the caller can decline to answer rather than answering from
+        half the evidence.
+        """
+        subject_url = subject.get("url") or ""
+        urls: list[str] = []
+        if "/pulls/" in subject_url:
+            urls.append(f"{subject_url}/comments")  # inline review comments
+            urls.append(f"{_pull_url_to_issue_url(subject_url)}/comments")
+        elif "/issues/" in subject_url:
+            urls.append(f"{subject_url}/comments")
+        if not urls:
+            return [], True  # no comment surface exists — a complete read of nothing
+
+        rows: list[dict] = []
+        complete = True
+        for url in urls:
+            ok, out = await run_gh_checked(
+                "gh", "api", f"{url}?per_page=100", "--paginate", "--slurp", timeout=_GH_TIMEOUT
+            )
+            if not ok:
+                complete = False  # never holds the cursor; only withholds an answer
+                continue
+            rows.extend(_parse_paged(out))
+        return rows, complete
+
+    async def _login_at(self, url: str) -> str | None:
+        """``.user.login`` at one API url, or None on any error/shape mismatch."""
+        ok, out = await run_gh_checked("gh", "api", url, timeout=_GH_TIMEOUT)
+        if not ok:
+            return None  # never holds the cursor — the caller falls through
+        try:
+            return (json.loads(out).get("user") or {}).get("login") or None
+        except Exception:
+            return None
 
     async def _record_notification(self, item: dict, mode: str) -> bool:
         """Record a notification observation; ping immediately in ``live`` mode.
@@ -1067,6 +1194,40 @@ def _parse_paged(out: str) -> list[dict]:
         elif isinstance(item, dict):
             flat.append(item)
     return flat
+
+
+def _mention_re(login: str) -> re.Pattern[str]:
+    """Match an @-mention of ``login`` and nothing that merely contains it.
+
+    The right-hand guard stops `@owner` matching `@owner-ci` or `@ownerBot`;
+    a bare ``\\b`` would accept both, since `-` ends a word boundary. The
+    left-hand guard stops an email local-part or a longer handle
+    (`dev@owner.com`, `foo@owner`) reading as a mention.
+    """
+    return re.compile(rf"(?<![A-Za-z0-9._%+-])@{re.escape(login)}(?![A-Za-z0-9-])", re.IGNORECASE)
+
+
+def _newest_comment_login(rows: list[dict]) -> str | None:
+    """Author of the newest row by ``created_at``.
+
+    Chosen by max rather than by position: these endpoints return OLDEST
+    first, and the conversation surface ignores ``direction`` entirely, so
+    trusting the ordering would hand back the oldest commenter as the latest.
+    """
+    if not rows:
+        return None
+    newest = max(rows, key=lambda r: r.get("created_at") or "")
+    return (newest.get("user") or {}).get("login") or None
+
+
+def _pull_url_to_issue_url(pull_url: str) -> str:
+    """`.../pulls/7` -> `.../issues/7`.
+
+    A pull request's CONVERSATION comments are served from the issues
+    spelling; only its inline REVIEW comments live under `/pulls/`. Anchored
+    to the trailing segment so a repo or owner containing "pulls" is untouched.
+    """
+    return re.sub(r"/pulls/(\d+)$", r"/issues/\1", pull_url)
 
 
 def _issue_num(issue_url: str) -> int | None:

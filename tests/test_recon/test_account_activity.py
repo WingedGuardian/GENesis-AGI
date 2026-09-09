@@ -604,9 +604,10 @@ def _notif(
     title="My upstream PR",
     latest_comment_url="LCU",
     subject_url="SU",
+    stype="Issue",
 ):
     owner_login = repo.split("/")[0]
-    subject: dict = {"title": title, "type": "Issue"}
+    subject: dict = {"title": title, "type": stype}
     if subject_url is not None:
         subject["url"] = subject_url
     if latest_comment_url is not None:
@@ -620,11 +621,18 @@ def _notif(
     }
 
 
-def _fake_notif_gh(pages, *, actor="ext-user", actor_error=False, url_actors=None):
-    """Fake ``run_gh_checked``. The ``notifications`` list call returns ``pages``
-    (list of pages, slurped). Any other api call is an actor-resolution lookup →
-    ``{"user":{"login": ...}}`` from ``url_actors[url]`` if given (None → no
-    login), else ``actor``; ``actor_error`` fails every resolution call."""
+def _fake_notif_gh(
+    pages, *, actor="ext-user", actor_error=False, url_actors=None, review_comments=None
+):
+    """Fake ``run_gh_checked``.
+
+    The ``notifications`` list call returns ``pages`` (list of pages, slurped).
+    A ``{pull_url}/comments?...`` call is the PR review-comment surface and
+    returns the LIST at ``review_comments[pull_url]`` (default empty). Any other
+    api call is a single-object actor lookup → ``{"user":{"login": ...}}`` from
+    ``url_actors[url]`` if given (None → no login), else ``actor``.
+    ``actor_error`` fails every resolution call.
+    """
 
     async def fn(*args, **kwargs):
         url = args[2]
@@ -632,6 +640,8 @@ def _fake_notif_gh(pages, *, actor="ext-user", actor_error=False, url_actors=Non
             return True, json.dumps(pages)
         if actor_error:
             return False, ""
+        if "/comments?" in url:  # PR review comments — a list endpoint
+            return True, json.dumps((review_comments or {}).get(url.split("/comments?")[0], []))
         login = (url_actors or {}).get(url, actor)
         if login is None:
             return True, json.dumps({})  # resolved, but carries no user login
@@ -760,10 +770,16 @@ async def test_notifications_unresolved_actor_recorded_digest_only(db, monkeypat
     assert items[0]["ping"] is False and items[0]["actor"] == ""
 
 
-async def test_notifications_bot_skipped_owner_mention_digest_only(db, monkeypatch):
-    """A bot actor is dropped; the owner as the LATEST commenter on a mention is
-    kept digest-only (the mention is real even if the owner replied last); an
-    external human is pinged."""
+async def test_notifications_bot_and_owner_dropped_external_pinged(db, monkeypatch):
+    """A bot actor is dropped; the OWNER as the resolved actor is dropped too, as
+    self-activity; an external human is pinged.
+
+    The owner case used to be kept as an actor-less digest row, on the reasoning
+    that "the mention is real even if the owner replied last". That row is the
+    thing the owner actually experienced as noise, and it is safe to drop now the
+    mention search is WINDOWED to the notification's own interval: a genuine new
+    mention resolves to whoever wrote it, so only a thread the owner themselves
+    bumped reaches here."""
     mon, _ = _mon(db)
     pages = [
         [
@@ -793,9 +809,533 @@ async def test_notifications_bot_skipped_owner_mention_digest_only(db, monkeypat
     mon._is_automation = is_auto
     _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
     by_id = {i["thread_id"]: i for i in items}
-    assert set(by_id) == {"self", "human"}  # bot dropped
-    assert by_id["self"]["ping"] is False  # owner-latest on a mention → digest-only
+    assert set(by_id) == {"human"}  # bot AND owner-self dropped
     assert by_id["human"]["ping"] is True
+
+
+# ── actor resolution: only the first two sources observe someone ACTING ──
+#
+# GitHub sets `latest_comment_url` to the THREAD's own url when it has no comment
+# to point at. Reading `.user.login` there yields the thread AUTHOR — on the
+# owner's own repo, the owner — which the lane used to report as the resolved
+# actor. That made ordinary self-traffic on the owner's PRs look like real events,
+# and it hid the true actor, who lives in the PR's REVIEW comments: a surface
+# `latest_comment_url` never points at and the flagship deep-poll never polls
+# (it reads issues/comments, whose id space is disjoint).
+
+_PULL = "https://api.github.com/repos/me/myrepo/pulls/7"
+
+
+def _rc(login, created, body=""):
+    return {"user": {"login": login}, "created_at": created, "body": body}
+
+
+async def test_mention_actor_is_the_mentioner_not_the_latest_commenter(db, monkeypatch):
+    """THE ACCEPTANCE CASE, reproduced from the measured live shape.
+
+    A review bot mentions the owner; the owner replies afterwards. "Latest
+    commenter" therefore names the OWNER — a true statement about the thread and
+    the wrong answer about the notification, which the bot triggered. Resolving
+    by who wrote the @-text names the bot, and the automation filter drops it.
+    MEASURED on the live feed: both candidates resolved owner-by-latest-commenter
+    and bot-by-mention-author."""
+    mon, _ = _mon(db)
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,  # GitHub's "no comment to point at" spelling
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [
+                    _rc("some-bot", "2026-08-06T01:00:00Z", "nit @me consider renaming"),
+                    _rc("me", "2026-08-06T04:00:00Z", "good point, fixed"),  # latest, no @
+                ]
+            },
+        ),
+    )
+
+    async def is_auto(login, denylist):
+        return login == "some-bot"
+
+    mon._is_automation = is_auto
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv == _WM
+    assert items == []  # resolved to the bot, then dropped as automation
+
+
+async def test_mention_by_external_human_pings_even_if_owner_replied_later(db, monkeypatch):
+    """Same shape, human mentioner: must survive and ping. This is the class a
+    latest-commenter heuristic silently swallows whenever the owner replies."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [
+                    _rc("outsider", "2026-08-06T01:00:00Z", "hey @me is this intentional?"),
+                    _rc("me", "2026-08-06T04:00:00Z", "looking now"),
+                ]
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "outsider" and items[0]["ping"] is True
+
+
+async def test_mention_search_covers_pr_conversation_comments_too(db, monkeypatch):
+    """A pull request carries TWO disjoint comment surfaces — inline review
+    comments under /pulls/ and conversation comments under /issues/. A mention in
+    the conversation half must be found as well."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [],  # nothing inline
+                _PULL.replace("/pulls/", "/issues/"): [
+                    _rc("talker", "2026-08-06T02:00:00Z", "cc @me")
+                ],
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "talker" and items[0]["ping"] is True
+
+
+async def test_mention_match_does_not_run_past_the_login(db, monkeypatch):
+    """`@meadow` is not a mention of `me`. A bare word-boundary would match it,
+    because '-' and most punctuation end a \\b."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [
+                    _rc("wrong", "2026-08-06T03:00:00Z", "ping @meadow and @me-too"),
+                    _rc("right", "2026-08-06T01:00:00Z", "actually @me please look"),
+                ]
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "right"
+
+
+async def test_non_mention_reason_ignores_the_mention_filter(db, monkeypatch):
+    """`author` means someone responded on the owner's thread — the actor is the
+    latest commenter and no @-text need exist anywhere. The comment surfaces are
+    still READ (that is where the latest commenter lives); what the mention gate
+    controls is only whether the @-text FILTER is applied to them."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pull = "https://api.github.com/repos/someone/litellm/pulls/9"
+    pages = [
+        [
+            _notif(
+                reason="author",
+                repo="someone/litellm",
+                tid="a",
+                latest_comment_url=pull,
+                subject_url=pull,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={pull: "me"},
+            # No comment mentions the owner. Under the mention filter this would
+            # resolve to nobody; for `author` the latest commenter is the answer.
+            review_comments={pull: [_rc("maintainer", "2026-08-06T02:00:00Z", "merged, thanks")]},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "maintainer" and items[0]["ping"] is True
+
+
+async def test_mention_outside_the_window_is_not_reattributed(db, monkeypatch):
+    """GitHub's `reason` is STICKY: a thread the owner was mentioned in once keeps
+    emitting `mention` notifications for every later update, and the owner's own
+    replies bump `updated_at`. An unwindowed search re-attributes each of those to
+    the ORIGINAL mentioner — re-pinging a contributor for activity they had no
+    part in. Only comments inside the notification's own interval may attribute
+    it; here the owner is the sole in-window actor, so it is self-activity."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [
+                    # BEFORE _SINCE — an old mention this notification is not about.
+                    _rc("outsider", "2026-08-01T00:00:00Z", "hey @me take a look"),
+                    # In-window: the owner bumping their own thread.
+                    _rc("me", "2026-08-06T04:00:00Z", "pushed a fix"),
+                ]
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []  # self-activity, NOT a re-ping of `outsider`
+
+
+async def test_comment_after_the_notification_is_not_attributed(db, monkeypatch):
+    """The window closes at the notification's own `updated_at`, so a comment that
+    lands between the poll and the resolve cannot change who this item is about."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [
+                    _rc("outsider", "2026-08-06T02:00:00Z", "@me thoughts?"),
+                    # After the notification's updated_at (04:30) — out of scope.
+                    _rc("latecomer", "2026-08-06T04:45:00Z", "@me and another thing"),
+                ]
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "outsider"
+
+
+async def test_incomplete_comment_read_declines_to_answer(db, monkeypatch):
+    """A pull has two disjoint comment surfaces. If one fails to read, an answer
+    drawn from the other is a PARTIAL search reported as a whole one — and since
+    a bot actor gets the item DROPPED, a half-read thread could discard a human
+    mention the unread half was holding. Decline instead: digest-only, kept."""
+    mon, _ = _mon(db)
+
+    async def is_auto(login, denylist):
+        return login == "some-bot"
+
+    mon._is_automation = is_auto
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    inner = _fake_notif_gh(
+        pages,
+        url_actors={_PULL: "me"},
+        review_comments={_PULL: [_rc("some-bot", "2026-08-06T01:00:00Z", "nit @me")]},
+    )
+
+    async def fail_conversation_surface(*args, **kwargs):
+        if "/issues/7/comments" in args[2]:
+            return False, ""  # the surface that might hold a human mention
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", fail_conversation_surface)
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv == _WM  # still never holds the cursor
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_comment_surfaces_are_paginated(db, monkeypatch):
+    """These endpoints return OLDEST first and the conversation surface ignores
+    `direction`, so a single-page read of a busy thread silently yields the oldest
+    100 comments and a stale author. Match _poll_repo's always-paginate rule."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    seen: list[tuple] = []
+    inner = _fake_notif_gh(pages, url_actors={_PULL: "me"}, review_comments={_PULL: []})
+
+    async def spy(*args, **kwargs):
+        seen.append(args)
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", spy)
+    await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    comment_calls = [a for a in seen if "/comments?" in a[2]]
+    assert comment_calls, "the comment surfaces were never read"
+    for call in comment_calls:
+        assert "--paginate" in call, f"unpaginated comment read: {call[2]}"
+
+
+async def test_issue_subject_reads_its_comment_surface(db, monkeypatch):
+    """An Issue subject has ONE comment surface (no inline review comments).
+    It must still be read — this branch had no coverage."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    issue = "https://api.github.com/repos/me/myrepo/issues/5"
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="i",
+                latest_comment_url=issue,
+                subject_url=issue,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={issue: "me"},
+            review_comments={issue: [_rc("asker", "2026-08-06T02:00:00Z", "@me question")]},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "asker" and items[0]["ping"] is True
+
+
+async def test_mention_match_needs_a_left_boundary_too(db, monkeypatch):
+    """An email local-part or a longer handle must not read as a mention:
+    `dev@me.com` and `foo@me` are not mentions of `me`."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [
+                    _rc("wrong", "2026-08-06T03:00:00Z", "reach me at dev@me.com or foo@me"),
+                    _rc("right", "2026-08-06T01:00:00Z", "cc @me please"),
+                ]
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "right"
+
+
+async def test_actor_is_newest_comment_by_created_at_not_by_position(db, monkeypatch):
+    """Both comment endpoints return OLDEST first and the conversation surface
+    ignores `direction` entirely, so position is not recency. Pick by max."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={_PULL: "me"},
+            review_comments={
+                _PULL: [  # deliberately not in chronological order
+                    _rc("older", "2026-08-06T01:00:00Z", "@me one"),
+                    _rc("newest", "2026-08-06T04:00:00Z", "@me three"),
+                    _rc("middle", "2026-08-06T02:00:00Z", "@me two"),
+                ]
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "newest"
+
+
+async def test_author_response_on_foreign_repo_survives_the_fallback(db, monkeypatch):
+    """Where rejecting the owner as thread-author actually BITES.
+
+    `author` on someone else's repo is a response on the owner's OUTBOUND
+    contribution — half of why this lane exists. The thread author there is the
+    owner, so reading that as the resolved actor made the item look like
+    self-activity, and `author` is an owner-filtered reason, so it was dropped
+    outright. (On a `mention` the two paths are indistinguishable, which is why
+    the naive version of this test passed with the check deleted.)"""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    foreign = "https://api.github.com/repos/someone/litellm/pulls/9"
+    pages = [
+        [
+            _notif(
+                reason="author",
+                repo="someone/litellm",
+                tid="out",
+                latest_comment_url=foreign,
+                subject_url=foreign,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, url_actors={foreign: "me"}, review_comments={foreign: []}),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1  # pre-fix this was dropped entirely
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_thread_author_fallback_keeps_a_non_owner(db, monkeypatch):
+    """The control against over-rejecting: the fallback is still valid when it
+    names someone else — an external contributor whose PR BODY mentions the
+    owner, with no comments on the thread at all."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention",
+                repo="me/myrepo",
+                tid="pr",
+                latest_comment_url=_PULL,
+                subject_url=_PULL,
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, url_actors={_PULL: "opener"}, review_comments={_PULL: []}),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "opener" and items[0]["ping"] is True
+
+
+async def test_no_comment_surface_spends_no_requests(db, monkeypatch):
+    """A subject that is neither an issue nor a pull (a CheckSuite, say) has no
+    comment surface — read nothing, and treat that as a COMPLETE read of nothing
+    so the remaining sources still get their turn."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    calls: list[str] = []
+    inner = _fake_notif_gh(
+        [
+            [
+                _notif(
+                    reason="mention",
+                    repo="me/myrepo",
+                    tid="x",
+                    latest_comment_url=None,
+                    subject_url="SU",
+                )
+            ]
+        ],
+        url_actors={"SU": "opener"},
+    )
+
+    async def spy(*args, **kwargs):
+        calls.append(args[2])
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", spy)
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "opener"  # fell through to the thread author
+    assert not [c for c in calls if "/comments?" in c]
 
 
 async def test_notifications_classification_unresolved_surfaces(db, monkeypatch):
