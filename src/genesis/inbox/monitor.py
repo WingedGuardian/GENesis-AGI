@@ -1772,6 +1772,13 @@ class InboxMonitor:
                     evaluation_text=output_text,
                     batch_id=batch_id,
                     source_files=[item.file_path],
+                    # The CC-generated id of the evaluation session — the
+                    # tracker below's FIRST preference only (output.session_id,
+                    # the id transcript tracing keys on). Its second fallback,
+                    # the internal manager id, is deliberately NOT taken here:
+                    # wrong namespace for this column, and a substitute id is
+                    # forbidden. None when absent.
+                    source_session=getattr(output, "session_id", None) or None,
                 )
                 if fu_count:
                     logger.info(
@@ -2191,6 +2198,7 @@ class InboxMonitor:
         evaluation_text: str,
         batch_id: str,
         source_files: list[str],
+        source_session: str | None = None,
     ) -> int:
         """Parse Recommendation blocks and create follow-ups for actionable items.
 
@@ -2256,6 +2264,13 @@ class InboxMonitor:
                     # The evaluator judges each item genesis-vs-user; reuse it.
                     domain=("internal" if rec.classification == "genesis" else "user_world"),
                     dedup_key=dedup_key,
+                    # The CC session that produced this evaluation — the same id
+                    # transcript tracing keys on. Passed down from the caller
+                    # (which holds `output.session_id`); the monitor itself runs
+                    # under no session scope, so without this the ContextVar
+                    # default would store an honest NULL and the provenance the
+                    # caller already holds would be dropped.
+                    source_session=source_session,
                 )
             except sqlite3.IntegrityError:
                 # Lost a race on the partial-unique dedup_key index — another

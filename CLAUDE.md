@@ -386,17 +386,25 @@ reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
-**PR-body convention — `E2E:` (required, merge-gated):** every PR body declares
+**PR-body convention — `E2E:` (encouraged, advisory):** a PR body may declare
 the POST-MERGE end-to-end verification its change needs, on its own line:
 `E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
-The merge gate blocks a PR that declares neither — and a `none` carrying no real
-reason (a bare `none`, a placeholder, or a refusal word like TBD). Merge time
-only, never on push. PRs created before the convention are exempt; if the PR's
-creation date cannot be READ, the gate blocks rather than assuming the
-exemption. `none` is a fine answer for a docs PR; what is refused is leaving the
-decision unmade. It does NOT release
-the validator, which assumes every merged PR has an E2E and hunts for one anyway
-— the line is its first lead, not a boundary.
+This does NOT gate the merge — the merge gate prints an advisory NOTE when a
+body declares neither, and proceeds.
+
+**The obligation WILL be carried after the merge, not before it — and that half
+is NOT BUILT YET (issue #1718).** The design: every merged PR gets a post-merge
+verification row; a documentation-only diff has its row auto-closed with the
+reason recorded (a DETERMINISTIC exemption by path, so no LLM ever decides that
+a prompt or docs change "needs an E2E"); the validator session runs the rest, or
+records why nothing was needed. **Until that ships, this line is the only record
+there is** — so writing it is worth the ten seconds even though nothing forces
+you. When the row exists, declaring here will PRE-FILL it with your own lead:
+the author knows in one sentence what a validator would otherwise
+reverse-engineer from the diff days later. Note the row's exemption is by PATH,
+so it cannot recover a judgment the author skipped on a code PR — a bare
+`E2E: none` there just costs a validator round-trip instead of one sentence
+from the person who knew.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -585,7 +593,24 @@ every emitter's arithmetic, so this class cannot go quiet again.
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
-  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  or (3) big enough to derail the session — or the user directs it.
+
+  **FILING IS NOT DEFERRING, and the two decisions are separate.** Everything below
+  answers WHERE a record lives. It never answers WHETHER the work waits — that is the
+  bias above, and it is decided FIRST. An issue is a public RECORD, not a disposal:
+  in-scope work gets filed *and* done, often in the same session, and the issue is
+  then simply where someone else could have found it. Treating "I filed it" as a
+  disposition is how a tracked item becomes an untracked drop wearing a ticket
+  number.
+
+  So before routing anything, answer in this order: **is it in scope for what this
+  session is doing?** If yes, it gets addressed here — file it too if that helps
+  someone else, but the filing is in addition, never instead. Only when it is
+  genuinely out of scope, or one of the three deferral tests above actually holds,
+  does the routing question below become the whole answer. Naming the OWNER of a
+  piece of work is a classification, and a classification is not a decision.
+
+  Route by OWNER:
   **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
   public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
   **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
