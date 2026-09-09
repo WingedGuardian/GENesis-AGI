@@ -2224,6 +2224,43 @@ The same holds for a superseded PR: name the successor in a comment and leave it
 open. If you believe a PR should be retired and nobody is picking it up, that is
 a question for the user, not a judgment call for the review station.
 
+### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
+
+**A review session's job is to get THAT PR merged.** Reviews routinely surface
+bugs that are real, pre-existing on `main`, and nothing to do with the diff in
+front of you. Those do not belong in the PR and they must not hold it up.
+
+Route every finding by ONE question — **does the PR work without this fixed?**
+
+- **No, the PR is broken without it** → fix it in this PR. The builder session
+  should have caught it, and shipping a PR that cannot function is not a merge.
+- **Yes, the PR works** → **file a GitHub issue and merge the PR.** Do not grow
+  the diff, do not open a discussion, do not park it in a reply and move on.
+
+**Standing approval to file, for this class only.** The user has granted
+blanket, ongoing approval to open GitHub issues for adjacent non-blocking bugs
+discovered during review. Do NOT ask per instance — asking each time was the
+friction this rule removes. That standing approval is scoped to exactly this
+case: an adjacent, non-blocking, already-existing defect found while reviewing.
+Every other public post still needs explicit per-instance approval.
+
+**The exception that is NEVER waived: a security defect is not filed publicly
+before it is fixed.** An unpatched bypass, a credential exposure, anything
+exploitable — that goes to a private record under `~/.genesis/output/` plus a
+`follow_up_create` row, and nothing about it reaches a public surface, this
+standing approval included. If a finding is both adjacent and a live bypass,
+the security rule wins.
+
+Write the issue while the context is in your head — the measurement, the
+file:line, the falsifier, and why it was out of scope for the PR. An issue that
+merely names a symptom costs the next session the whole investigation again, and
+you already did it.
+
+Why this is the rule: a review that widens into every adjacent defect stops
+being a review and becomes an unbounded refactor, which is how a two-finding PR
+turns into a six-round loop. The PR is the unit of work. The queue is the place
+the rest of it goes.
+
 ## Pre-Merge Gate
 
 **Canonical pre-merge check:** run
