@@ -31,6 +31,12 @@ user-owned + purely-local operational work → a follow-up; consciously-not-doin
 `tabled`) and its two hard limits (explicit approval every time; never publish a
 security defect before it is fixed). This section is the operational detail.
 
+**Everything here is about WHERE a record lives, never about whether the work
+waits.** Filing and doing are not alternatives: in-scope work is filed *and*
+done, frequently in the same session. Settle the in-scope question with
+`CLAUDE.md`'s fix-now bias BEFORE reaching for any of the mechanics below —
+reading this section is not how you decide to defer something.
+
 ### Filing it — use the script, not a hand-typed command
 
 ```bash
