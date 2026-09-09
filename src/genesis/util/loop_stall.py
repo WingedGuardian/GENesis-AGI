@@ -108,9 +108,18 @@ class LoopStallSampler:
                 stack = "<loop thread frame unavailable (loop moved on)>"
             else:
                 stack = "".join(traceback.format_stack(frame))
+            # The stack is EVIDENCE, not a verdict. Calling it "the synchronous
+            # frame starving the loop" asserts a conclusion the snapshot does not
+            # carry: a stale heartbeat also happens when the loop is descheduled
+            # rather than blocked, and the stack then shows the loop idle in
+            # `selectors.select`. MEASURED — 5 of 40 dumps on one host were
+            # exactly that. Same defect as the lag sampler's old message
+            # (hosting/standalone.py); naming a cause the instrument cannot
+            # observe is what misdirects the next investigation.
             self._log.warning(
                 "event-loop WEDGED %.0fms (no loop-health publish) — executor=%s\n"
-                "loop-thread stack (the synchronous frame starving the loop):\n%s",
+                "loop-thread stack at the snapshot (idle in selectors.select = the\n"
+                "loop was descheduled, NOT blocked by this frame):\n%s",
                 age_ms,
                 getattr(sample, "executor", None),
                 stack,

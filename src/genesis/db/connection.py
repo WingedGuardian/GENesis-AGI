@@ -79,19 +79,41 @@ MIN_READ_POOL_SIZE = 4
 MAX_READ_POOL_SIZE = 12
 
 
+def available_cpu_count() -> int | None:
+    """CPUs available to THIS PROCESS, not to the host.
+
+    ``os.cpu_count()`` reports the host's logical CPUs, so inside a container
+    constrained by ``host-setup.sh --cpus N`` it OVERREPORTS: a 4-CPU container on
+    a 32-core host would size the pool from 32 and open the ceiling's worth of
+    readers, which is precisely the "more readers than cores buys queueing" case
+    the bounds exist to avoid. ``sched_getaffinity`` is what ``nproc`` reads.
+
+    Mirrors ``genesis.cc.session_cap._cpu_count``, whose docstring already
+    records this container behaviour. Deliberately DUPLICATED rather than
+    imported: ``db.connection`` is a low-level module and importing from
+    ``genesis.cc`` would invert the dependency direction. Worth consolidating
+    into a shared util if a third caller appears.
+    """
+    try:
+        return len(os.sched_getaffinity(0)) or None
+    except (AttributeError, OSError):
+        # Not Linux, or affinity unreadable — fall back to the host count.
+        return os.cpu_count()
+
+
 def derive_read_pool_size(cpu_count: int | None) -> int:
-    """Clamp a host's CPU count into the read-pool bounds above.
+    """Clamp a process-available CPU count into the read-pool bounds above.
 
     A function rather than an inline expression so the derivation has a testable
     seam: ``DEFAULT_READ_POOL_SIZE`` is evaluated at import time, so a test that
-    monkeypatches ``os.cpu_count`` and re-reads the constant measures nothing
+    monkeypatches the count source and re-reads the constant measures nothing
     (the module is already cached). ``cpu_count`` is passed in for the same
     reason. ``None`` (an unknowable count) takes the floor, never 1.
     """
     return max(MIN_READ_POOL_SIZE, min(cpu_count or MIN_READ_POOL_SIZE, MAX_READ_POOL_SIZE))
 
 
-DEFAULT_READ_POOL_SIZE = derive_read_pool_size(os.cpu_count())
+DEFAULT_READ_POOL_SIZE = derive_read_pool_size(available_cpu_count())
 
 # Schema migrations run rarely (deploy / server startup) but must win the write
 # lock even when other processes (concurrent CC-session MCP servers) are writing.
@@ -572,14 +594,48 @@ class ReadConnectionPool:
         return self._size
 
     async def open(self) -> None:
-        """Open all connections and fill the checkout queue. Idempotent."""
+        """Open all connections and fill the checkout queue. Idempotent.
+
+        TRANSACTIONAL: if any connection fails to open, every one already opened
+        is closed before the error propagates. Without that, a partial open
+        leaked permanently — the caller
+        (``runtime/init/memory.py``) catches, logs "degraded, not broken", and
+        sets the pool reference to ``None``, so the half-built pool became
+        unreachable with live connections still open, and EACH aiosqlite
+        connection owns a running worker thread. A larger default makes the
+        partial case likelier (an fd or thread ceiling is reached mid-loop), which
+        is what turned a latent leak into a real one.
+
+        ``BaseException`` on purpose: a ``CancelledError`` during shutdown leaks
+        exactly the same way, and it is not an ``Exception``.
+        """
         if self._opened:
             return
-        for _ in range(self._size):
-            conn = await open_ro_connection(self._path, cache_size_kib=self._cache_size_kib)
-            self._all.append(conn)
-            self._queue.put_nowait(conn)
+        try:
+            for _ in range(self._size):
+                conn = await open_ro_connection(self._path, cache_size_kib=self._cache_size_kib)
+                self._all.append(conn)
+                self._queue.put_nowait(conn)
+        except BaseException:
+            await self._rollback_partial_open()
+            raise
         self._opened = True
+
+    async def _rollback_partial_open(self) -> None:
+        """Close and forget every connection opened by a failed :meth:`open`.
+
+        Leaves ``_closed`` False: the pool is simply UN-opened, so ``acquire``
+        raises ``ReadPoolClosed`` and callers take their documented fallback to
+        the shared connection. Marking it closed would be indistinguishable to
+        callers but would make a retry of ``open()`` impossible.
+        """
+        for conn in self._all:
+            with suppress(Exception):
+                await conn.close()
+        self._all.clear()
+        while not self._queue.empty():  # drop the handles we just closed
+            with suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[aiosqlite.Connection]:

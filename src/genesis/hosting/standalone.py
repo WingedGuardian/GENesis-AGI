@@ -284,15 +284,26 @@ class StandaloneAdapter:
                         # Entering a stall episode — warn once, then suppress
                         # per-sample noise until it clears.
                         lagging = True
-                        # Report the MEASUREMENT, not a diagnosis. This line used
-                        # to assert "background work is starving the loop; recall
-                        # 503s correlate here" on every episode. Nothing measured
-                        # that correlation, and it fires at a 250ms default
-                        # threshold — an order of magnitude under the 4.5s recall
-                        # budget — so it named a cause it could not have observed.
-                        # It cost a real investigation: the claim was taken as
-                        # evidence, and recall timeouts turned out to be
-                        # read-pool checkout contention, unrelated to loop lag.
+                        # Report the MEASUREMENT ONLY. This line used to assert
+                        # "background work is starving the loop; recall 503s
+                        # correlate here" on every episode. Nothing measured that
+                        # correlation, and it fires at a 250ms default threshold —
+                        # an order of magnitude under the 4.5s recall budget — so
+                        # it named a cause it could not have observed. It cost a
+                        # real investigation: the claim was taken as evidence, and
+                        # recall timeouts turned out to be read-pool checkout
+                        # contention, unrelated to loop lag.
+                        #
+                        # Drift measures only that callbacks could not be
+                        # scheduled. It does NOT establish that a synchronous
+                        # frame was responsible: a VM pause, SIGSTOP, cgroup CPU
+                        # starvation or plain descheduling delay asyncio.sleep()
+                        # identically. MEASURED — of 40 wedge dumps on one host, 5
+                        # caught the loop idle in `selectors.select`, i.e. not
+                        # blocked at all. Establishing a blocking frame is the
+                        # off-loop stack sampler's job (util/loop_stall.py), which
+                        # prints the actual stack; this line must not pre-empt it
+                        # with a guess, which is the very error above.
                         #
                         # `workers` is len(executor._threads) — threads ever
                         # CREATED, which never shrinks. It is NOT an occupancy
@@ -302,8 +313,9 @@ class StandaloneAdapter:
                         # rather than dumping a dict a reader will misread.
                         pending = (executor or {}).get("pending")
                         logger.warning(
-                            "event-loop lag %.0fms (interval %.0fms) — a "
-                            "synchronous frame held the loop; executor "
+                            "event-loop lag %.0fms (interval %.0fms) — the loop "
+                            "could not schedule callbacks (cause NOT established "
+                            "here; see the loop-stall stack dump); executor "
                             "queue-depth(pending)=%s of max_workers=%s "
                             "[pending>0 means to_thread work is backing up; "
                             "workers= is threads-ever-created, not busy count] "

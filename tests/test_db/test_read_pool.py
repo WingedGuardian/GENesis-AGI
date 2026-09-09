@@ -15,6 +15,7 @@ SerializedConnection write lock. These tests pin the load-bearing invariants:
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 
 import aiosqlite
@@ -234,6 +235,72 @@ def test_default_pool_size_derivation_across_hosts(cpus, expected):
     from genesis.db.connection import derive_read_pool_size
 
     assert derive_read_pool_size(cpus) == expected
+
+
+def test_pool_size_uses_process_affinity_not_host_cpus(monkeypatch):
+    """A container constrained to N CPUs must size from N, not the host's cores.
+
+    ``os.cpu_count()`` reports HOST logical CPUs, so on a 4-CPU container on a
+    32-core host it would open the ceiling's worth of readers — the exact
+    "more readers than cores buys queueing" case the bounds exist to prevent.
+    """
+    from genesis.db import connection
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1, 2, 3})
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert connection.available_cpu_count() == 4
+    assert connection.derive_read_pool_size(connection.available_cpu_count()) == 4
+
+
+def test_available_cpu_count_falls_back_to_host_when_affinity_unavailable(monkeypatch):
+    """Non-Linux / unreadable affinity must degrade to the host count, not crash."""
+    from genesis.db import connection
+
+    def _boom(_pid):
+        raise OSError("no affinity")
+
+    monkeypatch.setattr(os, "sched_getaffinity", _boom)
+    monkeypatch.setattr(os, "cpu_count", lambda: 6)
+    assert connection.available_cpu_count() == 6
+
+
+async def test_partial_open_closes_what_it_opened(db_path, monkeypatch):
+    """A failed open must not leak the connections it already made.
+
+    Each aiosqlite connection owns a worker thread, and the caller
+    (runtime/init/memory.py) drops the pool reference on failure — so anything
+    left open becomes unreachable AND alive. Asserts against the real close()
+    calls, not a flag.
+    """
+    from genesis.db import connection as conn_mod
+
+    await _seed_db(db_path)  # mode=ro requires the file to already exist
+    opened: list[object] = []
+    real_open = conn_mod.open_ro_connection
+
+    async def flaky(*args, **kwargs):
+        if len(opened) >= 3:
+            raise OSError("simulated fd/thread ceiling")
+        c = await real_open(*args, **kwargs)
+        opened.append(c)
+        return c
+
+    monkeypatch.setattr(conn_mod, "open_ro_connection", flaky)
+    pool = conn_mod.ReadConnectionPool(db_path, size=8)
+    with pytest.raises(OSError):
+        await pool.open()
+
+    assert len(opened) == 3, "fixture must actually have opened some connections first"
+    # Every connection it opened is closed: a closed aiosqlite connection has no
+    # live worker thread, which is the resource that was leaking.
+    for c in opened:
+        assert not c._running, "connection left open after a failed pool open"
+    # And the pool is UN-opened rather than permanently closed, so acquire()
+    # gives callers their documented fallback.
+    assert pool._all == []
+    with pytest.raises(conn_mod.ReadPoolClosed):
+        async with pool.acquire():
+            pass
 
 
 def test_recall_read_pool_size_env(monkeypatch):
