@@ -28,8 +28,10 @@ consciously not pursuing → `follow_up_create` with `work_state="deferred_cold"
 
 `CLAUDE.md` carries the routing principle (Genesis-repo work → a GitHub issue;
 user-owned + purely-local operational work → a follow-up; consciously-not-doing →
-`tabled`) and its two hard limits (explicit approval every time; never publish a
-security defect before it is fixed). This section is the operational detail.
+`tabled`) and its two hard limits (scrub personal/identifying detail from anything
+public, and ask when borderline; never publish a security defect before it is
+fixed). Filing an issue does not need per-instance approval. This section is the
+operational detail.
 
 ### Filing it — use the script, not a hand-typed command
 

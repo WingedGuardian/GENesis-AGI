@@ -576,8 +576,8 @@ every emitter's arithmetic, so this class cannot go quiet again.
   approval, or a designed hard stop is finishing correctly, not dropping
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
-  issue, which keeps its per-instance approval gate from "Where deferred
-  work goes" below, this rule waives nothing. Where none of those trackers
+  issue, which still owes the privacy scrub from "Where deferred work goes"
+  below — this rule waives nothing. Where none of those trackers
   is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
   ledger or follow-up tool — the fallback is a structured handoff that NAMES
   every unfinished piece in your final message; a named remainder is tracked,
@@ -602,10 +602,15 @@ every emitter's arithmetic, so this class cannot go quiet again.
   far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
   never dispatched, surfaced, or filed as an issue, because we don't want it picked
   up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  Two hard limits on the issue route, both non-negotiable: a public post is
-  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
-  approval carries forward, and a channel-driven session has no confirmation step of
-  its own); and a **security** defect — an unpatched bypass, a credential exposure,
+  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
+  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
+  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
+  real-world life — and strip it; an issue carries technical detail only. Borderline,
+  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
+  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
+  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
+  One limit stays absolute — a **security** defect — an unpatched bypass, a
+  credential exposure,
   anything exploitable — is NEVER filed publicly before it is fixed, no matter who
   owns it. Everything else — who may file, the command, labels, dispatched sessions,
   the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
