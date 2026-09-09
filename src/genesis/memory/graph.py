@@ -2,8 +2,14 @@
 
 Primary path: in-memory NetworkX MultiDiGraph loaded lazily from memory_links
 (a multigraph because one memory pair may carry several typed edges).
-Fallback: recursive CTE queries (if NetworkX import fails or cache is cold
-during the first query of a session).
+
+Fallback: recursive CTE queries, reached on ONE condition — the NetworkX import
+failed at module load. A cold cache is NOT a trigger, though this docstring said
+so for years: the first query of a session calls `_ensure_graph`, which BUILDS
+the cache and returns it. Worth stating precisely, because the wrong version
+makes the fallback sound routine when it is in fact dormant wherever NetworkX
+installs (it is a hard dependency, present in this repo's venv), which is why
+the two paths were free to disagree unnoticed.
 
 The cache is invalidated via ``invalidate_graph_cache()`` when links are
 created or deleted. The next query triggers a rebuild from SQLite.
@@ -358,7 +364,59 @@ async def _traverse_cte(
     max_depth: int,
     min_strength: float,
 ) -> list[GraphNode]:
-    """Original recursive CTE traversal (fallback)."""
+    """Original recursive CTE traversal (fallback).
+
+    ONE ROW PER MEMORY, picked the same way the walk above picks: shallowest
+    depth, then the strongest edge reaching it, then link_type as a deterministic
+    tie-break. That is not tidiness — it is the same correctness property this
+    module's walk exists to provide, and the fallback used to contradict it.
+
+    `SELECT DISTINCT target_id, link_type, depth, strength` keeps one row per
+    COMBINATION, not per memory, so a node reached through two parents at the
+    same depth came back TWICE — once credited its strongest edge and once its
+    weakest. `mcp/memory/core.py` takes `traversal.nodes[:5]` and does NOT sort
+    it — the order this function emits IS the selection — so the duplicate both
+    occupied two of those five slots and dragged a false weaker strength into
+    what the model reads. Which implementation answers must not change that.
+
+    The window's ORDER BY mirrors the walk's `(strength, link_type)` maximum
+    exactly, and the outer `ORDER BY depth, strength DESC, target_id` mirrors the
+    walk's committed sequence — `(-strength, memory_id)` within a level,
+    preserved through a stable final sort on `(depth, -strength)`. That matters
+    because `drift.py:202` reads this sequence as a RANKED list for RRF without
+    reading a single label, so two implementations agreeing on every field and
+    disagreeing on order still hand that consumer different answers.
+
+    The trailing `target_id` is EXPLICIT, not load-bearing, and the distinction is
+    measured rather than assumed: with three equal-strength neighbours inserted in
+    a deliberately adversarial order (z, a, m), this query returns them id-sorted
+    WITH the key and identically WITHOUT it — the window's `PARTITION BY
+    target_id` already groups them that way. So no test can tell the two apart,
+    and none claims to. It is kept because that is a property of one engine's
+    query plan, which SQLite does not promise, and stating the order costs
+    nothing; do not read it as a guard something exercises.
+
+    Window functions need SQLite >= 3.25 (2018); this install runs 3.45, and the
+    repo already hard-depends on 3.35+ elsewhere (`UPDATE…RETURNING`,
+    `ALTER TABLE DROP COLUMN` in migrations 0010/0014/0016), so this floor sits
+    strictly below an existing one and cannot newly break a clone.
+
+    TWO GUARDS ON THE ANCHOR, because the anchor row skipped constraints both the
+    recursive step and the walk apply — one generator, two symptoms:
+
+    * `target_id <> source_id`. The walk seeds `visited = {root_id}` and can
+      therefore never emit the root; the anchor had no such guard, so a memory
+      linked to itself was returned as its own related memory, burning one of the
+      five slots `core.py` shows. MEASURED on the live table: 30 of 269,757 rows
+      are self-links, so this fired for 30 roots.
+    * `max_depth < 1` returns early (below). The anchor emits depth 1
+      unconditionally, ignoring the bound the walk's `while depth < max_depth`
+      respects — so `max_depth=0` asked for nothing and got a level. Inert today
+      (no caller passes 0; production passes 1, 2 or the default 3) and closed
+      anyway, because the claim being made here is that the two paths agree.
+    """
+    if max_depth < 1:
+        return []
     cursor = await db.execute(
         """
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
@@ -366,6 +424,7 @@ async def _traverse_cte(
                    source_id || ',' || target_id
             FROM memory_links
             WHERE source_id = ?
+              AND target_id <> source_id
               AND strength >= ?
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
@@ -376,9 +435,17 @@ async def _traverse_cte(
               AND ml.strength >= ?
               AND c.path NOT LIKE '%' || ml.target_id || '%'
         )
-        SELECT DISTINCT target_id, link_type, depth, strength
-        FROM connected
-        ORDER BY depth, strength DESC
+        SELECT target_id, link_type, depth, strength
+        FROM (
+            SELECT target_id, link_type, depth, strength,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY target_id
+                       ORDER BY depth ASC, strength DESC, link_type DESC
+                   ) AS rn
+            FROM connected
+        )
+        WHERE rn = 1
+        ORDER BY depth, strength DESC, target_id
         """,
         (root_id, min_strength, max_depth, min_strength),
     )
