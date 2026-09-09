@@ -675,3 +675,33 @@ async def test_the_cte_hides_a_hidden_memory_reached_at_depth_two(tmp_path):
         )
     finally:
         await db.close()
+
+
+async def test_a_closed_connection_after_a_cached_build_is_unavailability(tmp_path):
+    """Closing the handle AFTER a build must still raise the seam's typed error.
+
+    The sibling closed-connection test uses a FRESH store, so `_is_stale()`
+    returns early on the empty cache and never probes connection identity. This
+    one builds first, so the probe runs — and `aiosqlite.Connection._conn` is a
+    property that raises `ValueError("no active connection")` once closed.
+
+    That raise happens in `_is_stale()`, which is upstream of the guarded reads,
+    so an unhandled one escapes `traverse()` as a bare `ValueError`. `graph.py`
+    catches only `GraphUnavailableError`, so it would bypass the fallback chain
+    entirely — the exact raw-error leak this PR's typed contract exists to close,
+    reintroduced one layer above the guard that closed it.
+    """
+    path = tmp_path / "g.db"
+    await _seed(path, [("A", "B")])
+    store = NetworkxGraphStore()
+    db = await aiosqlite.connect(str(path))
+
+    await store.traverse(db, "A", max_depth=1, min_strength=0.0)
+    assert store._graph is not None, "precondition: the cache must be warm"
+    await db.close()
+
+    with pytest.raises(GraphUnavailableError):
+        await store.traverse(db, "A", max_depth=1, min_strength=0.0)
+
+    with pytest.raises(GraphUnavailableError):
+        await store.centrality(db, top_n=5)

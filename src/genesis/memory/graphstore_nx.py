@@ -66,8 +66,27 @@ def _connection_identity(db: object) -> object:
 
     Two proxies sharing one underlying connection deliberately compare EQUAL —
     same connection, same data, nothing to rebuild.
+
+    NON-THROWING BY CONTRACT, and `getattr`'s default is not enough for that:
+    on `aiosqlite.Connection` this attribute is a PROPERTY that raises
+    `ValueError("no active connection")` once the handle is closed, and a
+    default only covers `AttributeError`. This runs inside `_is_stale()`, which
+    is BEFORE the guarded reads, so an unhandled raise here escapes `traverse()`
+    as a bare `ValueError` — exactly the raw-error leak the seam's typed contract
+    exists to prevent, reintroduced one layer above the guard that fixed it.
+
+    Falling back to `db` on a closed handle is the right answer rather than
+    merely a safe one: the stored token is the connection captured while it was
+    OPEN, so `db` compares unequal, the projection is treated as stale, and the
+    rebuild runs straight into the guarded reads — which fail the way the
+    contract says, as `GraphUnavailableError`.
     """
-    return getattr(db, "_conn", db)
+    try:
+        return db._conn  # type: ignore[attr-defined]
+    except AttributeError:
+        return db        # a plain object with no wrapped handle: it IS the token
+    except Exception:
+        return db        # closed/unusable: force a rebuild into the guarded path
 
 
 def _bfs_with_strength(
