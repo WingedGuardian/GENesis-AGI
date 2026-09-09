@@ -113,7 +113,8 @@ class StandaloneAdapter:
         # MEASURE a stall after it clears, so it never captures the synchronous
         # frame that blocked the loop. This daemon thread reads the loop-health
         # heartbeat and, when it goes stale (loop wedged NOW), snapshots the loop
-        # thread's stack — catching the offending frame mid-stall. Diagnostic-only.
+        # thread's stack. The stack shows where the loop WAS when sampled; it is
+        # evidence, not a verdict on the cause. Diagnostic-only.
         stall_stop_event = None
         if os.environ.get("GENESIS_LOOP_STALL_SAMPLER", "1").lower() not in (
             "0",
@@ -241,15 +242,19 @@ class StandaloneAdapter:
 
         Sleeps a fixed interval and measures how much longer than the interval
         the wake-up actually took — that excess is time the loop spent unable to
-        schedule ready callbacks (blocked in synchronous work on some task).
-        When drift exceeds the threshold we log at WARNING so the stall is
-        timestamp-correlatable with awareness-tick / dispatch / bundle log lines,
-        naming what starves the recall coroutine behind the route 503s.
+        schedule ready callbacks. Drift alone does NOT say why: a synchronous
+        frame, a VM pause, a SIGSTOP and cgroup CPU starvation all delay
+        ``asyncio.sleep`` identically. When drift exceeds the threshold we log at
+        WARNING so the stall is timestamp-correlatable with awareness-tick /
+        dispatch / bundle log lines; establishing the CAUSE is the off-loop stack
+        sampler's job (util/loop_stall.py). This docstring previously claimed the
+        warning names what starves the recall coroutine behind route 503s — it
+        cannot, and that claim misdirected a real investigation.
 
         The WARN also carries ``executor=`` — the default-executor pending depth
-        (PR-2c). A lag episode with a deep executor queue means ``to_thread`` work
-        (Qdrant recall, awareness-tick git) is saturating the thread pool, which
-        loop drift alone cannot distinguish from pure loop starvation.
+        (PR-2c). Read ``pending`` and ONLY ``pending``: a sustained non-zero value
+        means ``to_thread`` work is backing up. ``workers`` is NOT an occupancy
+        gauge (see util/loop_diag.py) and says nothing about saturation.
 
         Debounced per stall EPISODE: one WARNING when drift first crosses the
         threshold, one INFO with the peak drift when it clears. A sustained

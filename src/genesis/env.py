@@ -317,6 +317,32 @@ def recall_read_pool_size() -> int:
         return DEFAULT_READ_POOL_SIZE
 
 
+def session_read_pool_size() -> int:
+    """Size of the read pool in a PER-SESSION MCP child (not the server's).
+
+    Deliberately a separate reader from :func:`recall_read_pool_size`, because the
+    two callers differ in CARDINALITY, not just in taste: the server is one per
+    box and fields every session's per-prompt recall, while an MCP child exists
+    once PER CC SESSION and serves only that session's explicit ``memory_recall``
+    calls. One host-derived number applied to both is multiplied by the number of
+    live sessions — MEASURED with 6 children on an 8-core box, that is 56 pooled
+    connections instead of 28.
+
+    Tunable via ``GENESIS_SESSION_READ_POOL_SIZE``; the pool floors it at 1, and a
+    missing or non-integer value falls back to the default. Set it explicitly on
+    an install that genuinely runs concurrent tool calls within one session.
+    """
+    from genesis.db.connection import DEFAULT_SESSION_READ_POOL_SIZE
+
+    raw = os.environ.get("GENESIS_SESSION_READ_POOL_SIZE", "").strip()
+    if not raw:
+        return DEFAULT_SESSION_READ_POOL_SIZE
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_SESSION_READ_POOL_SIZE
+
+
 # SQLite busy_timeout default (ms). Defined HERE, not in db/connection.py: it is
 # an env-tunable default (see db_busy_timeout_ms below), and env.py must sit
 # below the db layer in the import graph — connection.py re-exports it for its

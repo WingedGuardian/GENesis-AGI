@@ -50,13 +50,19 @@ RO_CACHE_SIZE_KIB = -65536  # 64 MiB per read-only connection
 # The previous fixed 4 was justified as "reads are sub-second, so a handful of
 # parallel readers clears the checkout queue fast". MEASURED 2026-09-08 on a live
 # install, that premise is false: reads are NOT sub-second under concurrency (the
-# recall stage alone reached ~2.4s at 6 concurrent recalls), and because the
-# (size+1)th recall BLOCKS ON CHECKOUT — designed backpressure, documented on
-# ReadConnectionPool below, not a defect — the request-budget timeout rate tracked
-# the pool size exactly — 0 timeouts at 1, 2 and 4 concurrent, 1/16 at 6, 7/16 at
-# 8, against a 4.5s route budget. Several concurrent sessions each firing a
-# per-prompt recall sit right on that knee, so the shipped default was the
-# binding constraint rather than a comfortable margin.
+# recall stage alone reached ~2.4s at 6 concurrent recalls). MEASURED against the
+# then-shipped pool of 4, varying CONCURRENCY: 0 request-budget timeouts at 1, 2
+# and 4 concurrent recalls, 1/16 at 6, and 7/16 at 8, against a 4.5s route budget.
+#
+# STATE THE INFERENCE AS AN INFERENCE, because an earlier draft of this comment
+# did not: the experiment varied concurrency and held pool size FIXED at 4, so it
+# does not by itself establish that the knee sits AT the pool size — only that
+# timeouts begin once concurrency exceeds 4. That reading is strongly supported
+# by the mechanism (the (size+1)th recall blocks on checkout — designed
+# backpressure documented on ReadConnectionPool below, not a defect) and by the
+# `recall` stage scaling near-linearly with N while `embed` stays flat, which is
+# the serialisation signature. It is NOT supported by a pool-size sweep, because
+# none was run. A sweep varying size at fixed concurrency is what would close it.
 #
 # Each connection is one genuinely-parallel reader backed by one OS thread, so
 # CPU count is the honest driver: more readers than cores buys queueing, not
@@ -77,6 +83,66 @@ RO_CACHE_SIZE_KIB = -65536  # 64 MiB per read-only connection
 # in the pool itself.
 MIN_READ_POOL_SIZE = 4
 MAX_READ_POOL_SIZE = 12
+
+# Per-SESSION read-pool size — a different ROLE, so a different number.
+#
+# There are exactly two pool constructors, and they have different CARDINALITY:
+#   runtime/init/memory.py    ONE per box  — the server, fielding EVERY session's
+#                             per-prompt recall against a 4.5s route budget.
+#   scripts/genesis_mcp_server.py  N per box — an MCP child per CC session,
+#                             serving that ONE session's explicit memory_recall
+#                             calls, which arrive essentially sequentially.
+# Sizing both from one host-derived default multiplies it by N: MEASURED with 6
+# live MCP children on an 8-core box, the derived size would open 7 x 8 = 56
+# pooled connections instead of 7 x 4 = 28 — roughly +140 MiB at the measured
+# ~5 MiB resident per connection, on a container already near its cgroup limit.
+# The core-bounded-parallelism argument does not survive that either: N
+# independent processes each sizing from the full host count share no budget.
+#
+# 2, and the number rests on the MEMORY arithmetic plus the bounded checkout
+# below — NOT on the two rationales a first draft gave, both of which were false
+# and are recorded here so they are not re-invented:
+#   "a session's MCP recalls are one-at-a-time" — FALSE. The MCP SDK starts a
+#     task per incoming message with no semaphore, and parallel subagents share
+#     the parent's MCP connection, so one child genuinely receives concurrent
+#     tool calls. Sequencing was an assumption about model behaviour, not a
+#     property of the system.
+#   "the second slot is headroom for a concurrent write-back" — IMPOSSIBLE. This
+#     pool is mode=ro; a write through a pooled handle raises SQLITE_READONLY,
+#     which tests/test_db/test_read_pool.py asserts directly. Write-backs run on
+#     the shared SerializedConnection. The second slot buys exactly the parallel
+#     read throughput that sentence denied.
+# What actually makes a small per-session pool safe is that checkout is BOUNDED
+# (DEFAULT_CHECKOUT_TIMEOUT_S): exhaustion degrades to the shared connection —
+# the pre-pool path — so a small pool costs LATENCY, never liveness. Without
+# that bound, halving the pool would have doubled the chance of an unbounded
+# wait in a process with no route timeout to catch it.
+# Net effect with 6 sessions: (6 x 2) + 8 = 20 connections, FEWER than today's 28,
+# while the central pool that actually hit the checkout knee doubles.
+DEFAULT_SESSION_READ_POOL_SIZE = 2
+
+# How long a caller waits for a free connection before taking the documented
+# fallback (the shared connection) instead of waiting longer.
+#
+# This exists because the pool's own class docstring outsources the bound to
+# "the route's own timeout", which is TRUE ONLY inside genesis-server. An MCP
+# child serves tool calls with no route budget, so an unbounded checkout there
+# waits forever — and a hung MCP tool call is effectively unrecoverable short of
+# the user interrupting, since the client-side tool timeout is enormous.
+#
+# 10s, and the two bounds that pick it:
+#   ABOVE normal contention. A recall's individual pooled reads are short; the
+#   slowest measured recall STAGE was ~2.4s and it spans several checkouts, so
+#   10s is far above anything a healthy holder needs. Timing out below that
+#   would thrash — every busy moment would abandon the pool.
+#   BELOW the busy_timeout a holder can legitimately absorb (15000ms in MCP
+#   children, per genesis_mcp_server.py; 5000ms default elsewhere). A reader
+#   parked behind a WAL checkpoint can hold its slot for that whole window; the
+#   right response for everyone BEHIND it is to stop waiting and use the shared
+#   connection, not to inherit its stall.
+# Falling back is cheap and correct: it is exactly the pre-pool code path, and
+# the pool is documented as an OPTIMISATION that must never make a read worse.
+DEFAULT_CHECKOUT_TIMEOUT_S = 10.0
 
 
 def available_cpu_count() -> int | None:
@@ -580,10 +646,12 @@ class ReadConnectionPool:
         *,
         size: int = DEFAULT_READ_POOL_SIZE,
         cache_size_kib: int = RO_CACHE_SIZE_KIB,
+        checkout_timeout_s: float = DEFAULT_CHECKOUT_TIMEOUT_S,
     ) -> None:
         self._path = str(Path(path))
         self._size = max(1, size)
         self._cache_size_kib = cache_size_kib
+        self._checkout_timeout_s = checkout_timeout_s
         self._queue: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue()
         self._all: list[aiosqlite.Connection] = []
         self._closed = False
@@ -647,10 +715,29 @@ class ReadConnectionPool:
         is safe for autocommit ``mode=ro`` reads (no dangling transaction). If
         the pool was closed while the connection was held, it is dropped rather
         than returned (``close()`` closes every ``self._all`` connection).
+
+        CHECKOUT IS BOUNDED. The class docstring above outsources the bound to
+        "the route's own timeout", and that is only true inside genesis-server:
+        an MCP child serves tool calls with NO route budget, so a bare
+        ``queue.get()`` there waits forever. That matters because a pooled reader
+        can legitimately park for the full ``busy_timeout`` (15s in MCP children)
+        behind a WAL checkpoint — on a small pool two such readers hold every
+        slot, and everything behind them blocked with no timeout at any layer,
+        silently, since nothing logs contention.
+        Exhaustion now degrades to ``ReadPoolClosed``, which every caller already
+        handles by falling back to the shared connection — the pre-pool
+        behaviour. That is what keeps the pool's founding promise (an
+        OPTIMISATION, "never worse than without it") true under saturation
+        instead of only under failure, and it is what makes a SMALL pool cost
+        latency rather than liveness.
         """
         if self._closed or not self._opened:
             raise ReadPoolClosed
-        conn = await self._queue.get()
+        try:
+            conn = await asyncio.wait_for(self._queue.get(), timeout=self._checkout_timeout_s)
+        except TimeoutError:
+            # Not an error: the documented fallback, taken deliberately.
+            raise ReadPoolClosed from None
         try:
             yield conn
         finally:

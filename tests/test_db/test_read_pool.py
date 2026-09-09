@@ -303,6 +303,108 @@ async def test_partial_open_closes_what_it_opened(db_path, monkeypatch):
             pass
 
 
+async def test_checkout_is_bounded_and_degrades_to_the_fallback(db_path):
+    """An exhausted pool must DEGRADE, never wait forever.
+
+    The class docstring outsources the bound to "the route's own timeout", which
+    is true only inside genesis-server. An MCP child serves tool calls with no
+    route budget, so an unbounded checkout there waits indefinitely — and a
+    pooled reader can legitimately hold its slot for the whole busy_timeout
+    (15s in MCP children) behind a WAL checkpoint. Exhaustion now raises
+    ReadPoolClosed, which every caller already handles by falling back to the
+    shared connection.
+    """
+    await _seed_db(db_path)
+    pool = ReadConnectionPool(db_path, size=1, checkout_timeout_s=0.05)
+    await pool.open()
+    try:
+        async with pool.acquire():  # holds the only slot
+            async with asyncio.timeout(2):  # would hang here without the bound
+                with pytest.raises(ReadPoolClosed):
+                    async with pool.acquire():
+                        pass
+        # The slot is returned, so a later checkout still succeeds — the timeout
+        # must not have poisoned the pool.
+        async with pool.acquire() as conn:
+            rows = await conn.execute_fetchall("SELECT COUNT(*) FROM t")
+            assert rows[0][0] == 2
+    finally:
+        await pool.close()
+
+
+def test_session_pool_is_sized_by_ROLE_not_by_the_host(monkeypatch):
+    """A per-session MCP child must NOT take the host-derived size.
+
+    There are exactly two pool constructors and they differ in CARDINALITY: the
+    server is ONE per box, an MCP child is one per CC SESSION. Feeding both from
+    one host-derived number multiplies it by the number of live sessions —
+    measured at 6 children on an 8-core box, 56 pooled connections instead of 28.
+    """
+    from genesis import env
+    from genesis.db.connection import (
+        DEFAULT_SESSION_READ_POOL_SIZE,
+        MIN_READ_POOL_SIZE,
+    )
+
+    monkeypatch.delenv("GENESIS_SESSION_READ_POOL_SIZE", raising=False)
+    monkeypatch.delenv("GENESIS_RECALL_READ_POOL_SIZE", raising=False)
+    # The session size is small and FIXED — it must not track the host at all,
+    # which is the whole point of the split.
+    assert env.session_read_pool_size() == DEFAULT_SESSION_READ_POOL_SIZE
+    assert MIN_READ_POOL_SIZE > DEFAULT_SESSION_READ_POOL_SIZE
+    # Its own lever, independent of the server's.
+    monkeypatch.setenv("GENESIS_SESSION_READ_POOL_SIZE", "5")
+    assert env.session_read_pool_size() == 5
+    monkeypatch.setenv("GENESIS_SESSION_READ_POOL_SIZE", "not-an-int")
+    assert env.session_read_pool_size() == DEFAULT_SESSION_READ_POOL_SIZE
+
+
+def test_session_pool_knob_reaches_the_mcp_child():
+    """A knob the MCP child READS must also be in its env ALLOWLIST, or it is inert.
+
+    `genesis_mcp_server.py` filters the environment it passes to the child through
+    `_MCP_VARS`; a variable absent from that list is silently dropped, so a
+    documented lever does nothing and nothing reports it. This exact class has
+    shipped twice before (the list's own comments cite #1302 and #1587), and this
+    PR made it a third time — the new `session_read_pool_size` reader was wired
+    without its allowlist entry.
+
+    Asserted against the file text because the allowlist is a module-level literal
+    consumed at subprocess-spawn time; importing the module is not needed and would
+    drag in the whole MCP stack.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "scripts/genesis_mcp_server.py").read_text()
+    assert "session_read_pool_size()" in src, "the child no longer reads the session knob"
+    assert '"GENESIS_SESSION_READ_POOL_SIZE"' in src, (
+        "GENESIS_SESSION_READ_POOL_SIZE is read by the child but missing from "
+        "_MCP_VARS — the documented lever would be INERT"
+    )
+    assert '"GENESIS_RECALL_READ_POOL_OFF"' in src  # the kill switch it still honours
+
+
+def test_the_two_pool_constructors_use_different_size_readers():
+    """Lock the SPLIT itself, not just the numbers.
+
+    A refactor that points the MCP child back at ``recall_read_pool_size`` would
+    silently restore the N-times multiplication while every other test still
+    passed, because each reader is individually correct. Assert on the actual
+    call sites.
+    """
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    server = (repo / "src/genesis/runtime/init/memory.py").read_text()
+    mcp_child = (repo / "scripts/genesis_mcp_server.py").read_text()
+
+    # The ONE-per-box server takes the host-derived size.
+    assert "size=recall_read_pool_size()" in server
+    # The PER-SESSION child must not.
+    assert "size=session_read_pool_size()" in mcp_child
+    assert "recall_read_pool_size()" not in mcp_child
+
+
 def test_recall_read_pool_size_env(monkeypatch):
     """The size env-reader parses an int and falls back to the default on a
     missing/blank/non-integer value (a bad env value must never crash boot)."""
