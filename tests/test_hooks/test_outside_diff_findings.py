@@ -210,37 +210,48 @@ class TestSectionParsing:
 
 
 class TestGateBehaviour:
-    """Severity policy: only Critical scores. A Major is surfaced and does NOT
-    block, because an undelivered finding has no comment thread — the
-    maintainer-reply route that clears every other finding does not exist for
-    it, so blocking would make it satisfiable only by fixing."""
+    """Severity policy: NOTHING in this channel scores. Every level is surfaced
+    and none blocks.
+
+    That is an owner decision taken at the escalation cap (2026-09-09), not a
+    convenience. Four consecutive review rounds on this parser each produced a
+    defect of one class — text from a third-party rendered document read as
+    structure or identity — and every one was only dangerous because a mis-read
+    could move a BLOCKING verdict. Removing the verdict makes the whole class
+    unreachable instead of patched. Measured cost: nil. Across all 84 then-open
+    non-draft PRs (2026-09-07) the channel carried 27 findings — 15 Major, 12
+    Minor, ZERO Critical — so the scoring path never fired on live data, while
+    surfacing keeps everything the channel was built to recover.
+    """
 
     def _run(self, guard_module, monkeypatch, no_inline, reviews):
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", "\n".join(reviews))
         with no_inline:
             return guard_module._check_inline_review_findings("100")
 
-    def test_outside_diff_critical_blocks(self, guard_module, monkeypatch, no_inline, capsys):
+    def test_outside_diff_critical_is_surfaced_and_does_not_block(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        """VERIFY-RED against the PREVIOUS design, which scored this at 1.0."""
         review = _review(_section(_entry("src/a.py", "1-2", "🔴 Critical", "Data loss")))
-        block, msg = self._run(guard_module, monkeypatch, no_inline, [review])
-        assert block is True
-        assert "Data loss" in msg
-        assert "outside-diff Critical" in msg
+        block, _msg = self._run(guard_module, monkeypatch, no_inline, [review])
+        assert block is False, "this channel is advisory; it must never block"
+        err = capsys.readouterr().err
+        assert "[outside-diff Critical] Data loss" in err, "and it must still be SEEN"
+        assert "NEVER SCORED" in err
 
-    def test_a_lone_outside_diff_blocker_is_counted_and_actionable(
+    def test_a_lone_outside_diff_finding_produces_no_block_message_at_all(
         self, guard_module, monkeypatch, no_inline
     ):
-        # VERIFY-RED anchor (Codex P2, this PR): with an outside-diff Critical
-        # as the ONLY blocker, the summary counted "0 …" of everything above a
-        # blocking score, and the sole printed remedy was "reply in-thread" —
-        # an impossible instruction, because this channel's findings have no
-        # comment thread to reply in.
+        """The impossible-remedy problem is DISSOLVED rather than reworded.
+
+        An earlier round had to explain that these findings have no comment
+        thread to reply in, because the block message told the operator to
+        reply in one. A channel that never blocks never prints that message.
+        """
         review = _review(_section(_entry("src/a.py", "1-2", "🔴 Critical", "Data loss")))
         block, msg = self._run(guard_module, monkeypatch, no_inline, [review])
-        assert block is True
-        assert "1 outside-diff Critical" in msg
-        assert "NO thread" in msg
-        assert "dismissal of the carrying review" in msg
+        assert (block, msg) == (False, "")
 
     def test_outside_diff_major_does_not_block_but_is_surfaced(
         self, guard_module, monkeypatch, no_inline, capsys
@@ -336,28 +347,31 @@ class TestGateBehaviour:
         assert "Not from CodeRabbit" not in err
         assert "outside-diff" not in err
 
-    def test_critical_on_a_doc_path_does_not_block(
+    def test_critical_on_a_doc_path_is_surfaced_like_any_other(
         self, guard_module, monkeypatch, no_inline, capsys
     ):
-        # Only the FLOOR consults the exclusions, and it reports through the
-        # SAME doc list the inline path uses so a reader sees one story.
+        """The doc-path and off-diff EXCLUSIONS are gone from this channel,
+        because both existed only to keep a FLOOR honest and there is no floor
+        here now. A doc-path Critical is surfaced under its own severity —
+        which is more information than the old doc-skipped lane gave, not
+        less."""
         review = _review(_section(_entry("CHANGELOG.md", "1-2", "🔴 Critical", "Prose")))
         block, _ = self._run(guard_module, monkeypatch, no_inline, [review])
         assert block is False
-        assert "doc CodeRabbit Critical/Major" in capsys.readouterr().err
+        assert "[outside-diff Critical] Prose" in capsys.readouterr().err
 
-    def test_critical_outside_the_diff_is_not_scored(
-        self, guard_module, monkeypatch, no_inline, capsys, offdiff_lock
+    def test_a_base_branch_finding_is_surfaced_without_diff_scoping(
+        self, guard_module, monkeypatch, no_inline, capsys
     ):
-        # #1728: a base-branch finding is not this PR's to answer. Off-diff
-        # routing is this test's SUBJECT, so it declares itself to the
-        # conftest lock (see `offdiff_lock`) — without the declaration the
-        # lock fails the test for silently discounting a finding.
-        offdiff_lock.expected()
+        """#1728's scoping was needed because a base-branch finding must not be
+        SCORED against this PR. Nothing in this channel is scored, so there is
+        nothing to scope — the finding is simply shown, and the reader decides.
+        The `offdiff_lock` opt-in this test used to need is gone with the lane
+        it declared."""
         review = _review(_section(_entry("src/not_in_diff.py", "1-2", "🔴 Critical", "Base")))
         block, _ = self._run(guard_module, monkeypatch, no_inline, [review])
         assert block is False
-        assert "off-diff" in capsys.readouterr().err
+        assert "[outside-diff Critical] Base" in capsys.readouterr().err
 
 
 class TestQuotedContent:
@@ -367,7 +381,7 @@ class TestQuotedContent:
 
     def test_a_fenced_summary_does_not_reassign_the_current_file(
         self, guard_module, monkeypatch, no_inline
-    ):
+    , capsys):
         # FAIL-OPEN, measured before the fence mask: the quoted <summary> below
         # reassigned `current_file`, so the REAL Critical two lines later was
         # emitted against docs/unrelated.md, routed to the doc-skipped lane, and
@@ -383,7 +397,10 @@ class TestQuotedContent:
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
             block, _msg = guard_module._check_inline_review_findings("100")
-        assert block is True, "a real Critical must not be misattributed onto a doc path"
+        assert block is False  # advisory channel
+        assert "[outside-diff Critical] Real critical (src/a.py:10-12)" in (
+            capsys.readouterr().err
+        ), "the finding must still be SURFACED against the right file"
 
     def test_a_backticked_tag_in_prose_does_not_move_depth(self, guard_module):
         # VERIFY-RED anchor (Codex P1, this PR): `str.count` saw the quoted
@@ -594,7 +611,7 @@ class TestStructuralAttribution:
 class TestShortfallFailsClosed:
     """A body declaring more findings than were parsed is an INCOMPLETE read."""
 
-    def test_a_balanced_fence_hiding_a_finding_blocks(self, guard_module, monkeypatch, no_inline):
+    def test_a_balanced_fence_hiding_a_finding_is_noted(self, guard_module, monkeypatch, no_inline, capsys):
         # The one suppression shape the fence mask cannot judge — a balanced
         # fence around a real finding is indistinguishable from legitimately
         # quoted content, so the mask correctly hides it and the COUNT is what
@@ -609,12 +626,14 @@ class TestShortfallFailsClosed:
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
             block, msg = guard_module._check_inline_review_findings("100")
-        assert block is True
-        assert "declares 2 finding(s), parsed 1" in msg
+        # NOTED, not blocked: an under-report can no longer pass a merge it should
+        # have stopped, because there is no merge decision to pass.
+        assert block is False
+        assert "declares 2 finding(s), parsed 1" in capsys.readouterr().err
 
-    def test_more_parsed_than_declared_blocks_as_unreadable(
+    def test_more_parsed_than_declared_is_noted(
         self, guard_module, monkeypatch, no_inline
-    ):
+    , capsys):
         # The OTHER direction of the reconciliation (Codex P2, this PR): a
         # surplus means prose was mis-read as a finding, and which entries are
         # the phantoms is unknowable from here — so the read blocks as
@@ -632,8 +651,8 @@ class TestShortfallFailsClosed:
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
             block, msg = guard_module._check_inline_review_findings("100")
-        assert block is True
-        assert "surplus entries indicate prose" in msg
+        assert block is False
+        assert "surplus entries indicate prose" in capsys.readouterr().err
 
 
 class TestSeverityMerge:
@@ -656,11 +675,15 @@ class TestSeverityMerge:
         ],
         ids=["downgraded", "upgraded", "severity-lost"],
     )
-    def test_a_critical_survives_being_restated(self, guard_module, monkeypatch, no_inline, order):
-        # Reviews arrive oldest-first, so last-write-wins made the VERDICT
-        # order-dependent: Critical-then-Minor stopped blocking while
-        # Minor-then-Critical blocked. Measured, all three cells.
-        assert self._run(guard_module, monkeypatch, no_inline, order) is True
+    def test_a_critical_survives_being_restated(self, guard_module, monkeypatch, no_inline, order, capsys):
+        # Reviews arrive oldest-first, so last-write-wins made the reported
+        # LEVEL order-dependent: a Critical restated later as Minor was shown
+        # as Minor. The channel no longer scores, so the property is now about
+        # what the operator is TOLD — which is the entire product of an
+        # advisory channel, and just as order-dependent if merged by
+        # assignment rather than by MAX.
+        self._run(guard_module, monkeypatch, no_inline, order)
+        assert "[outside-diff Critical] Same finding" in capsys.readouterr().err
 
     def test_the_channel_still_reports_the_highest_level_seen(
         self, guard_module, monkeypatch, no_inline, capsys
@@ -685,12 +708,11 @@ class TestDeclaredCountReconciliation:
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
             block, msg = guard_module._check_inline_review_findings("100")
-        # BLOCKS, not merely notes. A body that declares more than was parsed is
-        # an incomplete finding scan, and this gate treats an incomplete scan as
-        # "not clean, retry" everywhere else — degrading it to an advisory here
-        # would leave the detected under-parse fail-open.
-        assert block is True
-        assert "declares 3 finding(s), parsed 1" in msg
+        # An advisory NOTE now, and the reasoning that demanded a BLOCK no longer
+        # holds: an under-parse was fail-open only because this channel could
+        # stop a merge. It cannot, so there is nothing left open.
+        assert block is False
+        assert "declares 3 finding(s), parsed 1" in capsys.readouterr().err
 
     def test_no_shortfall_reports_nothing(self, guard_module, monkeypatch, no_inline, capsys):
         body = _section(_entry("src/a.py", "1-2", "🟠 Major", "Parsed"))
@@ -704,21 +726,16 @@ class TestFailDirection:
     """An unreadable second channel must block, exactly as the first one does —
     a scan that cannot be read is 'not clean, retry', never a silent pass."""
 
-    def test_unreadable_review_fetch_blocks(self, guard_module, monkeypatch, no_inline):
+    def test_unreadable_review_fetch_is_noted(self, guard_module, monkeypatch, no_inline, capsys):
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", "{not json")
         with no_inline:
             block, msg = guard_module._check_inline_review_findings("100")
-        assert block is True
-        assert "UNREADABLE" in msg
-        # Assert WHICH failure, not merely that it blocked. `reviews is None`
-        # always implies `complete is False`, so the incomplete-read check also
-        # blocks this input — a bare `assert block` passes with the unreadable
-        # branch deleted (mutation-measured: it survived). The message is the
-        # maintainer's only signal for which of the two happened, so it is the
-        # thing worth pinning.
-        assert "outside-diff findings" in msg, (
-            "must report the unreadable-fetch cause, not the incomplete-read one"
-        )
+        # A NOTE now: it cannot hide a blocking finding, because this channel has
+        # none — and keeping it fail-closed would let a third-party document's
+        # formatting hard-block a merge while contributing nothing.
+        assert block is False
+        assert "UNDER-REPORTING" in capsys.readouterr().err
+
 
     def test_report_survives_an_unreadable_review_fetch(self, guard_module, monkeypatch, capsys):
         """An unreadable second channel must not erase the FIRST channel's report.
@@ -795,7 +812,7 @@ class TestAuditResiduals:
 
     def test_a_surplus_critical_reports_the_surplus_not_the_finding(
         self, guard_module, monkeypatch, no_inline
-    ):
+    , capsys):
         # VERIFY-RED: without the quarantine `continue`, the suspect entries
         # still reached the score, the score branch returned FIRST, and the
         # message named the possibly-phantom Critical as a real finding while
@@ -812,10 +829,11 @@ class TestAuditResiduals:
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
             block, msg = guard_module._check_inline_review_findings("100")
-        assert block is True
-        assert "surplus entries indicate prose" in msg
-        assert "PhantomOrReal" not in msg, (
-            "a quarantined batch must not be named as a real finding"
+        assert block is False
+        err = capsys.readouterr().err
+        assert "surplus entries indicate prose" in err
+        assert "PhantomOrReal" not in err, (
+            "a quarantined batch must not be surfaced as a real finding"
         )
 
 
@@ -851,8 +869,10 @@ class TestRoundTwoFindings:
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
             block, msg = guard_module._check_inline_review_findings("100")
-        assert block is True, "an in-diff Critical must block, escaped path or not"
-        assert "off-diff" not in capsys.readouterr().err
+        assert block is False  # advisory channel
+        assert "[outside-diff Critical] Escaped path (src/a&b.py:1-2)" in (
+            capsys.readouterr().err
+        ), "the decoded path must reach the report, not an escaped spelling"
 
     @pytest.mark.parametrize(
         ("token", "shown"),
@@ -888,14 +908,19 @@ class TestBlockquotedFenceInversion:
     fires. Measured end-to-end: a floor-class Critical stopped blocking.
     """
 
-    def _run(self, guard_module, monkeypatch, no_inline, body):
+    def _surfaced(self, guard_module, monkeypatch, no_inline, capsys, body) -> str:
+        """Everything the guard reported for this body. The observable moved
+        from the VERDICT to the REPORT when the channel became advisory — the
+        parser property is unchanged, and so is what a mis-read costs: a
+        finding attributed to the wrong file, or lost entirely."""
         monkeypatch.setenv(
             "_TEST_GH_PR_FILES",
             json.dumps({"filename": "src/a.py", "previous_filename": None}),
         )
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
         with no_inline:
-            return guard_module._check_inline_review_findings("100")[0]
+            guard_module._check_inline_review_findings("100")
+        return capsys.readouterr().err
 
     # The trailing fence is load-bearing, not decoration: without it the
     # phantom fence never closes, the unclosed-construct recovery clears the
@@ -909,20 +934,22 @@ class TestBlockquotedFenceInversion:
         return f"```md\n{middle}\nX\n```\n\n{section}{self._TAIL}"
 
     def test_a_blockquoted_delimiter_does_not_close_a_document_level_fence(
-        self, guard_module, monkeypatch, no_inline
+        self, guard_module, monkeypatch, no_inline, capsys
     ):
         # VERIFY-RED: dropping `depth == fence_bq` from the close condition
-        # makes this return False while the control below stays True.
-        assert self._run(guard_module, monkeypatch, no_inline, self._body(True)) is True, (
-            "a Critical must still block when the body quotes a fence delimiter "
+        # loses the finding entirely here, while the control below keeps it.
+        err = self._surfaced(guard_module, monkeypatch, no_inline, capsys, self._body(True))
+        assert "[outside-diff Critical] Real critical" in err, (
+            "the finding must survive a body that quotes a fence delimiter "
             "inside a fenced block"
         )
 
-    def test_the_control_blocks_too(self, guard_module, monkeypatch, no_inline):
-        """The pair is the evidence: without a control that also blocks, a
-        green result cannot distinguish the fix from a fixture that never
-        exercised the mask at all."""
-        assert self._run(guard_module, monkeypatch, no_inline, self._body(False)) is True
+    def test_the_control_surfaces_it_too(self, guard_module, monkeypatch, no_inline, capsys):
+        """The pair is the evidence: without a control that also surfaces the
+        finding, a green result cannot distinguish the fix from a fixture that
+        never exercised the mask at all."""
+        err = self._surfaced(guard_module, monkeypatch, no_inline, capsys, self._body(False))
+        assert "[outside-diff Critical] Real critical" in err
 
     def test_a_quoted_delimiter_leaves_the_fence_open_in_the_mask(self, guard_module):
         """The same property one layer down, where it is directly observable:
@@ -956,7 +983,7 @@ class TestSectionDepthDrift:
     """
 
     def test_a_section_nested_one_level_deeper_is_reported_not_ignored(
-        self, guard_module, monkeypatch, no_inline
+        self, guard_module, monkeypatch, no_inline, capsys
     ):
         # VERIFY-RED: without the canary this returns block=False with an empty
         # message — the whole channel silently switched off by third-party
@@ -972,9 +999,9 @@ class TestSectionDepthDrift:
 
         monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(nested))
         with no_inline:
-            block, msg = guard_module._check_inline_review_findings("100")
-        assert block is True
-        assert "unexpected" in msg or "depth" in msg
+            block, _msg = guard_module._check_inline_review_findings("100")
+        assert block is False  # advisory: drift is REPORTED, never a block
+        assert "depth" in capsys.readouterr().err
 
     def test_a_section_at_the_expected_depth_reports_no_drift(self, guard_module):
         """The negative control. Without it, a canary that fired on every body

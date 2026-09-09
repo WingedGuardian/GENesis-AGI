@@ -2367,7 +2367,7 @@ def _check_inline_review_findings(
     # The floor (Critical) still binds, so the safety direction is kept while the
     # disposition mechanism is built. MEASURED across the live queue when this
     # shipped: 15 Major, 12 Minor, 0 Critical.
-    outside_block: list[tuple[str, str]] = []  # Critical — scores 1.0
+    outside_critical: list[tuple[str, str]] = []  # surfaced, NEVER scored
     outside_major: list[tuple[str, str]] = []  # Major — surfaced loudly, 0.0
     # (label, path, severity) — the severity is carried so the report can
     # name the level the reviewer gave rather than one bucket for all of them.
@@ -2480,15 +2480,7 @@ def _check_inline_review_findings(
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
-            # Only the floor consults the exclusions, because only the floor
-            # can block: an off-diff or doc-path Critical is reported through
-            # the SAME lists the inline path uses, so a reader sees one story.
-            if _off_diff(path):
-                cr_off_diff.append((title or "(untitled)", path))
-            elif _is_doc_path(path) and _doc_findings_mode() == "skip":
-                cr_doc_skipped.append(label)
-            else:
-                outside_block.append((label, path))
+            outside_critical.append((label, path))
         elif severity == "major":
             outside_major.append((label, path))
         else:
@@ -2499,24 +2491,22 @@ def _check_inline_review_findings(
             # operator deciding what to spend time on (Codex P3, PR #1847).
             outside_minor.append((label, path, severity))
 
-    if outside_block or outside_major or outside_minor:
-        blocking = len(outside_block)
+    if outside_critical or outside_major or outside_minor:
         # Count what this block ITEMISES, not every deduped finding: entries
-        # routed to the unknown-severity, off-diff or doc-path lanes are
-        # reported by those lanes' own NOTEs, so `len(outside_seen)` would
-        # claim a total larger than the list beneath it and read as findings
-        # gone missing.
-        itemised = blocking + len(outside_major) + len(outside_minor)
+        # routed to the unknown-severity lane are reported by that lane's own
+        # NOTE, so `len(outside_seen)` would claim a total larger than the list
+        # beneath it and read as findings gone missing.
+        itemised = len(outside_critical) + len(outside_major) + len(outside_minor)
         print(
-            f"{'WARNING' if outside_major or blocking else 'NOTE'}: PR #{pr_num} — "
-            f"{itemised} CodeRabbit finding(s) delivered in the REVIEW BODY "
-            f"because their anchor falls outside this PR's diff hunks. These are "
-            f"invisible to the inline endpoint. {blocking} Critical (scored), "
-            f"{len(outside_major)} Major and {len(outside_minor)} below-Major "
-            f"(surfaced, NOT scored — no comment thread exists to accept them in):",
+            f"NOTE: PR #{pr_num} — {itemised} CodeRabbit finding(s) delivered in "
+            f"the REVIEW BODY because their anchor falls outside this PR's diff "
+            f"hunks. These are invisible to the inline endpoint and are SURFACED, "
+            f"NEVER SCORED — read them and decide; this channel cannot block a "
+            f"merge. {len(outside_critical)} Critical, {len(outside_major)} Major, "
+            f"{len(outside_minor)} below-Major:",
             file=sys.stderr,
         )
-        for label, _p in outside_block[:5]:
+        for label, _p in outside_critical[:5]:
             print(f"  [outside-diff Critical] {label}", file=sys.stderr)
         for label, _p in outside_major[:8]:
             print(f"  [outside-diff Major] {label}", file=sys.stderr)
@@ -2603,15 +2593,19 @@ def _check_inline_review_findings(
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
     # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
-    # An outside-diff CRITICAL carries the same 1.0 as an inline Critical/Major:
-    # one score, one threshold (`_CR_BLOCKING_WEIGHT`'s stated policy). Majors
-    # from that channel are deliberately absent from this sum — see the severity
-    # policy where they are collected.
+    # The REVIEW-BODY channel contributes NOTHING to this sum, at any severity.
+    # It is surfaced and never scored — owner decision at the escalation cap,
+    # 2026-09-09. Every fail-open this parser produced across four review rounds
+    # was reachable only because a mis-read of a third-party rendered document
+    # could move a BLOCKING verdict; with no blocking verdict to move, the whole
+    # class is unreachable rather than patched. The measured cost is nil: 0
+    # Criticals in 27 findings across 23 PRs (2026-09-07, all 84 then-open
+    # non-draft PRs), so this path has never once fired on live data, while the
+    # surfacing keeps 100% of the value the channel was built for.
     score = (
         len(p1)
         + _INLINE_P2_SCORE_WEIGHT * len(p2)
         + _CR_BLOCKING_WEIGHT * len(cr_block)
-        + _CR_BLOCKING_WEIGHT * len(outside_block)
     )
     if cr_advisory:
         print(
@@ -2645,36 +2639,15 @@ def _check_inline_review_findings(
             [f"  [P1] {t}" for t in p1[:5]]
             + [f"  [P2] {t}" for t in p2[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
-            + [f"  [outside-diff Critical] {t}" for t, _p in outside_block[:5]]
-        )
-        # The remedy line names BOTH dispositions because the channels differ:
-        # inline findings have a comment thread a maintainer reply can clear;
-        # an outside-diff finding lives in a review BODY with no thread, so its
-        # only dispositions are fixing it, the reviewer dismissing the review,
-        # or the logged override. Telling an operator to "reply in-thread" to a
-        # threadless finding was an impossible instruction (Codex P2, #1847) —
-        # and the count line below must include outside_block for the same
-        # reason: a summary claiming zero findings above a blocking score reads
-        # as the gate malfunctioning.
-        remedy = (
-            "Fix and reply in-thread, or append '# review-override' to the "
-            "merge command to acknowledge and proceed."
-            if not outside_block
-            else (
-                "Fix the findings (inline ones can instead be answered by a "
-                "maintainer reply in-thread; outside-diff ones have NO thread — "
-                "their dispositions are a fix, a dismissal of the carrying "
-                "review, or the override), or append '# review-override' to "
-                "the merge command to acknowledge and proceed."
-            )
         )
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
             f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
             f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
             f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
-            f"Critical/Major + {len(outside_block)} outside-diff Critical "
-            f"finding(s), none maintainer-replied:\n{listing}\n{remedy}"
+            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
+            f"Fix and reply in-thread, or append '# review-override' "
+            f"to the merge command to acknowledge and proceed."
         )
     # No unresolved P1 among what we read. If the read is INCOMPLETE (a later page
     # failed), a P1 could exist on an unread page — fail per _scan_unreadable rather
@@ -2685,16 +2658,28 @@ def _check_inline_review_findings(
     # could carry the Critical this scan just reported not finding. Checked
     # after the score so a finding already READ still blocks with its own
     # message rather than being flattened into "unreadable".
-    if reviews_unreadable:
-        return _scan_unreadable("PR review bodies (outside-diff findings)")
-    if outside_shortfall:
-        return _scan_unreadable(
-            "every outside-diff finding CodeRabbit declared ("
-            + "; ".join(outside_shortfall)
-            + ")"
+    # THE REVIEW-BODY CHANNEL NO LONGER BLOCKS ON AN INCOMPLETE READ, and that
+    # is a consequence of the advisory decision rather than a separate one. Every
+    # fail-closed check here — unreadable fetch, declared-count shortfall, count
+    # surplus, section-depth drift — existed for ONE reason: this channel could
+    # move a blocking verdict, so a mis-read had to stop the merge instead of
+    # quietly passing it. With the verdict gone the premise is gone, and keeping
+    # them would mean a third-party document's formatting could still hard-block
+    # a merge while contributing nothing to the decision — the fail-CLOSED twin
+    # of the defect being removed, and one this parser has already produced once
+    # (a file legitimately named after the section header tripped the drift
+    # canary and blocked as unreadable, Codex P2, #1847).
+    # They stay as NOTES: an operator still learns the channel may be
+    # under-reporting, which is the whole value a canary had here.
+    if reviews_unreadable or not reviews_complete or outside_shortfall:
+        detail = "; ".join(outside_shortfall) if outside_shortfall else "the read did not complete"
+        print(
+            f"NOTE: PR #{pr_num} — the CodeRabbit review-body channel may be "
+            f"UNDER-REPORTING ({detail}). It is advisory and never scored, so "
+            f"this does not affect the verdict; read the review bodies directly "
+            f"if this PR's outside-diff findings matter to you.",
+            file=sys.stderr,
         )
-    if not reviews_complete:
-        return _scan_unreadable("PR review bodies (incomplete read)")
     return False, ""
 
 
