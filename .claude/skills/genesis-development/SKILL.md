@@ -107,6 +107,32 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
+**A check keyed on EXISTENCE can only confirm — it can never disconfirm.**
+Before trusting a verification, ask what it would do if the thing were absent,
+stale, or the wrong object. If the answer is "pass", it proved nothing. Three
+shapes of this, all measured in one session 2026-09-08:
+
+- **Waiting for a NEW artifact by testing that one exists.** A poll for "a
+  scheduled-review marker is present" passed instantly against a marker from six
+  days earlier. Key the wait on the artifact's IDENTITY — the head SHA it names —
+  not on its presence.
+- **Matching the first row instead of the right one.** "Is main green?" matched
+  the first `push` run for that SHA, which was the CodeQL workflow (success),
+  while the CI workflow for the same SHA had failed. Filter by the thing you
+  actually mean (`--workflow ci.yml`), and prefer reading the JOB you care about
+  over an aggregate conclusion.
+- **Counting from a listing sorted by the wrong key.** `gh pr list --state
+  merged --limit 40` sorts by CREATION, so PRs created earlier and merged today
+  fall outside the window and vanish; the count read low and looked plausible.
+  Use a query whose filter IS the property you are counting (`gh search prs
+  --merged-at`), per CLAUDE.md's truncated-listing rule.
+
+The failure is silent and self-confirming in all three: an under-read is
+indistinguishable from a clean result, so nothing prompts a second look. The
+tell is that the check passed FASTER or more easily than the work should have
+allowed — a poll that succeeds on the first attempt for something that takes
+40 seconds to produce has not observed that thing.
+
 **Verify in the REAL runtime context, not a shell proxy.** "Works when I
 run it" is not "works where it runs." Same code + same uid ≠ same context:
 a long-running systemd service (genesis-server, guardian) differs from your
@@ -2325,6 +2351,60 @@ The review-findings gate specifically:
    `ci: incomplete` and blocks (see the CI-gate bullet above) — the trap text
    stays because the DIAGNOSIS (check `mergeable` first) is still the fastest
    route to the cause.
+
+   Three corollaries, each measured 2026-09-08 and each costing a wrong diagnosis:
+
+   - **`UNKNOWN` suppresses it too, not just `CONFLICTING`.** GitHub recomputes
+     mergeability lazily, and EVERY merge to main invalidates it repo-wide — so
+     right after a merge batch the whole queue reads `UNKNOWN` and its CI looks
+     missing. That is also why a merge gate refuses with "mergeable status is
+     'UNKNOWN'": wait and re-read rather than concluding anything.
+   - **A PR opened against a NON-DEFAULT base never ran CI at all**, because
+     `ci.yml` filters `on: pull_request: branches: [main]` — the filter is on the
+     BASE. Retargeting it to main afterwards fires nothing: the default
+     `pull_request` types are opened/synchronize/reopened, and a base change is
+     none of them. This one does NOT self-heal and nothing will ever fire for it
+     again on its own; it needs a push. Stacked PRs land here by construction.
+   - **`workflow_dispatch` is not a workaround.** `gh workflow run ci.yml --ref
+     <branch>` runs to completion and never appears in the PR's
+     `statusCheckRollup`, so it cannot satisfy a gate that reads the rollup.
+
+9. **`gh run rerun` CANNOT clear a failure caused by a broken base.** It replays
+   the ORIGINAL merge commit rather than recomputing one against current main,
+   so re-running a PR whose base was broken faithfully reproduces the breakage.
+   MEASURED: a re-run started 15 minutes AFTER the fix merged still failed, and
+   `git merge-base --is-ancestor <fix-sha> refs/pull/<N>/merge` returned false —
+   the pull request's merge ref did not contain the fix. Only a push or
+   `gh pr update-branch <N>` recomputes it. Two consequences: do not "just
+   re-run" someone's stale red, and do not tell them it will clear — it will
+   not, and their next push clears it for free anyway.
+
+10. **`gh run view --log-failed` truncates and shows only PASSED lines.** On a
+    large suite it cuts around 44%, so a FAILING job reads as a clean log with
+    no failure in it — the most misleading possible output, because it looks
+    like an answer. It reported nothing useful on three separate attempts in one
+    session. To find what actually failed, reproduce locally against a clean
+    `origin/main` checkout (which is what identified it, twice), or fetch the
+    raw job log rather than the CLI's rendering.
+
+11. **Two individually-GREEN PRs can break main, and nothing warns you.** PR A
+    adds a repo-wide invariant test (one that ENUMERATES modules or consumers and
+    asserts a property); PR B adds a violation of it. Each is green against a
+    main that lacks the other, neither diff touches the other's files, so there
+    is no textual conflict, no reviewer signal, and both merge clean — then main
+    goes red, and because PR CI builds the merge commit it fails EVERY open PR on
+    a test unrelated to their changes. MEASURED 2026-09-08: a chokepoint test
+    requiring every consumer of the shared shell parser to use the checked entry
+    point, and a guard importing the unchecked one, merged an hour apart.
+    This is NOT the structural collision described under the architecture-session
+    rule — that one is main superseding a mechanism the PR uses, and it is
+    visible from the PR's own files. Here neither PR can see the other.
+    The detectable signature is a new ENUMERATING invariant test landing while
+    other PRs are in flight: when you merge one, re-run it against the other open
+    PRs' merge commits before merging them, not just against its own branch.
+    Sequencing follows from the same fact — batch merges rather than interleaving
+    them with active pushes, because each merge invalidates every other PR's
+    mergeability and manufactures the false "CI never ran" signal above.
 
 ## Reference Router
 
