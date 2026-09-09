@@ -1501,6 +1501,54 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   then at the third (escalation cap, `# escalation-ack`). Both call `_deny`, so
   the first stop arrives one round earlier than "the cap" suggests — see the
   two-tier table below. Switch to enumeration BEFORE the gate has to say so.
+- **Interrogate every MECHANISM you introduce along six axes BEFORE the first
+  review — original code and fixes alike.** The two bullets above enumerate the
+  class of a DEFECT, reactively, once a reviewer names one. This one is about the
+  extent of a MECHANISM — a deadline, a lock, a cache, a guard, a token — which is
+  correct on the path that motivated it and undefined everywhere else.
+  MEASURED 2026-09-09 on 31 inline review findings from two PRs, each attributed
+  by `git blame` at the SHA the reviewer was looking at, and classified as
+  "original" or "post-review" by whether the blamed commit predates that PR's
+  first review. Over all rounds, 21 of 31 (68%) blame to the original
+  implementation. But round 1 CANNOT blame to a fix commit — none exists yet — so
+  that figure is partly forced arithmetic. In the rounds that actually loop it is
+  close to even: **of the 21 findings from rounds 2+, 11 were already in the
+  original code and 10 were in code written to answer an earlier round.** Both
+  halves are worth the same attention; neither dominates.
+  Deduplicating re-posts and cross-reviewer duplicates and dropping one finding
+  later refuted by measurement leaves 25 distinct findings, and **24 of those 25
+  fall into six shapes.** These are the checklist:
+  1. **SIGNAL** (8, the largest) — does the thing you read change exactly when
+     the property you assert changes? A whole-database counter read as "did this
+     table change"; an mtime read as "did content change"; empty read as
+     "unbuilt"; a proxy's identity read as "same connection"; two autocommit
+     reads used as one snapshot.
+  2. **SCOPE and LIFETIME** (5) — a deadline per query when the operation is a
+     traversal; a lock per process when the race is cross-process; a lease that
+     expires mid-work; a hang moved from the operation to interpreter teardown.
+  3. **INPUT DOMAIN** (5) — the values the type permits, not the ones you
+     pictured: non-boolean, empty string, malformed timestamp, sub-second
+     precision, unescaped path.
+  4. **EQUIVALENCE** (3) — what does it claim to match, and has anything checked?
+  5. **FAILURE PATH** (2) — what is left behind when the work aborts.
+  6. **CALLER CONTRACT** (1) — does an explicit option the caller passed survive?
+  (The 25th was a test whose identity comparison was unsound in both directions.)
+  A finding is a POINT, so a fix that treats the finding as its spec inherits
+  that point as its only test — which is why the fix half of that near-even split
+  exists at all, and why the six axes are worth running over a fix and not only
+  over a feature.
+  METHOD NOTE, because getting this wrong inverted an earlier version of this
+  measurement: to attribute a finding to a commit, blame the line at the SHA the
+  reviewer was looking at. `original_commit_id` is the PR HEAD when the review was
+  posted, not the introducing commit — one commit here touched only changelog
+  files yet carries three findings on a Python file.
+  FALSIFIABLE, with a denominator: #1850 pushed four commits after its first
+  review round, and deduplicated they carried 5 findings between them — 1.25 per
+  post-review commit. If the next three PRs whose mechanisms are interrogated on
+  these six axes before pushing still average above one deduplicated finding per
+  post-review commit, the axes are not the right ones. Re-derive rather than
+  adding a seventh.
+
 - **Run the pre-push adversarial pass with `/deep-review`** (`.claude/commands/deep-review.md`):
   one command that dispatches a fresh-context `genesis-architect` (+ `genesis-security-reviewer`
   on security surfaces) over the FULL branch diff with the right SHAPE — fail-open/state/TOCTOU/
