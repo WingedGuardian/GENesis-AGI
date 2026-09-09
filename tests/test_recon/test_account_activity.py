@@ -1298,6 +1298,680 @@ async def test_a_null_thread_object_does_not_prove_absence(db, monkeypatch):
     assert items[0]["actor"] == "" and items[0]["ping"] is False
 
 
+# ── the negative is only as good as the inputs ───────────────────────────────
+#
+# Dropping asserts that NOBODY acted. Every input that cannot be interpreted is a
+# way for that assertion to be wrong, so ignorance must never look like absence.
+
+
+async def test_a_bumped_thread_does_not_attribute_to_its_author(db, monkeypatch):
+    """THE REGRESSION THIS WHOLE CHANGE EXISTS TO PREVENT, in its subtlest form.
+
+    An old pull request opened by an outsider; this window only the owner acts.
+    The thread's `updated_at` moves because ANYBODY touched it, so scoring the
+    thread row by `updated_at` puts it in-window while its author field still
+    names the outsider — pinging the owner about the outsider for the owner's own
+    activity. The thread row testifies to its CREATION only."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{_PULL}/comments": [_rc("me", "2026-08-06T04:00:00Z")]},
+            threads={
+                _PULL: {
+                    "user": {"login": "outsider"},
+                    "created_at": "2026-07-01T00:00:00Z",  # opened long ago
+                    "updated_at": "2026-08-06T04:00:00Z",  # bumped by the owner just now
+                }
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []  # the owner's own activity, not the outsider's
+
+
+async def test_an_unattributable_lone_actor_is_not_absence(db, monkeypatch):
+    """A deleted account leaves every login field null. If that is the ONLY
+    external in-window action, something happened and we do not know who — which
+    is the opposite of evidence that nobody did."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{_PULL}/comments": [
+                    {"user": None, "created_at": "2026-08-06T02:00:00Z"},
+                    _rc("me", "2026-08-06T03:00:00Z"),
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_ordering_uses_the_in_window_timestamp_not_the_row_maximum(db, monkeypatch):
+    """A comment created in-window but edited AFTER it stays in-window on its
+    creation time — and must be ordered by that, not by the later edit, or it
+    outranks someone who genuinely acted later inside the window."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{_PULL}/comments": [
+                    {
+                        "user": {"login": "edited-early"},
+                        "created_at": "2026-08-06T01:00:00Z",  # in-window
+                        "updated_at": "2026-08-06T04:45:00Z",  # edited after `until`
+                    },
+                    _rc("acted-later", "2026-08-06T03:00:00Z"),  # genuinely latest in-window
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "acted-later"
+
+
+async def test_unreadable_surface_payload_is_not_an_empty_surface(db, monkeypatch):
+    """`gh` can exit zero and emit a body that is not an array of rows. Reading
+    that as an empty page makes an un-enumerated surface look like a surface with
+    nothing on it — and the item is then dropped on that false reading."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    inner = _fake_notif_gh(
+        pages,
+        surfaces={f"{_PULL}/comments": [_rc("me", "2026-08-06T02:00:00Z")]},
+        threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+    )
+
+    async def garbage_on_one_surface(*args, **kwargs):
+        if "/reviews?" in args[2]:
+            return True, '{"message": "Not Found"}'  # exit zero, not an array
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", garbage_on_one_surface)
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_a_tie_across_the_cap_still_advances_the_cursor(db, monkeypatch):
+    """`since` is exclusive and these timestamps are second-precision, so if every
+    processed item ties the first deferred one there is nowhere to advance to: the
+    cursor holds, the same slice is re-selected every tick, dedup hides it, and the
+    later tied items are never processed at all. The whole tie group is taken."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    tied = "2026-08-06T02:00:00Z"
+    pages = [[_notif(reason="mention", tid=f"n{i}", updated=tied) for i in range(4)]]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
+    assert adv != _SINCE, "cursor held at `since` — the lane cannot make progress"
+    assert len(items) == 4, "the tie group was split, stranding the deferred twins"
+
+
+# ── unrecognised input is uncertainty, never absence ─────────────────────────
+
+
+async def test_a_mentioned_timeline_row_is_not_somebody_acting(db, monkeypatch):
+    """MEASURED on a live timeline: when one person writes an @-mention, GitHub
+    emits a `mentioned` row per RECIPIENT one second later, each carrying the
+    recipient in `.actor`. Reading those as actors means the owner mentioning a
+    third party pings that third party about the owner's own comment — this
+    branch's own defect, re-entering through the timeline surface."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    issue_of_pull = _PULL.replace("/pulls/", "/issues/")
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{issue_of_pull}/timeline": [
+                    {
+                        "event": "commented",
+                        "actor": {"login": "me"},
+                        "created_at": "2026-08-06T02:00:00Z",
+                    },
+                    {
+                        "event": "mentioned",
+                        "actor": {"login": "alice"},
+                        "created_at": "2026-08-06T02:00:01Z",
+                    },
+                    {
+                        "event": "subscribed",
+                        "actor": {"login": "alice"},
+                        "created_at": "2026-08-06T02:00:01Z",
+                    },
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []  # the owner commented; alice did nothing
+
+
+async def test_an_unmodelled_timeline_event_is_uncertainty(db, monkeypatch):
+    """A timeline event type in neither the doer set nor the recipient set is a
+    shape we have not modelled. Every payload this code has been wrong about was
+    wrong by reading an unrecognised row as one that did not happen."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    issue_of_pull = _PULL.replace("/pulls/", "/issues/")
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{issue_of_pull}/timeline": [
+                    {
+                        "event": "some_future_event",
+                        "actor": {"login": "somebody"},
+                        "created_at": "2026-08-06T02:00:00Z",
+                    }
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_a_commit_message_mention_is_not_dropped(db, monkeypatch):
+    """A commit payload carries NO top-level created_at/updated_at/submitted_at —
+    VERIFIED live; its date is at commit.author.date. Without recovering it the
+    row can never enter the window, and an @-mention written in a commit MESSAGE
+    is dropped as though nobody acted. The fixture models the REAL shape."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    commit = "https://api.github.com/repos/me/myrepo/commits/abc123"
+    pages = [
+        [_notif(reason="mention", repo="me/myrepo", tid="c", subject_url=commit, stype="Commit")]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{commit}/comments": []},
+            threads={
+                commit: {  # exactly the live shape: no top-level timestamps
+                    "user": None,
+                    "author": {"login": "outsider"},
+                    "commit": {"author": {"date": "2026-08-06T02:00:00Z"}},
+                }
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "outsider" and items[0]["ping"] is True
+
+
+async def test_a_row_with_no_readable_timestamp_is_uncertainty(db, monkeypatch):
+    """A row we cannot place in time is invisible to the window filter — it can
+    neither prove nor disprove that somebody acted, so it must not pass silently
+    into a drop."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{_PULL}/comments": [
+                    {"user": {"login": "outsider"}},  # no timestamp at all
+                    _rc("me", "2026-08-06T02:00:00Z"),
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_a_garbled_surface_payload_is_not_an_empty_surface(db, monkeypatch):
+    """Mutation survivor M08. The non-list branch was covered; the JSON DECODE
+    branch was not. `gh` exiting zero with truncated output must not read as a
+    surface that was successfully enumerated and found empty."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    inner = _fake_notif_gh(
+        pages,
+        surfaces={f"{_PULL}/comments": [_rc("me", "2026-08-06T02:00:00Z")]},
+        threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+    )
+
+    async def garbled(*args, **kwargs):
+        if "/reviews?" in args[2]:
+            return True, '{"incomplete json'  # exits zero, does not parse
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", garbled)
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_a_deferred_twin_on_the_boundary_second_is_not_stranded(db, monkeypatch):
+    """Mutation survivor M24. `since` is EXCLUSIVE, so the cursor must advance to
+    the OLDEST deferred timestamp, not the newest: advancing past a deferred
+    item's second strands it permanently."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", tid="a", updated="2026-08-06T01:00:00Z"),
+            _notif(reason="mention", tid="b", updated="2026-08-06T02:00:00Z"),
+            _notif(reason="mention", tid="c", updated="2026-08-06T02:00:00Z"),
+            _notif(reason="mention", tid="d", updated="2026-08-06T03:00:00Z"),
+        ]
+    ]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, _ = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
+    assert adv == "2026-08-06T01:00:00Z", "advanced past a deferred item, stranding it"
+
+
+async def test_ordering_takes_the_newest_in_window_stamp_not_the_oldest(db, monkeypatch):
+    """Mutation survivor M03. Among the timestamps that DO fall inside the window,
+    the newest is the one that orders the row."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{_PULL}/comments": [
+                    # created early, edited later — both inside the window
+                    {
+                        "user": {"login": "edited-late"},
+                        "created_at": "2026-08-06T01:00:00Z",
+                        "updated_at": "2026-08-06T04:00:00Z",
+                    },
+                    _rc("acted-midway", "2026-08-06T02:00:00Z"),
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "edited-late"
+
+
+async def test_issue_subjects_read_their_timeline_too(db, monkeypatch):
+    """Mutation survivor M28. Only the PullRequest timeline was pinned. An issue
+    closed or assigned by an external maintainer, with no comment, is invisible
+    without the Issue branch reading it as well."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    issue = "https://api.github.com/repos/me/myrepo/issues/5"
+    pages = [
+        [_notif(reason="mention", repo="me/myrepo", tid="i", subject_url=issue, stype="Issue")]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{issue}/comments": [],
+                f"{issue}/timeline": [
+                    {
+                        "event": "closed",
+                        "actor": {"login": "maintainer"},
+                        "created_at": "2026-08-06T02:00:00Z",
+                    }
+                ],
+            },
+            threads={issue: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "maintainer" and items[0]["ping"] is True
+
+
+async def test_owner_match_is_case_insensitive(db, monkeypatch):
+    """Mutation survivor M29. The guard that prevents self-pings must not depend
+    on both sides being spelled identically."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{_PULL}/comments": [_rc("ME", "2026-08-06T02:00:00Z")]},
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []  # "ME" is the owner
+
+
+async def test_an_oversized_tie_advances_loudly_rather_than_stalling(db, monkeypatch):
+    """The tie extension exists so the cursor can move, not so one tick can
+    process an unbounded batch. Past the hard cap it advances past the tied
+    second and says what it skipped."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    tied = "2026-08-06T02:00:00Z"
+    pages = [[_notif(reason="mention", tid=f"n{i}", updated=tied) for i in range(12)]]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
+    assert len(items) == 8, "the hard cap (max_events * 4) was not applied"
+    assert adv == tied, "did not advance past the tied second; the lane would stall"
+
+
+# ── window edges, and shapes the fake could not previously emit ──────────────
+
+
+async def test_a_committed_row_is_understood_not_unknown(db, monkeypatch):
+    """MEASURED live: a `committed` timeline row has no `.actor`, no
+    `.created_at`, and an `author` of {name, email, date} with no login. Every
+    real pull request on this install carries 2-16 of them. Treating that
+    understood-but-identity-free shape as UNKNOWN made every pull request
+    permanently uncertain and the self/bot-only drop unreachable — the fix was
+    inert on precisely the notifications it was built for."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    issue_of_pull = _PULL.replace("/pulls/", "/issues/")
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{issue_of_pull}/timeline": [
+                    {
+                        "event": "commented",
+                        "actor": {"login": "me"},
+                        "created_at": "2026-08-06T02:00:00Z",
+                    },
+                    {  # the real shape — no actor, no created_at
+                        "event": "committed",
+                        "author": {
+                            "name": "Someone",
+                            "email": "s@example.invalid",
+                            "date": "2026-08-06T02:30:00Z",
+                        },
+                    },
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == [], "a committed row made the window uncertain instead of dropping"
+
+
+async def test_an_unreadable_thread_object_is_not_a_drop(db, monkeypatch):
+    """Mutation survivors M59/M60, and the sharpest pair the battery found: they
+    invert the lane's central rule. If the thread object cannot be fetched, we do
+    not know who opened the thread, so we cannot claim nobody acted."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    inner = _fake_notif_gh(pages, surfaces={f"{_PULL}/comments": []})
+
+    async def thread_fetch_fails(*args, **kwargs):
+        if args[2] == _PULL:  # the bare subject url
+            return False, ""
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", thread_fetch_fails)
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv == _WM  # still never holds the cursor
+    assert len(items) == 1
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_an_action_exactly_at_the_window_open_is_excluded(db, monkeypatch):
+    """`since` is EXCLUSIVE — it is the previous tick's watermark, and that tick
+    already reported anything stamped on it. Including it double-reports."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{_PULL}/comments": [_rc("outsider", _SINCE)]},  # exactly at `since`
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []
+
+
+async def test_an_action_exactly_at_the_window_close_is_included(db, monkeypatch):
+    """`until` is INCLUSIVE — it is the notification's own `updated_at`, so the
+    action that produced the notification sits exactly on it. Excluding it drops
+    the very event being reported."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    updated = "2026-08-06T04:30:00Z"  # the _notif default
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{_PULL}/comments": [_rc("outsider", updated)]},  # exactly at `until`
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "outsider"
+
+
+async def test_notification_exactly_at_the_cursor_is_excluded_and_at_the_watermark_kept(
+    db, monkeypatch
+):
+    """The candidate filter's own edges: `since < updated <= wm`. One stamped at
+    the cursor was covered by the previous tick; one stamped at the watermark is
+    this tick's newest and must not be deferred forever.
+
+    The cursor-edge half needs an INCOMPLETE read to be observable: with a clean
+    read, a notification stamped at `since` has an empty window and drops anyway,
+    so admitting it looks identical. Failing its surfaces makes the difference
+    visible as a spurious digest row about something the last tick already
+    handled — which is exactly the cost of getting this boundary wrong."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", tid="at_since", updated=_SINCE),
+            _notif(reason="mention", tid="at_wm", updated=_WM),
+        ]
+    ]
+    inner = _fake_notif_gh(pages)
+
+    async def surfaces_fail(*args, **kwargs):
+        if "?per_page=100" in args[2]:
+            return False, ""  # every surface unreadable -> uncertain -> digest row
+        return await inner(*args, **kwargs)
+
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", surfaces_fail)
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert {i["thread_id"] for i in items} == {"at_wm"}
+
+
+async def test_exactly_max_events_candidates_is_not_truncation(db, monkeypatch):
+    """`truncated` must be a strict `>`: at exactly the cap there is no deferred
+    item, and reading `candidates[max_events]` would index off the end."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", tid="n1", updated="2026-08-06T01:00:00Z"),
+            _notif(reason="mention", tid="n2", updated="2026-08-06T02:00:00Z"),
+        ]
+    ]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
+    assert len(items) == 2
+    assert adv == _WM  # a clean sweep, not a truncation
+
+
+async def test_owned_repo_filter_is_case_insensitive(db, monkeypatch):
+    """Mutation survivor M69. The `author`-on-own-repo filter is a SECOND owner
+    comparison, distinct from the actor one, and a case difference there pings the
+    owner about their own thread — the reported defect through a spelling."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [[_notif(reason="author", repo="ME/myrepo", tid="own")]]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []
+
+
+async def test_a_review_row_is_readable_via_submitted_at(db, monkeypatch):
+    """MEASURED live: a review carries `user` + `submitted_at` and NO
+    `created_at`. The fake had never emitted that shape, so nothing exercised it."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="mention", repo="me/myrepo", tid="pr", subject_url=_PULL, stype="PullRequest"
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={
+                f"{_PULL}/reviews": [
+                    {"user": {"login": "reviewer"}, "submitted_at": "2026-08-06T02:00:00Z"}
+                ]
+            },
+            threads={_PULL: _rc("me", "2026-07-01T00:00:00Z")},
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "reviewer" and items[0]["ping"] is True
+
+
+async def test_parse_paged_checked_separates_empty_from_unreadable():
+    """An empty body is a legitimately empty read; anything unparseable is not.
+    The `_parse_paged` wrapper discards the flag, so this is asserted directly."""
+    from genesis.recon.account_activity import _parse_paged_checked
+
+    assert _parse_paged_checked("") == ([], True)
+    assert _parse_paged_checked("[]") == ([], True)
+    assert _parse_paged_checked("{not json") == ([], False)
+    assert _parse_paged_checked('{"message": "Not Found"}') == ([], False)
+    # a slurped page list, with a non-dict row filtered out rather than kept
+    assert _parse_paged_checked('[[1, {"a": 2}]]') == ([{"a": 2}], True)
+
+
 async def test_comment_surfaces_are_paginated(db, monkeypatch):
     """These endpoints return OLDEST first and the conversation surface ignores
     `direction`, so a single-page read of a busy thread silently returns the

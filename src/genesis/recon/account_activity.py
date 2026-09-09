@@ -879,6 +879,47 @@ class AccountActivityMonitor:
                 max_events,
             )
         work = candidates[:max_events]
+        over_cap_tie = False
+        if truncated:
+            # Extend through the WHOLE tie group at the boundary. `since` is
+            # exclusive and these timestamps are second-precision, so a cursor can
+            # only advance to a value strictly below the first deferred item; if
+            # every processed item ties that value there is nowhere to advance to,
+            # the cursor holds, and the same slice is re-selected every tick while
+            # dedup hides the repetition — the later tied items never processed at
+            # all. Taking the whole tie group costs a bounded overrun (one second
+            # of notifications) and guarantees forward progress. Reachable in
+            # practice because this lane's cap is deliberately small.
+            boundary_ts = candidates[max_events]["updated"]
+            if all(c["updated"] == boundary_ts for c in work):
+                tie = [c for c in candidates if c["updated"] <= boundary_ts]
+                # Bounded: the extension exists to let the cursor move, not to
+                # let one tick process an unbounded batch. Past the hard cap the
+                # cursor advances PAST the tied second anyway and the remainder
+                # is skipped LOUDLY — a declared loss beats a silent stall, and
+                # beats a tick that outruns its own cadence.
+                hard_cap = max_events * 4
+                if len(tie) > hard_cap:
+                    logger.error(
+                        "github steward: %d notifications tie at %s (hard cap %d) — "
+                        "processing %d and ADVANCING PAST that second; %d tied "
+                        "notifications are skipped and will not be retried",
+                        len(tie),
+                        boundary_ts,
+                        hard_cap,
+                        hard_cap,
+                        len(tie) - hard_cap,
+                    )
+                    tie = tie[:hard_cap]
+                    over_cap_tie = True
+                else:
+                    logger.warning(
+                        "github steward: %d notifications tie at %s across the cap — "
+                        "processing the whole tie group so the cursor can advance",
+                        len(tie),
+                        boundary_ts,
+                    )
+                work = tie
 
         # Per-item failures NEVER hold the account-level cursor (one bad item — a
         # deleted comment, a discussion, a malformed payload — must not freeze the
@@ -922,7 +963,20 @@ class AccountActivityMonitor:
         # re-poll next tick.
         if not truncated:
             return wm, items
-        boundary = candidates[max_events]["updated"]
+        # `work` may have been extended through the boundary tie above, so derive
+        # the deferred boundary from what was actually processed rather than from
+        # the cap index.
+        if over_cap_tie:
+            # The tie was cut short, so nothing before or at that second will be
+            # retried. Advance to it rather than holding: holding re-selects the
+            # same slice forever, which is the stall this block exists to avoid.
+            return work[-1]["updated"], items
+        deferred = [c["updated"] for c in candidates if c not in work]
+        if not deferred:
+            return wm, items  # the extension consumed everything after all
+        # min, not max: `since` is exclusive, so advancing past a deferred item's
+        # timestamp strands it permanently.
+        boundary = min(deferred)
         safe = [c["updated"] for c in work if c["updated"] < boundary]
         return (safe[-1] if safe else since), items
 
@@ -959,17 +1013,32 @@ class AccountActivityMonitor:
         Capped at ``until`` so an edit landing after this notification cannot
         retroactively change what the notification was about.
         """
-        rows, complete = await self._thread_comments(subject)
-        # Scan BEFORE consulting `complete`: completeness is required only for the
-        # NEGATIVE conclusion. Evidence already in hand still proves someone acted,
-        # and returning early would let one flaky call out of five suppress a real
-        # contributor's ping.
-        in_window = [r for r in rows if _in_window(r, since, until)]
-        # Newest first: report the most recent human, not the first one found.
-        in_window.sort(key=_event_time, reverse=True)
-        for row in in_window:
-            login = _row_actor(row)
-            if not login or login.lower() == owner.lower():
+        rows, certain = await self._thread_comments(subject)
+        # Scan BEFORE consulting `certain`: certainty is required only for the
+        # NEGATIVE conclusion. Evidence already in hand still proves someone
+        # acted, and returning early would let one flaky call out of five
+        # suppress a real contributor's ping.
+        # A row we cannot place in time is INVISIBLE to the filter below — it can
+        # neither prove nor disprove that somebody acted. Silently vanishing is
+        # how a commit-message mention got dropped, so an unreadable timestamp
+        # becomes uncertainty here rather than an absence downstream.
+        if any(not _has_readable_time(r) and not _is_understood_shape(r) for r in rows):
+            certain = False
+
+        in_window = [(t, r) for r in rows if (t := _in_window_time(r, since, until))]
+        # Newest first, by the timestamp that actually falls inside the window.
+        in_window.sort(key=lambda pair: pair[0], reverse=True)
+        for _, row in in_window:
+            login, understood = _row_actor(row)
+            if not understood:
+                # A shape we have not modelled. Every payload this code has been
+                # wrong about was wrong by reading an unrecognised row as one that
+                # did not happen; unrecognised now means we do not know.
+                certain = False
+                continue
+            if not login:
+                continue  # positively known to testify to nobody acting
+            if login.lower() == owner.lower():
                 continue
             auto = await self._is_automation(login, denylist)
             if auto is True:
@@ -978,9 +1047,12 @@ class AccountActivityMonitor:
             # drop: a classification blip must never silence a contributor.
             logger.debug("github steward: window actor %s (automation=%s)", login, auto)
             return login, True
-        # Nothing found. Claim ABSENCE only if the read was whole.
-        logger.debug("github steward: no external actor in window (complete=%s)", complete)
-        return None, complete
+        # Nothing found. Claiming ABSENCE means asserting a negative, so it is
+        # allowed only when EVERY input was interpretable: every surface read,
+        # every payload parsed, every in-window row attributed. Anything else is
+        # ignorance, and ignorance keeps the digest row.
+        logger.debug("github steward: no external actor in window (certain=%s)", certain)
+        return None, certain
 
     async def _thread_comments(self, subject: dict) -> tuple[list[dict], bool]:
         """Every comment on a notification's thread, and whether the read is WHOLE.
@@ -1036,7 +1108,13 @@ class AccountActivityMonitor:
             if not ok:
                 complete = False  # never holds the cursor; only withholds a verdict
                 continue
-            rows.extend(_parse_paged(out))
+            page_rows, parsed = _parse_paged_checked(out)
+            if not parsed:
+                # Exit zero with an unreadable body. An empty list here would be
+                # indistinguishable from a surface that genuinely had nothing.
+                logger.warning("github steward: unreadable payload from %s", url)
+                complete = False
+            rows.extend(page_rows)
 
         # The thread itself — its author acted when they opened it.
         ok, out = await run_gh_checked("gh", "api", subject_url, timeout=_GH_TIMEOUT)
@@ -1049,12 +1127,20 @@ class AccountActivityMonitor:
                 "github steward: thread object unreadable for %s", subject_url, exc_info=True
             )
             return rows, False
+        if isinstance(thread, dict) and stype == "Commit" and not _has_readable_time(thread):
+            # A commit object carries no top-level created_at/updated_at — its
+            # date is at commit.author.date (VERIFIED live). Without this the row
+            # can never enter the window, and an @-mention in a commit MESSAGE is
+            # dropped as though nobody acted.
+            committed = ((thread.get("commit") or {}).get("author") or {}).get("date")
+            if isinstance(committed, str) and committed:
+                thread = {**thread, "created_at": committed}
         if not isinstance(thread, dict):
             # `null` parses fine and is not a dict. Without the author row we
             # cannot claim nobody acted, so this is incomplete, not empty.
             logger.warning("github steward: thread object was not an object: %s", subject_url)
             return rows, False
-        rows.append(thread)
+        rows.append({**thread, _THREAD_ROW_FLAG: True})
         return rows, complete
 
     async def _record_notification(self, item: dict, mode: str) -> bool:
@@ -1160,63 +1246,210 @@ def _parse_json_list(out: str) -> list[dict]:
 
 
 def _parse_paged(out: str) -> list[dict]:
-    """Flatten a ``gh api --paginate --slurp`` payload — an outer array whose
-    elements are each page's array — into a flat list of rows. A plain (single,
-    non-slurped) array is returned as-is, so this is safe on both shapes."""
+    """Flatten a ``gh api --paginate --slurp`` payload into a flat list of rows.
+
+    Kept for callers that only want the rows. Where the difference between "this
+    page was empty" and "this payload could not be read" matters, use
+    :func:`_parse_paged_checked` — conflating the two lets a malformed response
+    that exited zero pass for a successfully-read empty surface.
+    """
+    return _parse_paged_checked(out)[0]
+
+
+def _parse_paged_checked(out: str) -> tuple[list[dict], bool]:
+    """``(rows, ok)``. ``ok`` is False when the payload could not be interpreted.
+
+    An empty string is a legitimately empty read (ok). Anything that fails to
+    parse, or parses to something that is not an array of rows/pages, is NOT —
+    and on the notifications path a silently-empty surface would be read as
+    proof that nobody acted.
+    """
     if not out:
-        return []
+        return [], True
     try:
         data = json.loads(out)
     except Exception:
-        return []
+        return [], False
     if not isinstance(data, list):
-        return []
+        return [], False
     flat: list[dict] = []
     for item in data:
         if isinstance(item, list):
             flat.extend(x for x in item if isinstance(x, dict))
         elif isinstance(item, dict):
             flat.append(item)
-    return flat
+    return flat, True
 
 
 # The timestamps a thread event may carry, by surface: comments and the thread
 # object use created_at/updated_at, a review uses submitted_at, a timeline event
 # uses created_at only.
 _EVENT_TIME_KEYS = ("created_at", "updated_at", "submitted_at")
+# Marks the appended thread object so its `updated_at` — which moves whenever
+# ANYBODY touches the thread — is never credited to the thread's author.
+_THREAD_ROW_FLAG = "__genesis_thread_row__"
+
+# Timeline events whose `.actor` is the person the event happened TO, not the
+# person who did anything. GitHub emits one per recipient the instant somebody
+# else writes an @-mention, so reading `.actor` here reports the mentioned user
+# as having acted — the owner mentioning a third party would ping that third
+# party about the owner's own comment. MEASURED on a live timeline: a comment by
+# one login at :55, three `mentioned` rows naming three OTHER logins at :56.
+_RECIPIENT_ACTOR_EVENTS = frozenset({"mentioned", "subscribed", "unsubscribed"})
+
+# Timeline events whose `.actor` DID the thing — the closed set we are willing to
+# attribute. Anything outside both sets is a shape we have not modelled, and the
+# rule for an unmodelled shape is uncertainty, never a confident reading.
+# Timeline events we UNDERSTAND and which carry no attributable identity. A
+# `committed` row is a push: MEASURED live it has no `.actor`, no `.created_at`,
+# and an `author` of {name, email, date} carrying no login. Knowing a shape has
+# no identity is NOT the same as never having seen it, and conflating the two is
+# what made the drop unreachable — every one of this install's 9 sampled pull
+# requests carries 2-16 `committed` rows, so treating them as unknown made every
+# pull request permanently uncertain.
+#
+# COST, stated because it is real: an external contributor whose ONLY action in a
+# window is pushing commits is not attributable from this surface, and that
+# window reads as empty. A force-push emits `head_ref_force_pushed`, which does
+# carry `.actor`, so the exposed case is an ordinary push with no comment, review
+# or thread-open in the same window.
+_IDENTITY_FREE_EVENTS = frozenset({"committed"})
+
+_DOER_ACTOR_EVENTS = frozenset(
+    {
+        "commented",
+        "reviewed",
+        "merged",
+        "closed",
+        "reopened",
+        "assigned",
+        "unassigned",
+        "labeled",
+        "unlabeled",
+        "milestoned",
+        "demilestoned",
+        "renamed",
+        "locked",
+        "unlocked",
+        "pinned",
+        "unpinned",
+        "transferred",
+        "head_ref_force_pushed",
+        "head_ref_deleted",
+        "head_ref_restored",
+        "base_ref_changed",
+        "ready_for_review",
+        "convert_to_draft",
+        "review_requested",
+        "review_request_removed",
+        "review_dismissed",
+        "referenced",
+        "cross-referenced",
+        "connected",
+        "disconnected",
+        "added_to_project",
+        "removed_from_project",
+        "moved_columns_in_project",
+        "converted_note_to_issue",
+        "marked_as_duplicate",
+        "unmarked_as_duplicate",
+        "user_blocked",
+        "deployed",
+        "auto_merge_enabled",
+        "auto_merge_disabled",
+    }
+)
 
 
-def _row_actor(row: dict) -> str:
-    """The login that ACTED, across every surface shape GitHub returns.
+def _row_actor(row: dict) -> tuple[str, bool]:
+    """``(login, understood)`` — who acted, and whether we know that we know.
 
-    Not one field: a comment or review nests it under ``user``, a timeline event
-    under ``actor``, and a commit or release under ``author`` — with ``user``
-    present but ``null``. Reading only ``user`` silently scores a real external
-    action as nobody, which on this path means claiming nobody acted. Returns ""
-    when no login is readable (a deleted account leaves every field null).
+    Not one field: a comment or review nests the login under ``user``, a timeline
+    event under ``actor``, and a commit or release under ``author`` — with
+    ``user`` present but ``null``. Reading only ``user`` silently scores a real
+    external action as nobody.
+
+    ``understood`` is False whenever the row is a shape we have not modelled: a
+    timeline event outside both the recipient-actor and doer-actor sets, or any
+    row from which no login is readable at all (a deleted account nulls every
+    field). The caller must turn that into UNCERTAINTY rather than treating an
+    unrecognised row as one that did not happen — every payload shape this code
+    has been wrong about so far was wrong in exactly that direction.
+
+    A recipient-actor event returns ``("", True)``: it is positively known to
+    testify to nobody acting, which is different from not being understood.
     """
+    event = row.get("event")
+    if event is not None:
+        if not isinstance(event, str) or (
+            event not in _DOER_ACTOR_EVENTS
+            and event not in _RECIPIENT_ACTOR_EVENTS
+            and event not in _IDENTITY_FREE_EVENTS
+        ):
+            return "", False  # unmodelled timeline shape
+        if event in _RECIPIENT_ACTOR_EVENTS or event in _IDENTITY_FREE_EVENTS:
+            # Understood, and carrying no login we can attribute. Not uncertainty.
+            return "", True
     for key in ("user", "actor", "author"):
-        login = (row.get(key) or {}).get("login")
-        if login:
-            return login
-    return ""
+        value = row.get(key)
+        if not isinstance(value, dict):
+            continue
+        login = value.get("login")
+        if isinstance(login, str) and login:
+            return login, True
+    return "", False
 
 
-def _in_window(row: dict, since: str, until: str) -> bool:
-    """Did this row represent somebody acting inside ``(since, until]``?
+def _event_keys(row: dict) -> tuple[str, ...]:
+    """Which timestamps on this row testify that its actor DID something.
 
-    ANY of its timestamps landing in the window counts, rather than the newest
-    one: a comment created inside the window and edited after ``until`` would
-    otherwise score out-of-window and vanish, which on this path is a silent
-    drop of a real contributor. A row carrying no timestamp at all matches
-    nothing and is handled by the caller's completeness rule, not here.
+    For a comment, review or timeline event, all of them: creating it and editing
+    it are both acting. For the THREAD object it is ``created_at`` alone — a
+    thread's ``updated_at`` moves whenever anybody touches it, and crediting that
+    to the thread's author would report the person who opened a pull request as
+    the actor behind somebody else's activity on it. That is the original defect
+    wearing a new hat.
     """
-    return any(since < (row.get(k) or "") <= until for k in _EVENT_TIME_KEYS)
+    return ("created_at",) if row.get(_THREAD_ROW_FLAG) else _EVENT_TIME_KEYS
 
 
-def _event_time(row: dict) -> str:
-    """The row's newest timestamp — used ONLY to order in-window rows."""
-    return max((row.get(k) or "") for k in _EVENT_TIME_KEYS)
+def _in_window_time(row: dict, since: str, until: str) -> str:
+    """The row's newest testifying timestamp INSIDE ``(since, until]``, or "".
+
+    Bounded on purpose, and used for ordering as well as membership: a comment
+    created in-window but edited after ``until`` is still in-window, and must not
+    then outrank someone who genuinely acted later within the window.
+    """
+    inside = [
+        t for k in _event_keys(row) if isinstance(t := row.get(k), str) and since < t <= until
+    ]
+    return max(inside) if inside else ""
+
+
+def _is_understood_shape(row: dict) -> bool:
+    """Is this a row whose shape we have positively classified?
+
+    Distinguishes "we know this carries no timestamp or login" from "we have
+    never seen this". Only the second is uncertainty. Without the distinction a
+    `committed` row — present on every real pull request timeline on this
+    install — makes every pull request permanently uncertain and the self/bot-only
+    drop unreachable, which is the entire behaviour this lane exists to provide.
+    """
+    event = row.get("event")
+    return isinstance(event, str) and (
+        event in _IDENTITY_FREE_EVENTS or event in _RECIPIENT_ACTOR_EVENTS
+    )
+
+
+def _has_readable_time(row: dict) -> bool:
+    """Does this row carry ANY string timestamp we know how to read?
+
+    A row with none is INVISIBLE to the window filter — it can neither prove nor
+    disprove that somebody acted, and silently vanishing is the failure mode that
+    let a commit-message mention be dropped (a commit payload's date lives at
+    ``commit.author.date``, and none of the keys read here exist on it).
+    """
+    return any(isinstance(row.get(k), str) and row.get(k) for k in _EVENT_TIME_KEYS)
 
 
 def _pull_url_to_issue_url(pull_url: str) -> str:
