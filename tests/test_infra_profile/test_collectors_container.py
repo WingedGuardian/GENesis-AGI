@@ -606,86 +606,120 @@ def test_cc_tmp_marker_fresh_helper():
     assert _container._cc_tmp_marker_fresh(now.replace(tzinfo=None).isoformat()) is True
 
 
-def _oom_proc(tmp_path, *, cgroup: str, effective: str):
-    """A minimal /proc root carrying just what the fact reads."""
+def _oom_proc(tmp_path, pids: dict[str, str]):
+    """A minimal /proc root holding oom_score_adj for the given pids."""
     root = tmp_path / "proc"
-    (root / "self").mkdir(parents=True, exist_ok=True)
-    (root / "self" / "cgroup").write_text(cgroup)
-    (root / "self" / "oom_score_adj").write_text(effective)
+    for pid, adj in pids.items():
+        d = root / pid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "oom_score_adj").write_text(adj + "\n")
+    root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-_GENESIS_CG = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/genesis-server.service\n"
+def _fake_systemctl(units: dict[str, tuple[str, str]]):
+    """Fake _run_cmd over `systemctl`: units maps unit -> (MainPID, declared).
 
-
-def test_oom_score_adj_declared_vs_effective(tmp_path):
-    """The real defect: a DECLARED value the kernel never applied.
-
-    The manager's write is refused silently, so `systemctl show` and the unit
-    file keep agreeing with each other while the kernel disagrees with both.
-    Comparing declared against effective is the only surface that sees it.
+    Returns Key=Value output deliberately — systemd emits properties in ITS OWN
+    order, so a --value form would let positional parsing pair the wrong numbers.
     """
-    from genesis.infra_profile.collectors.container import _oom_score_adj_declared_ok
 
-    units = tmp_path / "units"
-    units.mkdir()
-    unit = units / "genesis-server.service"
+    async def _run(*argv: str, timeout: float = 0):
+        if "list-units" in argv:
+            return "\n".join(f"{u} loaded active running x" for u in units)
+        if "show" in argv:
+            unit = argv[argv.index("show") + 1]
+            if unit not in units:
+                return None
+            pid, declared = units[unit]
+            return f"MainPID={pid}\nOOMScoreAdjust={declared}"
+        return None
 
-    # The measured live case: declared -500, effective 100 (a user manager cannot
-    # go negative — oom_score_adj_min is 0 and lowering needs CAP_SYS_RESOURCE).
-    unit.write_text("[Service]\nOOMScoreAdjust=-500\n")
-    proc = _oom_proc(tmp_path, cgroup=_GENESIS_CG, effective="100\n")
-    assert _oom_score_adj_declared_ok(proc, units) is False
-
-    # DIRECTION CONTROL: an achievable value that DID apply must read ok, or the
-    # fact would nag every install forever and get muted.
-    unit.write_text("[Service]\nOOMScoreAdjust=100\n")
-    assert _oom_score_adj_declared_ok(proc, units) is True
+    return _run
 
 
-def test_oom_score_adj_silent_when_not_applicable(tmp_path):
-    """None (silent) for every case the fact cannot or should not judge —
-    the explicit-False-only contract the posture check relies on."""
-    from genesis.infra_profile.collectors.container import _oom_score_adj_declared_ok
+async def test_oom_score_adj_detects_a_real_divergence(tmp_path, monkeypatch):
+    """The measured defect: declared -500, effective 100, silently.
 
-    units = tmp_path / "units"
-    units.mkdir()
-    (units / "genesis-server.service").write_text("[Service]\nOOMScoreAdjust=100\n")
+    systemd keeps reporting the DECLARED value, so this is the only surface that
+    can see it.
+    """
+    from genesis.infra_profile.collectors import container
 
-    # Not a genesis unit — another project's declaration is not ours to police.
-    other = _oom_proc(
-        tmp_path,
-        cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/other.service\n",
-        effective="0\n",
+    monkeypatch.setattr(
+        container, "_run_cmd",
+        _fake_systemctl({"genesis-server.service": ("275329", "-500")}),
     )
-    assert _oom_score_adj_declared_ok(other, units) is None
+    proc = _oom_proc(tmp_path, {"275329": "100"})
+    assert await container._oom_score_adj_declared_ok(proc) is False
 
-    # Not under a systemd unit at all (a CC session scope) — nothing declared it.
-    scope = _oom_proc(
-        tmp_path,
-        cgroup="0::/user.slice/user-1000.slice/user@1000.service/session-c1.scope\n",
-        effective="0\n",
-    )
-    assert _oom_score_adj_declared_ok(scope, units) is None
 
-    # Unit file exists but declares nothing -> no declaration to diverge from.
-    (units / "genesis-server.service").write_text("[Service]\nMemoryMax=80%\n")
-    proc = _oom_proc(tmp_path, cgroup=_GENESIS_CG, effective="100\n")
-    assert _oom_score_adj_declared_ok(proc, units) is None
+async def test_oom_score_adj_silent_when_everything_agrees(tmp_path, monkeypatch):
+    """DIRECTION CONTROL. Units that declare nothing are reported by systemd as
+    200 and RUN at 200 — measured 6/6 on a live install — so they must not nag."""
+    from genesis.infra_profile.collectors import container
 
-    # A COMMENTED value must not be read as a declaration — the shipped unit has
-    # a long explanatory comment block directly above the real assignment.
-    (units / "genesis-server.service").write_text(
-        "[Service]\n# OOMScoreAdjust=-500 was a silent no-op; see note\nOOMScoreAdjust=100\n"
+    monkeypatch.setattr(
+        container, "_run_cmd",
+        _fake_systemctl({
+            "genesis-server.service": ("275329", "100"),
+            "genesis-tmp-watchgod.service": ("380", "200"),
+        }),
     )
-    assert _oom_score_adj_declared_ok(proc, units) is True
+    proc = _oom_proc(tmp_path, {"275329": "100", "380": "200"})
+    assert await container._oom_score_adj_declared_ok(proc) is True
 
-    # Last assignment wins (systemd semantics), and an empty value RESETS.
-    (units / "genesis-server.service").write_text(
-        "[Service]\nOOMScoreAdjust=-500\nOOMScoreAdjust=100\n"
+
+async def test_oom_score_adj_inspects_managed_units_not_the_refresh_process(
+    tmp_path, monkeypatch,
+):
+    """It must NOT read /proc/self.
+
+    `refresh()` is shared by the server, the CLI and a separate health-MCP
+    process. An earlier version sampled whichever process happened to refresh, so
+    a CLI or MCP refresh returned None — and because the posture check treats
+    None as silent, that could AUTO-RESOLVE a standing divergence alert.
+    Here the refreshing process's own pid is absent from the fake /proc while a
+    managed unit diverges: reading self would yield None, not False.
+    """
+    import os
+
+    from genesis.infra_profile.collectors import container
+
+    monkeypatch.setattr(
+        container, "_run_cmd",
+        _fake_systemctl({"genesis-server.service": ("275329", "-500")}),
     )
-    assert _oom_score_adj_declared_ok(proc, units) is True
-    (units / "genesis-server.service").write_text(
-        "[Service]\nOOMScoreAdjust=100\nOOMScoreAdjust=\n"
+    proc = _oom_proc(tmp_path, {"275329": "100"})
+    assert not (proc / str(os.getpid())).exists()  # self is deliberately absent
+    assert not (proc / "self").exists()
+    assert await container._oom_score_adj_declared_ok(proc) is False
+
+
+async def test_oom_score_adj_silent_when_nothing_checkable(tmp_path, monkeypatch):
+    """None (silent) whenever no judgement is possible — the explicit-False-only
+    contract the posture check depends on."""
+    from genesis.infra_profile.collectors import container
+
+    proc = _oom_proc(tmp_path, {})
+
+    # No systemctl at all (or the listing failed).
+    async def _none(*argv: str, timeout: float = 0):
+        return None
+
+    monkeypatch.setattr(container, "_run_cmd", _none)
+    assert await container._oom_score_adj_declared_ok(proc) is None
+
+    # A unit that is not running has no effective value to compare.
+    monkeypatch.setattr(
+        container, "_run_cmd",
+        _fake_systemctl({"genesis-backup.service": ("0", "200")}),
     )
-    assert _oom_score_adj_declared_ok(proc, units) is None
+    assert await container._oom_score_adj_declared_ok(proc) is None
+
+    # Running, declared, but /proc entry unreadable (raced with exit).
+    monkeypatch.setattr(
+        container, "_run_cmd",
+        _fake_systemctl({"genesis-server.service": ("999999", "100")}),
+    )
+    assert await container._oom_score_adj_declared_ok(proc) is None
