@@ -1055,11 +1055,17 @@ _HIDDEN_GIT_VERB = [
     ("parameter_default", f"{GIT} ${{V:-{PUSH}}} origin main"),
     ("backtick_sub", f"{GIT} `echo {PUSH}` origin main"),
     ("indirect_expansion", f"{GIT} ${{!P}} origin main"),
+    # The POSITION-SHIFT case, which the others do not cover: an unquoted
+    # substitution containing a space is one word to bash and several tokens to
+    # shlex, so the option's value is only the head of a word and the walk lands
+    # on its tail — an ordinary-looking literal with the real verb behind it.
+    ("split_option_value", f"{GIT} -C $(echo a) {PUSH} origin main"),
 ]
 _HIDDEN_GH_VERB = [
     ("gh_group", f'gh $"pr" {MERGE} 5'),
     ("gh_verb", f'gh pr $"{MERGE}" 5'),
     ("gh_verb_hex", f"gh pr {_hex_word(MERGE)} 5"),
+    ("gh_split_option_value", f"gh -R $(echo o/r) pr {MERGE} 5"),
 ]
 # Ordinary work carrying the same characters OUTSIDE verb position, which must
 # stay clean. This is the over-block surface: `$` in an argument is routine,
@@ -1071,6 +1077,14 @@ _BENIGN_EXPANSIONS = [
     ("tilde_exe_path", "~/venv/bin/python -m pytest tests/x.py"),
     ("variable_exe_dir", "$VENV/bin/python -m pytest tests/x.py"),
     ("subcommand_then_var", f"{GIT} log --format=$FMT -1"),
+    # The CONTROL for the position-shift case above: QUOTED, so it stays one
+    # token, the walk keeps its place, and the verb resolves. Without this the
+    # split-word rule could be a blanket "any substitution in an option value"
+    # and nothing here would notice.
+    ("quoted_option_value", f'{GIT} -C "$(pwd)" status'),
+    # Parentheses that are DATA, not syntax. A rule reading every paren as a
+    # substitution boundary would flag this ordinary formatting string.
+    ("format_string_parens", f'{GIT} for-each-ref --format="%(refname)" refs/heads'),
 ]
 
 

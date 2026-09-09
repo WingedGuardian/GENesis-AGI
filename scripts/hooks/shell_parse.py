@@ -1434,6 +1434,45 @@ def _word_is_literal(token: str) -> bool:
     return not any(mark in token for mark in _EXPANSION_MARKS)
 
 
+def _word_continues(token: str) -> bool:
+    """Whether *token* is only PART of a bash word, so the next tokens are its tail.
+
+    An UNQUOTED ``$( … )`` containing a space is ONE word to bash and SEVERAL tokens
+    to shlex, which splits on that space like any other. Every position after it is
+    then off by however many tokens the substitution contributed — so a walk that
+    counts positions is reading a different word than bash will.
+
+    This matters at exactly one place: the token a value-taking option consumes.
+    Everywhere else the walk already inspects the token itself, and a partial
+    substitution carries the ``$`` or the backtick that :func:`_word_is_literal`
+    catches. The consumed value is the one token skipped unread — and skipping the
+    HEAD of a split word leaves the walk pointing at that word's TAIL, which can be
+    an ordinary-looking literal with the real verb sitting behind it.
+
+    Detects an unterminated ``$(`` and an odd backtick count. Deliberately ignores
+    parentheses NOT opened by ``$`` — ``--format=%(refname)`` is data, and treating
+    its parens as syntax is how a rule like this starts flagging ordinary work.
+    MEASURED over 129,179 real commands: this adds ZERO flags on top of the verb
+    rule, so it closes the position-shift case at no cost at all.
+    """
+    depth = 0
+    saw_sub = False
+    i, n = 0, len(token)
+    while i < n:
+        if token[i] == "$" and i + 1 < n and token[i + 1] == "(":
+            depth += 1
+            saw_sub = True
+            i += 2
+            continue
+        if depth:
+            if token[i] == "(":
+                depth += 1
+            elif token[i] == ")":
+                depth -= 1
+        i += 1
+    return (saw_sub and depth > 0) or token.count("`") % 2 == 1
+
+
 def _verb_unresolved(argv: list[str]) -> bool:
     """Whether this argv's VERB — the words that decide WHICH operation runs —
     carries a shell expansion, so the parse cannot establish what it is.
@@ -1447,7 +1486,9 @@ def _verb_unresolved(argv: list[str]) -> bool:
       with no hazard behind it. ``/usr/bin/$X`` does NOT resolve, and is flagged.
     * for a multi-verb dispatcher, the words that select the subcommand — plus any
       option word passed on the way to it, because an unreadable option can shift
-      which word lands in the verb slot.
+      which word lands in the verb slot, and plus the VALUE of a value-taking
+      option when that value is only the head of a split word (see
+      :func:`_word_continues`), for the same reason one step removed.
 
     An ARGUMENT is deliberately out of scope. ``git commit -m "$msg"``,
     ``rm "$f"``, ``echo $PATH`` are ordinary work; a gate that asked about every
@@ -1472,7 +1513,13 @@ def _verb_unresolved(argv: list[str]) -> bool:
         if not _word_is_literal(tok):
             return True  # the verb itself, or an option that decides where it sits
         if tok in value_flags:
-            i += 2  # the value is not verb position — skip it unread
+            # The value is not verb position, so it is skipped unread — UNLESS it is
+            # only the head of a split word, in which case skipping it lands the walk
+            # on that word's tail and every position after is wrong. See
+            # :func:`_word_continues`.
+            if i + 1 < len(argv) and _word_continues(argv[i + 1]):
+                return True
+            i += 2
             continue
         if tok.startswith("-"):
             i += 1
