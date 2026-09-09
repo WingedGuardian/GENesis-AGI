@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import local_overlay_mtime, merge_local_overlay
+from genesis._config_overlay import local_overlay_key, merge_local_overlay
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -48,27 +48,48 @@ def _base_path() -> Path:
     return repo_root() / "config" / _CONFIG_NAME
 
 
-#: (base mtime, overlay mtime) -> merged config. Keyed on the files themselves,
-#: so there is no TTL and no staleness window: a hand edit or a
-#: settings_update takes effect on the very next call, exactly as the
-#: fresh-read did.
-_CACHE: tuple[tuple[float, float], dict[str, Any]] | None = None
+#: (base ns, base size, overlay ns, overlay size) -> merged config. Keyed on the
+#: files themselves, so there is no TTL: a hand edit or a settings_update takes
+#: effect on the very next call, exactly as the fresh read did. Nanoseconds and
+#: size rather than a float mtime, because a rewrite inside one filesystem tick
+#: is invisible to the coarser key and would pin the old value indefinitely.
+_CACHE: tuple[tuple[Any, ...], dict[str, Any]] | None = None
 
 
-def _config_mtimes() -> tuple[float, float]:
+def _config_mtimes() -> tuple[Any, ...]:
     """Freshness key for `load_config`'s cache.
 
     Follows the house pattern (`channels/tts_config.py`,
-    `perception/confidence.py`) but keeps the two mtimes as a TUPLE rather than
+    `perception/confidence.py`) but keeps the parts as a TUPLE rather than
     summing them: a sum can collide when one file moves forward by exactly what
     the other moves back, which a backdated write can produce.
+
+    NANOSECONDS AND SIZE, not a float mtime alone. `st_mtime` is a float whose
+    resolution is the filesystem's, and a rewrite that lands inside one tick —
+    a coarse filesystem, a fast `settings_update`, an editor or a restore that
+    preserves timestamps — leaves the key unchanged, so the cache would serve
+    the OLD mode indefinitely against a file that had actually changed. That is
+    the failure this cache must not have: the module's whole contract is that a
+    lever change takes effect on the next traversal. `st_mtime_ns` is an integer
+    at nanosecond resolution and `st_size` moves on almost any real edit; both
+    come from the same `stat()` already being made, so the guard costs nothing
+    it did not already cost.
+
+    Still not a content hash, deliberately — hashing would re-read the file,
+    which is the work the cache exists to avoid. This narrows the window rather
+    than closing it, and `reset_config_cache()` is the deterministic escape for
+    a caller that knows it just wrote.
     """
     base_path = _base_path()
     try:
-        base_mtime = base_path.stat().st_mtime
+        st = base_path.stat()
+        base_key: tuple[Any, ...] = (st.st_mtime_ns, st.st_size, st.st_ino)
     except OSError:
-        base_mtime = 0.0  # absent base is a legitimate state — DEFAULTS answer
-    return (base_mtime, local_overlay_mtime(base_path))
+        base_key = (0, 0, 0)  # absent base is a legitimate state — DEFAULTS answer
+    # The overlay is the file `settings_update` writes, so it is the one whose
+    # same-tick rewrite matters most. `local_overlay_key` is the shared helper's
+    # finer form; absent overlay answers (0, 0), which a real file cannot.
+    return base_key + local_overlay_key(base_path)
 
 
 def reset_config_cache() -> None:

@@ -45,9 +45,11 @@ the second half is bounded only by how often the projector runs -- see
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from genesis.env import falkordb_socket_path
@@ -104,6 +106,15 @@ _READ_TIMEOUT_S = 0.5
 #: PROJECT bounds a batch job with no reader waiting on it, so it is sized to
 #: catch a HUNG engine and nothing else — 90x the slowest measured batch.
 _PROJECT_TIMEOUT_S = 30.0
+
+#: How long a projector may hold the right to publish before the engine takes
+#: it back. Sized as a CRASH ESCAPE, not as a normal-path bound: a full
+#: projection MEASURED at 12-16s, so 300s is ~20x, generous enough that a slow
+#: run never loses its claim mid-build, and short enough that a projector killed
+#: between acquire and release blocks the next one for five minutes rather than
+#: forever. The engine's own expiry is what makes it self-healing — nothing has
+#: to notice the crash.
+_PUBLISH_LOCK_TTL_S = 300
 
 #: Batch size for the projection. MEASURED at 10k: 60,384 nodes/s and 29,867
 #: edges/s, a 9.06s full projection of 68,064 nodes / 236,937 edges.
@@ -181,6 +192,9 @@ class FalkorGraphStore:
         #: The in-flight client construction, shared so a timed-out caller does
         #: not start a second one. See `_graph` for why that matters.
         self._connecting: asyncio.Future[Any] | None = None
+        #: Engine-side key naming who may publish this graph. Derived from the
+        #: graph key so a test key and the canonical one never contend.
+        self._publish_lock_key = f"{graph_key}_publishing"
 
     # ── connection ────────────────────────────────────────────────────
 
@@ -319,8 +333,8 @@ class FalkorGraphStore:
 
         return await self._bounded(_run, timeout=timeout, what="graph query")
 
-    async def _key_op(self, op: str, *args: Any, timeout: float) -> Any:
-        """A raw key operation (`delete`, `rename`, `exists`), under a deadline.
+    async def _key_op(self, op: str, *args: Any, timeout: float, **kwargs: Any) -> Any:
+        """A raw key operation (`delete`, `rename`, `set`, `eval`), under a deadline.
 
         The graph API has no key-level verbs, so these go through the redis
         connection — which is exactly why they used to escape the query
@@ -330,9 +344,58 @@ class FalkorGraphStore:
 
         async def _run() -> Any:
             conn = await self._connection()
-            return await getattr(conn, op)(*args)
+            return await getattr(conn, op)(*args, **kwargs)
 
         return await self._bounded(_run, timeout=timeout, what=f"graph key {op}")
+
+    async def _acquire_publish_lock(self) -> str | None:
+        """Claim the right to publish this graph key, ACROSS PROCESSES.
+
+        The in-process lock cannot see another process, and the staging keys are
+        deliberately per-process, so two projector runs build independently and
+        then both `RENAME` onto the canonical key. Publication order is decided
+        by who finishes LAST, not by who read the newer data — so a run that
+        read an older snapshot and built slowly can overwrite a newer projection
+        and walk the live graph backwards until something projects again.
+
+        `SET NX EX` in the engine both runs already talk to is the smallest
+        thing that orders them. The TTL is the crash escape: a projector killed
+        mid-build cannot hold this forever.
+        """
+        token = f"{os.getpid()}:{time.monotonic_ns()}"
+        acquired = await self._key_op(
+            "set",
+            self._publish_lock_key,
+            token,
+            nx=True,
+            ex=_PUBLISH_LOCK_TTL_S,
+            timeout=_PROJECT_TIMEOUT_S,
+        )
+        return token if acquired else None
+
+    async def _release_publish_lock(self, token: str) -> None:
+        """Release the lock ONLY if we still hold it.
+
+        A plain `DELETE` would be wrong: if our build overran the TTL, the lock
+        has already been handed to someone else, and deleting it then frees a
+        lock another run is relying on — reintroducing the race this closes, at
+        the one moment it is most likely. Compare-and-delete in a script so the
+        check and the delete cannot be separated.
+        """
+        # `eval` here is the ENGINE's EVAL command — a fixed Lua literal run
+        # server-side — not Python's builtin. The script is a constant in this
+        # file and takes no caller input; the key and token are bound as KEYS/
+        # ARGV, which is the parameterised form, so nothing interpolates.
+        with contextlib.suppress(Exception):
+            await self._key_op(
+                "eval",
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                self._publish_lock_key,
+                token,
+                timeout=_PROJECT_TIMEOUT_S,
+            )
 
     # ── GraphStore protocol ───────────────────────────────────────────
 
@@ -382,6 +445,14 @@ class FalkorGraphStore:
         """
         if max_depth < 1:
             return []
+        # ONE deadline for the whole call, not one per query. An empty traversal
+        # makes a SECOND awaited query (`_assert_projection_exists`), and giving
+        # each its own `_READ_TIMEOUT_S` let a slow engine spend ~1s reaching an
+        # empty answer — twice the phase budget the ceiling was chosen to
+        # respect, and the empty path is exactly the one that then pays for a
+        # multi-second NetworkX rebuild on top. The budget belongs to the
+        # TRAVERSAL, so it is stamped once here and spent down.
+        deadline = time.monotonic() + _READ_TIMEOUT_S
         result = await self._query(
             _TRAVERSE.replace("{depth}", str(int(max_depth))),
             {
@@ -408,11 +479,11 @@ class FalkorGraphStore:
             if row[0] != root_id
         ]
         if not nodes:
-            await self._assert_projection_exists()
+            await self._assert_projection_exists(deadline=deadline)
         nodes.sort(key=lambda n: (n.depth, -n.strength, n.memory_id))
         return nodes
 
-    async def _assert_projection_exists(self) -> None:
+    async def _assert_projection_exists(self, *, deadline: float | None = None) -> None:
         """Raise if the projection was never built, rather than answering [].
 
         THE hazard this closes, and it arrives from the opposite side to the one
@@ -468,8 +539,25 @@ class FalkorGraphStore:
 
         `:ProjectionMeta` is not `:Memory`, so it cannot appear in a traversal:
         `_TRAVERSE` binds both endpoints as `:Memory`.
+
+        ``deadline`` is the caller's REMAINING budget, not a fresh one. This is
+        the second query an empty traversal makes, and giving it an independent
+        `_READ_TIMEOUT_S` meant an empty answer could cost twice the ceiling.
+        A budget already spent is itself the answer — the engine is too slow to
+        confirm anything, which is unavailability — so it raises rather than
+        borrowing more time.
         """
-        result = await self._query("MATCH (m:ProjectionMeta) RETURN count(m)", {})
+        if deadline is None:
+            timeout = _READ_TIMEOUT_S
+        else:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise GraphUnavailableError(
+                    "the traversal budget was spent before the projection could be "
+                    "confirmed — the engine is not answering fast enough to tell an "
+                    "empty graph from an unbuilt one"
+                )
+        result = await self._query("MATCH (m:ProjectionMeta) RETURN count(m)", {}, timeout=timeout)
         rows = result.result_set or []
         if not (rows and rows[0] and rows[0][0]):
             raise GraphUnavailableError(
@@ -546,18 +634,44 @@ class FalkorGraphStore:
         or the new one, never a partial. MEASURED on the live engine 2026-09-07,
         including that the id index rides along with the rename.
 
-        SERIALISED PER GRAPH KEY, process-wide. The staging key is per-PROCESS
-        (see below), so two coroutines projecting the same key in one process
-        would share it — and with the whole-build cleanup added here, the loser's
-        cleanup wipes the winner's staging mid-build, after which the winner
-        writes its marker and renames a PARTIAL graph that reads as complete.
-        Unreachable today (`project()` has exactly one caller, the CLI, one run
-        per process) but it is precisely the shape F3's in-server scheduled
-        projector introduces, so it is closed here rather than left to a future
-        PR remembering to set `max_instances=1`.
+        SERIALISED TWICE, because there are two different collisions and one
+        lock cannot see both.
+
+        IN-PROCESS (`_project_lock`): the staging key is per-PROCESS, so two
+        coroutines projecting the same key in one process share it — and with
+        the whole-build cleanup, the loser's cleanup wipes the winner's staging
+        mid-build, after which the winner writes its marker and renames a
+        PARTIAL graph that reads as complete. That is the shape F3's in-server
+        scheduled projector introduces, closed here rather than left to a future
+        PR remembering `max_instances=1`.
+
+        CROSS-PROCESS (`_acquire_publish_lock`): two projector PROCESSES get
+        DIFFERENT staging keys, so they never corrupt each other's build — and
+        then both rename onto the canonical key. Publication order is decided by
+        who finishes LAST rather than who read newer data, so a run that read an
+        older snapshot and built slowly overwrites a newer projection and walks
+        the live graph BACKWARDS until something projects again. An asyncio lock
+        is invisible across processes; the ordering has to live in the engine
+        both of them already talk to.
+
+        A refused claim RAISES rather than waiting. Waiting would mean holding a
+        SQLite read open for the length of someone else's build, and the work is
+        redundant anyway — the run that holds the lock is projecting the same
+        rows.
         """
         async with _project_lock(self._graph_key):
-            return await self._project_locked(db)
+            token = await self._acquire_publish_lock()
+            if token is None:
+                raise GraphUnavailableError(
+                    f"another projection of {self._graph_key!r} is already in progress "
+                    "— not starting a second one, because the two would race to "
+                    "publish and the SLOWER build wins, which can walk the live "
+                    "graph backwards. Wait for it to finish, or re-run once it has."
+                )
+            try:
+                return await self._project_locked(db)
+            finally:
+                await self._release_publish_lock(token)
 
     async def _project_locked(self, db: aiosqlite.Connection) -> dict[str, int]:
         """The body of `project()`, run under its per-key lock."""
@@ -705,11 +819,32 @@ class FalkorGraphStore:
         Epoch SECONDS, not an ISO string. Both forms were proven to filter
         correctly in the spike, but numbers need no temporal type and carry no
         collation question — and this engine has no temporal types at all.
+
+        An UNPARSEABLE non-null value takes SQLite's answer, not "never
+        expires". The two are different, and treating them as the same was a
+        real parity break: SQLite never parses `invalid_at` at all — it compares
+        the raw TEXT lexicographically against an ISO `now` — so `2020-bad`
+        sorts before a 2026 timestamp and is HIDDEN there, while a store that
+        read it as unparseable-therefore-NULL kept it VISIBLE. Same memory, two
+        backends, opposite answers, and the schema does not constrain the format
+        so nothing prevents it.
+
+        MEASURED 2026-09-08: 0 of 1,633 live non-null values are unparseable, so
+        this is latent rather than firing — which is exactly when it is cheap to
+        close. The comparison is made HERE, at projection time, because a
+        malformed string has no epoch to compare later; its verdict is therefore
+        as fresh as the projection, the same bound everything else in this store
+        carries.
         """
         cursor = await db.execute("SELECT memory_id, invalid_at, deprecated FROM memory_metadata")
+        now_iso = datetime.now(UTC).isoformat()
         out: dict[str, tuple[float | None, int]] = {}
         for memory_id, invalid_at, deprecated in await cursor.fetchall():
-            out[memory_id] = (_to_epoch(invalid_at), 1 if deprecated else 0)
+            epoch = _to_epoch(invalid_at)
+            if epoch is None and invalid_at:
+                # Unparseable and non-null. Ask what SQLite would say.
+                epoch = 0.0 if str(invalid_at) <= now_iso else None
+            out[memory_id] = (epoch, 1 if deprecated else 0)
         return out
 
 

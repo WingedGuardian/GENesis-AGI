@@ -554,6 +554,36 @@ class TestFalkordbProbeIsOptionalShaped:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_an_absent_socket_is_DOWN_once_the_lever_selects_falkordb(self, tmp_path):
+        """The same absence means something different once the mode moves.
+
+        Before the cutover an absent socket is a not-yet-provisioned install.
+        AFTER the lever selects falkordb it is the live backend gone — every
+        traversal falling back and logging, while this probe and the
+        infrastructure snapshot omitted the engine entirely. Health that goes
+        quiet exactly when the thing it watches breaks is worse than no probe.
+        """
+        from genesis.observability.health import probe_falkordb
+        from genesis.observability.types import ProbeStatus
+
+        absent = str(tmp_path / "absent.sock")
+
+        with patch(
+            "genesis.memory.graphstore_config.effective_mode", return_value="falkordb"
+        ):
+            result = await probe_falkordb(socket_path=absent)
+        assert result is not None, "a selected-but-missing engine must not read as n/a"
+        assert result.status is ProbeStatus.DOWN
+        assert "falkordb" in result.message and absent in result.message
+
+        # CONTROL: the default lever must still answer not-applicable, or this
+        # would pin every unprovisioned install permanently unhealthy.
+        with patch(
+            "genesis.memory.graphstore_config.effective_mode", return_value="networkx"
+        ):
+            assert await probe_falkordb(socket_path=absent) is None
+
+    @pytest.mark.asyncio
     async def test_collect_probe_results_drops_a_none_instead_of_recording_it(self):
         """`_safe` must DROP a None, which its call-site comment used to claim
         while the code recorded it unconditionally.

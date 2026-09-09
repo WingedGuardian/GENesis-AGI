@@ -45,6 +45,7 @@ come back into range.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -453,6 +454,104 @@ async def test_expiry_keeps_subsecond_precision():
     assert falkor_mod._is_hidden((epoch, 0), epoch + 0.1), "and hidden once the moment passes"
 
 
+async def test_the_config_cache_notices_a_rewrite_that_keeps_its_timestamp(tmp_path, monkeypatch):
+    """A cache keyed on a float mtime alone can pin the old config forever.
+
+    `st_mtime` carries the filesystem's resolution, so a rewrite landing inside
+    one tick is invisible to it — a coarse filesystem, a fast `settings_update`,
+    or an editor or restore that preserves timestamps. The module's contract is
+    that a lever change takes effect on the next traversal, and a cache that
+    cannot see the write breaks exactly that.
+
+    The timestamp is pinned identically on both writes, which is the whole point:
+    if the key were mtime-only this would be indistinguishable from no write.
+    The write is an ATOMIC REPLACE, which is how every writer here actually puts
+    a config down (`_atomic_yaml_write` does mkstemp + rename, and a restore
+    writes a new file too) — so the inode moves even when the clock does not.
+
+    The one shape this deliberately does NOT claim to catch is an IN-PLACE
+    rewrite that keeps the size AND the timestamp. No writer in this repo does
+    that, and closing it would mean hashing the file — which is the read the
+    cache exists to avoid. `reset_config_cache()` is the escape if one appears.
+    """
+    import os as _os
+
+    from genesis.memory import graphstore_config as cfg
+
+    base = tmp_path / "graphstore.yaml"
+    base.write_text("enabled: true\nmode: networkx\n")
+    monkeypatch.setattr(cfg, "_base_path", lambda: base)
+    monkeypatch.setattr(cfg, "local_overlay_key", lambda _p: (0, 0, 0))
+    cfg.reset_config_cache()
+
+    assert cfg.load_config()["mode"] == "networkx"
+    stamp = base.stat().st_mtime_ns
+    before_ino = base.stat().st_ino
+
+    # Atomic replace, then pin the timestamp back — same clock, same byte count
+    # (both modes are nine characters), different inode.
+    tmp = tmp_path / "graphstore.yaml.tmp"
+    tmp.write_text("enabled: true\nmode: falkordb\n")
+    _os.replace(tmp, base)
+    _os.utime(base, ns=(stamp, stamp))
+
+    st = base.stat()
+    assert st.st_mtime_ns == stamp, "the fixture must really pin the mtime"
+    assert st.st_ino != before_ino, "the fixture must really replace the file"
+
+    assert cfg.load_config()["mode"] == "falkordb", (
+        "an atomic replace that keeps its timestamp must still invalidate the cache"
+    )
+    cfg.reset_config_cache()
+
+
+async def test_an_unparseable_timestamp_takes_sqlites_answer(tmp_path):
+    """ "Unparseable" and "NULL" are different, and SQLite treats them differently.
+
+    SQLite never parses `invalid_at`: it compares the raw TEXT lexicographically
+    against an ISO `now`. So `2020-bad` sorts before a 2026 timestamp and is
+    HIDDEN there — while a mirror that read it as unparseable-therefore-NULL
+    kept the same memory VISIBLE. The schema does not constrain the format, so
+    nothing prevents such a value existing.
+
+    MEASURED 2026-09-08: 0 of 1,633 live non-null values are unparseable, so this
+    is latent. Both directions are asserted, because a fix that hid everything
+    malformed would pass a one-sided test.
+    """
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    try:
+        await db.execute(
+            "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+        )
+        await db.executemany(
+            "INSERT INTO memory_metadata VALUES (?, ?, 0)",
+            [
+                ("past_garbage", "2020-bad"),  # sorts BEFORE now -> SQLite hides
+                ("future_garbage", "9999-bad"),  # sorts AFTER now -> SQLite shows
+                ("null_stamp", None),  # NULL -> visible on both
+                ("real", "2099-01-01T00:00:00+00:00"),  # parseable, future
+            ],
+        )
+        await db.commit()
+
+        meta = await FalkorGraphStore._metadata(db)
+        now = time.time()
+
+        assert falkor_mod._is_hidden(meta["past_garbage"], now), (
+            "a malformed stamp sorting before now is hidden by SQLite and must be here too"
+        )
+        assert not falkor_mod._is_hidden(meta["future_garbage"], now), (
+            "a malformed stamp sorting after now stays visible in SQLite — hiding "
+            "everything malformed would be a different bug, not a fix"
+        )
+        assert not falkor_mod._is_hidden(meta["null_stamp"], now)
+        assert not falkor_mod._is_hidden(meta["real"], now)
+    finally:
+        await db.close()
+
+
 async def test_the_traversal_sends_an_unfloored_now(tmp_path, monkeypatch):
     """The conversion above is worthless if the query still floors the comparand.
 
@@ -510,6 +609,12 @@ async def test_a_failure_mid_build_leaves_no_staging_graph(tmp_path):
             raise AssertionError("the build failed before the swap")
 
         async def exists(self, *a):  # pragma: no cover
+            return 1
+
+        async def set(self, *a, **k):
+            return True  # the cross-process publish claim is granted
+
+        async def eval(self, *a, **k):  # pragma: no cover - release path
             return 1
 
     class _Graph:
@@ -596,6 +701,15 @@ async def test_two_projections_of_one_key_never_interleave(tmp_path):
         async def rename(self, *_a):
             return True
 
+        async def set(self, *a, **k):
+            # The engine-side publish claim. Both runs are granted it here so
+            # this test measures the IN-PROCESS lock; the cross-process claim
+            # has its own test.
+            return True
+
+        async def eval(self, *a, **k):  # the EVAL release, not Python's eval
+            return 1
+
     # ONE patch around the whole gather. Patching inside each coroutine has the
     # first to finish restore `_FALKOR_AVAILABLE` while the second is still
     # running — which is how this test failed on its first outing, for a reason
@@ -640,6 +754,122 @@ async def test_two_projections_of_one_key_never_interleave(tmp_path):
         ["A:start", "A:end", "B:start", "B:end"],
         ["B:start", "B:end", "A:start", "A:end"],
     ), f"projections of one key must not interleave; saw {order}"
+
+
+async def test_an_empty_traversal_spends_one_deadline_not_two(tmp_path, monkeypatch):
+    """The budget belongs to the TRAVERSAL, not to each query inside it.
+
+    An empty result makes a SECOND awaited query — the projection-marker check —
+    and giving that its own full `_READ_TIMEOUT_S` let a slow engine spend twice
+    the ceiling reaching an empty answer. That is the worst path to double: the
+    empty one is also the one that then pays for a NetworkX rebuild.
+
+    Discriminating, which the sibling hung-engine test is not: that one asserts a
+    5s stub finishes under 4s, which is true whether the budget is spent once or
+    twice. Here the engine ANSWERS, slowly, so one budget and two budgets give
+    different outcomes — with one, the marker check inherits the remainder and
+    times out; with two it gets a fresh ceiling and succeeds.
+    """
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(falkor_mod, "_READ_TIMEOUT_S", 0.2)
+
+    class _Result:
+        def __init__(self, rows):
+            self.result_set = rows
+
+    class _Graph:
+        async def query(self, cypher, _params=None):
+            await _asyncio.sleep(0.15)  # under one deadline, over the remainder
+            if "ProjectionMeta" in cypher:
+                return _Result([[1]])  # a marker exists — so any raise is the deadline
+            return _Result([])  # empty traversal, which is what triggers the check
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, _key):
+            return _Graph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+    ):
+        started = _asyncio.get_running_loop().time()
+        with pytest.raises(GraphUnavailableError):
+            await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+        elapsed = _asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.28, (
+        "the whole traversal must fit in ONE deadline; a second independent one "
+        f"would let it run to ~0.30s+ (took {elapsed:.3f}s)"
+    )
+
+
+async def test_a_second_process_is_refused_the_publish_claim(tmp_path):
+    """The in-process lock cannot see another process; the engine can.
+
+    Two projector PROCESSES get DIFFERENT (pid-suffixed) staging keys, so they
+    never corrupt each other's build — and then both `RENAME` onto the canonical
+    key. Publication order is then decided by who finishes LAST rather than who
+    read newer data, so a run that read an older snapshot and built slowly
+    overwrites a newer projection and walks the live graph backwards.
+
+    Refusal must be LOUD rather than a silent no-op: a projector that quietly
+    did nothing would look identical to one that succeeded.
+    """
+    import aiosqlite
+
+    class _Conn:
+        async def set(self, *a, **k):
+            return None  # SET NX finds the key already held
+
+        async def delete(self, *_a):
+            return 1
+
+        async def eval(self, *a, **k):  # pragma: no cover - not reached
+            return 0
+
+    class _Graph:
+        async def query(self, *a, **k):
+            # Reached only if the build started, which is the failure this test
+            # is about. `select_graph` itself must stay harmless: `_connection()`
+            # goes through it to reach the raw connection, so raising THERE would
+            # fire during the claim and mask the thing being asserted.
+            raise AssertionError("the build must not start without the publish claim")
+
+    class _Client:
+        connection = _Conn()
+
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, _key):
+            return _Graph()
+
+    db = await aiosqlite.connect(":memory:")
+    try:
+        await db.execute(
+            "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, "
+            "link_type TEXT, strength REAL)"
+        )
+        await db.execute(
+            "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+        )
+        await db.commit()
+
+        store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"), graph_key="test_claim")
+        falkor_mod._PROJECT_LOCKS.pop("test_claim", None)
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", _Client),
+            pytest.raises(GraphUnavailableError, match="already in progress"),
+        ):
+            await store.project(db)
+    finally:
+        await db.close()
 
 
 async def test_a_hanging_engine_is_bounded_by_the_read_deadline(tmp_path):

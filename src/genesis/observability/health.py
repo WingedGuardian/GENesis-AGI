@@ -790,7 +790,38 @@ async def probe_falkordb(
     _clock = clock or (lambda: datetime.now(UTC))
     resolved = socket_path or str(falkordb_socket_path())
     if not Path(resolved).exists():
-        return None
+        # "Not armed" and "armed, then it vanished" are DIFFERENT states, and
+        # returning None for both concealed the one that matters. Once the lever
+        # SELECTS falkordb, an absent socket is not a not-yet-provisioned
+        # install — it is the live backend gone, with every traversal falling
+        # back and logging an error while this probe and the infrastructure
+        # snapshot omitted the engine entirely. Health that goes quiet exactly
+        # when the thing it watches breaks is worse than no probe.
+        #
+        # So the mode decides which answer this is. Read fresh (the lever is
+        # re-read per call by design) and fail toward NOT-APPLICABLE: if the
+        # mode cannot be determined, this is the pre-cutover state and the
+        # engine is not yet anyone's dependency.
+        try:
+            from genesis.memory.graphstore_config import effective_mode
+
+            selected = effective_mode() == "falkordb"
+        except Exception:  # pragma: no cover - config unreadable degrades to n/a
+            selected = False
+        if not selected:
+            return None
+        return ProbeResult(
+            name="falkordb",
+            status=ProbeStatus.DOWN,
+            # No attempt was made — there is nothing to connect to — so this is
+            # 0.0 rather than a fabricated duration.
+            latency_ms=0.0,
+            message=(
+                f"graphstore mode is 'falkordb' but no engine socket exists at "
+                f"{resolved} — every memory-graph read is falling back to NetworkX"
+            ),
+            checked_at=_clock().isoformat(),
+        )
 
     start = time.monotonic()
     try:
