@@ -626,12 +626,12 @@ every emitter's arithmetic, so this class cannot go quiet again.
   either way? Ask. Filing itself needs no per-instance approval: a bug you found while
   reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
   the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
-  One limit stays absolute — a **security** defect — an unpatched bypass, a
-  credential exposure,
-  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
-  owns it. Everything else — who may file, the command, labels, dispatched sessions,
-  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
-  Goes"). Read it before filing your first.
+  One limit stays absolute: a **security** defect — an unpatched bypass, a
+  credential exposure, anything exploitable — is NEVER filed publicly before it
+  is fixed, no matter who owns it. Everything else — who may file, the command,
+  labels, dispatched sessions, the time-gated case — is in
+  `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
+  filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
