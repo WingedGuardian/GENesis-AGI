@@ -1595,7 +1595,17 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
   user-level config, not here.
   **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
-  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
+  reply. An explicit usage-limits comment is unavailability. So is an explicit
+  REVIEW-FAILURE reply that reproduces — the bot answering `Codex Review: Something went
+  wrong` names its own cause, and a cause you can DISPROVE locally is the strongest
+  reading available: MEASURED 2026-09-09 on two PRs, twice each 43 minutes apart,
+  `Provided git ref <sha> does not exist` while `git ls-remote origin refs/heads/<branch>`
+  returned that exact sha, and two other PRs on the same account reviewed normally in the
+  same window. Reproduces + refuted locally + not account-wide = a defect on their side,
+  not a quota and not something a further retry fixes. One such reply is an incident, not
+  yet evidence: retry once, let time pass, and check the INLINE endpoint before concluding
+  anything.
+  Nothing else is — silence
   is not, and neither is `--check-pr` reporting no review, which says the same thing
   whether the reviewer is down or was simply never triggered at this head. Nor is a
   `codex exec` quota error: that is a separate surface on separate quota.
