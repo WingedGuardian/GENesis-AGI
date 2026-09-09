@@ -2201,23 +2201,24 @@ verified: f24c15e9 2026-09-05
     while destroying a session's whole context. Removed 2026-09-07 (measured: 1
     reach and 0 kills across the entire log history). RED remains the pressure
     valve and still reaps.
-  * **RED decides what to preserve the same way.** "Preserving active session"
-    used to mean the depth-2 project directory with the newest mtime — the same
+  * **RED's preserve rule is UNCHANGED, and is the known remaining gap.** It
+    still means "the depth-2 project directory with the newest mtime" — the same
     proxy YELLOW got wrong, in the tier where being wrong costs the most, since
     that mtime moves only when a session dir is created or removed. MEASURED
     2026-09-07: the active project's newest FILE was 3 days newer than its own
     directory mtime, and that directory led a DORMANT project's by 10 minutes; one
-    more session started in the dormant project and RED would have preserved that
-    one and reaped 54 live workspaces while logging "preserving active session".
-    Selection is now by the newest ENTRY of any type at depth 3 or below — files
-    AND directories. Files alone left a session that had created its workspace
-    but not yet written anything with no candidate at all, so nothing was
-    preserved and the sweep reaped that live session's directories out from under
-    it; a brand-new session is a fresh directory and nothing else. The depth floor
-    is what keeps the original fix intact: the stale project directory at depth 2
-    is still excluded. The preserved UNIT stays the project, deliberately —
-    narrowing it to the single session would reap the active project's other
-    sessions, which is more destruction, not better aim.
+    more session started in the dormant project and RED would preserve that one
+    and reap 54 live workspaces while logging "preserving active session".
+    This change deliberately does NOT fix it. Two attempts to fix it here each
+    shipped a worse regression — widening the selector's depth silently
+    re-anchored its `-path` glob (find's `-path` matches the whole path and its
+    `*` crosses `/`), so an unrelated directory won and RED deleted the live
+    workspace it claimed to preserve; MEASURED against a one-decoy fixture, where
+    the unchanged selector preserves and the widened one destroys. The answer is
+    not a narrower glob: RED should not INFER the live set from mtimes when it is
+    directly observable, and this file already enumerates listening CC sockets.
+    That is a redesign of the nuclear tier's preserve rule, tracked separately so
+    it cannot ride along in a change about reaping sessions instead of projects.
 
   Deliberately NOT done: relocating the sockets out of cc-tmp. That is the real
   fix — the control plane should not live in a directory whose purpose is to be

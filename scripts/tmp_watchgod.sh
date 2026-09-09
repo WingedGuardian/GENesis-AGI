@@ -27,6 +27,7 @@ CONF_FILE="$HOME/.genesis/config/watchgod.conf"
 STATE_FILE="$HOME/.genesis/watchgod_state.json"
 LOG_FILE="$HOME/.genesis/logs/tmp_watchgod.log"
 ALERT_DIR="$HOME/.genesis/alerts"
+CP_IDS_FILE="$HOME/.genesis/alerts/control_plane_severed_ids"
 
 # OOM event capture: the container cgroup-v2 cumulative oom_kill counter, and a
 # durable log for the snapshots. OOM_EVENTS_FILE is overridable so tests can
@@ -69,6 +70,12 @@ load_config() {
         # shellcheck source=/dev/null
         source "$CONF_FILE"
     fi
+    # Normalise ONCE, here, so no later site has to remember. watchgod.conf is
+    # re-sourced every poll and `CC_TMP_DIR=/path/to/cc-tmp/` is a perfectly valid
+    # thing to write there; a trailing slash then broke string surgery downstream
+    # in one place while another had its own `%/` guard — normalised here, and
+    # nowhere else, that whole class cannot recur (Codex P2, PR #1856).
+    CC_TMP_DIR="${CC_TMP_DIR%/}"
 }
 
 # ── Logging ──────────────────────────────────────────────────
@@ -136,7 +143,23 @@ reap_dir_sparing_sockets() {
     # stay non-empty so they survive; a dir holding no sockets is removed
     # entirely, exactly like rm -rf. -delete failures on non-empty dirs are
     # expected and suppressed; GNU find continues past them.
-    find "$1" -depth -not -type s -delete 2>/dev/null || true
+    #
+    # The socket DIRECTORY is spared as well, because sparing the inodes is not
+    # enough: an EMPTY cc-socks has no socket inside it to keep it non-empty, so
+    # the depth-first pass removes it — and it is the directory the next session
+    # binds into. Zone B's empty-dir sweep already spares it; this is the same
+    # rule in Zone A, applied at the one function every Zone A caller goes
+    # through rather than at each call site.
+    #
+    # `-type d -name` and NOT `-path '*/cc-socks*'`: `-path` matches the whole
+    # path and its `*` crosses `/`, so the path form would also spare every
+    # reclaimable FILE sitting inside the directory — which RED must still
+    # reclaim, and which `test_red_reclaims_files_inside_socket_dir` pins.
+    # `-name` matches the basename only and cannot widen.
+    find "$1" -depth -not -type s \
+        -not \( -type d -name 'cc-socks' \) \
+        -not \( -type d -name 'cc-daemon-*' \) \
+        -delete 2>/dev/null || true
 }
 
 # ── Control plane: severed CC messaging sockets ───────────────
@@ -196,10 +219,11 @@ check_control_plane() {
     local -A dirs=()
     # Always scan cc-tmp's own socket dir, even when no listener points there:
     # on a fully-severed install every listener path is already gone from disk,
-    # and that is exactly when the leftovers still need counting. `%/` because
-    # watchgod.conf is re-sourced every poll and a trailing slash there would
-    # otherwise build keys that never match the ones `find` produces.
-    dirs["${CC_TMP_DIR%/}/cc-socks"]=1
+    # and that is exactly when the leftovers still need counting. The trailing
+    # slash a re-sourced watchgod.conf could carry is stripped once in
+    # `load_config` (a local `%/` here would be a second place to remember), so
+    # this key always matches the ones `find` produces.
+    dirs["$CC_TMP_DIR/cc-socks"]=1
 
     local path
     while IFS= read -r path; do
@@ -222,7 +246,16 @@ check_control_plane() {
         # user's cc-socks path would be counted here, and an unstattable one
         # would read as severed. Genesis is single-user by design, so this is
         # left as a known limitation rather than engineered around.
-    done < <(awk '$4 ~ /\/cc-socks\/.*\.sock$/ {print $4}' <<<"$raw" | sort -u)
+        # Whichever FIELD looks like a socket path — never a fixed index. Two
+        # reviewers pushed this in opposite directions (one to $4, one to $5)
+        # because the column count is not stable: `ss` prints a State column for
+        # unix sockets, and MEASURED here on iproute2-6.1.0 with `state listening`
+        # it does not, putting the path at $4 while the man page's row shape says
+        # $5. A guard whose verdict depends on which release of a tool is
+        # installed is the wrong shape; matching the field by what it IS cannot
+        # be wrong either way. Scoped to a field, so the `users:((...))` column
+        # can never supply one.
+    done < <(awk '{for (i = 1; i <= NF; i++) if ($i ~ /\/cc-socks\/[^\/]*\.sock$/) { print $i; break }}' <<<"$raw" | sort -u)
 
     local d f
     for d in "${!dirs[@]}"; do
@@ -233,13 +266,19 @@ check_control_plane() {
         done < <(find "$d" -maxdepth 1 -type s -name '*.sock' 2>/dev/null)
     done
 
+    # Identities travel on their OWN channel, never as a fifth field. Packing them
+    # into the colon-delimited string meant two readers with different arities:
+    # `write_state` reads four, so bash handed it "1:123.sock" as the listener
+    # count and the state file became invalid JSON exactly when a severance made
+    # it worth reading (Codex P1, PR #1856). A positional protocol with a
+    # variable-length tail cannot be extended safely; this one is fixed-width
+    # again, and the tail has a file of its own.
+    printf '%s' "$severed_ids" > "$CP_IDS_FILE" 2>/dev/null || true
     if (( listeners == 0 && stale == 0 )); then
-        echo "empty:0:0:0:"
+        echo "empty:0:0:0"
         return 0
     fi
-    # Fifth field: the severed socket basenames, space separated. write_state
-    # reads only the first four, so the protocol is unchanged for it.
-    echo "ok:${severed}:${stale}:${listeners}:${severed_ids}"
+    echo "ok:${severed}:${stale}:${listeners}"
 }
 
 # Should this control-plane reading page, and which severances are now reported?
@@ -431,49 +470,46 @@ clean_cc_orange() {
 clean_cc_red() {
     log WARN "Zone A RED — NUCLEAR cleanup, preserving active session"
 
-    # Which workspace is ACTIVE — by the newest file anywhere inside it, not by a
-    # directory's own mtime.
+    # Which workspace is ACTIVE. UNCHANGED FROM main, DELIBERATELY — see below.
     #
-    # This is the same defect the YELLOW reap had, in the tier where getting it
-    # wrong costs the most, and fixing it in only one of the two places would have
-    # left the class alive in the nuclear one. Depth 2 is the PROJECT directory,
-    # and its mtime moves only when a session dir is created or removed directly
-    # under it — never when a live session writes. So the sort was ranking
-    # projects by "when did a session last start here", and preserving the winner.
+    # This selector is NOT part of this change, and two attempts to improve it
+    # here both shipped a regression that deleted the live session workspace
+    # while logging "preserving active session". Recorded so the next reader does
+    # not make it three:
     #
-    # MEASURED on a live install (2026-09-07): the truly-active project's newest
-    # FILE was 3 days newer than its own directory mtime, and that directory led a
-    # DORMANT project's by 10 minutes. One more session started in the dormant
-    # project and RED would have preserved that one and reaped the active
-    # project's 54 session workspaces — while logging "preserving active session".
+    #   1. Widening to `-mindepth 3 -type f` (to let a file's mtime outrank a
+    #      stale directory mtime) silently RE-ANCHORED the `-path` glob. `find`'s
+    #      `-path` matches the WHOLE path and its `*` crosses `/`, so with the
+    #      `-maxdepth` bound gone, `*/claude-*` matches a component OR BASENAME
+    #      beginning `claude-` ANYWHERE in the tree. A file under an unrelated
+    #      depth-1 directory then wins the sort, the reduction below names that
+    #      directory as the active project, and the depth-1 loop reaps the real
+    #      one. MEASURED with one decoy: main preserves the live tree, the
+    #      widened selector destroys it. The shape is not hypothetical — pytest
+    #      basetemps live inside cc-tmp, so the test suite plants it.
+    #   2. Reducing the winning entry to `<uid>/<project>` by string surgery
+    #      (`${p#$ROOT/}` then `%%/*`) turns a mis-selection into a plausible
+    #      wrong answer rather than an obvious one, and inherits every
+    #      normalisation bug in the configured path.
     #
-    # Every entry at depth 3 or deeper, of ANY type — not just files.
+    # The real fix is not a narrower glob: RED should not INFER which session is
+    # live from filesystem mtimes at all, when the live set is directly
+    # observable (this file already enumerates listening CC sockets in
+    # `check_control_plane`). That is a redesign of the nuclear tier's preserve
+    # rule and is tracked separately — it must not ride along in a change about
+    # reaping sessions instead of projects.
     #
-    # `-type f` was wrong in the other direction and is the regression this line
-    # exists to avoid: a session that has created its workspace but not yet
-    # written a regular file has no candidate at all, `newest_session` comes back
-    # empty, and the depth-1 sweep below then reaps the live session's own
-    # directories out from under it (its next write gets ENOENT). Directories
-    # count as evidence of life precisely because a brand-new session IS a fresh
-    # directory and nothing else. The depth floor is what keeps this correct: the
-    # stale PROJECT directory at depth 2 is still excluded, so the divergence
-    # this whole change is about cannot come back.
+    # KNOWN LIMITATION, carried from main unchanged: depth 2 is the PROJECT
+    # directory, whose mtime moves only when a session dir is created or removed
+    # directly under it — never when a live session writes. So this ranks
+    # projects by "when did a session last start here". MEASURED on a live
+    # install (2026-09-07): the active project's newest FILE was 3 days newer
+    # than its own directory mtime, and that directory led a dormant project's by
+    # 10 minutes. The YELLOW reap below no longer has this defect; RED still does,
+    # and closing it is the tracked redesign above.
     local newest_session=""
-    newest_session=$(find "$CC_TMP_DIR" -mindepth 3 -path "*/claude-*" \
+    newest_session=$(find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*" \
         -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}') || true
-    if [[ -n "$newest_session" ]]; then
-        # Reduce the winning FILE to its project dir (…/claude-<uid>/<project>),
-        # which is the unit the sweeps below exclude. Deliberately NOT narrowed to
-        # the single session dir, which is what the review that found this
-        # suggested: that would make RED delete the other sessions of the active
-        # project, i.e. MORE destruction in the nuclear tier, and this change is
-        # about preserving the right thing rather than preserving less of it.
-        local _rel="${newest_session#"$CC_TMP_DIR"/}"
-        local _uid="${_rel%%/*}"
-        local _proj="${_rel#*/}"
-        _proj="${_proj%%/*}"
-        newest_session="$CC_TMP_DIR/$_uid/$_proj"
-    fi
 
     # Reap every depth-1 dir except the newest session's ancestor —
     # object-level and socket-sparing (see reap_dir_sparing_sockets); loose
@@ -749,10 +785,17 @@ main() {
     local cp_paged_file="$ALERT_DIR/control_plane_paged"
     local cp_paged_ids
     cp_paged_ids=$(cat "$cp_paged_file" 2>/dev/null) || cp_paged_ids=""
-    # Ids are `<pid>.sock` basenames; anything else is a file from an older
-    # version (which stored a count) or corruption — start clean rather than
-    # treat a stray token as a reported severance.
-    [[ "$cp_paged_ids" =~ ^([0-9]+\.sock( [0-9]+\.sock)*)?$ ]] || cp_paged_ids=""
+    # Ids are socket basenames; anything else is a file from an older version
+    # (which stored a count) or corruption — start clean rather than treat a
+    # stray token as a reported severance.
+    #
+    # This pattern must stay as WIDE as the producer, which takes any basename
+    # ending `.sock` (see check_control_plane). Today CC names them `<pid>.sock`,
+    # but a validator narrower than its producer fails in the worst direction:
+    # ONE non-conforming id would fail the whole-string match, discard every
+    # reported severance, and re-page the same unhealed condition after every
+    # restart — exactly what this file exists to prevent.
+    [[ "$cp_paged_ids" =~ ^([^[:space:]]+\.sock( [^[:space:]]+\.sock)*)?$ ]] || cp_paged_ids=""
 
     while true; do
         load_config
@@ -769,8 +812,12 @@ main() {
 
         write_state "$cc_tier" "$cc_used" "$sys_tier" "$sys_pct" "$cp_result"
 
+        # FOUR fields, matching the fixed-width contract check_control_plane
+        # publishes. The identities come from their own channel — see the note
+        # there on why a variable-length tail cannot ride a positional string.
         local cp_status cp_severed cp_stale cp_listeners cp_ids
-        IFS=: read -r cp_status cp_severed cp_stale cp_listeners cp_ids <<<"$cp_result"
+        IFS=: read -r cp_status cp_severed cp_stale cp_listeners <<<"$cp_result"
+        cp_ids=$(cat "$CP_IDS_FILE" 2>/dev/null) || cp_ids=""
 
         # Log only on CHANGE — this runs every poll and an unchanged plane has
         # nothing to say.
@@ -794,6 +841,13 @@ main() {
             local cp_next_paged="${cp_decision#*:}"
             if [[ "$cp_should_page" == "1" ]]; then
                 log WARN "control plane SEVERED: ${cp_severed} of ${cp_listeners} session(s) unreachable"
+                # The dedupe key carries the IDENTITIES, for the same reason the
+                # paging decision does. Keyed on the COUNT, a severance of one
+                # session replaced by a severance of a different session inside
+                # the drainer's 24h dedupe window is a second "count 1" alert —
+                # rejected and unlinked, while this daemon has already recorded
+                # the new id as paged and will never raise it again (Codex P2,
+                # PR #1856).
                 # `warning` is the honest severity for the event, but note it does
                 # NOT buy a quieter delivery: the container drain submits every
                 # queued entry at one category and salience regardless of this
@@ -809,12 +863,21 @@ main() {
                 # the return value.
                 local _q="${_ALERT_QUEUE_ROOT:-$HOME/.genesis/alerts/queue}"
                 local _before _after
-                _before=$(find "$_q" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+                # `set -euo pipefail` is on, and `find` on a MISSING directory
+                # exits nonzero — which under pipefail fails the whole
+                # substitution and kills the daemon outright. On a clean install
+                # the queue does not exist until queue_alert makes it, so the
+                # probe added to verify delivery would have taken the service
+                # down on the first severance and again after every restart
+                # (Codex P1, PR #1856). Create it first, and give every count a
+                # floor so no arithmetic can inherit an empty string.
+                mkdir -p "$_q" 2>/dev/null || true
+                _before=$( { find "$_q" -maxdepth 1 -name '*.json' 2>/dev/null || true; } | wc -l)
                 queue_alert warning "watchgod:control-plane" \
                     "CC control plane severed (${cp_severed} session(s) unreachable)" \
                     "${cp_severed} of ${cp_listeners} live Claude Code session(s) are listening on a socket whose PATH no longer exists, so peers get ENOENT and cannot reach them. Nothing re-binds after startup — the only remedy is restarting those sessions. Check what deleted the paths under cc-socks." \
-                    "watchgod:control_plane:${cp_severed}"
-                _after=$(find "$_q" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+                    "watchgod:control_plane:${cp_ids// /,}"
+                _after=$( { find "$_q" -maxdepth 1 -name '*.json' 2>/dev/null || true; } | wc -l)
                 if (( _after > _before )); then
                     cp_paged_ids="$cp_next_paged"
                 else

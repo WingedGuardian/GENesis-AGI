@@ -159,8 +159,16 @@ def test_ordinary_empty_dirs_are_still_reclaimed(zone_b):
 
 
 def test_socket_files_survive_every_zone_b_tier(zone_b):
-    """The pre-existing `-not -name '*.sock'` exclusion, pinned across all three
-    tiers — RED is the aggressive one and the easiest to regress."""
+    """A unix socket survives all three Zone B tiers — RED is the aggressive one
+    and the easiest to regress.
+
+    What this pins is that every Zone B file sweep is `-type f`, which a socket
+    can never satisfy. It does NOT pin the `-not -name '*.sock'` exclusion those
+    sweeps also carry: that exclusion is redundant for a real socket, and
+    MEASURED 2026-09-08 this test still passes with all four occurrences
+    stripped. `test_a_regular_file_named_sock_is_still_reclaimable` below is
+    what gives that exclusion a mutation-sensitive case.
+    """
     home, systmp, bind = zone_b
     sock = systmp / "cc-socks" / "42.sock"
     sock.parent.mkdir()
@@ -177,3 +185,28 @@ def test_socket_files_survive_every_zone_b_tier(zone_b):
             f"{tier} deleted a unix socket under the swept tree"
         )
     assert not junk.exists(), "the sweeps must still reclaim ordinary old files"
+
+
+def test_a_regular_file_named_sock_is_still_reclaimable(zone_b):
+    """The `-not -name '*.sock'` exclusion, given the one input that can see it.
+
+    A real socket is spared by `-type f` alone, so the name exclusion is
+    invisible to every socket-based test. A REGULAR FILE named `*.sock` is the
+    only input that distinguishes them: it is reclaimable disk that the name
+    exclusion currently protects. This test documents which way that falls, so
+    a future change to the exclusion has to decide deliberately rather than
+    discover it.
+    """
+    home, systmp, bind = zone_b
+    impostor = systmp / "cc-socks" / "notreally.sock"
+    impostor.parent.mkdir()
+    impostor.write_bytes(b"x" * 8192)
+    _age(impostor, 30)
+    _age(impostor.parent, 30)
+
+    proc = _run(home, systmp, bind, "clean_sys_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert impostor.exists(), (
+        "a regular file named *.sock was reclaimed — the name exclusion no "
+        "longer covers it, which changes what Zone B RED protects"
+    )

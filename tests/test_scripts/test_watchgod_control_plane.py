@@ -113,26 +113,26 @@ def _mksock(path: Path) -> None:
 
 
 def _probe(home: Path, bind: Path, rows: str = "", **kw) -> str:
-    """The COUNTS tuple — `status:severed:stale:listeners`.
+    """The COUNTS tuple — `status:severed:stale:listeners`, and nothing else.
 
-    The check also emits a fifth field carrying the severed socket identities;
-    `_probe_ids` is for that. Splitting them keeps the counts assertions readable
-    and stops every one of them having to restate an id list it does not care
-    about.
+    FIXED WIDTH on purpose. The identities used to ride along as a fifth field,
+    and `write_state` parses four — so bash handed it "1:123.sock" as the
+    listener count and the state file became invalid JSON exactly when a
+    severance made it worth reading. They travel on their own channel now, which
+    `_probe_ids` reads.
     """
-    return ":".join(_probe_full(home, bind, rows, **kw).split(":")[:4])
-
-
-def _probe_full(home: Path, bind: Path, rows: str = "", **kw) -> str:
     proc = _run(home, bind, "check_control_plane", rows=rows, **kw)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    return proc.stdout.strip()
+    out = proc.stdout.strip()
+    assert out.count(":") == 3, f"the counts tuple must stay four fields, got {out!r}"
+    return out
 
 
 def _probe_ids(home: Path, bind: Path, rows: str = "", **kw) -> list[str]:
-    """The severed socket identities, as a list."""
-    parts = _probe_full(home, bind, rows, **kw).split(":")
-    return parts[4].split() if len(parts) > 4 else []
+    """The severed socket identities, from the channel of their own."""
+    _probe(home, bind, rows, **kw)
+    ids = home / ".genesis" / "alerts" / "control_plane_severed_ids"
+    return ids.read_text().split() if ids.is_file() else []
 
 
 # ── severed ──────────────────────────────────────────────────────────────
@@ -313,6 +313,8 @@ def test_severed_identities_are_reported_not_just_counted(tmp_path):
     rows = f"{socks}/11.sock 11\n{socks}/77.sock 77"
     assert _probe_ids(home, bind, rows) == ["11.sock"]
     assert _probe(home, bind, rows) == "ok:1:0:2"
+    # ...and the counts tuple carries no trace of them (see _probe's docstring).
+    assert "sock" not in _probe(home, bind, rows)
 
 
 def test_first_sighting_does_not_page(tmp_path):
@@ -359,3 +361,220 @@ def test_a_healthy_plane_says_nothing(tmp_path):
     home, _cctmp, bind = _sandbox(tmp_path)
     assert _decide(home, bind, "", "", "") == "0:"
     assert _decide(home, bind, "a.sock", "a.sock", "") == "0:"
+
+
+# ── round 2: the mechanisms behind the fixes, not the fixes ──────────────
+#
+# Three of Codex's round-2 findings were defects the round-1 fixes introduced.
+# Each test below pins the MECHANISM that made its class possible, so the class
+# cannot come back through a different door.
+
+
+def test_the_state_file_stays_valid_json_when_sockets_are_severed(tmp_path):
+    """The defect the fixed-width protocol exists to prevent.
+
+    Identities were packed into the counts tuple as a fifth field while
+    `write_state` read four, so bash assigned the surplus to the LAST
+    destination: `"listeners": 5:1859653.sock` — invalid JSON, emitted precisely
+    when a severance made the file worth reading, so `collect_cc_tmp_usage()`
+    returned a parse error exactly then (Codex P1, PR #1856).
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    gone = cctmp / "cc-socks" / "1859653.sock"
+    gone.parent.mkdir(parents=True)
+    _mksock(cctmp / "cc-socks" / "2501887.sock")
+    # Drive the PRODUCER's real output into the CONSUMER — passing a hand-written
+    # four-field string would exercise a shape the old code never emitted, and
+    # would pass against the very bug this pins.
+    proc = _run(
+        home,
+        bind,
+        'cp=$(check_control_plane); write_state green 10 green 5 "$cp"',
+        rows=f"{gone} 1859653",
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    raw = (home / ".genesis" / "watchgod_state.json").read_text()
+    state = json.loads(raw)  # the assertion: this parses at all
+    assert state["control_plane"]["severed_sockets"] == 1
+    assert state["control_plane"]["listeners"] == 1
+    # `.sock` — the identity shape. Plain "sock" matches the field NAMES
+    # (`severed_sockets`), which is what an earlier draft of this line caught.
+    assert ".sock" not in raw, "a socket identity leaked into the state file"
+
+
+def test_the_socket_path_is_found_whatever_column_it_lands_in(tmp_path):
+    """`ss` column counts are not stable, so the parse must not depend on one.
+
+    Two reviewers pushed this to opposite indexes — one to `$4`, one to `$5` —
+    because `ss` prints a State column for unix sockets and MEASURED here on
+    iproute2-6.1.0 with `state listening` it does not. A guard whose verdict
+    depends on which release is installed is the wrong shape.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    gone = cctmp / "cc-socks" / "42.sock"
+    gone.parent.mkdir(parents=True)
+    # A stub that DOES emit the State column, i.e. the shape this box does not
+    # produce and the man page says to expect — the path is now at $5.
+    _make_exec(
+        bind / "ss",
+        "#!/usr/bin/env bash\n"
+        'printf \'u_str LISTEN 0 512 %s 12345 * 0 users:(("claude",pid=42,fd=11))\\n\' '
+        '"${STUB_SS_ROWS%% *}"\n',
+    )
+    assert _probe(home, bind, f"{gone} 42") == "ok:1:0:1", (
+        "the path was not found when ss included its State column"
+    )
+
+
+def test_a_missing_alert_queue_does_not_kill_the_daemon(tmp_path):
+    """`set -euo pipefail` plus `find` on an absent directory is fatal.
+
+    The probe added in round 1 to confirm an alert actually landed ran `find` on
+    the queue directory BEFORE `queue_alert` could create it. On a clean install
+    that exits nonzero, the substitution fails, and the daemon dies — so every
+    confirmed severance became another service restart with no alert ever sent
+    (Codex P1, PR #1856).
+
+    Exercises the REAL daemon, not a copy of its snippet: one poll of `main`
+    against a sandbox whose alert queue does not exist. An earlier draft of this
+    test ran the fixed guard inline and therefore passed against the bug.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir(parents=True)
+    queue = home / ".genesis" / "alerts" / "queue"
+    assert not queue.exists(), "fixture precondition: the queue must be absent"
+    conf = home / ".genesis" / "config"
+    conf.mkdir(parents=True)
+    (conf / "watchgod.conf").write_text("POLL_INTERVAL=1\n")
+    proc = subprocess.run(
+        ["timeout", "-s", "TERM", "4", "bash", str(_WATCHGOD)],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{bind}:{os.environ['PATH']}",
+            "STUB_SS_ROWS": f"{cctmp}/cc-socks/77.sock 77",
+            "STUB_SS_RC": "0",
+            "SYS_TMP_DIR": str(tmp_path / "systmp"),
+        },
+        capture_output=True,
+        text=True,
+    )
+    # SIGTERM from `timeout` is 124; anything else means the loop died on its own.
+    assert proc.returncode in (0, 124), (
+        f"the daemon exited on its own (rc={proc.returncode}): {proc.stderr[-400:]}"
+    )
+    log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "control plane" in log, f"the poll loop never completed a pass: {log}"
+
+
+def test_a_trailing_slash_in_the_configured_path_is_normalised_once(tmp_path):
+    """`CC_TMP_DIR=/path/to/cc-tmp/` is a valid thing to write in watchgod.conf.
+
+    Left un-normalised it broke string surgery downstream — one site carried its
+    own `%/` guard and another did not, so RED reconstructed the wrong exclusion
+    path and deleted the project it meant to preserve (Codex P2, PR #1856).
+    Normalising in `load_config`, once, is what stops a future site having to
+    remember.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    conf = home / ".genesis" / "config"
+    conf.mkdir(parents=True)
+    (conf / "watchgod.conf").write_text(f'CC_TMP_DIR="{cctmp}/"\n')
+    proc = _run(home, bind, 'load_config; printf "%s" "$CC_TMP_DIR"')
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert proc.stdout == str(cctmp), (
+        f"trailing slash survived load_config: {proc.stdout!r}"
+    )
+
+
+def _run_daemon(home, bind, cctmp, tmp_path, rows, seconds="4"):
+    """One or two polls of the REAL daemon against a sandbox."""
+    return subprocess.run(
+        ["timeout", "-s", "TERM", seconds, "bash", str(_WATCHGOD)],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{bind}:{os.environ['PATH']}",
+            "STUB_SS_ROWS": rows,
+            "STUB_SS_RC": "0",
+            "SYS_TMP_DIR": str(tmp_path / "systmp"),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_a_severance_already_paged_does_not_page_again_after_a_restart(tmp_path):
+    """The paged level survives a restart, so a deploy cannot re-page an
+    unhealed severance.
+
+    A severance is UNHEALABLE without restarting the sessions themselves, and
+    the unit is Restart=always. If the reported level lived only in memory, the
+    same unfixed condition would page again after every deploy or crash. This
+    exercises the REAL daemon reading the on-disk marker at startup — the path
+    the PR body claimed by manual verification and no test covered.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir(parents=True)
+    conf = home / ".genesis" / "config"
+    conf.mkdir(parents=True)
+    (conf / "watchgod.conf").write_text("POLL_INTERVAL=1\n")
+    queue = home / ".genesis" / "alerts" / "queue"
+    queue.mkdir(parents=True, exist_ok=True)
+
+    # A listener whose socket path is absent from disk = one severed session,
+    # and it is ALREADY the reported level from before the restart.
+    rows = f"{cctmp}/cc-socks/77.sock 77"
+    (home / ".genesis" / "alerts" / "control_plane_paged").write_text("77.sock")
+
+    proc = _run_daemon(home, bind, cctmp, tmp_path, rows)
+    assert proc.returncode in (0, 124), (
+        f"the daemon exited on its own (rc={proc.returncode}): {proc.stderr[-400:]}"
+    )
+    log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "control plane" in log, f"the poll loop never completed a pass: {log}"
+    # Guard the guard: the severance must actually be DETECTED this run, or the
+    # absence of an alert below proves nothing.
+    state = json.loads((home / ".genesis" / "watchgod_state.json").read_text())
+    assert state["control_plane"]["severed_sockets"] == 1, (
+        "fixture precondition: the daemon did not detect the severed listener, "
+        f"so a quiet queue says nothing — {state['control_plane']}"
+    )
+    assert not list(queue.glob("*.json")), (
+        "the daemon re-paged a severance already recorded as reported — the "
+        "restart marker was not honoured"
+    )
+
+
+def test_an_unrecognised_id_in_the_marker_does_not_discard_the_whole_level(tmp_path):
+    """The marker validator must be as wide as the id producer.
+
+    The producer takes any basename ending `.sock`; a validator that accepts
+    only `<pid>.sock` would fail the whole-string match on ONE unusual name,
+    discard every reported severance, and re-page the same unhealed condition
+    after every restart — the failure the marker exists to prevent.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir(parents=True)
+    conf = home / ".genesis" / "config"
+    conf.mkdir(parents=True)
+    (conf / "watchgod.conf").write_text("POLL_INTERVAL=1\n")
+    queue = home / ".genesis" / "alerts" / "queue"
+    queue.mkdir(parents=True, exist_ok=True)
+
+    rows = f"{cctmp}/cc-socks/agent-a.sock 77"
+    (home / ".genesis" / "alerts" / "control_plane_paged").write_text("agent-a.sock")
+
+    proc = _run_daemon(home, bind, cctmp, tmp_path, rows)
+    assert proc.returncode in (0, 124), (
+        f"the daemon exited on its own (rc={proc.returncode}): {proc.stderr[-400:]}"
+    )
+    state = json.loads((home / ".genesis" / "watchgod_state.json").read_text())
+    assert state["control_plane"]["severed_sockets"] == 1, (
+        "fixture precondition: the severance was not detected — "
+        f"{state['control_plane']}"
+    )
+    assert not list(queue.glob("*.json")), (
+        "a non-<pid> socket name poisoned the marker, so the whole reported "
+        "level was discarded and the severance paged again"
+    )

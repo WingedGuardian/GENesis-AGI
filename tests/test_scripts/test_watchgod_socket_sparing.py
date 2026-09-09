@@ -205,57 +205,83 @@ def test_red_preserves_a_session_that_has_not_written_a_file_yet(tmp_path):
     )
 
 
-def test_red_preserves_the_project_with_the_newest_FILE_not_the_newest_DIR(tmp_path):
-    """RED's "preserving active session" must mean the workspace someone is
-    actually using — judged by the newest file inside it, not by a directory's
-    own mtime.
 
-    Same defect as the YELLOW reap had, in the tier where being wrong costs
-    most: a project directory's mtime moves only when a session dir is created
-    or removed under it, never when a live session writes. So the old sort
-    ranked projects by "when did a session last START here".
 
-    MEASURED on a live install: the active project's newest FILE was 3 days newer
-    than its own directory mtime, and that directory led a DORMANT project's by
-    10 minutes. This fixture makes the dormant project win that comparison
-    outright, which is the shape one more dormant session would have produced —
-    RED would preserve the dormant project and reap the active one's workspaces
-    while logging "preserving active session".
+def test_red_does_not_let_a_claude_named_decoy_outside_the_tree_win(tmp_path):
+    """RED's preserve-selector must never resolve to a directory outside the
+    ``claude-<uid>/`` tree, however new an entry inside it happens to be.
 
-    Verify-RED: against the pre-fix selection this fails on the first assertion.
+    This is the anti-regression for the defect two attempts at "improve the
+    selector" shipped (PR #1856): ``find``'s ``-path`` matches the WHOLE path
+    and its ``*`` crosses ``/``, so widening the selector's depth turns
+    ``-path "*/claude-*"`` into "a component OR BASENAME beginning ``claude-``
+    anywhere". A file under an unrelated depth-1 directory then wins the mtime
+    sort, the winner is reduced to the wrong project root, and the depth-1 loop
+    reaps the real live workspace — while the log still says "preserving active
+    session".
+
+    The shape is not hypothetical: pytest basetemps live inside cc-tmp on this
+    install, so the watchgod suite itself plants ``claude-*`` fixtures in the
+    directory the daemon sweeps.
     """
     home, cctmp, bind = _sandbox(tmp_path)
-    old = time.time() - 30 * 86400
 
-    # ACTIVE project: stale directory mtime, recently-written file inside.
-    # Aged an HOUR, deliberately: RED's file sweep spares anything touched in the
-    # last 60 seconds, so a just-written file would survive whatever the selection
-    # did and the assertion below would pass for the wrong reason. An hour is
-    # outside that window and still far newer than the dormant project.
-    active = cctmp / "claude-1000" / "-home-dev-active" / "session-a"
-    active.mkdir(parents=True)
-    (active / "live.json").write_bytes(b"a" * 4096)
-    recent = time.time() - 3600
-    os.utime(active / "live.json", (recent, recent))
-    os.utime(active, (recent, recent))
-    os.utime(active.parent, (old, old))  # no NEW session started here in a month
+    live = cctmp / "claude-1000" / "-home-dev-active" / "session-a"
+    live.mkdir(parents=True)
+    (live / "live.json").write_bytes(b"L" * 4096)
 
-    # DORMANT project: newer directory mtime, nothing written inside for a month.
-    dormant = cctmp / "claude-1000" / "-home-dev-dormant" / "session-b"
-    dormant.mkdir(parents=True)
-    (dormant / "cold.bin").write_bytes(b"b" * 4096)
-    os.utime(dormant / "cold.bin", (old, old))
-    os.utime(dormant, (old, old))
-    # its project dir is left with a NOW mtime — it wins the old comparison
+    # The decoy: basename begins "claude-", depth 3, under a NON-claude depth-1
+    # dir, and strictly the newest thing in the tree.
+    decoy = cctmp / "tmpXYZ" / "sub"
+    decoy.mkdir(parents=True)
+    (decoy / "claude-notes.txt").write_bytes(b"D" * 4096)
+    old = time.time() - 600
+    os.utime(live / "live.json", (old, old))
+    os.utime(live, (old, old))
 
     proc = _run(home, bind, _PRELUDE + "clean_cc_red")
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
 
-    assert (active / "live.json").exists(), (
-        "RED reaped the ACTIVE project's files and preserved a dormant one — it "
-        "selected by directory mtime, which does not track writes inside sessions"
+    assert (live / "live.json").exists(), (
+        "RED deleted the live session workspace: a claude-named decoy OUTSIDE "
+        "the claude-<uid> tree won the preserve-selector"
     )
-    assert not (dormant / "cold.bin").exists(), (
-        "the dormant project's files should be reclaimed; if they survive, RED "
-        "preserved everything and this test proves nothing"
+    # Guard the guard: if the decoy survived too, RED preserved everything and
+    # the assertion above is vacuous.
+    assert not (decoy / "claude-notes.txt").exists(), (
+        "the decoy survived as well, so RED reclaimed nothing and this test "
+        "proves nothing"
+    )
+
+
+def test_red_spares_an_empty_socket_dir_but_still_reclaims_files_in_it(tmp_path):
+    """cc-socks must survive RED even with no socket inside it — it is the
+    directory the next session binds into — while non-socket files sitting in
+    it are still reclaimable.
+
+    Sparing socket INODES is not enough: an empty cc-socks has nothing to keep
+    it non-empty, so the depth-first pass removes the directory itself. Zone B's
+    empty-dir sweep already spares it; this pins the same rule in Zone A.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    socks = cctmp / "cc-socks"
+    socks.mkdir()
+    junk = socks / "stale.log"
+    junk.write_bytes(b"j" * 8192)
+    old = time.time() - 600
+    os.utime(junk, (old, old))
+
+    session = cctmp / "claude-1000" / "-home-dev-active" / "session-a"
+    session.mkdir(parents=True)
+    (session / "live.json").write_bytes(b"L" * 1024)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert socks.is_dir(), (
+        "RED removed an EMPTY cc-socks — the next session has nowhere to bind"
+    )
+    assert not junk.exists(), (
+        "the reclaimable file inside cc-socks survived, so the directory "
+        "exclusion widened to its contents"
     )
