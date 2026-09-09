@@ -66,14 +66,6 @@ _SIDECAR_VERSION = 1
 # "/"), so this "/"-less sentinel can never collide with one, and gather() only
 # ever reads cursors for keys in the resolved repo list — never this one.
 _NOTIF_CURSOR_KEY = "__notifications__"
-# A notification subject URL that names the THREAD itself rather than a comment
-# on it (".../issues/12", ".../pulls/12"). GitHub sets `latest_comment_url` to
-# this spelling when the thread carries no comment it can point at, and the
-# `.user.login` there is the thread AUTHOR, not whoever acted.
-_THREAD_URL_RE = re.compile(r"/(?:issues|pulls)/\d+$")
-# Notification reasons whose ACTOR is the author of the @-mention text, not
-# whoever commented most recently on the thread.
-_MENTION_REASONS = frozenset({"mention", "team_mention"})
 
 
 def _now_z() -> str:
@@ -391,7 +383,12 @@ class AccountActivityMonitor:
                 details.append("notifications: baselined")
             else:
                 nc, items = await self._poll_notifications(
-                    owner, n_since, wm, notif["reasons"], denylist, max_events
+                    owner,
+                    n_since,
+                    wm,
+                    notif["reasons"],
+                    denylist,
+                    steward_cfg.knob_int(cfg, "max_notifications_per_tick"),
                 )
                 for item in items:
                     did = await self._record_notification(item, mode)
@@ -903,34 +900,20 @@ class AccountActivityMonitor:
                 # GraphQL-only actor — record for the digest, no ping (follow-up).
                 items.append({**base, "actor": "", "ping": False})
                 continue
-            actor, fresh = await self._resolve_notification_actor(
-                subject,
-                owner,
-                mention=c["reason"] in _MENTION_REASONS,
-                since=since,
-                until=c["updated"],
+            actor, complete = await self._window_actor(
+                subject, owner, denylist, since=since, until=c["updated"]
             )
-            if actor is None:
-                items.append({**base, "actor": "", "ping": False})  # unresolved → digest-only
-                continue
-            if actor.lower() == owner.lower():
-                # The owner acted in this window — self-activity, whatever the
-                # reason. Safe to drop outright now that the search is WINDOWED:
-                # a genuine new mention by someone else falls inside the window
-                # and resolves to THEM, so nothing external is lost here. This
-                # used to keep a digest-only row for mentions, which is precisely
-                # the "notified about my own activity" report.
-                logger.debug("github steward: dropping self-activity on %s", c["repo"])
-                continue
-            auto = await self._is_automation(actor, denylist)
-            if auto is True:
-                logger.debug("github steward: dropping automation actor %s", actor)
-                continue  # bot / org (None → can't tell → surface rather than drop)
-            # `fresh` is False for a mention this window did not carry — the thread
-            # was merely bumped. Report it, never re-ping: the contributor already
-            # heard about it, and pinging again on every later update is the same
-            # noise complaint pointed at someone else.
-            items.append({**base, "actor": actor, "ping": fresh})
+            if actor:
+                items.append({**base, "actor": actor, "ping": True})
+            elif not complete:
+                # A surface could not be read, so "nobody else acted" is UNPROVEN.
+                # Keep it as a digest row rather than dropping on missing evidence.
+                items.append({**base, "actor": "", "ping": False})
+            else:
+                # Nobody but the owner and/or automation acted in this window.
+                # This is the reported defect: the steward notifying its owner
+                # about the owner's own traffic on their own threads.
+                logger.debug("github steward: dropping self/bot-only update on %s", c["repo"])
 
         # Advance the cursor. Clean sweep → wm. Truncation → the newest processed
         # timestamp STRICTLY BEFORE the first deferred item (tie-safe: advancing to
@@ -943,193 +926,106 @@ class AccountActivityMonitor:
         safe = [c["updated"] for c in work if c["updated"] < boundary]
         return (safe[-1] if safe else since), items
 
-    async def _resolve_notification_actor(
+    async def _window_actor(
         self,
         subject: dict,
         owner: str,
+        denylist: set[str],
         *,
-        mention: bool,
         since: str,
         until: str,
     ) -> tuple[str | None, bool]:
-        """Best-effort resolve of who ACTED on a notification's thread.
+        """Who, other than the owner and automation, acted on this thread this window.
 
-        The feed carries no actor inline, so this reads the thread's comments and
-        falls back to the pointers on the subject. Returns the login, or ``None``
-        when nothing can be attributed — it NEVER signals a cursor hold, so one
-        unresolvable item (a deleted comment, a rate-limited surface) can't freeze
-        the account-level lane.
+        This deliberately does NOT ask who wrote the ``@`` text. Attributing a
+        mention means reconstructing GitHub's own rendering rules from raw
+        Markdown, against an API that exposes no mention events and no edit
+        history — escaped literals, code fences, ``@org/team`` handles and edited
+        bodies each defeat it, and every fix for one of those opened another. The
+        question the owner actually asked is narrower and directly answerable:
+        did somebody ELSE do something here.
 
-        Everything is scoped to ``since < created_at <= until``, the same window
-        the notification itself covers. That window is load-bearing, not hygiene:
-        GitHub's ``reason`` is STICKY, so a thread the owner was mentioned in once
-        keeps producing ``mention`` notifications for every later update, and an
-        unwindowed search would keep re-attributing each of them to the original
-        mentioner — re-pinging a contributor for activity they had no part in.
+        Returns ``(login, complete)``:
+        * ``(login, True)``  — a real external human acted; ping-worthy.
+        * ``(None, True)``   — nobody but the owner and/or bots acted; the caller
+          drops it as self-activity, which is the whole point of the change.
+        * ``(None, False)``  — a surface could not be read, so ABSENCE is not
+          established. The caller keeps it as a digest row rather than dropping on
+          missing evidence.
 
-        Sources, in order:
-
-        1. For a mention, the author of the newest in-window comment whose body
-           actually NAMES the owner. The actor of a mention is whoever wrote the
-           @-text, not whoever commented last; those differ in the ordinary case,
-           and the difference is the bug this exists to fix. MEASURED on a live
-           feed: latest-commenter said the owner on both candidates, mention-author
-           said the review bot on both. (``team_mention`` is deliberately included
-           in the mention reasons even though an ``@org/team`` string never equals
-           a personal login: the search simply finds nothing and falls through.)
-        2. The author of the newest in-window comment, whatever it says — the right
-           answer for ``author``/``subscribed``, where the actor is the responder.
-        3. ``latest_comment_url``, when it names a COMMENT. GitHub also sets this
-           to the thread's own URL, which names the thread's AUTHOR instead; that
-           spelling is deferred to step 4 rather than read as an actor.
-        4. The thread author (``subject.url``) — an actor observation ONLY when it
-           is someone other than the owner. The owner authoring their own thread
-           says nothing about who acted on it, and reporting it as the actor is
-           what made ordinary self-traffic look like a resolved event.
-
-        An INCOMPLETE comment read answers NOTHING — not even from the sources
-        that did succeed. A partial answer is worse than none here: the caller
-        drops an item whose actor is a bot, so a half-read thread that happens to
-        surface an old bot comment would discard a human mention the unread half
-        was holding. Declining leaves it as a digest row, which is recoverable.
+        An event counts as in-window at ``max(created_at, updated_at)``: editing a
+        comment IS acting on the thread, and GitHub bumps the notification for it,
+        so keying on creation alone would silently drop a whole class of update.
+        Capped at ``until`` so an edit landing after this notification cannot
+        retroactively change what the notification was about.
         """
         rows, complete = await self._thread_comments(subject)
-        if not complete:
-            # Decline outright rather than answer from half the evidence. The
-            # caller DROPS an item whose actor is a bot, so a half-read thread
-            # that surfaces an old bot comment would discard a human mention the
-            # unread half was holding. Returning None keeps it as a digest row.
-            return None, False
-
-        if mention:
-            # ORIGIN, at any age — the mention that made this a mention thread.
-            # Deliberately NOT windowed: the window decides whether to PING, and
-            # who triggered it decides whether it is worth reporting at all. A
-            # thread the owner merely bumped still has a knowable trigger, and
-            # if that trigger was a bot the item is noise however recently the
-            # owner typed in it.
-            origin = await self._mention_origin(subject, owner, rows, until)
-            if origin is None:
-                # No identifiable mention anywhere: an @org/team mention, or a
-                # comment since edited or deleted. The latest commenter is NOT
-                # evidence about who mentioned the owner, so do not let it stand
-                # in — an owner reply here would otherwise read as self-activity
-                # and discard a real external mention.
-                return None, False
-            login = (origin.get("user") or {}).get("login") or None
-            fresh = since < (origin.get("created_at") or "") <= until
-            if not fresh:
-                # The mention predates this update, so something ELSE bumped the
-                # thread. If nobody but the owner acted in the window, that
-                # something was the owner: report it as their own activity so it
-                # drops, rather than re-listing a months-old mention every time
-                # they reply. Anyone else in the window and it stays reportable.
-                in_window = [r for r in rows if since < (r.get("created_at") or "") <= until]
-                others = [
-                    r
-                    for r in in_window
-                    if ((r.get("user") or {}).get("login") or "").lower() != owner.lower()
-                ]
-                if not others:
-                    logger.debug("github steward: stale mention, owner-only window")
-                    return owner, True
-            logger.debug("github steward: actor %s via mention-origin (fresh=%s)", login, fresh)
-            return login, fresh
-
-        in_window = [r for r in rows if since < (r.get("created_at") or "") <= until]
-        if login := _newest_comment_login(in_window):
-            logger.debug("github steward: actor %s via latest-comment", login)
+        # Scan BEFORE consulting `complete`: completeness is required only for the
+        # NEGATIVE conclusion. Evidence already in hand still proves someone acted,
+        # and returning early would let one flaky call out of five suppress a real
+        # contributor's ping.
+        in_window = [r for r in rows if _in_window(r, since, until)]
+        # Newest first: report the most recent human, not the first one found.
+        in_window.sort(key=_event_time, reverse=True)
+        for row in in_window:
+            login = _row_actor(row)
+            if not login or login.lower() == owner.lower():
+                continue
+            auto = await self._is_automation(login, denylist)
+            if auto is True:
+                continue
+            # auto is None → the human/bot lookup failed. Surface rather than
+            # drop: a classification blip must never silence a contributor.
+            logger.debug("github steward: window actor %s (automation=%s)", login, auto)
             return login, True
-
-        lcu = subject.get("latest_comment_url")
-        if lcu and not _THREAD_URL_RE.search(lcu) and (login := await self._login_at(lcu)):
-            logger.debug("github steward: actor %s via latest_comment_url", login)
-            return login, True
-
-        subject_url = subject.get("url") or ""
-        if subject_url:
-            login = await self._login_at(subject_url)
-            # Not `owner`: the owner is the thread's AUTHOR here, not its actor.
-            if login and login.lower() != owner.lower():
-                logger.debug("github steward: actor %s via thread-author", login)
-                return login, True
-        return None, False
-
-    async def _mention_origin(
-        self, subject: dict, owner: str, rows: list[dict], until: str
-    ) -> dict | None:
-        """The newest thing that actually MENTIONS ``owner`` — comment or thread body.
-
-        Searched at any age, deliberately. Who triggered a mention thread is a
-        different question from whether it happened in this window, and conflating
-        them is what loses signal in both directions: windowing the search alone
-        re-attributes stale threads to the wrong person, while refusing to look
-        outside the window leaves an owner reply looking like self-activity.
-
-        The thread BODY is a real mention surface and the comment endpoints do not
-        return it — an outside contributor opening a pull request that says
-        "@owner does this look right?" has mentioned the owner without commenting
-        at all. Returns a comment-shaped dict (``user``/``created_at``) or None
-        when nothing identifiable names the owner: an ``@org/team`` mention, whose
-        text never equals a personal login, or a comment since edited or deleted.
-        """
-        pattern = _mention_re(owner)
-        # Capped at `until`: a comment written AFTER this notification cannot be
-        # what it is about, and letting one in would re-date the attribution
-        # every time someone else typed between the poll and the resolve.
-        named = [
-            r
-            for r in rows
-            if pattern.search(r.get("body") or "") and (r.get("created_at") or "") <= until
-        ]
-
-        subject_url = subject.get("url") or ""
-        if subject_url:
-            ok, out = await run_gh_checked("gh", "api", subject_url, timeout=_GH_TIMEOUT)
-            if ok:
-                try:
-                    thread = json.loads(out)
-                except Exception:
-                    thread = None
-                if (
-                    isinstance(thread, dict)
-                    and pattern.search(thread.get("body") or "")
-                    and (thread.get("created_at") or "") <= until
-                ):
-                    named.append(thread)
-        if not named:
-            return None
-        return max(named, key=lambda r: r.get("created_at") or "")
+        # Nothing found. Claim ABSENCE only if the read was whole.
+        logger.debug("github steward: no external actor in window (complete=%s)", complete)
+        return None, complete
 
     async def _thread_comments(self, subject: dict) -> tuple[list[dict], bool]:
         """Every comment on a notification's thread, and whether the read is WHOLE.
 
+        Surfaces are chosen by ``subject.type``, NOT by matching substrings in the
+        URL: a repository (or owner) named ``pulls`` or ``issues`` makes a
+        substring test pick the wrong branch, request an endpoint that does not
+        exist, and mark the whole read incomplete. The type field is what GitHub
+        actually promises.
+
         A pull request carries THREE disjoint text surfaces — inline review
-                comments under ``/pulls/{n}/comments``, conversation comments under
-                ``/issues/{n}/comments``, and review SUMMARY bodies under
-                ``/pulls/{n}/reviews`` — and the flagship deep-poll reads only the second
-                (VERIFIED: those two id spaces do not intersect). All three are read here,
-                so a mention written in any of them has an actor at all.
+        comments under ``/pulls/{n}/comments``, conversation comments under
+        ``/issues/{n}/comments``, and review SUMMARY bodies under
+        ``/pulls/{n}/reviews``. The flagship deep-poll reads only the second
+        (VERIFIED: those two id spaces do not intersect). A commit carries its own
+        ``/commits/{sha}/comments``. Discussions are GraphQL-only and are handled
+        by the caller before reaching here.
 
-                Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
-                return OLDEST first and ignore ``direction`` on the conversation surface,
-                so a single-page read of a busy thread would silently return the oldest
-                100 comments and hand back a stale author with total confidence.
+        Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
+        return OLDEST first and the conversation surface ignores ``direction``, so
+        a single-page read of a busy thread would silently return the oldest 100.
 
-                Returns ``(rows, complete)``. ``complete`` is False when any surface failed
-                to read, so the caller can decline to answer rather than answering from
-                half the evidence.
+        Returns ``(rows, complete)``. ``complete`` is False when any surface failed
+        to read, so the caller can decline to conclude ABSENCE from a partial read.
+        The thread itself is included as an event: opening a pull request is an
+        action by its author, and on a freshly-opened thread it is the only one.
         """
         subject_url = subject.get("url") or ""
+        stype = subject.get("type") or ""
         urls: list[str] = []
-        if "/pulls/" in subject_url:
+        issue_url = _pull_url_to_issue_url(subject_url)
+        if stype == "PullRequest":
             urls.append(f"{subject_url}/comments")  # inline review comments
-            urls.append(f"{_pull_url_to_issue_url(subject_url)}/comments")
+            urls.append(f"{issue_url}/comments")  # conversation comments
             urls.append(f"{subject_url}/reviews")  # review SUMMARY bodies
-        elif "/issues/" in subject_url:
+            urls.append(f"{issue_url}/timeline")  # merges, closes, pushes, assigns
+        elif stype == "Issue":
+            urls.append(f"{issue_url}/comments")
+            urls.append(f"{issue_url}/timeline")
+        elif stype == "Commit":
             urls.append(f"{subject_url}/comments")
-        if not urls:
-            return [], True  # no comment surface exists — a complete read of nothing
+        if not subject_url or not urls:
+            # An unmodelled subject type: we cannot enumerate its surfaces, so we
+            # cannot claim nobody acted. Incomplete, not empty — never "absent".
+            return [], False
 
         rows: list[dict] = []
         complete = True
@@ -1138,26 +1034,28 @@ class AccountActivityMonitor:
                 "gh", "api", f"{url}?per_page=100", "--paginate", "--slurp", timeout=_GH_TIMEOUT
             )
             if not ok:
-                complete = False  # never holds the cursor; only withholds an answer
+                complete = False  # never holds the cursor; only withholds a verdict
                 continue
-            for row in _parse_paged(out):
-                # A review carries `submitted_at` where a comment carries
-                # `created_at`. Normalise so one recency rule covers all three
-                # surfaces; a PENDING review has neither and sorts to the back.
-                if "created_at" not in row and (ts := row.get("submitted_at")):
-                    row = {**row, "created_at": ts}
-                rows.append(row)
-        return rows, complete
+            rows.extend(_parse_paged(out))
 
-    async def _login_at(self, url: str) -> str | None:
-        """``.user.login`` at one API url, or None on any error/shape mismatch."""
-        ok, out = await run_gh_checked("gh", "api", url, timeout=_GH_TIMEOUT)
+        # The thread itself — its author acted when they opened it.
+        ok, out = await run_gh_checked("gh", "api", subject_url, timeout=_GH_TIMEOUT)
         if not ok:
-            return None  # never holds the cursor — the caller falls through
+            return rows, False
         try:
-            return (json.loads(out).get("user") or {}).get("login") or None
+            thread = json.loads(out)
         except Exception:
-            return None
+            logger.warning(
+                "github steward: thread object unreadable for %s", subject_url, exc_info=True
+            )
+            return rows, False
+        if not isinstance(thread, dict):
+            # `null` parses fine and is not a dict. Without the author row we
+            # cannot claim nobody acted, so this is incomplete, not empty.
+            logger.warning("github steward: thread object was not an object: %s", subject_url)
+            return rows, False
+        rows.append(thread)
+        return rows, complete
 
     async def _record_notification(self, item: dict, mode: str) -> bool:
         """Record a notification observation; ping immediately in ``live`` mode.
@@ -1282,28 +1180,43 @@ def _parse_paged(out: str) -> list[dict]:
     return flat
 
 
-def _mention_re(login: str) -> re.Pattern[str]:
-    """Match an @-mention of ``login`` and nothing that merely contains it.
+# The timestamps a thread event may carry, by surface: comments and the thread
+# object use created_at/updated_at, a review uses submitted_at, a timeline event
+# uses created_at only.
+_EVENT_TIME_KEYS = ("created_at", "updated_at", "submitted_at")
 
-    The right-hand guard stops `@owner` matching `@owner-ci` or `@ownerBot`;
-    a bare ``\\b`` would accept both, since `-` ends a word boundary. The
-    left-hand guard stops a longer handle or an address local-part
-    (`foo@owner`, `a.b@owner`) reading as a mention.
+
+def _row_actor(row: dict) -> str:
+    """The login that ACTED, across every surface shape GitHub returns.
+
+    Not one field: a comment or review nests it under ``user``, a timeline event
+    under ``actor``, and a commit or release under ``author`` — with ``user``
+    present but ``null``. Reading only ``user`` silently scores a real external
+    action as nobody, which on this path means claiming nobody acted. Returns ""
+    when no login is readable (a deleted account leaves every field null).
     """
-    return re.compile(rf"(?<![A-Za-z0-9._%+-])@{re.escape(login)}(?![A-Za-z0-9-])", re.IGNORECASE)
+    for key in ("user", "actor", "author"):
+        login = (row.get(key) or {}).get("login")
+        if login:
+            return login
+    return ""
 
 
-def _newest_comment_login(rows: list[dict]) -> str | None:
-    """Author of the newest row by ``created_at``.
+def _in_window(row: dict, since: str, until: str) -> bool:
+    """Did this row represent somebody acting inside ``(since, until]``?
 
-    Chosen by max rather than by position: these endpoints return OLDEST
-    first, and the conversation surface ignores ``direction`` entirely, so
-    trusting the ordering would hand back the oldest commenter as the latest.
+    ANY of its timestamps landing in the window counts, rather than the newest
+    one: a comment created inside the window and edited after ``until`` would
+    otherwise score out-of-window and vanish, which on this path is a silent
+    drop of a real contributor. A row carrying no timestamp at all matches
+    nothing and is handled by the caller's completeness rule, not here.
     """
-    if not rows:
-        return None
-    newest = max(rows, key=lambda r: r.get("created_at") or "")
-    return (newest.get("user") or {}).get("login") or None
+    return any(since < (row.get(k) or "") <= until for k in _EVENT_TIME_KEYS)
+
+
+def _event_time(row: dict) -> str:
+    """The row's newest timestamp — used ONLY to order in-window rows."""
+    return max((row.get(k) or "") for k in _EVENT_TIME_KEYS)
 
 
 def _pull_url_to_issue_url(pull_url: str) -> str:
