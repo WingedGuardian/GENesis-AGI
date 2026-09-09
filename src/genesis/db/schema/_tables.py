@@ -286,7 +286,11 @@ TABLES = {
             delivered_at        TEXT,
             thread_id           TEXT,
             validated_recipient TEXT,
-            labeled_surplus     INTEGER NOT NULL DEFAULT 0
+            labeled_surplus     INTEGER NOT NULL DEFAULT 0,
+            -- NULL = live; non-NULL = cancelled at that time. Deliberately ONE
+            -- column rather than a flag + timestamp like `delivered` above: this
+            -- way "cancelled with no timestamp" is unrepresentable.
+            cancelled_at        TEXT
         )
     """,
     "brainstorm_log": """

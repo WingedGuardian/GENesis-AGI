@@ -223,6 +223,13 @@ _NO_OUTREACH_ENGAGEMENT = [
     "mcp__genesis-outreach__outreach_engagement",
     "mcp__genesis-outreach__outreach_preferences",
     "mcp__genesis-outreach__outreach_queue",
+    # outreach_pending lists the QUEUED messages (id + a message preview) and
+    # outreach_cancel retracts one. Denied alongside outreach_queue for the same
+    # reason: a profile that may not read delivered history has no business
+    # reading the pending queue either, and cancel is a destructive write on
+    # owner-facing alerts.
+    "mcp__genesis-outreach__outreach_pending",
+    "mcp__genesis-outreach__outreach_cancel",
 ]
 
 _NO_RECON_WRITES = [
@@ -238,10 +245,41 @@ _NO_WEB_TOOLS = [
 ]
 
 # Perimeter sessions: block outreach tools beyond basic send.
+#
+# NOTE ON POLARITY — this is a DENY list, so a tool nobody enumerates is
+# ALLOWED. The `mail` profile's comment claims "only outreach_send is
+# available"; that is a description of the intended result, not something the
+# mechanism enforces. Every new genesis-outreach tool is reachable from the
+# untrusted-inbound perimeter until it is named here. Add new tools to this list
+# as part of adding them, not afterwards.
 _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-outreach__outreach_poll",
     "mcp__genesis-outreach__outreach_digest",
+    # Queue introspection is an exfiltration surface — outreach_pending returns
+    # up to 50 queued messages with a preview of each, which an injected inbound
+    # message could have echoed back through the profile's own reply tool. Cancel
+    # is worse: it silently retracts the owner's queued reminders and alerts.
+    "mcp__genesis-outreach__outreach_pending",
+    "mcp__genesis-outreach__outreach_cancel",
+]
+
+# Host-capacity actuators. They live on the genesis-outreach server (it owns the
+# owner-approval channel they use), so a profile that mounts that server for its
+# reply tool gets these too unless they are named here — which is how they were
+# reachable from the untrusted-inbound perimeter until the allowlist-polarity test
+# in tests/test_cc/test_direct_session_profiles.py surfaced them.
+#
+# Both are approval-gated (an APPROVE/DENY request goes to the owner's channel and
+# nothing mutates without it), so this is not a silent-compromise path. It is still
+# wrong: injected inbound content should not be able to raise plausible-looking
+# infrastructure approval prompts in the owner's channel, and the gate is defence
+# in depth rather than a reason to leave the actuator reachable. Denied on the
+# perimeter only — an autonomous working session asking the owner to grow a disk is
+# the intended use.
+_NO_PROVISIONING = [
+    "mcp__genesis-outreach__provision_grow",
+    "mcp__genesis-outreach__provision_vzdump",
 ]
 
 # Cold-marketing tools. marketing_send resolves its recipient in-code from the
@@ -305,11 +343,23 @@ PROFILES: dict[str, list[str]] = {
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
+    # Also a perimeter profile — it reads external Discord messages (see
+    # _PROFILE_ORIGIN below, which classifies it as external-ingesting). It mounts
+    # genesis-outreach (session_config.py) but carried NEITHER outreach deny group,
+    # so the whole outreach surface beyond send — digest, queue, poll,
+    # send_and_wait, engagement, preferences — plus both host-capacity actuators
+    # were reachable from attacker-controlled Discord content. `mail` had the same
+    # shape and was covered; this profile was simply never given the same groups.
+    # Surfaced by the allowlist-polarity test, which is the point of stating the
+    # boundary as an allowlist: an `in`-based test cannot fail for an omission.
     "community-responder": (
         _UNIVERSAL_DISALLOW
         + _NO_BROWSER_INTERACTION
         + _NO_MEMORY_WRITES
         + _NO_FOLLOW_UPS
+        + _NO_OUTREACH_ENGAGEMENT
+        + _NO_OUTREACH_EXTRAS
+        + _NO_PROVISIONING
         + _NO_MARKETING_SEND
     ),
     # ── Perimeter profile ────────────────────────────────────────
@@ -328,6 +378,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_WEB_TOOLS
         + _NO_OUTREACH_EXTRAS
+        + _NO_PROVISIONING
         + _NO_MARKETING_SEND
     ),
 }
