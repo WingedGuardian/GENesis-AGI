@@ -48,6 +48,39 @@ not to confirm:
   itself a review failure.
 - **End with a verdict:** `Ready to merge: Yes | No | With fixes` + a one-line reason.
 
+### Documentation is out of scope for review
+
+Do not review CHANGELOG entries, release notes, README, or ordinary `docs/`
+prose, and do not raise findings on them. They ship no behaviour: an imprecise
+sentence in a changelog cannot break an install, while a review round spent on
+one costs the same as a round spent on the code that can. Skip them and put the
+whole budget on executable code.
+
+This does NOT relax factual accuracy where prose makes a CHECKABLE claim about
+behaviour — "restores the previous behaviour exactly", "defaults to off", a
+config key or a path. If such a statement contradicts the diff it describes, that
+is a code-adjacent defect and is still worth one line. The distinction is between
+*wrong* and merely *improvable*: report the first, ignore the second.
+
+<!-- BEGIN prose-review-scope (temporary; remove this block to restore full prose review) -->
+### Prompts, skills and other prose: basic factual accuracy only
+
+Markdown, agent and skill definitions, and other prose surfaces get a
+FACTUAL-ACCURACY pass, not the adversarial enumeration above. Check that what the
+text asserts matches the code it describes — a named file, function, flag,
+default or command that does not exist, or a claim the diff contradicts. Stop
+there.
+
+Do not enumerate wording, structure, tone, completeness, redundancy, or
+hypothetical misreadings by a future reader, and do not open a finding whose
+remedy is a rewrite for clarity. Prose in this repository is deliberately long
+and argumentative because it has to survive being read out of context by a fresh
+session; density there is a feature, and reviewing it as if it were code produces
+volume without defects.
+
+Executable code is unaffected by this section — review it in full.
+<!-- END prose-review-scope -->
+
 ## GitNexus — Code Intelligence (advisory)
 
 This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,

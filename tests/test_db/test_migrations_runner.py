@@ -392,16 +392,24 @@ class TestConnectionProxy:
 
 
 class TestDuplicatePrefixDetection:
-    """Pre-flight check must catch duplicate migration prefixes before running."""
+    """Pre-flight check must catch duplicate migration ids before running.
+
+    These use TIMESTAMP ids because that is the only collision still reachable.
+    A duplicate LEGACY id cannot occur any more: the frozen set holds exactly
+    one filename per legacy id, so a second file claiming ``0001`` is refused
+    by discovery as an illegal legacy id before the duplicate pre-flight is
+    consulted. Two authors CAN still stamp the same second, which is what this
+    pre-flight exists for.
+    """
 
     @pytest.mark.asyncio
     async def test_duplicate_prefix_raises_before_any_migration_runs(
         self, db, tmp_path, monkeypatch,
     ) -> None:
-        # Create two migration files with the same prefix in a temp dir
+        # Two migration files claiming the same timestamp id in a temp dir
         migrations_dir = tmp_path / "migrations"
         migrations_dir.mkdir()
-        for name in ("0001_alpha.py", "0001_beta.py"):
+        for name in ("20260904120000_alpha.py", "20260904120000_beta.py"):
             (migrations_dir / name).write_text(
                 "async def up(db): pass\n"
             )
@@ -410,7 +418,9 @@ class TestDuplicatePrefixDetection:
         )
 
         runner = MigrationRunner(db)
-        with pytest.raises(RuntimeError, match=r"Duplicate migration prefix '0001'"):
+        with pytest.raises(
+            RuntimeError, match=r"Duplicate migration prefix '20260904120000'"
+        ):
             await runner.run_pending()
 
         # No migrations applied — check was pre-flight
@@ -421,13 +431,13 @@ class TestDuplicatePrefixDetection:
     async def test_no_false_positive_on_unique_prefixes(
         self, db, tmp_path, monkeypatch,
     ) -> None:
-        """Unique prefixes pass the pre-flight check (verified via get_pending)."""
+        """Unique ids pass the pre-flight check (verified via get_pending)."""
         migrations_dir = tmp_path / "migrations"
         migrations_dir.mkdir()
-        (migrations_dir / "0001_alpha.py").write_text(
+        (migrations_dir / "20260904120000_alpha.py").write_text(
             "async def up(db): pass\n"
         )
-        (migrations_dir / "0002_beta.py").write_text(
+        (migrations_dir / "20260904120001_beta.py").write_text(
             "async def up(db): pass\n"
         )
         monkeypatch.setattr(

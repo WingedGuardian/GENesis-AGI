@@ -388,7 +388,7 @@ the delta touches:
   backstop).
 - **`--flags` Genesis passes** (`--model`, `--mcp-config`, `--bare`, `-p`, `--append-system-prompt`).
 
-Capture any such change as a follow-up + a doc entry — that is how the next update stays
+Capture any such change as a GitHub issue + a doc entry — that is how the next update stays
 execute-not-rediscover.
 
 ## Detection → behavior (new-capability adoption path)
@@ -401,8 +401,14 @@ existing Genesis workflow, replaces a hand-rolled mechanism, or covers a known
 gap), do BOTH:
 
 1. File the informational KB entry as usual (no alert — calibration unchanged).
-2. Create a `follow_up_create` row (`work_state="ready"`, low priority) naming
-   the SPECIFIC instruction change, e.g. "once CC >= vX.Y.Z is pinned: prefer
+2. File a GitHub ISSUE (see the mechanics in `.claude/docs/mcp-tools-guide.md`) naming
+   the SPECIFIC instruction change — editing a skill or CLAUDE.md is repo work,
+   so it belongs on the public tracker. At THIS step the selected pin is already
+   deployed and validated (steps 8-9), so the issue alone is enough — do NOT add a
+   `blocked_on_trigger` row here; it would record a blocker already satisfied and,
+   since the condition is never evaluated, sit there indefinitely. Add one only for
+   a pin genuinely not yet reached, with a `revisit_condition` (the tool
+   hard-errors without one). E.g. "once CC >= vX.Y.Z is pinned: prefer
    native `/design` over the gstack `design-*` skills for UI drafting; decide
    precedence and update the relevant skill/CLAUDE.md instruction". A
    capability nobody wires into an instruction is a capability Genesis never

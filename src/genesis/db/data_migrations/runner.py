@@ -14,7 +14,6 @@ import importlib
 import logging
 import math
 import os
-import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -22,13 +21,22 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db._migration_discovery import discover_numbered_modules
+from genesis.db._migration_ids import DATA, DATA_MIGRATION_PATTERN
 from genesis.db.crud import data_migrations as crud
 from genesis.db.data_migrations._util import MigrationDependencyUnavailable
 
 logger = logging.getLogger(__name__)
 
 _DATA_MIGRATIONS_DIR = Path(__file__).parent
-_DATA_MIGRATION_PATTERN = re.compile(r"^(d\d{4})_\w+\.py$")
+#: A ``d`` + 4-digit legacy id OR ``d`` + a 14-digit UTC timestamp. Defined in
+#: ``db/_migration_ids`` (stdlib-only, shared with CI's guard); see the schema
+#: runner's module docstring for why new ids are timestamps.
+#:
+#: MATCHING IS NOT SUFFICIENT — the pattern says well-FORMED, not ALLOWED; the
+#: legacy set is enumerated, and ``classify`` is the verdict. Discovery raises
+#: on anything that presents as a data migration and cannot run, because a
+#: silently-skipped backfill is indistinguishable from one that ran.
+_DATA_MIGRATION_PATTERN = DATA_MIGRATION_PATTERN
 
 # The ledger bookkeeping (mark_completed / mark_failed) writes through the shared
 # server connection, which waits only BUSY_TIMEOUT_MS (5s) for the write lock. A
@@ -110,7 +118,9 @@ class DataMigrationRunner:
         self._db = db
 
     def _discover(self) -> list[tuple[str, str, Path]]:
-        return discover_numbered_modules(_DATA_MIGRATIONS_DIR, _DATA_MIGRATION_PATTERN)
+        # Raises if any file presents as a data migration but cannot run — a
+        # silently-skipped backfill is indistinguishable from one that ran.
+        return discover_numbered_modules(_DATA_MIGRATIONS_DIR, DATA)
 
     async def run_pending(self) -> list[dict]:
         """Run every claimable data migration once. Returns per-migration outcomes.
@@ -120,7 +130,7 @@ class DataMigrationRunner:
         task) and never blocks the others."""
         available = self._discover()
 
-        # Pre-flight: two files sharing a dNNNN prefix would collide on the
+        # Pre-flight: two files sharing a d-prefix would collide on the
         # ledger PRIMARY KEY. Unlike the schema runner (whose plain INSERT
         # surfaces the clash as a UNIQUE error mid-run), our ensure_row uses
         # INSERT OR IGNORE, so a collision would SILENTLY drop the second
@@ -131,7 +141,8 @@ class DataMigrationRunner:
             if mid in seen:
                 raise RuntimeError(
                     f"Duplicate data-migration prefix '{mid}': '{seen[mid]}' and "
-                    f"'{name}'. Rename one to the next free prefix."
+                    f"'{name}'. Rename one to a fresh UTC timestamp id "
+                    f"(`d$(date -u +%Y%m%d%H%M%S)`)."
                 )
             seen[mid] = name
 
