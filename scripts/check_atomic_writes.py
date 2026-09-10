@@ -599,6 +599,41 @@ _CATCHES_MOVE = _FULLY_CATCHES | {
 }
 
 
+def _unlinks_on_success(scope: ast.AST, temp: str, lineno: int, covering: list) -> bool:
+    """Is the temp removed on the path where the publish SUCCEEDS?
+
+    Two ways to qualify:
+      * a covering `finally` that unlinks -- it runs on every path out, success
+        included;
+      * an unlink AFTER the publish that is not inside an `except` handler, i.e.
+        one the normal flow reaches.
+
+    An unlink reachable only from a handler does not qualify: that path is the
+    failure path, and a hardlink publish leaks on the SUCCESS path.
+    """
+    if any(f is not None and _unlinks([f], temp, scope) for _, f in covering):
+        return True
+    handler_bodies = [
+        h.body for n in ast.walk(scope) if isinstance(n, _TRY_NODES)
+        for h in n.handlers
+    ]
+
+    def _in_handler(line: int) -> bool:
+        return any(
+            any(c.lineno <= line <= (c.end_lineno or c.lineno) for c in body)
+            for body in handler_bodies
+        )
+
+    for n in ast.walk(scope):
+        if not isinstance(n, ast.Call) or n.lineno <= lineno:
+            continue
+        if _in_handler(n.lineno):
+            continue
+        if _unlinks([n], temp, scope):
+            return True
+    return False
+
+
 def _reraises(handler: ast.ExceptHandler) -> bool:
     """Does this handler end by re-raising, so an OUTER handler still runs?
 
@@ -1077,6 +1112,20 @@ def analyse_source(src: str, rel: str) -> list[dict]:
                 if (wants & operands) and not _handlers_covering(scope, n.lineno):
                     verdict = "LEAKS"
                     break
+        # PUBLISH-BY-HARDLINK NEEDS CLEANUP ON THE **SUCCESS** PATH TOO.
+        # `os.link` does not consume its source: after a SUCCESSFUL publish the
+        # staging entry is still on disk, so exception-only cleanup leaks once
+        # per successful write -- the common case, not the error case. This file
+        # already said "link does not consume its source, so the temp ALWAYS
+        # needs an explicit unlink" when the verb was added, and then routed link
+        # sites through the rename verdict anyway, which contradicted it. A
+        # covering `finally` satisfies this (it runs on success); so does an
+        # unlink on the normal path after the link. An unlink reachable only from
+        # an `except` does not.
+        if verdict == "CLEANS_UP" and verb == "link" and not _unlinks_on_success(
+            scope, temp, node.lineno, covering
+        ):
+            verdict = "LEAKS"
         rows.append({"file": rel, "line": node.lineno,
                      # `_qualname` dereferences node.name, so module scope keeps
                      # its literal label rather than being passed None. The old

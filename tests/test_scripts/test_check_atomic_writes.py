@@ -286,7 +286,7 @@ def write_batch(dir_path, stem, payload):
     return path
 """
 
-_HARDLINK_PUBLISH_CLEANS_UP = """
+_HARDLINK_EXCEPTION_ONLY_STILL_LEAKS = """
 import os
 
 _STAGING_SUFFIX = ".part"
@@ -303,6 +303,44 @@ def write_batch(dir_path, stem, payload):
         os.unlink(staging)
         return None
     return path
+"""
+
+_HARDLINK_PUBLISH_CLEANS_UP = """
+import os
+
+_STAGING_SUFFIX = ".part"
+
+
+def write_batch(dir_path, stem, payload):
+    staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
+    path = os.path.join(dir_path, f"{stem}.jsonl")
+    try:
+        with open(staging, "w") as fh:
+            fh.write(payload)
+        os.link(staging, path)
+    except OSError:
+        os.unlink(staging)
+        return None
+    os.unlink(staging)
+    return path
+"""
+
+_HARDLINK_FINALLY_CLEANS_UP = """
+import os
+
+_STAGING_SUFFIX = ".part"
+
+
+def write_batch(dir_path, stem, payload):
+    staging = os.path.join(dir_path, f"{stem}{_STAGING_SUFFIX}")
+    path = os.path.join(dir_path, f"{stem}.jsonl")
+    try:
+        with open(staging, "w") as fh:
+            fh.write(payload)
+        os.link(staging, path)
+        return path
+    finally:
+        os.unlink(staging)
 """
 
 _NON_OS_LINK_IS_NOT_A_MOVE = """
@@ -453,6 +491,28 @@ def test_publish_by_hardlink_is_an_atomic_write():
     deleted from the real file, the guard reported `0 NEW` and exited 0."""
     assert _verdicts(_HARDLINK_PUBLISH_LEAKS) == ["LEAKS"]
     assert _verdicts(_HARDLINK_PUBLISH_CLEANS_UP) == ["CLEANS_UP"]
+
+
+def test_a_hardlink_publish_must_clean_up_on_the_SUCCESS_path():
+    """`os.link` does not CONSUME its source. After a successful publish the
+    staging entry is still on disk, so exception-only cleanup leaks once per
+    SUCCESSFUL write -- the common case, not the error case.
+
+    This guard said exactly that when the link verb was added ("link does not
+    consume its source, so the temp ALWAYS needs an explicit unlink") and then
+    routed link sites through the rename verdict anyway, which contradicted it.
+    Worse, the fixture on the line above USED to assert that the exception-only
+    shape was CLEANS_UP -- the suite encoded the defect, so nothing could catch
+    it. Found by Codex on the head that shipped the verb.
+
+    A covering `finally` qualifies (it runs on success) and so does an unlink on
+    the normal path after the link; an unlink reachable only from an `except`
+    does not, because that is the failure path.
+
+    Rename/replace/move are NOT subject to this: they consume the source, so
+    after a successful rename there is nothing left to unlink."""
+    assert _verdicts(_HARDLINK_EXCEPTION_ONLY_STILL_LEAKS) == ["LEAKS"]
+    assert _verdicts(_HARDLINK_FINALLY_CLEANS_UP) == ["CLEANS_UP"]
 
 
 def test_link_on_a_non_os_receiver_is_not_a_move():
