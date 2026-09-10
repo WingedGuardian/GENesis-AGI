@@ -1022,3 +1022,31 @@ class TestSectionDepthDrift:
         )
         entries, _, _, drift = guard_module._cr_outside_diff_entries(body)
         assert entries and not drift
+
+
+def test_every_surfaced_finding_is_printed(guard_module, monkeypatch, no_inline, capsys):
+    """No display cap on this channel — the inventory IS the output.
+
+    The inline channel can afford one, because its findings also reach a score
+    and a clipped list still blocks. Here nothing scores, so an entry dropped
+    for display is a finding that never reaches the operator at all: cutting
+    the only copy, which is the amputation CLAUDE.md forbids.
+
+    VERIFY-RED: restore any of the `[:5]` / `[:8]` slices and this fails.
+    """
+    entries = "\n".join(
+        _entry(f"src/f{i}.py", f"{i}-{i}", "🟠 Major", f"Major finding {i}") for i in range(9)
+    )
+    monkeypatch.setenv(
+        "_TEST_GH_PR_FILES",
+        "\n".join(
+            json.dumps({"filename": f"src/f{i}.py", "previous_filename": None})
+            for i in range(9)
+        ),
+    )
+    monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(_section(entries)))
+    with no_inline:
+        guard_module._check_inline_review_findings("100")
+    err = capsys.readouterr().err
+    missing = [i for i in range(9) if f"Major finding {i}" not in err]
+    assert not missing, f"findings dropped from the only place they appear: {missing}"

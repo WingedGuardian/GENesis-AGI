@@ -2137,9 +2137,19 @@ def _check_inline_review_findings(
     CodeRabbit could NOT anchor inline (an "Outside diff range comments"
     section in the review body) — a channel no gate could see until 2026-09-07,
     when 27 findings across 23 open PRs were measured invisible, 15 of them
-    Major and two floor-class. Both feed ONE score and ONE threshold; see the
-    severity policy at the outside-diff block below for why only a Critical
-    from the second channel scores.
+    Major and two floor-class.
+
+    THE TWO CHANNELS ARE NOT SYMMETRIC. Only the INLINE channel feeds the score
+    and the threshold. The review-body channel is ADVISORY AT EVERY SEVERITY —
+    surfaced, never scored — and its incomplete-read canaries print a NOTE
+    rather than blocking. That is a deliberate design decision taken at the
+    escalation cap (2026-09-09): every fail-open this parser produced was
+    reachable only because a mis-read of a third-party rendered document could
+    move a blocking verdict, and the scoring path had never once fired on live
+    data (0 Criticals in those 27 findings). An earlier version of this
+    docstring described the symmetric design and outlived it by one commit —
+    which is the failure mode a stale contract statement always has: a
+    maintainer relies on enforcement the gate no longer provides.
 
 
     Returns (should_block, message). Each unresolved finding contributes to a review
@@ -2506,11 +2516,18 @@ def _check_inline_review_findings(
             f"{len(outside_minor)} below-Major:",
             file=sys.stderr,
         )
-        for label, _p in outside_critical[:5]:
+        # PRINT EVERY ONE. The inline channel can afford a display cap because
+        # its findings also reach a SCORE, so a clipped list still blocks. This
+        # channel scores nothing, so the printed inventory is its ONLY output —
+        # a silently dropped entry is a finding that never reaches the operator
+        # at all, which is precisely the amputation CLAUDE.md forbids: cutting
+        # the only copy. Bounded by what CodeRabbit chose to report, and 27
+        # findings across 23 PRs was the whole measured population.
+        for label, _p in outside_critical:
             print(f"  [outside-diff Critical] {label}", file=sys.stderr)
-        for label, _p in outside_major[:8]:
+        for label, _p in outside_major:
             print(f"  [outside-diff Major] {label}", file=sys.stderr)
-        for label, _p, sev in outside_minor[:5]:
+        for label, _p, sev in outside_minor:
             print(f"  [outside-diff {sev.capitalize() or 'Minor'}] {label}", file=sys.stderr)
 
     if unmatched_bot:
