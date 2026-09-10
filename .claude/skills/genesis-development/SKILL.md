@@ -820,8 +820,13 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   ALLOW / 2 BLOCK, PR head 339 / 407, after the fix 534 / 212. That surfaced 206
   over-blocks which a 129,179-command corpus had shown none of. A second sweep
   built 384 cells over the same four axes. Run the matrix against main as well as
-  against your branch — if the two verdict distributions are identical, the
-  harness is measuring nothing and the finding is about your harness.
+  against your branch, and compare it PER CELL, keyed by input — never by the
+  aggregate counts. Two cells can swap ALLOW and BLOCK while the totals sit
+  identical, and a resource-only fix legitimately preserves every verdict (the
+  next bullet is exactly that case), so a matching distribution proves nothing in
+  either direction. What establishes a live harness is a known differentiating
+  control: an input whose verdict you can predict and which the two trees are
+  known to answer differently.
   **Instrument the probe before you trust 746 of anything.** These guards emit
   ASK as JSON on stdout with EXIT CODE 0, so a probe reading only the return code
   cannot tell ASK from ALLOW — and ASK is precisely the state a newly added flag
@@ -837,7 +842,7 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   specific exploit it existed for — three passes, all CORRECTNESS, all green —
   while the scan itself was quadratic in the length of a SINGLE token, the
   ordinary accidental-O(n²) shape of a nested scan with no early exit. On the
-  linear form it stayed sub-millisecond at every length; on the pathological one
+  linear form it held flat at 0.004s (4ms) at every length; on the pathological one
   it ran to SECONDS, then minutes, at input sizes a caller can simply type. A
   PreToolUse hook that overruns its wall-clock is SIGKILLed, and a killed hook
   fails OPEN — the guard code says as much in its own comments — so a scan that
@@ -1664,13 +1669,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   a correct verification OF THE FIX, and a false statement about the PR. MEASURED
   2026-09-09: a session reported a peer's PR as one blocker from green on exactly
   that confusion. So say which tree produced any verdict you pass on, and for a
-  claim about a PR's CURRENT state, run it from a tree at `origin/main`. The
-  bounding check is cheap enough to make a habit —
-  `git log --since=<window> origin/main -- scripts/hooks/git_push_guard.py` (add
-  whichever modules the checker imports) — because if the checker did not change
-  inside the window, every verdict taken in that window used identical logic and
-  this cannot have bitten. The same reasoning applies to any local checker whose
-  answer is about a remote object.
+  claim about a PR's CURRENT state, run it from a tree at `origin/main`. To bound
+  a verdict you already took, compare the CHECKER ITSELF across the two trees, not
+  main's history: `git diff origin/main -- scripts/hooks/git_push_guard.py` (add
+  whichever modules the checker imports), or hash the blobs. Reaching for
+  `git log origin/main -- <checker>` instead is the trap — it inspects only what
+  landed on main, so it comes back EMPTY in the exact case that bites you, a
+  worktree carrying an unmerged change to the gate. Empty history is not identical
+  logic. The same reasoning applies to any local checker whose answer is about a
+  remote object.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
   A PR touching the enforcement-hook surface (the guard code itself) gets almost no
   stale-review leniency: the merge gate (1) never classifies a post-review delta that
