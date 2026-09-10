@@ -5,17 +5,11 @@
   It is the likeliest path there is: retrying a correction re-sends the same
   content with a corrected id, and lands exactly there.
 
-  The dedup short-circuit now performs the supersede, with two guards the
-  normal path does not need. On that path the successor is not a memory the
-  caller chose -- it is whatever the duplicate lookup matched, and that lookup
-  consults neither the supersede target nor the deprecation column. So a memory
-  can no longer replace itself (which deprecated the only copy and recorded it
-  as its own correction), and a correction can no longer land on an
-  already-deprecated memory (which deprecated the target toward a successor
-  recall filters out -- both halves gone). Both are rejected before anything is
-  written.
-
-  The supersede also sits outside the duplicate lookup's own error handler.
-  Inside it, a failed supersede was logged as a failed lookup and execution
-  fell through into the full store pipeline, writing a second copy of content
-  the lookup had just proved already existed.
+  The duplicate check now runs *after* the supersede target has been resolved,
+  so a request to deprecate a memory that does not exist no longer succeeds
+  quietly just because the content happened to be a duplicate. When the content
+  does already exist, that memory becomes the successor -- and because it is a
+  memory the caller never chose, the pair is validated first, using the same
+  check `memory_supersede` uses. A memory cannot replace itself, and a
+  correction cannot land on an already-deprecated memory that recall filters
+  out. Both are rejected before anything is written.

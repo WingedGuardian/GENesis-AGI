@@ -135,10 +135,21 @@ async def _links(db):
     return [tuple(r) for r in await cur.fetchall()]
 
 
+async def _supersede(store, handle, new_id, ts):
+    """Resolve then mark, in the order ``store()`` does it.
+
+    Resolution is a SEPARATE step that runs before any write. Driving the two
+    together here keeps these tests on the real call order rather than on a
+    combined method that no longer exists.
+    """
+    resolved = await store._resolve_supersede_target(handle)
+    return await store._mark_superseded(resolved, new_id, ts)
+
+
 @pytest.mark.asyncio()
 async def test_eight_char_prefix_deprecates_the_memory_it_names(store, db):
     """THE LIVE BUG: an 8-char handle must supersede, not silently no-op."""
-    await store._mark_superseded(PREFIX, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, PREFIX, NEW, "2026-09-06T19:53:21+00:00")
 
     row = await _row(db, OLD)
     assert row["deprecated"] == 1, (
@@ -151,7 +162,7 @@ async def test_eight_char_prefix_deprecates_the_memory_it_names(store, db):
 @pytest.mark.asyncio()
 async def test_prefix_never_becomes_a_dangling_link_source(store, db):
     """The only artifact of the broken path was an edge from a non-memory."""
-    await store._mark_superseded(PREFIX, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, PREFIX, NEW, "2026-09-06T19:53:21+00:00")
 
     links = await _links(db)
     assert (PREFIX, NEW, "succeeded_by") not in links, (
@@ -166,10 +177,12 @@ async def test_unknown_id_is_reported_not_swallowed(store, db):
     from genesis.memory.store import SupersedeUnresolved
 
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded("deadbeef", NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, "deadbeef", NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "not_found"
-    assert exc.value.stored_memory_id == NEW, "caller needs a handle on what DID land"
+    # Nothing is stored and nothing is claimed about the target's recall state —
+    # resolution is exactly what just failed to establish it.
+    assert "no deprecation was performed" in str(exc.value)
     assert await _links(db) == [], "no edge may be written for an unresolved target"
 
 
@@ -187,7 +200,7 @@ async def test_ambiguous_prefix_is_never_guessed(store, db):
     await db.commit()
 
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(PREFIX, NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, PREFIX, NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "ambiguous"
     assert set(exc.value.candidates) == {OLD, twin}
@@ -199,7 +212,7 @@ async def test_ambiguous_prefix_is_never_guessed(store, db):
 @pytest.mark.asyncio()
 async def test_full_id_still_works(store, db):
     """Regression lock: the 36-char path is unchanged."""
-    await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, OLD, NEW, "2026-09-06T19:53:21+00:00")
 
     assert (await _row(db, OLD))["deprecated"] == 1
     assert (OLD, NEW, "succeeded_by") in await _links(db)
@@ -219,7 +232,7 @@ async def test_a_full_id_naming_no_memory_is_reported_not_swallowed(store, db):
 
     ghost = "deadbeef-0000-4000-8000-000000000009"  # 36 chars, no such row
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(ghost, NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, ghost, NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "not_found"
     assert await _links(db) == [], "no succeeded_by edge may be written"
@@ -237,7 +250,7 @@ async def test_a_truncated_paste_in_the_32_to_35_band_resolves(store, db):
     truncated = OLD[:33]
     assert 32 <= len(truncated) < 36, "fixture must sit in the band under test"
 
-    await store._mark_superseded(truncated, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, truncated, NEW, "2026-09-06T19:53:21+00:00")
 
     assert (await _row(db, OLD))["deprecated"] == 1
     assert (OLD, NEW, "succeeded_by") in await _links(db)
@@ -262,7 +275,7 @@ async def test_a_saturated_candidate_list_is_flagged_as_truncated(store, db):
     await db.commit()
 
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(OLD[:8], NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, OLD[:8], NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "ambiguous"
     assert exc.value.truncated is True
@@ -285,19 +298,6 @@ async def test_a_saturated_candidate_list_is_flagged_as_truncated(store, db):
 
 
 @pytest.mark.asyncio()
-async def test_a_memory_cannot_supersede_itself(store, db):
-    """X superseded by X deprecates the only copy and names itself its own
-    correction — and nothing downstream can tell that happened."""
-    from genesis.memory.store import SupersedeUnresolved
-
-    with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(PREFIX, OLD, "2026-09-06T19:53:21+00:00")
-
-    assert exc.value.reason == "self_supersede"
-    assert (await _row(db, OLD))["deprecated"] == 0, "deprecated the only copy"
-    assert await _links(db) == [], "wrote a self-referential succeeded_by edge"
-
-
 @pytest.mark.asyncio()
 async def test_dedup_short_circuit_cannot_self_supersede(store, db):
     """The REAL path: identical content + a handle for the memory holding it.
@@ -306,14 +306,20 @@ async def test_dedup_short_circuit_cannot_self_supersede(store, db):
     content it has not actually changed, which is the shape a retried
     correction takes.
 
-    ``store()`` swallows the rejection and returns the surviving id, exactly as
-    the normal supersede path does; what must hold is that NOTHING was mutated.
+    The pair is validated BEFORE any write, so the rejection is a no-op and
+    simply raises: there is no stored content whose fate the caller would have
+    to reconcile against the error. The exception names the memory that already
+    holds this content, so nothing is lost by failing.
     """
+    from genesis.memory.store import SupersedeUnresolved
+
     await _index(db, OLD, DUPE)
 
-    returned = await store.store(DUPE, "conversation", supersedes=PREFIX)
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.store(DUPE, "conversation", supersedes=PREFIX)
 
-    assert returned == OLD, "the caller needs the surviving id"
+    assert exc.value.reason == "self_supersede"
+    assert exc.value.successor_id == OLD, "the caller needs the surviving id"
     assert (await _row(db, OLD))["deprecated"] == 0
     assert await _links(db) == []
 
@@ -323,14 +329,16 @@ async def test_a_deprecated_dedup_candidate_cannot_carry_the_correction(store, d
     """Superseding ONTO a deprecated memory loses both halves.
 
     The target goes deprecated and the successor was already filtered out of
-    recall, so the correction is unreachable — and nothing raised out of
-    ``_mark_superseded``, so it looked like a completed supersede.
+    recall, so the correction is unreachable. Rejected before any write.
     """
+    from genesis.memory.store import SupersedeUnresolved
+
     await _index(db, DEAD, DUPE)
 
-    returned = await store.store(DUPE, "conversation", supersedes=OLD)
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.store(DUPE, "conversation", supersedes=OLD)
 
-    assert returned == DEAD
+    assert exc.value.reason == "successor_deprecated"
     assert (await _row(db, OLD))["deprecated"] == 0, (
         "deprecated the target toward a successor recall cannot see"
     )
@@ -338,13 +346,16 @@ async def test_a_deprecated_dedup_candidate_cannot_carry_the_correction(store, d
 
 
 @pytest.mark.asyncio()
-async def test_the_normal_path_does_not_pay_for_successor_verification(store, db):
-    """Cost lock: `verify_successor` is OFF by default, so the ordinary
-    supersede does not add a metadata query to prove something structurally
-    guaranteed (the normal path's successor is a uuid4 it just wrote).
+async def test_the_normal_path_does_not_validate_the_pair(store, db):
+    """Cost lock: ONLY the dedup path validates the pair.
+
+    The ordinary supersede's successor is a uuid4 minted moments earlier, so
+    checking it would be a query per supersede to prove something structurally
+    guaranteed.
 
     Asserted by behaviour rather than by call counting: NEW is deprecated here,
-    and the default path supersedes onto it anyway because it never looks.
+    and `_mark_superseded` supersedes onto it anyway because nothing on that
+    path looks.
     """
     await db.execute("UPDATE memory_metadata SET deprecated = 1 WHERE memory_id = ?", (NEW,))
     await db.commit()
