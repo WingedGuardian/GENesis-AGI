@@ -107,6 +107,32 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
+**A check keyed on EXISTENCE can only confirm — it can never disconfirm.**
+Before trusting a verification, ask what it would do if the thing were absent,
+stale, or the wrong object. If the answer is "pass", it proved nothing. Three
+shapes of this, all measured in one session 2026-09-08:
+
+- **Waiting for a NEW artifact by testing that one exists.** A poll for "a
+  scheduled-review marker is present" passed instantly against a marker from six
+  days earlier. Key the wait on the artifact's IDENTITY — the head SHA it names —
+  not on its presence.
+- **Matching the first row instead of the right one.** "Is main green?" matched
+  the first `push` run for that SHA, which was the CodeQL workflow (success),
+  while the CI workflow for the same SHA had failed. Filter by the thing you
+  actually mean (`--workflow ci.yml`), and prefer reading the JOB you care about
+  over an aggregate conclusion.
+- **Counting from a listing sorted by the wrong key.** `gh pr list --state
+  merged --limit 40` sorts by CREATION, so PRs created earlier and merged today
+  fall outside the window and vanish; the count read low and looked plausible.
+  Use a query whose filter IS the property you are counting (`gh search prs
+  --merged-at`), per CLAUDE.md's truncated-listing rule.
+
+The failure is silent and self-confirming in all three: an under-read is
+indistinguishable from a clean result, so nothing prompts a second look. The
+tell is that the check passed FASTER or more easily than the work should have
+allowed — a poll that succeeds on the first attempt for something that takes
+40 seconds to produce has not observed that thing.
+
 **Verify in the REAL runtime context, not a shell proxy.** "Works when I
 run it" is not "works where it runs." Same code + same uid ≠ same context:
 a long-running systemd service (genesis-server, guardian) differs from your
@@ -213,12 +239,20 @@ repo bounds exactly that at a few MiB (`autonomy/executor/deterministic.py`
 2026-09-04). Losing the tail of a log beats losing the process. The obligation
 there is not to keep the bytes, it is to be LOUD about the cut — say the output
 was bounded and roughly by how much, so nobody reads a clipped log as a
-complete one. That cited cap does NOT yet meet this bar: `_read_limited`
-returns only the retained bytes with no truncation flag, and its caller reports
-the retained length as the total — a 3 MiB stream reads as "2097152 bytes
-total". The cap is right; its silence is the improvable half, cited here as a
-counterexample to "never cut", not as a model of declaring. A silent lossy cap
-is still the defect; a declared one is a resource guard doing its job. This
+complete one. That cited cap has since been fixed AT THE READ and is no longer
+the silent-cut example it was: `_read_limited` drains the whole stream while
+retaining only `limit` bytes and returns `(retained, total_size)`, so the caller
+appends `... (truncated, N bytes total)` with N the TRUE drained total (PR
+#1796; verified in `autonomy/executor/deterministic.py` 2026-09-08).
+**It is still not a worked example of a loud cut, and the reason generalises:
+a declaration has to survive the CONSUMERS, not just be emitted.** That marker
+is appended at character 50,000 of the result field, and all six onward paths
+head-slice it at 200-2000 characters — including the one that feeds the next
+step's prompt — so the declaration is unreachable in every direction it
+travels, and the slice that removes it declares nothing itself (MEASURED
+2026-09-08). When you fix a silent cut, check the READERS of the field you just
+made honest; otherwise you have moved the silence one layer out. A silent lossy
+cap is still the defect; a declared one is a resource guard doing its job. This
 section is about the remaining case.
 
 **A handle that does not resolve is a separate defect, and do not conflate the
@@ -643,6 +677,60 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
   and report the conflict instead. The cleanest way to avoid the window entirely
   is to mutate inside an isolated worktree nobody else is editing.
+- **A RED for the WRONG REASON is not a verify-RED — read WHICH assertion
+  fired, never just that one did.** The six causes above all ask why an
+  expected RED came back GREEN. This is the mirror, and the dangerous half of
+  it passes review: the run failed, so the checklist is satisfied and the test
+  is trusted, but it failed on something other than the defect. **The tell is
+  any failure line you have not actually read.** Two shapes, and they cost
+  differently:
+  1. **The PRIMARY assertion fired, but on a condition the FIXTURE created**
+     rather than the defect — a leftover competing candidate, an unaged file,
+     stale state from setup. This one goes green on the fix, because the fix's
+     side effects remove the condition, so it passes review and pins nothing.
+     This is the expensive one.
+  2. **A guard-the-guard / precondition assertion fired FIRST**, which proves
+     the fixture never built the hazard at all. This one does NOT go green on
+     the fix — the fixture is unchanged, so it fails again and says so. It
+     costs a round, not a false green, and the guard is doing exactly its job
+     (see the vacuous-shapes bullet below, which prescribes adding one).
+     Repair the fixture and re-run before recording a RED.
+  MEASURED twice in one session on the same PR: a fileless-session test whose
+  file was not yet aged past the 60-second window, and a selection test with a
+  competing candidate still in the tree — each reported a textbook RED while
+  exercising nothing. Name the assertion that fired and confirm its message
+  describes the defect. A RED you have not read is a GREEN you have not earned.
+- **A fixture must create the shape its docstring claims — and the check is the
+  guard-the-guard assert, not a re-read.** This is the same obligation as the
+  vacuous-shapes bullet below; the addition here is WHERE the shape most often
+  goes wrong, which is a contract between two components. Two ways to break it,
+  both MEASURED in one session, and both PASS against the unfixed code — which
+  is the only way they are caught: a **hand-written intermediate** (the test fed
+  the consumer a value the real producer never emits, so the arity mismatch it
+  claimed to pin was never present) and an **inlined copy of the fix** (the test
+  ran the corrected logic as a snippet instead of invoking the real script, so
+  it graded its own copy and the shipped file never executed). If the defect
+  lives in the seam between a producer and a consumer, drive the REAL producer
+  into the REAL consumer; anything typed by hand in the middle is the bug's
+  hiding place, and anything inlined is a second copy of the code under test.
+- **Two reviewers pushing OPPOSITE values for the same constant, one review
+  pass apart, is a signal about the DEPENDENCY, not about the value.** (Review
+  passes here, not the cross-model *rounds* the escalation cap counts — see
+  that section for the reserved sense.) The instinct is to adjudicate: measure
+  the box, pick the winner, move on. That answers the pass and leaves the
+  mechanism, because both reviewers are usually right about the environment
+  each has in mind — which means the code depends on something that is not
+  invariant. MEASURED: one reviewer moved a parse to field `$4`, the next moved
+  it to `$5`, and both were correct, for different releases of the tool being
+  parsed. The value was never the defect; depending on column POSITION was.
+  Remove the dependency — match the field by what it IS, derive the index, or
+  read a named output format — which is usually cheaper than a third pass of
+  picking a number. **Scope: this applies where the constant names a POSITION
+  or a shape in something external** (a field index, a column offset, an offset
+  into a format you do not control). It does NOT apply to a threshold or a
+  timeout: there the disagreement is about which failure mode each reviewer has
+  in mind, and the Timeout Policy above governs — name the failure mode, and
+  the value follows from it.
 - **Vacuous-test shapes to check for by name** (a list of the common ones, not a
   definition). The most frequent in practice is the one that never ran at all: a
   test SKIPPED by a marker, or deselected by a `-k` filter or a wrong path, which
@@ -656,6 +744,15 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   exec-replaces itself and loses the marker from its argv — add a
   guard-the-guard assert that the fixture really has the property). Ask of every
   new test: *would this still pass if the mechanism it names were deleted?*
+  When the DISTINGUISHING fact is produced by a lane the assertion cannot see,
+  asking every test to assert it is a convention, and conventions decay — the
+  merge gate's own suite carried that request in a fixture docstring and 3 tests
+  had already drifted from it. `tests/test_hooks/conftest.py`'s `offdiff_lock` is
+  the worked chokepoint: it fails any IN-PROCESS hook test whose finding was
+  silently discounted as outside the diff, so a forgotten allowlist entry can no
+  longer turn a not-block assertion green for the wrong reason. It fails OPEN,
+  so its own self-tests are the load-bearing part — a lock nobody checks is the
+  convention it replaced.
 - **Contested/subtle specs: write the expectations first.** When what-should-
   happen is itself under discussion (which keys count, which states clear an
   alarm), enumerate the expectation table as failing tests BEFORE implementing
@@ -971,10 +1068,19 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   fail-open by design and says so in its own docstring, so argue with the design
   rather than patching it; `protected_paths_guard`'s calls itself "conservative:
   over-blocks, never under", which is true relative to the old guard it
-  reinstates (`protected_paths_guard.py:33-35`) and false of the parsed resolver
-  it stands in for — one sentence, two readings, and that ambiguity is the
-  defect. Verify a docstring's stated direction IN CONTEXT; never quote it as a
-  fact. The shapes are deliberately not enumerated here, per the rule above.
+  reinstates (`_legacy_substring_block`'s docstring) and false of the parsed
+  resolver it stands in for — one sentence, two readings, and that ambiguity is
+  the defect. Verify a docstring's stated direction IN CONTEXT; never quote it as
+  a fact. The shapes are deliberately not enumerated here, per the rule above.
+
+  That guard's MODULE docstring has since been split so it no longer states one
+  fail direction for both blind spots: a bounds-induced blind spot REFUSES and an
+  untokenizable one falls back. The sentence quoted above still sits on the
+  fallback helper, where both readings remain available, so the lesson is
+  unchanged — and note the citation here is now to a SYMBOL rather than to a line
+  range, because the range this paragraph originally named stopped containing the
+  quote the moment that docstring was edited. A line number is a claim with a
+  shelf life.
 
   Within the git-operation blind-spot net, the two rules are scoped by who is
   present: `ask` is the interactive form of the refusal, and where a session is
@@ -1286,7 +1392,9 @@ trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
 reviewed diff's FULL content, so re-staging different content after the audit
 re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
 substantial change — not clearance. Depth is override-exempt: a findings
-`# review-override` does NOT waive it; only a loud, logged `# depth-ack` does (the
+`# review-override` does NOT waive it; only a loud, announced-on-stderr `# depth-ack`
+does (announced, not RECORDED — nothing persists it, unlike the four PR-merge sigils
+below, whose rows survive the session; the word "logged" now means a durable row) (the
 audited escape for a genuine format mismatch). "Adversarial" is verified
 STRUCTURALLY — a severity ladder (BLOCKER/SHOULD-FIX/NOTE, CRITICAL/HIGH/LOW,
 P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substance —
@@ -1393,6 +1501,54 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   then at the third (escalation cap, `# escalation-ack`). Both call `_deny`, so
   the first stop arrives one round earlier than "the cap" suggests — see the
   two-tier table below. Switch to enumeration BEFORE the gate has to say so.
+- **Interrogate every MECHANISM you introduce along six axes BEFORE the first
+  review — original code and fixes alike.** The two bullets above enumerate the
+  class of a DEFECT, reactively, once a reviewer names one. This one is about the
+  extent of a MECHANISM — a deadline, a lock, a cache, a guard, a token — which is
+  correct on the path that motivated it and undefined everywhere else.
+  MEASURED 2026-09-09 on 31 inline review findings from two PRs, each attributed
+  by `git blame` at the SHA the reviewer was looking at, and classified as
+  "original" or "post-review" by whether the blamed commit predates that PR's
+  first review. Over all rounds, 21 of 31 (68%) blame to the original
+  implementation. But round 1 CANNOT blame to a fix commit — none exists yet — so
+  that figure is partly forced arithmetic. In the rounds that actually loop it is
+  close to even: **of the 21 findings from rounds 2+, 11 were already in the
+  original code and 10 were in code written to answer an earlier round.** Both
+  halves are worth the same attention; neither dominates.
+  Deduplicating re-posts and cross-reviewer duplicates and dropping one finding
+  later refuted by measurement leaves 25 distinct findings, and **24 of those 25
+  fall into six shapes.** These are the checklist:
+  1. **SIGNAL** (8, the largest) — does the thing you read change exactly when
+     the property you assert changes? A whole-database counter read as "did this
+     table change"; an mtime read as "did content change"; empty read as
+     "unbuilt"; a proxy's identity read as "same connection"; two autocommit
+     reads used as one snapshot.
+  2. **SCOPE and LIFETIME** (5) — a deadline per query when the operation is a
+     traversal; a lock per process when the race is cross-process; a lease that
+     expires mid-work; a hang moved from the operation to interpreter teardown.
+  3. **INPUT DOMAIN** (5) — the values the type permits, not the ones you
+     pictured: non-boolean, empty string, malformed timestamp, sub-second
+     precision, unescaped path.
+  4. **EQUIVALENCE** (3) — what does it claim to match, and has anything checked?
+  5. **FAILURE PATH** (2) — what is left behind when the work aborts.
+  6. **CALLER CONTRACT** (1) — does an explicit option the caller passed survive?
+  (The 25th was a test whose identity comparison was unsound in both directions.)
+  A finding is a POINT, so a fix that treats the finding as its spec inherits
+  that point as its only test — which is why the fix half of that near-even split
+  exists at all, and why the six axes are worth running over a fix and not only
+  over a feature.
+  METHOD NOTE, because getting this wrong inverted an earlier version of this
+  measurement: to attribute a finding to a commit, blame the line at the SHA the
+  reviewer was looking at. `original_commit_id` is the PR HEAD when the review was
+  posted, not the introducing commit — one commit here touched only changelog
+  files yet carries three findings on a Python file.
+  FALSIFIABLE, with a denominator: #1850 pushed four commits after its first
+  review round, and deduplicated they carried 5 findings between them — 1.25 per
+  post-review commit. If the next three PRs whose mechanisms are interrogated on
+  these six axes before pushing still average above one deduplicated finding per
+  post-review commit, the axes are not the right ones. Re-derive rather than
+  adding a seventh.
+
 - **Run the pre-push adversarial pass with `/deep-review`** (`.claude/commands/deep-review.md`):
   one command that dispatches a fresh-context `genesis-architect` (+ `genesis-security-reviewer`
   on security surfaces) over the FULL branch diff with the right SHAPE — fail-open/state/TOCTOU/
@@ -1416,9 +1572,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
-  A PR touching the enforcement-hook surface (the guard code itself) gets no
-  stale-review leniency: the merge gate (1) never classifies its post-review delta as
-  "review-trivial", and (2) refuses `# stale-review-override` — regardless of Codex
+  A PR touching the enforcement-hook surface (the guard code itself) gets almost no
+  stale-review leniency: the merge gate (1) never classifies a post-review delta that
+  TOUCHES that surface as "review-trivial" — the test is on the DELTA's files, not the
+  PR's, so a docs-only follow-up commit on such a PR can still be trivial (see the
+  budgeting note further down, which measures exactly this) — and (2) refuses
+  `# stale-review-override` — regardless of Codex
   head-freshness — unless recorded fallback-review evidence exists for the EXACT
   base+head (`~/.genesis/override_review_evidence/<repo>__<pr>__<base12>__<sha>.txt`).
   A current at-head Codex review does NOT substitute for that evidence: the same sigil
@@ -1434,12 +1593,45 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review (local `codex exec` when quota allows, else genesis-architect), evidence
   recorded naming the head, then the merge re-run — the gate's block message walks
   through it.
-- **One reviewer at a time — NEVER run two review agents simultaneously.** Run
-  one reviewer (e.g. Codex), apply/verify its findings, then run the next
-  reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
-  The second reviewer should see the improved code, not the same unfixed diff
-  both would otherwise review; parallel also doubles review spend per baseline.
-  (Standing user directive.)
+- **One reviewer at a time on a given diff — almost never two at once.** Run one
+  reviewer (e.g. Codex), apply/verify its findings, then run the next reviewer
+  (e.g. Claude) on the *fixed* code. The second reviewer should see the improved
+  code, not the same unfixed diff both would otherwise review; parallel also
+  doubles review spend per baseline. (Standing user directive.)
+
+  **Sequential means WAIT. It does not mean kill.** When a review is already
+  running and a different reviewer gets named — a tool switch, a stated
+  preference, a peer session's run — let the in-flight one FINISH. Terminating
+  it destroys the findings the next reviewer is supposed to build on, which is
+  the opposite of what this rule is for. MEASURED 2026-09-08: a running review
+  was killed four minutes in, mid-analysis on the load-bearing question, to
+  honour this rule's former "NEVER" — and nothing was gated on stopping it.
+
+  The "almost" is load-bearing. This is standard practice, not a prohibition:
+  * Two reviewers on DIFFERENT diffs is fine — no shared baseline, no
+    cross-bias. It is not licence to fan out across the queue: external
+    reviewers share one quota, and exhausting it strands the cross-model gate
+    every open PR depends on. Concurrency here is a tolerated exception, not a
+    throughput strategy.
+  * A peer session's reviewer is not yours to stop while that session is alive.
+    An ORPHAN — a process whose session is gone, or one wedged holding a
+    semaphore slot — is ordinary cleanup; establish it is orphaned first.
+  * The user may ask for both, in their own words naming the running one. A
+    preference for a different tool is NOT that ask; that misreading is the
+    incident above.
+
+  **If you are about to terminate a running reviewer in order to satisfy this
+  rule, that is the tell that you are misreading it.** Wait, or ask.
+
+  This rule prohibits a STATE ("two running") rather than an ACTION, which is
+  why it is spelled out: a state prohibition can be satisfied by DESTROYING the
+  offending state, where an action prohibition — never push to main, never
+  hardcode the slug — can only be satisfied by not acting. The other instance of
+  the shape is `CLAUDE.md`'s genesis-bridge line ("must never run alongside the
+  server"), where the wrong discharge is worse: stopping the server rather than
+  declining to start the bridge. Prefer phrasing a new rule as an action; where
+  it must name a state, say which side gives way, because an absolute with an
+  unstated remedy is discharged in whatever direction the reader already leans.
 - **A different model is the real correctness gate; Codex is the default.** A Claude
   reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
   the cross-model gate. When the GitHub Codex reviewer is unavailable AND the install
@@ -1448,9 +1640,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
   user-level config, not here.
   **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
-  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
-  is not, and neither is `--check-pr` reporting no review, which says the same thing
-  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  reply. An explicit usage-limits comment is the STRONGEST evidence available — but it
+  is not proof, and treating it as proof is how an alternate-reviewer approval gets
+  spent on a Codex that was never down. The two channels are INDEPENDENT: a
+  usage-limits ISSUE comment can sit there while a later trigger delivers real INLINE
+  findings (MEASURED on #1484 — see the inline-findings section below). So: re-trigger,
+  let time pass, and check the INLINE endpoint before concluding unavailable.
+  Everything weaker is not evidence at all — silence is not, and neither is
+  `--check-pr` reporting no review, which says the same thing whether the reviewer is
+  down or was simply never triggered at this head. Nor is a
   `codex exec` quota error: that is a separate surface on separate quota.
   Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
   **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
@@ -2020,9 +2218,18 @@ code. This is "the user decides tradeoffs" applied to every install.
 **Retention for every unbounded store.** Any table, log, or directory that
 grows without bound ships its prune path in the SAME PR, wired into
 `disk_hygiene.sh` or an existing retention tick (precedents: repo-pulse
-45d prune; ledger-shadow 45d prune; label-aware attention-snapshot GC).
-An unbounded store is a slow disk-leak on someone else's smaller disk —
-retention is part of the feature, not a follow-up.
+45d prune; ledger-shadow 45d prune; label-aware attention-snapshot GC;
+hook audit stores 5 MB size trim). An unbounded store is a slow disk-leak on
+someone else's smaller disk — retention is part of the feature, not a follow-up.
+
+**But retention machinery does not belong on a hook path.** `disk_hygiene.sh` IS
+the retention path; a guard computing a security verdict must not also be grooming
+a store. Two measured reasons, both from the same feature: a helper whose work
+scaled with the command exceeded a hook's registration timeout, and a hook killed
+before its `exit 2` lets the refused command RUN; and an in-hook retention engine
+whose failure mode is rewriting a file produced most of that feature's defects
+across five review rounds. Prefer a store shape the daily timer can bound by
+deleting whole old files — that is what makes the split possible at all.
 
 **Install-agnostic tests.** Tests must pass on a fresh clone with no
 Genesis services, no live DB, no network, no `gh` auth, no local config:
@@ -2101,6 +2308,78 @@ closing-shaped work (answering, merging green PRs, the handoff row). What
 this rule removes is only the WATCHING — unprompted gate-polling and
 review-soliciting between a push and the next external event. When you do
 merge, the Pre-Merge Gate below governs unchanged.
+
+### Never RETIRE a PR you are not the one reviving (standing user rule, 2026-09-08)
+
+Terminology first, because the section above already uses "closing" to mean
+merging: **RETIRING** is `gh pr close` — abandoning a PR unmerged. This rule is
+about that, and only that. Merging a green PR is unaffected.
+
+**A reviewer session retires nothing.** When a PR turns out to be wrong at the
+premise — the mechanism cannot work, the design is contested, the fix belongs on
+a different event — the disposition is `needs-architecture-session` **on the PR**,
+carrying the evidence, and the PR stays OPEN. Retiring it belongs to the session
+that actually takes up its revival, at the moment it takes it up.
+
+Why the split, since "it's clearly dead, just close it" is the rationalization
+this rule exists to stop:
+
+- **A reviewer has read the diff, not the intent.** You can establish that a
+  mechanism does not work. You cannot establish that nothing in the branch is
+  worth reviving, that the author holds no context you lack, or that the right
+  successor design does not reuse most of it.
+- **An open PR carrying an evidence-bearing comment is a live handoff; a closed
+  one is an archaeology task.** The next session finds an open PR by listing the
+  queue. It finds a closed one only if someone remembers it existed.
+- **Retiring costs the review record its addressability.** Threads on a closed
+  PR stop being where the conversation happens, so the reasoning that just cost
+  a review round stops being read.
+
+So: post the finding, flag it, leave it open, and let the reviving session
+decide — including deciding to retire it in favour of a successor, which is that
+session's call to make and to justify.
+
+The same holds for a superseded PR: name the successor in a comment and leave it
+open. If you believe a PR should be retired and nobody is picking it up, that is
+a question for the user, not a judgment call for the review station.
+
+### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
+
+**A review session's job is to get THAT PR merged.** Reviews routinely surface
+bugs that are real, pre-existing on `main`, and nothing to do with the diff in
+front of you. Those do not belong in the PR and they must not hold it up.
+
+Route every finding by ONE question — **does the PR work without this fixed?**
+
+- **No, the PR is broken without it** → fix it in this PR. The builder session
+  should have caught it, and shipping a PR that cannot function is not a merge.
+- **Yes, the PR works** → **file a GitHub issue and merge the PR.** Do not grow
+  the diff, do not open a discussion, do not park it in a reply and move on.
+
+**No per-instance approval to file.** Do NOT ask — asking each time was the
+friction this rule removes, and the owner relaxed the general rule on
+2026-09-09 after reading what actually got filed. The gate on a public post is
+now WHAT GOES IN IT, not permission: scrub anything personal or identifying —
+names, hosts, IPs, paths embedding a username, anything about the user's
+real-world life — so the issue carries technical detail only. Borderline, in
+either direction? Ask. See CLAUDE.md, "Where deferred work goes".
+
+**The exception that is NEVER waived: a security defect is not filed publicly
+before it is fixed.** An unpatched bypass, a credential exposure, anything
+exploitable — that goes to a private record under `~/.genesis/output/` plus a
+`follow_up_create` row, and nothing about it reaches a public surface — the
+relaxed filing rule above does not touch this one. If a finding is both adjacent and a live bypass,
+the security rule wins.
+
+Write the issue while the context is in your head — the measurement, the
+file:line, the falsifier, and why it was out of scope for the PR. An issue that
+merely names a symptom costs the next session the whole investigation again, and
+you already did it.
+
+Why this is the rule: a review that widens into every adjacent defect stops
+being a review and becomes an unbounded refactor, which is how a two-finding PR
+turns into a six-round loop. The PR is the unit of work. The queue is the place
+the rest of it goes.
 
 ## Pre-Merge Gate
 
@@ -2272,7 +2551,44 @@ The review-findings gate specifically:
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
-   The override is logged. Use only when findings are intentionally accepted.
+   The override is logged — one metadata row per sigil, written as one file per
+   merge under `~/.genesis/merge_overrides/` (sigil, PR, bound head, which gate it
+   waived, and the verdict THAT GUARD returned: `allowed` / `asked` / `blocked` /
+   `error`), so "was this escape reached for?" is a query rather than a survey:
+   `cat ~/.genesis/merge_overrides/*.jsonl`. One file per merge rather than one
+   shared log, so a multi-sigil merge is a single atomic record and the writer
+   never maintains a file on the merge path. The store is bounded to 5 MB by the
+   daily `disk_hygiene.sh` timer (`scripts/prune_hook_audit_logs.py`, oldest whole
+   records dropped) and backed up by `backup.sh` §6d.
+   `blocked` matters: a sigil can be appended to a command that some OTHER gate
+   inside the same guard then stops, which is a real signal but not an override
+   that took effect, and `asked` means the decision went to a human who may still
+   have denied it. Read `allowed` as "the sigil was accepted HERE", never as "the
+   merge happened": other PreToolUse matchers and the harness's own permission
+   prompt sit downstream of this guard and can still stop the command.
+   Never any command text — the row is metadata only, because a trailing comment
+   rides a Bash command that can carry a credential.
+   **Scope, stated so the log is not read as more complete than it is:** the four
+   PR-merge sigils are covered (`# review-override`, `# ci-override`,
+   `# stale-review-override`, `# scheduled-review-override`), from the point the
+   PR is resolved onward. A merge rejected BEFORE that point writes nothing —
+   no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
+   operations, or a merge compounded with a local `git merge` into main are the
+   ones measured, and the list is illustrative rather than exhaustive: anything
+   that blocks before the PR resolves leaves no row. No OTHER sigil in
+   `shell_parse._KNOWN_SIGILS` is recorded either — `# depth-ack`, `# audit-ack`,
+   `# discard-override` and `# full-suite-ok` belong to gates outside this guard
+   and announce themselves on stderr only. The command-scoped acks
+   (`# merge-to-main-override`, `# escalation-ack`, `# final-round-accept`) are
+   NOT logged, for two different reasons. `# merge-to-main-override` waives a
+   gate that short-circuits BEFORE the branch is resolved, so a row could only
+   say the ack was typed, never that it waived anything. The round-cap acks are
+   simply OUT OF SCOPE here: since #1680 they are honoured inside
+   `_check_codex_round_escalation`'s scan loop, where the PR number and the real
+   round count are resolved (`repo` only when the command carries `--repo` or a PR
+   URL), so a row naming a waiver that actually happened is now writable — whether
+   the store should carry ack-class sigils at all is an open decision, not a
+   settled no. Use only when findings are intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
    (review state COMMENTED) and emits **SOFT WARNINGs** (PII /
@@ -2316,6 +2632,60 @@ The review-findings gate specifically:
    `ci: incomplete` and blocks (see the CI-gate bullet above) — the trap text
    stays because the DIAGNOSIS (check `mergeable` first) is still the fastest
    route to the cause.
+
+   Three corollaries, each measured 2026-09-08 and each costing a wrong diagnosis:
+
+   - **`UNKNOWN` suppresses it too, not just `CONFLICTING`.** GitHub recomputes
+     mergeability lazily, and EVERY merge to main invalidates it repo-wide — so
+     right after a merge batch the whole queue reads `UNKNOWN` and its CI looks
+     missing. That is also why a merge gate refuses with "mergeable status is
+     'UNKNOWN'": wait and re-read rather than concluding anything.
+   - **A PR opened against a NON-DEFAULT base never ran CI at all**, because
+     `ci.yml` filters `on: pull_request: branches: [main]` — the filter is on the
+     BASE. Retargeting it to main afterwards fires nothing: the default
+     `pull_request` types are opened/synchronize/reopened, and a base change is
+     none of them. This one does NOT self-heal and nothing will ever fire for it
+     again on its own; it needs a push. Stacked PRs land here by construction.
+   - **`workflow_dispatch` is not a workaround.** `gh workflow run ci.yml --ref
+     <branch>` runs to completion and never appears in the PR's
+     `statusCheckRollup`, so it cannot satisfy a gate that reads the rollup.
+
+9. **`gh run rerun` CANNOT clear a failure caused by a broken base.** It replays
+   the ORIGINAL merge commit rather than recomputing one against current main,
+   so re-running a PR whose base was broken faithfully reproduces the breakage.
+   MEASURED: a re-run started 15 minutes AFTER the fix merged still failed, and
+   `git merge-base --is-ancestor <fix-sha> refs/pull/<N>/merge` returned false —
+   the pull request's merge ref did not contain the fix. Only a push or
+   `gh pr update-branch <N>` recomputes it. Two consequences: do not "just
+   re-run" someone's stale red, and do not tell them it will clear — it will
+   not, and their next push clears it for free anyway.
+
+10. **`gh run view --log-failed` truncates and shows only PASSED lines.** On a
+    large suite it cuts around 44%, so a FAILING job reads as a clean log with
+    no failure in it — the most misleading possible output, because it looks
+    like an answer. It reported nothing useful on three separate attempts in one
+    session. To find what actually failed, reproduce locally against a clean
+    `origin/main` checkout (which is what identified it, twice), or fetch the
+    raw job log rather than the CLI's rendering.
+
+11. **Two individually-GREEN PRs can break main, and nothing warns you.** PR A
+    adds a repo-wide invariant test (one that ENUMERATES modules or consumers and
+    asserts a property); PR B adds a violation of it. Each is green against a
+    main that lacks the other, neither diff touches the other's files, so there
+    is no textual conflict, no reviewer signal, and both merge clean — then main
+    goes red, and because PR CI builds the merge commit it fails EVERY open PR on
+    a test unrelated to their changes. MEASURED 2026-09-08: a chokepoint test
+    requiring every consumer of the shared shell parser to use the checked entry
+    point, and a guard importing the unchecked one, merged an hour apart.
+    This is NOT the structural collision described under the architecture-session
+    rule — that one is main superseding a mechanism the PR uses, and it is
+    visible from the PR's own files. Here neither PR can see the other.
+    The detectable signature is a new ENUMERATING invariant test landing while
+    other PRs are in flight: when you merge one, re-run it against the other open
+    PRs' merge commits before merging them, not just against its own branch.
+    Sequencing follows from the same fact — batch merges rather than interleaving
+    them with active pushes, because each merge invalidates every other PR's
+    mergeability and manufactures the false "CI never ran" signal above.
 
 ## Reference Router
 

@@ -19,6 +19,10 @@ from genesis.autonomy.watchdog import (
     reclaim_page_cache,
 )
 
+# Captured at import time, BEFORE the autouse fixture stubs the class attribute,
+# so TestServiceUptimeProbe can drive the real body.
+_REAL_SERVICE_UPTIME_S = WatchdogChecker._service_uptime_s
+
 
 @pytest.fixture(autouse=True)
 def _mock_bridge_active():
@@ -39,6 +43,16 @@ def _no_deploy_in_progress():
     """
     with patch("genesis.autonomy.watchdog.update_in_progress", return_value=False):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_service_uptime(monkeypatch):
+    """Default the bootstrap-grace probe to 'unknown' so tests are insulated
+    from the REAL target unit's uptime on a dev box running genesis-server
+    (same pattern as _is_bridge_active above). None falls through to the
+    pre-grace restart path; the grace tests patch their own readings.
+    """
+    monkeypatch.setattr(WatchdogChecker, "_service_uptime_s", lambda self: None)
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +178,311 @@ class TestDeployInProgress:
         # guard adds zero behavior change outside a deploy window.
         checker = _make_checker(tmp_path, stale_status)
         assert checker.check() is WatchdogAction.RESTART
+
+
+class TestStaleBootstrapGrace:
+    """A status file stale from BEFORE the service started is not evidence about
+    THIS process (2026-09-08 incident: post-outage boot left a 22,583s-stale
+    status.json; the watchdog fired 49s into a ~2min bootstrap and SIGKILLed a
+    healthy server — once per boot, twice that day). Service start is treated as
+    the freshness epoch: while the unit's own uptime is below the staleness
+    threshold, the file cannot yet be expected fresh → SKIP. A genuinely wedged
+    server still restarts once its uptime exceeds the threshold, so the grace
+    cannot livelock; a failed probe suppresses nothing (pre-existing behavior).
+    """
+
+    def test_young_service_grace_skips_restart(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # The incident shape: stale file, service 49s old (< 300s threshold).
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            assert checker.check() is WatchdogAction.SKIP
+
+    def test_grace_does_not_trip_failure_counter(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # SKIP returns BEFORE _restart_if_allowed, so backoff/flap counters
+        # never burn during bootstrap (same contract as the deploy guard).
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps({
+            "consecutive_failures": 2, "next_attempt_after": None, "last_reason": "x",
+        }))
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            checker.check()
+        state = json.loads(state_file.read_text())
+        assert state["consecutive_failures"] == 2
+
+    def test_old_service_still_restarts(self, tmp_path: Path, stale_status: Path):
+        # Control (anti-livelock): a service up longer than the threshold with a
+        # still-stale file is genuinely wedged — grace must not suppress that.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=301.0):
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_unknown_uptime_falls_through_to_restart(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # Probe failure (unit absent, no systemd) preserves pre-grace behavior:
+        # suppression requires a POSITIVE young reading.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=None):
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_unpersisted_counter_grants_no_grace(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # A grace whose counter did not persist is unbounded on a box with a
+        # failing state write — each oneshot invocation would reload the old
+        # count and re-grant the same slot forever (Codex P2, PR #1858). Deny
+        # the skip and fall through to the pre-existing restart path.
+        checker = _make_checker(tmp_path, stale_status)
+        with (
+            patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0),
+            patch.object(WatchdogChecker, "_save_state", return_value=False),
+        ):
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_grace_is_bounded_by_skip_counter(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # ActiveEnter resets on every activation, so a crash-loop that stays
+        # `active` at tick time presents a young uptime FOREVER. The explicit
+        # counter is what keeps that from renewing the grace indefinitely:
+        # max skips, then normal stale-restart handling resumes.
+        checker = _make_checker(tmp_path, stale_status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            for _ in range(4):  # default max_bootstrap_grace_skips
+                assert checker.check() is WatchdogAction.SKIP
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_grace_counter_clears_on_fresh_status(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # A genuinely fresh status file (bootstrap finished) resets the whole
+        # state including the grace counter, so the NEXT outage gets a full
+        # grace budget rather than inheriting spent skips.
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps({"bootstrap_grace_skips": 3}))
+        stale_status.write_text(json.dumps({
+            "timestamp": datetime.now(UTC).isoformat(),
+            "resilience_state": {"cloud": "NORMAL"},
+            "human_summary": "All systems normal.",
+        }))
+        assert checker.check() is WatchdogAction.SKIP  # healthy
+        state = json.loads(state_file.read_text())
+        assert state.get("bootstrap_grace_skips", 0) == 0
+
+
+class TestZombieFileFromPreviousActivation:
+    """The zombie branch runs on a status file that is FRESH by timestamp, but a
+    restart landing inside the freshness window leaves the PREVIOUS process's
+    file in place: its `uptime_s` is that process's (status_writer stamps it from
+    the writing runtime's own `_bootstrap_completed_at`) and its scheduler
+    heartbeats describe a runtime that no longer exists. So the pre-existing
+    `uptime_s < stabilization_s` guard cannot fire, and the first tick after boot
+    would restart a healthy, still-bootstrapping server — the same defect the
+    stale branch's grace closes, reached through the fresh/zombie path instead
+    (Codex P2, PR #1858). The discriminator is systemd's own clock: a status file
+    OLDER than the unit's uptime was written before this activation.
+    """
+
+    def _retained_zombie(self, tmp_path: Path, *, age_s: float) -> Path:
+        """A status.json `age_s` old (inside the freshness window) whose
+        heartbeats are 30 min stale and whose uptime_s is far past
+        stabilization — i.e. reaches the zombie-restart decision on every
+        pre-existing guard."""
+        written = datetime.now(UTC) - timedelta(seconds=age_s)
+        stale_hb = datetime.now(UTC) - timedelta(minutes=30)
+        status_file = tmp_path / "status.json"
+        status_file.write_text(json.dumps({
+            "timestamp": written.isoformat(),
+            "uptime_s": 99999,  # the PREVIOUS process's uptime
+            "scheduler_heartbeats": {"surplus": stale_hb.isoformat()},
+        }))
+        return status_file
+
+    def test_path_assertions_hold(self, tmp_path: Path):
+        """Guard against a vacuous fixture: prove this status really does reach
+        the zombie decision (fresh by timestamp, zombie heartbeats, past
+        stabilization) before the tests below claim the grace is what stopped
+        the restart."""
+        status = self._retained_zombie(tmp_path, age_s=100)
+        checker = _make_checker(tmp_path, status)
+        data = json.loads(status.read_text())
+        staleness = WatchdogChecker._compute_staleness(data)
+        assert staleness is not None and staleness <= checker._staleness_threshold
+        assert WatchdogChecker._check_scheduler_heartbeats(data)  # zombie
+        assert data["uptime_s"] >= checker._stabilization_s  # stabilization guard cannot fire
+        # ...and with no systemd reading at all it restarts (the defect).
+        assert checker.check() is WatchdogAction.RESTART
+
+    def test_retained_file_predating_activation_grants_grace(self, tmp_path: Path):
+        status = self._retained_zombie(tmp_path, age_s=100)
+        checker = _make_checker(tmp_path, status)
+        # Unit came up 40s ago; the file is 100s old ⇒ written before this boot.
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=40.0):
+            assert checker.check() is WatchdogAction.SKIP
+        # Prove the BOOTSTRAP GRACE is what suppressed it (not some other skip):
+        # the shared counter was consumed.
+        state = json.loads((tmp_path / "watchdog_state.json").read_text())
+        assert state["bootstrap_grace_skips"] == 1
+
+    def test_file_written_by_current_activation_still_restarts(self, tmp_path: Path):
+        # Control: unit up 500s, file only 100s old ⇒ THIS process wrote it, so
+        # its dead heartbeats are real. Grace must not suppress that.
+        status = self._retained_zombie(tmp_path, age_s=100)
+        checker = _make_checker(tmp_path, status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=500.0):
+            assert checker.check() is WatchdogAction.RESTART
+        state = json.loads((tmp_path / "watchdog_state.json").read_text())
+        assert state.get("bootstrap_grace_skips", 0) == 0
+
+    def test_zombie_grace_shares_the_bootstrap_bound(self, tmp_path: Path):
+        # One counter for both branches: a crash loop must not get a fresh
+        # budget per branch. Four skips, then normal zombie-restart handling.
+        status = self._retained_zombie(tmp_path, age_s=100)
+        checker = _make_checker(tmp_path, status)
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=40.0):
+            for _ in range(4):  # default max_bootstrap_grace_skips
+                assert checker.check() is WatchdogAction.SKIP
+            assert checker.check() is WatchdogAction.RESTART
+
+    def test_zombie_grace_requires_persisted_counter(self, tmp_path: Path):
+        status = self._retained_zombie(tmp_path, age_s=100)
+        checker = _make_checker(tmp_path, status)
+        with (
+            patch.object(WatchdogChecker, "_service_uptime_s", return_value=40.0),
+            patch.object(WatchdogChecker, "_save_state", return_value=False),
+        ):
+            assert checker.check() is WatchdogAction.RESTART
+
+
+class TestStateCounterSanitization:
+    """A persisted counter is arithmetic input (`_coerce_counter(x) + 1`,
+    `x += 1`), so a malformed value in watchdog_state.json — null, a string, a
+    container, a bool, a negative — must not take the oneshot down with
+    TypeError/ValueError/KeyError on every check (Codex P2, PR #1858).
+    Normalised at the ONE load boundary so no individual reader has to remember.
+    """
+
+    @pytest.mark.parametrize(
+        "bad", [None, "3", {}, [], True, False, -5, 2.7, float("nan")],
+    )
+    def test_malformed_grace_counter_does_not_crash_the_check(
+        self, tmp_path: Path, stale_status: Path, bad
+    ):
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps(
+            {"consecutive_failures": 0, "bootstrap_grace_skips": bad},
+            allow_nan=True,
+        ))
+        with patch.object(WatchdogChecker, "_service_uptime_s", return_value=49.0):
+            assert checker.check() is WatchdogAction.SKIP
+        # 2.7 truncates to 2 → 3; everything else normalises to 0 → 1.
+        expected = 3 if bad == 2.7 else 1
+        assert json.loads(state_file.read_text())["bootstrap_grace_skips"] == expected
+
+    @pytest.mark.parametrize("bad", [None, "9", {}, True, -1])
+    def test_malformed_starved_counter_does_not_crash_the_check(
+        self, tmp_path: Path, stale_status: Path, bad
+    ):
+        # Same hazard on the other bounded suppression, reached via the
+        # liveness gate inside _restart_if_allowed.
+        checker = _liveness_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps({"consecutive_failures": 0, "starved_skips": bad}))
+        with patch.object(
+            WatchdogChecker, "_probe_liveness",
+            return_value=("starved", {"lag_ms": 5000, "sample_age_s": 1}),
+        ):
+            assert checker.check() is WatchdogAction.SKIP
+        assert json.loads(state_file.read_text())["starved_skips"] == 1
+
+    @pytest.mark.parametrize("blob", ["[1, 2]", '"nope"', "5", "null"])
+    def test_non_object_state_falls_back_to_defaults(
+        self, tmp_path: Path, stale_status: Path, blob: str
+    ):
+        # Valid JSON that is not an object has no `.get`; every normaliser and
+        # reader below would raise AttributeError.
+        checker = _make_checker(tmp_path, stale_status)
+        (tmp_path / "watchdog_state.json").write_text(blob)
+        state = checker._load_state()
+        assert state["consecutive_failures"] == 0
+        assert state["restart_history"] == []
+        assert checker.check() is WatchdogAction.RESTART
+
+    def test_directly_subscripted_keys_are_materialised(
+        self, tmp_path: Path, stale_status: Path
+    ):
+        # Three readers subscript state directly rather than .get() —
+        # watchdog.py:561 and :568-569 in _restart_if_allowed, :883 in
+        # _record_failure — so a state file that merely OMITS these keys raises
+        # KeyError instead of returning an action. (Found by this test: the
+        # first draft normalised only consecutive_failures and the check died
+        # on `state["next_attempt_after"]`.)
+        checker = _make_checker(tmp_path, stale_status)
+        (tmp_path / "watchdog_state.json").write_text(json.dumps({"last_reason": "x"}))
+        state = checker._load_state()
+        assert state["consecutive_failures"] == 0
+        assert state["next_attempt_after"] is None
+        assert checker.check() is WatchdogAction.RESTART
+
+    @pytest.mark.parametrize("bad", ["soon", {}, [], True, float("inf")])
+    def test_malformed_backoff_deadline_does_not_crash_the_check(
+        self, tmp_path: Path, stale_status: Path, bad
+    ):
+        # `time.time() < state["next_attempt_after"]` raises TypeError on a
+        # string or a container. None is the field's own "unset" value, so the
+        # backoff simply does not apply and the next decision rewrites it.
+        checker = _make_checker(tmp_path, stale_status)
+        state_file = tmp_path / "watchdog_state.json"
+        state_file.write_text(json.dumps(
+            {"consecutive_failures": 0, "next_attempt_after": bad}, allow_nan=True,
+        ))
+        assert checker.check() is WatchdogAction.RESTART
+
+
+class TestServiceUptimeProbe:
+    """Drive the REAL _service_uptime_s body (the autouse fixture stubs it for
+    every other test, so nothing else runs the subprocess triage). `systemctl
+    show <nonexistent> --value` exits 0 with "0" (measured), so `int(raw) == 0`
+    — not the returncode — rejects a never-activated unit. BOTH clocks are
+    injected below: a HOST-derived stamp went negative <42s after kernel boot.
+    """
+
+    def _real_uptime(self, checker: WatchdogChecker) -> float | None:
+        return _REAL_SERVICE_UPTIME_S(checker)
+
+    def test_parses_monotonic_active_enter(self, tmp_path: Path, stale_status: Path, monkeypatch):
+        checker = _make_checker(tmp_path, stale_status)
+        monkeypatch.setattr(time, "clock_gettime", lambda _clock: 10_000.0)
+        fake = MagicMock(returncode=0, stdout=f"{int((10_000.0 - 42.0) * 1e6)}\n")
+        with patch("genesis.autonomy.watchdog.subprocess.run", return_value=fake):
+            uptime = self._real_uptime(checker)
+        assert uptime is not None and 41.0 < uptime < 43.0
+
+    @pytest.mark.parametrize(
+        "stdout", ["0\n", "", "  \n", "not-a-number", "[not set]", "-5", "²"],
+    )
+    def test_unparsable_or_never_activated_is_none(
+        self, tmp_path: Path, stale_status: Path, stdout: str
+    ):
+        checker = _make_checker(tmp_path, stale_status)
+        fake = MagicMock(returncode=0, stdout=stdout)
+        with patch("genesis.autonomy.watchdog.subprocess.run", return_value=fake):
+            assert self._real_uptime(checker) is None
+
+    def test_subprocess_failure_is_none(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status)
+        with patch(
+            "genesis.autonomy.watchdog.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("systemctl", 5),
+        ):
+            assert self._real_uptime(checker) is None
 
 
 class TestFlapDamping:
@@ -1201,6 +1520,22 @@ class TestLivenessRestartGate:
         assert state["starved_skips"] == 1
         # A suppressed cycle must NOT burn the restart/backoff counter.
         assert state.get("consecutive_failures", 0) == 0
+
+    def test_starved_suppression_requires_persisted_counter(self, tmp_path: Path):
+        # Same class as the bootstrap-grace persistence gate (Codex P2,
+        # PR #1858): a suppression whose counter did not land is unbounded on a
+        # box with a failing state write — fall through to restart instead.
+        c = self._stale(tmp_path)
+        payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True,
+                            "executor": {"pending": 30}}}
+        with (
+            patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)),
+            patch.object(c, "_alert_starved") as alert,
+            patch.object(WatchdogChecker, "_save_state", return_value=False),
+        ):
+            action = c.check()
+        assert action is WatchdogAction.RESTART
+        alert.assert_not_called()
 
     def test_starved_suppression_is_bounded(self, tmp_path: Path):
         c = self._stale(tmp_path)

@@ -63,7 +63,15 @@ async def run_centrality_recompute(
         # the importance shield keeps its last real threshold instead of
         # silently shielding nothing. The stale-cache cost is bounded: the
         # next successful run atomically replaces it.
-        logger.warning("Centrality skipped — graph unavailable: %s", exc)
+        # exc_info, because this branch now receives causes it did not before.
+        # Making the store raise GraphUnavailableError for a DB failure routed
+        # those out of the generic handler below — which logs a stack — and into
+        # this typed one, which did not. A locked or corrupt database during the
+        # dream cycle would have gone from a traceback to a single line, and
+        # nothing downstream compensates: `report["graph_unavailable"]` has no
+        # production reader, and `dream_cycle` only records an error if this
+        # function RAISES, which it never does.
+        logger.warning("Centrality skipped — graph unavailable: %s", exc, exc_info=True)
         report["graph_unavailable"] = True
         report["error"] = str(exc)
         return report
