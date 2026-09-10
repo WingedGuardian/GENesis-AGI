@@ -1,0 +1,1 @@
+- Background task failures now reach the reflex nerve. They were published one severity level below the threshold the reflex ingestor listens on, and the ego deliberately ignores them as reflex-owned, so every one of them was discarded without a trace.
