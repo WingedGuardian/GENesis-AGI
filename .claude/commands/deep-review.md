@@ -12,7 +12,9 @@ CLI parsing.)
 
 Note: `/deep-review` is the LOCAL pre-push adversarial pass (Claude-model reviewers). It does
 NOT replace the independent-model Codex review, which runs on the PR — automatically when the PR
-opens, and after any later push ONLY when you comment `@codex review` — and is required by the
+opens, and after any later push only when you comment `@codex review` (an
+owner-tunable setting that has flipped before — verify at the PR rather than
+trusting this sentence) — and is required by the
 merge gate. The two are complementary (Codex catches cross-model blind spots). This command
 clears the local commit review-depth gate; it does not certify the PR by itself.
 

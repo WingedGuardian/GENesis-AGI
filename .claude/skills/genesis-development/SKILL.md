@@ -1628,7 +1628,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   2. **The block point is BEFORE dispatching the next review.** The check is
      "am I about to trigger round 4+?" — evaluated at the mechanical moment
      (the `@codex review` comment, the reviewer dispatch — NOT the push itself,
-     which triggers nothing), never after reading the next batch of findings.
+     which triggers nothing TODAY — an owner-tunable
+     setting, so verify at the PR rather than trusting this clause), never after
+     reading the next batch of findings.
   3. **The cap CONSUMES standing approval.** A prior "proceed", "merge when
      clean", or "keep going until Codex is green" is VOID once the cap fires.
      Continuing a round-4+ loop on an earlier instruction is a violation, not
@@ -1776,9 +1778,13 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `_required_ci_workflows` / `_required_scheduled_review_kinds` / `_doc_findings_mode`
   all share, and all three then discard your configured value and take their DEFAULT.
   Say "default", not "fail closed" — the directions differ, which is the whole reason
-  it matters. The first two default to the stricter reading; `_doc_findings_mode`
-  defaults to `skip` (`git_push_guard.py:1143`), which scores FEWER findings, so a
-  duplicate key silently LOOSENS that one (Codex P2, #1903). The rule below
+  it matters, and they differ two-to-one rather than the other way round. Only
+  `_required_scheduled_review_kinds` defaults to its MAXIMAL set, so a discard there
+  TIGHTENS. The other two can LOOSEN: `_doc_findings_mode` defaults to `skip`
+  (`git_push_guard.py:1143`), scoring fewer findings and saying nothing about it; and
+  `_required_ci_workflows` falls back to the shipped `("CI",)`, which is NARROWER than
+  any larger required set an install declared — it does print a NOTE, so that one is
+  loud rather than silent, but it is still a relaxation (Codex P2, #1903). The rule below
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
@@ -1842,15 +1848,23 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   exemption stated HERE, where the cap is, the two rules read as a contradiction and
   a session fixing a floor-class finding cannot satisfy both (Codex P2, #1903). The gate's strictest path points at the gate
   itself: a PR changing the rules must pass the rules it is changing, every fix moves
-  the head, and each moved head costs another manual review request. READ (#1824): four rounds spent to RELAX a gate. Meanwhile the fixes those PRs carry are what unblock
+  the head, and each moved head costs another manual review request. READ (#1824): four review PASSES to relax a gate — architect,
+  security, a cross-model reviewer, and a mandated fresh audit — of which the EXTERNAL
+  streak was 2. The count is stated that way deliberately: an earlier draft here said
+  "four rounds", which is the wrong denominator by this very file's definition, since
+  internal reviews are never rounds. The public record shows 3 review objects and 2
+  review requests; anyone re-deriving "four" from the PR alone will not find it. Meanwhile the fixes those PRs carry are what unblock
   everything behind them, so a slow lane here is not a safe lane — it is a queue that
   stops fixing itself.
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `_HOOK_SURFACE_PREFIXES` + `_HOOK_SURFACE_FILES` in `scripts/hooks/git_push_guard.py`.
   Read those constants; do not copy them here — a hand-copied list is wrong the moment
-  a hook is wired. `TestWiredHooksFenceGuardrail` keeps the WIRED-HOOK half exhaustive
-  by parsing `.claude/settings.json`; it cannot do the same for the tracked CONFIGS the
+  a hook is wired. `TestWiredHooksFenceGuardrail` keeps the WIRED-HOOK half
+  self-maintaining FOR THE SPELLINGS IT RECOGNISES, by parsing
+  `.claude/settings.json` (measured: 42 of 54 wired commands discovered; the rest are
+  `.claude/hooks/*.sh` and inline blobs already covered by the prefixes, so no live
+  gap — but a `python3 -u scripts/foo.py` or `node …` wiring would slip past it); it cannot do the same for the tracked CONFIGS the
   hooks read, because settings.json lists hooks and not the files they consume. Those
   entries are maintained by hand, so adding a config a hook's behaviour depends on means
   adding it to `_HOOK_SURFACE_FILES` deliberately (Codex P2, #1903). This lane is a STRICTER-REVIEW, FEWER-ROUNDS trade on that surface. It does
@@ -1862,7 +1876,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   changes the gate. Throughout this block "gate PR" means exactly "hook-surface PR".
 
   1. **Round 1 is DUAL and immediate.** CONFIRM Codex has fired (it auto-reviews when
-     the PR opens; if it did not, request it — `--check-pr <N>` tells you which), and
+     the PR opens). `--check-pr <N>` shows whether a review EXISTS at this head; it
+     CANNOT distinguish "never requested" from "still running", so if you did not
+     request one yourself, request one rather than reading a blank line as proof
+     nobody did. Then
      run the secondary reviewer (`merge_gate.secondary_reviewer`) alongside it — two
      sets of blind spots in one calendar round, which is the scarce resource here. No
      secondary configured → Codex-only, and say so in the PR. Nothing validates that
@@ -1885,23 +1902,36 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      invalidates the review, and a push whose DELTA touches the hook surface is never
      classed review-trivial (`_classify_post_review_delta` tests the DELTA's files, not
      the PR's), so a one-line courtesy fix to guard code buys a whole extra review
-     cycle. A docs-only push can still ride the existing review — that is the one cheap
-     fix this rule does not charge you for. A cheap NON-floor finding gets a reply,
+     cycle. A push of ORDINARY PROSE can still ride the existing
+     review — that is the one cheap fix this rule does not charge you for, and note
+     how narrow it is: `_is_docs_or_config` DELIBERATELY excludes prompt surfaces
+     even when they are `.md` (`review_enforcement_commit.py:114-127`), so a skill,
+     command or agent file is SUBSTANTIAL and buys the full cycle
+     (`review_scope.classify_compare_substantiality`). Since a gate PR's docs are
+     usually exactly those files, assume you are paying (Codex P2, #1903). A cheap NON-floor finding gets a reply,
      not a commit. Merge both reviewers' findings into ONE table,
      then classify each: {live bug | latent trap | hardening | observation}. Only live
      bugs and cheaper-now-than-later traps change code. The rest get a maintainer reply
-     carrying the evidence — which the gate honours as engagement and which costs ZERO
-     rounds. Most findings never needed to become a diff.
+     carrying the evidence — IN-THREAD on the inline comment, from a maintainer
+     account: that is the ONLY shape the gate scores as engagement (it reads
+     `in_reply_to_id` on `pulls/N/comments`, so a top-level PR comment engages
+     nothing). Two findings therefore have no thread to reply into and must be
+     documented in the PR body instead: anything the SECONDARY reviewer raised, which
+     runs locally, and anything living in a review BODY rather than an inline comment.
+     Engagement costs ZERO rounds. Most findings never needed to become a diff.
   3. **One batched fix push per round, self-audited first.** Not two, not three: every
      push invalidates the review, so three pushes turn one round into three review
-     requests. (A compliant run has at most two pushes total — one answering round 1,
+     requests. (A compliant run has at most two CODE pushes total — the free
+     ordinary-prose push of rule 2 does not count against it — one answering round 1,
      and rule 4's terminal push if the floor demands one.)
      Before pushing, run the adversarial pass over your own FIX-CODE — reviewing your
      own work needs no approval and is the specific gap that keeps biting. READ, three
      instances (#1856, #1686, e7ae445a5): each a fail-open introduced BY fix-code
      written under review pressure, and each caught only by a later round. The danger is the fixing, not the
      reviewing.
-  4. **Round 2 is the TERMINAL.** Treat it as the round-7 menu arriving early: accept
+  4. **Round 2 is the TERMINAL.** Treat it as the round-7 menu arriving early —
+     the same two branches, but WITHOUT that tier's take-it-to-the-user
+     requirement, because here it is the FLOOR that routes to the owner (rule 5): accept
      and merge with every outstanding finding documented in the PR body, or abandon and
      re-cut from a design that does not need a third round. **The always-fix floor is
      never accepted** — a P1, a security defect, anything destructive or fail-open gets
@@ -1910,9 +1940,19 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      or abandon.
      **A terminal push whose delta touches the hook surface needs a fresh review at that
      head** — that delta is never review-trivial, by design (a docs-only terminal push
-     is the exception, and may ride the existing review). That confirming review
-     is a GATE REQUIREMENT, not a discovery round: if it is clean you merge; if it
-     surfaces something new, you are in rule 5 and it goes to the owner. A round 2 with NO
+     is the exception, and may ride the existing review — ORDINARY PROSE only, the
+     same narrowness rule 2 spells out: a skill, command or agent file is a PROMPT
+     SURFACE, classifies SUBSTANTIAL, and needs the fresh review even though it is
+     `.md`. That is the identical claim rule 2 already corrects, and it survived here
+     for a round because the fix was applied to the sentence that was flagged instead
+     of to every sentence making the claim). That confirming review
+     is a GATE REQUIREMENT, not a discovery round: if it is clean you merge. If it
+     surfaces something new, the SEVERITY routes it, exactly as it does anywhere
+     else in this rule — a non-floor finding is accepted and documented like any
+     other, and only a FLOOR-CLASS one (P1, security, destructive, fail-open) goes
+     to the owner under rule 5. An earlier draft sent everything to rule 5, which
+     contradicted the accept-and-document branch two sentences above and left one
+     confirmation result with two required actions (Codex P2, #1903). A round 2 with NO
      floor findings needs no push at all, so there is nothing to re-review.
   5. **A NEW P1 on the fix-code at round 2 is an owner decision, not round 3.** That is
      the measured tripwire: a PR whose fix introduced a P1 is the kind that introduces
@@ -1936,8 +1976,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      a fix you have already decided to make.
 
   **This is DOCTRINE, not a gate change.** No edit to `git_push_guard.py`, and stopping
-  at 2 keeps you clear of the round-3 cap and the lifetime terminal — so no
-  `# escalation-ack` and no standing sigil. Be precise about ONE tier though: the
+  at 2 DISCOVERY rounds normally keeps you clear of the round-3 cap and the lifetime
+  terminal. "Normally" is doing work there, so say the exception out loud: the machine
+  counter is CLASS-BLIND. `bump_review_round` increments on a distinct staged diff and
+  records no notion of "confirming" versus "discovery" (`review_state.py`), so if the
+  confirming review returns a floor finding and you stage its fix as an external
+  defect-bearing round, that IS machine round 3 and the commit blocks pending
+  `# escalation-ack`. The doctrine's exemption is about which rounds you CHOOSE to run;
+  it cannot exempt you from a counter that cannot see the distinction. Ack it honestly
+  — the step-back it demands has by then genuinely happened — rather than being
+  surprised by it (Codex P2, #1903). Be precise about ONE tier though: the
   machine layer's FIRST stop is the round-2 MODE-SWITCH block, and a run that takes two
   defect-bearing external rounds DOES reach it, so the terminal commit may need
   `# audit-ack`. That is honest rather than a bypass — the block demands a
@@ -1955,12 +2003,19 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   **On the word "round" here:** these are CALENDAR rounds — one head, sent out and come
   back, however many reviewers saw it. That is deliberately not the same denominator as
   the escalation counter (which counts marks) or `_check_codex_round_escalation` (which
-  counts Codex reviews via the API). One dual round 1 is one round in all three senses;
-  the shapes only diverge if you push between reviewers, which rule 3 forbids.
+  counts Codex reviews via the API). A DEFECT-BEARING dual round 1 is one round in all
+  three. A CLEAN one is NOT: `--clean` writes the local streak to 0 while the API count
+  still reads 1, and a mark run before the fix is staged counts nothing locally at all.
+  So never infer one counter's value from another — read the counter you care about.
+  (Pushing between reviewers, which rule 3 forbids, is a further way to diverge them,
+  not the only one.)
 
   **A note for anyone reading only CLAUDE.md:** "hard stop at 2" is a rule you keep, not
-  a gate that stops you. Nothing mechanical blocks a third round until the machine cap
-  at 3 — which is exactly why the stop has to be honoured deliberately.
+  a gate that stops you: nothing mechanical stops you REQUESTING a third round until
+  the machine cap at 3. A mechanical block DOES land earlier — the round-2 MODE-SWITCH
+  block on the COMMIT, four paragraphs up — which is a different thing acting on a
+  different verb, and is exactly why the stop has to be honoured deliberately rather
+  than waited for.
 
 - **Some PRs are not a review problem — hand them to an architecture session.**
   When you ARE driving a PR toward green (per "When to DRIVE a Merge" below),

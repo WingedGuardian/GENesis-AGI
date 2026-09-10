@@ -492,7 +492,11 @@ every emitter's arithmetic, so this class cannot go quiet again.
   requested. **Verify rather than remember** — that trigger is an owner-tunable
   setting which has flipped more than once, so a session that recalls it from prose
   will eventually be wrong. `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
-  reports `codex-at-head` and settles it for free. A PR whose diff touches the
+  reports `codex-at-head`, which settles whether a review EXISTS at this head — not
+  whether one was requested. It reads published reviews only, so "never triggered"
+  and "triggered, still running" are the SAME output; if you have not just requested
+  one, request one rather than reading that line as proof nobody did.
+  A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
   protocols: genesis-development skill.
