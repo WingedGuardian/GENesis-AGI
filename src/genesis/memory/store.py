@@ -256,6 +256,12 @@ class MemoryStore:
                         supersedes, existing, datetime.now(UTC).isoformat(),
                         verify_successor=True,
                     )
+                except SupersedeUnresolved:
+                    # Escapes to the reporting layer exactly as it does on the
+                    # normal path below. The `existing` id it carries is the
+                    # memory that already held this content, so the caller is
+                    # never left without a handle on what is durable.
+                    raise
                 except Exception:
                     # Mirrors the normal supersede path below: a failed
                     # deprecation must not turn a durable store into a raised
@@ -575,6 +581,13 @@ class MemoryStore:
         if supersedes:
             try:
                 await self._mark_superseded(supersedes, memory_id, now_iso)
+            except SupersedeUnresolved:
+                # Deliberately NOT swallowed. The memory above is already
+                # durable, so this is a partial outcome the caller must see —
+                # swallowing it is what let a session be told its correction
+                # landed while the stale memory stayed live in recall. Carries
+                # memory_id so the MCP layer can report both halves.
+                raise
             except Exception:
                 logger.warning(
                     "Failed to mark memory %s as superseded by %s",

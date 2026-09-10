@@ -521,7 +521,7 @@ async def test_dedup_short_circuit_still_supersedes(store, db):
 
 
 @pytest.mark.asyncio()
-async def test_dedup_path_supersede_failure_does_not_duplicate(store, db):
+async def test_dedup_path_unresolved_supersede_does_not_duplicate(store, db):
     """A supersede failure on the dedup path must not reach the store pipeline.
 
     Found in review of PR #1831. The supersede call added to the dedup path sat
@@ -532,8 +532,12 @@ async def test_dedup_path_supersede_failure_does_not_duplicate(store, db):
     lookup had proved already existed.
 
     ``create_metadata.assert_not_awaited()`` is the duplication itself, not a
-    proxy for it.
+    proxy for it. ``stored_memory_id`` is an independent assertion: it proves
+    the error names the memory that already existed rather than a freshly
+    minted duplicate id.
     """
+    from genesis.memory.store import SupersedeUnresolved
+
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.update_payload"), \
          patch("genesis.memory.store.memory_crud") as mock_mem, \
@@ -547,10 +551,52 @@ async def test_dedup_path_supersede_failure_does_not_duplicate(store, db):
         mock_mem.mark_superseded = AsyncMock(return_value=True)
         mock_links.create = AsyncMock(return_value=("old", "new"))
 
-        out = await store.store(
-            "a correction", "conversation", supersedes="deadbeef",
-        )
+        with pytest.raises(SupersedeUnresolved) as exc:
+            await store.store(
+                "a correction", "conversation", supersedes="deadbeef",
+            )
 
     mock_mem.create_metadata.assert_not_awaited()
-    assert out == "pre-existing-id", "the surviving memory must be returned"
+    assert exc.value.stored_memory_id == "pre-existing-id", (
+        "the error must name the memory that already exists, not a duplicate "
+        "the full pipeline minted after the exception was swallowed"
+    )
+    assert exc.value.reason == "not_found"
+    mock_mem.mark_superseded.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+async def test_store_lets_an_unresolved_supersede_out(store, db):
+    """store() must NOT swallow SupersedeUnresolved on the normal path either.
+
+    Added because a mutation survived: re-widening the call site's
+    ``except Exception`` to catch this error broke nothing, since every other
+    test either calls ``_mark_superseded`` directly or mocks ``store`` whole.
+    That except clause IS the live defect (a session was told its correction
+    landed while the stale memory stayed in recall), so it needs a test that
+    reaches it.
+    """
+    from genesis.memory.store import SupersedeUnresolved
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        # The handle names no memory — the resolver's NOT_FOUND verdict.
+        mock_mem.resolve_id = AsyncMock(return_value=([], "not_found"))
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        with pytest.raises(SupersedeUnresolved) as exc:
+            await store.store(
+                "a correction", "conversation", supersedes="deadbeef",
+            )
+
+    assert exc.value.reason == "not_found"
+    # The new memory was still written before the supersede was attempted —
+    # that is why the MCP layer reports instead of raising to the caller.
+    assert exc.value.stored_memory_id
     mock_mem.mark_superseded.assert_not_awaited()

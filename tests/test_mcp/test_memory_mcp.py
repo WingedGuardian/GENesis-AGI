@@ -2237,3 +2237,146 @@ async def test_memory_recall_wing_validation_shares_one_definition_with_the_writ
             mod.side_effect = RuntimeError("reached the search path")
             with pytest.raises(RuntimeError):
                 await tools["memory_recall"].fn(query="q", wing=wing)
+
+
+# --- memory_store: a supersede that fails must not read as a clean store -----
+# MEASURED 2026-09-06: three `succeeded_by` edges whose source was an 8-char
+# handle, created in a 14-minute window (0 historically). The store returned an
+# id, the caller read success, and one target is still deprecated=0 — a memory a
+# session believed it had corrected, still live in recall. Two of the three were
+# RETRIED ~90s later with the full id, so the silence also duplicated memories.
+
+
+@pytest.mark.asyncio
+async def test_memory_store_without_supersedes_still_returns_a_bare_id():
+    """Contract lock: the ~all-calls path is untouched by the report shape."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_store"].fn("content", "src")
+
+    assert result == "mem-id"
+    assert isinstance(result, str)
+
+
+@pytest.mark.asyncio
+async def test_memory_store_reports_a_successful_supersede():
+    """Asking for a supersede gets you a verdict, not just an id."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="new-id")
+        result = await tools["memory_store"].fn("content", "src", supersedes="old-id")
+
+    assert result["memory_id"] == "new-id"
+    assert result["superseded"] is True
+
+
+@pytest.mark.asyncio
+async def test_memory_store_reports_an_unresolved_supersede_without_losing_the_memory():
+    """The stored id survives, the failure is stated, and retry is warned off."""
+    from genesis.mcp.memory import core
+    from genesis.memory.store import SupersedeUnresolved
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(
+            side_effect=SupersedeUnresolved("abcd1234", "not_found", "new-id")
+        )
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234"
+        )
+
+    # The content is NOT lost — that is why this reports instead of raising.
+    assert result["memory_id"] == "new-id"
+    assert result["superseded"] is False
+    assert result["reason"] == "not_found"
+    # And it must give an instruction that is actually executable: there is no
+    # standalone supersede tool, so "re-issue the supersede" was uncompletable.
+    # The retry is safe because the dedup path supersedes too.
+    assert "WAS stored" in result["warning"]
+    assert "same content" in result["warning"].lower()
+    assert "will not be duplicated" in result["warning"]
+
+
+@pytest.mark.asyncio
+async def test_memory_store_names_the_candidates_of_an_ambiguous_supersede():
+    """An ambiguous handle is never guessed; the caller is told which ids collide."""
+    from genesis.mcp.memory import core
+    from genesis.memory.store import SupersedeUnresolved
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(
+            side_effect=SupersedeUnresolved(
+                "abcd1234", "ambiguous", "new-id", ["abcd1234-aaa", "abcd1234-bbb"]
+            )
+        )
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234"
+        )
+
+    assert result["superseded"] is False
+    assert result["reason"] == "ambiguous"
+    assert result["candidates"] == ["abcd1234-aaa", "abcd1234-bbb"]
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_advice_fits_the_reason_it_reports():
+    """"Re-send with a full 36-char id" is the fix for a handle that named
+    nothing. For the successor-validation reasons the target id was FINE and
+    re-sending the same content reproduces the same collision, so that
+    instruction cannot work — and an uncompletable instruction is what kept the
+    original defect's retry loop running.
+    """
+    from genesis.mcp.memory import core
+    from genesis.memory.store import SupersedeUnresolved
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(
+            side_effect=SupersedeUnresolved("abcd1234", "self_supersede", "abcd1234-x")
+        )
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234"
+        )
+
+    assert result["superseded"] is False
+    assert result["reason"] == "self_supersede"
+    assert "cannot replace itself" in result["warning"]
+    assert "36-char" not in result["warning"], (
+        "handed back the not_found advice, which cannot resolve a self-supersede"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_does_not_report_a_supersede_nobody_asked_for():
+    """An empty `supersedes` must not produce `superseded: True`.
+
+    Both store-side guards are truthiness tests (`if supersedes:`), so "" and
+    "   " perform no deprecation at all. An `is None` test here would treat
+    them as a requested supersede and build a success report about an operation
+    that never ran. MCP and `POST /api/t/memory_store` both take a string here,
+    so an empty one arrives without any client bug.
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    for empty in ("", "   "):
+        with patch.object(core, "_memory_mod") as mod:
+            mod.return_value._store = MagicMock()
+            mod.return_value._store.store = AsyncMock(return_value="new-id")
+            result = await tools["memory_store"].fn("content", "src", supersedes=empty)
+
+        assert result == "new-id", (
+            f"supersedes={empty!r} produced a supersede report: {result!r}"
+        )
+        assert isinstance(result, str), "the bare-id shape is what a non-request returns"

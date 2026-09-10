@@ -306,14 +306,18 @@ async def test_dedup_short_circuit_cannot_self_supersede(store, db):
     content it has not actually changed, which is the shape a retried
     correction takes.
 
-    ``store()`` swallows the rejection and returns the surviving id, exactly as
-    the normal supersede path does; what must hold is that NOTHING was mutated.
+    The rejection escapes ``store()`` so the reporting layer can tell the
+    caller; what must also hold is that NOTHING was mutated.
     """
+    from genesis.memory.store import SupersedeUnresolved
+
     await _index(db, OLD, DUPE)
 
-    returned = await store.store(DUPE, "conversation", supersedes=PREFIX)
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.store(DUPE, "conversation", supersedes=PREFIX)
 
-    assert returned == OLD, "the caller needs the surviving id"
+    assert exc.value.reason == "self_supersede"
+    assert exc.value.stored_memory_id == OLD, "the caller needs the surviving id"
     assert (await _row(db, OLD))["deprecated"] == 0
     assert await _links(db) == []
 
@@ -326,11 +330,14 @@ async def test_a_deprecated_dedup_candidate_cannot_carry_the_correction(store, d
     recall, so the correction is unreachable — and nothing raised out of
     ``_mark_superseded``, so it looked like a completed supersede.
     """
+    from genesis.memory.store import SupersedeUnresolved
+
     await _index(db, DEAD, DUPE)
 
-    returned = await store.store(DUPE, "conversation", supersedes=OLD)
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.store(DUPE, "conversation", supersedes=OLD)
 
-    assert returned == DEAD
+    assert exc.value.reason == "successor_deprecated"
     assert (await _row(db, OLD))["deprecated"] == 0, (
         "deprecated the target toward a successor recall cannot see"
     )

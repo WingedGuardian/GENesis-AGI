@@ -824,8 +824,20 @@ async def memory_store(
     room: str | None = None,
     collection: str | None = None,
     supersedes: str | None = None,
-) -> str:
+) -> str | dict:
     """Store memory with source metadata and type tag. Returns memory_id.
+
+    Return shape depends on ``supersedes``, which the caller controls: without
+    it you get the memory_id string, exactly as before. WITH it you get a dict
+    ``{"memory_id", "superseded", ...}`` reporting whether the deprecation
+    actually happened — because it can fail on its own while the store
+    succeeds, and reporting only the id is what let that failure go unnoticed.
+    ``reason`` names why a supersede did not happen, and the ``warning`` gives
+    advice that fits that reason.
+
+    This tool is also reachable over HTTP as ``POST /api/t/memory_store``
+    (``dashboard/routes/tool_api.py``), which accepts ``supersedes`` like any
+    other parameter — so the conditional shape is visible to that door too.
 
     Args:
         memory_class: Optional classification — "rule", "fact", or "reference".
@@ -836,7 +848,13 @@ async def memory_store(
             collection routing when provided (e.g. "knowledge_base").
         supersedes: Memory ID that this new memory replaces. The old memory
             will be marked as deprecated with a ``succeeded_by`` link to the
-            new one. Use when correcting stale facts.
+            new one. Use when correcting stale facts. Accepts the same short
+            ``id:<8-char>`` handles the proactive hook prints and
+            ``memory_expand`` accepts; an ambiguous handle is never guessed.
+            When the supersede cannot be performed the memory is STILL STORED
+            and the returned dict says so — do not retry the store blindly, or
+            you will duplicate the memory (measured: that retry happened twice
+            on 2026-09-06 while this path was silent).
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -847,21 +865,89 @@ async def memory_store(
     # external-influenced session's writes stop landing first_party via the
     # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
     from genesis.memory.provenance import session_origin_from_env
+    from genesis.memory.store import SupersedeUnresolved
 
-    return await memory_mod._store.store(
-        content,
-        source,
-        memory_type=memory_type,
-        tags=tags,
-        confidence=confidence,
-        memory_class=memory_class,
-        source_pipeline="conversation",
-        origin_class=session_origin_from_env(),
-        wing=wing,
-        room=room,
-        collection=collection,
-        supersedes=supersedes,
-    )
+    # An empty or all-whitespace handle is not a request. Both store-side
+    # guards are truthiness tests (`if supersedes:`), so "" and "   " perform no
+    # deprecation at all — while an `is None` test here would treat them as a
+    # requested supersede and build a success report about an operation that
+    # never ran. Normalized ONCE, so the two layers cannot disagree about what
+    # counts as a request. MCP and `POST /api/t/memory_store` both accept a
+    # string, so an empty one arrives without any client bug.
+    supersedes = supersedes.strip() if supersedes else None
+
+    try:
+        memory_id = await memory_mod._store.store(
+            content,
+            source,
+            memory_type=memory_type,
+            tags=tags,
+            confidence=confidence,
+            memory_class=memory_class,
+            source_pipeline="conversation",
+            origin_class=session_origin_from_env(),
+            wing=wing,
+            room=room,
+            collection=collection,
+            supersedes=supersedes,
+        )
+    except SupersedeUnresolved as exc:
+        # The memory IS durable; only the deprecation failed. Report both
+        # halves rather than raising — an exception here reads as "the store
+        # failed" and invites the retry that duplicates the memory.
+        #
+        # The advice is REASON-SPECIFIC. "Re-send with a full 36-char id" is
+        # the fix for a handle that named nothing or named several; it is the
+        # wrong instruction for the two successor-validation reasons, where the
+        # target id was fine and re-sending the same content reproduces the
+        # same collision. Handing a caller an instruction that cannot work is
+        # how the original defect kept its retry loop going.
+        if exc.reason == "self_supersede":
+            advice = (
+                "The content you sent is byte-identical to the memory you asked "
+                "to supersede, so the correction and its target are the SAME "
+                "memory, and a memory cannot replace itself. Nothing was "
+                "deprecated. Send the CORRECTED content, or name the memory you "
+                "actually meant to deprecate."
+            )
+        elif exc.reason == "successor_deprecated":
+            advice = (
+                f"The content you sent already exists as memory "
+                f"{exc.stored_memory_id}, which is itself DEPRECATED and so is "
+                "filtered out of normal recall — it cannot carry the correction. "
+                "Nothing was deprecated. Send the correction as new content."
+            )
+        else:
+            advice = (
+                "Re-run memory_store with the SAME content and a full 36-char "
+                "memory id: the content will not be duplicated, and the "
+                "supersede will be applied to the memory that already landed. "
+                "There is no standalone supersede tool."
+            )
+        return {
+            "memory_id": exc.stored_memory_id,
+            "superseded": False,
+            "supersedes_requested": supersedes,
+            "reason": exc.reason,
+            "candidates": exc.candidates,
+            "candidates_truncated": exc.truncated,
+            "warning": (
+                f"The memory WAS stored ({exc.stored_memory_id}). The supersede "
+                f"did NOT happen: {supersedes!r} is {exc.reason}. The old memory "
+                f"is still live in recall. {advice}"
+            ),
+        }
+
+    # Normalized ABOVE, so the store and this report agree on what "asked for a
+    # supersede" means — see the note there.
+    if not supersedes:
+        return memory_id
+
+    return {
+        "memory_id": memory_id,
+        "superseded": True,
+        "supersedes_requested": supersedes,
+    }
 
 
 @mcp.tool()
