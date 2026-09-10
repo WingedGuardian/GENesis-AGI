@@ -146,15 +146,32 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
     flag can no longer decide the verdict; at worst it costs one extra token
     before `pytest`, which this does not read.
 
-    Returns None when the segment is not a carrier, or carries no pytest token —
-    `uv pip install requests` must stay allowed.
+    The scan starts AFTER the `run` literal, because a `pytest` token ahead of it
+    is a package NAME, not an invocation. MEASURED on this PR's own tree: scanning
+    the whole argv blocked 18 install/inspect commands — `uv pip install pytest`,
+    `uv add pytest`, `poetry add pytest`, `pipenv install pytest`, `pdm remove
+    pytest`, `uv pip show pytest` — with a message telling the user to target a
+    specific file, advice that means nothing for an install. Requiring the literal
+    keeps the whole fail-open set closed: `uv --color always run pytest` and
+    `uv --cache-dir /tmp/c run pytest` both carry `run` AHEAD of the token, which
+    is exactly why the closed question beats modelling the flag grammar. `uvx`
+    takes the command directly and has no subcommand to require.
+
+    Returns None when the segment is not a carrier, carries no `run` subcommand,
+    or carries no pytest token — `uv pip install requests` must stay allowed.
     """
     if _basename(seg.exe) not in _CARRIER_EXES:
         return None  # resolved to a real command (or not a carrier at all)
-    for i, tok in enumerate(seg.argv[1:], start=1):
+    argv = seg.argv
+    start = 1
+    if _basename(seg.exe) != "uvx":
+        if "run" not in argv[1:]:
+            return None  # `uv pip install pytest` installs pytest, it does not run it
+        start = argv.index("run", 1) + 1
+    for i, tok in enumerate(argv[start:], start=start):
         name = _basename(tok).split("@", 1)[0]  # uv permits `pytest@8.3.5`
         if name == "pytest":
-            return seg.argv[i + 1 :]
+            return argv[i + 1 :]
     return None
 
 

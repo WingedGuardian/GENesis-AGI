@@ -87,10 +87,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   their `run` subcommand, deliberately: treating the whole tool as a
   pass-through would have made the parser skip past the first word of *every*
   subcommand, hiding commands that other guards catch today. Any other
-  subcommand still resolves to the tool itself. Replayed against 37,568 real
-  commands from this install's history: one resolution changed, and it was a
-  `poetry run python` the parser had been reading as `poetry` — the fix
-  behaving, not a casualty.
+  subcommand still resolves to the tool itself — `uv pip install pytest`,
+  `poetry add pytest` and friends install the package, they do not run it, and
+  stay allowed. Replayed against 37,568 real commands from this install's
+  history: one resolution changed, and it was a `poetry run python` the parser
+  had been reading as `poetry` — the fix behaving, not a casualty.
 
 - **A schema rebuild no longer destroys columns a private fork added.** The
   ledger table rebuild (widening a constraint means rebuilding the table on

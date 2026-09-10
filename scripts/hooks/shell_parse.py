@@ -732,14 +732,19 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
-def _run_carrier_command_start(argv: list[str], i: int) -> int | None:
-    """Index of the command wrapped by a ``<front-end> run …`` invocation, else None.
+def _run_carrier_command_start(argv: list[str], i: int) -> tuple[int, bool] | None:
+    """``(index, via_tool_run)`` for a ``<front-end> run …`` invocation, else None.
 
     ``argv[i]`` is the front-end (``uv``/``poetry``/…). Returns the index of the
     first token of the WRAPPED command only when the front-end's first bare word
     is the literal ``run``; any other subcommand (``uv pip install …``) returns
     None so the front-end resolves as its own exe and NOTHING is skipped past.
     That asymmetry is the safety property — see ``_RUN_CARRIERS``.
+
+    The second element reports whether the subcommand was ``tool run`` (the
+    ``uvx`` alias). The CALLER must not re-derive that from a fixed argv offset:
+    this function first consumes the front-end's own value flags, so
+    ``uv --directory /x tool run …`` puts ``tool run`` at argv[3:5], not argv[1:3].
     """
     j = i + 1
     while j < len(argv):  # the front-end's own flags, ahead of its subcommand
@@ -755,8 +760,10 @@ def _run_carrier_command_start(argv: list[str], i: int) -> int | None:
     # tool run). Requiring a bare `run` left that spelling opaque, so
     # `uv tool run pytest` was allowed where `uvx pytest` was blocked. A literal
     # two-token sequence, not a grammar: closed set, nothing to keep up with.
+    via_tool = False
     if argv[j : j + 2] == ["tool", "run"]:
         j += 2
+        via_tool = True
     elif j < len(argv) and argv[j] == "run":
         j += 1
     else:
@@ -764,9 +771,9 @@ def _run_carrier_command_start(argv: list[str], i: int) -> int | None:
     while j < len(argv):  # `run`'s own flags, ahead of the wrapped command
         t = argv[j]
         if t == "--":
-            return j + 1
+            return j + 1, via_tool
         if not t.startswith("-"):
-            return j
+            return j, via_tool
         j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
     return None  # `uv run --flag` with no command after it
 
@@ -834,12 +841,11 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             i += 1  # leading VAR=value assignment
             continue
         if _basename(tok) in _RUN_CARRIERS:
-            j = _run_carrier_command_start(argv, i)
-            if j is None:
+            found = _run_carrier_command_start(argv, i)
+            if found is None:
                 break  # not a `run` invocation — the front-end IS the command
-            if argv[i + 1 : i + 3] == ["tool", "run"]:
-                via_uv_tool = True
-            i = j
+            i, tool_run = found
+            via_uv_tool = via_uv_tool or tool_run
             continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:

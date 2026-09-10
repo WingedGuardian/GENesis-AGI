@@ -873,6 +873,21 @@ class TestUvCarrierResolution:
         assert self._exe("uvx pytest@8.3.5 tests/") == "pytest"
         assert self._exe("uv tool run ruff@0.3.0 check .") == "ruff"
 
+    def test_a_front_end_flag_before_tool_run_still_normalises_the_version(self):
+        """The `tool run` fact comes from the RESOLVER, never from a fixed offset.
+
+        The resolver consumes the front-end's own value flags before matching the
+        subcommand, so `tool run` does not sit at argv[1:3] once any of them is
+        present. Reading it off that offset left `uv --directory v tool run
+        pytest@8.3.5` resolving to the exe `pytest@8.3.5` — a name that matches no
+        gate, so full_suite_guard ALLOWED it where the unflagged spelling blocks.
+        Every flag asserted here is already in _RUN_CARRIER_VALUE_FLAGS, so these
+        are reachable spellings, not hypotheticals.
+        """
+        for flag in ("--directory", "--project", "--python", "-C"):
+            cmd = f"uv {flag} /x tool run pytest@8.3.5 tests/"
+            assert self._exe(cmd) == "pytest", cmd
+
     def test_a_version_suffix_is_only_stripped_for_uv_tool_runners(self):
         """Scoped on purpose — @ is uv's spelling, not a universal one, and
         stripping it everywhere would invent syntax for tools that lack it."""

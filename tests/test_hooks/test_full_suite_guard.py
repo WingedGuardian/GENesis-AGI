@@ -212,6 +212,11 @@ class TestUvCarrierBypasses:
             "uv --cache-dir /tmp/c run pytest",  # ditto, different flag
             "uv tool run pytest",  # documented uvx alias
             "uvx pytest@8.3.5",  # documented versioned name
+            # A front-end value flag moves `tool run` off argv[1:3]; the versioned
+            # name must still normalise, or the exe is `pytest@8.3.5` and matches
+            # no gate. MEASURED fail-OPEN before the resolver reported the fact.
+            "uv --directory /x tool run pytest@8.3.5",
+            "uv --python 3.12 tool run pytest@8.3.5",
             "poetry run pytest",
             "uv run pytest tests/",  # whole-directory run
         ],
@@ -232,6 +237,23 @@ class TestUvCarrierBypasses:
             # Not a pytest run at all — a carrier doing something else must not
             # be caught by the carrier check.
             "uv pip install requests",
+            # Installing/inspecting pytest is not RUNNING it. Scanning the whole
+            # argv for the token blocked 206 of 746 generated carrier forms,
+            # every one of them install-shaped, with a message telling the user
+            # to target a specific file — advice that means nothing here.
+            "uv pip install pytest",
+            "uv pip uninstall pytest",
+            "uv pip show pytest",
+            "uv add pytest",
+            "uv add --dev pytest",
+            "uv remove pytest",
+            "uv sync --extra pytest",
+            "uv tool install pytest",
+            "poetry add pytest",
+            "poetry remove pytest",
+            "pipenv install pytest",
+            "pdm add pytest",
+            "rye add pytest",
             "uv run ruff check .",
             # A mere textual MENTION is not an invocation.
             "echo pytest",
