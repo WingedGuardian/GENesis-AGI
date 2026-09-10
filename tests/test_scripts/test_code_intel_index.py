@@ -710,7 +710,7 @@ def _derive_mem_max(limit_bytes: str | None, tmp_path, *ancestors: str) -> str:
     return res.stdout.strip()
 
 
-def test_cap_is_bounded_by_the_smallest_finite_limit_on_the_chain():
+def test_cap_is_bounded_by_the_smallest_finite_limit_on_the_chain(tmp_path):
     """A constrained ANCESTOR binds before the container root does.
 
     cgroup v2 nested limits only restrict further and are enforced across the
@@ -720,17 +720,21 @@ def test_cap_is_bounded_by_the_smallest_finite_limit_on_the_chain():
     replaced, which at least isolated. This repo already walks the chain the same
     way for pids.max (_collect_pid_budget in observability/snapshots/infrastructure).
     """
-    import tempfile
     gib = 1024 * 1024 * 1024
-    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as td:
-        # Root is generous; an intermediate slice is not. 3 GiB - 2 GiB reserve.
-        assert _derive_mem_max(str(32 * gib), Path(td), str(3 * gib)) == "1024M"
-    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as td:
-        # An uncapped intermediate level must not mask the root's real limit.
-        assert _derive_mem_max(str(4 * gib), Path(td), "max") == "2048M"
-    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as td:
-        # Deepest level binding, several levels down.
-        assert _derive_mem_max(str(32 * gib), Path(td), "max", str(5 * gib)) == "3072M"
+    # A separate subdirectory per case: _derive_mem_max builds its fake tree at a
+    # fixed name under the directory it is given, so reusing one would have each
+    # case overwrite the last and silently test the same chain three times.
+    # (pytest's tmp_path, never an absolute home path — that is both unportable
+    # and a machine-specific value with no business in the repo.)
+    a, b, c = (tmp_path / "case1", tmp_path / "case2", tmp_path / "case3")
+    for d in (a, b, c):
+        d.mkdir()
+    # Root is generous; an intermediate slice is not. 3 GiB - 2 GiB reserve.
+    assert _derive_mem_max(str(32 * gib), a, str(3 * gib)) == "1024M"
+    # An uncapped intermediate level must not mask the root's real limit.
+    assert _derive_mem_max(str(4 * gib), b, "max") == "2048M"
+    # Deepest level binding, several levels down.
+    assert _derive_mem_max(str(32 * gib), c, "max", str(5 * gib)) == "3072M"
 
 
 def test_cap_is_bounded_by_the_container_limit(tmp_path):
