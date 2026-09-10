@@ -12,6 +12,8 @@ from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
+from genesis.db.crud._id_resolve import AMBIGUOUS as _AMBIGUOUS
+from genesis.db.crud._id_resolve import NOT_FOUND as _NOT_FOUND
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
@@ -43,6 +45,10 @@ except ImportError:  # pragma: no cover — safety for minimal installs
 
 logger = logging.getLogger(__name__)
 
+# _id_resolve.resolve_unique_prefix reads with LIMIT 3; a result at that
+# size is a truncated listing, so the candidate set may be incomplete.
+_RESOLVER_MATCH_LIMIT = 3
+
 
 def _strip_kv_prefix(value: str | None, key: str) -> str | None:
     """Strip a leaked ``key=`` / ``key:`` prefix from a taxonomy value.
@@ -67,6 +73,48 @@ _COLLECTION_MAP = {
     "episodic": "episodic_memory",
     "knowledge": "knowledge_base",  # External knowledge → knowledge_base
 }
+
+
+class SupersedeUnresolved(Exception):
+    """``supersedes`` named no memory, or named several.
+
+    Raised BEFORE ``_mark_superseded`` writes anything, and — on the ``store()``
+    path — AFTER the new memory is durably stored, so it describes a partial
+    outcome rather than a failed write: the content is safe, the deprecation did
+    not happen.
+
+    Never guess an ambiguous handle: two memories sharing a prefix are two
+    different corrections, and deprecating the wrong one is unrecoverable
+    without the transcript.
+    """
+
+    def __init__(
+        self,
+        raw_id: str,
+        reason: str,
+        stored_memory_id: str,
+        candidates: list[str] | None = None,
+        truncated: bool = False,
+    ):
+        self.raw_id = raw_id
+        self.reason = reason  # "not_found" | "ambiguous"
+        # The memory that DID land. Carried so a reporting layer can hand the
+        # caller its id without a second lookup — without it the caller has a
+        # failure and no handle on the content it just wrote.
+        self.stored_memory_id = stored_memory_id
+        self.candidates = candidates or []
+        # The resolver reads with LIMIT 3, so a saturated result is a TRUNCATED
+        # listing, not the complete collision set. Saying "matches: a, b, c"
+        # about ten colliding memories is the repo's own truncated-read trap.
+        self.truncated = truncated
+        more = " (possibly more)" if truncated else ""
+        detail = (
+            f" (matches: {', '.join(self.candidates)}{more})" if self.candidates else ""
+        )
+        super().__init__(
+            f"supersedes={raw_id!r} is {reason}{detail}; "
+            f"memory {stored_memory_id} WAS stored"
+        )
 
 
 class MemoryStore:
@@ -503,9 +551,34 @@ class MemoryStore:
         Sets ``deprecated=1``, ``superseded_by``, and ``superseded_at`` in
         SQLite.  Sets ``deprecated=True`` and ``merged_into`` in the Qdrant
         payload.  Creates a ``succeeded_by`` link from old to new.
+
+        Raises ``SupersedeUnresolved`` — BEFORE any write — when *old_id* names
+        no memory or names several. Nothing is mutated on that path, so an
+        unresolvable handle can no longer leave a ``succeeded_by`` edge whose
+        source is not a memory (the only artifact the broken path used to
+        produce).
         """
-        # SQLite: mark deprecated + record successor (via CRUD module)
-        await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp)
+        # Resolve short handles FIRST. The proactive hook prints memories as
+        # `id:<8-char>` and memory_expand resolves those on the read side, so
+        # the ecosystem teaches the short form; this path used to feed it
+        # straight into an exact-match UPDATE that matched nothing.
+        matches, outcome = await memory_crud.resolve_id(self._db, old_id)
+        if outcome == _AMBIGUOUS:
+            raise SupersedeUnresolved(
+                old_id, "ambiguous", new_id, matches,
+                truncated=len(matches) >= _RESOLVER_MATCH_LIMIT,
+            )
+        if outcome == _NOT_FOUND:
+            raise SupersedeUnresolved(old_id, "not_found", new_id)
+        old_id = matches[0]
+
+        # SQLite: mark deprecated + record successor (via CRUD module).
+        # The return value says whether the row was FOUND — discarding it was
+        # how an unresolvable id became a silent no-op. PASSTHROUGH ids (full
+        # length, or non-hex) reach here unverified by design, so this is the
+        # check that catches them.
+        if not await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp):
+            raise SupersedeUnresolved(old_id, "not_found", new_id)
 
         # Qdrant: look up collection from metadata, then update payload.
         # Only touch Qdrant when a vector actually exists (status 'embedded').
