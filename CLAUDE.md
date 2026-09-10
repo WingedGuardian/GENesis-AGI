@@ -588,8 +588,8 @@ every emitter's arithmetic, so this class cannot go quiet again.
   approval, or a designed hard stop is finishing correctly, not dropping
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
-  issue, which keeps its per-instance approval gate from "Where deferred
-  work goes" below, this rule waives nothing. Where none of those trackers
+  issue, which still owes the privacy scrub from "Where deferred work goes"
+  below — this rule waives nothing. Where none of those trackers
   is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
   ledger or follow-up tool — the fallback is a structured handoff that NAMES
   every unfinished piece in your final message; a named remainder is tracked,
@@ -605,7 +605,24 @@ every emitter's arithmetic, so this class cannot go quiet again.
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
-  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  or (3) big enough to derail the session — or the user directs it.
+
+  **FILING IS NOT DEFERRING, and the two decisions are separate.** Everything below
+  answers WHERE a record lives. It never answers WHETHER the work waits — that is the
+  bias above, and it is decided FIRST. An issue is a public RECORD, not a disposal:
+  in-scope work gets filed *and* done, often in the same session, and the issue is
+  then simply where someone else could have found it. Treating "I filed it" as a
+  disposition is how a tracked item becomes an untracked drop wearing a ticket
+  number.
+
+  So before routing anything, answer in this order: **is it in scope for what this
+  session is doing?** If yes, it gets addressed here — file it too if that helps
+  someone else, but the filing is in addition, never instead. Only when it is
+  genuinely out of scope, or one of the three deferral tests above actually holds,
+  does the routing question below become the whole answer. Naming the OWNER of a
+  piece of work is a classification, and a classification is not a decision.
+
+  Route by OWNER:
   **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
   public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
   **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
@@ -614,14 +631,19 @@ every emitter's arithmetic, so this class cannot go quiet again.
   far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
   never dispatched, surfaced, or filed as an issue, because we don't want it picked
   up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  Two hard limits on the issue route, both non-negotiable: a public post is
-  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
-  approval carries forward, and a channel-driven session has no confirmation step of
-  its own); and a **security** defect — an unpatched bypass, a credential exposure,
-  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
-  owns it. Everything else — who may file, the command, labels, dispatched sessions,
-  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
-  Goes"). Read it before filing your first.
+  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
+  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
+  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
+  real-world life — and strip it; an issue carries technical detail only. Borderline,
+  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
+  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
+  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
+  One limit stays absolute: a **security** defect — an unpatched bypass, a
+  credential exposure, anything exploitable — is NEVER filed publicly before it
+  is fixed, no matter who owns it. Everything else — who may file, the command,
+  labels, dispatched sessions, the time-gated case — is in
+  `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
+  filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.

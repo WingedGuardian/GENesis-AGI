@@ -1366,14 +1366,20 @@ def _validate_skill_evolution_gate(changes: dict) -> list[str]:
 def _validate_repo_pulse(changes: dict) -> list[str]:
     """Validate repo-pulse lever changes (see
     genesis.session_awareness.repo_pulse_config)."""
-    from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
+    from genesis.session_awareness.repo_pulse_config import _BOOL_KNOBS, _INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "open_pr_enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
+    # Every BOOLEAN knob the config advertises must be listed here, or the
+    # settings API rejects the key and the switch is reachable only by hand
+    # editing the yaml — a lever that reads as operable and is not (Codex P2,
+    # PR #1836, on `verification_enabled`). `_BOOL_KNOBS` is the single source
+    # the config module already keeps, so a new knob cannot be added there and
+    # silently miss this validator.
+    valid_keys = ("mode", *_BOOL_KNOBS, *_INT_KNOBS, "inject_confidence_floor")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key in ("enabled", "open_pr_enabled"):
+        elif key in _BOOL_KNOBS:
             if not isinstance(value, bool):
                 errors.append(f"'{key}' must be a boolean")
         elif key == "mode":

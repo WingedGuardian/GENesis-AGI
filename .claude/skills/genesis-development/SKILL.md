@@ -1501,6 +1501,54 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   then at the third (escalation cap, `# escalation-ack`). Both call `_deny`, so
   the first stop arrives one round earlier than "the cap" suggests — see the
   two-tier table below. Switch to enumeration BEFORE the gate has to say so.
+- **Interrogate every MECHANISM you introduce along six axes BEFORE the first
+  review — original code and fixes alike.** The two bullets above enumerate the
+  class of a DEFECT, reactively, once a reviewer names one. This one is about the
+  extent of a MECHANISM — a deadline, a lock, a cache, a guard, a token — which is
+  correct on the path that motivated it and undefined everywhere else.
+  MEASURED 2026-09-09 on 31 inline review findings from two PRs, each attributed
+  by `git blame` at the SHA the reviewer was looking at, and classified as
+  "original" or "post-review" by whether the blamed commit predates that PR's
+  first review. Over all rounds, 21 of 31 (68%) blame to the original
+  implementation. But round 1 CANNOT blame to a fix commit — none exists yet — so
+  that figure is partly forced arithmetic. In the rounds that actually loop it is
+  close to even: **of the 21 findings from rounds 2+, 11 were already in the
+  original code and 10 were in code written to answer an earlier round.** Both
+  halves are worth the same attention; neither dominates.
+  Deduplicating re-posts and cross-reviewer duplicates and dropping one finding
+  later refuted by measurement leaves 25 distinct findings, and **24 of those 25
+  fall into six shapes.** These are the checklist:
+  1. **SIGNAL** (8, the largest) — does the thing you read change exactly when
+     the property you assert changes? A whole-database counter read as "did this
+     table change"; an mtime read as "did content change"; empty read as
+     "unbuilt"; a proxy's identity read as "same connection"; two autocommit
+     reads used as one snapshot.
+  2. **SCOPE and LIFETIME** (5) — a deadline per query when the operation is a
+     traversal; a lock per process when the race is cross-process; a lease that
+     expires mid-work; a hang moved from the operation to interpreter teardown.
+  3. **INPUT DOMAIN** (5) — the values the type permits, not the ones you
+     pictured: non-boolean, empty string, malformed timestamp, sub-second
+     precision, unescaped path.
+  4. **EQUIVALENCE** (3) — what does it claim to match, and has anything checked?
+  5. **FAILURE PATH** (2) — what is left behind when the work aborts.
+  6. **CALLER CONTRACT** (1) — does an explicit option the caller passed survive?
+  (The 25th was a test whose identity comparison was unsound in both directions.)
+  A finding is a POINT, so a fix that treats the finding as its spec inherits
+  that point as its only test — which is why the fix half of that near-even split
+  exists at all, and why the six axes are worth running over a fix and not only
+  over a feature.
+  METHOD NOTE, because getting this wrong inverted an earlier version of this
+  measurement: to attribute a finding to a commit, blame the line at the SHA the
+  reviewer was looking at. `original_commit_id` is the PR HEAD when the review was
+  posted, not the introducing commit — one commit here touched only changelog
+  files yet carries three findings on a Python file.
+  FALSIFIABLE, with a denominator: #1850 pushed four commits after its first
+  review round, and deduplicated they carried 5 findings between them — 1.25 per
+  post-review commit. If the next three PRs whose mechanisms are interrogated on
+  these six axes before pushing still average above one deduplicated finding per
+  post-review commit, the axes are not the right ones. Re-derive rather than
+  adding a seventh.
+
 - **Run the pre-push adversarial pass with `/deep-review`** (`.claude/commands/deep-review.md`):
   one command that dispatches a fresh-context `genesis-architect` (+ `genesis-security-reviewer`
   on security surfaces) over the FULL branch diff with the right SHAPE — fail-open/state/TOCTOU/
@@ -1524,9 +1572,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
-  A PR touching the enforcement-hook surface (the guard code itself) gets no
-  stale-review leniency: the merge gate (1) never classifies its post-review delta as
-  "review-trivial", and (2) refuses `# stale-review-override` — regardless of Codex
+  A PR touching the enforcement-hook surface (the guard code itself) gets almost no
+  stale-review leniency: the merge gate (1) never classifies a post-review delta that
+  TOUCHES that surface as "review-trivial" — the test is on the DELTA's files, not the
+  PR's, so a docs-only follow-up commit on such a PR can still be trivial (see the
+  budgeting note further down, which measures exactly this) — and (2) refuses
+  `# stale-review-override` — regardless of Codex
   head-freshness — unless recorded fallback-review evidence exists for the EXACT
   base+head (`~/.genesis/override_review_evidence/<repo>__<pr>__<base12>__<sha>.txt`).
   A current at-head Codex review does NOT substitute for that evidence: the same sigil
@@ -1595,19 +1646,25 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
   user-level config, not here.
   **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
-  reply. An explicit usage-limits comment is unavailability. So is an explicit
-  REVIEW-FAILURE reply that reproduces — the bot answering `Codex Review: Something went
+  reply. An explicit usage-limits comment is the STRONGEST evidence available — but it
+  is not proof, and treating it as proof is how an alternate-reviewer approval gets
+  spent on a Codex that was never down. The two channels are INDEPENDENT: a
+  usage-limits ISSUE comment can sit there while a later trigger delivers real INLINE
+  findings (MEASURED on #1484 — see the inline-findings section below). So: re-trigger,
+  let time pass, and check the INLINE endpoint before concluding unavailable.
+  A second shape carries the same weight and the same caveat: an explicit
+  REVIEW-FAILURE reply that REPRODUCES. The bot answering `Codex Review: Something went
   wrong` names its own cause, and a cause you can DISPROVE locally is the strongest
-  reading available: MEASURED 2026-09-09 on two PRs, twice each 43 minutes apart,
+  reading available — MEASURED 2026-09-09 on two PRs, twice each 43 minutes apart,
   `Provided git ref <sha> does not exist` while `git ls-remote origin refs/heads/<branch>`
   returned that exact sha, and two other PRs on the same account reviewed normally in the
   same window. Reproduces + refuted locally + not account-wide = a defect on their side,
   not a quota and not something a further retry fixes. One such reply is an incident, not
-  yet evidence: retry once, let time pass, and check the INLINE endpoint before concluding
-  anything.
-  Nothing else is — silence
-  is not, and neither is `--check-pr` reporting no review, which says the same thing
-  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  yet evidence: retry once, let time pass, and check the INLINE endpoint first, exactly
+  as the usage-limits case demands.
+  Everything weaker is not evidence at all — silence is not, and neither is
+  `--check-pr` reporting no review, which says the same thing whether the reviewer is
+  down or was simply never triggered at this head. Nor is a
   `codex exec` quota error: that is a separate surface on separate quota.
   Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
   **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
@@ -1619,7 +1676,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   rounds — they never move the machine counter (see "THE COUNTER IS CROSS-MODEL ONLY"
   below) and must not be counted in the visible tally either, or a session re-creates the
   very false-stop this is meant to remove. A cloud-bot (Codex) re-review round counts; a
-  locally-run non-Anthropic reviewer (e.g. Kimi 3) counts. The cap is enforced by three
+  locally-run non-Anthropic reviewer (the install's configured secondary) counts. The
+  cap is enforced by three
   mechanics, not by vibes:
   1. **Visible round counter.** From the first EXTERNAL round, the plan file (or task
      list) carries `Cross-model rounds: N (cap 3)`, updated every external cycle. Rounds
@@ -1733,7 +1791,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   button. Note the fresh-context subagent this tier mandates is INTERNAL — mark it
   plainly (`--source internal`, the default); it satisfies the depth gate and does
   NOT advance the counter, so it can never be the round that hard-blocks you. Only a
-  repeat EXTERNAL (Codex/Kimi 3/…) non-convergence moves the streak toward the cap.
+  repeat EXTERNAL (Codex, the configured secondary, …) non-convergence moves the streak
+  toward the cap.
   (Origin, 2026-09-01: under the old model the audit this very tier demanded counted
   as round 3 and tripped the HARD cap — the gate penalized the remedy it mandated.)
 
@@ -1765,7 +1824,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   they are cognitive infrastructure, not a review service, so no internal Genesis model call
   is ever `--source external`. The approved methods are **Codex** plus whatever the
   install names as its SECONDARY reviewer — `merge_gate.secondary_reviewer` in local
-  `genesis.yaml` (e.g. `kimi-code/k3`); **absent means there is no standing secondary**,
+  `genesis.yaml` — one value, the model or CLI to invoke; **absent means there is no
+  standing secondary**,
   and round 1 of the gate-fix lane below runs Codex-only. It is named in config rather
   than here because which model an install can reach is install-local, and a version
   frozen into this file goes stale the day the model does. **OpenRouter is NOT an
@@ -2533,18 +2593,19 @@ Route every finding by ONE question — **does the PR work without this fixed?**
 - **Yes, the PR works** → **file a GitHub issue and merge the PR.** Do not grow
   the diff, do not open a discussion, do not park it in a reply and move on.
 
-**Standing approval to file, for this class only.** The user has granted
-blanket, ongoing approval to open GitHub issues for adjacent non-blocking bugs
-discovered during review. Do NOT ask per instance — asking each time was the
-friction this rule removes. That standing approval is scoped to exactly this
-case: an adjacent, non-blocking, already-existing defect found while reviewing.
-Every other public post still needs explicit per-instance approval.
+**No per-instance approval to file.** Do NOT ask — asking each time was the
+friction this rule removes, and the owner relaxed the general rule on
+2026-09-09 after reading what actually got filed. The gate on a public post is
+now WHAT GOES IN IT, not permission: scrub anything personal or identifying —
+names, hosts, IPs, paths embedding a username, anything about the user's
+real-world life — so the issue carries technical detail only. Borderline, in
+either direction? Ask. See CLAUDE.md, "Where deferred work goes".
 
 **The exception that is NEVER waived: a security defect is not filed publicly
 before it is fixed.** An unpatched bypass, a credential exposure, anything
 exploitable — that goes to a private record under `~/.genesis/output/` plus a
-`follow_up_create` row, and nothing about it reaches a public surface, this
-standing approval included. If a finding is both adjacent and a live bypass,
+`follow_up_create` row, and nothing about it reaches a public surface — the
+relaxed filing rule above does not touch this one. If a finding is both adjacent and a live bypass,
 the security rule wins.
 
 Write the issue while the context is in your head — the measurement, the

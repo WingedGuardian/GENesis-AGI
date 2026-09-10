@@ -121,8 +121,8 @@ started, and neither of which the findings list will tell you about:
   (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
   NEVER counts toward the cross-model escalation streak, whatever it found. No outcome flag is
   needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
-  Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`, e.g.
-  Kimi 3); NOT OpenRouter, and never a Genesis internal model — is marked
+  Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`);
+  NOT OpenRouter, and never a Genesis internal model — is marked
   `--source external --defects|--clean`; that alone moves the counter.)
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an

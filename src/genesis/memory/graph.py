@@ -1,274 +1,96 @@
-"""Knowledge graph traversal with NetworkX caching.
+"""Memory-graph facade — picks a backend, owns the public read surface.
 
-Primary path: in-memory NetworkX MultiDiGraph loaded lazily from memory_links
-(a multigraph because one memory pair may carry several typed edges).
+The traversal and centrality logic now live behind the ``GraphStore`` seam
+(``memory/graphstore.py``); this module is what the rest of Genesis imports. It
+owns the single production store instance, because ``invalidate_graph_cache()``
+is called by every ``memory_links`` writer — 13 call sites across 9 modules at
+the time of writing — none of which holds a store reference, and several of
+which hold no database handle either.
 
-Fallback: recursive CTE queries, reached on ONE condition — the NetworkX import
-failed at module load. A cold cache is NOT a trigger, though this docstring said
-so for years: the first query of a session calls `_ensure_graph`, which BUILDS
-the cache and returns it. Worth stating precisely, because the wrong version
-makes the fallback sound routine when it is in fact dormant wherever NetworkX
-installs (it is a hard dependency, present in this repo's venv), which is why
-the two paths were free to disagree unnoticed.
+Fallback: the recursive CTE at the bottom of this module, reached on ONE
+condition — the active store raised ``GraphUnavailableError``. A cold cache is
+NOT a trigger, though this docstring said so for years: the store's first query
+builds its projection and returns it. Worth stating precisely, because the wrong
+version made the fallback sound routine when it is in fact dormant on a healthy
+install — which is how the two paths were free to disagree unnoticed.
 
-The cache is invalidated via ``invalidate_graph_cache()`` when links are
-created or deleted. The next query triggers a rebuild from SQLite.
+Backend today: ``NetworkxGraphStore`` — the in-process MultiDiGraph projection,
+unchanged. When NetworkX cannot be imported at all, ``traverse`` still degrades
+to the recursive-CTE fallback exactly as before; ``centrality_scores``
+deliberately does NOT degrade — it raises, because its consumer (the importance
+shield) treats "unavailable" and "empty" oppositely.
+
+The seam exists for the graph-DB adoption (issue #1641): a server-backed engine
+becomes another ``GraphStore`` and this facade's selection changes, with no
+reader touched. The four readers are ``mcp/memory/core.py`` (recall enrichment
+and ``memory_expand``), ``memory/drift.py``, and ``memory/dream_centrality.py``.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-import aiosqlite
+from genesis.memory.graphstore import (
+    GraphNode,
+    GraphStore,
+    GraphUnavailableError,
+    TraversalResult,
+)
+
+# Re-exported deliberately: `_bfs_with_strength` is imported ACROSS packages by
+# eval/graph_bakeoff/engines/nx_incremental.py, which reuses production's exact
+# BFS so the bake-off control is honest. Moving it must not break that import.
+from genesis.memory.graphstore_nx import (  # noqa: F401
+    NetworkxGraphStore,
+    _bfs_with_strength,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-try:
-    import networkx as nx
+__all__ = [
+    "GraphNode",
+    "GraphUnavailableError",
+    "TraversalResult",
+    "centrality_scores",
+    "invalidate_graph_cache",
+    "traverse",
+]
 
-    _NX_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _NX_AVAILABLE = False
-
-# ─── Data structures ──────────────────────────────────────────────────────────
-
-@dataclass
-class GraphNode:
-    """A node in a traversal result."""
-
-    memory_id: str
-    link_type: str
-    depth: int
-    strength: float
-
-
-@dataclass
-class TraversalResult:
-    """Result of a graph traversal query."""
-
-    root_id: str
-    nodes: list[GraphNode]
-    query_ms: float
+# The ONE production store. Module-level by necessity, not convenience: the
+# writer sites that invalidate it (memory_links CRUD, linker, the dream jobs,
+# connection pass, integrity repair) reach it through a lazy `from ... import
+# invalidate_graph_cache` and have no other handle on it.
+#
+# Annotated against the protocol deliberately: CI runs no type checker, so this
+# annotation plus the conformance test is the only thing standing between a
+# future backend and silently violating the raise-never-return-empty contract.
+_store: GraphStore = NetworkxGraphStore()
 
 
-# ─── NetworkX cache ───────────────────────────────────────────────────────────
+def _reset_store_for_tests() -> None:
+    """Drop the production store and its pinned connection.
 
-_nx_graph: object | None = None  # nx.MultiDiGraph when _NX_AVAILABLE
-_nx_dirty: bool = True
-
-
-class GraphUnavailableError(RuntimeError):
-    """The graph backend cannot answer AT ALL (missing library, unreachable
-    store) — as distinct from answering "empty". Decision-tier readers
-    (dream-centrality → the importance shield) treat these opposite ways:
-    empty supersedes their cache, unavailable must LEAVE it alone."""
+    Mirrors ``memory/health.py::_reset_top_tags_state``. The store holds a
+    strong reference to the last connection it built from, which over a long
+    test session keeps closed aiosqlite connections (each a Thread) alive.
+    """
+    global _store
+    _store = NetworkxGraphStore()
 
 
 def invalidate_graph_cache() -> None:
     """Mark the in-memory graph as stale.
 
-    Called by the linker after link creation/deletion. The next query
-    triggers a full rebuild from memory_links.
+    Called by writers after link creation/deletion. The next query triggers a
+    full rebuild from memory_links.
     """
-    global _nx_dirty
-    _nx_dirty = True
-
-
-async def _ensure_graph(db: aiosqlite.Connection) -> object:
-    """Lazy-load the graph from memory_links, rebuild if dirty."""
-    global _nx_graph, _nx_dirty
-
-    if _nx_graph is not None and not _nx_dirty:
-        return _nx_graph
-
-    start = time.monotonic()
-    cursor = await db.execute(
-        "SELECT source_id, target_id, link_type, strength FROM memory_links"
-    )
-    rows = await cursor.fetchall()
-
-    # MultiDiGraph, not DiGraph: memory_links' primary key is
-    # (source_id, target_id, link_type), so one pair may legitimately carry
-    # several typed edges. A DiGraph cannot hold parallel edges — the second
-    # add_edge for a pair overwrites the first's attributes — so the graph kept
-    # an arbitrary survivor and the strength/link_type filters below were
-    # evaluated against it.
-    G = nx.MultiDiGraph()
-    for source_id, target_id, link_type, strength in rows:
-        G.add_edge(
-            source_id, target_id,
-            key=link_type,
-            link_type=link_type, strength=strength,
-        )
-
-    elapsed_ms = (time.monotonic() - start) * 1000
-    logger.info(
-        "Graph cache rebuilt: %d nodes, %d edges in %.1fms",
-        G.number_of_nodes(), G.number_of_edges(), elapsed_ms,
-    )
-    if G.number_of_edges() > 50_000:
-        logger.warning(
-            "Graph has %d edges — measure NetworkX rebuild cost; consider an "
-            "incremental or server-backed graph if rebuilds become a bottleneck",
-            G.number_of_edges(),
-        )
-
-    _nx_graph = G
-    _nx_dirty = False
-    return G
-
-
-def _bfs_with_strength(
-    G: object,  # nx.MultiDiGraph
-    root_id: str,
-    *,
-    max_depth: int,
-    min_strength: float,
-    link_type_filter: str | None = None,
-) -> list[GraphNode]:
-    """BFS traversal with edge-attribute filtering.
-
-    NetworkX's bfs_edges doesn't filter by edge attributes, so we roll
-    a simple BFS that respects min_strength and optional link_type.
-    """
-    if root_id not in G:
-        return []
-
-    visited: set[str] = {root_id}
-    frontier: list[str] = [root_id]
-    results: list[GraphNode] = []
-    depth = 0
-
-    while frontier and depth < max_depth:
-
-        # A pair may carry several typed edges (MultiDiGraph), so out_edges
-        # yields one tuple per parallel edge. Consider them all and keep the
-        # STRONGEST that passes the filters — otherwise the arbitrary survivor
-        # merely moves from load time to traversal time (the first parallel
-        # edge would win via the `visited` check) and a weak edge could still
-        # mask a strong one.
-        #
-        # Strength-max mirrors memory_links.neighbors_of's MAX(strength)
-        # collapse, but note neighbors_of returns no link_type — this path is
-        # the only one that must also PICK a type, so strongest-wins is a
-        # deliberate choice, not an inherited convention. Revisit if polarity
-        # types start appearing on multi-type pairs (0 of 139 today carry
-        # `contradicts` as their max-strength edge). Note the consumers of THIS
-        # path (mcp/memory/core.py:431,:704) put link_type in front of the model
-        # and do NOT exclude `contradicts` — graph_expansion, which does exclude
-        # it, reaches the graph through memory_links_crud.neighbors_of and never
-        # calls this function. So demoting the type here is a small real
-        # improvement on the one path that surfaces it, not consistency with a
-        # subsystem that already filters it elsewhere.
-        #
-        # The comparison is on the (strength, link_type) TUPLE, not on strength
-        # alone, because strength alone leaves ties to row order: 106 of the 139
-        # live multi-type pairs carry EQUAL strengths (MEASURED 2026-09-02), and
-        # the loader's SELECT has no ORDER BY, so a strength-only max would keep
-        # reporting an arbitrary type for those — the same defect as the DiGraph
-        # collapse, just narrowed. The secondary key is a DETERMINISTIC tie-break,
-        # not a semantic ranking; it happens to demote `contradicts` (which sorts
-        # early), the safe direction. 0 of the 106 tied pairs carries one.
-        #
-        # `best` is scoped to the whole LEVEL, not to one expanding parent, and
-        # that is the point. Per-parent, a node reachable from several parents was
-        # claimed by whichever one the queue happened to reach first — so the
-        # reported edge followed the loader's row order (its SELECT has no ORDER
-        # BY) and could be the WEAKER of the two. That is not cosmetic: `strength`
-        # is put in front of the model AND is what the consumers sort on before
-        # taking the top five, so a node credited to a weaker parent sinks in that
-        # order and can leave the slice entirely.
-        #
-        # MEASURED against this module on the live graph, old vs new, over the FULL
-        # population (256,063 links; all 66,856 roots that have neighbours; the real
-        # call parameters max_depth=2, min_strength=0.3):
-        #   68,330 of 1,066,912 reported nodes (6.40%) gained a higher, truer
-        #     strength, across 50.4% of roots; 0 were ever lowered.
-        #   top-five SET churn between a forward and a reversed row order: 3.09%
-        #     before, 0 after; the full output is likewise identical under both.
-        #   reach-set unchanged (0 roots) and no reported depth changed (0 nodes).
-        # Draining the level is what allows the cross-parent comparison.
-        #
-        # State the DENOMINATOR when quoting any of this. 6.40% is over every node
-        # the walk computes (~16 per root); restricted to the five that actually
-        # reach the model it is 0.16% of surfaced nodes and 0.7% of lookups. The
-        # blast radius at that slice is separate again: the surfaced SET changes on
-        # 1.94% of roots and its ORDER on 8.15%. An earlier revision of this comment
-        # quoted a 1,000-root sample and read an order of magnitude high on the
-        # surfaced surface — which is why every figure here is a population count.
-        #
-        # Sample-drawn figures also drift between runs on an unchanged table: the
-        # loader's SELECT has no ORDER BY, so node insertion order — and any sample
-        # drawn from it — varies per rebuild. Prefer the population numbers above.
-        #
-        # The commit below is ordered by a TOTAL key, and that alone is what makes
-        # the whole output deterministic: it fixes the append sequence, and the
-        # final sort is stable, so equal `(depth, -strength)` keys keep that
-        # sequence rather than the row order they used to keep. Note `drift.py`
-        # consumes that sequence as a RANKED list for RRF (its `local_ids`,
-        # drift.py:202) even though it reads no labels, so the ordering here is
-        # load-bearing for a second consumer, not just for the sliced view.
-        #
-        # A total key on the FINAL sort as well was tried and dropped. It is
-        # redundant by construction — a stable sort of an already-deterministic
-        # list cannot reintroduce nondeterminism — and measured redundant too
-        # (0 differences either way across 1,447 live roots). Keeping it would only
-        # have reordered ties gratuitously and widened the divergence from the CTE
-        # fallback's documented `(depth, strength DESC)`.
-        best: dict[str, tuple[float, str]] = {}
-        for node in frontier:
-            for _, neighbor, data in G.out_edges(node, data=True):
-                if neighbor in visited:
-                    continue
-                strength = data.get("strength", 0.0)
-                edge_type = data.get("link_type", "")
-
-                if strength < min_strength:
-                    continue
-                if link_type_filter and edge_type != link_type_filter:
-                    continue
-
-                current = best.get(neighbor)
-                if current is None or (strength, edge_type) > current:
-                    best[neighbor] = (strength, edge_type)
-
-        next_frontier: list[str] = []
-        # Key is (-strength, neighbour_id) and DELIBERATELY excludes link_type,
-        # unlike the within-pair comparison above. The id alone already makes the
-        # key total, so link_type buys no determinism here — and it is not neutral:
-        # sorting equal-strength neighbours alphabetically by TYPE front-loads
-        # early-sorting relationships in the order the model reads. MEASURED over
-        # all 66,856 roots, 13.8% of which carry a (depth, strength) tie group:
-        # including link_type moved the reported top-1 type by +32.8%
-        # (categorized_as), +31.8% (action_item_for), -23.8% (preceded_by) and
-        # -39.6% (succeeded_by) against the id-only key. Memory ids are UUIDs, so
-        # they carry no such correlation. The within-pair key above is a different
-        # case: there the two candidates are the SAME pair and a type must be
-        # picked, so a stated rule beats an arbitrary one.
-        for neighbor, (strength, edge_type) in sorted(
-            best.items(), key=lambda kv: (-kv[1][0], kv[0])
-        ):
-            visited.add(neighbor)
-            results.append(GraphNode(
-                memory_id=neighbor,
-                link_type=edge_type,
-                depth=depth + 1,
-                strength=strength,
-            ))
-            next_frontier.append(neighbor)
-        frontier = next_frontier
-        depth += 1
-
-    # Match CTE output order: depth ascending, strength descending. Deliberately
-    # left as a partial key — ties now resolve to the deterministic commit order
-    # established above, so no further tiebreak is needed to make this stable.
-    results.sort(key=lambda n: (n.depth, -n.strength))
-    return results
-
-
-# ─── Public API ───────────────────────────────────────────────────────────────
+    _store.invalidate()
 
 
 async def traverse(
@@ -280,7 +102,8 @@ async def traverse(
 ) -> TraversalResult:
     """Traverse the memory graph from a root node.
 
-    Uses NetworkX cache when available, falls back to recursive CTE.
+    Uses the active graph store; falls back to the recursive CTE when the
+    store cannot answer at all (today: NetworkX missing).
 
     Args:
         db: Database connection.
@@ -293,13 +116,40 @@ async def traverse(
     """
     start = time.monotonic()
 
-    if _NX_AVAILABLE:
-        G = await _ensure_graph(db)
-        nodes = _bfs_with_strength(
-            G, root_id, max_depth=max_depth, min_strength=min_strength,
+    try:
+        nodes = await _store.traverse(
+            db, root_id, max_depth=max_depth, min_strength=min_strength,
         )
-    else:
-        nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
+    except GraphUnavailableError as exc:
+        # Traversal is an ENRICHMENT path — its readers already treat a thin
+        # result as "no neighbours", so degrading to SQL keeps them working.
+        # centrality_scores below is the opposite case and must not do this.
+        #
+        # LOUD, because this stops being a once-per-process import verdict the
+        # moment a server-backed store lands: a backend that times out would
+        # otherwise route every recall enrichment through SQL while looking
+        # perfectly healthy.
+        logger.warning(
+            "Graph store %r unavailable — falling back to the recursive CTE: %s",
+            getattr(_store, "name", "?"), exc, exc_info=True,
+        )
+        try:
+            nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
+        except Exception as cte_exc:
+            # The fallback reads the SAME connection the store just failed on,
+            # so every non-transient cause — a closed handle, a missing table, a
+            # corrupt file — fails it identically. Without this, making the
+            # store raise properly only moved the leak one layer: the store's
+            # error was caught here and the CTE's raw one escaped in its place.
+            # MEASURED against this facade on a closed connection: `traverse()`
+            # raised a bare `ValueError: no active connection` at the caller,
+            # after logging a line that said it was falling back.
+            #
+            # The one cause the fallback genuinely rescues is a transient
+            # `database is locked`, which is why it still runs first.
+            raise GraphUnavailableError(
+                f"the graph store and its SQL fallback both failed: {cte_exc}"
+            ) from cte_exc
 
     elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -313,9 +163,6 @@ async def traverse(
     return TraversalResult(root_id=root_id, nodes=nodes, query_ms=elapsed_ms)
 
 
-# ─── New NetworkX-only functions ──────────────────────────────────────────────
-
-
 async def centrality_scores(
     db: aiosqlite.Connection,
     top_n: int | None = 100,
@@ -323,39 +170,21 @@ async def centrality_scores(
     """Return memories ranked by betweenness centrality.
 
     Identifies memories that are "bridges" between clusters of knowledge.
-    Requires NetworkX; raises GraphUnavailableError if the backend cannot
-    answer (an EMPTY graph still returns [] — zero nodes means zero bridges).
+    Raises GraphUnavailableError if the backend cannot answer (an EMPTY graph
+    still returns [] — zero nodes means zero bridges). The NetworkX store
+    additionally raises when the library itself is unimportable. Deliberately
+    does NOT fall back: a decision-tier consumer must never be handed a
+    silently different metric.
 
     ``top_n`` caps the returned slice; ``top_n=None`` returns EVERY scored
     node (the full ranking). Betweenness is computed over all nodes regardless
     — ``top_n`` is only a post-sort slice — so ``None`` adds no compute cost,
     just a longer list.
     """
-    if not _NX_AVAILABLE:
-        # "The store is unreachable" and "no bridges exist" are DIFFERENT
-        # answers, and returning [] for both let the first masquerade as the
-        # second: the dream-centrality consumer reads an empty result as "no
-        # bridges", wipes centrality_cache, and the importance shield then
-        # computes no threshold — bridge-node protection silently disappears
-        # because a library failed to import. A decision-tier consumer must
-        # never degrade silently (issue #1641 / the graph-store seam contract),
-        # so unavailability RAISES; an empty graph still returns [] below,
-        # because zero nodes genuinely means zero bridges.
-        raise GraphUnavailableError("NetworkX is not importable — centrality cannot be computed")
-
-    G = await _ensure_graph(db)
-    if G.number_of_nodes() == 0:
-        return []
-
-    # Use approximate betweenness for large graphs to avoid blocking
-    n_nodes = G.number_of_nodes()
-    k = min(200, n_nodes) if n_nodes > 200 else None
-    scores = nx.betweenness_centrality(G, k=k)
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return ranked if top_n is None else ranked[:top_n]
+    return await _store.centrality(db, top_n)
 
 
-# ─── CTE fallbacks ───────────────────────────────────────────────────────────
+# ─── CTE fallback ────────────────────────────────────────────────────────────
 
 
 async def _traverse_cte(
@@ -366,7 +195,11 @@ async def _traverse_cte(
 ) -> list[GraphNode]:
     """Original recursive CTE traversal (fallback).
 
-    ONE ROW PER MEMORY, picked the same way the walk above picks: shallowest
+    The walk this mirrors is `graphstore_nx._bfs_with_strength` — it lives
+    behind the seam now, not above this function, and these two implementations
+    answering differently is exactly what must not happen.
+
+    ONE ROW PER MEMORY, picked the same way the NetworkX walk picks: shallowest
     depth, then the strongest edge reaching it, then link_type as a deterministic
     tie-break. That is not tidiness — it is the same correctness property this
     module's walk exists to provide, and the fallback used to contradict it.
@@ -379,7 +212,7 @@ async def _traverse_cte(
     occupied two of those five slots and dragged a false weaker strength into
     what the model reads. Which implementation answers must not change that.
 
-    The window's ORDER BY mirrors the walk's `(strength, link_type)` maximum
+    The window's ORDER BY mirrors that walk's `(strength, link_type)` maximum
     exactly, and the outer `ORDER BY depth, strength DESC, target_id` mirrors the
     walk's committed sequence — `(-strength, memory_id)` within a level,
     preserved through a stable final sort on `(depth, -strength)`. That matters
@@ -401,8 +234,15 @@ async def _traverse_cte(
     `ALTER TABLE DROP COLUMN` in migrations 0010/0014/0016), so this floor sits
     strictly below an existing one and cannot newly break a clone.
 
-    TWO GUARDS ON THE ANCHOR, because the anchor row skipped constraints both the
-    recursive step and the walk apply — one generator, two symptoms:
+    Carries the SAME visibility predicate as the graph stores — a degraded path
+    that showed the model memories the primary path hides would be worse than
+    the degradation itself. Expressed in SQL here (rather than reusing
+    ``invalid_memory_ids``) because the traversal is recursive; the cost is
+    bounded by the edges actually walked, not the whole table.
+
+    GUARDS ON THE ANCHOR, because the anchor row skipped constraints both the
+    recursive step and the walk apply — one generator, several symptoms. Two of
+    them are described here; the visibility clauses above are the others:
 
     * `target_id <> source_id`. The walk seeds `visited = {root_id}` and can
       therefore never emit the root; the anchor had no such guard, so a memory
@@ -410,13 +250,14 @@ async def _traverse_cte(
       five slots `core.py` shows. MEASURED on the live table: 30 of 269,757 rows
       are self-links, so this fired for 30 roots.
     * `max_depth < 1` returns early (below). The anchor emits depth 1
-      unconditionally, ignoring the bound the walk's `while depth < max_depth`
+      unconditionally, ignoring the bound that walk's `while depth < max_depth`
       respects — so `max_depth=0` asked for nothing and got a level. Inert today
       (no caller passes 0; production passes 1, 2 or the default 3) and closed
       anyway, because the claim being made here is that the two paths agree.
     """
     if max_depth < 1:
         return []
+    now = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         """
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
@@ -426,6 +267,21 @@ async def _traverse_cte(
             WHERE source_id = ?
               AND target_id <> source_id
               AND strength >= ?
+              -- The ROOT is filtered too. The NX loader drops an edge when
+              -- EITHER endpoint is hidden, so a hidden memory has no edges at
+              -- all there; filtering only the target here would let the CTE
+              -- traverse FROM a hidden root and return a subtree the primary
+              -- path returns nothing for. MEASURED: 2,827 live memories are
+              -- hidden AND have out-edges, and the two forms otherwise
+              -- classify 6,503 edges (2.5% of the graph) differently.
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                              WHERE m.memory_id = memory_links.source_id
+                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
+                                  OR m.deprecated != 0))
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                              WHERE m.memory_id = memory_links.target_id
+                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
+                                  OR m.deprecated != 0))
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
                    c.path || ',' || ml.target_id
@@ -434,6 +290,10 @@ async def _traverse_cte(
             WHERE c.depth < ?
               AND ml.strength >= ?
               AND c.path NOT LIKE '%' || ml.target_id || '%'
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                              WHERE m.memory_id = ml.target_id
+                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
+                                  OR m.deprecated != 0))
         )
         SELECT target_id, link_type, depth, strength
         FROM (
@@ -447,7 +307,7 @@ async def _traverse_cte(
         WHERE rn = 1
         ORDER BY depth, strength DESC, target_id
         """,
-        (root_id, min_strength, max_depth, min_strength),
+        (root_id, min_strength, now, now, max_depth, min_strength, now),
     )
     rows = await cursor.fetchall()
     return [

@@ -106,6 +106,26 @@ def _proc(code: int, out: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=out)
 
 
+def _argv_for_endpoint(run_mock, endpoint: str) -> list[str]:
+    """The argv of the mocked ``subprocess.run`` call that fetched ``endpoint``.
+
+    The inline finding scan issues MORE THAN ONE gh call (``pulls/N/comments``
+    for inline findings, ``pulls/N/reviews`` for the outside-diff channel), so
+    ``run_mock.call_args`` — the LAST call — is not reliably the one a given
+    assertion is about. Selecting by endpoint makes the test say which request
+    it grades; a test that graded whichever call happened to be last would go
+    green or red for reasons unrelated to its own name.
+    """
+    for call in run_mock.call_args_list:
+        argv = call[0][0] if call[0] else []
+        if any(endpoint in str(tok) for tok in argv):
+            return list(argv)
+    raise AssertionError(
+        f"no mocked subprocess call fetched {endpoint!r}; "
+        f"calls were: {[c[0][0] if c[0] else [] for c in run_mock.call_args_list]}"
+    )
+
+
 def _config_run(values: dict, default: tuple = (1, "")):
     """A ``subprocess.run`` side_effect mapping a git-config KEY (the last argv
     token) to ``(rc, stdout)``. Unlisted keys resolve to ``default`` = ``(1, "")``
@@ -2045,7 +2065,11 @@ class TestCheckInlineReviewFindings:
         # page, which sequential pagination reaches.
         with self._mock(guard_module, []) as run_mock:
             guard_module._check_inline_review_findings("100")
-        argv = run_mock.call_args[0][0]
+        # Select the COMMENTS fetch explicitly. The scan also fetches
+        # pulls/N/reviews (the outside-diff channel), so `call_args` — the LAST
+        # call — is no longer this one; asserting against it silently graded the
+        # wrong request.
+        argv = _argv_for_endpoint(run_mock, "pulls/100/comments")
         assert "sort=created" not in argv
         assert "direction=desc" not in argv
         assert any("pulls/100/comments" in tok for tok in argv)
@@ -2211,8 +2235,26 @@ class TestCheckInlineReviewFindings:
         # the production fetch sends includes `path: .path`.
         with self._mock(guard_module, []) as run_mock:
             guard_module._check_inline_review_findings("100")
-        argv = run_mock.call_args[0][0]
+        argv = _argv_for_endpoint(run_mock, "pulls/100/comments")
         assert any("path: .path" in tok for tok in argv)
+
+    def test_outside_diff_channel_pins_its_endpoint_and_projection(
+        self, guard_module, monkeypatch
+    ):
+        """The PRODUCTION fetch for the review-body channel, not the test seam.
+
+        Without this, mutating either the endpoint path or the jq projection to
+        garbage leaves the whole suite green (measured: 456 passed with both
+        wrong) while the channel returns zero findings on every PR forever — a
+        silent clean read on a merge gate, which is the exact vacuous-green the
+        channel was built to remove. The seam that makes the other tests
+        hermetic is what hides this, so it is deleted for this one case."""
+        monkeypatch.delenv("_TEST_GH_PR_REVIEW_BODIES", raising=False)
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        argv = _argv_for_endpoint(run_mock, "pulls/100/reviews")
+        for field in ("login: .user.login", "body: .body", "state: .state"):
+            assert any(field in tok for tok in argv), f"projection lost {field!r}"
 
     # Fail-closed allowlist (security review HIGH): a NON-prose extension under
     # docs/ must still block — the exemption is an allowlist of doc extensions,
