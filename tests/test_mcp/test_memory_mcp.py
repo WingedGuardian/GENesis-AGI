@@ -2419,3 +2419,28 @@ async def test_memory_store_advice_fits_the_reason_it_reports():
     assert "36-char" not in result["warning"], (
         "handed back the not_found advice, which cannot resolve a self-supersede"
     )
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_does_not_report_a_supersede_nobody_asked_for():
+    """An empty `supersedes` must not produce `superseded: True`.
+
+    Both store-side guards are truthiness tests (`if supersedes:`), so "" and
+    "   " perform no deprecation at all. The MCP guard was `is None`, which
+    treated them as a requested supersede and built a success report about an
+    operation that never ran. MCP and `POST /api/t/memory_store` both take a
+    string here, so an empty one arrives without any client bug.
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    for empty in ("", "   "):
+        with patch.object(core, "_memory_mod") as mod:
+            mod.return_value._store = MagicMock()
+            mod.return_value._store.store = AsyncMock(return_value="new-id")
+            result = await tools["memory_store"].fn("content", "src", supersedes=empty)
+
+        assert result == "new-id", (
+            f"supersedes={empty!r} produced a supersede report: {result!r}"
+        )
+        assert isinstance(result, str), "the bare-id shape is what a non-request returns"

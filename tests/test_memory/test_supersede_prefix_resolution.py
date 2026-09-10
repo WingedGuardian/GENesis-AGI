@@ -391,3 +391,80 @@ async def test_an_unexpected_supersede_error_is_reported_not_swallowed(store, db
     assert SUPERSEDE_FAILED in degraded, (
         "the failure left no trace, so the report claimed the supersede landed"
     )
+
+
+# ─── round-2 review findings ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio()
+async def test_a_failure_after_the_deprecation_commits_is_a_partial(store, db):
+    """`SUPERSEDE_FAILED` means "did not land AT ALL". Anything thrown after
+    `crud.mark_superseded` has COMMITTED makes that false: SQLite recall already
+    excludes the old memory, so reporting a total failure tells the caller the
+    old memory is probably still live when it is not.
+
+    MEASURED before the fix: `get_metadata` raising left `OLD.deprecated=1` and
+    `superseded_by` set, while the exception escaped `_mark_superseded` to
+    store()'s outer handler, which recorded SUPERSEDE_FAILED.
+    """
+    import genesis.memory.store as store_mod
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("simulated fault after the commit")
+
+    with patch.object(store_mod.memory_crud, "get_metadata", boom):
+        degraded = await store._mark_superseded(
+            OLD, NEW, "2026-09-06T19:53:21+00:00"
+        )
+
+    assert (await _row(db, OLD))["deprecated"] == 1, "the deprecation did commit"
+    assert "post_deprecation" in degraded, "reported as a partial, naming the step"
+    from genesis.memory.store import SUPERSEDE_FAILED
+
+    assert SUPERSEDE_FAILED not in degraded, (
+        "a post-commit fault must NOT be classified as a total failure"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_dedup_sees_the_same_text_the_store_persists(store, db):
+    """The dedup lookup must be handed the SAME text the store will persist.
+
+    `find_exact_duplicate` matches `memory_fts` content EXACTLY, and what lands
+    in `memory_fts` is the NORMALIZED text. Normalizing AFTER the lookup meant a
+    store of aliased text persisted the canonical form while the next store of
+    the same raw text queried the raw form, missed its own row, and wrote a
+    second copy whose stored content was byte-identical to the first. Aliases
+    are seeded by default (`"CC" -> "Claude Code"`), so this needed no
+    configuration, and it made the MCP retry instruction — "re-run with the SAME
+    content ... the content will not be duplicated" — false for that text.
+
+    Asserted at the seam rather than through the full pipeline ON PURPOSE: the
+    lookup is handed a value, and that value IS the defect. Driving it through
+    `store()` instead made the mutation fail on an unrelated fixture-schema
+    error, which proves nothing about the ordering.
+    """
+    import genesis.memory.store as store_mod
+    from genesis.memory.entity_resolution import normalize_content
+
+    raw = "CC owns the review gate"
+    canonical = normalize_content(raw)
+    if canonical == raw:
+        pytest.skip("no alias configured for this input on this install")
+
+    seen: dict[str, str] = {}
+
+    async def spy(_db, *, content):
+        seen["content"] = content
+        return OLD  # ALWAYS short-circuit, so the full pipeline never runs and
+        # the only thing that can fail is the assertion below.
+
+    with patch.object(store_mod.memory_crud, "find_exact_duplicate", spy), \
+         patch.object(MemoryStore, "_mark_superseded", new=AsyncMock(return_value=[])):
+        await store.store(raw, "conversation", supersedes=OLD)
+
+    assert seen["content"] == canonical, (
+        "the dedup lookup was handed the RAW text while the store persists the "
+        f"normalized form ({seen['content']!r} != {canonical!r}) — a retry can "
+        "never match the row its own first attempt wrote"
+    )

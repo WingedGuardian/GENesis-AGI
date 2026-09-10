@@ -239,6 +239,24 @@ class MemoryStore:
         # exact duplication this change exists to stop, on the exact path the
         # MCP warning tells the caller to retry ("the content will not be
         # duplicated"). Found in review of this PR (#1831).
+        # Surface form normalization: expand known aliases before embedding.
+        # MUST run BEFORE the dedup lookup below, not after it. The lookup
+        # matches memory_fts content EXACTLY, and what lands in memory_fts is
+        # the NORMALIZED text — so normalizing afterwards meant a store of
+        # "CC ..." persisted "Claude Code ..." while the next store of the same
+        # raw text queried for "CC ..." , missed its own row, and wrote a second
+        # copy with byte-identical stored content. Aliases are seeded by default
+        # ("CC" -> "Claude Code", entity_resolution._SEED_ALIASES), so this was
+        # not a configured-only hazard. It also made the MCP retry instruction
+        # ("re-run with the SAME content ... the content will not be
+        # duplicated") false for any aliased text. Found in review of #1831.
+        try:
+            from genesis.memory.entity_resolution import normalize_content
+
+            content = normalize_content(content)
+        except Exception:
+            pass  # best-effort — never block a store on normalization failure
+
         existing: str | None = None
         try:
             existing = await memory_crud.find_exact_duplicate(
@@ -290,14 +308,6 @@ class MemoryStore:
                         supersedes, existing, exc_info=True,
                     )
             return existing
-
-        # Surface form normalization: expand known aliases before embedding
-        try:
-            from genesis.memory.entity_resolution import normalize_content
-
-            content = normalize_content(content)
-        except Exception:
-            pass  # best-effort — never block a store on normalization failure
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
@@ -696,6 +706,42 @@ class MemoryStore:
         # check that catches them.
         if not await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp):
             raise SupersedeUnresolved(old_id, "not_found", new_id)
+
+        # ── PAST THE POINT OF NO RETURN ──────────────────────────────────────
+        # The deprecation is COMMITTED (crud.mark_superseded commits before it
+        # returns), so SQLite recall already excludes the old memory. Everything
+        # below is follow-up. An exception escaping from here would reach
+        # store()'s outer handler, which records SUPERSEDE_FAILED — and that
+        # marker means "did not land AT ALL", which would now be false: the
+        # caller would be told the old memory is probably still live when it is
+        # not. Anything that throws past this line is therefore a PARTIAL, named
+        # as such, and never allowed to escape. Found in review of #1831.
+        try:
+            degraded.extend(
+                await self._supersede_follow_up(old_id, new_id, timestamp)
+            )
+        except Exception:
+            degraded.append("post_deprecation")
+            logger.warning(
+                "Supersede follow-up failed after the deprecation committed "
+                "(%s -> %s); the SQLite deprecation DID apply",
+                old_id, new_id, exc_info=True,
+            )
+        return degraded
+
+    async def _supersede_follow_up(
+        self,
+        old_id: str,
+        new_id: str,
+        timestamp: str,
+    ) -> list[str]:
+        """The best-effort steps AFTER the SQLite deprecation has committed.
+
+        Split out so the caller can bound them: every failure in here is a
+        PARTIAL (the deprecation already landed), never a total failure.
+        Returns the names of the steps that failed.
+        """
+        degraded: list[str] = []
 
         # Qdrant: look up collection from metadata, then update payload.
         # Only touch Qdrant when a vector actually exists (status 'embedded').

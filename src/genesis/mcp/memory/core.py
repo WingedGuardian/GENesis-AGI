@@ -878,6 +878,10 @@ async def memory_store(
     # a complete one, which is the class of lie this whole change exists to stop.
     degraded: list[str] = []
 
+    # An all-whitespace handle is not a request either; fold it to None so the
+    # single truthiness test below and the store's own guards cannot disagree.
+    supersedes = supersedes.strip() if supersedes else None
+
     try:
         memory_id = await memory_mod._store.store(
             content,
@@ -941,7 +945,14 @@ async def memory_store(
             ),
         }
 
-    if supersedes is None:
+    # Normalized ABOVE, so the store and this report agree on what "asked for a
+    # supersede" means. Both store-side guards are truthiness tests
+    # (`if supersedes:`), so "" / "   " performs no deprecation — while an
+    # `is None` test here treated it as a requested supersede and reported
+    # `superseded: True` about an operation that never ran. MCP and
+    # `POST /api/t/memory_store` both accept a string, so an empty one is
+    # reachable without any client bug. Found in review of #1831.
+    if not supersedes:
         return memory_id
 
     report: dict = {

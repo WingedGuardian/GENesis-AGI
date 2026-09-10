@@ -34,3 +34,15 @@
   an unexpected database error is now reported as failed rather than logged and
   forgotten, with advice that fits the reason instead of a retry instruction
   that cannot apply.
+
+  A second review round closed three more ways the report could mislead. A
+  failure that happens *after* the deprecation has already committed is now
+  reported as a partial rather than a total failure, so the caller is no longer
+  told the old memory is probably still live when recall already hides it. An
+  empty `supersedes` value is treated as no request at all, instead of producing
+  a success report for an operation that never ran. And alias normalization now
+  runs before the duplicate check rather than after it -- previously a memory
+  containing a default alias was stored in canonical form while the next save of
+  the same raw text searched for the raw form, missed the row it had just
+  written, and stored a second copy of identical content, which also made the
+  "re-send and it will not be duplicated" instruction untrue for that text.
