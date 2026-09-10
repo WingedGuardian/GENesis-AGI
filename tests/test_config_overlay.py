@@ -122,6 +122,10 @@ def test_suite_isolates_user_config_dir_from_real_home():
     # real config/ws3_immunity.local.yaml sibling). Both must point at the same
     # sandboxed resolver.
     assert immunity._resolve_overlay_path is _config_overlay._resolve_overlay_path
+    # federation/config.py holds the same class of module-level binding.
+    from genesis.federation import config as federation_config
+
+    assert federation_config._resolve_overlay_path is _config_overlay._resolve_overlay_path
 
 
 def test_isolation_survives_a_test_calling_monkeypatch_undo(monkeypatch):
@@ -147,8 +151,9 @@ def test_module_level_user_config_bindings_are_patched_or_listed():
     exactly one bucket below.
     """
     # Patched directly by the autouse _isolate_user_config_dir fixture
-    # (both _user_config_dir AND _resolve_overlay_path).
-    patched_in_conftest = {"security/immunity.py"}
+    # (immunity: both _user_config_dir AND _resolve_overlay_path;
+    # federation/config: _resolve_overlay_path, its only binding).
+    patched_in_conftest = {"security/immunity.py", "federation/config.py"}
     # Own ``_USER_CONFIG_DIR`` + resolver; import-heavy (FastMCP registry at
     # module level), so excluded from the every-test fixture — their own tests
     # patch _USER_CONFIG_DIR (tests/test_mcp/test_settings.py, test_recon_*.py).
