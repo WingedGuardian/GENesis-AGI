@@ -20,10 +20,15 @@
 # tests/test_hooks/test_git_push_guard_hook_surface.py, which parses
 # .claude/settings.json and fails CI when a wired hook falls outside the fence.
 # GitHub cannot read a Python constant, so this file restates it in glob form —
-# and a restatement can drift. It is deliberately written as PREFIXES rather
-# than as the enumerated filenames: a broad glob keeps matching when a new hook
-# lands, where a copied file list silently stops. Over-matching costs a review
-# request nobody needed; under-matching costs the notification entirely.
+# and a restatement can drift. Three directory prefixes below, then the 27 named
+# files enumerated one by one — which is what the constant is. An earlier version
+# of this comment claimed the whole thing was written as prefixes so it would
+# keep matching when a new hook lands; that is true of the directories and false
+# of the files, and it describes a safety property this file does not have.
+# Two things actually cover a 28th hook: the `*` backstop below, and the test
+# named above, which reads the constant from the guard's AST and fails when this
+# list falls behind it. Over-matching costs a review request nobody needed;
+# under-matching costs the notification entirely.
 
 # ON A FORK OR A SEPARATE INSTALL, RE-POINT THE HANDLE BELOW. GitHub requires
 # a code owner to have write access, so an upstream handle in someone else's

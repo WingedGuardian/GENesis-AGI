@@ -10,11 +10,16 @@ MATCHED BY NAME, never by id. A ruleset id is per-repository, so a fork or a
 re-created ruleset would make an id-keyed file wrong everywhere but here. The
 name is what a human sees in the settings UI and what the file declares.
 
-DELETES NOTHING. A ruleset whose name is not among the local files is left
-exactly as it is and reported. This script's job is to assert what we declare,
-never to assume our directory is the whole truth about someone's repository —
-and a script that removes protections it does not recognise is a script nobody
-should run against a repository that matters.
+DELETES NOTHING. A BRANCH ruleset whose name is not among the local files is
+left exactly as it is and reported. This script's job is to assert what we
+declare, never to assume our directory is the whole truth about someone's
+repository — and a script that removes protections it does not recognise is a
+script nobody should run against a repository that matters.
+
+The word BRANCH is load-bearing and was missing from an earlier version of this
+sentence: TAG and PUSH rulesets are filtered out of the listing, so they are
+left alone AND NEVER REPORTED. An operator reading a clean run has seen the
+repository's branch rules, not its whole rule surface.
 
 Usage:
     python3 scripts/apply_rulesets.py --dry-run     # show the diff, write nothing
@@ -107,6 +112,19 @@ def _local_definitions() -> dict[str, dict]:
             raise RuntimeError(f"{path} declares no `name` — cannot be matched")
         if name in out:
             raise RuntimeError(f"two files declare the ruleset name {name!r}")
+        target = data.get("target", "branch")
+        if target != "branch":
+            # The live listing filters to `target == "branch"`, so a tag or push
+            # ruleset declared here could never match one: the name would read
+            # ABSENT on every run and `--apply` would POST another copy each
+            # time, unbounded, each one enforcing. Refuse the file rather than
+            # silently accumulating duplicates — the same "row skipped, reads
+            # absent, create a duplicate" degrade the --slurp guard above exists
+            # to prevent, one level down (audit, PR #1907).
+            raise RuntimeError(
+                f"{path} declares target {target!r}; this script reconciles BRANCH "
+                "rulesets only and would create a duplicate of it on every apply"
+            )
         out[name] = data
     if not out:
         raise RuntimeError(f"no ruleset definitions found in {RULESET_DIR}")
@@ -139,7 +157,21 @@ def _live_definitions(repo: str) -> dict[str, dict]:
         if row.get("target") != "branch":
             continue
         full = _gh_json(["api", f"repos/{repo}/rulesets/{row['id']}"])
-        live[full["name"]] = full
+        name = full["name"]
+        if name in live:
+            # The LOCAL side already refuses this (two files, one name); the
+            # live side kept the last one silently, which is worse in both
+            # directions. A dry run would report the survivor as in sync while
+            # the hidden duplicate went on enforcing stale rules, and the
+            # unmanaged-ruleset report reads the same name-keyed dict, so it
+            # loses the duplicate too. Same class, opposite handling, forty
+            # lines apart (Codex P2, PR #1907).
+            raise RuntimeError(
+                f"two LIVE rulesets are named {name!r} (ids {live[name]['id']} and "
+                f"{full['id']}) — reconciling one would leave the other enforcing "
+                f"unreviewed rules; remove or rename one in the repository settings"
+            )
+        live[name] = full
     return live
 
 
@@ -151,14 +183,22 @@ def _normalise(value: object) -> object:
     cry wolf until nobody reads its output.
     """
     if isinstance(value, dict):
-        # Keys the SERVER adds with a null value are dropped. GitHub echoes
-        # optional fields it did not receive (`integration_id: null` on a
-        # status-check entry is the reported one), and comparing them against a
-        # local file that simply omits the key makes a freshly-applied ruleset
-        # read as drifted forever: every dry run exits 1 and every apply repeats
-        # the same PUT that changes nothing (Codex P2, PR #1907). Safe in both
-        # directions because a local definition never declares a null — an
-        # explicit null on our side would be dropped from both sides equally.
+        # Keys the SERVER adds with a null value are dropped, so a
+        # freshly-applied ruleset cannot read as drifted forever — every dry run
+        # exiting 1 and every apply repeating a PUT that changes nothing (Codex
+        # P2, PR #1907). Safe in both directions because a local definition never
+        # declares a null; an explicit null on our side would drop from both.
+        #
+        # The example that comment used to give was WRONG and is worth correcting
+        # rather than deleting, because it names the wrong echo behaviour:
+        # MEASURED against this repository's live ruleset, a status-check entry
+        # comes back as `{"context": "test"}` — `integration_id` is OMITTED, not
+        # nulled. Absence is the real shape, and this normalisation does not
+        # address it: a local `[]` or `{}` against an absent key still compares
+        # as drift. Harmless as shipped (every key both files declare is echoed
+        # in the same shape, verified key-for-key), but `required_reviewers` is
+        # flagged beta in GitHub's schema and `approvals.json` declares it as
+        # `[]` — the day the beta stops echoing it, that is where this bites.
         return {k: _normalise(v) for k, v in sorted(value.items()) if v is not None}
     if isinstance(value, list):
         return sorted((_normalise(v) for v in value), key=lambda v: json.dumps(v, sort_keys=True))

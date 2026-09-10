@@ -14,9 +14,14 @@
 # label; reason from the gate's own report (`--check-pr`) and treat the label
 # as the thing that made you look.
 #
-# The globs deliberately mirror `_HOOK_SURFACE_PREFIXES` / `_HOOK_SURFACE_FILES`
-# in prefix form, for the same reason CODEOWNERS does: a prefix keeps matching
-# when a new hook lands where an enumerated list quietly stops.
+# The globs mirror `_HOOK_SURFACE_PREFIXES` / `_HOOK_SURFACE_FILES`: three
+# directory prefixes, then the 27 named files enumerated one by one, because
+# that is what the constant is. An earlier version of this comment said the
+# mirror was written "in prefix form" so it would keep matching when a new hook
+# lands — true of the three directories, false of the 27 files, and the claim
+# mattered because it describes a safety property the file does not have. What
+# actually catches a 28th hook is the test, which reads the constant from the
+# guard's AST and fails when this list falls behind it.
 
 gate-surface:
   - changed-files:
@@ -74,8 +79,18 @@ documentation:
       #
       # Mirrors `_is_doc_path` (git_push_guard.py): any prose extension at any
       # depth, plus a known documentation STEM with `.txt` or no extension.
-      # Verified by the test below against the classifier over `git ls-files`,
-      # rather than by reasoning about globs — which is what got this wrong
-      # twice.
+      # NOT verified by running this glob. An earlier version of this comment
+      # claimed a test matched it against the classifier over `git ls-files`; no
+      # such test exists, and saying it did is how the next reader stops looking.
+      # What the test DOES check is the clause count and the extension/stem
+      # vocabulary, read from the classifier rather than restated — enough to
+      # catch the two mistakes actually made here, and blind to a narrowed path
+      # scope (measured: it survives dropping `**/`, and survives narrowing to
+      # `docs/**`, which is the exact shape of the original bug).
+      #
+      # Case is a second, latent divergence: the classifier lowercases, this
+      # glob is matched without `nocase`, so `license.txt` or `Changelog.txt`
+      # would classify as docs and not be labelled. MEASURED 0 such files in
+      # 3,924 tracked — latent, and the kind of gap a corpus cannot show you.
       - all-globs-to-all-files:
           - '**/{*.{md,markdown,rst,adoc,MD,RST,ADOC},{CHANGELOG,README,LICENSE,NOTICE,COPYING,AUTHORS,CONTRIBUTING}{,.txt}}'

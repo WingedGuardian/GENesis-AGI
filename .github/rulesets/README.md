@@ -26,6 +26,22 @@ without recreating the self-approval deadlock. This is the whole point of the
 split: before it, a single ruleset with one bypass entry made *every* rule in it
 advisory for the merging actor, so the required check was decoration.
 
+## Two field values a reader cannot look up
+
+JSON carries no comments, so the two least self-explanatory values are recorded
+here. Both were verified against this repository's live ruleset rather than
+inferred, because neither is documented by GitHub.
+
+`bypass_actors[0].actor_id: 5` is the **repository-admin role**. GitHub publishes
+no mapping from `RepositoryRole` ids to role names anywhere; 5 is confirmed by
+reading the live ruleset back and seeing `current_user_can_bypass: "always"` for
+the owner. This single number decides WHO can bypass the approval rule, so it
+should never be changed on a guess.
+
+`require_extra_approval_for_unattributed_changes` is absent from GitHub's
+published OpenAPI schema yet accepted and echoed in production. It is declared
+deliberately; a reader who cannot find it in the docs has not missed anything.
+
 ## Which rules go in which, and the test that decides
 
 One question settles it: **does the rule need approval semantics?** Only
@@ -39,8 +55,18 @@ over (Codex P1, PR #1907). They live in the checks ruleset, where they bind.
 
 `update` and `creation` stay in the approvals ruleset. They are already
 bypassed today, so leaving them is the status quo rather than a regression, and
-direct pushes to `main` are refused by the checks ruleset anyway (below) plus
-the local push guard.
+direct pushes to `main` are refused by the checks ruleset in the ordinary case
+(below) plus the local push guard. Read the cost section for the case that
+slips through, because it is narrower than "refused".
+
+`pull_request` also carries `require_last_push_approval: true`. Without it an
+approval survives the push that changes what it approved: a contributor's PR is
+approved at one commit, the contributor pushes another, and GitHub still counts
+the stale approval against the one-review requirement — so the code that merges
+is not the code anyone reviewed (Codex P1, PR #1907). Requiring the LAST push to
+be approved by someone other than its pusher closes that window without
+recreating the self-approval deadlock, because self-authored PRs merge through
+the admin bypass rather than through this rule.
 
 ## What is required, and why exactly these three
 
@@ -48,16 +74,30 @@ the local push guard.
 the check-run name exactly as the rollup reports it.
 
 They were chosen on one criterion: a red result must mean the change is
-genuinely not mergeable, never that something unrelated is flaky. Each is
-deterministic and reads only the diff. Lint is included even though it is the
-least severe: it is fast and deterministic, and the only thing that breaks it
-in a way it would not break `test` is an Actions outage, which blocks
-everything regardless — so excluding it would buy no availability.
+genuinely not mergeable, never that something unrelated is flaky.
+
+**Two of the three read the whole tree, not the diff** — `leak-detector` scans
+every tracked file, and `test` runs the full suite. An earlier draft of this
+section claimed all three were diff-scoped and that only an Actions outage could
+break one without breaking `test`. Both were false, and together they understated
+the real availability risk: with NO bypass actors, anything that turns one of
+these red blocks every merge in the repository, and the only escape is a human
+disabling the ruleset in the settings UI.
+
+The concrete version of that risk was an unpinned tool. A new `ruff` release
+adding a default rule, or a new `detect-secrets` release adding a detector that
+fires on pre-existing content, would have gone red on a diff that touched
+nothing — and `test` would have stayed green, so nothing would have looked like
+a cause. Both are version-pinned in `ci.yml` now, which is what makes the
+selection criterion true rather than aspirational. `gitleaks` was already pinned
+by version and checksum. Pin anything else these three jobs install.
 
 Not required, and each for a reason: `review-depth-check` is advisory by design;
-`CodeQL` and `CodeRabbit` are third-party surfaces whose availability is not
-ours; the remaining `CI` jobs are worth keeping green but a stall in one should
-not hold the repository.
+`CodeRabbit` is a third-party surface whose availability is not ours; `CodeQL`
+is our own workflow but reports under matrix-named contexts and depends on
+analysis-service latency, which is a different argument for the same conclusion;
+the remaining `CI` jobs are worth keeping green but a stall in one should not
+hold the repository.
 
 ## Squash only, in two places on purpose
 
@@ -86,7 +126,56 @@ session-level escape: that is the design, not an oversight. It also ends direct 
 approvals ruleset, but a required status check has nothing to attach to on a
 bare push, so the push is refused. That matches the repo's own
 never-push-to-main policy, and it is worth knowing before the first time
-someone tries. Recovery is the
+someone tries.
+
+**With one hole, stated rather than papered over.** "Refused" holds for a bare
+push of a commit no workflow has ever run on — there is no check run for that
+SHA, so the requirement cannot be satisfied. It does NOT hold for a commit that
+already carries green `test`, `leak-detector` and `lint` runs, which is exactly
+what the head of an open PR is: the checks ruleset is satisfied by those
+existing runs, and the rules that would otherwise demand the PR route —
+`update` and `pull_request` — are both in the bypassed ruleset. So the admin can
+fast-forward `main` onto an already-green commit, skipping approval and the
+squash-only history, and no server-side rule stops it (Codex P2, PR #1907).
+
+This residual is accepted rather than closed — a deliberate deferral, not an
+impossibility. An earlier draft of this section claimed the only server-side fix
+would recreate the self-approval deadlock. That was wrong, and it was the worst
+kind of wrong: a confident sentence telling the next reader a closable hole
+cannot be closed. Two remedies exist and are recorded here so nobody has to
+rediscover them.
+
+1. **`"bypass_mode": "pull_request"`** on this ruleset instead of `"always"`.
+   The maintainer would still bypass the approval rule on a pull request, so no
+   deadlock — but the bypass would stop applying to a bare push, leaving the
+   `update` rule binding there. One word.
+2. **A second `pull_request` rule with `required_approving_review_count: 0`** in
+   the no-bypass ruleset. GitHub's rules allow zero approvals: the pull request
+   must be OPENED, not approved. That demands the route without demanding a
+   review.
+
+Both are UNVERIFIED against GitHub's live behaviour, and the uncertainty is
+specific rather than general. Rulesets targeting one ref AGGREGATE — there is no
+priority between them, and where the same rule appears twice the most
+restrictive version applies — so remedy 2 depends on bypass being evaluated per
+ruleset BEFORE aggregation. If it is evaluated after, the one-approval rule wins
+and the maintainer is locked out. Remedy 1 depends on `gh pr merge --admin`
+counting as "on a pull request".
+
+Neither is adopted here because both end emergency direct pushes for the admin
+as well, and that is a sovereignty decision rather than a documentation fix. The
+declared end-to-end check for applying this ruleset is where remedy 1 gets
+tested, against the live repository, where the answer is cheap to obtain and
+free to revert.
+
+What stands in its place meanwhile is local, and weaker than an earlier draft
+of this file claimed: the push guard is an APPROVAL GATE on pushes to `main`,
+not a refusal, it runs only inside Claude Code sessions on a configured install,
+and it does not exist for a plain shell or for a fork. It is nonetheless the
+layer that has actually been enforcing this all along — worth knowing precisely
+because the protection is not where a reader would assume it is.
+
+Recovery is the
 owner setting the checks ruleset to `disabled` in the repository's rules
 settings (roughly a minute in the UI), landing the fix, and re-enabling it.
 `scripts/apply_rulesets.py --dry-run` shows what would change before any write.

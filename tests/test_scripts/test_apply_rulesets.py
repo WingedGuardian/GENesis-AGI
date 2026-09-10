@@ -100,10 +100,87 @@ def test_the_approvals_ruleset_keeps_its_bypass():
     )
 
 
+def test_an_approval_does_not_survive_the_push_it_approved():
+    """A stale approval means the merging code is not the reviewed code.
+
+    The window is contributor-shaped and invisible: approve at commit A, the
+    contributor pushes B, and GitHub still counts the approval of A toward the
+    one-review requirement. `require_last_push_approval` is what makes the
+    approval refer to the head that will actually merge.
+
+    Pinned rather than left to the JSON because flipping it back reads as a
+    convenience fix the day someone hits the prompt — and it costs the sole
+    maintainer nothing, since self-authored PRs merge through the bypass, not
+    through this rule (Codex P1, PR #1907).
+    """
+    approvals = json.loads((_RULESET_DIR / "approvals.json").read_text())
+    pr_rule = next(r for r in approvals["rules"] if r["type"] == "pull_request")
+    params = pr_rule["parameters"]
+    assert params["require_last_push_approval"] is True, (
+        "an approval must not survive the push that changed what it approved"
+    )
+    assert params["required_approving_review_count"] >= 1, (
+        "last-push approval is inert without a review requirement to attach to"
+    )
+
+
+def test_two_live_rulesets_with_one_name_raise_rather_than_overwrite(mod, monkeypatch):
+    """The live side must fail as loudly as the local side already does.
+
+    Keyed by name, a duplicate silently kept the last one: a dry run would then
+    report the survivor as in sync while the hidden duplicate went on enforcing
+    unreviewed rules, and the unmanaged-ruleset report reads the same dict, so
+    it loses the duplicate too.
+
+    VERIFY-RED: with the raise removed this returns one entry and asserts
+    nothing — which is precisely the silence being fixed, so the test has to
+    assert the exception, not the result.
+    """
+
+    def fake(args):
+        url = args[-1]
+        if "/rulesets?" in url or url.endswith("/rulesets"):
+            return [
+                {"id": 7, "name": "Genesis Main Ruleset", "target": "branch"},
+                {"id": 9, "name": "Genesis Main Ruleset", "target": "branch"},
+            ]
+        rid = int(url.rsplit("/", 1)[-1])
+        return {
+            "id": rid,
+            "name": "Genesis Main Ruleset",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {},
+            "rules": [{"type": "update"}],
+        }
+
+    monkeypatch.setattr(mod, "_gh_json", fake)
+    with pytest.raises(RuntimeError) as excinfo:
+        mod._live_definitions("owner/name")
+    message = str(excinfo.value)
+    assert "Genesis Main Ruleset" in message, "the message must name the collision"
+    assert "7" in message and "9" in message, (
+        "both ids must be reported — the operator has to find the duplicate to delete it"
+    )
+
+
 def test_the_two_rulesets_do_not_both_carry_the_same_rule_type():
-    """One rule, one enforcer. A rule type present in both rulesets would be
-    enforced under two different bypass postures, and which one bound would
-    depend on evaluation order nobody controls."""
+    """One rule, one enforcer — but NOT for the reason an earlier draft gave.
+
+    That draft said the binding copy would depend on evaluation order. There is
+    no evaluation order: rulesets targeting the same ref AGGREGATE, with no
+    priority between them, and where the same rule appears twice the MOST
+    RESTRICTIVE version applies. So a duplicated rule does not resolve
+    arbitrarily — it resolves strictly, which is a different hazard and a
+    smaller one.
+
+    The invariant is kept because the strictest-wins outcome is exactly what the
+    split exists to avoid for `pull_request`: a no-bypass copy would bind the
+    maintainer too. That makes duplicating a rule a DESIGN decision, not a
+    tidy-up — see the README's note on closing the bypass residual, which weighs
+    precisely that trade.
+    """
     a = {r["type"] for r in json.loads((_RULESET_DIR / "approvals.json").read_text())["rules"]}
     b = {r["type"] for r in json.loads((_RULESET_DIR / "checks.json").read_text())["rules"]}
     assert not (a & b), f"rule types declared in both rulesets: {sorted(a & b)}"
@@ -437,6 +514,43 @@ def test_creations_are_applied_before_updates(mod, monkeypatch):
         ("POST", "Genesis Required Checks"),
         ("PUT", "Genesis Main Ruleset"),
     ], f"protection must be created before anything is updated; got {seq}"
+
+
+def test_a_failed_creation_stops_before_any_update_runs(mod, monkeypatch):
+    """The property the ordering EXISTS for, which nothing asserted.
+
+    There is no transaction, so order decides what a mid-run failure leaves
+    behind — and the sibling test above grades only the happy-path sequence. If
+    the create fails and the run continues, the update loop strips `deletion`,
+    `non_fast_forward` and `required_status_checks` out of the bypassed ruleset
+    while their replacement was never created: the repository ends STRICTLY
+    WEAKER than it started, which is the exact outcome the whole design exists
+    to prevent.
+
+    VERIFY-RED: delete the `return 2` on the create-failure path and the rest of
+    this file stays green. That is what made this a gap rather than a duplicate
+    (audit, PR #1907).
+    """
+    seq: list[tuple[str, str]] = []
+
+    def _boom(repo, d):
+        seq.append(("POST", d["name"]))
+        raise RuntimeError("github said no")
+
+    monkeypatch.setattr(mod, "_post", _boom)
+    monkeypatch.setattr(mod, "_put", lambda repo, i, d: seq.append(("PUT", d["name"])))
+    monkeypatch.setattr(mod, "_resolve_repo", lambda explicit: "owner/name")
+    monkeypatch.setattr(
+        mod,
+        "_live_definitions",
+        lambda repo: {"Genesis Main Ruleset": {"id": 1, "rules": [], "bypass_actors": []}},
+    )
+    monkeypatch.setattr(sys, "argv", ["apply_rulesets.py", "--apply"])
+    assert mod.main() == 2, "a failed creation must exit 2, never fall through to 0"
+    assert seq == [("POST", "Genesis Required Checks")], (
+        "no update may run after a creation failed — the update is what REMOVES "
+        f"the protections the failed creation was replacing; got {seq}"
+    )
 
 
 def test_a_slurped_non_list_page_raises_rather_than_degrading(mod, monkeypatch):
