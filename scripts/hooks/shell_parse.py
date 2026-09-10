@@ -901,8 +901,17 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     # exits 2. Scoped to the uv tool-runners on purpose — this is uv's spelling, not
     # a general one, and stripping an `@` suffix off every resolved command would be
     # inventing syntax for tools that do not have it.
-    if via_uv_tool and result and "@" in result[0]:
-        result[0] = result[0].split("@", 1)[0]
+    #
+    # Split the NAME, not the whole token. `result[0]` may be a path, and an `@` in
+    # a DIRECTORY is not a version suffix: MEASURED, `uvx /opt/homebrew/opt/
+    # python@3.12/bin/pytest` resolved its exe to `python`, and
+    # `uvx /nix/store/abc@1/bin/rm -rf …` to `abc` — the HIDE direction, in the one
+    # place this whole change exists to reveal. `python@3.12` is Homebrew's real keg
+    # layout, so that is a path shape, not a contrivance.
+    if via_uv_tool and result:
+        head, sep, name = result[0].rpartition("/")
+        if "@" in name:
+            result[0] = head + sep + name.split("@", 1)[0]
     return result
 
 

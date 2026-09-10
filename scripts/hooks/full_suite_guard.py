@@ -32,6 +32,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 from shell_parse import (  # noqa: E402
+    _RUN_CARRIER_VALUE_FLAGS,
     Segment,
     _basename,
     analyze,
@@ -157,21 +158,52 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
     is exactly why the closed question beats modelling the flag grammar. `uvx`
     takes the command directly and has no subcommand to require.
 
+    Both walks skip a value-flag's VALUE, using the SAME list the resolver walks
+    with. That is one grammar dependency back, taken deliberately, because the
+    unlisted-flag direction of this list is the safe one: a missing entry costs an
+    extra token read (an over-block, overridable), while the list's one dangerous
+    direction — a BOOLEAN flag wrongly listed — is the failure `--isolated` already
+    taught this module, and is guarded there. Without the skip, a package NAME
+    passed to a flag was read as the command: MEASURED, `uv --color always run
+    --with pytest ruff check .` (a ruff run) and `uv --color always run --with
+    pytest pytest tests/foo.py` (a correctly TARGETED run) both blocked.
+
+    KNOWN RESIDUAL, safe direction: the `run` walk skips only flags it knows, so a
+    literal `run` reached as an unlisted flag's value still ends the walk —
+    `uv pip install --target run pytest` over-blocks. It is an install into a
+    directory named `run`, it is refused rather than allowed, and `# full-suite-ok`
+    clears it. Closing it needs pip's grammar, which is the open set this function
+    exists to avoid.
+
     Returns None when the segment is not a carrier, carries no `run` subcommand,
     or carries no pytest token — `uv pip install requests` must stay allowed.
     """
     if _basename(seg.exe) not in _CARRIER_EXES:
         return None  # resolved to a real command (or not a carrier at all)
     argv = seg.argv
-    start = 1
+    i = 1
     if _basename(seg.exe) != "uvx":
-        if "run" not in argv[1:]:
-            return None  # `uv pip install pytest` installs pytest, it does not run it
-        start = argv.index("run", 1) + 1
-    for i, tok in enumerate(argv[start:], start=start):
-        name = _basename(tok).split("@", 1)[0]  # uv permits `pytest@8.3.5`
-        if name == "pytest":
+        # `uv pip install pytest` installs pytest, it does not run it — only a
+        # `run` subcommand carries a command. (`uvx` takes the command directly.)
+        while i < len(argv):
+            tok = argv[i]
+            if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
+                i += 2  # a flag's value is never the subcommand
+                continue
+            if tok == "run":
+                i += 1
+                break
+            i += 1
+        else:
+            return None
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
+            i += 2  # `--with pytest` names a DEPENDENCY, not the command being run
+            continue
+        if _basename(tok).split("@", 1)[0] == "pytest":  # uv permits `pytest@8.3.5`
             return argv[i + 1 :]
+        i += 1
     return None
 
 

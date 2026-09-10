@@ -888,6 +888,18 @@ class TestUvCarrierResolution:
             cmd = f"uv {flag} /x tool run pytest@8.3.5 tests/"
             assert self._exe(cmd) == "pytest", cmd
 
+    def test_an_at_inside_a_directory_is_not_a_version_suffix(self):
+        """Split the NAME, not the whole token.
+
+        `python@3.12` is Homebrew's real keg layout, so a path carrying an `@` is
+        an ordinary shape. Splitting the whole token resolved
+        `uvx /opt/homebrew/opt/python@3.12/bin/pytest` to `python` and
+        `uvx /nix/store/abc@1/bin/rm` to `abc` — the HIDE direction, in the one
+        place this resolver exists to reveal.
+        """
+        assert self._exe("uvx /opt/homebrew/opt/python@3.12/bin/pytest tests/") == "pytest"
+        assert self._exe("uv tool run /nix/store/abc@1/bin/rm -rf /x") == "rm"
+
     def test_a_version_suffix_is_only_stripped_for_uv_tool_runners(self):
         """Scoped on purpose — @ is uv's spelling, not a universal one, and
         stripping it everywhere would invent syntax for tools that lack it."""

@@ -219,6 +219,14 @@ class TestUvCarrierBypasses:
             "uv --python 3.12 tool run pytest@8.3.5",
             "poetry run pytest",
             "uv run pytest tests/",  # whole-directory run
+            # Skipping a value-flag's VALUE must not skip the command word after
+            # it: `--with pytest-cov` names a dependency, `pytest` is still the
+            # bare run. And `--isolated` is BOOLEAN, so nothing follows it to skip.
+            "uv --color always run --with pytest-cov pytest",
+            "uv --color always run --isolated pytest",
+            # An `@` inside a DIRECTORY is not a version suffix. Splitting the whole
+            # token resolved this to `python` — matching no gate at all.
+            "uvx /opt/homebrew/opt/python@3.12/bin/pytest tests/",
         ],
     )
     def test_a_full_suite_run_is_blocked_through_every_carrier_spelling(self, cmd):
@@ -249,6 +257,14 @@ class TestUvCarrierBypasses:
             "uv remove pytest",
             "uv sync --extra pytest",
             "uv tool install pytest",
+            # A value flag's VALUE is a dependency name, not the command. Reading
+            # it as one refused a ruff run and a correctly TARGETED pytest run —
+            # the shape that trains a session to reflex-append the override.
+            "uv --color always run --with pytest ruff check .",
+            "uv --color always run --with pytest pytest tests/foo.py",
+            # The `run` walk skips value-flag values too, so a flag whose value is
+            # the literal `run` no longer looks like the subcommand.
+            "uv --directory run pip install pytest",
             "poetry add pytest",
             "poetry remove pytest",
             "pipenv install pytest",
