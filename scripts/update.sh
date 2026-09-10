@@ -156,6 +156,33 @@ _on_signal_prestop() {
     exit 1
 }
 
+# ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
+# deploy can repair the keys.
+#
+# bootstrap.sh runs as a SUBPROCESS later in this script and calls
+# cc_ensure_local, which may repair CC's auto-updater suppression. That repair
+# sets CC_SUPPRESSION_STATE in the SUBPROCESS, where it dies; the in-process
+# call in _sync_deploy_targets then finds an already-correct file and reports
+# `ok`, so a real repair reaches neither update_history nor the deploy output —
+# and bootstrap's own message is usually cut by its `tail -10`.
+#
+# cc_ensure_updater_suppressed leaves a durable breadcrumb on any non-ok
+# outcome. CLEARING the file here is what lets the consumer tell "repaired
+# during THIS deploy" from a breadcrumb left weeks ago: anything present after
+# the subprocess was written by this deploy, BY CONSTRUCTION. This replaced an
+# epoch watermark compared with `-gt` — an ordering that rode on the wall
+# clock, so a clock rollback, a snapshot restore carrying a future-dated
+# breadcrumb, or a same-second overwrite each made a GENUINE repair read as a
+# clean deploy. Existence cannot be reordered. The epoch inside the file is
+# display data only, and no reader may compare it again.
+rm -f "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true
+if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
+    # The clear is load-bearing for attribution; a file that survives it would
+    # quietly restore the old weeks-ago-breadcrumb misattribution for one run.
+    echo "  WARNING: could not clear $HOME/.genesis/cc_suppression_outcome —" \
+         "a suppression outcome reported later in this deploy may predate it"
+fi
+
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
 if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
@@ -545,13 +572,57 @@ _sync_deploy_targets() {
         # swallowing it — symmetric with the host-side pin failures accumulated
         # above, so a container left on a stale CC pin is surfaced in
         # update_history, not silently dropped.
+        # Clear any inherited value first: the `+set` probe below catches a
+        # LIBRARY that predates the state variable only if nothing else already
+        # put the name in scope — an exported CC_SUPPRESSION_STATE=ok from the
+        # parent environment, or an earlier in-process call, would defeat it.
+        # cc_settings_align.sh does the same, for the same reason.
+        unset CC_SUPPRESSION_STATE
         if ! cc_ensure_local; then
             echo "  WARNING: container Claude Code sync failed"
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
         fi
+        # cc_ensure_local also re-asserts auto-updater suppression (it sets
+        # CC_SUPPRESSION_STATE). Surface a non-ok outcome the same way as a version
+        # sync failure: an unsuppressed auto-updater makes the pin advisory, and a
+        # REPEATED repair means something on this box keeps rewriting settings.json
+        # — neither should live only as a line in a long deploy log.
+        # UNSET is not ok. `cc_ensure_local` sourced from a revision that predates
+        # the state variable — version skew across a partial deploy — would sail
+        # through a `${VAR:-ok}` default as a clean deploy that verified nothing.
+        # scripts/cc_settings_align.sh already refuses that read for the same
+        # reason; this is the sibling consumer of the same channel, so it refuses
+        # it too. The `+set` test distinguishes unset from empty; `:-` cannot.
+        if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
+        elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
+        else
+            # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier
+            # in this same deploy, as a subprocess, and may already have repaired
+            # the keys — leaving this call nothing to do and nothing to report.
+            # The breadcrumb is the only surviving evidence, and the file was
+            # CLEARED at the top of this script — so its mere existence now
+            # means "written during this deploy". No epoch comparison: that is
+            # the wall-clock ordering this channel used to ride on, and a clock
+            # rollback or restored snapshot made a genuine repair read as clean.
+            _supp_line="$(cat "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
+            _supp_state="${_supp_line%% *}"
+            if [ -n "$_supp_state" ]; then
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${_supp_state}"
+                echo "  NOTE: auto-updater suppression was '${_supp_state}' earlier in this" \
+                     "deploy (bootstrap) — recording it, since this later check found the" \
+                     "file already correct and would otherwise have reported a clean run"
+            fi
+        fi
         cc_shadow_scan || true
     else
+        # Without the marker, a deploy that never ran the container CC sync OR
+        # the suppression check recorded "success" with an empty degraded list —
+        # the whole block above is behind this file check, so its absence must
+        # be a first-class degraded cause, same as any failure inside it.
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
+        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_env_missing"
     fi
 
     # ── Restart resident repo-script daemons running pre-pull code ──────
@@ -945,6 +1016,22 @@ fi
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
+
+# Baseline for the post-restart subsystem delta (consumed in the health block far
+# below). Captured HERE, while the old server is still ALIVE, and NOT next to the
+# code that uses it: `systemctl show -p MainPID` returns "0" for a stopped unit, so
+# reading the pid any time after the stop below can never match the pid recorded in
+# the manifest on disk — the baseline would be silently rejected on every deploy and
+# the delta would degrade to a no-op that still looks healthy.
+#
+# Why a delta at all: a subsystem's own status is ambiguous. "degraded" means BOTH
+# "an optional dependency is absent" (normal, and permanent on many installs) and
+# "the initializer crashed and swallowed its own exception" — and 30 of the 33
+# modules under runtime/init/ do exactly that, so "failed:" almost never appears.
+# "Was working before this restart, is not working after it" is unambiguous.
+MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
+SERVER_PID_BEFORE="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+
 # Detect what is running BEFORE stopping anything, so the pre-stop signal handler
 # can restart exactly what was running if an interrupt lands mid-stop (the stop
 # polls up to ~10s) — otherwise a Ctrl-C / shutdown during the stop would leave
@@ -1827,21 +1914,155 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     done
 
     if [ "$HEALTH_OK" = "true" ]; then
-        # Check for failed subsystems
-        DEGRADED=$(curl -sf --max-time 20 http://localhost:5000/api/genesis/health 2>/dev/null | \
-            "$VENV_DIR/bin/python" -c "
-import sys, json
+        # Which subsystems actually came up? The health ENDPOINT cannot answer
+        # that: its response carries no per-subsystem mapping. This check used to
+        # parse a `subsystems` key off it that has never existed, so DEGRADED was
+        # always empty and the branch below it had never fired on any install —
+        # a silent fail-open in a deploy gate.
+        #
+        # The bootstrap manifest is the authoritative record, written as the last
+        # statement of GenesisRuntime.bootstrap(). Statuses are exactly
+        # "ok" | "degraded" | "failed: <exc>" (runtime/_core.py _run_init_step).
+        #
+        # Two properties of that vocabulary drive the design, and testing a status
+        # in isolation gets BOTH of them wrong:
+        #
+        #   1. "failed:" is almost unreachable. _run_init_step only records it when
+        #      an exception ESCAPES the init function — and 30 of the 33 modules
+        #      under runtime/init/ catch their own (perception.py is the worked
+        #      example: `except Exception: logger.exception(...)`). A subsystem that
+        #      CRASHED therefore lands in the manifest as "degraded".
+        #   2. "degraded" is ambiguous. It is also the normal, PERMANENT state of an
+        #      optional dependency that is simply absent — no Ollama, no optional
+        #      API key — so reporting it outright cries wolf on every deploy of the
+        #      installs least able to act on it.
+        #
+        # So the check compares against a BASELINE taken before the restart instead.
+        # A delta is unambiguous where a status is not: a subsystem that was ok
+        # before this restart and is not ok after it regressed, whichever flavour of
+        # not-ok it is, while one that was already degraded stays quiet. Hard
+        # failures are reported regardless of baseline.
+        #
+        # ADVISORY, deliberately — it records, it does not revert. A CRITICAL
+        # subsystem (db/observability/router) never reaches here: the runtime
+        # refuses to report bootstrapped without all three, hosting/standalone.py
+        # then leaves no app and serve() exits, so the health wait above exhausts
+        # and rolls back on its own. What is left is the non-critical remainder,
+        # where reverting an otherwise-good deploy over one subsystem is the wrong
+        # trade. Surfaced like HOST_CC_DEGRADED below, via degraded_subsystems.
+        #
+        # python3, not "$VENV_DIR/bin/python": this needs stdlib only, and the
+        # venv may be mid-reinstall at this point in a deploy.
+        #
+        # Every read below fails CLOSED — an unowned, empty or unusable value
+        # reports `check:*` (unknown), never an empty string. Empty means "checked,
+        # nothing wrong", and handing that back for a check that did not happen is
+        # precisely the defect being fixed here: the old code trusted a key that was
+        # not there and therefore always said "clean".
+        SERVER_PID="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+        # Quoted heredoc, NOT `python3 -c '...'`: inside a single-quoted -c body an
+        # apostrophe in a comment silently terminates the shell string and breaks the
+        # script. Same form already used elsewhere in this file.
+        if ! DEGRADED=$(SERVER_PID="$SERVER_PID" SERVER_PID_BEFORE="$SERVER_PID_BEFORE" \
+                        MANIFEST_BEFORE="$MANIFEST_BEFORE" python3 - <<'PYEOF'
+import json, os, sys
+
+def rank(value):
+    """ok > degraded > everything else. Ordering only — never a pass/fail test."""
+    s = str(value)
+    return 2 if s == "ok" else 1 if s == "degraded" else 0
+
+def owner_ok(doc, pid_want):
+    """True IFF this document was written by pid_want.
+
+    Identity, not recency. The file is user-global and the server is not its only
+    writer (bridge, interactive terminal), so "written recently" cannot establish
+    whose it is — any writer can land at any moment. "Written by the process
+    systemd is running as genesis-server" is a yes/no fact.
+    """
+    return isinstance(doc, dict) and str(doc.get("pid")) == pid_want
+
+def payload(doc):
+    """The non-empty manifest mapping, or None. Kept SEPARATE from ownership so the
+    two failures get distinct sentinels — "someone else wrote this" and "this is
+    ours but says nothing" send a reader to completely different places."""
+    m = doc.get("manifest") if isinstance(doc, dict) else None
+    return m if isinstance(m, dict) and m else None
+
 try:
-    d = json.load(sys.stdin)
-    failed = [k for k,v in d.get('subsystems',{}).items() if v.get('status') == 'failed']
-    print(' '.join(failed))
-except Exception:
-    pass
-" 2>/dev/null || true)
+    pid_want = (os.environ.get("SERVER_PID") or "").strip()
+    if not pid_want or pid_want == "0":
+        print("check:no-server-pid")
+        sys.exit(0)
+    with open(os.path.expanduser("~/.genesis/bootstrap_manifest.json")) as fh:
+        doc = json.load(fh)
+    if not owner_ok(doc, pid_want):
+        # Written by the bridge, a terminal, or a previous boot. Unknown — and
+        # unknown is reported, never treated as a clean bill of health.
+        print("check:manifest-not-this-server")
+        sys.exit(0)
+    after = payload(doc)
+    if after is None:
+        print("check:manifest-empty")
+        sys.exit(0)
+
+    before, baseline_known = {}, False
+    raw = (os.environ.get("MANIFEST_BEFORE") or "").strip()
+    pid_before = (os.environ.get("SERVER_PID_BEFORE") or "").strip()
+    # `!= "0"` is load-bearing: "0" is what systemd reports for a STOPPED unit, and
+    # it is a TRUTHY string, so `raw and pid_before` alone would accept it and then
+    # fail the comparison silently — reporting "no baseline" (which reads like a
+    # first deploy) instead of "I read a stopped unit". Same falsy-check family that
+    # review already caught here once.
+    if raw and pid_before and pid_before != "0":
+        try:
+            d = json.loads(raw)
+            if owner_ok(d, pid_before):
+                b = payload(d)
+                if b is not None:
+                    before, baseline_known = b, True
+        except Exception:
+            pass
+
+    bad = []
+    if not baseline_known:
+        # First deploy on this install, or the pre-restart manifest was not the old
+        # server's. The check still runs, but it can only see hard failures — say so
+        # rather than emitting a confident-looking empty result.
+        bad.append("check:no-baseline")
+    for name, status in sorted(after.items()):
+        if rank(status) == 0:
+            bad.append(name)                          # hard failure, baseline or not
+        elif not baseline_known:
+            continue
+        elif name not in before:
+            # Arrived on THIS deploy already not-ok. The likeliest real regression:
+            # a newly added init step whose module swallows its own exception and
+            # so records "degraded" rather than "failed:".
+            if rank(status) < 2:
+                bad.append(name)
+        elif rank(status) < rank(before[name]):
+            bad.append(name)                          # regressed across the restart
+    if baseline_known:
+        # Present before, absent after. A manifest key is written on BOTH branches of
+        # _run_init_step, so an absent key means the step never ran at all — a
+        # deleted or newly-skipped subsystem. A legitimate rename costs one false
+        # positive, once; a silent drop costs the signal entirely.
+        for name in sorted(set(before) - set(after)):
+            if rank(before[name]) == 2:
+                bad.append(name + ":gone")
+    print(",".join(bad))
+except Exception as exc:
+    # Name the cause: this token is the only artefact the check leaves behind, and
+    # a bare "unreadable" makes the one signal it exists to emit undiagnosable.
+    print("check:manifest-unreadable(" + type(exc).__name__ + ")")
+PYEOF
+); then
+            # The interpreter itself failed (absent python3, OOM). Unknown, not clean.
+            DEGRADED="check:manifest-interpreter-failed"
+        fi
         if [ -n "$DEGRADED" ]; then
-            echo "  Degraded subsystems: $DEGRADED"
-            _do_rollback "subsystems failed after update: $DEGRADED" "$DEGRADED"
-            exit 1
+            echo "  NOTE: recording degraded subsystems after update: $DEGRADED"
         fi
     fi
 
@@ -1952,6 +2173,12 @@ _p6_degraded="$HOST_CC_DEGRADED"
 if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
     echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
     _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
+fi
+# Subsystems that failed to initialise (or an unreadable/stale manifest). Advisory
+# by design — see the health-verification block — but it must reach the record,
+# or "surfaced, not silent" is only true of the console output of one run.
+if [ -n "${DEGRADED:-}" ]; then
+    _p6_degraded="${_p6_degraded:+$_p6_degraded,}$DEGRADED"
 fi
 _record_update_history "success" "" "$_p6_degraded"
 
