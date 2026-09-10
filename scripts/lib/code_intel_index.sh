@@ -251,127 +251,6 @@ PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
 _log() { printf '[code-intel-index] %s\n' "$*"; }
 
-# Make this job the kernel's PREFERRED victim under CONTAINER-wide memory
-# pressure — the safety counterpart of the larger cap above. A bigger cap means
-# a bigger consumer, and the thing that must never be killed instead of this one
-# is a CC session holding a user's in-flight work.
-#
-# Mechanics, all MEASURED rather than assumed:
-#  * CORRECTION (MEASURED 2026-09-09, replacing what this comment said before):
-#    lowering oom_score_adj is NOT refused. The only constraint is
-#    oom_score_adj_min, which is 0 here (inherited from init) — so an unprivileged
-#    task may set ANY value in 0..1000, in either direction, and only a NEGATIVE
-#    value is refused. Verified directly: 500 -> 321 accepted, 321 -> 0 accepted,
-#    -1 refused. The earlier "raising works, lowering never does" was wrong, and
-#    it mattered: an unconditional write would silently LOWER an inherited higher
-#    value, making this job LESS likely to be chosen than its parent intended.
-#    The raise-only contract therefore has to be enforced here, in code, because
-#    the kernel does not enforce it. See the inherited-value check below.
-#  * `-p OOMScoreAdjust=` is INVALID on `systemd-run --scope` ("Unknown
-#    assignment") because a scope does not exec, so Exec properties do not
-#    apply. A self-write is the mechanism that works while KEEPING --scope,
-#    which is load-bearing here (it keeps the job a child of this script so the
-#    watchdog's pgid isolation and stdio survive).
-#  * The value is INHERITED across fork/exec and survives
-#    `systemd-run --user --scope` (verified: child reads 500), and systemd does
-#    not reset it for a scope, so writing it once here covers the indexer.
-#  * On the 32 GiB reference host each 100 of adj is worth ~3.2 GB of
-#    oom_badness, so these rungs decide outcomes rather than express a taste.
-#
-# 900, NOT 500 — and this is the correction that makes the whole feature work.
-# 500 was chosen without checking what already uses it, and `cc/invoker.py`
-# ALREADY assigns every CC subprocess exactly 500 (its `set_oom_score_adj`
-# default, applied at both call sites). At EQUAL adj the kernel falls back to
-# each process's memory charge, and a CC session may be allowed far more memory
-# than this job — so "the index dies before a session" would have been false in
-# precisely the container-wide pressure it was written for. A distinctly higher
-# value is what makes the ordering real. 1000 is deliberately left unused as the
-# ceiling; nothing here needs to outrank a batch index that can simply re-run.
-#
-# Values are normalised to CANONICAL DECIMAL before the write. MEASURED: the
-# kernel parses this file with base autodetection, so a zero-padded "0500" is
-# read as OCTAL and applies 320 — silently WEAKENING the preference while the
-# log would have echoed the operator's "0500" back as if it took. Range is
-# checked too: the kernel's valid band is -1000..1000 and only non-negative
-# values are achievable here (lowering is refused), so anything above 1000 or
-# non-numeric is rejected at the lever rather than written and misapplied.
-_apply_oom_score_adj() {
-    # Raise-only guards the DEFAULT, not an operator's explicit instruction —
-    # that distinction is the whole point. The risk being fixed is this script's
-    # own 900 silently undoing a parent that deliberately raised the job higher.
-    # Someone who exports CODE_INTEL_INDEX_OOM_SCORE_ADJ has stated an intent,
-    # and quietly ignoring a lever because it happens to lower the value would
-    # be its own surprise — the lever exists to be obeyed. So: explicit wins and
-    # says what it did; the default defers to a higher inherited value.
-    local want explicit=0
-    if [ -n "${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-}" ]; then
-        want="$CODE_INTEL_INDEX_OOM_SCORE_ADJ"
-        explicit=1
-    else
-        want=900
-    fi
-    case "$want" in
-        '' | *[!0-9]*)
-            _log "WARNING: ignoring non-numeric CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' — kill order unchanged"
-            return 0
-            ;;
-    esac
-
-    # Reject oversized input BEFORE any arithmetic. All-digit is not the same as
-    # in-range: $((10#$want)) on a value past bash's signed 64-bit range WRAPS,
-    # so "18446744073709551616" evaluates to 0, passes a `> 1000` check, and is
-    # written and logged as accepted. Strip leading zeros textually, then bound by
-    # LENGTH first — a decimal string of more than 4 digits cannot be <= 1000, and
-    # a length test cannot overflow.
-    local digits="${want#"${want%%[!0]*}"}"   # drop leading zeros
-    [ -n "$digits" ] || digits=0
-    if [ "${#digits}" -gt 4 ]; then
-        _log "WARNING: CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' exceeds the kernel maximum of 1000 — kill order unchanged"
-        return 0
-    fi
-    # 10# forces base-10 so "0500" means five hundred, not octal 320 — the kernel
-    # parses this file with base autodetection, so a zero-padded value would
-    # silently apply a WEAKER preference while the log echoed the operator's
-    # string back as though it took.
-    local canonical=$((10#$digits))
-    if [ "$canonical" -gt 1000 ]; then
-        _log "WARNING: CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' exceeds the kernel maximum of 1000 — kill order unchanged"
-        return 0
-    fi
-
-    # Raise-only, enforced HERE because the kernel does not enforce it (see the
-    # correction above). If we inherited a value at or above what we want, keep
-    # it: a parent that raised us to 1000 wanted this job even more killable than
-    # our default does, and writing 900 over it would quietly reverse that.
-    local current=""
-    read -r current < /proc/self/oom_score_adj 2>/dev/null || current=""
-    case "$current" in
-        '' | *[!0-9]*) current="" ;;   # unreadable or negative — no opinion
-    esac
-    if [ "$explicit" = "0" ] && [ -n "$current" ] && [ "$current" -ge "$canonical" ]; then
-        _log "oom_score_adj=$current inherited (>= the default $canonical) — kept, raise-only"
-        return 0
-    fi
-    if [ "$explicit" = "1" ] && [ -n "$current" ] && [ "$current" -gt "$canonical" ]; then
-        # Say it out loud. An explicit lever that lowers the inherited preference
-        # is honoured, but it is also the kind of thing someone wants to see in a
-        # log when they are working out why a kill went the way it did.
-        _log "note: CODE_INTEL_INDEX_OOM_SCORE_ADJ=$canonical LOWERS the inherited $current (explicit override wins over raise-only)"
-    fi
-
-    if printf '%s\n' "$canonical" > /proc/self/oom_score_adj 2>/dev/null; then
-        # Deliberately does NOT name other units' scores. An earlier version said
-        # "the server at 100", which no shipped configuration set — the unit
-        # template declared -500 (a value the user manager silently refuses, which
-        # is a separate fix). Quoting a number this script does not own turns an
-        # operational log line into a false claim about kill ordering.
-        _log "oom_score_adj=$canonical — this job is the preferred OOM victim, ahead of CC subprocesses, the server and the session"
-    else
-        # Not fatal: an unwritable /proc (odd sandbox) costs kill-order
-        # preference, never the index itself.
-        _log "WARNING: could not raise oom_score_adj — kill order unchanged"
-    fi
-}
 
 # Shared load/iowait sampler for the pressure watchdog. Best-effort: if it's
 # missing (older checkout), the watchdog degrades to a wall-clock cap only.
@@ -447,11 +326,6 @@ else
 fi
 
 # ── 3. Resource-capped runner ───────────────────────────────────────────
-# Raise the kill-order preference BEFORE the probe, so every descendant this
-# script goes on to create — probe, scope, indexer — inherits it. Doing it after
-# the probe would leave the first scope at the default.
-_apply_oom_score_adj
-
 # Probe systemd-run exactly like .claude/mcp/run-codebase-memory does: the
 # probe must create a real scope, because CC-spawned / hook-spawned contexts
 # sometimes cannot reach the user manager even when systemd-run exists.
