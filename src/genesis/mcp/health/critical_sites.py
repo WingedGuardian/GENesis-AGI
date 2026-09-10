@@ -2,9 +2,12 @@
 
 The unified call-site health detector (``mcp/health/errors.py``) reads the
 ``call_site_last_run`` table and, for any site whose last run failed within
-:data:`CALLSITE_DOWN_RECENCY_HOURS`, emits a ``callsite:down:<id>`` alert. A
-site in :data:`CRITICAL_CALL_SITES` renders **CRITICAL/red**; every other
-failing site renders **WARNING/yellow** (watched, not alarming). The detector
+its recency window, emits a ``callsite:down:<id>`` alert. The window is
+TWO-TIER: sites in :data:`CRITICAL_CALL_SITES` use
+:data:`CRITICAL_CALLSITE_DOWN_RECENCY_HOURS` (weeks — a broken weekly
+reflection must not fall silent after a day) and render **CRITICAL/red**;
+every other failing site uses :data:`CALLSITE_DOWN_RECENCY_HOURS` (tight)
+and renders **WARNING/yellow** (watched, not alarming). The detector
 is dashboard-only: ``callsite:down:`` is never on the outreach escalation
 whitelist and is UNMAPPED in the Sentinel remediation map, so it never pages
 Telegram and never wakes the firefighter (both fail-closed by design).
@@ -39,10 +42,26 @@ from __future__ import annotations
 # actionable outage. 24h is chosen from live cadence data: the frequently
 # cycling critical sites (embeddings, fact/procedure extraction, ego focus) and
 # the ~18h ego cycles all refresh within a day, while every observed stale
-# failure sat far outside it. Tunable — widen if slow-cadence critical sites
-# (weekly strategic/deep reflection) start under-surfacing. Dashboard-only, so
-# the cost of a miss is low and the cost of noise is low.
+# failure sat far outside it. Slow-cadence CRITICAL sites get the wider
+# window below (the "widen if under-surfacing" case arrived). Dashboard-only,
+# so the cost of a miss is low and the cost of noise is low.
 CALLSITE_DOWN_RECENCY_HOURS = 24
+
+# Sites in CRITICAL_CALL_SITES get a much WIDER window. The single 24h
+# ceiling had an inversion for exactly the sites that matter most: a
+# slow-cadence critical site (the weekly reflections) that failed its last
+# run fell OUT of the alert set after a day and stayed broken-and-silent
+# until its next attempt — Genesis got QUIETER the longer it was broken,
+# the same architectural property that made a multi-day provider outage
+# inaudible. 35 days mirrors the job-health never-succeeded floor
+# (crud/job_health.py ``recent_since`` ~35d): wide enough for every cadence
+# in the critical set (daily cycles, ~18h egos, weekly reflections), while
+# still a FLOOR — a critical site retired or abandoned for over ~5 weeks
+# stops alarming instead of alarming forever. The measured stale-noise
+# offenders that motivated the 24h ceiling (dream_cycle_* /
+# models_md_synthesis at 600h+) are all NON-critical and keep the tight
+# window, so this widens nothing for them.
+CRITICAL_CALLSITE_DOWN_RECENCY_HOURS = 35 * 24
 
 # Sites that render CRITICAL/red when their last run failed. Everything else
 # failing renders WARNING/yellow. Ids are runtime ``call_site_id`` values as

@@ -170,12 +170,55 @@ def load_config_from_string(text: str, *, check_api_keys: bool = True) -> Routin
     return _parse(raw, check_api_keys=check_api_keys)
 
 
+#: Placeholders that have a real accessor in ``genesis.env``. For these the
+#: accessor is authoritative, because it — and not this function — implements the
+#: documented precedence: environment, then ~/.genesis/config/genesis.yaml, then a
+#: hardcoded default.
+#:
+#: WHY THIS EXISTS. Expanding from ``os.environ`` alone made the routing layer the
+#: ONE consumer that could not see the yaml config, and the split was silent: an
+#: install pointing ``network.ollama_url`` at a remote server had its dashboard,
+#: health check and embeddings reach that server while routed model calls still
+#: went to localhost. It was masked for as long as secrets.env.example force-
+#: assigned the same values, since env then agreed with the default by accident;
+#: removing those assignments so the yaml lever could work is what exposed it.
+#: Nothing here changes when the environment variable IS set — the accessor
+#: returns it first, so env still wins.
+_ENV_ACCESSORS: dict[str, str] = {
+    "OLLAMA_URL": "ollama_url",
+    "LM_STUDIO_URL": "lm_studio_url",
+    "LM_STUDIO_HEALTH_URL": "lm_studio_health_url",
+    "GENESIS_ENABLE_OLLAMA": "ollama_enabled",
+}
+
+
 def _expand_env_vars(text: str) -> str:
-    """Expand ${VAR} and ${VAR:-default} placeholders in config text."""
+    """Expand ${VAR} and ${VAR:-default} placeholders in config text.
+
+    A placeholder listed in ``_ENV_ACCESSORS`` resolves through that accessor
+    rather than the raw environment, so routing agrees with every other consumer
+    of the same setting. Everything else keeps the previous behaviour exactly:
+    environment, else the inline default, else the placeholder untouched.
+    """
 
     def repl(match: re.Match[str]) -> str:
         key = match.group(1)
         default = match.group(2)
+        accessor = _ENV_ACCESSORS.get(key)
+        if accessor is not None:
+            try:
+                from genesis import env as _genesis_env  # noqa: PLC0415 — lazy: keep import light
+
+                value = getattr(_genesis_env, accessor)()
+            except Exception:
+                # Never let a config-resolution problem take routing down: fall
+                # back to the previous behaviour rather than raising into a
+                # module that every model call depends on.
+                logger.warning("env accessor %s failed for %s", accessor, key, exc_info=True)
+            else:
+                # yaml booleans must render as the lowercase tokens the config
+                # expects, not Python's "True"/"False".
+                return str(value).lower() if isinstance(value, bool) else str(value)
         return os.environ.get(key, default if default is not None else match.group(0))
 
     return _ENV_PATTERN.sub(repl, text)

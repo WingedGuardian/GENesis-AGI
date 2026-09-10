@@ -324,15 +324,49 @@ async def settings_timezone():
         return jsonify({"error": f"Invalid timezone: {new_tz}"}), 400
 
     # Write to genesis.yaml
+    import shutil
     import tempfile
-    from pathlib import Path
+
     cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
+    malformed_backup: str | None = None
     try:
         import yaml
         existing = {}
         if cfg_path.is_file():
             with cfg_path.open() as fh:
-                existing = yaml.safe_load(fh) or {}
+                loaded = yaml.safe_load(fh)
+            # `or {}` covers an empty file but keeps a truthy non-mapping root, and
+            # the assignment below would then TypeError into an opaque 500. This
+            # dropdown is the recovery surface for a broken genesis.yaml, so it has
+            # to survive the one file the operator has just broken.
+            #
+            # BUT SURVIVING MUST NOT MEAN DELETING. Coercing a non-mapping root to
+            # {} and then writing the file back replaces whatever was in it with a
+            # lone timezone key — so a stray top-level list carrying real network /
+            # github / custom settings would be destroyed by the very control
+            # documented as the way to recover. That is worse than the 500 it
+            # replaced, which at least left the file intact. Side the original
+            # first, and tell the operator where it went.
+            if not isinstance(loaded, dict):
+                # Second-resolution timestamps COLLIDE: two malformed writes in
+                # the same second would have the second overwrite the first
+                # backup, losing the very content the backup exists to preserve.
+                # Find a free name instead of trusting the clock to be unique.
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                backup = cfg_path.with_suffix(f".malformed-{stamp}.yaml")
+                suffix = 2
+                while backup.exists():
+                    backup = cfg_path.with_suffix(f".malformed-{stamp}-{suffix}.yaml")
+                    suffix += 1
+                shutil.copy2(cfg_path, backup)
+                malformed_backup = str(backup)
+                logger.warning(
+                    "genesis.yaml root is %s, not a mapping — copied the original to %s "
+                    "before writing the timezone; its other settings are NOT carried over.",
+                    type(loaded).__name__,
+                    backup,
+                )
+            existing = loaded if isinstance(loaded, dict) else {}
         existing["timezone"] = new_tz
         # Ensure the config dir exists — on an install that never ran
         # setup-local-config, ~/.genesis/config/ may be absent and the dropdown
@@ -363,7 +397,16 @@ async def settings_timezone():
     from genesis.util.tz import reload as tz_reload
     effective = tz_reload()
 
-    return jsonify({
+    payload = {
         "timezone": effective,
         "note": "Scheduler timezone updates on next restart",
-    })
+    }
+    if malformed_backup:
+        # Surfaced, never silent: the operator's other settings were NOT carried
+        # into the rewritten file, and they need to know where the original went.
+        payload["warning"] = (
+            "genesis.yaml had a malformed (non-mapping) root. The original was copied to "
+            f"{malformed_backup} and the file was rewritten with only the timezone — "
+            "any other settings it contained must be restored by hand from that copy."
+        )
+    return jsonify(payload)

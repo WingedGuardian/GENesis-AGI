@@ -416,3 +416,78 @@ class TestWordFormParentheses:
         """
         folded = dg._fold_continuations("echo $(true); (true)#note \\\nZZZ")
         assert "\nZZZ" in folded, "comment must survive as its own line"
+
+
+class TestNestedQuotingContexts:
+    """A quote belonging to a NESTED command does not close the outer word.
+
+    One scalar `quote` slot read a nested OPENING quote as the outer CLOSING
+    quote and left quote mode early. A `#` in nested quoted data then looked
+    like a word start, opened a comment, and suppressed the real continuation
+    further along — so the recursive-force flags split across the newline and
+    no recursive-force removal was seen for a command the shell does run.
+
+    The same divergence has three spellings, and fixing only the reported one
+    would leave its twins open. All three rows below were measured through a
+    marker-file shim (an `echo` payload prints its own arguments, so matching
+    output would lie), with ``main`` as the control column so a pre-existing
+    gap could not be reported as a regression: bash runs the removal in every
+    row, ``main`` blocks every row, and the pre-fix branch allowed all three.
+
+    The shapes live here as fixture data rather than as prose, and no worked
+    example is spelled out in the module: naming a construct beside a statement
+    that a gate stopped working is a recipe, and this repository is public.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "prefix"),
+        [
+            ("command-substitution-in-double-quotes", 'echo "$(printf "%s #x" hi)"'),
+            ("backtick-substitution-in-double-quotes", 'echo "`printf "%s #x" hi`"'),
+            ("parameter-expansion", "echo ${unset:- #x}"),
+        ],
+        ids=[
+            "command-substitution-in-double-quotes",
+            "backtick-substitution-in-double-quotes",
+            "parameter-expansion",
+        ],
+    )
+    def test_a_nested_quote_does_not_fake_a_comment(self, label, prefix):
+        assert _blocks(f"{prefix}; rm -r\\\nf /"), (
+            f"{label}: the `#` is data to the shell, so the continuation after "
+            "it is real and the guard must still see -rf"
+        )
+
+    def test_single_quotes_are_not_entered(self):
+        """Nothing expands inside single quotes, so the substitution is literal.
+
+        The inverse error of the class above: treating this body as a nested
+        command would leave quote mode at its inner double quote for real.
+        """
+        assert _blocks("echo '$(printf \"%s #x\" hi)'; rm -r\\\nf /")
+
+    # New state that never RESETS is itself a bypass: with the brace depth or
+    # the saved backtick left occupied, comment recognition would be dead for
+    # the rest of the command and every later continuation would be folded —
+    # which glues the next command onto comment text so no rm token survives.
+    # bash runs the rm in every row (the comment ends at the newline).
+    @pytest.mark.parametrize(
+        ("label", "payload"),
+        [
+            ("after-parameter-expansion", "echo ${x:-y} #note\\\nrm -rf /"),
+            ("after-backtick-substitution", 'echo "`printf hi`" #note\\\nrm -rf /'),
+            ("after-command-substitution", 'echo "$(printf hi)" #note\\\nrm -rf /'),
+            ("unmatched-close-brace", "echo } #note\\\nrm -rf /"),
+        ],
+        ids=[
+            "after-parameter-expansion",
+            "after-backtick-substitution",
+            "after-command-substitution",
+            "unmatched-close-brace",
+        ],
+    )
+    def test_the_nested_context_state_returns_to_zero(self, label, payload):
+        assert _blocks(payload), (
+            f"{label}: a real comment must still open once the nested context "
+            "has closed, so the rm on the next line survives as its own command"
+        )

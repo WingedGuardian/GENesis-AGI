@@ -855,10 +855,22 @@ if [ -f "$_cc_env" ]; then
     # shellcheck source=/dev/null
     source "$_cc_env"
     echo "  Installing Claude Code (v${CC_VERSION}) before service generation..."
+    unset CC_SUPPRESSION_STATE
     if ! cc_ensure_local; then
         echo "    (will finalize at step 12; manual: npm install -g @anthropic-ai/claude-code@${CC_VERSION})"
         SETUP_WARNINGS=1
     fi
+    # cc_ensure_local's return code carries only the VERSION outcome; suppression
+    # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
+    # warning suffices at this step — step 12 makes the authoritative call and
+    # sets SETUP_WARNINGS if it still cannot verify.
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|repaired) : ;;
+        *)
+            echo "    WARNING: CC auto-updater suppression not verified yet" \
+                 "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
+            ;;
+    esac
 fi
 
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
@@ -1290,6 +1302,7 @@ echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 # Install OR align to the pin — cc_ensure_local (scripts/lib/cc_version.sh, sourced
 # above) installs when absent AND upgrades/downgrades a drifted-but-present CC to
 # the pin (the prior "already installed → skip" check never re-aligned drift).
+unset CC_SUPPRESSION_STATE
 if ! cc_ensure_local; then
     echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
     SETUP_WARNINGS=1
@@ -1324,57 +1337,35 @@ fi
 # recovery `claude -p` is single-brain and never nests, so host-setup.sh deliberately
 # does NOT set the nesting default.) See docs/reference/cc-compatibility.md.
 _settings_file="$HOME/.claude/settings.json"
-mkdir -p "$HOME/.claude"
-if [ ! -f "$_settings_file" ]; then
-    cat > "$_settings_file" <<'CCSETTINGS'
-{
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_UPDATES": "1",
-    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2"
-  }
-}
-CCSETTINGS
-    echo "    + Created $_settings_file with auto-updater suppression + subagent-nesting default"
+# Both concerns land in ONE call, and therefore in ONE atomic write:
+#   * the two auto-updater keys are ENFORCED to "1" (cc_ensure_updater_suppressed,
+#     scripts/lib/cc_version.sh — the SAME function the align path and the
+#     genesis-cc-settings-align timer re-run, so setup and steady state cannot
+#     drift apart);
+#   * the container-only subagent-nesting default is SET IF ABSENT, so a
+#     deliberate operator override (0 to disable, or higher) is preserved.
+# One call so BOTH policies share a single write contract (mode/xattr carry-over,
+# compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
+# it. Note what this does NOT claim: on a fresh install the file is still touched
+# twice overall, because cc_ensure_local (earlier in this script) already creates
+# it with the suppression keys before this line adds the nesting default. Those
+# two writes are sequential within one process, so they do not race each other —
+# the lost-update hazard the CAS addresses is a CONCURRENT writer (CC itself
+# rewrites settings.json), not this ordering.
+# (The host VM's recovery `claude -p` is single-brain and never nests, so
+# host-setup.sh deliberately passes no nesting default.)
+if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
+    # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
+    # "verified" is finally true here. The nesting default is deliberately not
+    # claimed on this line: on the python3-less create path it is NOT applied
+    # (the function says so loudly on stderr), and a summary line that
+    # overclaims for a corner case teaches the reader to distrust the summary.
+    echo "    + CC auto-updater suppression verified in $_settings_file"
 else
-    # Merge — preserves any existing env vars and other top-level keys.
-    if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(2)
-if not isinstance(data, dict):
-    sys.exit(2)
-env = data.setdefault("env", {})
-if not isinstance(env, dict):
-    sys.exit(2)
-changed = False
-for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
-    if env.get(key) != "1":
-        env[key] = "1"
-        changed = True
-# Genesis default: allow ONE level of subagent nesting (session->subagent->subagent
-# = 3 tiers) on CC 2.1.217+, which made nested spawning opt-in (default 1 = none).
-# Set-if-absent so a deliberate operator override (0 to disable, or higher) is kept.
-if "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH" not in env:
-    env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "2"
-    changed = True
-if changed:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    print("merged")
-else:
-    print("unchanged")
-PYEOF
-    then
-        echo "    + Auto-updater suppression + subagent-nesting default set in $_settings_file"
-    else
-        echo "    WARNING: Could not merge auto-updater settings into $_settings_file"
-        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\", \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
-    fi
+    echo "    WARNING: Could not write CC settings in $_settings_file"
+    echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    SETUP_WARNINGS=1
 fi
 
 # Login guidance (interactive only)

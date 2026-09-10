@@ -191,7 +191,22 @@ def _fold_continuations(cmd: str) -> str:
     # the command read as mid-word. Independent classification also keeps `$((`
     # right without a special case: the inner entry may be command-form, but the
     # outer word-form `)` is the one that decides where the word ends.
-    paren_forms: list[bool] = []
+    #
+    # Each entry also carries the quote state to RESTORE when this parenthesis
+    # closes. It is None for every parenthesis met outside a quote; it holds the
+    # enclosing quote for a `$(` met INSIDE a double quote, whose body is a
+    # fresh command with its own quoting (see the `quote` handling below).
+    paren_forms: list[tuple[bool, str | None]] = []
+    # The quote to restore at the closing backtick of a `` ` `` substitution
+    # opened inside a double quote — the backtick spelling of the frame above,
+    # which needs its own slot because a backtick is closed by another backtick
+    # rather than by a `)`.
+    backtick_quote: str | None = None
+    # Open `${ … }` expansions. Bash never opens a comment inside one — a `#`
+    # there is expansion text or the length operator — so comment recognition is
+    # suppressed while this is non-zero. Only the UNQUOTED path needs it: inside
+    # a quote a `#` opens nothing anyway.
+    brace_depth = 0
     # The previous UNQUOTED, UNESCAPED character — what decides a `(`'s form.
     # A quoted or backslash-escaped character resets it to None: `\$(` is a
     # literal `$` followed by a subshell, not a command substitution.
@@ -203,6 +218,40 @@ def _fold_continuations(cmd: str) -> str:
             if c == "\\" and i + 1 < n and cmd[i + 1] == "\n":
                 i += 2  # fold inside quotes, as before
                 continue
+            # A command substitution inside a DOUBLE quote runs a fresh command
+            # with its own quoting, so a quote belonging to that nested command
+            # does not close the surrounding word. One scalar `quote` slot read
+            # the nested OPENING quote as the outer CLOSING quote and left quote
+            # mode early; a `#` in nested quoted data then looked like a word
+            # start and opened a comment, which suppressed a real line
+            # continuation further along — so the recursive-force flags split
+            # across the newline and no violation was found for a command the
+            # shell does run. Push the enclosing quote onto this parenthesis's
+            # frame, scan the body unquoted, and restore it at the matching `)`.
+            #
+            # Single quotes are deliberately excluded: nothing expands inside
+            # them, so `$(` there is literal text and must stay quoted.
+            if quote == '"' and c == "$" and i + 1 < n and cmd[i + 1] == "(":
+                paren_forms.append((True, quote))
+                out.append(c)
+                out.append(cmd[i + 1])
+                quote = None
+                at_word_start = True  # a fresh command begins after `$(`
+                prev = None
+                i += 2
+                continue
+            # The OTHER spelling of the same construct. A backtick substitution
+            # inside a double quote has the identical fresh-quoting property, so
+            # leaving it out would close one spelling of this bypass and leave
+            # its twin open — measured as a live bypass, not inferred.
+            if quote == '"' and c == "`":
+                backtick_quote = quote
+                out.append(c)
+                quote = None
+                at_word_start = True
+                prev = None
+                i += 1
+                continue
             out.append(c)
             if quote == '"' and c == "\\" and i + 1 < n:
                 out.append(cmd[i + 1])
@@ -213,6 +262,16 @@ def _fold_continuations(cmd: str) -> str:
                 prev = None
             i += 1
             continue
+        if not in_comment and c == "`" and backtick_quote is not None:
+            # Closing backtick of a substitution opened inside a double quote —
+            # the outer quote resumes here, exactly as it does at the `)` above.
+            quote = backtick_quote
+            backtick_quote = None
+            out.append(c)
+            at_word_start = False  # closes an expansion, so still inside a word
+            prev = c
+            i += 1
+            continue
         if not in_comment and c in ("'", '"'):
             quote = c
             out.append(c)
@@ -220,7 +279,11 @@ def _fold_continuations(cmd: str) -> str:
             prev = None
             i += 1
             continue
-        if c == "#" and not in_comment and at_word_start:
+        if not in_comment and c == "$" and i + 1 < n and cmd[i + 1] == "{":
+            brace_depth += 1
+        elif not in_comment and c == "}" and brace_depth:
+            brace_depth -= 1
+        if c == "#" and not in_comment and at_word_start and not brace_depth:
             in_comment = True
         if c == "\\" and i + 1 < n and not in_comment:
             if cmd[i + 1] == "\n":
@@ -234,13 +297,19 @@ def _fold_continuations(cmd: str) -> str:
             continue
         if not in_comment:
             if c == "(":
-                paren_forms.append(prev in _WORD_PAREN_PREFIXES)
-            elif c == ")" and paren_forms and paren_forms.pop():
-                out.append(c)
-                at_word_start = False  # closes an expansion, so still inside a word
-                prev = c
-                i += 1
-                continue
+                paren_forms.append((prev in _WORD_PAREN_PREFIXES, None))
+            elif c == ")" and paren_forms:
+                word_form, saved_quote = paren_forms.pop()
+                if word_form:
+                    if saved_quote is not None:
+                        # This `$(` was opened inside a double quote; the outer
+                        # quote resumes at its matching `)`.
+                        quote = saved_quote
+                    out.append(c)
+                    at_word_start = False  # closes an expansion, so still inside a word
+                    prev = c
+                    i += 1
+                    continue
         if c == "\n":
             in_comment = False  # a comment ends at the newline, never past it
         out.append(c)
