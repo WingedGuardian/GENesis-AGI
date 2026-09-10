@@ -38,10 +38,21 @@ right-sizes from a small VPS to a large workstation:
   ships `auto` or nothing).
 - `/etc/systemd/oomd.conf.d/genesis.conf` — swap-use limit 90%, default
   pressure limit 60%, 20s duration.
-- `genesis-server.service` carries `ManagedOOMPreference=avoid` (plus the
-  kernel-side `OOMScoreAdjust=-500`), so oomd prefers killing the greedy
-  session tree over the cognitive core. `avoid` is honored by the per-user
-  monitor (same-UID cgroup ownership) — see systemd.resource-control(5).
+- `genesis-server.service` carries `ManagedOOMPreference=avoid`, so oomd prefers
+  killing the greedy session tree over the cognitive core. `avoid` is honored by
+  the per-user monitor (same-UID cgroup ownership) — see
+  systemd.resource-control(5).
+- Its kernel-side `OOMScoreAdjust` is **`100`, not a negative value**, and that
+  is a constraint rather than a preference. A user manager cannot lower
+  `oom_score_adj` below the `oom_score_adj_min` of 0 it inherits from init;
+  doing so needs `CAP_SYS_RESOURCE`, which the manager does not hold, and the
+  write fails **silently**. MEASURED 2026-09-08: the unit declared `-500` while
+  the live process ran at `100`, and had since the line was written. Raising
+  always works, lowering never does — so the kill order is built by pushing
+  sacrificial processes UP (CC subprocesses to 500), never by protecting the
+  server DOWN. Deleting the declaration would be worse than a wrong value:
+  unset units report systemd's default of **200**, which is more killable than
+  100.
 
 Graceful degradation: no systemd, no `systemd-oomd`, no kernel PSI, or no
 non-interactive sudo each produce a one-line skip note, never a failure.
@@ -193,7 +204,11 @@ tune anything:
   and was killed by the kernel within ~2 minutes (`memory.events` `oom_kill`
   is the counter to check — inside a container you cannot see the host's
   dmesg, and `journalctl -u systemd-oomd` staying empty does NOT mean nothing
-  fired). `genesis-server` survived on `OOMScoreAdjust=-500`.
+  fired). `genesis-server` survived that episode — but NOT because of
+  `OOMScoreAdjust=-500`, which this note originally credited. That value never
+  applied (see above); the server was running at an effective `100` throughout,
+  which still outranked the session tree the kernel chose instead. The outcome
+  was right; the stated reason was not.
 - **systemd-oomd thresholds against the *full* PSI metric** — the fraction of
   time ALL tasks in the cgroup were stalled simultaneously (see
   systemd.oomd(5)) — not the `some` line most dashboards show. A single

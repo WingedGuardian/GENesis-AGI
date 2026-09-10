@@ -48,10 +48,18 @@ logger = logging.getLogger(__name__)
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
     """Set OOM score adjustment for a process.
 
-    Higher scores make the process more likely to be OOM-killed.
-    CC subprocesses get +500 so the kernel kills them before genesis-server
-    (-500) or qdrant. This is the container-side complement to the
-    host VM's cgroup OOM scoring.
+    Higher scores make the process more likely to be OOM-killed. CC subprocesses
+    get +500 so the kernel kills them before genesis-server or qdrant. This is
+    the container-side complement to the host VM's cgroup OOM scoring.
+
+    This docstring used to say genesis-server sits at ``-500``. It never did.
+    MEASURED 2026-09-08: the unit declared ``-500`` while the live process ran at
+    ``100``, because a user manager cannot lower oom_score_adj below the inherited
+    ``oom_score_adj_min`` of 0 without CAP_SYS_RESOURCE — the write fails silently.
+    The unit now declares an achievable ``100``. Only the direction this function
+    uses is actually available to us: RAISING needs no privilege, LOWERING is
+    always refused, so every rung of the kill order has to be built by pushing
+    sacrificial processes UP rather than protecting important ones DOWN.
     """
     try:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
@@ -1200,10 +1208,12 @@ class CCInvoker:
         result_data: dict | None = None
         collected_text: list[str] = []
         event_types: list[str] = []
+        tools_seen: list[str] = []
         rate_limit_raw: dict | None = None
         timed_out = False
         terminated_after_result = False
         line_count = 0
+        multi_block_seen = False
 
         try:
             async with asyncio.timeout(invocation.timeout_s):
@@ -1226,6 +1236,35 @@ class CCInvoker:
                         rate_limit_raw = event_raw
                     logger.debug("CC stream event #%d: type=%s", line_count, etype)
 
+                    # `StreamEvent.from_raw` keeps only the FIRST recognized
+                    # content block, which is lossless only while CC emits one
+                    # block per line. MEASURED 2026-09-04 against CC 2.1.246 on
+                    # this exact surface (`claude -p --output-format stream-json
+                    # --verbose`, two probes): 8/8 assistant lines carried
+                    # exactly one block, 0 multi-block — including a
+                    # thinking→text→tool_use turn and three PARALLEL tool calls,
+                    # which the API packs into a single message and the CLI split
+                    # across three lines. The version matters: this is a property
+                    # of a CLI build, not of the protocol.
+                    #
+                    # So this RECORDS the assumption rather than defending
+                    # against it — it is a log line, and nothing polls it. It
+                    # earns its keep by making a future batching CC diagnosable
+                    # in one grep instead of a week of missing tool calls.
+                    # Invocation-scoped on purpose: cross-invocation de-dup
+                    # belongs to the log aggregator, and one line per affected
+                    # turn is what tells you WHICH turns were lossy.
+                    if etype == "assistant" and not multi_block_seen:
+                        n_blocks = StreamEvent.recognized_blocks(event_raw)
+                        if n_blocks > 1:
+                            multi_block_seen = True
+                            logger.warning(
+                                "CC assistant line carried %d recognized content "
+                                "blocks — StreamEvent.from_raw keeps only the "
+                                "first; tool calls and answer text may be dropped",
+                                n_blocks,
+                            )
+
                     event = StreamEvent.from_raw(event_raw)
 
                     # Log CC version from init event (pure observability)
@@ -1235,6 +1274,27 @@ class CCInvoker:
 
                     if event.event_type == "text" and event.text:
                         collected_text.append(event.text)
+                    if etype == "assistant":
+                        # Read off the RAW content array, not the parsed
+                        # StreamEvent: `from_raw` returns ONE event per message
+                        # and stops at the first recognised block, so a message
+                        # shaped `thinking + text + tool_use` parses as "text"
+                        # and drops the tool name entirely. MEASURED on this
+                        # install's own transcripts: 13 of 8655 assistant
+                        # messages carrying a tool_use (0.15%) have it in a
+                        # non-first position. Rare, but the failure is
+                        # asymmetric — if OTHER tools were captured the list is
+                        # marked runtime-sourced and rendered as authoritative
+                        # while silently incomplete, which is the exact grammar
+                        # this change exists to remove.
+                        for block in event_raw.get("message", {}).get("content", []) or []:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name")
+                            # First-seen order, deduplicated — the same shape
+                            # the text-scraping fallback produces.
+                            if name and name not in tools_seen:
+                                tools_seen.append(name)
                     if event.event_type == "result":
                         result_data = event_raw
                         result_text = event_raw.get("result", "")
@@ -1353,6 +1413,11 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            # Unconditional: () is now a real report ("the runtime watched and
+            # saw no tool_use"), distinct from None ("nothing watched"). A
+            # `if tools_seen:` guard here would silently downgrade the former
+            # to the latter on every tool-free streaming turn.
+            output = replace(output, tools_used=tuple(tools_seen))
             # When CC uses extended thinking, the result field can be empty
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
@@ -1419,6 +1484,7 @@ class CCInvoker:
             model_requested=str(invocation.model),
             via_proxy=bool(invocation.anthropic_base_url),
             bg_truncated=bg_truncated,
+            tools_used=tuple(tools_seen),
         )
         if bg_truncated:
             await _emit_bg_truncation_event(output.session_id)
