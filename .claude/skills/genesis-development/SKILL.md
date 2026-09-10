@@ -1501,6 +1501,27 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   then at the third (escalation cap, `# escalation-ack`). Both call `_deny`, so
   the first stop arrives one round earlier than "the cap" suggests — see the
   two-tier table below. Switch to enumeration BEFORE the gate has to say so.
+- **Findings that RISE round over round mean the diff is DIVERGING — minimise,
+  don't patch.** The bullet above says stop when two consecutive rounds each find
+  NEW defects; this is the same signal with a trigger you can check mechanically:
+  round N+1 returns MORE findings than round N. Two responses, in preference
+  order — (1) REVERT to the smallest correct diff, or (2) SPLIT into separate PRs,
+  one concern each. Patching again is the move that fails: each fix enlarges the
+  diff, and the enlarged diff is what the next round reviews, so the loop
+  terminates by a DECISION, never by exhaustion.
+  MEASURED 2026-09-10 on PR #1831: insertions 731 → 827 → 1193 → 1372, findings
+  round 1 = 2 → round 2 = 4, and round 2's findings were entirely about round 1's
+  own additions. Every one was a genuine live bug — the fixes were correct AND
+  they were manufacturing the next round's findings, which is why the owner chose
+  SPLITTING there: a plain revert would have discarded correct work.
+  The discriminator is the finding-count TREND, not the growth itself — same
+  session, PR #1793 grew 85 → 139 → 209 insertions with findings 3 → 2, and
+  converged. Queue-scale support for the mechanism: 86% of PRs over 1,000 lines
+  reach 3+ Codex rounds against 6% of PRs under 200 (n=196 merged PRs, 14-day
+  window); size drives rounds, and each round past the cap spends a maintainer
+  decision. **The limit, honestly:** that size→rounds relation is strong at
+  n=196, but the rising-findings trigger itself rests on one clear instance and
+  one clear counter-instance. Act on it as a signal; it is not a law.
 - **Interrogate every MECHANISM you introduce along six axes BEFORE the first
   review — original code and fixes alike.** The two bullets above enumerate the
   class of a DEFECT, reactively, once a reviewer names one. This one is about the
