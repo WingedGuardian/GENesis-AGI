@@ -1524,9 +1524,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
-  A PR touching the enforcement-hook surface (the guard code itself) gets no
-  stale-review leniency: the merge gate (1) never classifies its post-review delta as
-  "review-trivial", and (2) refuses `# stale-review-override` — regardless of Codex
+  A PR touching the enforcement-hook surface (the guard code itself) gets almost no
+  stale-review leniency: the merge gate (1) never classifies a post-review delta that
+  TOUCHES that surface as "review-trivial" — the test is on the DELTA's files, not the
+  PR's, so a docs-only follow-up commit on such a PR can still be trivial (see the
+  budgeting note further down, which measures exactly this) — and (2) refuses
+  `# stale-review-override` — regardless of Codex
   head-freshness — unless recorded fallback-review evidence exists for the EXACT
   base+head (`~/.genesis/override_review_evidence/<repo>__<pr>__<base12>__<sha>.txt`).
   A current at-head Codex review does NOT substitute for that evidence: the same sigil
@@ -1589,9 +1592,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
   user-level config, not here.
   **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
-  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
-  is not, and neither is `--check-pr` reporting no review, which says the same thing
-  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  reply. An explicit usage-limits comment is the STRONGEST evidence available — but it
+  is not proof, and treating it as proof is how an alternate-reviewer approval gets
+  spent on a Codex that was never down. The two channels are INDEPENDENT: a
+  usage-limits ISSUE comment can sit there while a later trigger delivers real INLINE
+  findings (MEASURED on #1484 — see the inline-findings section below). So: re-trigger,
+  let time pass, and check the INLINE endpoint before concluding unavailable.
+  Everything weaker is not evidence at all — silence is not, and neither is
+  `--check-pr` reporting no review, which says the same thing whether the reviewer is
+  down or was simply never triggered at this head. Nor is a
   `codex exec` quota error: that is a separate surface on separate quota.
   Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
   **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
@@ -2299,18 +2308,19 @@ Route every finding by ONE question — **does the PR work without this fixed?**
 - **Yes, the PR works** → **file a GitHub issue and merge the PR.** Do not grow
   the diff, do not open a discussion, do not park it in a reply and move on.
 
-**Standing approval to file, for this class only.** The user has granted
-blanket, ongoing approval to open GitHub issues for adjacent non-blocking bugs
-discovered during review. Do NOT ask per instance — asking each time was the
-friction this rule removes. That standing approval is scoped to exactly this
-case: an adjacent, non-blocking, already-existing defect found while reviewing.
-Every other public post still needs explicit per-instance approval.
+**No per-instance approval to file.** Do NOT ask — asking each time was the
+friction this rule removes, and the owner relaxed the general rule on
+2026-09-09 after reading what actually got filed. The gate on a public post is
+now WHAT GOES IN IT, not permission: scrub anything personal or identifying —
+names, hosts, IPs, paths embedding a username, anything about the user's
+real-world life — so the issue carries technical detail only. Borderline, in
+either direction? Ask. See CLAUDE.md, "Where deferred work goes".
 
 **The exception that is NEVER waived: a security defect is not filed publicly
 before it is fixed.** An unpatched bypass, a credential exposure, anything
 exploitable — that goes to a private record under `~/.genesis/output/` plus a
-`follow_up_create` row, and nothing about it reaches a public surface, this
-standing approval included. If a finding is both adjacent and a live bypass,
+`follow_up_create` row, and nothing about it reaches a public surface — the
+relaxed filing rule above does not touch this one. If a finding is both adjacent and a live bypass,
 the security rule wins.
 
 Write the issue while the context is in your head — the measurement, the
