@@ -96,24 +96,44 @@ def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None
 _FAKE_CONTAINER_BYTES = 32 * 1024**3  # 32 GiB — big enough that the target wins
 
 
-def _fake_cgroup_limit(tmp_path: Path, total_bytes: int = _FAKE_CONTAINER_BYTES) -> Path:
-    """A stand-in for /sys/fs/cgroup/memory.max.
+def _fake_cgroup_tree(tmp_path: Path, *levels: int) -> tuple[Path, Path]:
+    """Build a fake cgroup v2 tree and return ``(root, self_cgroup_file)``.
 
-    Required for determinism, not convenience. The cap is now derived as
-    min(measured target, a fraction of the container, container - reserve), so a
-    bare assertion of "4096M" silently depends on the size of whatever machine
-    runs the suite: on a container below ~6.8 GiB production correctly derives
-    LESS, and the test would fail while the code was right. Pinning the input is
-    what makes these cells environment-independent, which the module docstring
-    already claims of the rest of the file.
+    ``levels`` are memory.max byte values from the ROOT downward; 0 means "max"
+    (uncapped) at that level. The leaf is the deepest level, which is what
+    /proc/self/cgroup points at.
+
+    A TREE, not a single file, because the cap is derived by walking this
+    process's whole cgroup chain and taking the smallest finite limit — nested
+    v2 limits only restrict further, so a constrained ANCESTOR binds before the
+    root. Pinning only the root could not express that case at all.
+
+    Named by the level values: a single shared path collides, because _run_entry
+    builds its default env AFTER a test has written its own smaller tree and
+    would silently overwrite it — the test would then exercise the default while
+    believing it had set something else.
     """
-    # Named by SIZE. A single shared filename collides: _run_entry builds its
-    # default env (writing the 32 GiB value) AFTER a test has written its own
-    # smaller one, silently overwriting it — so the test would exercise 32 GiB
-    # while believing it had set 4 GiB, and pass or fail for the wrong reason.
-    p = tmp_path / f"fake_memory_max_{total_bytes}"
-    p.write_text(f"{total_bytes}\n", encoding="utf-8")
-    return p
+    tag = "-".join(str(x) for x in levels) or "default"
+    root = tmp_path / f"cg-{tag}"
+    rel_parts = [f"level{i}" for i in range(1, len(levels))]
+    d = root
+    for i, val in enumerate(levels):
+        if i:
+            d = d / rel_parts[i - 1]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "memory.max").write_text(f"{val}\n" if val else "max\n", encoding="utf-8")
+    selfcg = tmp_path / f"selfcgroup-{tag}"
+    selfcg.write_text("0::/" + "/".join(rel_parts) + "\n", encoding="utf-8")
+    return root, selfcg
+
+
+def _fake_cgroup_env(tmp_path: Path, *levels: int) -> dict[str, str]:
+    """The two env vars pinning cap derivation to a fake tree."""
+    root, selfcg = _fake_cgroup_tree(tmp_path, *(levels or (_FAKE_CONTAINER_BYTES,)))
+    return {
+        "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+        "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+    }
 
 
 def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
@@ -121,9 +141,9 @@ def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
         "PATH": path,
         "HOME": str(tmp_path),
         "GENESIS_HOME": str(tmp_path / ".genesis"),
-        # Pin the container limit so cap derivation is deterministic; individual
+        # Pin the cgroup chain so cap derivation is deterministic; individual
         # tests override it to exercise the bound.
-        "CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(_fake_cgroup_limit(tmp_path)),
+        **_fake_cgroup_env(tmp_path),
         # Fast, never-pausing watchdog by default so a fast fake tool doesn't
         # idle on the real 15s sample gap; watchdog tests override these.
         "CODE_INTEL_WATCHDOG_INTERVAL": "1",
@@ -642,10 +662,9 @@ def test_cap_leaves_a_reserve_on_a_small_container(tmp_path):
     _fake_tools(fakebin, log)
     _fake_systemd_run(fakebin, slog, probe_ok=True)
     repo = _make_repo(tmp_path)
-    limit = _fake_cgroup_limit(tmp_path, 4 * 1024**3)
     res = _run_entry(
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-        env_extra={"CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(limit)},
+        env_extra=_fake_cgroup_env(tmp_path, 4 * 1024**3),
     )
     assert res.returncode == 0, res.stderr
     assert "MemoryMax=2048M" in slog.read_text(), slog.read_text()
@@ -664,10 +683,9 @@ def test_cap_never_emits_a_nonpositive_value(tmp_path):
     _fake_tools(fakebin, log)
     _fake_systemd_run(fakebin, slog, probe_ok=True)
     repo = _make_repo(tmp_path)
-    limit = _fake_cgroup_limit(tmp_path, 1 * 1024**3)
     res = _run_entry(
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-        env_extra={"CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(limit)},
+        env_extra=_fake_cgroup_env(tmp_path, 1 * 1024**3),
     )
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
@@ -688,10 +706,9 @@ def test_cap_is_derived_without_depending_on_PATH(tmp_path):
     log = tmp_path / "tools.log"
     _fake_tools(minbin, log)
     repo = _make_repo(tmp_path)
-    limit = _fake_cgroup_limit(tmp_path, 4 * 1024**3)
     res = _run_entry(
         tmp_path, repo, "cbm", path=str(minbin),
-        env_extra={"CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(limit)},
+        env_extra=_fake_cgroup_env(tmp_path, 4 * 1024**3),
     )
     assert res.returncode == 0, res.stderr
     # 2048M in KB — the BOUNDED value, proving the read succeeded without `cat`.
@@ -854,28 +871,68 @@ def test_triggers_enqueue_markers_and_do_not_spawn():
 # install at 4 GiB) — a cap equal to the whole container isolates nothing.
 
 
-def _derive_mem_max(limit_bytes: str | None, tmp_path) -> str:
-    """Run the script's own _derive_mem_max against a faked cgroup limit.
+def _derive_mem_max(limit_bytes: str | None, tmp_path, *ancestors: str) -> str:
+    """Run the script's own _derive_mem_max against a faked cgroup chain.
 
     Sources the real function rather than restating its arithmetic — a test that
     reimplements the code under test passes while production stays broken.
+
+    ``limit_bytes`` is the ROOT level; ``ancestors`` are further levels below it,
+    innermost last, so a constrained intermediate slice can be expressed. ``None``
+    at the root means the file is absent entirely.
     """
     src = _ENTRYPOINT.read_text()
     start = src.index("_CI_MEM_TARGET_MB=")
     end = src.index("MEM_MAX=", start)
     body = src[start:end]
-    fake_cgroup = tmp_path / "cg"
-    fake_cgroup.mkdir(exist_ok=True)
+
+    root = tmp_path / "cg"
+    root.mkdir(exist_ok=True)
     if limit_bytes is not None:
-        (fake_cgroup / "memory.max").write_text(limit_bytes)
-    # Point the function's first candidate path at the fake.
-    body = body.replace("/sys/fs/cgroup/memory.max", str(fake_cgroup / "memory.max"))
-    body = body.replace("/sys/fs/cgroup/memory/memory.limit_in_bytes", str(fake_cgroup / "nope"))
+        (root / "memory.max").write_text(limit_bytes)
+    d, rel = root, []
+    for i, val in enumerate(ancestors, 1):
+        d = d / f"level{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "memory.max").write_text(val)
+        rel.append(f"level{i}")
+    selfcg = tmp_path / "selfcg"
+    selfcg.write_text("0::/" + "/".join(rel) + "\n")
+
     res = subprocess.run(
-        ["bash", "-c", body + "\n_derive_mem_max"], capture_output=True, text=True, timeout=30
+        ["bash", "-c", body + "\n_derive_mem_max"],
+        capture_output=True, text=True, timeout=30,
+        env={
+            "PATH": _SYSTEM_PATH,
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+        },
     )
     assert res.returncode == 0, res.stderr
     return res.stdout.strip()
+
+
+def test_cap_is_bounded_by_the_smallest_finite_limit_on_the_chain():
+    """A constrained ANCESTOR binds before the container root does.
+
+    cgroup v2 nested limits only restrict further and are enforced across the
+    subtree, so a 3 GiB user slice inside a 32 GiB container is the real ceiling.
+    Reading only /sys/fs/cgroup/memory.max derived 4096M for a scope that could
+    never fire before its own slice OOMed — strictly worse than the 2 GiB scope it
+    replaced, which at least isolated. This repo already walks the chain the same
+    way for pids.max (_collect_pid_budget in observability/snapshots/infrastructure).
+    """
+    import tempfile
+    gib = 1024 * 1024 * 1024
+    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as td:
+        # Root is generous; an intermediate slice is not. 3 GiB - 2 GiB reserve.
+        assert _derive_mem_max(str(32 * gib), Path(td), str(3 * gib)) == "1024M"
+    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as td:
+        # An uncapped intermediate level must not mask the root's real limit.
+        assert _derive_mem_max(str(4 * gib), Path(td), "max") == "2048M"
+    with tempfile.TemporaryDirectory(dir="/home/ubuntu/tmp") as td:
+        # Deepest level binding, several levels down.
+        assert _derive_mem_max(str(32 * gib), Path(td), "max", str(5 * gib)) == "3072M"
 
 
 def test_cap_is_bounded_by_the_container_limit(tmp_path):

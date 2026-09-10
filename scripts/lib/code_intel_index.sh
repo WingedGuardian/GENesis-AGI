@@ -147,34 +147,87 @@ _derive_mem_max() {
     # exactly the constrained install the bound protects. A builtin cannot go
     # missing. Failure now `continue`s to the next candidate instead of breaking
     # out of the loop, so an unreadable v2 path still lets v1 be tried.
-    local limit_bytes="" f
-    for f in "${CODE_INTEL_FAKE_CGROUP_LIMIT_FILE:-/sys/fs/cgroup/memory.max}" \
-             /sys/fs/cgroup/memory/memory.limit_in_bytes; do
-        [ -r "$f" ] || continue
-        # Do NOT gate on read's exit status: `read` returns non-zero at EOF when
-        # the file has no trailing newline, even though it HAS set the variable.
-        # Gating on it made a newline-less memory.max look unreadable and fall
-        # through to the unbounded target — the exact fail-open this bound
-        # exists to prevent. The value being non-empty is the real success test.
-        read -r limit_bytes < "$f" 2>/dev/null || true
-        [ -n "$limit_bytes" ] && break
-        limit_bytes=""
+    # Walk THIS PROCESS'S OWN cgroup chain and take the SMALLEST finite limit on
+    # it — not just the container root. cgroup v2 nested limits only restrict
+    # further and are enforced across the subtree, so a constrained ANCESTOR binds
+    # before the root does: a 3 GiB user slice inside a 32 GiB container would
+    # otherwise derive 4096M for a scope that can never fire before its own slice
+    # OOMs, taking the server or a session with it — strictly worse than the 2 GiB
+    # scope this replaces, which at least isolated. Reading only
+    # /sys/fs/cgroup/memory.max was that blind spot.
+    #
+    # This repo already documents the identical hierarchical rule and walks the
+    # chain for pids.max: see _collect_pid_budget in
+    # src/genesis/observability/snapshots/infrastructure.py. Same reasoning, same
+    # shape, different controller.
+    local root="${CODE_INTEL_FAKE_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local selfcg="${CODE_INTEL_FAKE_CGROUP_SELF:-/proc/self/cgroup}"
+
+    local rel="" line
+    if [ -r "$selfcg" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                0::*) rel="${line#0::}" ; break ;;   # v2 has a single 0:: line
+            esac
+        done < "$selfcg" 2>/dev/null
+    fi
+    [ "$rel" = "/" ] && rel=""
+
+    local limit_mb="" dir="$root$rel"
+    while :; do
+        local f="$dir/memory.max" v=""
+        if [ -r "$f" ]; then
+            # Do NOT gate on read's exit status: `read` returns non-zero at EOF
+            # when the file has no trailing newline, even though it HAS set the
+            # variable. Gating on it made a newline-less memory.max look
+            # unreadable and fall through to the unbounded target — the exact
+            # fail-open this bound exists to prevent.
+            read -r v < "$f" 2>/dev/null || true
+            case "$v" in
+                '' | max | *[!0-9]*) : ;;   # uncapped or unparseable at this level
+                *)
+                    local mb=$(( v / 1024 / 1024 ))
+                    # Skip an implausibly huge "no limit" sentinel.
+                    if [ "$mb" -gt 0 ] && [ "$mb" -le 4194304 ]; then
+                        if [ -z "$limit_mb" ] || [ "$mb" -lt "$limit_mb" ]; then
+                            limit_mb=$mb
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+        [ "$dir" = "$root" ] && break
+        dir="${dir%/*}"
+        # Never step above the cgroup root, whatever /proc/self/cgroup claimed.
+        case "$dir" in
+            "$root"*) : ;;
+            *) break ;;
+        esac
     done
-    case "$limit_bytes" in
-        '' | max | *[!0-9]*)
-            printf '%sM\n' "$_CI_MEM_TARGET_MB"
-            return 0
-            ;;
-    esac
-    local limit_mb=$(( limit_bytes / 1024 / 1024 ))
-    # An implausibly huge v1 "no limit" sentinel behaves like uncapped.
-    if [ "$limit_mb" -le 0 ] || [ "$limit_mb" -gt 4194304 ]; then
+
+    # cgroup v1 fallback, only if the v2 walk found nothing at all.
+    if [ -z "$limit_mb" ]; then
+        local v1="$root/memory/memory.limit_in_bytes" v=""
+        if [ -r "$v1" ]; then
+            read -r v < "$v1" 2>/dev/null || true
+            case "$v" in
+                '' | max | *[!0-9]*) : ;;
+                *)
+                    local mb=$(( v / 1024 / 1024 ))
+                    [ "$mb" -gt 0 ] && [ "$mb" -le 4194304 ] && limit_mb=$mb
+                    ;;
+            esac
+        fi
+    fi
+
+    # Nothing finite anywhere on the branch → nothing bounds us, target stands.
+    if [ -z "$limit_mb" ]; then
         printf '%sM\n' "$_CI_MEM_TARGET_MB"
         return 0
     fi
 
-    # The cap is the SMALLEST of: the measured target, the container fraction,
-    # and whatever is left after the reserve.
+    # The cap is the SMALLEST of: the measured target, a fraction of the BINDING
+    # limit found on the chain above, and whatever is left after the reserve.
     local cap=$_CI_MEM_TARGET_MB
     local by_fraction=$(( limit_mb * _CI_MEM_CONTAINER_FRACTION / 100 ))
     [ "$by_fraction" -lt "$cap" ] && cap=$by_fraction
