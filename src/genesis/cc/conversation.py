@@ -31,6 +31,7 @@ from genesis.cc.types import (
     EffortLevel,
     StreamEvent,
     is_owner_attended_channel,
+    model_name_supports_effort,
     origin_delivery_supported,
     session_origin_for_channel,
     task_detected_origin,
@@ -133,16 +134,39 @@ def _session_control_block(
     """
     if not origin_delivery_supported(channel):
         return ""
+    # Haiku does not use --effort at all: `invoker._build_args` gates the flag on
+    # `model_supports_effort`, so a stored effort never reaches dispatch there —
+    # while `session_config` still writes the row and returns success. Stating an
+    # ACTIVE effort on Haiku would have the session confirm a change dispatch
+    # never saw, which is the same false self-belief this block exists to remove.
+    # An unrecognised (roster/provider) id resolves to effort-capable, so nothing
+    # is silently stripped of effort on a model we cannot classify.
+    if model_name_supports_effort(str(model)):
+        current = (
+            f"You are currently running model={model}, effort={effort}. "
+            "Neither is fixed for the conversation. "
+        )
+        asks = '("use opus", "switch to haiku", "think harder", "low effort")'
+    else:
+        current = (
+            f"You are currently running model={model}, which has no effort "
+            f"setting — a stored effort ({effort}) is inert until you switch "
+            "models. Your model is not fixed. "
+        )
+        # No effort examples here: on a model with no effort setting, "think
+        # harder" is not a switch this session can make.
+        asks = '("use opus", "switch to sonnet")'
     return (
         "\n\n## Changing your own model / effort\n"
-        f"You are currently running model={model}, effort={effort}. "
-        "These are NOT fixed for the conversation. When the user asks you to "
-        "switch (\"use opus\", \"switch to haiku\", \"think harder\", \"low effort\"), "
+        + current
+        + f"When the user asks you to switch {asks}, "
         f'call `mcp__genesis-health__session_config` with session_id="{session_id}" '
         "(not the shorter id in the [Clock | Session: x] tag). The change takes "
         "effect on your next response, so say what you switched to and continue. "
-        "You DO have this capability — never claim otherwise; if the tool returns "
-        "an error, report that error verbatim rather than hiding it."
+        "You DO have this capability when that tool is listed — do not refuse on "
+        "the belief that you cannot. If it is absent from this session, or "
+        "returns an error, report that verbatim rather than a change that did "
+        "not happen."
     )
 
 

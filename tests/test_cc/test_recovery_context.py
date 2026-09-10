@@ -227,8 +227,12 @@ class TestSessionControlBlock:
         a fabricated success."""
         block = self._block()
         assert "You DO have this capability" in block
-        assert "report that error verbatim" in block
+        assert "report that verbatim" in block
 
     def test_block_is_bounded(self):
-        """It rides every turn, so it must not crowd out real context."""
-        assert len(self._block()) < 700, len(self._block())
+        """It rides every turn, so it must not crowd out real context. Bounded on
+        EVERY branch: the no-effort (Haiku) wording is the longest one, so a bound
+        checked only on the default would not bind the branch most likely to grow."""
+        for model in ("sonnet", "opus", "haiku"):
+            block = self._block(model=model)
+            assert len(block) < 700, (model, len(block))

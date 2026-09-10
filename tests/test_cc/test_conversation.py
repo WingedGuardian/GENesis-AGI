@@ -802,6 +802,48 @@ async def test_session_control_reports_the_CURRENT_model_not_the_original(loop, 
     assert "effort=low" in captured["sp"], captured["sp"][:400]
 
 
+def test_session_control_states_no_active_effort_on_haiku():
+    """Haiku does not use --effort: `invoker._build_args` gates the flag on
+    `model_supports_effort`, so a stored effort never reaches dispatch. But
+    `session_config` writes the row and returns success anyway — so a block that
+    printed `effort=high` would have the session confirm a change dispatch never
+    saw, the exact false self-belief this block exists to remove."""
+    from genesis.cc.conversation import _session_control_block
+
+    block = _session_control_block(
+        ChannelType.TELEGRAM, CCModel.HAIKU, EffortLevel.HIGH, "sess-haiku",
+    )
+    assert "effort=high" not in block, block
+    assert "has no effort setting" in block, block
+    # "think harder" is not a switch this session can make, so it is not offered
+    # as an example on this branch.
+    assert "think harder" not in block, block
+    # The capability itself is still advertised — this narrows the claim, it
+    # does not withhold the tool.
+    assert "session_config" in block, block
+
+    # Control: an effort-capable tier still states its ACTIVE effort, so the
+    # assertion above is about Haiku and not about the sentence disappearing.
+    opus = _session_control_block(
+        ChannelType.TELEGRAM, CCModel.OPUS, EffortLevel.HIGH, "sess-opus",
+    )
+    assert "effort=high" in opus, opus
+
+
+def test_session_control_permits_reporting_an_absent_tool():
+    """An absent tool is not "the tool returned an error". When genesis-health
+    fails to start, `session_config` is simply not registered, and an absolute
+    "never claim otherwise" would compel a fabricated success in exactly the
+    session that can least deliver one."""
+    from genesis.cc.conversation import _session_control_block
+
+    block = _session_control_block(
+        ChannelType.TELEGRAM, CCModel.SONNET, EffortLevel.MEDIUM, "sess-abs",
+    )
+    assert "never claim otherwise" not in block, block
+    assert "absent from this session" in block, block
+
+
 @pytest.mark.asyncio
 async def test_session_control_withheld_on_terminal(loop, mock_invoker, db):
     """TERMINAL has Claude Code's own /model and /effort, and its resumed turns
