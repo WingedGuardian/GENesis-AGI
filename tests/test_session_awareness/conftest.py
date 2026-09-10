@@ -5,28 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-
 from genesis.session_awareness.statefiles import empty_state, save_state
-
-
-@pytest.fixture(autouse=True)
-def _reset_pr_verifications_table_cache():
-    """pr_verifications caches its table-existence check per DB path (TRUE only).
-
-    Every test in this package gets a fresh tmp DB, so a TRUE cached by one
-    test lies to the next: the verification lane would then attempt INSERTs on
-    a DB whose table was never created, the lane's own try/except would eat the
-    error, and a "verification_lane_failed" note would leak into unrelated
-    tests' run details — a state-leak masking failure (vacuous-test cause #6),
-    invisible until a detail assertion happens to collide. Reset on BOTH sides:
-    before, so this test starts honest; after, so test ORDER cannot matter.
-    """
-    from genesis.db.crud import pr_verifications as verif_crud
-
-    verif_crud._tables_verified.clear()
-    yield
-    verif_crud._tables_verified.clear()
 
 DIM = 8
 

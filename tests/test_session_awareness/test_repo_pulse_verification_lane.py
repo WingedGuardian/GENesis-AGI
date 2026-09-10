@@ -571,3 +571,37 @@ async def test_a_watermark_from_another_repository_is_discarded(
     assert [r["pr_number"] for r in await _rows(db_path)] == [82], (
         "a PR older than ANOTHER repo's watermark must still be recorded here"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_newer_foreign_watermark_is_not_carried_forward(
+    pulse_root, db_path, monkeypatch
+):
+    """VERIFY-RED: the reset on the READ side is defeated by a monotonic write.
+
+    The stored watermark is a (repo, timestamp) pair, so both halves must agree
+    about identity. Resetting the reader while `_write_cursor` still took
+    `max(prior, new)` carried a FOREIGN repository's timestamp forward whenever
+    it happened to be newer — which is exactly what the reset exists to prevent
+    (CodeRabbit Major, PR #1836). Fixing one side of a pair is not fixing it.
+    """
+    rpw._atomic_write_json(
+        pulse_root / rpw.CURSOR_FILENAME,
+        {
+            "last_merged_at": None,
+            "last_run_ts": None,
+            "runs": 1,
+            # FUTURE relative to this run's PR, so a max() would keep it.
+            "verification_through": "2099-01-01T00:00:00Z",
+            "verification_repo": "someone/else",
+        },
+    )
+    out = await _run(
+        db_path, monkeypatch, gh=_gh([_pr(83)]), files=_files({83: {"files": ["src/a.py"]}})
+    )
+    assert out["status"] == "ok"
+    cursor = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
+    assert cursor["verification_through"] == MERGED, (
+        "the foreign repository's newer watermark must be DISCARDED, not max'd"
+    )
+    assert cursor["verification_repo"] == REPO

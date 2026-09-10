@@ -126,7 +126,17 @@ def effective_mode() -> str:
     off, never a silent absorb).
     """
     cfg = load_config()
-    if not knob_bool(cfg, "enabled"):
+    # `fallback=False` — the MASTER switch keeps its old fail direction, and
+    # this is the one knob where the module's "never a silent off" argument
+    # points the WRONG way. MEASURED: `load_config` does `merged.update(base)`,
+    # so a yaml key present with a falsy NON-bool value (bare `enabled:`,
+    # `enabled: ~`, `enabled: 0`, `enabled: ''`) overwrites the default. Before
+    # `knob_bool` those all produced mode `off`; taking DEFAULTS[key]=True would
+    # start the worker in LIVE mode — auto-absorbing ledger rows and completing
+    # follow-ups. That is a fail-OPEN widening of a write-authority switch,
+    # arriving as collateral of a refactor aimed at a different knob (audit,
+    # PR #1836). The warning still fires; only the direction changes.
+    if not knob_bool(cfg, "enabled", fallback=False):
         return "off"
     mode = cfg.get("mode")
     if mode is False:
@@ -148,7 +158,7 @@ def knob_int(cfg: dict[str, Any], key: str) -> int:
     return value
 
 
-def knob_bool(cfg: dict[str, Any], key: str) -> bool:
+def knob_bool(cfg: dict[str, Any], key: str, *, fallback: bool | None = None) -> bool:
     """Master-switch knob: a REAL bool, or the default plus a WARNING.
 
     The bare ``cfg.get(key, True)`` this replaces is a truthiness test, and the
@@ -165,15 +175,16 @@ def knob_bool(cfg: dict[str, Any], key: str) -> bool:
     value = cfg.get(key)
     if isinstance(value, bool):
         return value
+    default = DEFAULTS[key] if fallback is None else fallback
     if key in cfg:
         logger.warning(
             "repo_pulse %s is %r, not a boolean — using the default %r "
             "(quote-wrapped 'false'/'no'/'off' are truthy strings, not booleans)",
             key,
             value,
-            DEFAULTS[key],
+            default,
         )
-    return bool(DEFAULTS[key])
+    return bool(default)
 
 
 def knob_float01(cfg: dict[str, Any], key: str) -> float:

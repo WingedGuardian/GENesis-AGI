@@ -14,7 +14,6 @@ version: follow_ups' readers (ego dispatch, morning report) surface rows as
 actionable work, and these are a ledger, not work.
 
 Subprocess writers do NOT run migrations, so writers guard on table existence
-(cached per DB path, TRUE result only — the repo_pulse/capability_shadow
 pattern) and no-op pre-migration. The migration + ``schema/_tables.py`` are
 the schema authority; nothing here creates tables. ``now`` is always injected
 (never wall-clock here) so behaviour is deterministic and testable.
@@ -38,38 +37,31 @@ STATUSES = ("open", "closed")
 # an OperationalError inside the lane's try/except — a silent incomplete run.
 # Today's entry points touch one DB per process, so this is prophylactic; it
 # costs one dict lookup and removes a trap rather than documenting it.
-_tables_verified: set[str] = set()
-
-
-def _db_key(db: aiosqlite.Connection) -> str | None:
-    """The database's PATH, or None when it cannot be determined.
-
-    None means DO NOT CACHE, and that is the whole point. An earlier version
-    fell back to ``id(db)`` with a comment claiming it "degrades to cache
-    nothing" — it does the opposite. ``id`` is a perfectly good dict key, and
-    CPython REUSES the id of a closed object, so a later connection to a
-    DIFFERENT database can land on the same key and be told the tables are
-    present without ever consulting ``sqlite_master``. The promised no-op path
-    then raises `no such table` instead (Codex P2, PR #1836). Caching nothing
-    costs one `sqlite_master` query per call on an unrecognised connection
-    shape; caching wrongly costs correctness in a multi-database process.
-    """
-    path = getattr(db, "_conn_path", None) or getattr(db, "_path", None)
-    return str(path) if path else None
 
 
 async def _tables_available(db: aiosqlite.Connection) -> bool:
-    key = _db_key(db)
-    if key is not None and key in _tables_verified:
-        return True
+    """Does the table exist? Asked EVERY time, deliberately uncached.
+
+    There was a per-path cache here and it never populated: `_db_key` read
+    `_conn_path` / `_path` off the connection, and MEASURED against the
+    installed aiosqlite (0.22.1) neither attribute exists — so the key was
+    always None, nothing was ever added, and the module docstring's claim of a
+    cache was false in every execution (audit, PR #1836). The version before
+    that fell back to `id(db)`, which DID cache and was worse: CPython reuses
+    the id of a closed object, so a later connection to a DIFFERENT database
+    could be told the tables were present without consulting `sqlite_master`.
+
+    Rather than key it on something that works, the mechanism is gone. It was
+    never load-bearing — it saved one `sqlite_master` COUNT on a short-lived
+    worker connection — and a cache that has demonstrably been wrong in both of
+    its implementations is not worth a third attempt. Correctness is unchanged:
+    both prior versions failed toward always checking, which is what this does.
+    """
     cursor = await db.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'pr_verifications'"
     )
     row = await cursor.fetchone()
-    exists = bool(row and row[0] == 1)
-    if exists and key is not None:
-        _tables_verified.add(key)
-    return exists
+    return bool(row and row[0] == 1)
 
 
 async def tables_available(db: aiosqlite.Connection) -> bool:
