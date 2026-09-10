@@ -833,7 +833,11 @@ async def memory_store(
     actually happened — because it can fail on its own while the store
     succeeds, and reporting only the id is what let that failure go unnoticed.
     A partially-applied supersede adds ``partial`` naming the steps that did
-    not land.
+    not land; ``partial`` containing ``supersede_failed`` means it did not land
+    AT ALL (an unexpected database error), and ``superseded`` is False there.
+    ``reason`` names why, and the ``warning`` gives advice that fits that
+    reason — the retry that works for an unresolvable handle does not work for
+    a self-supersede or a deprecated successor.
 
     This tool is also reachable over HTTP as ``POST /api/t/memory_store``
     (``dashboard/routes/tool_api.py``), which accepts ``supersedes`` like any
@@ -865,7 +869,7 @@ async def memory_store(
     # external-influenced session's writes stop landing first_party via the
     # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
     from genesis.memory.provenance import session_origin_from_env
-    from genesis.memory.store import SupersedeUnresolved
+    from genesis.memory.store import SUPERSEDE_FAILED, SupersedeUnresolved
 
     # Collector for steps that failed AFTER the SQLite deprecation landed. The
     # Qdrant payload write and the link create are best-effort and swallow
@@ -894,6 +898,35 @@ async def memory_store(
         # The memory IS durable; only the deprecation failed. Report both
         # halves rather than raising — an exception here reads as "the store
         # failed" and invites the retry that duplicates the memory.
+        #
+        # The advice is REASON-SPECIFIC. "Re-send with a full 36-char id" is
+        # the fix for a handle that named nothing or named several; it is the
+        # wrong instruction for the two successor-validation reasons, where the
+        # target id was fine and re-sending the same content reproduces the
+        # same collision. Handing a caller an instruction that cannot work is
+        # how the original defect kept its retry loop going.
+        if exc.reason == "self_supersede":
+            advice = (
+                "The content you sent is byte-identical to the memory you asked "
+                "to supersede, so the correction and its target are the SAME "
+                "memory, and a memory cannot replace itself. Nothing was "
+                "deprecated. Send the CORRECTED content, or name the memory you "
+                "actually meant to deprecate."
+            )
+        elif exc.reason == "successor_deprecated":
+            advice = (
+                f"The content you sent already exists as memory "
+                f"{exc.stored_memory_id}, which is itself DEPRECATED and so is "
+                "filtered out of normal recall — it cannot carry the correction. "
+                "Nothing was deprecated. Send the correction as new content."
+            )
+        else:
+            advice = (
+                "Re-run memory_store with the SAME content and a full 36-char "
+                "memory id: the content will not be duplicated, and the "
+                "supersede will be applied to the memory that already landed. "
+                "There is no standalone supersede tool."
+            )
         return {
             "memory_id": exc.stored_memory_id,
             "superseded": False,
@@ -904,10 +937,7 @@ async def memory_store(
             "warning": (
                 f"The memory WAS stored ({exc.stored_memory_id}). The supersede "
                 f"did NOT happen: {supersedes!r} is {exc.reason}. The old memory "
-                "is still live in recall. Re-run memory_store with the SAME "
-                "content and a full 36-char memory id: the content will not be "
-                "duplicated, and the supersede will be applied to the memory "
-                "that already landed. There is no standalone supersede tool."
+                f"is still live in recall. {advice}"
             ),
         }
 
@@ -920,15 +950,31 @@ async def memory_store(
         "supersedes_requested": supersedes,
     }
     if degraded:
-        # The deprecation landed in SQLite but a later step did not. Say which,
-        # rather than letting "superseded: True" stand for a partial outcome.
         report["partial"] = degraded
-        report["warning"] = (
-            "The SQLite deprecation applied, but these steps did NOT: "
-            + ", ".join(degraded)
-            + ". If 'qdrant_payload' is listed the old memory may still surface "
-            "in vector recall even though FTS now hides it."
-        )
+        if SUPERSEDE_FAILED in degraded:
+            # The supersede did not merely half-apply — it threw before or
+            # during the SQLite deprecation, so we do NOT know that anything
+            # landed and must not claim it did. `superseded` flips to False for
+            # the same reason SupersedeUnresolved reports False: the caller's
+            # next decision depends on whether the old memory is still live.
+            report["superseded"] = False
+            report["warning"] = (
+                f"The memory WAS stored ({memory_id}), but the supersede FAILED "
+                "with an unexpected error (see the server log for the "
+                "traceback). The old memory is probably still live in recall. "
+                "Do NOT re-send this as a new memory — re-run memory_store with "
+                "the SAME content and the same supersedes id; the content will "
+                "not be duplicated."
+            )
+        else:
+            # The deprecation landed in SQLite but a later step did not. Say
+            # which, rather than letting "superseded: True" stand for a partial.
+            report["warning"] = (
+                "The SQLite deprecation applied, but these steps did NOT: "
+                + ", ".join(degraded)
+                + ". If 'qdrant_payload' is listed the old memory may still "
+                "surface in vector recall even though FTS now hides it."
+            )
     return report
 
 

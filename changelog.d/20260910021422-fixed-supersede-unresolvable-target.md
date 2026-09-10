@@ -23,3 +23,14 @@
   target: that path returned early, so the retry above would have reported a
   supersede it never performed, and an unresolvable id on that same path would
   have stored a second copy of content that already existed.
+
+  Two further ways the same lie could arrive, both closed. The successor of a
+  supersede is now validated on the path where the caller did not choose it: a
+  memory cannot replace itself (re-sending unchanged content alongside a handle
+  for the memory holding it used to deprecate the only copy and record it as its
+  own correction), and a correction cannot land on an already-deprecated memory
+  (which would deprecate the target toward a successor recall filters out --
+  both halves gone, reported as done). And a supersede that fails outright with
+  an unexpected database error is now reported as failed rather than logged and
+  forgotten, with advice that fits the reason instead of a retry instruction
+  that cannot apply.

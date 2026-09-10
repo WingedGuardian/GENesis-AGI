@@ -2355,3 +2355,67 @@ async def test_memory_store_reports_a_partially_applied_supersede():
     assert result["memory_id"] == "new-id"
     assert result["partial"] == ["qdrant_payload"]
     assert "vector recall" in result["warning"]
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_does_not_report_success_for_a_failed_supersede():
+    """An outright supersede failure must not arrive as `superseded: True`.
+
+    The two `except Exception` handlers in ``store()`` catch anything that is
+    not ``SupersedeUnresolved`` — a SQLite fault in resolve_id, mark_superseded
+    or get_metadata — so the exception never reaches this layer. They logged and
+    left the out-param empty, and the unconditional `superseded: True` below
+    then told the caller a deprecation that provably had not run had landed.
+    The marker is what distinguishes "threw before the deprecation" from the
+    post-deprecation partials, which legitimately stay `superseded: True`.
+    """
+    from genesis.mcp.memory import core
+    from genesis.memory.store import SUPERSEDE_FAILED
+
+    async def _store_that_failed(*a, **kw):
+        kw["supersede_degraded"].append(SUPERSEDE_FAILED)
+        return "new-id"
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(side_effect=_store_that_failed)
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234-0000-4000-8000-000000000001"
+        )
+
+    assert result["memory_id"] == "new-id", "the content is still durable"
+    assert result["superseded"] is False, (
+        "reported a supersede that threw before touching SQLite as successful"
+    )
+    assert "FAILED" in result["warning"]
+    assert "not be duplicated" in result["warning"], "the retry must stay safe"
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_advice_fits_the_reason_it_reports():
+    """"Re-send with a full 36-char id" is the fix for a handle that named
+    nothing. For the successor-validation reasons the target id was FINE and
+    re-sending the same content reproduces the same collision, so that
+    instruction cannot work — and an uncompletable instruction is what kept the
+    original defect's retry loop running.
+    """
+    from genesis.mcp.memory import core
+    from genesis.memory.store import SupersedeUnresolved
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(
+            side_effect=SupersedeUnresolved("abcd1234", "self_supersede", "abcd1234-x")
+        )
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234"
+        )
+
+    assert result["superseded"] is False
+    assert result["reason"] == "self_supersede"
+    assert "cannot replace itself" in result["warning"]
+    assert "36-char" not in result["warning"], (
+        "handed back the not_found advice, which cannot resolve a self-supersede"
+    )
