@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config" / "autonomy.yaml"
 
+# Restart reasons persisted under an older name, normalised once on load.
+# ~/.genesis/watchdog_state.json survives upgrades, so a rename that stopped
+# matching the old entries would silently reset the flap counter for a full
+# flap_window (6h) — granting flap_threshold extra unrestrained restarts on a
+# service that is ALREADY flapping.
+#
+# Normalising on load rather than matching aliases at compare time keeps the
+# flap filter a plain equality, self-heals the persisted `last_reason` the
+# dashboard renders, and leaves no alias set that could be written without its
+# own current name (which would stop a reason matching its own go-forward
+# history). `restart_history` is pruned to flap_window_s on every write, so this
+# shim goes inert on its own within one window of the rename.
+_LEGACY_REASONS: dict[str, str] = {
+    # Renamed once the watchdog's target became genesis-server: `_detect_genesis_service`
+    # prefers genesis-server whenever that unit FILE is installed, so the old label
+    # named a unit this never monitors.
+    "bridge_inactive": "target_inactive",
+}
+
 
 class WatchdogChecker:
     """Stateless health checker — called by systemd timer or standalone script.
@@ -71,6 +90,7 @@ class WatchdogChecker:
         liveness_lag_suppress_ms: float = 1000.0,
         liveness_sample_stale_s: float = 120.0,
         liveness_max_starved_skips: int = 6,
+        max_bootstrap_grace_skips: int = 4,
         remediation_registry: RemediationRegistry | None = None,
         outreach_fn: OutreachFn | None = None,
     ) -> None:
@@ -92,6 +112,7 @@ class WatchdogChecker:
         self._liveness_lag_suppress_ms = liveness_lag_suppress_ms
         self._liveness_sample_stale_s = liveness_sample_stale_s
         self._liveness_max_starved_skips = liveness_max_starved_skips
+        self._max_bootstrap_grace_skips = max_bootstrap_grace_skips
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
         self._target_service = self._detect_target_service()
@@ -105,8 +126,10 @@ class WatchdogChecker:
         """Auto-detect which Genesis service to monitor.
 
         Reuses the canonical detector (``observability.service_status``): it
-        probes ``is-enabled`` then ``is-active`` for genesis-server, then the
-        legacy relay, and defaults to genesis-server. It never targets the
+        probes whether the genesis-server unit FILE is installed
+        (``list-unit-files``) and prefers it whenever it is — enabled or not,
+        running or not — falling back to the legacy relay only when that unit is
+        genuinely absent. It never targets the
         deprecated relay when genesis-server is present (the 2026-07-02 §7
         recovery bug: restarting an inactive unit "succeeds" but hides
         genesis-server crash loops) while still recovering a relay-only legacy
@@ -140,6 +163,7 @@ class WatchdogChecker:
                 liveness_lag_suppress_ms=wd.get("liveness_lag_suppress_ms", 1000.0),
                 liveness_sample_stale_s=wd.get("liveness_sample_stale_s", 120.0),
                 liveness_max_starved_skips=wd.get("liveness_max_starved_skips", 6),
+                max_bootstrap_grace_skips=wd.get("max_bootstrap_grace_skips", 4),
             )
         except (yaml.YAMLError, OSError, AttributeError):
             logger.warning("Failed to load watchdog config — using defaults", exc_info=True)
@@ -160,12 +184,18 @@ class WatchdogChecker:
         bridge_active = self._is_bridge_active()
         if bridge_active is False:
             if self._bridge_exited_unconfigured():
-                logger.info("Bridge exited unconfigured (exit 2) — skipping restart")
+                logger.info(
+                    "%s exited unconfigured (exit 2) — skipping restart",
+                    self._target_service,
+                )
                 return WatchdogAction.SKIP
-            logger.warning("Bridge service is not active — skipping staleness check, going to restart logic")
+            logger.warning(
+                "%s is not active — skipping staleness check, going to restart logic",
+                self._target_service,
+            )
             # Fall through to backoff/validation/restart below
             state = self._load_state()
-            return self._restart_if_allowed(state, reason="bridge_inactive")
+            return self._restart_if_allowed(state, reason="target_inactive")
 
         # 1. Read status.json
         status = self._read_status()
@@ -204,6 +234,42 @@ class WatchdogChecker:
                     )
                     return WatchdogAction.SKIP
 
+                # ...but `uptime_s` belongs to whichever process WROTE the
+                # file. When a restart lands while the previous status.json is
+                # still inside the freshness window, that file is retained: its
+                # `uptime_s` is the PRIOR runtime's (stamped from that
+                # process's own bootstrap — see resilience/status_writer.py's
+                # `_bootstrap_completed_at` arithmetic) and its scheduler
+                # heartbeats describe a runtime that no longer exists. A large
+                # `uptime_s` therefore cannot establish that THIS process is
+                # old, and the first tick after boot would restart a healthy,
+                # still-bootstrapping server — the same defect the stale branch
+                # below closes, reached through the fresh/zombie path instead.
+                # systemd's clock is the only reading tied to the CURRENT
+                # activation: a status file older than the unit's own uptime
+                # was written before the service started. (The comparison mixes
+                # a wall-clock age with a monotonic one; a wall-clock step can
+                # only inflate `staleness_s`, i.e. err toward suppressing, and
+                # the shared counter bounds that.)
+                service_uptime = self._service_uptime_s()
+                if (
+                    service_uptime is not None
+                    and staleness_s > service_uptime
+                    and self._grant_bootstrap_grace(
+                        service_uptime,
+                        context=(
+                            f"Zombie heartbeats ({', '.join(zombie)}) but the "
+                            f"status file ({staleness_s:.0f}s old) predates this "
+                            f"activation of {self._target_service} "
+                            f"({service_uptime:.0f}s ago), so they belong to the "
+                            f"previous process"
+                        ),
+                    )
+                ):
+                    return WatchdogAction.SKIP
+                # An exhausted / unpersisted grace falls through to the normal
+                # zombie-restart path below.
+
                 # Connectivity forgiveness (PR-2): a zombie scheduler during a
                 # network outage is surplus dispatch stalled on dead-network
                 # provider calls — a restart cannot fix an ISP outage (it just
@@ -226,14 +292,119 @@ class WatchdogChecker:
             self._reset_state()
             return WatchdogAction.SKIP  # Healthy — no action needed
 
+        # 3. Bootstrap grace: a file stale from BEFORE the service started says
+        # nothing about THIS process — after an outage the status.json predates
+        # the boot, so raw staleness is guaranteed huge while the server is
+        # still mid-bootstrap (2026-09-08: 22,583s-stale file, server 49s into
+        # a ~2min bootstrap, SIGKILLed on both boots that day). Service start
+        # is the freshness epoch: until the unit's own uptime exceeds the
+        # staleness threshold, the file cannot yet be expected fresh. A wedged
+        # (still-active) server restarts once its uptime crosses the threshold.
+        # A RESTARTING server is the hole: ActiveEnter resets on every
+        # activation, so a crash-loop that stays `active` at tick time would
+        # renew the grace forever — which is why the grace is bounded by an
+        # explicit skip counter (like every other suppression in this file),
+        # not by uptime alone. The counter clears with the rest of the state
+        # when a genuinely fresh status file appears (_reset_state), so a
+        # healthy bootstrap spends at most one skip. A failed probe suppresses
+        # nothing. The zombie branch above needs no equivalent — it only runs
+        # on a FRESH file, whose uptime_s field it already checks against
+        # stabilization_s.
+        service_uptime = self._service_uptime_s()
+        if (
+            service_uptime is not None
+            and service_uptime < self._staleness_threshold
+            and self._grant_bootstrap_grace(
+                service_uptime,
+                context=(
+                    f"Status file stale ({staleness_s:.0f}s) but "
+                    f"{self._target_service} started only {service_uptime:.0f}s "
+                    f"ago (< {self._staleness_threshold}s threshold)"
+                ),
+            )
+        ):
+            return WatchdogAction.SKIP
+        # An exhausted / unpersisted grace falls through to the normal
+        # stale-restart path below.
+
         logger.warning(
-            "Status file stale: %.0fs old (threshold %ds) — bridge may be down",
-            staleness_s, self._staleness_threshold,
+            "Status file stale: %.0fs old (threshold %ds) — %s may be down",
+            staleness_s, self._staleness_threshold, self._target_service,
         )
 
-        # 3. Stale — attempt restart via shared logic
+        # 4. Stale — attempt restart via shared logic
         state = self._load_state()
         return self._restart_if_allowed(state, reason="stale_status_restart")
+
+    def _grant_bootstrap_grace(self, service_uptime: float, *, context: str) -> bool:
+        """Consume one bounded bootstrap-grace slot. True ⇒ suppress this cycle.
+
+        Shared by the two branches that can be handed a status.json written
+        BEFORE the current activation: the stale branch (file older than the
+        staleness threshold) and the zombie branch (file still inside the
+        freshness window, but carrying the previous process's heartbeats and
+        `uptime_s`). They share ONE counter deliberately — a crash loop must
+        not get a fresh budget per branch, and the counter clears for both when
+        a genuinely fresh status file appears (``_reset_state``).
+
+        Returns False — do not suppress — in exactly two cases: the bound is
+        spent (logged + alerted once), or the incremented counter did not
+        persist. The second matters because an unwritable state file would
+        otherwise reload the old count on every oneshot invocation and re-grant
+        the same slot forever, which is precisely the unbounded grace the
+        counter exists to close.
+        """
+        state = self._load_state()
+        skips = self._coerce_counter(state.get("bootstrap_grace_skips")) + 1
+        if skips > self._max_bootstrap_grace_skips:
+            logger.error(
+                "Bootstrap grace exhausted (%d skips): %s keeps presenting a "
+                "young uptime without ever writing a fresh status file — "
+                "likely a restart loop; no longer suppressing. (%s)",
+                skips - 1, self._target_service, context,
+            )
+            self._alert_grace_exhausted(service_uptime, skips - 1)
+            return False
+
+        state["bootstrap_grace_skips"] = skips
+        if not self._save_state(state):
+            logger.error(
+                "Bootstrap grace NOT granted: skip counter could not be "
+                "persisted — falling through to normal handling. (%s)",
+                context,
+            )
+            return False
+
+        logger.info(
+            "%s — bootstrap grace %d/%d, skipping",
+            context, skips, self._max_bootstrap_grace_skips,
+        )
+        return True
+
+    def _service_uptime_s(self) -> float | None:
+        """Seconds since the target unit entered active, or None if unknowable.
+
+        Reads systemd's MONOTONIC ActiveEnter timestamp so a wall-clock step
+        during boot (a containerized install's clock is stepped by the host
+        rather than disciplined by a local NTP daemon) cannot fake a large
+        uptime. Never raises: unit absent, systemd
+        unreachable, or unparsable output all return None, and the caller
+        falls through to the pre-existing restart path — the grace suppresses
+        only on a positive young reading.
+        """
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show", self._target_service,
+                 "--property=ActiveEnterTimestampMonotonic", "--value"],
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
+            )
+            raw = (result.stdout or "").strip()
+            if result.returncode != 0 or not raw.isdigit() or int(raw) == 0:
+                return None
+            uptime = time.clock_gettime(time.CLOCK_MONOTONIC) - int(raw) / 1e6
+            return uptime if uptime >= 0 else None
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+            return None
 
     def _network_suppresses_restart(self, status: dict) -> bool:
         """True ONLY when a FRESH sentinel probe reports degraded/offline.
@@ -304,21 +475,31 @@ class WatchdogChecker:
             verdict, detail = self._probe_liveness()
             d = detail or {}
             if verdict == "starved":
-                skips = int(state.get("starved_skips", 0)) + 1
+                skips = self._coerce_counter(state.get("starved_skips")) + 1
                 if skips <= self._liveness_max_starved_skips:
                     state["starved_skips"] = skips
-                    self._save_state(state)
-                    self._alert_starved(reason, d, skips)
-                    logger.warning(
-                        "Liveness probe: server UP but event loop STARVED "
-                        "(lag %sms, sample %ss old, executor=%s) — suppressing "
-                        "'%s' restart (%d/%d); a restart would re-trigger the "
-                        "starvation. Alerting instead.",
-                        d.get("lag_ms", "?"), d.get("sample_age_s", "?"),
-                        d.get("executor"), reason, skips,
-                        self._liveness_max_starved_skips,
-                    )
-                    return WatchdogAction.SKIP
+                    if not self._save_state(state):
+                        # Same class as the bootstrap-grace persistence gate:
+                        # a suppression whose counter did not land is unbounded
+                        # on a box with a failing state write. Fall through to
+                        # the normal restart path instead of suppressing.
+                        logger.error(
+                            "Starved suppression NOT granted: skip counter "
+                            "could not be persisted — proceeding to normal "
+                            "restart logic.",
+                        )
+                    else:
+                        self._alert_starved(reason, d, skips)
+                        logger.warning(
+                            "Liveness probe: server UP but event loop STARVED "
+                            "(lag %sms, sample %ss old, executor=%s) — "
+                            "suppressing '%s' restart (%d/%d); a restart would "
+                            "re-trigger the starvation. Alerting instead.",
+                            d.get("lag_ms", "?"), d.get("sample_age_s", "?"),
+                            d.get("executor"), reason, skips,
+                            self._liveness_max_starved_skips,
+                        )
+                        return WatchdogAction.SKIP
                 # Past the suppression bound: stop suppressing and proceed to the
                 # restart path. Deliberately do NOT reset starved_skips here (that
                 # would re-enable suppression next cycle) — it stays pinned so we
@@ -580,17 +761,147 @@ class WatchdogChecker:
     def _load_state(self) -> dict:
         if self._state_path.exists():
             try:
-                return json.loads(self._state_path.read_text())
+                loaded = json.loads(self._state_path.read_text())
             except (json.JSONDecodeError, OSError):
-                pass
+                loaded = None
+            # Valid JSON that is not an object (a list, a bare string, a
+            # number) has no `.get`, so every normaliser and reader below
+            # would raise AttributeError. Treat it like unreadable state.
+            if isinstance(loaded, dict):
+                return self._normalise_numeric_fields(
+                    self._normalise_legacy_reasons(loaded),
+                )
         return {"consecutive_failures": 0, "next_attempt_after": None, "last_reason": None, "last_restart_at": None, "last_check_at": None, "restart_history": []}
 
-    def _save_state(self, state: dict) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _coerce_counter(value: Any) -> int:
+        """A persisted counter as a usable non-negative int; 0 for anything else.
+
+        The suppression paths do arithmetic on these (``int(x) + 1``,
+        ``x += 1``), so a state file carrying null, a string, a dict or a
+        negative — corruption, a partial write, a hand-edit — otherwise takes
+        the oneshot down with TypeError/ValueError/KeyError on every check
+        instead of returning an action. Booleans are rejected explicitly: bool
+        is a subclass of int, but True is not a count. Resetting corruption to
+        0 re-grants a budget, which is the conservative direction (suppress,
+        bounded) rather than restart-storm, and it is self-limiting — the next
+        successful save rewrites the field as a real int.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            return 0
+        return max(0, int(value))
+
+    @staticmethod
+    def _coerce_epoch(value: Any) -> float | None:
+        """A persisted epoch/deadline as a float, or None for anything unusable.
+
+        ``next_attempt_after`` and ``last_restart_at`` are fed straight into
+        ``time.time() < x`` / ``time.time() - x``, which raise TypeError on a
+        string, a container or None-with-arithmetic. None is the field's own
+        "unset" value, so degrading to it is the correct failure mode: the
+        backoff/cooldown simply does not apply this cycle, and the next
+        decision writes a real timestamp.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            return None
+        return float(value)
+
+    @classmethod
+    def _normalise_numeric_fields(cls, state: dict) -> dict:
+        """Coerce every numeric field at the ONE load boundary, in place.
+
+        Same rationale as ``_normalise_legacy_reasons`` above: state enters the
+        checker through a single path, so hardening here is what keeps each
+        individual reader from having to remember the guard (and keeps a future
+        reader from reintroducing the crash). ``_record_check`` then writes the
+        cleaned values back, so corruption does not survive a tick.
+
+        The set is derived from the readers, not guessed: every field that
+        ``check()``/``_restart_if_allowed`` index with ``state[...]`` or do
+        arithmetic on. ``consecutive_failures`` and ``next_attempt_after`` are
+        materialised UNCONDITIONALLY because three readers subscript them
+        directly (watchdog.py:561, :568-569, :883) and would raise KeyError on a
+        state file that merely omits them — MEASURED, not hypothesised.
+        """
+        for key in ("starved_skips", "bootstrap_grace_skips"):
+            if key in state:
+                state[key] = cls._coerce_counter(state[key])
+        state["consecutive_failures"] = cls._coerce_counter(
+            state.get("consecutive_failures"),
+        )
+        state["next_attempt_after"] = cls._coerce_epoch(state.get("next_attempt_after"))
+        if "last_restart_at" in state:
+            state["last_restart_at"] = cls._coerce_epoch(state["last_restart_at"])
+        return state
+
+    @staticmethod
+    def _normalise_legacy_reasons(state: dict) -> dict:
+        """Rewrite reason strings persisted under a previous name, in place.
+
+        Covers both surfaces that carry one: every `restart_history` entry (which
+        the flap window matches by equality) and `last_reason` (which the
+        dashboard's degraded card renders). Without the second, an operator keeps
+        seeing the retired label until the next restart decision writes over it.
+
+        It also DROPS entries the rest of the class cannot read. Three separate
+        sites filter `restart_history` with ``h.get("reason")`` and
+        ``now - h.get("ts", 0)``, so a persisted entry that is not a dict, or
+        whose timestamp is not a number, takes the watchdog down with an
+        AttributeError or a TypeError — MEASURED on both shapes. Skipping such an
+        entry here (the previous behaviour) left it in the list for those three
+        readers to trip over.
+
+        Filtering at this ONE load path is deliberate: it is the only way state
+        enters the checker, so the three readers cannot each forget the guard.
+        The alternative — teaching every filter to skip malformed entries — is a
+        convention three call sites have to remember, and a fourth reader would
+        reintroduce the crash.
+
+        Valid unrelated entries are kept: a malformed neighbour must not discard
+        real flap history, or a corrupt write would silently reset the damping
+        that stops a restart loop.
+        """
+        history = state.get("restart_history") or []
+        if isinstance(history, list):
+            kept = []
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                ts = entry.get("ts", 0)
+                # bool is a subclass of int; a True timestamp is not a time.
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                    continue
+                if entry.get("reason") in _LEGACY_REASONS:
+                    entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+                kept.append(entry)
+            state["restart_history"] = kept
+        else:
+            # Not even a list — the shape below it cannot be trusted either.
+            state["restart_history"] = []
+        if state.get("last_reason") in _LEGACY_REASONS:
+            state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
+        return state
+
+    def _save_state(self, state: dict) -> bool:
+        """Persist state; True only when the write actually landed.
+
+        The return value is load-bearing for the bounded suppressions (bootstrap
+        grace, starved skips): a suppression whose counter did not persist is
+        unbounded on a box with a failing state write (disk-full, permissions —
+        each oneshot invocation would reload the old count and re-grant the same
+        slot forever), so callers grant a skip only on True.
+        """
         try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
             self._state_path.write_text(json.dumps(state))
+            return True
         except OSError:
             logger.error("Failed to save watchdog state to %s", self._state_path, exc_info=True)
+            return False
 
     def _record_failure(self, state: dict, *, reason: str) -> None:
         now = time.time()
@@ -716,6 +1027,34 @@ class WatchdogChecker:
             return "starved", loop_block
         return "responsive", loop_block
 
+    def _alert_grace_exhausted(self, service_uptime: float, skips: int) -> None:
+        """Surface ONE durable alert that the bootstrap grace ran out — the
+        target keeps presenting a young uptime without ever writing a fresh
+        status file, the signature of a restart loop. Same queue + dedupe
+        mechanism as ``_alert_starved``. Best-effort — never raises."""
+        try:
+            from genesis.env import alert_queue_root
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                alert_queue_root(),
+                severity="warning",
+                source="watchdog",
+                title="Watchdog bootstrap grace exhausted — possible restart loop",
+                body=(
+                    f"{self._target_service} has consumed all "
+                    f"{skips}/{self._max_bootstrap_grace_skips} bootstrap-grace "
+                    f"skips: its unit uptime keeps reading young "
+                    f"({service_uptime:.0f}s) while the status file stays stale, "
+                    "which means it keeps (re)starting without ever finishing "
+                    "bootstrap. The watchdog has resumed normal stale-restart "
+                    "handling. Check the service journal for the crash cause."
+                ),
+                dedupe_key="watchdog:bootstrap-grace-exhausted",
+            )
+        except Exception:
+            logger.debug("Failed to enqueue grace-exhausted alert", exc_info=True)
+
     def _alert_starved(self, reason: str, detail: dict, count: int) -> None:
         """Surface ONE durable alert that a restart was suppressed because the
         server is up-but-starved. Same queue + dedupe mechanism as ``_alert_flap``
@@ -753,10 +1092,9 @@ class WatchdogChecker:
         # was attempted recently.  This prevents the counter from bouncing
         # back to 0 when a service briefly appears healthy right after
         # restart but crashes again within the cooldown window.
-        try:
-            state = json.loads(self._state_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            state = {}
+        # Via the hardened loader (not a raw json.loads) so the arithmetic
+        # below cannot trip over a corrupt/foreign-typed last_restart_at.
+        state = self._load_state()
 
         last_restart_at = state.get("last_restart_at")
         if last_restart_at is not None:

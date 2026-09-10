@@ -6,12 +6,16 @@ that supports hybrid search (Qdrant vectors + FTS5 + RRF fusion).
 
 from __future__ import annotations
 
+import logging
 import re
+import sqlite3  # noqa: F401 — used by search_ranked's FTS5 syntax-error backstop
 
 import aiosqlite
 
 from genesis.db.crud._fts import fetch_fts
 from genesis.db.timeutil import canonical_iso
+
+logger = logging.getLogger(__name__)
 
 
 def _prepare_fts5(query: str, *, boolean: bool = False) -> str | None:
@@ -223,7 +227,37 @@ async def search_ranked(
     # AND-first, OR-fallback on zero rows (see _fts.fetch_fts). Skipped when the
     # query is already a structured boolean expression (expand_query output),
     # since re-tokenising a parenthesised OR/AND query would corrupt it.
-    rows = await fetch_fts(db, sql, params, boolean=boolean)
+    try:
+        rows = await fetch_fts(db, sql, params, boolean=boolean)
+    except sqlite3.OperationalError as exc:
+        # BACKSTOP. A composed boolean expression that FTS5 will not parse used
+        # to escape as an exception and surface as HTTP 500 from the recall
+        # endpoint. Every known producer now sanitises its terms before joining
+        # (see _fts.fts5_term), so reaching here means a NEW producer emitted
+        # something malformed. Degrade to the always-valid bare-term form rather
+        # than fail the whole recall: expansion is an optimisation, and losing
+        # its precision beats losing the query.
+        #
+        # SQLite is the oracle on purpose. Validating the expression ourselves
+        # would mean hand-rolling an FTS5 grammar, and a grammar we maintain is
+        # one that disagrees with the engine on some input we never thought of.
+        # Narrow to the syntax error: any other OperationalError (a locked or
+        # corrupt database, a missing table) is a real failure and must raise.
+        if not (boolean and "fts5" in str(exc) and "syntax error" in str(exc)):
+            raise
+        safe = _prepare_fts5(query, boolean=False)
+        if not safe:
+            return []
+        logger.warning(
+            "FTS5 rejected a composed boolean query (%s); retrying with bare "
+            "terms. The expression was %r — a producer is emitting an invalid "
+            "structure and should sanitise its terms before joining them.",
+            exc,
+            escaped,
+        )
+        retry_params = list(params)
+        retry_params[0] = safe
+        rows = await fetch_fts(db, sql, retry_params, boolean=False)
     return [
         {
             "memory_id": r[0],
@@ -353,6 +387,7 @@ async def create_metadata(
     assertion_provenance: str | None = None,
     durability: str | None = None,
     expires_at: str | None = None,
+    preference_domain: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
@@ -367,11 +402,13 @@ async def create_metadata(
     ``MemoryStore.store()``; NULL = legacy/unclassified (gates treat it
     fail-closed at gate time).
     ``speech_act`` / ``speech_act_confidence`` / ``assertion_provenance`` /
-    ``durability`` / ``expires_at`` are the MW-1 Tier-0 extraction judgment
+    ``durability`` / ``expires_at`` / ``preference_domain`` are the MW-1 Tier-0
+    (+ the MW-4 ``preference_domain`` satellite) extraction judgment
     axes — WRITE-ONLY (no reader yet). NULL = unclassified; expiry is opt-in
     (``durability='temporary'`` + an elapsed canonicalized ``expires_at``
     only). Contract in ``memory/judgment.py``.
-    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
+    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-4-preference-domain
+    # / mw-5-speech-act-protection)
     """
     # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
     # at the write gate. Unparseable valid_at (LLM temporal strings like
@@ -384,8 +421,8 @@ async def create_metadata(
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
         "origin_class, speech_act, speech_act_confidence, assertion_provenance, "
-        "durability, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "durability, expires_at, preference_domain) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             memory_id,
             created_at,
@@ -404,6 +441,7 @@ async def create_metadata(
             assertion_provenance,
             durability,
             canonical_iso(expires_at),
+            preference_domain,
         ),
     )
     await db.commit()

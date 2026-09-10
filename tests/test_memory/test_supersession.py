@@ -477,3 +477,78 @@ async def test_dedup_short_circuit_still_supersedes(store, db):
     ms.assert_awaited_once()
     # and it must supersede TOWARD the memory that actually exists
     assert ms.await_args[0][1] == "pre-existing-id"
+
+
+@pytest.mark.asyncio()
+async def test_supersede_link_invalidates_the_graph_cache(store, db):
+    """The cached graph must learn about the new succeeded_by edge.
+
+    The CRUD create deliberately does not invalidate (its callers do, by
+    convention) — and this caller didn't either, so every supersede left the
+    cached projection missing the edge until some unrelated write refreshed
+    it. One of the two known invalidation gaps (issue #1641).
+    """
+    old_id = "old-memory-id"
+    calls = []
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links, \
+         patch("genesis.memory.graph.invalidate_graph_cache",
+               side_effect=lambda: calls.append(1)):
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        # _mark_superseded now resolves short handles before the UPDATE (see
+        # test_supersede_prefix_resolution). This id is non-hex, so the real
+        # resolver returns it PASSTHROUGH untouched with no DB read — mirror
+        # that exactly rather than inventing a verdict the resolver never gives.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": old_id, "collection": "episodic_memory",
+            "embedding_status": "embedded", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_links.create = AsyncMock(return_value=(old_id, "new"))
+
+        await store.store("new fact", "conversation", supersedes=old_id)
+
+    assert calls, "supersede created a graph edge without invalidating the cached projection"
+
+
+@pytest.mark.asyncio()
+async def test_failed_supersede_link_does_not_invalidate(store, db):
+    """CONTROL: a link create that RAISES must not invalidate — there is no
+    new edge for the cache to learn."""
+    old_id = "old-memory-id"
+    calls = []
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links, \
+         patch("genesis.memory.graph.invalidate_graph_cache",
+               side_effect=lambda: calls.append(1)):
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        # See above: PASSTHROUGH mirrors what the real resolver does with a
+        # non-hex id.
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": old_id, "collection": "episodic_memory",
+            "embedding_status": "embedded", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_links.create = AsyncMock(side_effect=RuntimeError("db down"))
+
+        await store.store("new fact", "conversation", supersedes=old_id)
+
+    assert not calls, "a failed link create must not dirty the cache"

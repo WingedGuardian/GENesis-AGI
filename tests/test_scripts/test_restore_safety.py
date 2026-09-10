@@ -347,3 +347,35 @@ def test_pre_restore_safety_copy_is_valid_and_taken_via_backup(sandbox):
     ).stdout.strip()
     assert val == "1", f"pre-restore copy missing the pre-restore state: {val!r}"
     assert "wal-correct" in proc.stdout.lower(), proc.stdout
+
+
+def test_the_audit_store_is_restored_after_secrets_so_its_path_can_be_configured():
+    """A custom audit store is configured in secrets.env, which this script restores.
+
+    The destination is resolved by asking the writer's own resolver, which reads the
+    ENVIRONMENT — and `restore.sh` never loads `secrets.env`, so on the disaster this
+    backup exists for (secrets.env gone) the resolver saw nothing and fell back to the
+    default directory. The records landed there while the restored config sent every
+    writer to the custom one, leaving the recovered audit trail orphaned in a
+    directory nothing reads (Codex P2, PR #1609).
+
+    The fix is ORDER, not a lookup: the section now runs after "Secrets", because
+    before that point there is no config to consult. Both halves are pinned here —
+    the ordering, and that the config is actually loaded before the resolve.
+
+    A STRUCTURAL check, and said plainly: driving it end-to-end needs a full backup
+    payload plus gpg for one branch. What it pins is the invariant that broke.
+    """
+    body = _RESTORE.read_text()
+    secrets_at = body.index('log "--- Secrets ---"')
+    resolve_at = body.index('_AUDIT_DST="$(python3')
+    assert resolve_at > secrets_at, (
+        "the audit-store destination is resolved BEFORE secrets are restored, so a "
+        "configured store cannot be seen and records go to the default directory"
+    )
+    # ...and the config is actually loaded, not merely available on disk.
+    window = body[secrets_at:resolve_at]
+    assert "load_secrets_file" in window, (
+        "secrets are restored but never loaded, so the resolver still reads an "
+        "environment that does not carry GENESIS_MERGE_OVERRIDE_DIR"
+    )

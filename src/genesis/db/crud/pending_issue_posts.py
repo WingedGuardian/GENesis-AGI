@@ -16,6 +16,21 @@ from __future__ import annotations
 
 import aiosqlite
 
+# The predicate for an AUTHORITATIVE follow_up ⇄ issue link, shared by both
+# directions of the join so they can never disagree about which rows count.
+# Each clause is load-bearing and is reasoned individually in
+# ``posted_index_for_repo``'s docstring — read it before changing anything here.
+# In short: only 'posted' rows carry an issue_number; source='follow_up' is the
+# authoritative filter because write-time does not stop a 'codebase' row from
+# carrying a stray source_ref; and adopted=0 excludes every pre-existing issue
+# Genesis merely ADOPTED, whose closure must not resolve a follow_up.
+_AUTHORITATIVE_LINK_SQL = (
+    "status = 'posted' "
+    "AND source = 'follow_up' "
+    "AND issue_number IS NOT NULL AND source_ref IS NOT NULL "
+    "AND adopted = 0"
+)
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -183,10 +198,7 @@ async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int
     """
     cursor = await db.execute(
         "SELECT issue_number, source_ref FROM pending_issue_posts "
-        "WHERE repo = ? COLLATE NOCASE AND status = 'posted' "
-        "AND source = 'follow_up' "
-        "AND issue_number IS NOT NULL AND source_ref IS NOT NULL "
-        "AND adopted = 0 "
+        f"WHERE repo = ? COLLATE NOCASE AND {_AUTHORITATIVE_LINK_SQL} "
         "ORDER BY rowid",
         (repo,),
     )
@@ -196,6 +208,43 @@ async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int
         if number not in index:
             index[number] = str(row["source_ref"])
     return index
+
+
+async def issue_by_follow_up(db: aiosqlite.Connection) -> dict[str, dict]:
+    """Map ``follow_up id → {number, url, repo}`` for POSTED, follow_up-sourced
+    issues — the same authoritative link as :func:`posted_index_for_repo`, read
+    in the direction a follow-up asks: *does this row already have an issue?*
+
+    Shares ``_AUTHORITATIVE_LINK_SQL`` with that function deliberately. The
+    filters there are load-bearing and individually reasoned (see its docstring);
+    a second hand-written copy of them is exactly how the two directions of one
+    link drift into disagreeing about which issues count.
+
+    Repo-agnostic on purpose. ``posted_index_for_repo`` scopes by repo because it
+    resolves an issue NUMBER, which is only unique within a repo. Here the key is
+    the follow_up id, which is globally unique, and the answer wanted is "is there
+    an issue anywhere" — so the row's own ``repo`` is returned rather than used as
+    a filter, and no caller needs a live ``gh repo view`` to ask the question.
+
+    First row by rowid wins per follow_up: a follow-up with two posted issues is a
+    data anomaly, and picking deterministically beats reporting an arbitrary one.
+    Requires ``db.row_factory = aiosqlite.Row``.
+    """
+    cursor = await db.execute(
+        "SELECT source_ref, issue_number, issue_url, repo FROM pending_issue_posts "
+        f"WHERE {_AUTHORITATIVE_LINK_SQL} "
+        "ORDER BY rowid"
+    )
+    out: dict[str, dict] = {}
+    for row in await cursor.fetchall():
+        ref = str(row["source_ref"])
+        if ref not in out:
+            out[ref] = {
+                "number": int(row["issue_number"]),
+                "url": row["issue_url"],
+                "repo": row["repo"],
+            }
+    return out
 
 
 async def mark_dry_run(db: aiosqlite.Connection, id: str, *, dry_run_at: str) -> bool:
