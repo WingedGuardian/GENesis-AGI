@@ -675,6 +675,54 @@ verified: 5808e7cd 2026-09-03
   the `approval_requests` row FIRST, then `pending_email_sends`; the
   `email_gate_watcher` job (every 5 min, learning scheduler) drains approved
   sends.
+- **Desktop takeover is gated before it exists** (`autonomy/desktop_gate.py`,
+  GROUNDWORK — no caller; the actuator is inert and the loop lands later).
+  Authority is per SESSION, not standing: an approved, unconsumed
+  `approval_requests` row (`desktop_takeover_gate`) carrying the session id AND
+  `context.kind == desktop_session_grant` (holds share the action_type, so
+  without the kind bar approving one held action would grant the whole
+  session), resolved through `DESKTOP_GRANT_RESOLVER_PREFIXES` — deliberately
+  NARROWER than `classify_resolver`'s human class, because `dashboard` is
+  stamped by a route any local process can reach with the internal token and
+  `user` is merely a default; neither proves a person acted. Bounded both ways
+  against a config TTL (a future-dated resolution would otherwise never
+  expire). SCOPE, stated because the obvious reading is stronger: that bar
+  closes the APP-LAYER path — no Genesis component using the sanctioned
+  approval APIs can mint itself desktop authority — but it does not make a
+  grant unforgeable, since `resolved_by` is a column and `genesis.db` is
+  writable by the uid every Genesis process runs as. That is a property of the
+  whole approval substrate, not of this gate, and closing it needs provenance
+  SQL cannot express. Screen-supplied text (window title, element name) is
+  passed through `strip_control_chars` and bounded before it reaches the
+  approval description a human reads, so a hostile window cannot forge lines or
+  reorder what is displayed away from what is approved. Desktop rows are also withheld from the generic dashboard approvals
+  queue, which renders every row as a CLI-fallback card, and refused by
+  `resolve_request` — the funnel for the per-item Approve button, Telegram
+  `cli_approve`, and the `cli_approve_all` button's own trigger row, which
+  resolves directly and so sidesteps the batch sweep's exclusion.
+  Classification reads the RESOLVED
+  TARGET from the accessibility tree, never the acting model's prose about its
+  own intent — and IDENTITY reads the control (window + element + type) rather
+  than the typed text, so ordinary typing is not held; only FINANCIAL also
+  reads text, because a card number is dangerous as content. A password field
+  is a REFUSAL with no approval path (matched on the target alone, so a window
+  named "Password Manager" does not make its controls unreachable); above
+  STANDARD holds per action; STANDARD under a live grant allows with an
+  `expires_at` the device re-checks and an audit log line + event, the one
+  outcome that actually acts. In `shadow` the gate classifies, records the cell
+  and logs the full verdict INCLUDING a missing grant — the state a shadow
+  install is actually in — then refuses, creating no approval row. A hold
+  queues NOTHING — there is no pending
+  table and no drain, because a held desktop action aims at a screen that has
+  moved, so every action executes against an observation taken after the last
+  approval. The capability cell (`desktop:control:*`) can DENY permanently but
+  can never GRANT: `desktop` is absent from `PROMOTABLE_DOMAINS`. Arming needs
+  BOTH `mode: live` and `live_opt_in: true` in
+  `config/desktop_takeover.yaml` (default `shadow`; env kill
+  `GENESIS_DESKTOP_TAKEOVER_DISABLED`), and the domain is deliberately absent
+  from the settings MCP so arming cannot happen through one API call. Excluded
+  from `approve_all_pending` and outside `_VOICE_GATED_TYPES`, so neither a
+  batch tap nor a bare spoken "approve" can hand over the keyboard.
 - **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
   `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
   observe-only into `capability_shadow`, best-effort so it can NEVER break the
