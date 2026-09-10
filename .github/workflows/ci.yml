@@ -457,6 +457,32 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  mutation-gate:
+    # Verify-RED, enforced. A guard's test can stop pinning the property it is
+    # named for -- through a refactor, a widened assertion, a sibling layer that
+    # starts masking it -- and nothing goes red, because the test still passes.
+    # This breaks a handful of load-bearing guard decisions on purpose and fails
+    # if the test does NOT notice. An ABORT is a failure too: a case that could
+    # not run has established nothing, which is the confident false negative this
+    # class is famous for. See scripts/mutation_sweep.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        # MUST mirror the `test` job. The ROOT tests/conftest.py imports
+        # aiosqlite, so a minimal install fails collection and every case
+        # ABORTS -- a job red for the wrong reason. `--noconftest` is not the
+        # escape either: the guard tests use fixtures from
+        # tests/test_hooks/conftest.py.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Mutation gate
+        run: python scripts/mutation_sweep.py config/mutation_gate.json --repo .
+
   frozen-clock-check:
     # A test that captures a wall clock at IMPORT time gives the whole suite's
     # runtime to burn its safety margin, then fails on slow runners as an
