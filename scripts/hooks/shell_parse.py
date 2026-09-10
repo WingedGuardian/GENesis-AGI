@@ -1411,10 +1411,12 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #:   COVERED  brace expansion     in verb position, via :func:`_has_brace_expansion`
 #:                                — ``{a,b}``, ``{a..b}``
 #:   LEFT     ANY expansion in a  A value-taking option's value is skipped unread
-#:            VALUE slot          (see :func:`_verb_unresolved`), so an expansion
-#:                                there can INJECT a verb the parse never sees —
-#:                                ``git -C <expansion producing "x <verb>"> …`` runs
-#:                                the verb with argv intact. PRE-EXISTING and not
+#:            VALUE slot          (see :func:`_verb_unresolved`), in BOTH the split
+#:            (either option      (``-C <v>``) and attached (``--git-dir=<v>``)
+#:             form)              forms — they are one command to bash and answer
+#:                                the same here. So an expansion there can INJECT a
+#:                                verb the parse never sees, with argv intact.
+#:                                PRE-EXISTING and not
 #:                                made worse here: measured base-vs-branch, these
 #:                                shapes are ALLOW on both. Left because the price is
 #:                                the wrong shape — MEASURED over 129,179 real
@@ -1427,6 +1429,14 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #:                                corpus exercises. `_word_continues` covers only the
 #:                                narrow sub-case where the value is the unterminated
 #:                                HEAD of a split word.
+#:                                RE-MEASURED from the GRAMMAR rather than the corpus
+#:                                after a corpus null result was wrong three times:
+#:                                384 generated cells over program x option form x
+#:                                construct x position, each evaluated under four
+#:                                environments so a slot that CAN move the verb is
+#:                                identified by watching it move rather than by
+#:                                argument. This slot moves; every other new refusal
+#:                                sits on a slot that also moves.
 #:   LEFT     tilde expansion     applies only at the start of a word and only up to
 #:                                the first ``/``, which is strictly ahead of the
 #:                                basename :func:`_basename` reads. ``~/venv/bin/python``
@@ -1651,20 +1661,32 @@ def _verb_unresolved(argv: list[str]) -> bool:
     i = 1
     while i < len(argv):
         tok = argv[i]
-        if not _word_is_literal(tok):
-            return True  # the verb itself, or an option that decides where it sits
-        if tok in value_flags:
-            # The value is not verb position, so it is skipped unread — UNLESS it is
-            # only the head of a split word, in which case skipping it lands the walk
-            # on that word's tail and every position after is wrong. See
-            # :func:`_word_continues`.
-            if i + 1 < len(argv) and _word_continues(argv[i + 1]):
-                return True
-            i += 2
-            continue
         if tok.startswith("-"):
+            # AN OPTION. Only its NAME can decide where the verb sits, so only the
+            # NAME is read. An ATTACHED value (``--git-dir=<value>``) rides inside
+            # the same shlex token, and testing the whole token reads a VALUE as
+            # though it were a verb — which made an ordinary ``git --git-dir=$DIR
+            # status`` ask for approval while the identical SPLIT form did not. The
+            # two forms are the same command to bash, so they answer the same here.
+            #
+            # An unreadable option NAME still returns True: it can expand to a
+            # value-taking flag and consume the following word, which shifts what
+            # lands in the verb slot.
+            if not _word_is_literal(tok.split("=", 1)[0]) or _word_continues(tok):
+                return True
+            if "=" not in tok and tok in value_flags:
+                # The SEPARATE form: the value is the next token, skipped unread for
+                # the same reason an attached one is — UNLESS it is only the head of
+                # a split word, in which case skipping it lands the walk on that
+                # word's tail and every position after is wrong (:func:`_word_continues`).
+                if i + 1 < len(argv) and _word_continues(argv[i + 1]):
+                    return True
+                i += 2
+                continue
             i += 1
             continue
+        if not _word_is_literal(tok):
+            return True  # the verb itself
         if tok in groups:
             groups = frozenset()  # a group name: the NEXT bare word is the verb
             i += 1

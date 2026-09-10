@@ -1093,6 +1093,15 @@ _BENIGN_EXPANSIONS = [
     # with a green test. The reasoning and the price are beside
     # `shell_parse._EXPANSION_MARKS`, in its LEFT column.
     ("dash_C_value", f"{GIT} -C $DIR status"),
+    # ATTACHED option values. shlex yields `--git-dir=$DIR` as ONE token, so a
+    # rule that tests the whole token reads the VALUE as though it were a verb.
+    # MEASURED: this asked for approval while the identical SPLIT form did not —
+    # and an ask is a BLOCK in a dispatched session, where nobody can answer, on
+    # a completely ordinary command. Same shape for --work-tree=, --namespace=
+    # and gh's --repo=.
+    ("attached_git_dir", f"{GIT} --git-dir=$DIR status"),
+    ("attached_work_tree", f"{GIT} --work-tree=$W status"),
+    ("attached_gh_repo", "gh --repo=$R pr view 1"),
     ("gh_api_endpoint", "gh api repos/o/r/issues/$n/comments --jq .[].body"),
     ("tilde_exe_path", "~/venv/bin/python -m pytest tests/x.py"),
     ("variable_exe_dir", "$VENV/bin/python -m pytest tests/x.py"),
@@ -1260,6 +1269,36 @@ class TestVerbPositionReachesTheGuard:
         cmd = f'{GIT} $"{PUSH}" origin main'
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path), dispatched="1")
         assert _decision(r) == "block", r.stdout + r.stderr
+
+    @pytest.mark.parametrize(
+        "attached,split",
+        [
+            (f"{GIT} --git-dir=$D status", f"{GIT} --git-dir $D status"),
+            (f"{GIT} --work-tree=$D status", f"{GIT} --work-tree $D status"),
+            ("gh --repo=$R pr view 1", "gh --repo $R pr view 1"),
+        ],
+    )
+    def test_the_attached_and_split_option_forms_agree(self, attached, split, tmp_path):
+        """Two spellings of ONE command must not get two verdicts.
+
+        `--opt=value` and `--opt value` are the same command to bash. The first
+        version of the verb rule read the whole attached token, so the value
+        landed in the test meant for the verb and only that spelling asked.
+
+        Asserts EQUALITY rather than a fixed verdict, so this keeps meaning
+        something if the shared verdict ever legitimately changes — what must
+        never differ is the two forms.
+        """
+        a = _decision(_run(_PUSH_GUARD, attached, cwd=str(tmp_path)))
+        b = _decision(_run(_PUSH_GUARD, split, cwd=str(tmp_path)))
+        assert a == b, (
+            f"the attached form decided {a!r} and the split form {b!r}, for the "
+            "same command. A value read as a verb is the likely cause"
+        )
+        assert a == "allow", (
+            f"an ordinary option value now costs a confirmation ({a!r}). In a "
+            "dispatched session an ask is a refusal nobody can answer"
+        )
 
     def test_an_unreadable_program_alone_does_not_prompt(self, tmp_path):
         """The measured half that must NOT engage the net on its own.

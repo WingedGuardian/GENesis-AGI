@@ -688,3 +688,51 @@ class TestCommandCarriersAreNotAHole:
         inner = f"echo /tmp/wt-x | xargs {_PHRASE}"
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
+# A NON-TRUNCATING blind spot must not swap the parse for the raw-text regex
+# ---------------------------------------------------------------------------
+
+_WT = "work" + "tree"
+_RM = "rem" + "ove"
+
+
+class TestBlindSpotDoesNotDegradeToProse:
+    """The legacy extractor reads RAW TEXT, so it cannot tell a command from a
+    sentence. It is the right fallback for a cause that leaves NO segments — a
+    bound — and the wrong one for a cause that leaves the segments complete.
+
+    MEASURED when this guard degraded on any blind spot: a `gh pr` whose verb
+    was a variable, with a --body whose prose merely mentions removing a
+    worktree, went ALLOW -> hard BLOCK. Sessions write that PR body constantly;
+    this PR's own body does.
+    """
+
+    def test_prose_in_a_pr_body_is_not_blocked(self, guard_cmd: str) -> None:
+        cmd = f'gh pr "$ACTION" 123 --body "docs about {_WT} {_RM} semantics"'
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 0, (
+            "prose describing a worktree removal was BLOCKED because the command "
+            f"also carried a blind spot.\n{result.stderr}"
+        )
+
+    def test_the_same_prose_with_a_readable_verb_is_the_control(
+        self, guard_cmd: str
+    ) -> None:
+        """CONTROL: identical text, verb spelled out. If this blocked too, the
+        test above would be measuring the prose rule and not the blind path."""
+        cmd = f'gh pr edit 123 --body "docs about {_WT} {_RM} semantics"'
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 0, result.stderr
+
+    def test_a_real_removal_alongside_a_blind_spot_still_blocks(
+        self, guard_cmd: str
+    ) -> None:
+        """The other direction, so this is not a licence to stop looking: an
+        ACTUAL removal must still be refused when a blind spot is present."""
+        cmd = f"git pus{{h..h}} origin main && git {_WT} {_RM} /home/ubuntu/wt/x"
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 2, (
+            f"a real worktree removal was allowed.\n{result.stdout}{result.stderr}"
+        )
