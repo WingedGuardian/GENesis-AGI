@@ -423,3 +423,65 @@ class TestBoundedParseNeverDowngradesToTheWeakerCheck:
         assert r.returncode == 0, (
             f"a buried non-rm command was blocked: out={r.stdout!r} err={r.stderr!r}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# A BLIND SPOT MUST NOT DISARM THE PRECISE SCAN
+#
+# For a NON-BOUNDS blind spot this guard runs its substring fallback, which its
+# own comment calls STRICTLY WEAKER than the segment scan — a substring test
+# cannot see an ANCESTOR of a protected directory, nor a GLOB over its contents,
+# because neither contains a protected path as a substring. That fallback used
+# to RETURN, so any such blind spot skipped the scan entirely.
+#
+# Latent while `untokenizable` was the only non-bounds cause; reachable once
+# there were two. MEASURED base-vs-branch, pairing a verb the shell builds with
+# an rm of the PARENT of the production database went BLOCK -> ALLOW. The
+# fallback now ADDS to the scan rather than replacing it.
+# ══════════════════════════════════════════════════════════════════════════
+
+# A segment whose operation the parser cannot establish, so `analyze_checked`
+# reports a non-bounds blind spot. Fixture data, per the sibling guard suites.
+_BLINDING_PREFIX = "git pus{h..h} origin main && "
+
+
+@pytest.mark.parametrize(
+    "target",
+    [f"{H}/genesis", f"{H}/genesis/*"],
+    ids=["ancestor", "glob"],
+)
+def test_a_blind_spot_does_not_disarm_the_precise_scan(target, fake_home):
+    """The two shapes the substring fallback structurally cannot see.
+
+    Each must still be refused when the command ALSO carries a blind spot.
+
+    The control is what makes this mean anything, and it is not decoration: the
+    same rm WITHOUT the prefix must already be refused, so a fixture whose
+    protected paths failed to resolve — or a guard that refused everything —
+    cannot pass this silently. The pair is the assertion.
+    """
+    plain = _run(f"rm -rf {target}", fake_home)
+    assert plain.returncode == 2, (
+        "CONTROL: the bare rm was not refused, so this fixture's protected paths "
+        f"do not resolve and the assertion below proves nothing.\n{plain.stderr}"
+    )
+    blinded = _run(f"{_BLINDING_PREFIX}rm -rf {target}", fake_home)
+    assert blinded.returncode == 2, (
+        "an rm the precise scan catches was ALLOWED because the command also "
+        "carried a blind spot — the substring fallback replaced the scan instead "
+        f"of adding to it, and it cannot see this shape.\n{blinded.stderr}"
+    )
+
+
+def test_the_blinding_prefix_really_blinds(fake_home):
+    """The other half of the control: prove the prefix does what it claims.
+
+    If it stopped raising a blind spot, the tests above would still pass — via
+    the ordinary path — while covering nothing. Asserted against the parser
+    directly rather than inferred from a verdict.
+    """
+    _segs, blind = shell_parse.analyze_checked(_BLINDING_PREFIX + "rm -rf /tmp/x")
+    assert blind is not None and not blind.bounds_induced, (
+        "the prefix no longer produces a NON-BOUNDS blind spot, so the "
+        f"fall-through tests above exercise the ordinary path: {blind}"
+    )

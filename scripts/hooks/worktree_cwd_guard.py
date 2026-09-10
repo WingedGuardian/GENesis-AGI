@@ -326,7 +326,25 @@ def _handle_bash(data: dict) -> int:
     # that already fail closed here. The legacy regex extractor is the same
     # coarser reading the untokenizable case falls back to: weaker than the
     # parser, but it reads the raw text, so a bound cannot hide anything from it.
-    if untokenizable(cmd) or blind is not None:
+    # `blind.bounds_induced`, NOT `blind is not None`, and the comment above says
+    # why without meaning to: it justifies this fallback with "a BOUND stopped the
+    # parse — and `analyze_checked` then returns NO segments". That is the whole
+    # argument, and it is true of the BOUNDS causes only. A cause that leaves the
+    # segments COMPLETE — the parse succeeded, one word of it is unreadable — hands
+    # this branch a full segment list and then throws it away for a quote-blind
+    # regex over the raw text.
+    #
+    # MEASURED base-vs-branch when this read `blind is not None`: a `gh pr` whose
+    # verb was a variable, with a --body whose PROSE mentions removing a worktree,
+    # went ALLOW -> hard BLOCK. Writing a PR body about worktree removal is
+    # something sessions do constantly — this one's own body does it — and a hard
+    # block on prose is the worst direction available to this guard.
+    #
+    # `untokenizable` keeps the fallback unchanged: there the tokens really are
+    # unreliable. The parsed route below has its own carrier fallback for a removal
+    # the parser cannot see, so declining to degrade here is not the same as
+    # trusting the parse blindly.
+    if untokenizable(cmd) or (blind is not None and blind.bounds_induced):
         targets = _legacy_targets(cmd)
     else:
         targets = _extract_worktree_targets(segs)

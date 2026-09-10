@@ -1026,3 +1026,304 @@ class TestNetDoesNotDowngradeHardBlocks:
         cmd = f'{GIT} {COMMIT} {NV} -m "x"{suffix}'
         r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
         assert _decision(r) == "block", r.stdout + r.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# VERB POSITION — an operation name the SHELL builds is unestablished, not
+# absent. shlex implements quote removal faithfully and implements no
+# expansion at all, so a word carrying `$` or a backtick tokenizes CLEANLY
+# into a token one or more characters off from the word bash runs. When such
+# a word sits where the operation is chosen, the parse reports success while
+# naming something else, and `untokenizable` — which answers "did the parse
+# fail" — has nothing to report. The forms are fixture data below; the
+# property is that a verb the parser cannot ESTABLISH must not read as absent.
+# ══════════════════════════════════════════════════════════════════════════
+MERGE = "mer" + "ge"
+
+
+def _hex_word(word: str) -> str:
+    """A word spelled as hex escapes inside a `$'...'` span."""
+    return "$'" + "".join(f"\\x{ord(c):02x}" for c in word) + "'"
+
+
+# Each pair is (id, command). The gated verb is built by the shell in every
+# one; none of them tokenizes badly, which is the point.
+_HIDDEN_GIT_VERB = [
+    ("locale", f'{GIT} $"{PUSH}" origin main'),
+    ("hex_escape", f"{GIT} {_hex_word(PUSH)} origin main"),
+    ("command_sub", f"{GIT} $(echo {PUSH}) origin main"),
+    ("parameter_default", f"{GIT} ${{V:-{PUSH}}} origin main"),
+    ("backtick_sub", f"{GIT} `echo {PUSH}` origin main"),
+    ("indirect_expansion", f"{GIT} ${{!P}} origin main"),
+    # The POSITION-SHIFT case, which the others do not cover: an unquoted
+    # substitution containing a space is one word to bash and several tokens to
+    # shlex, so the option's value is only the head of a word and the walk lands
+    # on its tail — an ordinary-looking literal with the real verb behind it.
+    ("split_option_value", f"{GIT} -C $(echo a) {PUSH} origin main"),
+    # BRACE EXPANSION generates words with no substitution character anywhere, so
+    # the two-character rule above is blind to it on its own. The RANGE form is the
+    # one that matters: a comma list emits at least two words and corrupts the rest
+    # of argv, while identical range endpoints emit exactly ONE — argv intact.
+    # Both are held here so a later narrowing to "only the comma form" fails.
+    ("brace_range_single_word", f"{GIT} pus{{h..h}} origin main"),
+    ("brace_range_split", f"{GIT} p{{u..u}}s{{h..h}} origin main"),
+    ("brace_list", f"{GIT} pu{{s,s}}h origin main"),
+]
+_HIDDEN_GH_VERB = [
+    ("gh_group", f'gh $"pr" {MERGE} 5'),
+    ("gh_verb", f'gh pr $"{MERGE}" 5'),
+    ("gh_verb_hex", f"gh pr {_hex_word(MERGE)} 5"),
+    ("gh_split_option_value", f"gh -R $(echo o/r) pr {MERGE} 5"),
+]
+# Ordinary work carrying the same characters OUTSIDE verb position, which must
+# stay clean. This is the over-block surface: `$` in an argument is routine,
+# and a rule that flagged it would be switched off within a week.
+_BENIGN_EXPANSIONS = [
+    ("message_argument", f'{GIT} {COMMIT} -m "$MSG"'),
+    # CHARACTERIZATION, NOT A REQUIREMENT. A value-taking option's value is
+    # skipped unread, so an expansion there can inject a verb the parse never
+    # sees. That residual is PRE-EXISTING — measured base-vs-branch, these shapes
+    # are ALLOW on both — and left deliberately: flagging a non-literal value slot
+    # fires on 711 of 129,179 real commands (0.55%), dominated by `-C $WT` on a
+    # worktree path, against 15 for everything this module currently moves.
+    #
+    # This row pins what the guard does TODAY so the measured cost stays honest.
+    # It does NOT say the shape ought to pass. Anyone closing the residual should
+    # DELETE this row and add the shape to the hidden-verb list above — not argue
+    # with a green test. The reasoning and the price are beside
+    # `shell_parse._EXPANSION_MARKS`, in its LEFT column.
+    ("dash_C_value", f"{GIT} -C $DIR status"),
+    # ATTACHED option values. shlex yields `--git-dir=$DIR` as ONE token, so a
+    # rule that tests the whole token reads the VALUE as though it were a verb.
+    # MEASURED: this asked for approval while the identical SPLIT form did not —
+    # and an ask is a BLOCK in a dispatched session, where nobody can answer, on
+    # a completely ordinary command. Same shape for --work-tree=, --namespace=
+    # and gh's --repo=.
+    ("attached_git_dir", f"{GIT} --git-dir=$DIR status"),
+    ("attached_work_tree", f"{GIT} --work-tree=$W status"),
+    ("attached_gh_repo", "gh --repo=$R pr view 1"),
+    ("gh_api_endpoint", "gh api repos/o/r/issues/$n/comments --jq .[].body"),
+    ("tilde_exe_path", "~/venv/bin/python -m pytest tests/x.py"),
+    ("variable_exe_dir", "$VENV/bin/python -m pytest tests/x.py"),
+    ("subcommand_then_var", f"{GIT} log --format=$FMT -1"),
+    # The CONTROL for the position-shift case above: QUOTED, so it stays one
+    # token, the walk keeps its place, and the verb resolves. Without this the
+    # split-word rule could be a blanket "any substitution in an option value"
+    # and nothing here would notice.
+    ("quoted_option_value", f'{GIT} -C "$(pwd)" status'),
+    # Parentheses that are DATA, not syntax. A rule reading every paren as a
+    # substitution boundary would flag this ordinary formatting string.
+    ("format_string_parens", f'{GIT} for-each-ref --format="%(refname)" refs/heads'),
+    # Braces that bash does NOT expand. A group needs a top-level comma or range to
+    # expand at all, so these are literal text — and a rule that flagged every brace
+    # would flag ordinary work while claiming to be about word generation.
+    ("literal_brace_no_comma", f"{GIT} log --format={{short}} -1"),
+    ("brace_outside_verb_position", f"{GIT} checkout -- src/{{a,b}}.py"),
+]
+
+
+class TestVerbPositionIsUnestablished:
+    """shell_parse: the parse succeeds, and must SAY the verb is unreadable."""
+
+    @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB + _HIDDEN_GH_VERB)
+    def test_the_parse_succeeds_so_the_older_probe_cannot_see_it(self, name, cmd):
+        """CONTROL for the whole class, and the reason it needed a new rule.
+
+        If any of these were untokenizable, the pre-existing net would already
+        have caught it and nothing below would be load-bearing. Assert the
+        premise rather than trusting it.
+        """
+        assert sp.untokenizable(cmd) is False, (
+            f"{name} does not tokenize, so this case is already covered by the "
+            "older probe and proves nothing about the verb-position rule"
+        )
+
+    @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB)
+    def test_the_ordinary_gate_still_does_not_see_the_git_verb(self, name, cmd):
+        """Pins that nothing here half-decodes the word into a real verb.
+
+        A decoder that guessed would hand a hard policy verdict to a command
+        whose operation it does not actually know. The rule reports rather
+        than guesses, so the resolved subcommand must stay wrong.
+        """
+        segs = sp.analyze(cmd)
+        assert not any(s.exe == "git" and sp.git_subcommand(s.argv) == PUSH for s in segs)
+
+    @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB + _HIDDEN_GH_VERB)
+    def test_a_shell_built_verb_is_reported_as_a_blind_spot(self, name, cmd):
+        segs, blind = sp.analyze_checked(cmd)
+        assert blind is sp._BLIND_UNRESOLVED_VERB, (
+            f"{name}: the parse resolved a verb bash never runs and reported "
+            f"{blind!r}. A guard reading the empty gated-segment list cannot "
+            "tell that from a command with no gated operation at all"
+        )
+        assert any(s.verb_unresolved for s in segs)
+
+    @pytest.mark.parametrize("name,cmd", _BENIGN_EXPANSIONS)
+    def test_an_expansion_outside_verb_position_stays_clean(self, name, cmd):
+        segs, blind = sp.analyze_checked(cmd)
+        assert blind is None, f"{name} was flagged: {blind}"
+        assert not any(s.verb_unresolved for s in segs)
+
+    def test_the_escape_free_decode_from_1686_still_resolves(self):
+        """REGRESSION: the shipped decode must keep producing a real verb.
+
+        A rule that flagged every `$`-bearing verb-position token WITHOUT
+        looking at the decoded form would flag this one too, and the gate that
+        currently fires its ordinary verdict on it would drop to a prompt.
+        """
+        segs, blind = sp.analyze_checked(f"{GIT} $'{PUSH}' origin main {FORCE}")
+        assert any(s.exe == "git" and sp.git_subcommand(s.argv) == PUSH for s in segs)
+        assert blind is None, f"the decoded form must not read as unreadable: {blind}"
+
+    def test_an_unreadable_program_is_recorded_but_not_reported(self):
+        """The PRICED HALF, pinned in both directions so neither can drift.
+
+        A program named by a variable is the same failure — nothing about the
+        segment is established — but it is ordinary work here at three orders
+        of magnitude more volume: 1,845 of 129,179 real commands against 14.
+        Reporting it MEASURED 203 extra push prompts, 206 commit prompts, and
+        one command going block -> allow, because `protected_paths_guard`
+        answers a non-bounds blind spot by swapping its precise scan for a
+        weaker substring test. So the fact is recorded on the segment and the
+        chokepoint stays quiet, and both halves of that are asserted: dropping
+        the record loses the fact, reporting it re-buys the cost.
+        """
+        segs, blind = sp.analyze_checked("$PY -m pytest tests/x.py")
+        assert any(s.verb_unresolved for s in segs), "the fact must still be recorded"
+        assert blind is None, f"reporting this cause was measured too expensive: {blind}"
+
+    @pytest.mark.parametrize(
+        "word,expands",
+        [
+            ("{a,b}", True),
+            ("{a..b}", True),
+            ("{a..a}", True),  # ONE word out — the argv-intact form
+            ("{,}", True),
+            ("{{a,b}}", True),  # the INNER group expands, so bash expands the word
+            ("{a}", False),  # no comma, no range: literal to bash
+            ("{}", False),
+            ("a{b}c", False),
+            ("{a", False),  # unterminated
+            ("a}", False),
+            ("--format=%(refname)", False),
+        ],
+    )
+    def test_the_brace_detector_matches_bash(self, word, expands):
+        """Each expectation was VERIFIED against bash itself, not reasoned about.
+
+        The two brace forms look alike and behave differently, and a detector
+        tuned to the wrong half is the failure this case exists to prevent. A
+        rule that flagged every brace would also flag ordinary text, so the
+        negative rows carry as much weight as the positive ones.
+        """
+        assert sp._has_brace_expansion(word) is expands
+
+    def test_a_bound_still_outranks_the_new_cause(self):
+        """Precedence, at the intersection where it can be wrong.
+
+        A command can be over a bound AND carry a shell-built verb. Consumers
+        that restore what a bound took away branch on `bounds_induced`, so
+        reporting the verb cause there would hand them the one answer they are
+        documented to ignore.
+        """
+        inner = f"{GIT} {_hex_word(PUSH)} origin main"
+        cmd = 'bash -c "$(' * 9 + inner + ')"' * 9
+        _segs, blind = sp.analyze_checked(cmd)
+        assert blind is not None and blind.bounds_induced, (
+            f"a bounded parse must report the bound, not a verb cause: {blind}"
+        )
+
+
+class TestVerbPositionReachesTheGuard:
+    """git_push_guard: the parser's signal has to become a VERDICT.
+
+    A blind spot nothing acts on is a field with a docstring. These run the
+    real guard, which is also the only way to exercise the conjunct deciding
+    whether the net engages at all.
+    """
+
+    @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB + _HIDDEN_GH_VERB)
+    def test_a_hidden_gated_verb_reaches_a_human(self, name, cmd, tmp_path):
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), (
+            f"{name} was decided without a human. The guard found no gated "
+            f"segment and no reason to doubt that.\n{r.stdout}{r.stderr}"
+        )
+
+    @pytest.mark.parametrize("name,cmd", _BENIGN_EXPANSIONS)
+    def test_ordinary_expansions_are_not_newly_prompted(self, name, cmd, tmp_path):
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
+        assert _decision(r) == "allow", (
+            f"{name} newly costs a confirmation. Measured over 129,179 real "
+            "commands the rule moves 14 of them; a shape in this list moving "
+            f"means that number is wrong.\n{r.stdout}{r.stderr}"
+        )
+
+    def test_a_hidden_verb_is_refused_outright_when_nobody_can_answer(self, tmp_path):
+        """A dispatched session has no human, so the ask has to become a deny.
+
+        Mirrors the existing dispatched legs: where no ask is available, not
+        refusing means permitting.
+        """
+        cmd = f'{GIT} $"{PUSH}" origin main'
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path), dispatched="1")
+        assert _decision(r) == "block", r.stdout + r.stderr
+
+    @pytest.mark.parametrize(
+        "attached,split",
+        [
+            (f"{GIT} --git-dir=$D status", f"{GIT} --git-dir $D status"),
+            (f"{GIT} --work-tree=$D status", f"{GIT} --work-tree $D status"),
+            ("gh --repo=$R pr view 1", "gh --repo $R pr view 1"),
+        ],
+    )
+    def test_the_attached_and_split_option_forms_agree(self, attached, split, tmp_path):
+        """Two spellings of ONE command must not get two verdicts.
+
+        `--opt=value` and `--opt value` are the same command to bash. The first
+        version of the verb rule read the whole attached token, so the value
+        landed in the test meant for the verb and only that spelling asked.
+
+        Asserts EQUALITY rather than a fixed verdict, so this keeps meaning
+        something if the shared verdict ever legitimately changes — what must
+        never differ is the two forms.
+        """
+        a = _decision(_run(_PUSH_GUARD, attached, cwd=str(tmp_path)))
+        b = _decision(_run(_PUSH_GUARD, split, cwd=str(tmp_path)))
+        assert a == b, (
+            f"the attached form decided {a!r} and the split form {b!r}, for the "
+            "same command. A value read as a verb is the likely cause"
+        )
+        assert a == "allow", (
+            f"an ordinary option value now costs a confirmation ({a!r}). In a "
+            "dispatched session an ask is a refusal nobody can answer"
+        )
+
+    def test_an_unreadable_program_alone_does_not_prompt(self, tmp_path):
+        """The measured half that must NOT engage the net on its own.
+
+        1,845 of 129,179 real commands name their program with a variable —
+        an interpreter or a remote shell held in one is ordinary work here.
+        Engaging on that turns the net into an outage, and MEASURED it also
+        moved one command block -> allow through a sibling guard.
+        """
+        r = _run(_PUSH_GUARD, "$PY -m pytest tests/x.py", cwd=str(tmp_path))
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+    def test_an_unreadable_program_is_the_documented_residual(self, tmp_path):
+        """CHARACTERIZATION, not an endorsement. Pinned so the gap is visible.
+
+        A command whose PROGRAM is a variable is read exactly as it is on the
+        default branch, whether or not it spells the operation — the net keys
+        on a blind spot, and this cause is deliberately not reported. This is
+        the boundary of what the verb-position rule closes; it is recorded
+        here so a later change that closes it fails LOUDLY on this assertion
+        rather than passing unnoticed, and so nobody reads the class above as
+        covering it.
+        """
+        r = _run(_PUSH_GUARD, f"$G {PUSH} origin main {FORCE}", cwd=str(tmp_path))
+        assert _decision(r) == "allow", (
+            "the residual closed without this test being updated — that is "
+            f"good news, but say so deliberately.\n{r.stdout}{r.stderr}"
+        )
