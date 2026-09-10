@@ -646,3 +646,79 @@ async def test_an_unresolvable_target_never_reaches_the_dedup_lookup(store, db):
         "reachable by a different route"
     )
     mock_mem.mark_superseded.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("dedup_hit", [False, True], ids=["normal-path", "dedup-path"])
+async def test_an_infrastructure_failure_is_recorded_not_just_logged(store, db, dedup_hit):
+    """Both supersede call sites must REPORT a failure, not only log it.
+
+    Silence here is the original defect arriving by a different door: the store
+    succeeds, the deprecation does not, and the caller is told nothing. Covered
+    at both sites because they are different code paths — the dedup one returns
+    ~300 lines earlier — and a single test cannot reach both.
+    """
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch.object(
+             MemoryStore, "_validate_supersede_pair", new=AsyncMock()
+         ):
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": "old-memory-id", "collection": "episodic_memory",
+            "embedding_status": "fts5_only", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_mem.find_exact_duplicate = AsyncMock(
+            return_value="pre-existing-id" if dedup_hit else None
+        )
+        # Pre-flight and pair validation pass; the deprecation itself throws.
+        mock_mem.mark_superseded = AsyncMock(
+            side_effect=RuntimeError("simulated SQLite fault")
+        )
+
+        outcome: dict = {}
+        result = await store.store(
+            "new content", "conversation",
+            supersedes="old-memory-id", supersede_outcome=outcome,
+        )
+
+    assert isinstance(result, str) and result, "the store itself must survive"
+    assert outcome == {"superseded": False}, (
+        "the failure was logged and nothing else — the report would have "
+        "claimed the supersede landed"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_a_successful_supersede_is_recorded_too(store, db):
+    """Written on BOTH branches, so 'absent' never has to mean 'fine'."""
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": "old-memory-id", "collection": "episodic_memory",
+            "embedding_status": "fts5_only", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        outcome: dict = {}
+        await store.store(
+            "new content", "conversation",
+            supersedes="old-memory-id", supersede_outcome=outcome,
+        )
+
+    assert outcome == {"superseded": True}

@@ -80,6 +80,11 @@ async def test_memory_store_delegates(mock_deps, tools):
         room=None,
         collection=None,
         supersedes=None,
+        # Out-param the MCP layer always passes: the store writes whether the
+        # deprecation landed, so a supersede that failed after the content was
+        # stored is not reported as a complete one. Empty here because nothing
+        # was superseded.
+        supersede_outcome={},
     )
 
 

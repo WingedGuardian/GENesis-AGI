@@ -185,6 +185,7 @@ class MemoryStore:
         life_domain: str | None = None,
         project_type: str | None = None,
         supersedes: str | None = None,
+        supersede_outcome: dict | None = None,  # out-param: see below
         origin_class: str | None = None,
         speech_act: str | None = None,
         speech_act_confidence: float | None = None,
@@ -269,19 +270,10 @@ class MemoryStore:
                 # earlier. Same validator memory_supersede uses; nothing is
                 # written if it rejects.
                 await self._validate_supersede_pair(resolved_supersedes, existing)
-                try:
-                    await self._mark_superseded(
-                        resolved_supersedes, existing, datetime.now(UTC).isoformat(),
-                    )
-                except Exception:
-                    # Mirrors the normal supersede path below: a failure once
-                    # the pair is validated is infrastructure, and it must not
-                    # turn a durable store into a raised error — that reads as
-                    # "the store failed" and invites a duplicating retry.
-                    logger.warning(
-                        "Failed to mark memory %s as superseded by %s",
-                        resolved_supersedes, existing, exc_info=True,
-                    )
+                await self._apply_supersede(
+                    resolved_supersedes, existing,
+                    datetime.now(UTC).isoformat(), supersede_outcome,
+                )
             return existing
 
         # Surface form normalization: expand known aliases before embedding
@@ -593,13 +585,9 @@ class MemoryStore:
         # above, so anything that fails here is an infrastructure fault rather
         # than a bad handle.
         if resolved_supersedes:
-            try:
-                await self._mark_superseded(resolved_supersedes, memory_id, now_iso)
-            except Exception:
-                logger.warning(
-                    "Failed to mark memory %s as superseded by %s",
-                    resolved_supersedes, memory_id, exc_info=True,
-                )
+            await self._apply_supersede(
+                resolved_supersedes, memory_id, now_iso, supersede_outcome,
+            )
 
         return memory_id
 
@@ -630,6 +618,44 @@ class MemoryStore:
         await self._mark_superseded(
             old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
         )
+
+    async def _apply_supersede(
+        self,
+        old_id: str,
+        new_id: str,
+        timestamp: str,
+        outcome: dict | None,
+    ) -> None:
+        """Run a VALIDATED supersede and record whether it landed.
+
+        By the time this runs, both ids are resolved and the pair has been
+        checked, so anything that throws here is infrastructure — a locked
+        database, a dead connection — not a bad request. Two consequences, and
+        they pull in opposite directions:
+
+        * It must NOT raise. The new memory is already durable, and an exception
+          reads to a caller as "the store failed", which invites the retry that
+          duplicates the memory. That retry was measured twice on 2026-09-06.
+        * It must NOT be silent either. Logging alone is what let a session be
+          told its correction had landed while the stale memory stayed live in
+          recall — the defect this whole change exists to close, arriving by a
+          different door.
+
+        So it swallows and REPORTS. ``outcome`` is written on both branches
+        rather than only on failure: "absent means fine" is the kind of default
+        that goes wrong quietly the first time a new path forgets to set it.
+        """
+        try:
+            await self._mark_superseded(old_id, new_id, timestamp)
+            applied = True
+        except Exception:
+            applied = False
+            logger.warning(
+                "Failed to mark memory %s as superseded by %s",
+                old_id, new_id, exc_info=True,
+            )
+        if outcome is not None:
+            outcome["superseded"] = applied
 
     async def _validate_supersede_pair(self, old_id: str, new_id: str) -> None:
         """Reject a pair that cannot express a correction. Reads only.

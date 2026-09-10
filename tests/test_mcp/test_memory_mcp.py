@@ -2238,3 +2238,127 @@ async def test_memory_recall_wing_validation_shares_one_definition_with_the_writ
             mod.side_effect = RuntimeError("reached the search path")
             with pytest.raises(RuntimeError):
                 await tools["memory_recall"].fn(query="q", wing=wing)
+
+
+# --- memory_store: what it reports when the deprecation did not land ---------
+# MEASURED 2026-09-06: three `succeeded_by` edges whose source was an 8-char
+# handle, created in a 14-minute window (0 historically). The store returned an
+# id, the caller read success, and one target is still deprecated=0 — a memory a
+# session believed it had corrected, still live in recall. Two of the three were
+# RETRIED ~90s later with the full id, so the silence also duplicated memories.
+#
+# With resolution and pair validation now happening BEFORE any write, the only
+# outcome left that needs reporting is the partial one: content stored,
+# deprecation failed on infrastructure. Everything else raises, having written
+# nothing.
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_without_supersedes_still_returns_a_bare_id():
+    """Contract lock: the ~all-calls path is untouched by the report shape."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_store"].fn("content", "src")
+
+    assert result == "mem-id"
+    assert isinstance(result, str)
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_reports_a_successful_supersede():
+    """Asking for a supersede gets you a verdict, not just an id."""
+    from genesis.mcp.memory import core
+
+    async def _store_ok(*a, **kw):
+        kw["supersede_outcome"]["superseded"] = True
+        return "new-id"
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(side_effect=_store_ok)
+        result = await tools["memory_store"].fn("content", "src", supersedes="old-id")
+
+    assert result["memory_id"] == "new-id"
+    assert result["superseded"] is True
+    assert "warning" not in result
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_reports_a_deprecation_that_did_not_land():
+    """The one partial outcome, and an instruction that can actually be carried out.
+
+    The content is durable, so this reports instead of raising — an exception
+    reads as "the store failed" and invites the retry that duplicates the
+    memory. The remedy names `memory_supersede`, which exists precisely so the
+    caller can finish the job without re-sending content. Before that tool, the
+    advice branched by reason and none of its branches could be completed.
+    """
+    from genesis.mcp.memory import core
+
+    async def _store_supersede_failed(*a, **kw):
+        kw["supersede_outcome"]["superseded"] = False
+        return "new-id"
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(side_effect=_store_supersede_failed)
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234-0000-4000-8000-000000000001"
+        )
+
+    assert result["memory_id"] == "new-id", "the content is still durable"
+    assert result["superseded"] is False
+    assert "memory_supersede(" in result["warning"], (
+        "the remedy must be an executable call, not a description of one"
+    )
+    assert "Do NOT re-send" in result["warning"]
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_does_not_claim_a_supersede_it_cannot_confirm():
+    """A store that never wrote the out-param must not report success.
+
+    "Absent means fine" is the default that goes wrong quietly the first time a
+    new path forgets to set it — and reporting an unperformed deprecation as
+    done is the exact defect this whole change exists to close.
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        # Writes nothing to supersede_outcome.
+        mod.return_value._store.store = AsyncMock(return_value="new-id")
+        result = await tools["memory_store"].fn("content", "src", supersedes="old-id")
+
+    assert result["superseded"] is False
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_does_not_report_a_supersede_nobody_asked_for():
+    """An empty `supersedes` must not produce a supersede report.
+
+    The store's own guard is a truthiness test, so "" and "   " deprecate
+    nothing. An `is None` test here would treat them as a requested supersede.
+    MCP and `POST /api/t/memory_store` both take a string, so an empty one
+    arrives without any client bug.
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    for empty in ("", "   "):
+        with patch.object(core, "_memory_mod") as mod:
+            mod.return_value._store = MagicMock()
+            mod.return_value._store.store = AsyncMock(return_value="new-id")
+            result = await tools["memory_store"].fn("content", "src", supersedes=empty)
+
+        assert result == "new-id", (
+            f"supersedes={empty!r} produced a supersede report: {result!r}"
+        )
+        assert isinstance(result, str)
