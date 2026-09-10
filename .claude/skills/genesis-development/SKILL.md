@@ -1906,7 +1906,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   to find defects. The confirming review of a terminal push (rule 4) is a gate
   requirement rather than a discovery round and never counts toward it; without that
   exemption stated HERE, where the cap is, the two rules read as a contradiction and
-  a session fixing a floor-class finding cannot satisfy both (Codex P2, #1903). The gate's strictest path points at the gate
+  a session fixing a floor-class finding cannot satisfy both (Codex P2, #1903).
+  **The exemption is DOCTRINE ONLY — no code knows about it, and you will feel that.**
+  This lane's "two" is a rule for the session; the MACHINE counters underneath are
+  unchanged (3 / 7) and are deliberately not being touched. So when a confirming review
+  finds a floor-class defect and you stage the correction, `bump_review_round` sees a
+  distinct staged hash and makes it machine round 3, and the commit gate blocks until a
+  trailing `# escalation-ack` (`review_state.py:850-860`,
+  `review_enforcement_commit.py:1072-1088`). That block is CORRECT and expected: acking
+  it means doing the step-back the block prints, on a PR whose fix-code just produced a
+  floor finding — which is exactly the moment that step-back is worth most. It is not
+  the lane contradicting itself, and a session that has not been told will read it that
+  way (Codex P2, #1903). The gate's strictest path points at the gate
   itself: a PR changing the rules must pass the rules it is changing, every fix moves
   the head, and each moved head costs another manual review request. READ (#1824): four review PASSES to relax a gate — architect,
   security, a cross-model reviewer, and a mandated fresh audit — of which the EXTERNAL
@@ -1922,9 +1933,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   Read those constants; do not copy them here — a hand-copied list is wrong the moment
   a hook is wired. `TestWiredHooksFenceGuardrail` keeps the WIRED-HOOK half
   self-maintaining FOR THE SPELLINGS IT RECOGNISES, by parsing
-  `.claude/settings.json` (measured: 42 of 54 wired commands discovered; the rest are
-  `.claude/hooks/*.sh` and inline blobs already covered by the prefixes, so no live
-  gap — but a `python3 -u scripts/foo.py` or `node …` wiring would slip past it); it cannot do the same for the tracked CONFIGS the
+  `.claude/settings.json` (measured 2026-09-10: **54** wired command entries, **49**
+  of them matched, **5** unmatched, yielding **42** unique paths — an earlier draft
+  said "42 of 54", which divides a path count by an entry count and so implies twelve
+  misses where there are five. The five are `.claude/hooks/*.sh` and inline blobs
+  already covered by the prefixes, so no live gap — but a `python3 -u scripts/foo.py`
+  or `node …` wiring would slip past it); it cannot do the same for the tracked CONFIGS the
   hooks read, because settings.json lists hooks and not the files they consume. Those
   entries are maintained by hand, so adding a config a hook's behaviour depends on means
   adding it to `_HOOK_SURFACE_FILES` deliberately (Codex P2, #1903). This lane is a STRICTER-REVIEW, FEWER-ROUNDS trade on that surface. It does
@@ -1952,10 +1966,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      everywhere else; here the secondary runs alongside a healthy Codex, at PR open,
      without asking (owner decision, 2026-09-09). Do not generalise this to any other PR.
      **One head = one round on every counter, however many reviewers saw it**; write the
-     local mark ONCE with combined evidence, or dual review silently halves the budget it
-     exists to spend well. That single mark is `--defects` if EITHER reviewer raised a
-     new BLOCKER/SHOULD-FIX/P1/P2 — a clean secondary does not launder a defect-bearing
-     Codex round, and an undeserved `--clean` resets the streak and disarms the cap.
+     local mark ONCE with combined evidence. That single mark is `--defects` if EITHER
+     reviewer raised a new BLOCKER/SHOULD-FIX/P1/P2 — a clean secondary does not launder
+     a defect-bearing Codex round.
+     **Two separate marks do NOT halve the budget; they can DISARM it, which is worse.**
+     An earlier draft said "halves", and the code says otherwise: `bump_review_round`
+     increments only on a DISTINCT staged hash, so a second defect mark on the same diff
+     is idempotent and costs nothing (`review_state.py:850-865`). But `--clean` resets
+     the streak to 0 **regardless of whether the staged diff changed** (`:780-784`), and
+     an idempotent same-hash `--defects` cannot restore the round it just erased. So on
+     one staged diff, in EITHER order, a mixed clean/defect pair records as CLEAN — the
+     defect-bearing round vanishes and the cap it was arming goes back to zero. That is
+     the failure the one-mark rule prevents (Codex P2, #1903).
   2. **Triage before touching code — and here it OUTRANKS "fixing is usually free".**
      That rule (below, and right for ordinary PRs) says a cheap finding costs nothing to
      fix so just fix it. On this surface the cost is not the edit, it is the PUSH: it
