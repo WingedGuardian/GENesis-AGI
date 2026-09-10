@@ -606,14 +606,23 @@ def test_cc_tmp_marker_fresh_helper():
     assert _container._cc_tmp_marker_fresh(now.replace(tzinfo=None).isoformat()) is True
 
 
-def _oom_proc(tmp_path, pids: dict[str, str]):
-    """A minimal /proc root holding oom_score_adj for the given pids."""
+def _oom_proc(tmp_path, pids: dict[str, str], *, owners: dict[str, str] | None = None):
+    """A minimal /proc root holding oom_score_adj (and cgroup) for the given pids.
+
+    ``owners`` maps pid -> the unit whose cgroup that pid sits in. Defaults to the
+    pid owning whatever unit the test names, which is the healthy case; pass it
+    explicitly to simulate a RECYCLED pid now owned by something else.
+    """
     root = tmp_path / "proc"
+    root.mkdir(parents=True, exist_ok=True)
     for pid, adj in pids.items():
         d = root / pid
         d.mkdir(parents=True, exist_ok=True)
         (d / "oom_score_adj").write_text(adj + "\n")
-    root.mkdir(parents=True, exist_ok=True)
+        owner = (owners or {}).get(pid, "genesis-server.service")
+        (d / "cgroup").write_text(
+            f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/{owner}\n"
+        )
     return root
 
 
@@ -666,7 +675,10 @@ async def test_oom_score_adj_silent_when_everything_agrees(tmp_path, monkeypatch
             "genesis-tmp-watchgod.service": ("380", "200"),
         }),
     )
-    proc = _oom_proc(tmp_path, {"275329": "100", "380": "200"})
+    proc = _oom_proc(
+        tmp_path, {"275329": "100", "380": "200"},
+        owners={"275329": "genesis-server.service", "380": "genesis-tmp-watchgod.service"},
+    )
     assert await container._oom_score_adj_declared_ok(proc) is True
 
 
@@ -722,4 +734,129 @@ async def test_oom_score_adj_silent_when_nothing_checkable(tmp_path, monkeypatch
         container, "_run_cmd",
         _fake_systemctl({"genesis-server.service": ("999999", "100")}),
     )
+    assert await container._oom_score_adj_declared_ok(proc) is None
+
+
+# ── the CLASS: no user unit may declare an unachievable OOM score ─────────────
+
+
+def test_no_repo_written_user_unit_declares_a_negative_oom_score():
+    """A user-manager unit can NEVER apply a negative oom_score_adj.
+
+    Lowering below the inherited oom_score_adj_min of 0 needs CAP_SYS_RESOURCE,
+    which a systemd USER manager does not hold, and the write fails SILENTLY —
+    no journal entry, no start failure, while `systemctl show` keeps reporting
+    the declared value. So a negative declaration in any unit this repo writes
+    into ~/.config/systemd/user is dead on arrival by construction.
+
+    This guardrail exists because scoping the runtime alert to `genesis-*`
+    units missed two real cases found in review: `qdrant.service` (written
+    inline by install.sh, a HARD dependency of the server, with no
+    template-sync path to heal it) and `agent-zero.service` (rendered from a
+    template edited in this very change, yet outside the glob). Checking the
+    SOURCE closes the class wherever the value is written, independent of which
+    units the runtime check happens to enumerate.
+
+    Deliberately excludes host/system units: `config/genesis-guardian.service`
+    runs as a SYSTEM unit where the constraint does not apply, and its 0 is a
+    considered choice ("the Guardian is NOT expendable").
+    """
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    offenders: list[str] = []
+    # Everything that writes a USER unit: the rendered templates plus the
+    # inline heredocs in the installer/bootstrap.
+    candidates = [
+        *(repo / "scripts" / "systemd").glob("*.service.template"),
+        repo / "scripts" / "install.sh",
+        repo / "scripts" / "bootstrap.sh",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue  # explanatory prose, not a declaration
+            m = re.match(r"^OOMScoreAdjust=(-?\d+)$", stripped)
+            if m and int(m.group(1)) < 0:
+                offenders.append(f"{path.relative_to(repo)}:{lineno} -> {stripped}")
+    assert not offenders, (
+        "a user unit declares a negative OOMScoreAdjust, which the user manager "
+        "will refuse SILENTLY (the value reads back correct while the kernel "
+        "ignores it). Use an achievable non-negative value:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_managed_unit_patterns_cover_every_user_unit_the_repo_writes():
+    """``_MANAGED_UNIT_PATTERNS`` must match every user unit this repo installs.
+
+    Stated as PARITY between two sets, derived from the repo, rather than as a
+    check for the three names that happen to be listed today. Mutation testing is
+    what forced this shape: narrowing the list back to ``genesis-*.service`` alone
+    broke nothing, because the source guardrail above only covers the WRITE side —
+    it proves no unit DECLARES an unachievable value, and says nothing about
+    whether the runtime alert would ever LOOK at that unit. Both halves are needed:
+    one stops the bad value being written, this one stops the watcher going blind.
+
+    So a newly added managed unit now fails here until it is enumerated, instead of
+    silently sitting outside the alert the way ``agent-zero.service`` and
+    ``qdrant.service`` did.
+    """
+    import fnmatch
+    import re
+    from pathlib import Path
+
+    from genesis.infra_profile.collectors import container
+
+    repo = Path(__file__).resolve().parents[2]
+
+    expected: set[str] = set()
+    # Rendered templates — the install/bootstrap loops write each of these.
+    for tpl in (repo / "scripts" / "systemd").glob("*.service.template"):
+        expected.add(tpl.name.removesuffix(".template"))
+    # Inline heredocs writing straight into the user unit dir.
+    for script in ("install.sh", "bootstrap.sh"):
+        path = repo / "scripts" / script
+        if not path.exists():
+            continue
+        for m in re.finditer(r'\$SYSTEMD_USER_DIR/([A-Za-z0-9@._-]+\.service)', path.read_text()):
+            expected.add(m.group(1))
+
+    assert expected, "found no user units — the derivation is stale, not the code"
+
+    unmatched = sorted(
+        unit for unit in expected
+        if not any(fnmatch.fnmatch(unit, pat) for pat in container._MANAGED_UNIT_PATTERNS)
+    )
+    assert not unmatched, (
+        "user unit(s) this repo writes are NOT covered by _MANAGED_UNIT_PATTERNS, so "
+        "the declared-vs-effective OOM alert can never see them:\n  "
+        + "\n  ".join(unmatched)
+        + "\nAdd a pattern, or the next regression in one of these is invisible."
+    )
+
+
+async def test_oom_score_adj_ignores_a_recycled_pid(tmp_path, monkeypatch):
+    """A recycled pid must not fabricate a divergence.
+
+    Between `systemctl show` and the /proc read, a unit's main process can exit
+    and its pid be reused by something unrelated — pid churn here is high. Judging
+    a stranger's adj would raise a standing high-priority alert that persists to
+    the next profile refresh (a same-key repeat is cooldown-suppressed while the
+    WRONG fact is what got persisted), and self-heal a day later — baffling rather
+    than obvious. The pid's cgroup is the discriminator.
+    """
+    from genesis.infra_profile.collectors import container
+
+    monkeypatch.setattr(
+        container, "_run_cmd",
+        _fake_systemctl({"genesis-server.service": ("275329", "100")}),
+    )
+    # The pid now belongs to an unrelated CC session scope, and its adj (500)
+    # differs from the unit's declaration (100) — a naive compare returns False.
+    proc = _oom_proc(tmp_path, {"275329": "500"}, owners={"275329": "session-c99.scope"})
     assert await container._oom_score_adj_declared_ok(proc) is None

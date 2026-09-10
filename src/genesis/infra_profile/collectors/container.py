@@ -195,6 +195,27 @@ _STOCK_TASKSMAX_FRACTION = 0.33
 _RAISED_TASKSMAX_MARGIN = 1.05
 
 
+# The user units Genesis MANAGES — the ones it writes into
+# ~/.config/systemd/user and is therefore answerable for.
+#
+# NOT just "genesis-*". Scoping by name prefix was a proxy for ownership and it
+# was wrong in two ways found in review, both of them units this very change had
+# to touch:
+#   agent-zero.service  rendered from scripts/systemd/agent-zero.service.template
+#                       by the same install/bootstrap loops as every genesis-*
+#                       unit, and its declaration is edited here — yet the prefix
+#                       never matched it, so a future regression there would have
+#                       been invisible to the alert built to catch exactly that.
+#   qdrant.service      written inline by install.sh (not a template, so
+#                       bootstrap's template-sync cannot heal it) and a HARD
+#                       dependency of genesis-server (Wants=qdrant.service).
+# A repo-source guardrail in tests/test_infra_profile closes the class at the
+# WRITE side, independent of what this runtime list happens to enumerate — that
+# is the durable half, since a new managed unit would otherwise have to be
+# remembered here.
+_MANAGED_UNIT_PATTERNS = ("genesis-*.service", "agent-zero.service", "qdrant.service")
+
+
 async def _oom_score_adj_declared_ok(proc_root: Path) -> bool | None:
     """Whether every RUNNING genesis unit's EFFECTIVE oom_score_adj matches its
     DECLARED one.
@@ -237,7 +258,7 @@ async def _oom_score_adj_declared_ok(proc_root: Path) -> bool | None:
     """
     listing = await _run_cmd(
         "systemctl", "--user", "list-units", "--type=service", "--all",
-        "--no-legend", "genesis-*.service",
+        "--no-legend", *_MANAGED_UNIT_PATTERNS,
     )
     if not listing:
         return None
@@ -269,6 +290,23 @@ async def _oom_score_adj_declared_ok(proc_root: Path) -> bool | None:
         effective = _read(proc_root / pid / "oom_score_adj")
         if effective is None:
             continue  # raced with exit, or unreadable
+        # CONFIRM the pid still belongs to this unit before comparing. Between the
+        # `systemctl show` above and this read, the unit's main process can exit
+        # and its pid be recycled by an unrelated process — this box spawns a CC
+        # subprocess constantly, so pid churn is high. Without this check the
+        # declared value would be compared against a STRANGER's adj, and a
+        # mismatch raises a standing high-priority alert that persists until the
+        # next profile refresh, because a same-key repeat is cooldown-suppressed
+        # while the wrong fact is what got persisted. The window is sub-millisecond
+        # and the alert self-heals within a day, which is precisely why it would be
+        # baffling rather than obvious.
+        # A recycled pid lands in a different cgroup, so the unit name is the
+        # discriminator. Note the SYMMETRIC case needs no guard: a genuinely
+        # divergent unit racing to exit reads as None and stays silent for one
+        # cycle, which is the safe direction.
+        owner_cgroup = _read(proc_root / pid / "cgroup") or ""
+        if unit not in owner_cgroup:
+            continue  # pid no longer this unit's — do not judge a stranger
         try:
             if int(declared) != int(effective):
                 return False
