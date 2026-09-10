@@ -1255,7 +1255,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 9730efe9 2026-09-05
+verified: 788dd9a9 2026-09-06
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1470,6 +1470,23 @@ verified: 9730efe9 2026-09-05
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
+- **Post-merge verification obligations** (LIVE, producer only — issue #1718):
+  the pulse worker's verification lane opens one `pr_verifications` row per
+  MERGED PR, so "run the E2E after merge" survives the merge instead of living
+  in someone's memory. A documentation-only diff is auto-closed with the reason
+  recorded — DETERMINISTIC by path (`session_awareness/doc_paths.py`), never a
+  model call, so a prompt/skill change is exempted by rule rather than by
+  judgement. An unreadable changed-file list fails toward KEEPING the
+  obligation. Deliberately NOT `follow_ups`: its readers (ego dispatch via
+  `get_actionable`, morning report via `get_pending`) would surface these as
+  actionable work, and they are a ledger for a validator, not work — see the
+  `20260906234824_pr_verifications` migration docstring for the full
+  New-Store-Gate justification. The CONSUMER (the Wave-3 validator session) does
+  not exist yet; today's reader is
+  `scripts/repo_pulse_worker.py --verification-backlog`. `doc_paths.is_doc_path`
+  is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
+  import `scripts/`), held in parity by
+  `tests/test_session_awareness/test_doc_paths.py`.
 - **Session charter + ledger** (session-manager stages 1-2): the
   `session_charters` + `session_ledger` DB tables (migration 0058) are the
   canonical store; `~/.genesis/sessions/<sid>/charter.md` is the regenerated
