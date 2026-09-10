@@ -261,7 +261,21 @@ def _display(value: str) -> str:
     # `str()` first: this is screen-supplied metadata, and an actuator payload
     # carrying a JSON number reached `strip_control_chars` as an int and raised
     # TypeError — on the path that builds the consent card a human reads.
-    cleaned = strip_control_chars(str(value) if value is not None else "")
+    # SURROGATES, before anything reaches the database. `strip_control_chars`
+    # is derived from the Unicode database and leaves a lone UTF-16 surrogate
+    # untouched — it is not a control character. `json.loads` of an escaped
+    # surrogate produces one, so an actuator relaying screen metadata can hand
+    # us one, and encoding it as UTF-8 then raises UnicodeEncodeError. That
+    # encode is exactly what the DB driver does when binding the parameter, so
+    # the gate would CRASH on the hold path instead of recording the hold —
+    # refusing nothing, allowing nothing, and taking the caller down with it.
+    # Hostile screen text must not be able to take out the authorization gate;
+    # that is the whole threat model here. `surrogatepass` then `replace`
+    # renders them as U+FFFD rather than dropping the field, so the operator
+    # still sees the rest of the control's name.
+    raw = str(value) if value is not None else ""
+    raw = raw.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+    cleaned = strip_control_chars(raw)
     if len(cleaned) <= _DISPLAY_LIMIT:
         return cleaned
     return f"{cleaned[:_DISPLAY_LIMIT]}… <{len(cleaned) - _DISPLAY_LIMIT} more chars>"
@@ -726,9 +740,7 @@ class DesktopTakeoverGate:
         # Also read fresh: stamping from the pre-await capture silently
         # shortens the window the DEVICE enforces, so an action could be
         # refused at the machine for time it was never given.
-        expires_at = (
-            datetime.now(UTC) + timedelta(seconds=action_ttl_seconds())
-        ).isoformat()
+        ttl_seconds = action_ttl_seconds()
         logger.info(
             "Desktop gate ALLOWED %s:%s:%s on %r in %r (grant=%s, expires=%s)",
             domain,
@@ -737,9 +749,17 @@ class DesktopTakeoverGate:
             element_name,
             window_title,
             grant.row_id,
-            expires_at,
+            f"+{ttl_seconds}s",
         )
         await self._emit_allowed(window_title, element_name, grant.row_id)
+        # Stamped AFTER the emit, which is the last awaited work on this path.
+        # `GenesisEventBus.emit` awaits its listeners INLINE, so a slow listener
+        # burns the window before the decision is even returned: stamp first and
+        # a listener taking action_ttl_seconds hands the device a deadline that
+        # is already past, and the device correctly refuses an action the gate
+        # correctly allowed. The freshness the device enforces has to start when
+        # the gate stops working, not when it started.
+        expires_at = (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat()
         return DesktopGateDecision(
             allow=True,
             reason=reason,

@@ -2236,6 +2236,55 @@ async def test_a_malformed_row_does_not_break_the_cli_approval_probe(db):
 
 
 @pytest.mark.asyncio
+async def test_a_lone_surrogate_in_screen_text_does_not_crash_the_gate(db, live):
+    """Hostile screen text must not be able to take out the authorization gate.
+
+    `strip_control_chars` is derived from the Unicode database, and a lone
+    UTF-16 surrogate is not a control character, so it passed through untouched.
+    `json.loads` of an escaped surrogate produces one — an actuator relaying
+    screen metadata can hand us one — and encoding it as UTF-8 raises
+    UnicodeEncodeError, which is precisely what the DB driver does when binding
+    the description. The gate CRASHED on the hold path instead of recording the
+    hold: refusing nothing, allowing nothing, taking the caller with it."""
+    await _grant(db)
+    d = await _check(db, element_name="Delete\ud800", control_type="Button")
+    assert d.reason == "held" and d.request_id, "the hold must still be RECORDED"
+
+    row = await ar.get_by_id(db, d.request_id)
+    row["description"].encode("utf-8")  # the operation that used to raise
+    assert "Delete" in row["description"], "the rest of the name still reaches the operator"
+
+
+@pytest.mark.asyncio
+async def test_the_device_deadline_starts_when_the_gate_STOPS_working(db, live, monkeypatch):
+    """`expires_at` was computed before `_emit_allowed`, which awaits its event
+    listeners INLINE. A listener slower than the action TTL therefore handed the
+    device a deadline already in the past, and the device correctly refused an
+    action the gate correctly allowed."""
+    import asyncio
+
+    await _grant(db)
+    monkeypatch.setattr(dg, "action_ttl_seconds", lambda: 1)
+
+    real_emit = dg.DesktopTakeoverGate._emit_allowed
+
+    async def _slow(self, *a, **kw):
+        await asyncio.sleep(1.4)  # longer than the whole TTL
+        return await real_emit(self, *a, **kw)
+
+    monkeypatch.setattr(dg.DesktopTakeoverGate, "_emit_allowed", _slow)
+
+    d = await _check(db, element_name="Text Area", control_type="Edit")
+    assert d.allow is True and d.expires_at
+
+    remaining = (datetime.fromisoformat(d.expires_at) - datetime.now(UTC)).total_seconds()
+    assert remaining > 0, (
+        f"the device deadline was already {-remaining:.1f}s in the past on return — "
+        "the action would be refused at the machine for time it was never given"
+    )
+
+
+@pytest.mark.asyncio
 async def test_the_kill_switch_reads_no_config_at_all(db, monkeypatch):
     """`effective_mode()` checks the env kill switch BEFORE any YAML, so an
     unparseable config is not a way around the stop. Reading the TTL at the top
