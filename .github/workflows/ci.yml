@@ -664,4 +664,25 @@ jobs:
         # whole point of shipping report-only first was to avoid inventing one.
         # Raising either bound is a deliberate act that belongs in the same commit
         # as the change that moves it; both failure messages say so.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 95 --min-collected 23164
+        #
+        # RAISED 95 -> 99 and 23164 -> 23217 by the FalkorDB store, both counted
+        # rather than padded. The skip axis: four engine-gated tests, which skip
+        # wherever the engine is not provisioned — CI included, by design, since
+        # no runner has a socket. MEASURED by running the file: "32 passed, 4
+        # skipped".
+        #
+        # The collected axis: +53. MEASURED by COLLECTION rather than by grepping
+        # for a test-function definition, because a parametrised case collects as
+        # many as it has params and reads as one. Collecting the three files that
+        # differ from main gives 94; main collects 41 from the one of the three
+        # that already existed.
+        #
+        # RE-COUNT AFTER THE LAST EDIT THAT ADDS A TEST. This line was wrong twice
+        # before it was right: first at 48, counted before a review round added
+        # four tests, then at 52, counted before that round's own audit added a
+        # fifth. Both times the skip axis WAS re-derived and this one was not,
+        # because a new skip announces itself by turning CI red while a new test
+        # does not. That asymmetry is the trap: an under-set floor still passes,
+        # so the guard quietly forfeits the exact fit it exists to hold and
+        # nothing says a word.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
