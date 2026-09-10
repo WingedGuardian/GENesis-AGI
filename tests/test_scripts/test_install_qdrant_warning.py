@@ -182,6 +182,113 @@ def test_every_warning_setter_goes_through_setup_warn():
     )
 
 
+# ── generated-code escaping ───────────────────────────────────────────────────
+# install.sh GENERATES shell (the `genesis` wrapper, a .bashrc line) and a sed
+# replacement. Both embed values that can contain metacharacters, and both used
+# fixed quoting that silently mis-renders rather than failing loudly.
+
+
+@pytest.mark.parametrize(
+    "repo_dir",
+    [
+        "/home/u/it's genesis",   # apostrophe ENDS a single-quoted string early
+        "/home/u/plain",
+        '/home/u/say "hi"',
+        "/home/u/with space",
+    ],
+)
+def test_generated_genesis_wrapper_parses_for_any_repo_path(repo_dir):
+    """The generated wrapper must be valid shell whatever the checkout path is.
+
+    With fixed single quotes an apostrophe in the path closed the string early, so
+    /usr/local/bin/genesis did not even parse — and nothing would surface that
+    until the first time someone typed `genesis`.
+
+    Runs the SHIPPED quoting and the SHIPPED heredoc, extracted from install.sh.
+    An earlier version of this test re-implemented `printf %q` inline and was
+    consequently GREEN when the production quoting was mutated back to fixed
+    single quotes — it was testing its own copy. Mutation testing is what caught
+    that, and it is the reason this extracts instead of restating.
+    """
+    text = INSTALL.read_text()
+
+    m = re.search(r"^(\s*_repo_q=.*)$", text, re.MULTILINE)
+    assert m, "could not extract the _repo_q assignment from install.sh — stale"
+    quote_line = m.group(1).strip()
+
+    h = re.search(
+        r"sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER\n(.*?)\nWRAPPER",
+        text, re.DOTALL,
+    )
+    assert h, "could not extract the wrapper heredoc from install.sh — stale"
+    heredoc_body = h.group(1)
+
+    # Reproduce install.sh's generation step verbatim: set REPO_DIR, run the
+    # shipped quoting line, expand the shipped heredoc.
+    gen = subprocess.run(
+        ["bash", "-c",
+         f'REPO_DIR="$1"\n{quote_line}\ncat <<WRAPPER\n{heredoc_body}\nWRAPPER\n',
+         "_", repo_dir],
+        capture_output=True, text=True,
+    )
+    assert gen.returncode == 0, f"generation failed: {gen.stderr}"
+    script = gen.stdout
+
+    syn = subprocess.run(["bash", "-n", "/dev/stdin"], input=script,
+                         capture_output=True, text=True)
+    assert syn.returncode == 0, (
+        f"the generated wrapper does not parse for {repo_dir!r}: {syn.stderr}\n{script}"
+    )
+
+    # And its `cd` must target the SAME directory, not a truncated one.
+    cd_line = next(line for line in script.splitlines() if line.startswith("cd "))
+    probe = subprocess.run(
+        ["bash", "-c", f'{cd_line.split(" 2>/dev/null")[0]} 2>/dev/null && pwd || echo MISSING'],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert probe in (repo_dir, "MISSING"), (
+        f"the generated cd resolved to {probe!r}, a DIFFERENT directory than {repo_dir!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "az_root",
+    [
+        "/tmp/R&D",          # bare & in a sed replacement = the whole matched text
+        "/tmp/a|b",          # the delimiter — sed rejects the expression outright
+        "/tmp/back\\slash",
+        "/home/u/agent-zero",
+    ],
+)
+def test_az_root_survives_sed_substitution_verbatim(az_root):
+    """A configurable path used as a sed REPLACEMENT must render verbatim.
+
+    AZ_ROOT is operator-set, so it is the one substitution value that can carry a
+    metacharacter. Unescaped, `/tmp/R&D` rendered
+    `WorkingDirectory=/tmp/R__AZ_ROOT__D` (& means "the whole match") and `|` made
+    sed reject the expression, aborting the install under `set -e`.
+
+    The escape is extracted from the shipped script so this tests the real
+    expression, not a restatement of it — and the first version I wrote emitted
+    TWO backslashes and still mis-rendered, which is exactly why this asserts the
+    rendered OUTPUT rather than the shape of the escape.
+    """
+    text = INSTALL.read_text()
+    m = re.search(r"_az_root_esc=\$\(printf '%s' \S+ \| (sed -e '[^']+')\)", text)
+    assert m, "could not extract the AZ_ROOT escape from install.sh — stale"
+    escape_cmd = m.group(1)
+
+    rendered = subprocess.run(
+        ["bash", "-c",
+         f'esc=$(printf "%s" "$1" | {escape_cmd}); '
+         f'printf "WorkingDirectory=__AZ_ROOT__\n" | sed -e "s|__AZ_ROOT__|$esc|g"',
+         "_", az_root],
+        capture_output=True, text=True,
+    )
+    assert rendered.returncode == 0, f"sed rejected the expression: {rendered.stderr}"
+    assert rendered.stdout.strip() == f"WorkingDirectory={az_root}", rendered.stdout
+
+
 # ── rendered-template placeholder parity ──────────────────────────────────────
 
 

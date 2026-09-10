@@ -799,7 +799,12 @@ if ! grep -q '# Auto-cd to Genesis project on login' "$HOME/.bashrc" 2>/dev/null
     # $REPO_DIR, not a hardcoded ~/genesis: the installer already knows where it
     # was cloned, and a clone anywhere else got a login hook pointing at a
     # directory that does not exist.
-    echo "[ -d '$REPO_DIR' ] && cd '$REPO_DIR'" >> "$HOME/.bashrc"
+    #
+    # printf %q, not fixed single quotes: a path containing an apostrophe would
+    # END the quoted string early, and the line would silently target a DIFFERENT
+    # directory (or fail to parse) with nothing to indicate it. %q produces a
+    # form the shell re-reads as exactly this path, whatever is in it.
+    echo "[ -d $(printf '%q' "$REPO_DIR") ] && cd $(printf '%q' "$REPO_DIR")" >> "$HOME/.bashrc"
     echo "    + Auto-cd to $REPO_DIR on login"
 fi
 
@@ -935,11 +940,25 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # placeholder where an absolute path belongs — systemd rejects it, and
             # nothing noticed because install.sh never enables agent-zero. Default
             # matches scripts/vendor_assets.sh's own AZ_ROOT default.
+            #
+            # AZ_ROOT is operator-CONFIGURABLE, so it is escaped for use as a sed
+            # REPLACEMENT before substitution. An unescaped `&` means "the whole
+            # matched text" to sed, so AZ_ROOT=/tmp/R&D would render
+            # `WorkingDirectory=/tmp/R__AZ_ROOT__D`; a `|` is the delimiter here
+            # and makes sed reject the expression outright, aborting the install
+            # under `set -e`. The other four values are installer-derived paths,
+            # not user input, but escaping only the configurable one is the point:
+            # it is the only one an operator can put a metacharacter into.
+            # Replacement is `\\&` in the sed script: `\\` is a literal backslash
+            # and `&` the matched char, so each metacharacter gets exactly ONE
+            # backslash. `\\\\&` would emit TWO, leaving `&` still meaning "the
+            # whole match" — verified by hand, since it looks correct and is not.
+            _az_root_esc=$(printf '%s' "${AZ_ROOT:-$HOME/agent-zero}" | sed -e 's/[\\&|]/\\&/g')
             sed -e "s|__HOME__|$HOME|g" \
                 -e "s|__VENV__|$VENV_PATH|g" \
                 -e "s|__REPO_DIR__|$REPO_DIR|g" \
                 -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
-                -e "s|__AZ_ROOT__|${AZ_ROOT:-$HOME/agent-zero}|g" \
+                -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
@@ -1363,9 +1382,15 @@ if [ ! -f /usr/local/bin/genesis ]; then
     # quoted form hardcoded ~/genesis, so on any clone elsewhere the `genesis`
     # command was installed dead and every assertion about it still passed.
     # "$@" is escaped so it survives to the generated script.
+    # printf %q, not fixed single quotes: an apostrophe in the path would end the
+    # quoted string early, so the GENERATED script would not even parse
+    # (`bash -n` fails on it) — and the failure would only show up the first time
+    # someone typed `genesis`. %q emits a form the shell re-reads as exactly this
+    # path. The message keeps the raw path, since it is prose, not code.
+    _repo_q="$(printf '%q' "$REPO_DIR")"
     sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER
 #!/bin/bash
-cd '$REPO_DIR' 2>/dev/null || { echo "Genesis repo not found at $REPO_DIR"; exit 1; }
+cd $_repo_q 2>/dev/null || { echo "Genesis repo not found at $REPO_DIR"; exit 1; }
 exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis
