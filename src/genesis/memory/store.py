@@ -214,31 +214,57 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
+        # Dedup: skip if exact content already stored (any collection).
+        # The LOOKUP is what is best-effort, and only the lookup is inside this
+        # guard. The supersede below deliberately sits OUTSIDE it: it raises
+        # SupersedeUnresolved, which is a plain Exception, so a handler wrapped
+        # around both would catch the unresolvable-target signal, mislabel it
+        # "Dedup check failed", and fall through into the full store pipeline —
+        # writing a SECOND copy of content that already exists. That is the
+        # exact duplication this change exists to stop, on the exact path the
+        # MCP warning tells the caller to retry ("the content will not be
+        # duplicated"). Found in review of this PR (#1831).
+        existing: str | None = None
         try:
             existing = await memory_crud.find_exact_duplicate(
                 self._db, content=content,
             )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                if supersedes:
-                    # The supersede still has to happen. This early return sits
-                    # ~300 lines above the supersede block, so a correction
-                    # whose content already exists used to skip the deprecation
-                    # silently while the caller was told it succeeded — worse
-                    # than the bug this path was fixed for, because it is an
-                    # affirmative false claim rather than silence. And it is
-                    # the LIKELIEST path: retrying a failed supersede re-sends
-                    # the same content with a corrected id, which lands here.
+        except Exception:
+            # Dedup check is best-effort — never block a store on lookup failure
+            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+            existing = None
+
+        if existing:
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            if supersedes:
+                # The supersede still has to happen. This early return sits
+                # ~300 lines above the supersede block, so a correction
+                # whose content already exists used to skip the deprecation
+                # silently while the caller was told it succeeded — worse
+                # than the bug this path was fixed for, because it is an
+                # affirmative false claim rather than silence. And it is
+                # the LIKELIEST path: retrying a failed supersede re-sends
+                # the same content with a corrected id, which lands here.
+                try:
                     _deg = await self._mark_superseded(
                         supersedes, existing, datetime.now(UTC).isoformat(),
                     )
                     if supersede_degraded is not None:
                         supersede_degraded.extend(_deg)
-                return existing
-        except Exception:
-            # Dedup check is best-effort — never block a store on lookup failure
-            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+                except SupersedeUnresolved:
+                    # Escapes to the MCP layer exactly as it does on the normal
+                    # path (see the same clause at the supersede block below).
+                    raise
+                except Exception:
+                    # Mirrors the normal path: a transient failure of the
+                    # deprecation must not turn a durable store into a raised
+                    # error, which reads as "the store failed" and invites the
+                    # duplicating retry.
+                    logger.warning(
+                        "Failed to mark memory %s as superseded by %s",
+                        supersedes, existing, exc_info=True,
+                    )
+            return existing
 
         # Surface form normalization: expand known aliases before embedding
         try:
