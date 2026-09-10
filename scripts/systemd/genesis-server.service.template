@@ -1,6 +1,14 @@
 [Unit]
 Description=Genesis Standalone Server
-After=network.target qdrant.service
+# genesis-falkordb is ordering-only and deliberately NOT pulled in. The unit is
+# rendered on every install but armed only by an explicit `enable`, and a Wants=
+# here would START it regardless of that -- MEASURED: a DISABLED unit named in
+# another unit's Wants= is started anyway (enablement gates only what
+# default.target pulls in). On an install that never opted into provisioning
+# there is no redis >= 8.0.0 to run, so it would restart-loop to `failed` on a
+# box whose operator declined the whole feature. After= alone orders the two
+# where the operator armed the engine, and is inert everywhere else.
+After=network.target qdrant.service genesis-falkordb.service
 Wants=qdrant.service
 StartLimitBurst=4
 StartLimitIntervalSec=120

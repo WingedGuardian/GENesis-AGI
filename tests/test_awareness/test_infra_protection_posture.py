@@ -61,6 +61,8 @@ def _profile(
     keepconfig: object = True,
     watchdog: object = True,
     cc_tmp_isolated: object = True,
+    falkordb_active: object = None,
+    falkordb_socket: object = False,
     container: object = "lxc",
     age_days: float = 0.0,
     collected_at: object = "auto",
@@ -97,6 +99,20 @@ def _profile(
             },
             "virt": {"status": "ok", "facts": {"container": container}},
             "storage": {"status": "ok", "facts": {"cc_tmp_isolated": cc_tmp_isolated}},
+            # Graph engine. Defaults are the unprovisioned state (no unit, no
+            # socket), which must stay SILENT — the engine is opt-in and most
+            # installs will never arm it.
+            "falkordb": {
+                "status": "ok",
+                # Volatile states live in METRICS (infra_profile/types.py):
+                # facts are hashed, and hashing a value that flips on every
+                # engine restart bills an LLM annotation each time.
+                "facts": {"unit": "genesis-falkordb.service"},
+                "metrics": {
+                    "unit_active_state": falkordb_active,
+                    "socket_present": falkordb_socket,
+                },
+            },
         }
     }
     if collected_at is not None:
@@ -130,6 +146,8 @@ _ALL_DEFECTS = dict(
     keepconfig=False,
     watchdog=False,
     cc_tmp_isolated=False,
+    falkordb_active="active",  # armed...
+    falkordb_socket=False,     # ...but its socket never appeared
 )
 
 
@@ -138,6 +156,7 @@ def test_all_defects_detected():
         "cc_tmp_shared_fs",
         "container_swap_disabled",
         "container_swap_knob_off",
+        "falkordb_socket_missing",
         "host_swap_absent",
         "network_watchdog_absent",
         "networkd_keepconfig_missing",
@@ -508,6 +527,54 @@ async def test_alert_notes_unverifiable_planes(monkeypatch):
         await db.close()
 
 
+def test_falkordb_unarmed_is_silent():
+    """The engine is opt-in: absent/disabled/stopped must never alert.
+
+    Most installs will never arm it, and nothing in Genesis reads it yet, so a
+    rule that fired on "not running" would cry wolf on every box — the fastest
+    way to get a posture check ignored.
+    """
+    for state in (None, "inactive", "failed", "activating"):
+        found = _infra_missing_protections(_profile(falkordb_active=state))
+        assert "falkordb_socket_missing" not in found, state
+
+
+def test_falkordb_active_with_socket_is_silent():
+    found = _infra_missing_protections(
+        _profile(falkordb_active="active", falkordb_socket=True)
+    )
+    assert "falkordb_socket_missing" not in found
+
+
+def test_falkordb_active_without_socket_alerts():
+    """systemd says healthy, every reader would fail to connect — the one
+    combination worth waking someone for."""
+    found = _infra_missing_protections(
+        _profile(falkordb_active="active", falkordb_socket=False)
+    )
+    assert "falkordb_socket_missing" in found
+
+
+def test_falkordb_stale_section_does_not_assert_posture():
+    """A not-ok section retains previous readings; rules must not read them."""
+    prof = _profile(falkordb_active="active", falkordb_socket=False)
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb_socket_missing" not in _infra_missing_protections(prof)
+
+
+def test_falkordb_stale_section_holds_the_all_clear():
+    """Going quiet is not the same as being fine.
+
+    The rule's only inputs come from this section, so a collector failure makes
+    it fall silent. Without falkordb in _POSTURE_PLANES that silence would read
+    as recovery and RESOLVE an open alert while the engine is still broken and
+    unobservable — the exact false all-clear the mechanism exists to prevent.
+    """
+    prof = _profile(falkordb_active="active", falkordb_socket=False)
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" in _loop._infra_unverifiable_planes(prof)
+
+
 # ── coverage guardrails (provision-or-surface convention) ──────────────────
 
 
@@ -527,10 +594,14 @@ def test_every_rule_slug_has_detail_text():
 
 
 def test_resilience_facts_are_covered():
-    # Provision-or-surface: every memory- AND network-resilience effective-fact
-    # must be read by the posture rules, so a protection can't silently lose its
+    # Provision-or-surface: every effective-fact a protection depends on must be
+    # read by the posture rules, so a protection can't silently lose its
     # surfacing signal in a refactor. (Adding a NEW protection fact requires
     # extending both the rules and this list — that is the point.)
+    # The list has outgrown its original memory+network scope: storage and the
+    # graph engine are in here too, and the guarantee is the same for all of
+    # them — a rename on either side must fail HERE rather than silently
+    # disarming the rule.
     src = inspect.getsource(_infra_missing_protections)
     for fact in (
         "cgroup_memory_swap_max",
@@ -543,6 +614,10 @@ def test_resilience_facts_are_covered():
         "network_watchdog_enabled",
         "cc_tmp_isolated",
         "cc_tmp_apply_blocked_on_cc",
+        # Graph engine. These are the ONLY two keys tying the collector's output
+        # to the rule; a rename on either side disarms the alert silently.
+        "unit_active_state",
+        "socket_present",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 

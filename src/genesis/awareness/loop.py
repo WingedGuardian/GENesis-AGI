@@ -587,6 +587,16 @@ _INFRA_POSTURE_DETAIL = {
         "persists across many quiet windows. To close it immediately, a deliberate "
         "container restart runs the apply in the guaranteed-quiet boot window"
     ),
+    "falkordb_socket_missing": (
+        "the graph engine's unit (genesis-falkordb) is ACTIVE but its unix socket "
+        "is absent, so every reader will fail to connect while systemd reports the "
+        "service healthy. Usually the module failed to load — check "
+        "`journalctl --user -u genesis-falkordb -n 30` for a load error (a module "
+        "without the execute bit, or a redis older than 8.0.0, both refuse at "
+        "startup). Re-run scripts/bootstrap.sh to re-provision, or "
+        "`systemctl --user disable --now genesis-falkordb` to stand it down — "
+        "nothing depends on the engine yet, so standing it down is safe"
+    ),
 }
 
 
@@ -624,6 +634,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             return {}
         facts = section.get("facts")
         return facts if isinstance(facts, dict) else {}
+
+    def _metrics(plane: str) -> dict:
+        # Same status gate as _facts: a not-ok section RETAINS its previous
+        # values, and asserting posture from stale readings is the defect that
+        # gate exists to prevent. Metrics (not facts) because volatile states
+        # must not be hashed — see infra_profile/types.py.
+        section = sections.get(plane)
+        if not isinstance(section, dict) or section.get("status") != "ok":
+            return {}
+        metrics = section.get("metrics")
+        return metrics if isinstance(metrics, dict) else {}
 
     def _explicit_zero(value: object) -> bool:
         # bool is an int subclass (False == 0), so a malformed bool fact must
@@ -684,10 +705,33 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
+    # Graph engine: the ONE combination that means something is wrong. An
+    # absent, disabled or stopped unit is the deliberate default (nothing reads
+    # the engine yet), so it stays silent — alerting there would fire on every
+    # install that has simply not adopted it. Active-without-a-socket is
+    # different: systemd reports the service healthy while every reader would
+    # fail to connect. Explicit values only, per this function's contract.
+    falkordb = _metrics("falkordb")
+    if (
+        falkordb.get("unit_active_state") == "active"
+        and falkordb.get("socket_present") is False
+    ):
+        missing.append("falkordb_socket_missing")
     return sorted(missing)
 
 
-_POSTURE_PLANES = ("memory", "host_system", "host_virt", "network", "storage")
+_POSTURE_PLANES = (
+    "memory",
+    "host_system",
+    "host_virt",
+    "network",
+    "storage",
+    # The falkordb rule's only inputs come from this section. Without it here, a
+    # collector failure (which RETAINS stale values under status=error) would
+    # make the rule fall silent AND leave `unverifiable` empty — resolving an
+    # open engine alert while the engine is still broken and unobservable.
+    "falkordb",
+)
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
