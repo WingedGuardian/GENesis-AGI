@@ -137,6 +137,42 @@ def local_overlay_mtime(base_path: Path) -> float:
         return 0.0
 
 
+def local_overlay_key(base_path: Path) -> tuple[int, int, int]:
+    """``(mtime_ns, size, inode)`` of the ``.local.yaml`` overlay, or zeros.
+
+    A finer cache key than :func:`local_overlay_mtime`, and purely additive —
+    that function is unchanged, so no existing caller moves.
+
+    The float mtime it returns carries the filesystem's own resolution, so a
+    rewrite landing inside one tick is invisible to a cache keyed on it: a
+    coarse filesystem, a fast `settings_update`, or an editor or restore that
+    preserves timestamps all leave the key unchanged while the file's CONTENT
+    changed. A config cache guarded that way serves the old value indefinitely,
+    which defeats the point of re-reading config live. `st_mtime_ns` is an
+    integer at nanosecond resolution, and `st_size` moves on almost any real
+    edit; both come from one `stat()`.
+
+    The INODE is the third part, and it is what covers the case the first two
+    cannot: a writer that preserves the timestamp AND lands the same byte count.
+    Every atomic write in this repo goes through a temp file and a rename
+    (`mcp/health/settings.py::_atomic_yaml_write`), and a restore from backup
+    writes a new file too — both change the inode even when nothing else moves.
+
+    Still not a content hash — hashing means reading the file, which is the work
+    such a cache exists to avoid. The one shape this cannot see is an IN-PLACE
+    rewrite that keeps both the size and the timestamp, which no writer here
+    performs; `reset_config_cache()` is the deterministic escape if one ever
+    does. This narrows the window; it does not close it, and saying otherwise
+    would be the kind of claim this repo keeps having to retract.
+    """
+    local_path = _resolve_overlay_path(base_path)
+    try:
+        st = local_path.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return (0, 0, 0)
+
+
 def _deep_merge(base: dict, overlay: dict) -> dict:
     """Recursively merge *overlay* into *base*.  Lists are replaced."""
     merged = dict(base)

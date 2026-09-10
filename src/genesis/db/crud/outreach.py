@@ -141,6 +141,30 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     return cursor.rowcount > 0
 
 
+async def delivered_topic_exists(
+    db: aiosqlite.Connection, *, signal_type: str, topic: str
+) -> bool:
+    """Was this EXACT (signal_type, topic) ever DELIVERED — at any time?
+
+    The unwindowed twin of ``OutreachGovernance._is_duplicate``'s primary key. That
+    check is deliberately bounded (24h by default) so a recurring signal can re-alert;
+    this one is for a POINT EVENT that must be delivered at most once for its whole
+    lifetime, where a caller's own permanent marker may have failed to commit after a
+    successful send. ``outreach_history`` carries no retention prune (only an
+    id-scoped ``delete``), so a delivered row is a durable record of that send.
+
+    Deliberately NOT keyed on ``category``: the caller owns the ``topic`` namespace
+    (it embeds its own dedup key), so signal_type + topic is already exact, and adding
+    a column a caller could change would silently weaken the guarantee.
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM outreach_history "
+        "WHERE signal_type = ? AND topic = ? AND delivered_at IS NOT NULL LIMIT 1",
+        (signal_type, topic),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def find_by_delivery_id(
     db: aiosqlite.Connection, delivery_id: str
 ) -> dict | None:

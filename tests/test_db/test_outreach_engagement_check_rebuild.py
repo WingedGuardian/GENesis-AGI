@@ -183,6 +183,7 @@ async def test_final_ddl_preserves_all_chain_probe_fragments(tmp_path):
         "'approval', 'content'",  # rebuild 2 ('content')
         "'content', 'notification'",  # rebuild 3 ('notification')
         "'engaged'",  # rebuild 4 (this fix)
+        "'notification', 'marketing'",  # rebuild 5 ('marketing')
     ]
     db = await _seeded_db(tmp_path)
     try:

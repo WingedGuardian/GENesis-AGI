@@ -23,6 +23,8 @@ import random
 import re
 import signal
 import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.mcp.health import mcp
@@ -51,6 +53,12 @@ _TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
 def _ts_log_write(msg: str) -> None:
     """Write a timestamped line directly to the Turnstile debug log."""
     try:
+        # Deliberate LOCAL import despite the module-level one: it keeps this
+        # writer out of reach of patch.object(browser, "datetime"), which the
+        # clock-controlled screenshot tests use. Deleting it as "redundant"
+        # would let this function consume an injected side_effect entry and
+        # write a MagicMock repr into the log — silently, since this block
+        # swallows exceptions.
         from datetime import UTC, datetime
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -114,6 +122,14 @@ _IDLE_TIMEOUT_S = 3600  # 1 hour
 
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
+#: Pointer readback tolerance. VNC positioning is not exact to the pixel, so a
+#: small delta is normal; a large one means the move was not DELIVERED as
+#: asked — clamped, dropped, or the pointer grabbed — rather than jitter.
+_POINTER_DRIFT_TOLERANCE_PX = 3
+#: Pointer readback probe timeout. Generous — xdotool answers in
+#: milliseconds against a healthy X server, so exceeding this means the
+#: server is wedged, not that the probe was slow.
+_POINTER_PROBE_TIMEOUT_S = 5
 _VNC_PASSWORD = os.environ.get("GENESIS_VNC_PASSWORD", "genesis")
 # vncdotool server format: display-number notation (display 99 = port 5999).
 # "localhost::5999" causes Connection Lost due to IPv6 resolution.
@@ -1496,6 +1512,110 @@ async def _solve_with_playwright_captcha(page) -> bool:
         return False
 
 
+def vnc_click_target(
+    *,
+    win_x: int,
+    win_y: int,
+    page_left: float,
+    page_top: float,
+    chrome_h: int,
+    dpr: float,
+) -> tuple[int, int]:
+    """Map a CSS-pixel page coordinate to a PHYSICAL screen coordinate.
+
+    Two different spaces meet here, and mixing them is silent:
+
+    * ``win_x``/``win_y`` come from ``xdotool getwindowgeometry`` — PHYSICAL
+      screen pixels, the space VNC input is delivered in.
+    * ``page_left``/``page_top`` come from ``getBoundingClientRect()``, and
+      ``chrome_h`` from ``outerHeight - innerHeight`` — both CSS pixels.
+
+    Those are the same number only when ``devicePixelRatio == 1``. Anywhere
+    else the click lands short of the target by the scale factor, with no
+    error — at dpr 1.25 a control 800 CSS-px down the page is clicked 200
+    physical pixels high.
+
+    This is pure so the scaled cases can be tested: the display this runs on
+    is dpr 1.0, so the bug is dormant here and CANNOT be exercised end to end.
+    Note the caller already spoofs window metrics for anti-detection, and
+    ``devicePixelRatio`` is itself a common fingerprinting vector, so a dpr
+    other than 1.0 is not hypothetical.
+    """
+    scale = dpr if dpr and dpr > 0 else 1.0
+    click_x = win_x + int(page_left * scale)
+    click_y = win_y + int((chrome_h + page_top) * scale)
+    return click_x, click_y
+
+
+async def _kill_and_reap(proc) -> None:
+    """Kill a subprocess and collect it.
+
+    ``asyncio.wait_for`` cancels the WAIT, never the child. MEASURED: a
+    process whose ``communicate()`` was cancelled by ``wait_for`` is still
+    running afterwards, with ``returncode is None``. Every timeout path that
+    does not do this leaks the process for as long as it chooses to run —
+    which, for a probe against a wedged X server, is unbounded.
+    """
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return  # already gone; nothing to reap
+    with contextlib.suppress(Exception):
+        await proc.wait()
+
+
+async def _read_pointer_position(
+    *, timeout_s: float = _POINTER_PROBE_TIMEOUT_S,
+) -> tuple[int, int] | None:
+    """Read the X pointer's ACTUAL position, or ``None`` if it cannot be read.
+
+    Best-effort by contract: every measurement failure returns ``None`` rather
+    than raising, because a click must not be blocked by an unavailable
+    measurement. Cancellation is not a measurement failure — the caller is
+    gone — so it reaps the child and propagates. It is still LOGGED: an absent
+    readback must never read as a clean one. The ``OSError`` catch is
+    load-bearing beyond tidiness: a missing ``xdotool`` raises
+    ``FileNotFoundError`` here, and the caller's outer handler for that
+    exception reports a missing ``vncdo`` and abandons the click.
+    """
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "xdotool", "getmouselocation", "--shell",
+            env={**os.environ, "DISPLAY": _VNC_DISPLAY},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        return None
+
+    try:
+        probe_out, _ = await asyncio.wait_for(probe.communicate(), timeout=timeout_s)
+    except asyncio.CancelledError:
+        # MEASURED: an outer cancellation reaches NEITHER handler below and
+        # leaves the child running (returncode None, pid alive). Not an exotic
+        # path — browser_navigate cancels this whole call at its 300s ceiling,
+        # and a wedged X server is both what holds the probe open and what
+        # makes that ceiling get reached.
+        await _kill_and_reap(probe)
+        raise
+    except (TimeoutError, OSError) as exc:
+        await _kill_and_reap(probe)
+        _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        return None
+
+    try:
+        probe_vals = dict(
+            line.split("=", 1)
+            for line in probe_out.decode().splitlines()
+            if "=" in line
+        )
+        return int(probe_vals["X"]), int(probe_vals["Y"])
+    except (KeyError, ValueError, UnicodeDecodeError) as exc:
+        _ts_log.info("VNC: pointer readback unavailable (%s)", type(exc).__name__)
+        return None
+
+
 async def _vnc_click_turnstile(page) -> bool:
     """Click the Turnstile checkbox via VNC trusted input (fallback).
 
@@ -1519,7 +1639,16 @@ async def _vnc_click_turnstile(page) -> bool:
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "DISPLAY": _VNC_DISPLAY},
             )
-            xdo_out, _ = await asyncio.wait_for(xdo.communicate(), timeout=3)
+            try:
+                xdo_out, _ = await asyncio.wait_for(xdo.communicate(), timeout=3)
+            except (asyncio.CancelledError, TimeoutError):
+                # Same leak as the pointer probe below: the wait is cancelled,
+                # the process is not. Reap it, then re-raise — a timeout falls
+                # through to the (0,0) default via the enclosing
+                # ``except Exception``, a cancellation propagates straight past
+                # it (CancelledError is a BaseException).
+                await _kill_and_reap(xdo)
+                raise
             xdo_text = xdo_out.decode()
             # Parse "Position: X,Y (screen: 0)\n  Geometry: WxH"
             import re
@@ -1595,10 +1724,14 @@ async def _vnc_click_turnstile(page) -> bool:
                 chrome_h = 34
         except Exception:
             chrome_h = 34
+            dpr = 1.0
             _ts_log.info("VNC: chrome_h measurement failed, using default 34")
 
-        click_x = win_x + int(page_coords["left"])
-        click_y = win_y + chrome_h + int(page_coords["top"])
+        click_x, click_y = vnc_click_target(
+            win_x=win_x, win_y=win_y,
+            page_left=page_coords["left"], page_top=page_coords["top"],
+            chrome_h=chrome_h, dpr=dpr,
+        )
 
         _ts_log.info(
             "VNC TARGETING: (%d, %d) matched='%s' "
@@ -1642,6 +1775,55 @@ async def _vnc_click_turnstile(page) -> bool:
             return False
 
         await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        # WHERE DID THE POINTER ACTUALLY GO? Read it back before clicking.
+        #
+        # Be precise about what this can and cannot catch, because the two are
+        # easy to conflate. It compares the pointer against the coordinate we
+        # ASKED FOR, so it detects a DELIVERY failure: a `vncdo move` that
+        # reported success and did nothing, a server that clamped the position,
+        # a pointer grabbed by something else.
+        #
+        # It CANNOT detect a wrong coordinate. If the computation above picked
+        # the wrong pixel — a coordinate-space mismatch, a window that moved
+        # after it was measured, a spoofed dpr — the move delivers the pointer
+        # to exactly that wrong pixel and drift is ZERO. Reading the position
+        # answers "did the pointer go where we said", never "was where we said
+        # correct"; only hit-testing what is under the pointer would answer
+        # that, and this path has no element handle to test against.
+        #
+        # It still earns its place: without it the log records only intent, and
+        # a click on the wrong thing is exactly the failure that needs a
+        # forensic trail afterwards. The dpr is logged alongside so the
+        # coordinate can be recomputed later from the record.
+        #
+        # Best-effort: a readback failure must not block the click, but it IS
+        # reported rather than swallowed, so "unknown" never reads as "fine".
+        pointer = await _read_pointer_position()
+
+        if pointer is None:
+            _ts_log.info(
+                "VNC LANDED: unknown — pointer readback failed; "
+                "intended=(%d,%d)", click_x, click_y,
+            )
+        else:
+            actual_x, actual_y = pointer
+            drift = abs(actual_x - click_x) + abs(actual_y - click_y)
+            _ts_log.info(
+                "VNC LANDED: (%d,%d) intended=(%d,%d) drift=%d dpr=%.2f",
+                actual_x, actual_y, click_x, click_y, drift, dpr,
+            )
+            if drift > _POINTER_DRIFT_TOLERANCE_PX:
+                # Loud, because the pointer is NOT where we put it — the click
+                # about to be sent lands somewhere we never chose. That is a
+                # different failure from aiming wrong, and it would otherwise
+                # look like an ordinary miss.
+                logger.warning(
+                    "VNC pointer drift %dpx: intended=(%d,%d) actual=(%d,%d) "
+                    "dpr=%.2f — clicking anyway, but the pointer is not where "
+                    "it was placed",
+                    drift, click_x, click_y, actual_x, actual_y, dpr,
+                )
 
         # VNC click at current position
         click_proc = await asyncio.create_subprocess_exec(
@@ -2120,7 +2302,18 @@ async def _impl_browser_screenshot() -> dict:
         page = _active_page
     try:
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        screenshot_path = _SCREENSHOT_DIR / "genesis_browser_screenshot.png"
+        # Unique per call: consecutive captures must not overwrite one another
+        # (a session capturing 8 pages kept only the last one). The timestamp
+        # makes a capture SEQUENCE sortable at MICROSECOND resolution — a
+        # 1-second stamp ties an 8-capture burst (measured). The full uuid4 hex,
+        # not a truncation, keeps collisions negligible across the 7-day ~/tmp
+        # retention window. Sibling writer: scripts/browser.py — the stamp
+        # FORMAT is asserted on both sides, see the _STAMP regex in each test.
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        screenshot_path = (
+            _SCREENSHOT_DIR
+            / f"genesis_browser_screenshot_{stamp}_{uuid.uuid4().hex}.png"
+        )
         await page.screenshot(path=str(screenshot_path))
         return {
             "path": str(screenshot_path),
@@ -2341,8 +2534,10 @@ async def browser_upload(selector: str, file_path: str) -> dict:
 async def browser_screenshot() -> dict:
     """Take a screenshot of the current page.
 
-    Saves to ~/tmp/genesis_browser_screenshot.png and returns the path.
-    Use the Read tool to view the image.
+    Saves to a uniquely-named, timestamp-prefixed file under ~/tmp/ (each
+    call gets its own file, so consecutive screenshots don't overwrite one
+    another and sort chronologically) and returns the path. Always read the
+    returned "path" — never reconstruct it. Use the Read tool to view it.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"

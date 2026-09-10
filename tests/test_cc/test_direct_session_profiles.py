@@ -959,3 +959,75 @@ def test_interact_allows_follow_up_update():
 
 def test_research_maps_to_research_mcp_profile():
     assert _PROFILE_TO_MCP["research"] == "research"
+
+
+# --- perimeter outreach surface: ALLOWLIST polarity ---
+# PROFILES entries are DENY lists, so a tool nobody enumerates is ALLOWED. Every
+# test above is `in` / `not in` on a named tool, which by construction cannot fail
+# for a tool that was just added — the `mail` profile's own comment claims "only
+# outreach_send is available", but nothing enforced that claim.
+#
+# This test states it as an allowlist instead: enumerate what the genesis-outreach
+# server actually registers, and require the perimeter profile to deny everything
+# outside a small, explicitly-reasoned allowed set. A new outreach tool now fails
+# this test until someone decides which side of the boundary it belongs on.
+#
+# It caught a real regression on the change that added it: outreach_pending (up to
+# 50 queued messages with previews — an exfiltration surface for injected inbound
+# content) and outreach_cancel (silently retracts the owner's queued alerts) were
+# both reachable from `mail`.
+
+# Deliberately allowed on the untrusted-inbound perimeter, with the reason:
+#   outreach_send  — the profile exists to reply to email; this IS its actuator.
+_PERIMETER_ALLOWED_OUTREACH = {"outreach_send"}
+
+
+async def test_perimeter_profiles_deny_every_outreach_tool_but_the_reply_actuator():
+    from genesis.mcp.outreach_mcp import mcp as outreach_mcp
+
+    registered = set(await outreach_mcp.get_tools())
+    assert "outreach_send" in registered, "enumeration is stale — the server changed"
+
+    for profile in ("mail", "community-responder"):
+        denied = set(PROFILES[profile])
+        should_deny = registered - _PERIMETER_ALLOWED_OUTREACH
+        missing = sorted(
+            name for name in should_deny if f"mcp__genesis-outreach__{name}" not in denied
+        )
+        assert not missing, (
+            f"profile {profile!r} does not deny outreach tool(s) {missing}. PROFILES is a "
+            "DENY list, so an unlisted tool is ALLOWED to a session reading "
+            "attacker-controlled inbound content. Add each to a _NO_OUTREACH_* group, "
+            "or to _PERIMETER_ALLOWED_OUTREACH with a written reason."
+        )
+
+
+def test_no_background_profile_can_read_or_cancel_the_pending_queue():
+    """EVERY background profile must deny the queue controls — allowed set is empty.
+
+    PROFILES governs background sessions only; the owner's own interactive session
+    does not go through it. No background session has business reading what the
+    owner has scheduled or retracting it, so this is stated over ALL profiles
+    rather than over a hand-maintained perimeter list.
+
+    That distinction is the finding: enumerating the perimeter profile-by-profile
+    left `steward` reachable, and steward ingests external GitHub PR content and
+    can publish `gh` comments — so an injected PR body could read queued-message
+    previews out through a comment, or silently cancel the owner's alerts.
+    `interact` (arbitrary browser pages) and `campaign` (external platform
+    replies) have the same shape. Iterating PROFILES removes the judgement call,
+    and a NEW profile is covered the moment it is added.
+    """
+    queue_controls = {
+        "mcp__genesis-outreach__outreach_pending",
+        "mcp__genesis-outreach__outreach_cancel",
+    }
+    gaps = {
+        profile: sorted(queue_controls - set(denied))
+        for profile, denied in PROFILES.items()
+        if queue_controls - set(denied)
+    }
+    assert not gaps, (
+        "background profile(s) can reach the pending-queue controls: "
+        f"{gaps}. Add _NO_OUTREACH_QUEUE_CONTROL to each."
+    )

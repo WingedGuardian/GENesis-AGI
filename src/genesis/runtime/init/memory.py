@@ -79,12 +79,23 @@ async def init(rt: GenesisRuntime) -> None:
         # Both share the same L2 diskcache — cache keys are text-based, not
         # provider-dependent, so a write cached via Ollama is instantly
         # available for a read via cloud.
+        #
+        # Only RECALL asks for the paid priority tier, and only because it is
+        # deadline-bound: the proactive route cancels at 4.5s, while DeepInfra's
+        # default tier queues under load (MEASURED 2026-09-04: 8.6-13.3s default
+        # vs ~650ms priority, which cost a 100% recall failure rate). Storage is
+        # a background write with no deadline, so it stays on the normal rate —
+        # paying the 1.5x premium there would buy nothing.
+        from genesis.env import embed_priority_tier
+
+        priority = embed_priority_tier()
         storage_backends = EmbeddingProvider.build_chain(ollama_first=True)
-        recall_backends = EmbeddingProvider.build_chain(ollama_first=False)
+        recall_backends = EmbeddingProvider.build_chain(ollama_first=False, priority_tier=priority)
         logger.info(
-            "Embedding chains: storage=%s, recall=%s",
+            "Embedding chains: storage=%s, recall=%s (recall priority_tier=%s)",
             [b.name for b in storage_backends],
             [b.name for b in recall_backends],
+            priority,
         )
         storage_embedder = EmbeddingProvider(
             backends=storage_backends,

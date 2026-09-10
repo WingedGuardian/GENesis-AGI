@@ -92,7 +92,14 @@ def test_git_fetch_is_timeout_bounded(text: str) -> None:
 def test_health_curls_have_max_time(text: str) -> None:
     health = "http://localhost:5000/api/genesis/health"
     bounded = text.count(f"curl -sf --max-time 20 {health}")
-    assert bounded >= 2, "both health curls must be --max-time bounded"
+    # Assert the INVARIANT (every health curl is bounded), not a head-count. The
+    # count was 2 until the degraded-subsystem check stopped curling the endpoint
+    # — it now reads ~/.genesis/bootstrap_manifest.json, because the response has
+    # no per-subsystem data to parse — and a hardcoded 2 fails on a call site
+    # being legitimately REMOVED, which says nothing about boundedness.
+    total = len(re.findall(rf"curl [^\n|]*{re.escape(health)}", text))
+    assert bounded >= 1, "the health wait must still curl the endpoint"
+    assert bounded == total, f"{total - bounded} health curl(s) are not --max-time bounded"
     # No unbounded health curl may remain.
     assert re.search(rf"curl -sf {re.escape(health)}", text) is None
 
