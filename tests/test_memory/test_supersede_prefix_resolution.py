@@ -111,10 +111,21 @@ async def _links(db):
     return [tuple(r) for r in await cur.fetchall()]
 
 
+async def _supersede(store, handle, new_id, ts):
+    """Resolve then mark, in the order ``store()`` does it.
+
+    Resolution is a SEPARATE step that runs before any write. Driving the two
+    together here keeps these tests on the real call order rather than on a
+    combined method that no longer exists.
+    """
+    resolved = await store._resolve_supersede_target(handle)
+    return await store._mark_superseded(resolved, new_id, ts)
+
+
 @pytest.mark.asyncio()
 async def test_eight_char_prefix_deprecates_the_memory_it_names(store, db):
     """THE LIVE BUG: an 8-char handle must supersede, not silently no-op."""
-    await store._mark_superseded(PREFIX, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, PREFIX, NEW, "2026-09-06T19:53:21+00:00")
 
     row = await _row(db, OLD)
     assert row["deprecated"] == 1, (
@@ -127,7 +138,7 @@ async def test_eight_char_prefix_deprecates_the_memory_it_names(store, db):
 @pytest.mark.asyncio()
 async def test_prefix_never_becomes_a_dangling_link_source(store, db):
     """The only artifact of the broken path was an edge from a non-memory."""
-    await store._mark_superseded(PREFIX, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, PREFIX, NEW, "2026-09-06T19:53:21+00:00")
 
     links = await _links(db)
     assert (PREFIX, NEW, "succeeded_by") not in links, (
@@ -142,10 +153,12 @@ async def test_unknown_id_is_reported_not_swallowed(store, db):
     from genesis.memory.store import SupersedeUnresolved
 
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded("deadbeef", NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, "deadbeef", NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "not_found"
-    assert exc.value.stored_memory_id == NEW, "caller needs a handle on what DID land"
+    # Nothing is stored and nothing is claimed about the target's recall state —
+    # resolution is exactly what just failed to establish it.
+    assert "no deprecation was performed" in str(exc.value)
     assert await _links(db) == [], "no edge may be written for an unresolved target"
 
 
@@ -163,7 +176,7 @@ async def test_ambiguous_prefix_is_never_guessed(store, db):
     await db.commit()
 
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(PREFIX, NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, PREFIX, NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "ambiguous"
     assert set(exc.value.candidates) == {OLD, twin}
@@ -175,7 +188,7 @@ async def test_ambiguous_prefix_is_never_guessed(store, db):
 @pytest.mark.asyncio()
 async def test_full_id_still_works(store, db):
     """Regression lock: the 36-char path is unchanged."""
-    await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, OLD, NEW, "2026-09-06T19:53:21+00:00")
 
     assert (await _row(db, OLD))["deprecated"] == 1
     assert (OLD, NEW, "succeeded_by") in await _links(db)
@@ -195,7 +208,7 @@ async def test_a_full_id_naming_no_memory_is_reported_not_swallowed(store, db):
 
     ghost = "deadbeef-0000-4000-8000-000000000009"  # 36 chars, no such row
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(ghost, NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, ghost, NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "not_found"
     assert await _links(db) == [], "no succeeded_by edge may be written"
@@ -213,7 +226,7 @@ async def test_a_truncated_paste_in_the_32_to_35_band_resolves(store, db):
     truncated = OLD[:33]
     assert 32 <= len(truncated) < 36, "fixture must sit in the band under test"
 
-    await store._mark_superseded(truncated, NEW, "2026-09-06T19:53:21+00:00")
+    await _supersede(store, truncated, NEW, "2026-09-06T19:53:21+00:00")
 
     assert (await _row(db, OLD))["deprecated"] == 1
     assert (OLD, NEW, "succeeded_by") in await _links(db)
@@ -238,7 +251,7 @@ async def test_a_saturated_candidate_list_is_flagged_as_truncated(store, db):
     await db.commit()
 
     with pytest.raises(SupersedeUnresolved) as exc:
-        await store._mark_superseded(OLD[:8], NEW, "2026-09-06T19:53:21+00:00")
+        await _supersede(store, OLD[:8], NEW, "2026-09-06T19:53:21+00:00")
 
     assert exc.value.reason == "ambiguous"
     assert exc.value.truncated is True

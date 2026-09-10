@@ -15,6 +15,11 @@
 
   `supersedes` now accepts the same short handles the rest of the system hands
   out, never guesses an ambiguous one, and refuses a full-length id that names
-  no memory instead of writing a dangling edge and reporting nothing. A
-  supersede that cannot resolve its target is rejected before anything is
-  written, so it can no longer leave half an operation behind.
+  no memory instead of writing a dangling edge and reporting nothing.
+
+  The target is resolved **before the new memory is written**, which is what
+  makes the rejection cheap and total: nothing is stored, nothing is linked, and
+  there is no half-completed operation for the caller to reason about. That
+  ordering also removes a way the old code could corrupt a memory outright --
+  resolving after the write meant a short handle could match the row the call
+  had just created and deprecate the new memory as its own successor.

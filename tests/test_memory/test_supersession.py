@@ -180,12 +180,25 @@ async def test_store_with_supersedes_skips_qdrant_for_fts5_only(store, db):
         mock_mem.resolve_id = AsyncMock(
             side_effect=lambda _db, mid: ([mid], "passthrough")
         )
+        # The pre-flight confirms a PASSTHROUGH id names a real row before any
+        # write, and _mark_superseded reads the same row for the collection.
+        # Without this the supersede raised in pre-flight and this test passed
+        # vacuously — update_payload was "not called" because nothing ran.
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": old_id, "collection": "episodic_memory",
+            "embedding_status": "fts5_only", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
 
         await store.store("new fact", "conversation", supersedes=old_id)
 
     # Qdrant update_payload should NOT be called for fts5_only memories
     mock_update.assert_not_called()
+    # ...and the supersede must actually have RUN, or the assertion above is
+    # vacuous rather than a skip.
+    mock_mem.mark_superseded.assert_awaited_once()
 
 
 @pytest.mark.asyncio()
@@ -248,30 +261,35 @@ async def test_store_without_supersedes_skips_deprecation(store, db):
 
 
 @pytest.mark.asyncio()
-async def test_supersedes_failure_does_not_block_store(store, db):
-    """If supersession fails, the new memory should still be stored successfully."""
+async def test_an_infrastructure_failure_during_supersede_does_not_block_the_store(
+    store, db
+):
+    """A deprecation that fails AFTER pre-flight must not lose the new memory.
+
+    The target was resolved and confirmed to exist before any write, so a
+    failure here is an infrastructure fault (a locked DB, a dead connection),
+    not a bad handle. The content is already durable at that point, and turning
+    it into a raised error reads as "the store failed" and invites a retry that
+    duplicates the memory.
+    """
     old_id = "nonexistent-id"
-
-    # Make the metadata lookup fail
-    async def failing_execute(sql, params=None):
-        if isinstance(sql, str) and "deprecated = 1" in sql:
-            raise RuntimeError("simulated DB error")
-        cursor = AsyncMock()
-        cursor.fetchone = AsyncMock(return_value=None)
-        return cursor
-
-    db.execute = AsyncMock(side_effect=failing_execute)
 
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
         mock_mem.create_metadata = AsyncMock(return_value=None)
-        # _mark_superseded now resolves short handles before the UPDATE (see
-        # test_supersede_prefix_resolution). These ids are non-hex, so the real
-        # resolver returns them PASSTHROUGH untouched with no DB read — mirror
-        # that exactly rather than inventing a verdict the resolver never gives.
         mock_mem.resolve_id = AsyncMock(
             side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        # Pre-flight PASSES — the row exists...
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": old_id, "collection": "episodic_memory",
+            "embedding_status": "fts5_only", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        # ...and the deprecation itself then fails on infrastructure.
+        mock_mem.mark_superseded = AsyncMock(
+            side_effect=RuntimeError("simulated DB error")
         )
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
 
@@ -284,6 +302,61 @@ async def test_supersedes_failure_does_not_block_store(store, db):
     # Store should succeed despite supersession failure
     assert isinstance(result, str)
     assert len(result) == 36
+    mock_mem.mark_superseded.assert_awaited_once(), "the failure must be the real one"
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("handle", "resolver_verdict"),
+    [
+        ("deadbeef", ([], "not_found")),
+        (
+            "deadbeef-0000-4000-8000-000000000009",
+            (["deadbeef-0000-4000-8000-000000000009"], "passthrough"),
+        ),
+    ],
+    ids=["prefix-matches-nothing", "full-id-names-nothing"],
+)
+async def test_an_unresolvable_target_is_rejected_before_anything_is_written(
+    store, db, handle, resolver_verdict
+):
+    """The hoist, locked: pre-flight runs BEFORE the first write.
+
+    Two things depend on this ordering, and neither is provable from
+    `_mark_superseded` alone:
+
+    * Nothing durable exists when the rejection happens, so it can be a plain
+      raise instead of a half-completed operation the caller has to reason
+      about.
+    * Resolution cannot see the row this very call is about to write. When it
+      ran afterwards, a short prefix could match the NEW memory and deprecate
+      it as its own successor.
+
+    Both resolver verdicts are covered. They fail in DIFFERENT places — a
+    prefix is rejected by the resolver, while a full-length id is waved through
+    as PASSTHROUGH and is only known to be bad once its row is looked up — so
+    one case passing says nothing about the other.
+    """
+    from genesis.memory.store import SupersedeUnresolved
+
+    with patch("genesis.memory.store.upsert_point") as mock_upsert, \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_mem.resolve_id = AsyncMock(return_value=resolver_verdict)
+        # A full-length id passes resolution untouched; only this lookup can
+        # tell that it names nothing.
+        mock_mem.get_metadata = AsyncMock(return_value=None)
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+
+        with pytest.raises(SupersedeUnresolved) as exc:
+            await store.store("a correction", "conversation", supersedes=handle)
+
+    assert exc.value.reason == "not_found"
+    mock_mem.create_metadata.assert_not_awaited(), "wrote the memory before checking"
+    mock_upsert.assert_not_called()
+    mock_mem.mark_superseded.assert_not_awaited()
 
 
 @pytest.mark.asyncio()
