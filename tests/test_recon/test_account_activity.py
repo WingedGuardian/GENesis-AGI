@@ -2256,3 +2256,106 @@ async def test_gather_notifications_runs_with_no_flagship_repos(db, monkeypatch,
     await mon.gather()
     assert len(pipe.sent) == 1  # notifications lane pinged despite zero flagship repos
     assert mon._load_cursors()[_NOTIF_CURSOR_KEY] == _WM
+
+
+# ── round-4: the two facts the resolver cannot support ──────────────────────
+
+
+async def test_a_commit_whose_every_date_predates_the_window_is_a_digest(db, monkeypatch):
+    """No date on a commit is the PUSH time, and the push is what raised the
+    notification. A branch held locally long enough carries BOTH an author and a
+    committer date from before the cursor, so the row falls outside the window;
+    with an empty comment surface the lane would then claim nobody acted. It
+    cannot — the payload holds no push time anywhere, so the question was never
+    answered. Digest, not drop."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    commit = "https://api.github.com/repos/me/myrepo/commits/abc123"
+    pages = [
+        [_notif(reason="mention", repo="me/myrepo", tid="c", subject_url=commit, stype="Commit")]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{commit}/comments": []},
+            threads={
+                commit: {
+                    "user": None,
+                    "author": {"login": "outsider"},
+                    # Both dates predate the cursor; the push did not.
+                    "commit": {
+                        "author": {"date": "2026-07-01T00:00:00Z"},
+                        "committer": {"date": "2026-08-05T00:00:00Z"},
+                    },
+                }
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items, "an unestablishable push time was read as nobody having acted"
+    assert items[0]["actor"] == "" and items[0]["ping"] is False
+
+
+async def test_a_ping_never_claims_the_actor_wrote_the_mention(db):
+    """`actor` is the newest non-owner human who ACTED this window, which the
+    resolver was rewritten to measure precisely because who-wrote-the-@ is not
+    answerable. GitHub's `reason` is sticky, so a thread Alice mentioned the
+    owner in still reports `mention` when Bob merges it a week later — and the
+    `author` branch has the same defect, since acting is not responding."""
+    mon, pipe = _mon(db)
+
+    assert await mon._ping_notification(_item(reason="mention", actor="bob")) is True
+    text, _ = pipe.sent[0]
+    assert "bob acted on a thread that mentions you" in text
+    assert "mentioned you" not in text
+
+    assert await mon._ping_notification(_item(reason="author")) is True
+    text, _ = pipe.sent[1]
+    assert "maintainer acted on your someone/litellm#5" in text
+    assert "responded" not in text
+
+    # `reasons` is an operator-editable allowlist, so an unmodelled reason can
+    # reach the ping. It must not inherit `author`'s claim that the thread is
+    # the owner's — only `author` establishes that.
+    assert await mon._ping_notification(_item(reason="subscribed")) is True
+    text, _ = pipe.sent[2]
+    assert "maintainer acted on someone/litellm#5 (subscribed)" in text
+    assert "your" not in text
+
+
+async def test_a_rewritten_commit_is_placed_by_its_committer_date(db, monkeypatch):
+    """A cherry-pick and a rebase both RESET the committer date to the rewrite
+    while the author date survives from the original. Reading the author date
+    puts a just-pushed commit outside the window and drops a real contributor;
+    the committer date places it near where the push actually happened.
+
+    This is the test that pins the MECHANISM rather than the outcome: reverting
+    to the author date drops, and removing the substitution altogether leaves the
+    row with no readable time — a digest by a different route. Only reading the
+    committer date pings."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    commit = "https://api.github.com/repos/me/myrepo/commits/abc123"
+    pages = [
+        [_notif(reason="mention", repo="me/myrepo", tid="c", subject_url=commit, stype="Commit")]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            surfaces={f"{commit}/comments": []},
+            threads={
+                commit: {
+                    "user": None,
+                    "author": {"login": "outsider"},
+                    "commit": {
+                        "author": {"date": "2026-07-01T00:00:00Z"},  # the original
+                        "committer": {"date": "2026-08-06T02:00:00Z"},  # the rewrite
+                    },
+                }
+            },
+        ),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "outsider" and items[0]["ping"] is True

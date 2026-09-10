@@ -1026,6 +1026,15 @@ class AccountActivityMonitor:
             certain = False
 
         in_window = [(t, r) for r in rows if (t := _in_window_time(r, since, until))]
+        # A commit's only timestamp says when it was AUTHORED, never when it was
+        # PUSHED, and the push is what raised this notification. A cherry-pick, a
+        # rebase or a long-held local branch keeps a date from well before it. So
+        # a commit row landing outside the window has answered nothing, and
+        # dropping on it would assert a negative from a timestamp that never
+        # addressed the question. Digest instead.
+        if any(r.get(_COMMIT_DATE_FLAG) and not _in_window_time(r, since, until) for r in rows):
+            certain = False
+
         # Newest first, by the timestamp that actually falls inside the window.
         in_window.sort(key=lambda pair: pair[0], reverse=True)
         for _, row in in_window:
@@ -1101,6 +1110,17 @@ class AccountActivityMonitor:
 
         rows: list[dict] = []
         complete = True
+        # ACCEPTED COST (Codex round 4, P2): `--paginate` walks every page of
+        # every surface before the window filter runs, so a thread with a very
+        # long history costs pages proportional to its whole life rather than to
+        # this window. Not fixed here, for two reasons. It fails SAFE: the shared
+        # timeout returns `ok=False`, which sets `complete=False` and yields a
+        # digest row, never a drop. And the server-side remedy is partial —
+        # `issues/{n}/comments` and `pulls/{n}/comments` accept `since`, but the
+        # timeline and reviews endpoints do not, so two of four surfaces stay
+        # unbounded and the change would buy an inconsistent read for no change
+        # in the failure mode.
+        # Bounded meanwhile by `max_notifications_per_tick` (25) threads a tick.
         for url in urls:
             ok, out = await run_gh_checked(
                 "gh", "api", f"{url}?per_page=100", "--paginate", "--slurp", timeout=_GH_TIMEOUT
@@ -1132,9 +1152,20 @@ class AccountActivityMonitor:
             # date is at commit.author.date (VERIFIED live). Without this the row
             # can never enter the window, and an @-mention in a commit MESSAGE is
             # dropped as though nobody acted.
-            committed = ((thread.get("commit") or {}).get("author") or {}).get("date")
-            if isinstance(committed, str) and committed:
-                thread = {**thread, "created_at": committed}
+            meta = thread.get("commit") or {}
+            # COMMITTER first, author second. A cherry-pick and a rebase both
+            # RESET the committer date to the rewrite, while the author date
+            # survives from the original — so the committer date is wrong in
+            # strictly fewer cases. MEASURED on this repo: the two differ on 6
+            # of the last 200 commits. Neither IS the push time, which the
+            # payload does not carry at all; hence the flag, read by
+            # `_window_actor`. Inside the window it attributes. Outside it, it
+            # testifies to nothing.
+            for field in ("committer", "author"):
+                stamp = (meta.get(field) or {}).get("date")
+                if isinstance(stamp, str) and stamp:
+                    thread = {**thread, "created_at": stamp, _COMMIT_DATE_FLAG: True}
+                    break
         if not isinstance(thread, dict):
             # `null` parses fine and is not a dict. Without the author row we
             # cannot claim nobody acted, so this is incomplete, not empty.
@@ -1196,10 +1227,22 @@ class AccountActivityMonitor:
         from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
 
         num = f"#{item['number']}" if item["number"] else ""
+        # `actor` is the newest non-owner human who ACTED in this notification's
+        # window, and knowably NOT whoever wrote the @-mention: the resolver was
+        # rewritten to ask the answerable question. GitHub's `reason` is sticky,
+        # so a thread Alice mentioned the owner in still reports `mention` when
+        # Bob merges it a week later. "Bob mentioned you" is then a claim this
+        # lane cannot support; what it measured is that Bob acted.
         if item["reason"] in ("mention", "team_mention"):
-            lead = f"💬 {item['actor']} mentioned you in {item['repo']}{num}"
-        else:  # author — a response to one of the owner's outbound contributions
-            lead = f"📨 {item['actor']} responded on your {item['repo']}{num}"
+            lead = f"💬 {item['actor']} acted on a thread that mentions you in {item['repo']}{num}"
+        elif item["reason"] == "author":
+            lead = f"📨 {item['actor']} acted on your {item['repo']}{num}"
+        else:
+            # `reasons` is an operator-editable allowlist, so a reason this lane
+            # has no wording for can reach here. A bare `else` would claim the
+            # thread is the owner's, which only `author` establishes. Say what
+            # the feed said and name the reason rather than inventing a relation.
+            lead = f"📨 {item['actor']} acted on {item['repo']}{num} ({item['reason']})"
         text = lead
         if item["title"]:
             text += f"\n{item['title']}"
@@ -1288,6 +1331,9 @@ _EVENT_TIME_KEYS = ("created_at", "updated_at", "submitted_at")
 # Marks the appended thread object so its `updated_at` — which moves whenever
 # ANYBODY touches the thread — is never credited to the thread's author.
 _THREAD_ROW_FLAG = "__genesis_thread_row__"
+# Marks a thread row whose `created_at` we substituted from the commit's own
+# committer/author date, because a commit object carries no timestamp of its own.
+_COMMIT_DATE_FLAG = "__genesis_commit_date__"
 
 # Timeline events whose `.actor` is the person the event happened TO, not the
 # person who did anything. GitHub emits one per recipient the instant somebody
@@ -1313,6 +1359,22 @@ _RECIPIENT_ACTOR_EVENTS = frozenset({"mentioned", "subscribed", "unsubscribed"})
 # window reads as empty. A force-push emits `head_ref_force_pushed`, which does
 # carry `.actor`, so the exposed case is an ordinary push with no comment, review
 # or thread-open in the same window.
+#
+# The SIBLING cost, ruled the other way on purpose. A `Commit` SUBJECT carries an
+# identity but no push time, so `_thread_comments` substitutes the committer date
+# and `_window_actor` treats a substituted date outside the window as UNCERTAIN
+# rather than absent. The two rulings differ because the evidence differs: a
+# `committed` row is positively known to name nobody, whereas a commit subject
+# whose every readable surface falls outside the window leaves the notification
+# itself unexplained, and an unexplained notification is not an empty one.
+# Ruling both UNCERTAIN would make every pull request carrying a `committed` row
+# permanently uncertain and put the drop out of reach, which is the failure this
+# frozenset exists to prevent. Residual exposure: a commit held locally long
+# enough that BOTH its dates predate the window still reads as uncertain, so it
+# yields a digest row rather than a drop. MEASURED 2026-09-10: 0 of 1488
+# notifications in this account's readable feed carry a `Commit` subject at all
+# (`all=true`, 30 pages; GitHub prunes old read rows, so that is the readable
+# feed and not all history).
 _IDENTITY_FREE_EVENTS = frozenset({"committed"})
 
 _DOER_ACTOR_EVENTS = frozenset(
