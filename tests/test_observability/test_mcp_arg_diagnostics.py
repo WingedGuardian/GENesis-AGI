@@ -305,8 +305,9 @@ def _call_with_db(arguments: dict, db):
 def test_the_substituted_path_still_rolls_the_transaction_back():
     """The middleware also owns a commit-on-success / rollback-on-error boundary
     whose whole purpose is releasing a read snapshot that would otherwise pin
-    the WAL checkpoint. Substituting the error must not skip it — `success` has
-    to be set to False BEFORE the replacement is raised."""
+    the WAL checkpoint. Substituting the error must not skip it — `success` is
+    only set True after a clean return, so the replacement raised from the
+    except clause must still leave it False and reach the rollback."""
     db = _FakeDB()
     absorbed = 'text</content>\n<parameter name="reason">why</parameter>'
 

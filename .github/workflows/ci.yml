@@ -63,6 +63,14 @@ jobs:
           #       CVE-2026-59821 — Guardrails create/update code-exec (proxy).
           #       CVE-2026-59822 — MCP Streamable-HTTP OAuth2 auth bypass (proxy MCP
           #         gateway; Genesis's own MCP servers are fastmcp, not litellm's).
+          #       CVE-2026-37004 — SSTI to OS command execution via the
+          #         dotprompt_content parameter of the /prompts/test endpoint, from
+          #         an unsandboxed jinja2.Environment. CVSS 9.8, and unreachable for
+          #         the same structural reason as the four above: the sink is
+          #         litellm/proxy/prompts/prompt_endpoints.py, served only by the
+          #         proxy. pip-audit names 1.83.7 as the fix, which is past the
+          #         1.82.x malware the pin exists to avoid — so the pin stays and
+          #         the reachability argument, not the version, is what holds here.
           #     grep-verified: only litellm.acompletion / completion_cost /
           #     model_cost + exception types are imported — no proxy surface.
           #   diskcache 5.6.3 (CVE-2025-69872) — pickle-by-default RCE, no fixed
@@ -95,6 +103,7 @@ jobs:
             --ignore-vuln CVE-2026-59822 \
             --ignore-vuln CVE-2025-69872 \
             --ignore-vuln PYSEC-2026-2475 \
+            --ignore-vuln CVE-2026-37004 \
             --ignore-vuln PYSEC-2026-2476
 
   leak-detector:
@@ -379,6 +388,62 @@ jobs:
             python3 scripts/check_migration_prefixes.py
           fi
 
+  changelog-fragments:
+    # Every file in changelog.d/ is a legal fragment — the residue is a
+    # violation, for the same reason the migration-id check treats it that way:
+    # a fragment nobody recognises is a changelog entry that never ships, and
+    # nothing notices, because the release section still looks complete.
+    #
+    # Validated on every PR rather than at release, because collect_fragments is
+    # all-or-nothing: one malformed fragment from any merged PR blocks assembly
+    # of EVERY fragment, and discovering that on release day means discovering
+    # it from the wrong person at the wrong time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # --base asks git what the base branch ALREADY has, which is the one
+          # question the checked-out tree cannot answer. A shallow clone has no
+          # base commit, and the check treats an unreadable base as a violation
+          # rather than a pass.
+          fetch-depth: 0
+          # This job only READS the tree, so it has no use for a credential
+          # left behind in .git/config where every later step can reach it.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Validate changelog.d fragments
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is useless there — it IS the
+          # just-pushed checkout — but the push event's `before` SHA is the
+          # pre-push state, which is what lets the post-merge run see a fragment
+          # that vanished outside the PR check (a direct push, an admin merge, a
+          # PR whose base was unreadable). Same resolution the migration-id job
+          # uses, for the same reason. All-zero on branch creation.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE_SHA:-}"
+          if [ -z "$base" ] && [ -n "${PUSH_BEFORE_SHA:-}" ] \
+             && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          fi
+          if [ -n "$base" ]; then
+            # Deliberately NOT guarded by `git cat-file`: the deletion rule fails
+            # CLOSED on a base it cannot read, and swallowing that here would
+            # turn its refusal into a silent pass — the one outcome its own
+            # docstring says must never happen.
+            python scripts/assemble_changelog.py --check --base "$base"
+          else
+            # schedule/dispatch only. Say what is NOT being enforced rather than
+            # reporting a green that covers less than it appears to.
+            echo "note: no base ref on this event; the deletion rule is not enforced"
+            python scripts/assemble_changelog.py --check
+          fi
+
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress
     # (Discord REST/webhook, public social APIs) outside the reasoned allowlist.
@@ -548,8 +613,17 @@ jobs:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
+    #
+    # fetch-depth: 0 because measurement tests derive a rate from this
+    # repository's own commit history and SKIP on a shallow clone rather than
+    # lie. A skipped gate is an unevaluated gate: the commit-msg framing
+    # advisory asserts a 0.1% fire-rate bar over real subjects, and under the
+    # default depth-1 checkout that assertion never ran at all, so a later
+    # pattern change with a bad rate would have passed CI (Codex P2, PR #1623).
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -559,10 +633,35 @@ jobs:
           pip install -e ".[test]"
       - name: Run tests
         run: |
+          # Never measure a stale report: if pytest dies before writing
+          # one, the checker must find nothing rather than yesterday's.
+          rm -f junit.xml
           # Ignore preserved AZ-era test files that import removed modules
           pytest -v \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
-            --ignore=tests/test_ui/
+            --ignore=tests/test_ui/ \
+            --junit-xml=junit.xml
         env:
           GENESIS_TESTING: "1"
+      # A test that stops running is invisible: it makes the suite SMALLER,
+      # not red. Two axes, because dormancy moves both ways — a broken
+      # skipif RAISES the skip count, while a lost marker or a dropped
+      # directory LOWERS it and is only visible in the collected count.
+      # REPORT ONLY until both bounds, measured on these runners, are
+      # recorded here — a threshold invented rather than measured is one
+      # nobody trusts. The step still has teeth meanwhile: a missing or
+      # unreadable report exits 2.
+      - name: Suite dormancy guard
+        # NOT always(): that also fires on cancellation, and this workflow
+        # sets cancel-in-progress for every non-main ref — so a re-push
+        # would kill pytest mid-suite, leave no report, and the step would
+        # refuse with a cause that is not the cause.
+        if: ${{ !cancelled() }}
+        # Baseline MEASURED on this PR's own green run (job 101515129147, head
+        # bbd11ad1): "95 skipped of 23164 collected". Exact-fit on both axes, not
+        # a padded guess — headroom would be a number nobody measured, and the
+        # whole point of shipping report-only first was to avoid inventing one.
+        # Raising either bound is a deliberate act that belongs in the same commit
+        # as the change that moves it; both failure messages say so.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 95 --min-collected 23164

@@ -17,6 +17,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from genesis.db.crud._fts import fts5_term
+
 logger = logging.getLogger(__name__)
 
 
@@ -397,7 +399,22 @@ def _build_expanded_query(keywords: list[str], expansions: list[str]) -> str:
 
     The result is fed to FTS5 with ``boolean=True``; ``_prepare_fts5`` preserves
     the ``AND``/``OR``/parentheses (balanced by construction here).
+
+    Every term is sanitised BEFORE it is joined, and terms that sanitise to
+    nothing are dropped. Expansion terms come from the live tag co-occurrence
+    index, so they may hold any character; sanitising after the join (which is
+    all ``_prepare_fts5`` can do) would reduce a punctuation-only tag to
+    whitespace and leave ``(fusion OR  )`` — balanced, so it passes that
+    function's parenthesis check, then fails in FTS5. Dropping the term keeps the
+    expression valid by construction, which is what this docstring's "balanced by
+    construction" was always relying on.
     """
+    keywords = [t for t in (fts5_term(k) for k in keywords) if t]
+    expansions = [t for t in (fts5_term(e) for e in expansions) if t]
+    if not keywords:
+        # Nothing left to gate on; an expansion-only query would violate the
+        # precision rule above, so decline to build one.
+        return ""
     original_and = " AND ".join(keywords)
     if not expansions:
         return f"({original_and})" if len(keywords) > 1 else original_and

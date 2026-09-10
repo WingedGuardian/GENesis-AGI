@@ -915,17 +915,31 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
             from genesis.mcp.health.critical_sites import (
                 CALLSITE_DOWN_RECENCY_HOURS,
                 CRITICAL_CALL_SITES,
+                CRITICAL_CALLSITE_DOWN_RECENCY_HOURS,
             )
 
+            # Two-tier recency: CRITICAL sites keep alarming for weeks (a
+            # failed weekly reflection must not fall silent after a day —
+            # "quieter the longer it's broken" is the inversion this fixes),
+            # while non-critical sites keep the tight window (a weeks-old
+            # failed row on a watched-only site is stale noise, not an
+            # outage). The SQL fetches the WIDE window; the tight filter is
+            # applied per row below with the same string-compare semantics
+            # (both sides are isoformat-with-offset, like the SQL compare).
             cs_cutoff = (datetime.now(UTC) - _td3(hours=CALLSITE_DOWN_RECENCY_HOURS)).isoformat()
+            cs_critical_cutoff = (
+                datetime.now(UTC) - _td3(hours=CRITICAL_CALLSITE_DOWN_RECENCY_HOURS)
+            ).isoformat()
             cs_cursor = await _service._db.execute(
                 "SELECT call_site_id, last_run_at, provider_used "
                 "FROM call_site_last_run WHERE success = 0 AND last_run_at >= ?",
-                (cs_cutoff,),
+                (cs_critical_cutoff,),
             )
             for cs_row in await cs_cursor.fetchall():
                 site_id, last_run_at, provider_used = cs_row
                 is_critical = site_id in CRITICAL_CALL_SITES
+                if not is_critical and str(last_run_at) < cs_cutoff:
+                    continue
                 alert_id = f"callsite:down:{site_id}"
                 alerts.append(
                     {

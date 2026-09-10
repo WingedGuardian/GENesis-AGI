@@ -62,7 +62,11 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+`scripts/cc_align_host.sh` — host-only by contract, no container leg),
+`genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
+auto-updater suppression in `~/.claude/settings.json`, because the align path
+only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
@@ -268,12 +272,42 @@ the question. Query SQLite `cc_sessions` for structured session data. Use
 `db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
 **Grep transcripts is LAST RESORT** — only after all above fail.
 
-**When to store back:**
-If you synthesize an answer from multiple recalled memories — something that
-connects information in a new way — store it via `memory_store` with
-`tags: ["synthesis"]` and appropriate wing/room tags. This is how the memory
-system compounds over time. Don't store routine answers; store genuine syntheses
-that would be expensive to re-derive.
+**When to store back — the test is RE-DERIVATION COST, not importance.**
+Store to Genesis memory when a future session would have to REDO WORK to know
+this. That is a question about the work you just did, which you can answer; "is
+this important?" is a question about the future, which you cannot, and it is why
+the rule below used to fire so rarely. Three concrete triggers:
+
+1. **You MEASURED something** that took real effort to obtain — a probe you had
+   to design, an enumeration across a directory, a live-state check. Store the
+   number WITH its denominator and the method, because the method is usually what
+   the next session gets wrong.
+2. **You established a durable ARCHITECTURAL fact** — X exists, X works this way,
+   X is not what its name suggests. Especially when you went looking for X
+   expecting it to be absent.
+3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
+   Use `supersedes` to link the correction to what it replaces. This is the
+   highest-value trigger and the easiest to skip, because being wrong does not
+   feel like a finding. It is the one that stops the next session paying for the
+   same mistake.
+
+Also store a genuine SYNTHESIS — an answer connecting several recalled memories
+in a new way — with `tags: ["synthesis"]`. Don't store routine answers, restatements
+of what a file already says, or anything the repo records on its own.
+
+**Do not park a durable FACT in CC file memory.** The two systems differ in
+LIFETIME, not just audience: CC file memory is for behavioural rules that must
+shape *how you work*, and it is compacted away within months, so a fact left
+there is a fact you will silently lose. Genesis memory is permanent and
+recallable system-wide. A measurement, an architecture note, or a correction
+belongs there even when it also taught you a behavioural lesson — in that case
+store BOTH: the rule in CC memory, the fact in Genesis memory.
+
+(Origin: a 2026-09-05 session measured an embedding regression, enumerated an
+init-path invariant across 33 modules, and corrected a wrong architectural claim
+of its own — then wrote only the behavioural lessons to CC memory and stored
+nothing durable until the user asked why. The routing rule was clear; nothing
+told it WHEN.)
 
 **Wings (structural domains):**
 Memories are tagged with a `wing` (top-level domain) and optional `room`
@@ -329,7 +363,16 @@ extraction pipeline is the safety net.
 
 Foreground sessions carry a durable charter + ledger (DB-backed, re-injected
 into every post-compaction window — see the `## Session Charter` block and
-the per-turn `[Charter: … | open: N]` tag).
+the per-turn `[Ledger open: N | mission: …]` inventory, one line per open row).
+
+**The ledger is the session's founding mission and OUTRANKS every follow-up.**
+Follow-ups are durable system-wide; ledger rows exist only on the ledger. In
+any status report or wrap-up, open ledger rows come FIRST, by name — never as
+"older items" or fine print under follow-ups you created yourself — and a
+wrap-up cannot say "only follow-ups left" while a ledger row is open. Every
+open row is either getting done or gets a disposition (done / absorbed /
+dropped, with the reason) — a row left undisposed is a defect, not a backlog.
+A ledger row is ONE sentence; evidence carries the detail.
 
 **Real-time capture is your responsibility.** At agreement moments — the
 user says "yes, do that", approves a plan item, or you promise work — call
@@ -337,9 +380,31 @@ user says "yes, do that", approves a plan item, or you promise work — call
 compaction summary can erase. Close items with `session_ledger_update`
 (done / absorbed-with-evidence / dropped) as work lands; set the living
 mission via `session_charter_update` when the session's purpose
-crystallizes or pivots. You are the first line of defense; ambient
+crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
+until you do, because an unset mission falls back to the raw origin prompt and
+reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
+
+**PR-body convention — `E2E:` (encouraged, advisory):** a PR body may declare
+the POST-MERGE end-to-end verification its change needs, on its own line:
+`E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
+This does NOT gate the merge — the merge gate prints an advisory NOTE when a
+body declares neither, and proceeds.
+
+**The obligation WILL be carried after the merge, not before it — and that half
+is NOT BUILT YET (issue #1718).** The design: every merged PR gets a post-merge
+verification row; a documentation-only diff has its row auto-closed with the
+reason recorded (a DETERMINISTIC exemption by path, so no LLM ever decides that
+a prompt or docs change "needs an E2E"); the validator session runs the rest, or
+records why nothing was needed. **Until that ships, this line is the only record
+there is** — so writing it is worth the ten seconds even though nothing forces
+you. When the row exists, declaring here will PRE-FILL it with your own lead:
+the author knows in one sentence what a validator would otherwise
+reverse-engineer from the diff days later. Note the row's exemption is by PATH,
+so it cannot recover a judgment the author skipped on a code PR — a bare
+`E2E: none` there just costs a validator round-trip instead of one sentence
+from the person who knew.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -360,6 +425,37 @@ When a user shares a file path or URL in conversation:
   the knowledge base as an authoritative source?"
 - Never auto-ingest without explicit user confirmation.
 - The dashboard also supports drag-drop file upload on the Knowledge tab.
+
+## Hook Output Persistence — a withheld hook is a SILENT loss
+
+Claude Code persists a hook's stdout above a size threshold instead of
+delivering it: the full text goes to a file and you get a short preview. It is
+not an error and nothing else announces it. MEASURED on this install: the
+SessionStart injection was withheld from 195 windows across a month — sessions
+ran without identity, charter and essential knowledge and nobody noticed,
+because the preview reads as ordinary furniture at the top of a window.
+
+**If a hook result arrives as a preview + a saved path** (as of CC 2.1.246:
+`<persisted-output>`, `Output too large (N KB). Full output saved to: <path>`,
+`Preview (first 2KB)`), that hook's contribution to this window was withheld:
+
+- **SessionStart** — Read the path the wrapper names **before anything else**,
+  then tell the user it happened. Genesis parts also mirror themselves to
+  `~/.genesis/sessions/<sid>/context-<part>.md` and name it in a
+  `[genesis-ctx:<part> · mirror: …]` header, so read the mirror if the
+  wrapper's path is gone. If neither exists, say which part this window lost.
+- **Any other hook** — that turn ran without what the hook was carrying (a
+  memory recall, a guard advisory). Say so rather than proceeding as if it
+  arrived.
+
+The size threshold is undocumented and **moves between CC versions** — treat
+the wrapper itself as the signal, never a byte count.
+`scripts/hooks/hook_output.py` is the single home of the measured cap and
+bounds the two hooks that carry the most to the model (the SessionStart
+injection and the per-prompt session-state tags); **route any new model-facing
+stdout through it** — the other hooks are not bounded yet. The hourly
+`context_injection_monitor` watches the harness's own filings independently of
+every emitter's arithmetic, so this class cannot go quiet again.
 
 ## Traps
 
@@ -397,7 +493,9 @@ When a user shares a file path or URL in conversation:
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
-  repo instead of getting done.
+  repo instead of getting done. (Merge-DRIVING specifically — when to actively
+  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
@@ -431,6 +529,25 @@ When a user shares a file path or URL in conversation:
   file does not outrank the user. That does NOT extend to the standing approval
   gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
   ego proposals; Rules: financial transactions, destructive commands).
+- **An inference you make CANNOT outrank a rule that names the exact thing.**
+  "This file does not outrank the user" means the user's ACTUAL WORDS, never your
+  reading of what they must have meant. A rule that names a specific object — a
+  service, host, surface, command, path, account — is cleared ONLY by user text
+  CONTAINING THAT NAME. Do the string check; it is mechanical, unlike "did they
+  mean it?", which is unfalsifiable and is what gets rationalized. Naming a
+  destination never authorizes a road: "use model X" does not clear a ban on the
+  service you happen to know reaches X. **Ambiguity resolves TOWARD the
+  prohibition** — a prohibition and an authorization are not symmetric, and
+  absence of mention is never permission. If the only route you know is a
+  forbidden one, that is exactly when you STOP and ask, not when you supply the
+  missing half yourself.
+
+  **The tripwire: writing "my read is you meant…" about something a rule forbids
+  IS the stop**, not a preamble to proceeding. And naming a rule then crossing it
+  in the same turn is not raising it — it is narrating, and it is worse than
+  silence, because it teaches the user to discount your flagging: if you surface a
+  conflict and proceed anyway, they cannot tell your real stops from your narrated
+  ones. Asking costs one line.
 - **Cross-session messages: the bar is on the REPLY, not the send.** Send a
   peer when there is good reason (region collision, a MEASURED contradiction of
   their claim, shared-resource contention, a defect in their blast radius, or a
@@ -453,11 +570,47 @@ When a user shares a file path or URL in conversation:
   decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
+- **Finish before you stop — the zero-drop rule.** A turn may run as long as
+  the work requires; never yield with steps you could still complete AND are
+  cleared to complete — stopping for an approval, a blocking question, plan
+  approval, or a designed hard stop is finishing correctly, not dropping
+  work. When something genuinely cannot finish this turn, every unfinished
+  piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
+  issue, which still owes the privacy scrub from "Where deferred work goes"
+  below — this rule waives nothing. Where none of those trackers
+  is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
+  ledger or follow-up tool — the fallback is a structured handoff that NAMES
+  every unfinished piece in your final message; a named remainder is tracked,
+  an unnamed one is dropped. An untracked remainder is a
+  drop, not a deferral, and a plan-file bullet is not a row. On the next
+  prompt, reconcile your own stranded artifacts early — ordered behind
+  anything the user's prompt makes urgent — before taking on discretionary
+  new work. The answer to "what has fallen through the cracks?" is MADE
+  zero: enumerate, then fix or file what the enumeration finds. (Origin
+  2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
+  days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
-  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  or (3) big enough to derail the session — or the user directs it.
+
+  **FILING IS NOT DEFERRING, and the two decisions are separate.** Everything below
+  answers WHERE a record lives. It never answers WHETHER the work waits — that is the
+  bias above, and it is decided FIRST. An issue is a public RECORD, not a disposal:
+  in-scope work gets filed *and* done, often in the same session, and the issue is
+  then simply where someone else could have found it. Treating "I filed it" as a
+  disposition is how a tracked item becomes an untracked drop wearing a ticket
+  number.
+
+  So before routing anything, answer in this order: **is it in scope for what this
+  session is doing?** If yes, it gets addressed here — file it too if that helps
+  someone else, but the filing is in addition, never instead. Only when it is
+  genuinely out of scope, or one of the three deferral tests above actually holds,
+  does the routing question below become the whole answer. Naming the OWNER of a
+  piece of work is a classification, and a classification is not a decision.
+
+  Route by OWNER:
   **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
   public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
   **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
@@ -466,14 +619,19 @@ When a user shares a file path or URL in conversation:
   far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
   never dispatched, surfaced, or filed as an issue, because we don't want it picked
   up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  Two hard limits on the issue route, both non-negotiable: a public post is
-  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
-  approval carries forward, and a channel-driven session has no confirmation step of
-  its own); and a **security** defect — an unpatched bypass, a credential exposure,
-  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
-  owns it. Everything else — who may file, the command, labels, dispatched sessions,
-  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
-  Goes"). Read it before filing your first.
+  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
+  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
+  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
+  real-world life — and strip it; an issue carries technical detail only. Borderline,
+  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
+  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
+  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
+  One limit stays absolute: a **security** defect — an unpatched bypass, a
+  credential exposure, anything exploitable — is NEVER filed publicly before it
+  is fixed, no matter who owns it. Everything else — who may file, the command,
+  labels, dispatched sessions, the time-gated case — is in
+  `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
+  filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.

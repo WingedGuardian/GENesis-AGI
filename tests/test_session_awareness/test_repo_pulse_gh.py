@@ -71,7 +71,7 @@ async def test_until_date_bounds_the_search_window():
 async def test_explicit_repo_skips_resolve():
     run = _fake_runner({"pr": (0, "[]", "")})
     out = await gh.list_merged_prs(since_date="2026-07-09", repo="o/r", runner=run)
-    assert out == {"repo": "o/r", "prs": [], "limit_hit": False}
+    assert out == {"repo": "o/r", "prs": [], "limit_hit": False, "dropped": 0}
     assert len(run.calls) == 1  # no gh repo view call
 
 

@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from genesis.cc import rate_limit_park, roster
+from genesis.cc import peer_availability, rate_limit_park, roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
@@ -660,13 +660,29 @@ class ConversationLoop:
                 **resume_overrides,
             )
 
-            # Phase 3: track whether any answer TEXT streamed this turn. If it did,
-            # we must NOT fail over (re-streaming a peer's reply would double-output
-            # to the user); tool_use/system_notice progress is fine before a failover.
-            streamed = {"text": False}
+            # Phase 3: track what this turn actually DID. Two different stakes:
+            #
+            #   text  — answer text reached the user, so failing over would
+            #           double-output. Cosmetic-but-confusing.
+            #   tools — the peer executed MCP tools, so re-running the prompt on
+            #           another peer can REPEAT the effect: an outreach send, a
+            #           database write. These invocations carry the full
+            #           user-scoped toolset with permission checks skipped, so
+            #           there is nothing downstream to catch a duplicate.
+            #
+            # Only `text` was tracked before, and a comment here asserted
+            # "tool_use progress is fine before a failover". That was true while
+            # failover happened solely on an exception; it stopped being true when
+            # an empty non-error return also advanced to the next peer.
+            streamed = {"text": False, "tools": False}
 
             async def _failover_tracked(ev: StreamEvent) -> None:
-                if ev.event_type == "text" and ev.text:
+                # strip(): this flag is EVIDENCE — it gates the double-output
+                # guard and, in the failover loop, records the peer as having
+                # SERVED and clears stale blocks. A whitespace-only text block
+                # is truthy but shows the user nothing, so counting it let a
+                # silent-cap attempt erase a genuine quota block.
+                if ev.event_type == "text" and ev.text and ev.text.strip():
                     streamed["text"] = True
                 if on_event:
                     await on_event(ev)
@@ -1052,10 +1068,32 @@ class ConversationLoop:
             # network is not a stale peer resume — retrying fresh won't help and
             # must not mark the sticky peer session stale.
             raise
-        except CCError:
-            # Don't re-stream: nothing to recover if already fresh, and never retry
-            # once answer text has reached the user (would double-output).
-            if inv.resume_session_id is None or (streamed and streamed.get("text")):
+        except CCError as exc:
+            # Don't re-run: nothing to recover if already fresh, and never once
+            # answer text has reached the user (would double-output) — this is a
+            # full re-run of the same prompt on the same peer.
+            #
+            # And never for a provider refusal. A DRAINED prepaid account arrives
+            # here as a generic CCProcessError rather than CCQuotaExhaustedError,
+            # because the invoker's global classifier deliberately does not know
+            # the balance phrases (teaching it would let a drained BACKUP report
+            # the primary as down — see peer_availability._BALANCE_REFUSALS). So
+            # it lands on this branch and buys a full second invocation of the
+            # same dead peer before the caller ever classifies it. A fresh
+            # session cannot refill an empty balance.
+            #
+            # Module-level import, deliberately: a DEFERRED import here would sit
+            # inside the `except` block, and an ImportError from it is not a
+            # CCError — it would skip both handlers in the peer loop, land on the
+            # outer `except Exception`, and abandon every remaining peer. That is
+            # the same outage-amplifier shape the never-raises guard exists to
+            # prevent. `peer_availability` imports only stdlib and `genesis.env`,
+            # so there is no cycle to work around.
+            if (
+                inv.resume_session_id is None
+                or (streamed and streamed.get("text"))
+                or peer_availability.is_provider_refusal(exc)
+            ):
                 raise
             logger.warning(
                 "failover peer %s sticky resume failed — retrying fresh", peer_name,
@@ -1112,6 +1150,46 @@ class ConversationLoop:
                     home,
                 )
                 return None
+            async def _record_peer(fn, *args) -> bool:
+                """Run a peer_availability recorder OFF the event loop, safely.
+
+                The recorder itself is exhaustively guarded against raising,
+                because a raise here escapes into the peer loop and abandons
+                every REMAINING peer. Moving it to a worker thread put that
+                guarantee back at risk: `asyncio.to_thread` raises RuntimeError
+                once the default executor is shut down, which the outer handler
+                catches by returning None — abandoning the whole failover, which
+                is strictly worse than the lost row it was protecting. Advisory
+                bookkeeping must never decide whether the user gets an answer.
+
+                CancelledError is deliberately re-raised: it is a BaseException
+                and means the turn itself is going away.
+                """
+                try:
+                    return await asyncio.to_thread(fn, *args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("peer availability record failed", exc_info=True)
+                    return False
+
+            async def _remember_peer_session(out) -> None:
+                """Persist this peer's session id so the turn can be continued.
+
+                Only with a real session id: an empty one cannot resume anything.
+                One named writer rather than an inline block, so any future path
+                that ends the turn on a peer has exactly one thing to call.
+                """
+                if not getattr(out, "session_id", ""):
+                    return
+                await self._merge_session_metadata(
+                    session["id"],
+                    {"fallback_session": {
+                        "cc_session_id": out.session_id,
+                        "roster_model": peer_name,
+                    }},
+                )
+
             sticky = self._session_fallback_session(session)
             for peer_name, peer_inv in peers:
                 if streamed and streamed.get("text"):
@@ -1122,23 +1200,85 @@ class ConversationLoop:
                         peer_name, peer_inv, sticky=sticky,
                         on_event=on_event, streamed=streamed,
                     )
-                except (CCRateLimitError, CCQuotaExhaustedError):
+                except (CCRateLimitError, CCQuotaExhaustedError) as exc:
+                    # The prose lives HERE, not in the availability record. This
+                    # handler previously logged nothing at all, while the record
+                    # persisted the provider's text into a file that is read into
+                    # every health snapshot and JSON-dumped into an LLM prompt.
+                    # The log is both the better home for it and outside that
+                    # exposure path, so the record carries no free text.
+                    logger.warning(
+                        "failover peer %s refused: %s", peer_name, exc, exc_info=True,
+                    )
+                    # Provider refused on a usage ceiling — real evidence about the
+                    # peer. Recording is advisory and never changes which peers are
+                    # tried; it exists so a blocked standby is VISIBLE, since the
+                    # roster admits a peer on credential presence alone.
+                    # to_thread: the recorder takes a lock with bounded retry
+                    # sleeps, then a tempfile write, fsync and replace. Run inline
+                    # it blocks the event loop — stalling every other conversation
+                    # during the very outage it exists to observe.
+                    # This branch is no longer refusals-only: since the MCP
+                    # exclusion, a tool's own 429 arrives HERE typed as a
+                    # rate-limit error and is correctly DECLINED as evidence.
+                    # So the declined-plus-streamed cleanup below applies on
+                    # this branch too — without it, a previously blocked peer
+                    # that just SERVED text stayed falsely blocked for days
+                    # because its clearing lived only on the generic branch.
+                    declined = not peer_availability.is_provider_refusal(exc)
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
+                    if streamed and streamed.get("text"):
+                        if declined:
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        # Text already reached the user this turn. Returning ""
+                        # (not None) stops the caller running contingency, which
+                        # would stack a SECOND answer on the first.
+                        return ""
                     continue  # this peer is also down → try the next one
-                except CCError:
+                except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
+                    # Routed through the SAME classifier on purpose: a local fault
+                    # (offline — which never left the box — our own timeout, an MCP
+                    # server crash, a stale sticky session) is a CCError here too,
+                    # but is not evidence about the peer. note_failure declines it,
+                    # so one local blip can't mark the whole standby fleet down.
+                    # Classified SEPARATELY from recording: `note_failure` returns
+                    # False for four different reasons, so reading its return as
+                    # "declined" let a transient write failure flip a refusal into
+                    # a recorded success.
+                    declined = not peer_availability.is_provider_refusal(exc)
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
+                    if streamed and streamed.get("text"):
+                        if declined:
+                            # The peer ANSWERED — text is on the user's screen —
+                            # and then a local fault ended the turn. A PRIOR block
+                            # must not survive an attempt that demonstrably served
+                            # from this peer; records only refresh during a home
+                            # outage, so a stale "blocked" stands for days.
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        return ""  # double-output guard, as above
                     continue
+                # Record availability only when the peer DEMONSTRABLY served the
+                # turn: a usable output, or answer text already on the user's
+                # screen. The degenerate empty non-error output (a silent cap)
+                # otherwise takes the success path below — behaviour identical to
+                # what shipped before this feature — and recording "available" on
+                # it would clear a real block with a turn that showed nothing.
+                # What to DO about that empty reply (advance? dead-end?) is retry
+                # policy, deliberately out of scope here; the effects-guard
+                # follow-up owns it.
+                usable = not output.is_error and bool((output.text or "").strip())
+                if usable or (streamed and streamed.get("text")):
+                    await _record_peer(peer_availability.note_success, peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
                 transitioned = fallback_state.enter(home, peer_name, "rate_limit")
-                if output.session_id:
-                    await self._merge_session_metadata(
-                        session["id"],
-                        {"fallback_session": {
-                            "cc_session_id": output.session_id,
-                            "roster_model": peer_name,
-                        }},
-                    )
+                await _remember_peer_session(output)
                 # Keep the session fresh. Cost + triage are intentionally NOT recorded
                 # for failover turns: CC's cost_usd is bogus for routed models, and
                 # triage must not attribute a peer model's output to the home model's
