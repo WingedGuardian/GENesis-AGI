@@ -142,7 +142,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **linkedin-post-writer** — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
 - **linkedin-profile-optimizer** — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
 - **obstacle-resolution** — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
-- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically when ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
+- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
 - **osint** — OSINT investigation — discover, track, and report on people, companies, and technologies
 - **prospect-researcher** — This skill should be used when the user asks to "research this company", "look into this person", "find the best angle for reaching out to", "who should I contact at [company]", "what does [company] care about", or when preparing outreach to a specific target. Also triggered by "help me prepare for an interview with [company]" or "I want to apply to [company]". Combines lead-generation intelligence with LinkedIn-specific approach planning.
 - **research** — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
@@ -189,6 +189,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `campaign_trigger` — Manually trigger a campaign tick (bypasses schedule).
 - `campaign_update` — Update campaign configuration.
 - `codebase_navigate` — Navigate the Genesis codebase progressively.
+- `contributor_issue_propose` — Propose a public GitHub issue for the Contributor Work-Log — sanitize it server-side and, if clean, hold it for owner approval on the dashboard.
 - `db_schema` — Query database schema: list all tables, or get columns for a specific table.
 - `direct_session_list` — List recent direct background sessions.
 - `direct_session_run` — Spawn a directed background CC session with profile-based tool restrictions.
@@ -230,8 +231,12 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 **genesis-outreach**
 
+- `marketing_prospects_list` — List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets the campaign may pitch — so it can enumerate → personalise a pitch → call ``marketing_send(prospect_id, subject, body)``.
+- `marketing_send` — Stage a COLD marketing email to a curated prospect. Returns a neutral queued/refused JSON status.
+- `outreach_cancel` — Cancel a queued, not-yet-sent message by its pending id.
 - `outreach_digest` — Generate a digest of recent outreach activity.
 - `outreach_engagement` — Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged, not_useful, ambivalent, ignored; 'replied' maps to 'useful').
+- `outreach_pending` — List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
 - `outreach_queue` — View recent outreach messages.

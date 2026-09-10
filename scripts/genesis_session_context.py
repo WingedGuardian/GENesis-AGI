@@ -634,7 +634,13 @@ def _emit_body() -> tuple[str, str, str] | None:
             _probe = None
         if _probe is not None:
             _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
-            sys.stdout.write("PROBE-START " + _ch * _n + " PROBE-END")
+            # This IS the probe that measures the harness cap, so it must emit a
+            # caller-chosen byte count verbatim — bounding it would destroy the
+            # only instrument that can re-derive the constant after a CC bump.
+            # Gated behind GENESIS_CTX_PROBE_BYTES, unset in normal operation.
+            sys.stdout.write(  # hook-output-exempt: this is the cap probe itself
+                "PROBE-START " + _ch * _n + " PROBE-END"
+            )
             sys.stdout.flush()
             return
 
@@ -941,6 +947,46 @@ def _emit_body() -> tuple[str, str, str] | None:
     last_session_data = _load_last_session_data()
 
     if is_genesis_session:
+        # 1.9. THE SESSION'S OWN ID. A foreground session learns it from the
+        # per-turn `[Clock: … | Session: xxxxxxxx]` tag, which
+        # `genesis_urgent_alerts` writes — and that hook returns immediately for
+        # a dispatched session (GENESIS_CC_SESSION=1). So a dispatched session
+        # had no way to know its own id, and every provenance field it wrote was
+        # NULL by construction: not a bug in the writer, an input it was never
+        # given (Codex P2, PR #1622).
+        #
+        # Emitted once at session start rather than per turn: this is a
+        # session-lifetime constant, and the per-turn tag exists for the clock
+        # beside it, not for the id.
+        #
+        # GATED ON THE PART, and "once" is why. settings.json wires FOUR
+        # SessionStart invocations of this script, one per --part; an ungated
+        # block inside `is_genesis_session` therefore ran in every part that
+        # reaches here, which MEASURED as two copies (charter and knowledge) —
+        # so the sentence above was false of the code beneath it (Codex P2).
+        # Charter is the right home: it is the identity part, it renders first,
+        # and the knowledge part is the one under a tight character budget,
+        # where a duplicate would push out later capability and MCP-crash
+        # warnings.
+        if _in("charter") and _hook_session_id:
+            if not first:
+                _emit("\n\n---\n\n")
+            # The argument NAME differs per tool and the difference is not
+            # cosmetic: `session_ledger_add`'s parameter is `session_id`, and an
+            # invocation using `source_session` is rejected before the handler
+            # runs — so instructing one name for both would lose the ledger row
+            # entirely, which is worse than the NULL this block exists to fix
+            # (Codex P2, PR #1622). Spell each call out.
+            _emit(
+                "## This Session\n\n"
+                f"- **CC session id**: `{_hook_session_id}`\n\n"
+                "Pass it when a tool asks which session work came from — the "
+                "argument is named per tool: `follow_up_create(source_session=…)`, "
+                "`session_ledger_add(session_id=…)`. Without it the row records no "
+                "origin, and nothing downstream can attribute the work back here.\n"
+            )
+            first = False
+
         # 2. Cognitive state from DB — for ego/background sessions only.
         # Foreground sessions get essential knowledge instead (see below).
         # Charter part (the dispatched session's highest-salience block).
@@ -1951,7 +1997,14 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     # ledger id. follow_up-target proposals (target_kind added by
                     # migration 0084) are session-agnostic and get their own
                     # global surface — never surface them here with a confirm
-                    # command that can't find them. Pre-0084 DBs lack the column;
+                    # command that can't find them. That surface is the
+                    # `follow_up_list` MCP tool, which decorates each row with any
+                    # pending proposal (mcp/health/follow_up_tools.py,
+                    # _enrich_external_state). It was promised here for a long time
+                    # before it existed — during which any follow_up proposal would
+                    # have gone stale unseen; measured, none had yet been proposed
+                    # (they auto-absorb in live mode), so the gap was latent, not
+                    # lossy. Pre-0084 DBs lack the column;
                     # the enclosing try/except then renders the block empty (same
                     # graceful degradation as the pre-0062 no-tables case).
                     cur = await db.execute(

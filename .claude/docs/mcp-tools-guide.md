@@ -28,8 +28,16 @@ consciously not pursuing → `follow_up_create` with `work_state="deferred_cold"
 
 `CLAUDE.md` carries the routing principle (Genesis-repo work → a GitHub issue;
 user-owned + purely-local operational work → a follow-up; consciously-not-doing →
-`tabled`) and its two hard limits (explicit approval every time; never publish a
-security defect before it is fixed). This section is the operational detail.
+`tabled`) and its two hard limits (scrub personal/identifying detail from anything
+public, and ask when borderline; never publish a security defect before it is
+fixed). Filing an issue does not need per-instance approval. This section is the
+operational detail.
+
+**Everything here is about WHERE a record lives, never about whether the work
+waits.** Filing and doing are not alternatives: in-scope work is filed *and*
+done, frequently in the same session. Settle the in-scope question with
+`CLAUDE.md`'s fix-now bias BEFORE reaching for any of the mechanics below —
+reading this section is not how you decide to defer something.
 
 ### Filing it — use the script, not a hand-typed command
 
@@ -107,10 +115,14 @@ another has already scanned and approved, between the scan and the post.
 
 Two things stay with you, because they are judgment, not mechanism:
 
-**Approval, every time.** A public post is irreversible;
-`contributor_issue.py` classifies it exactly that way. Channel-driven sessions run
-with `skip_permissions=True`, so no tool confirmation appears — ASK, in words, and
-get a yes, for each issue. A prior "go ahead" does not carry.
+**What goes IN it.** A public post is irreversible — `contributor_issue.py`
+classifies it exactly that way — so the gate is the CONTENT, not permission to
+file. Filing needs no per-instance approval; that mandate was the friction that
+kept adjacent bugs unfiled, and it is gone. What replaces it is the scan below,
+plus one judgement that stays yours: **borderline, in either direction? Ask.**
+Channel-driven sessions run with `skip_permissions=True`, so no tool
+confirmation appears and nothing will stop you — which is exactly why the
+scan is a habit rather than a prompt.
 
 **Privacy-scan the title AND the body.** Both egress. Technical detail only: no
 IPs, hostnames, absolute home paths, identifiers, or raw install metrics (row
