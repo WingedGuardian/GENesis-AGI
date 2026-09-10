@@ -1099,7 +1099,15 @@ RestartSec=5
 # 25% of container RAM (scales with the box); live qdrant RSS is ~0.3G.
 MemoryMax=25%
 LimitNOFILE=65536
-OOMScoreAdjust=-500
+# 100, not -500: a systemd USER manager cannot apply a negative oom_score_adj
+# (lowering below the inherited oom_score_adj_min of 0 needs CAP_SYS_RESOURCE),
+# and the write fails SILENTLY — the value reads back correct from
+# \`systemctl show\` while the kernel ignores it. Qdrant is a HARD dependency of
+# genesis-server, so a kill order that does not match what every configuration
+# surface claims is worth getting right. 100 matches genesis-server: both are
+# core, both restartable, both below unset units (systemd's 200) and above the
+# CC session (0). See genesis-server.service.template for the full note.
+OOMScoreAdjust=100
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes
@@ -1113,11 +1121,28 @@ QDSERVICE
 elif [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
     # Migrate the legacy hardcoded cap to the portable percentage in place.
     # Only the exact old default is touched, so a custom value is never clobbered.
+    _qd_migrated=0
     if grep -q '^MemoryMax=4G$' "$SYSTEMD_USER_DIR/qdrant.service"; then
         sed -i 's/^MemoryMax=4G$/MemoryMax=25%/' "$SYSTEMD_USER_DIR/qdrant.service"
+        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
+        _qd_migrated=1
+    fi
+    # Same in-place shape for the dead OOM score. Qdrant is NOT a template, so
+    # bootstrap.sh's template-sync cannot heal it the way it heals genesis-server
+    # and agent-zero — without this, every existing install keeps a declaration
+    # the user manager silently refuses. Only the exact old default is touched,
+    # so a custom value is never clobbered.
+    if grep -q '^OOMScoreAdjust=-500$' "$SYSTEMD_USER_DIR/qdrant.service"; then
+        sed -i 's/^OOMScoreAdjust=-500$/OOMScoreAdjust=100/' "$SYSTEMD_USER_DIR/qdrant.service"
+        echo "    ~ qdrant.service OOMScoreAdjust -500 -> 100 (the -500 never applied)"
+        _qd_migrated=1
+    fi
+    if [ "$_qd_migrated" = "1" ]; then
+        # OOMScoreAdjust is an EXEC-time property: daemon-reload alone does NOT
+        # re-apply it to the running process, so the restart is what makes the
+        # new value take effect.
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user try-restart qdrant.service 2>/dev/null || true
-        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
     else
         echo "    . qdrant.service already exists"
     fi
