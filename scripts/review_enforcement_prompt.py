@@ -37,11 +37,23 @@ def main() -> None:
     if is_review_current():
         sys.exit(0)
 
+    # The bounded writer lives in scripts/hooks/, a different dir from this
+    # script's own. Imported AFTER the silent-exit guards above so a healthy
+    # no-op prompt never pays for it, and UNGUARDED on purpose: a missing helper
+    # is a broken checkout and must be loud, not silently unbounded.
+    # APPEND, not insert(0): scripts/ went on at :26 and `review_scope` is
+    # imported from it below. Prepending scripts/hooks/ would let a same-named
+    # module there shadow it. hook_output is the only import from this dir.
+    sys.path.append(os.path.join(script_dir, "hooks"))
+    from hook_output import BoundedStdout  # noqa: PLC0415
+
+    _out = BoundedStdout(label="review-enforcement")
+
     # Unreviewed changes exist — inject the base reminder UNCONDITIONALLY first.
     # The deterministic review-scope manifest below is strictly ADDITIVE: it is
     # built and appended behind its own guards so a manifest error can never
     # truncate or suppress this core reminder.
-    print(
+    _out.emit(
         "MANDATORY: Unreviewed code changes detected. Review the BRANCH CHANGESET — "
         "`git diff $(git merge-base HEAD <your default branch>)`, which covers committed, "
         "staged and unstaged work (but NOT untracked files — `git status` for those). "
@@ -135,10 +147,12 @@ def main() -> None:
         "if you fixed a data path, confirm the data actually flows). "
         "Ask: 'If the system restarts now, will this actually work?' "
         "If you cannot answer yes WITH EVIDENCE, you are not done.",
-        flush=True,  # flush BEFORE the manifest's git calls: hook stdout is
-        # block-buffered (piped), so if the manifest git work overruns the 10s
-        # hook timeout and Python is killed, the base reminder must already be out.
+        block="reminder",
     )
+    # BoundedStdout._write flushes on every write, which preserves the reason the
+    # old `flush=True` was here: hook stdout is block-buffered (piped), so if the
+    # manifest's git work below overruns the 10s hook timeout and Python is
+    # killed, the base reminder must already be out.
 
     # Additive: deterministic per-file review-scope manifest. Fully fail-open —
     # any import/build error is swallowed so the base reminder above stands alone.
@@ -148,7 +162,24 @@ def main() -> None:
 
         block = render_reminder_block(build_manifest())
         if block:
-            print("\n" + block)
+            # The base reminder above is 6,436 chars — 64% of the harness's
+            # 10,000-char cap before a single file is listed — and
+            # _MAX_LISTED_FILES caps the manifest's COUNT, not its characters.
+            # MEASURED against real tracked paths: 50 median-length paths lands
+            # at 9,030 total and 50 of the longest at 10,961, i.e. over by 961. Over the
+            # cap the harness files the WHOLE block and shows a ~2 KB preview, so
+            # an unbounded manifest costs the mandatory reminder, not just itself.
+            # The writer decides what survives; the manifest is what degrades.
+            _out.emit_or_degrade(
+                "\n" + block,
+                block="scope-manifest",
+                notice=(
+                    "\n[review-scope manifest: {kept} chars kept — the rest was "
+                    "omitted to stay under the hook output cap. Run "
+                    "`git diff --stat $(git merge-base HEAD <default-branch>)` "
+                    "for the full file list.]"
+                ),
+            )
     except Exception:  # noqa: BLE001 - manifest is best-effort, never load-bearing
         pass
 

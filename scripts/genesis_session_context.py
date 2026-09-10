@@ -634,7 +634,13 @@ def _emit_body() -> tuple[str, str, str] | None:
             _probe = None
         if _probe is not None:
             _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
-            sys.stdout.write("PROBE-START " + _ch * _n + " PROBE-END")
+            # This IS the probe that measures the harness cap, so it must emit a
+            # caller-chosen byte count verbatim — bounding it would destroy the
+            # only instrument that can re-derive the constant after a CC bump.
+            # Gated behind GENESIS_CTX_PROBE_BYTES, unset in normal operation.
+            sys.stdout.write(  # hook-output-exempt: this is the cap probe itself
+                "PROBE-START " + _ch * _n + " PROBE-END"
+            )
             sys.stdout.flush()
             return
 
