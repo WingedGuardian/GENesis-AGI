@@ -1069,6 +1069,87 @@ async def test_run_streaming_tool_use_events(invoker):
     tool_events = [e for e in collected if e.event_type == "tool_use"]
     assert len(tool_events) == 1
     assert tool_events[0].tool_name == "Read"
+    # ...and the runtime's own record of it survives onto the output. Without
+    # this the collector is unwired: deleting its append left 172 tests green.
+    assert output.tools_used == ("Read",)
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_records_tools_in_first_seen_order_without_repeats(invoker):
+    """`tools_used` exists so a consumer never has to scrape tool names out of
+    the response text, which cannot tell a tool that RAN from one the reply
+    merely discussed. So it must match the shape that fallback produces:
+    first-seen order, no duplicates — and it must stay EMPTY when nothing ran,
+    because a consumer reads emptiness as "fall back", not as "no tools"."""
+
+    def _tool(name):
+        return {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": name}]}}
+
+    def _result(text):
+        return {
+            "type": "result", "subtype": "success", "is_error": False, "result": text,
+            "session_id": "s9", "total_cost_usd": 0.0, "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "modelUsage": {},
+        }
+
+    async def _run(events):
+        mock_proc = AsyncMock()
+        mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+        mock_proc.stdin = _make_mock_stdin()
+        mock_proc.stderr = _make_mock_stderr()
+        mock_proc.wait = AsyncMock()
+        mock_proc.terminate = MagicMock()
+        mock_proc.returncode = 0
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            return await invoker.run_streaming(CCInvocation(prompt="go"))
+
+    out = await _run([_tool("Bash"), _tool("Read"), _tool("Bash"), _result("done")])
+    assert out.tools_used == ("Bash", "Read")
+
+    # A response that only TALKS about tools reports none — this is the whole
+    # point of the field, and the text here is exactly what defeats the regex.
+    # `()` not None: the runtime DID watch this one and saw nothing.
+    out2 = await _run([_result("I would run Tool: Bash, but I did not.")])
+    assert out2.tools_used == ()
+
+    # A tool_use block that is not FIRST in the message. StreamEvent.from_raw
+    # stops at the first recognised block, so parsing the event would drop this
+    # name — and a partial list marked runtime-sourced renders as authoritative
+    # while silently incomplete. MEASURED at 13 of 8655 real assistant messages.
+    buried = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "thinking", "thinking": "considering"},
+                {"type": "text", "text": "let me look"},
+                {"type": "tool_use", "name": "Grep"},
+            ]
+        },
+    }
+    out3 = await _run([buried, _result("done")])
+    assert out3.tools_used == ("Grep",)
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_attaches_tools_when_the_stream_has_no_result(invoker):
+    """The no-result exit is a SECOND attachment site, and mutating the shared
+    collector cannot distinguish the two — deleting this site alone left 173
+    tests green. Reachable whenever CC's stream ends without a result event."""
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Grep"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}},
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        out = await invoker.run_streaming(CCInvocation(prompt="go"))
+    assert out.text == "partial"
+    assert out.tools_used == ("Grep",)
 
 
 # --- Streaming rate-limit event tests ---
@@ -2529,3 +2610,94 @@ async def test_streaming_escalates_when_leader_exits_but_group_survives(
     import signal as _signal
 
     assert (99992, _signal.SIGKILL) in calls
+
+
+@pytest.mark.asyncio
+async def test_a_multi_block_assistant_line_warns_exactly_once(invoker, caplog):
+    """Pin the assumption the stream loop relies on, instead of coding around a
+    condition that does not occur.
+
+    MEASURED 2026-09-04 against the real surface (`claude -p --output-format
+    stream-json --verbose`, two probes): 8/8 `assistant` lines carried exactly
+    ONE content block, 0 multi-block — including a thinking→text→tool_use turn
+    and three PARALLEL tool calls, which the API packs into a single message and
+    the CLI splits across three lines. `StreamEvent.from_raw` keeps only the
+    first recognized block, which is therefore lossless here.
+
+    That is an external CLI's wire format, not a contract. If a future CC starts
+    batching, this fails LOUDLY rather than silently dropping tool calls and
+    answer text. Once per invocation, not once per line — the same flood shape
+    fixed on the peer-availability read path.
+    """
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "name": "Bash", "input": {}},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": "s9", "total_cost_usd": 0.01,
+            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
+    assert len(hits) == 1, f"two multi-block lines, {len(hits)} warnings (want 1)"
+
+
+@pytest.mark.asyncio
+async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog):
+    """A canary that cries wolf trains its reader to ignore it.
+
+    `from_raw` returns on the first RECOGNIZED block, so a line pairing an
+    unrecognized block (`redacted_thinking`, or any future type) with one
+    recognized block loses nothing. Counting raw list length would fire here and
+    devalue every real firing.
+    """
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "redacted_thinking", "data": "x"},
+            {"type": "text", "text": "hi"},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": "s10", "total_cost_usd": 0.01,
+            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "done"
+    hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
+    assert not hits, "canary fired on a line from_raw parses losslessly"
