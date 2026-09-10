@@ -15,6 +15,7 @@ import aiosqlite
 import pytest
 
 from genesis.autonomy import desktop_gate as dg
+from genesis.autonomy import desktop_takeover_config as dtc
 from genesis.autonomy.approval import ApprovalManager
 from genesis.autonomy.classification import (
     DesktopAction,
@@ -2232,6 +2233,49 @@ async def test_a_malformed_row_does_not_break_the_cli_approval_probe(db):
 
     assert await ego_crud.has_pending_cli_approval(db, "cadence-1") is True
     assert await ego_crud.has_pending_cli_approval(db, "no-such-policy") is False
+
+
+@pytest.mark.asyncio
+async def test_the_kill_switch_reads_no_config_at_all(db, monkeypatch):
+    """`effective_mode()` checks the env kill switch BEFORE any YAML, so an
+    unparseable config is not a way around the stop. Reading the TTL at the top
+    of `check()` briefly put a base+overlay reload in FRONT of the off-return,
+    which made the emergency disable wait on the very files it exists to bypass.
+
+    Asserting "the kill switch wins" would NOT catch that — it wins either way.
+    The property is that the off path touches no config, so the test makes any
+    config read explode and requires the refusal anyway."""
+    monkeypatch.setenv(dtc.DISABLE_ENV, "1")
+
+    def _explode():
+        raise AssertionError("the off path must not read config")
+
+    monkeypatch.setattr(dg, "grant_ttl_minutes", _explode)
+    monkeypatch.setattr(dg, "action_ttl_seconds", _explode)
+
+    d = await _check(db, element_name="Save", control_type="Button")
+    assert d.allow is False
+    assert d.reason == "not_armed"
+
+
+@pytest.mark.asyncio
+async def test_a_nonboolean_password_flag_is_refused(db, live):
+    """`is_password` is a REFUSAL flag with no approval path, so it gets the same
+    strictness as the seven textual fields and the pid. It was the one field on
+    the object with no validation: a JSON `0`/`None`/`""` from a future transport
+    would be accepted, `bool(...)` would read it False, and a generically-named
+    password control would classify STANDARD and pass under a live grant."""
+    await _grant(db)
+    for flag in (0, 1, None, "", "true"):
+        d = await _check(db, element_name="Password", control_type="Edit", is_password=flag)
+        assert d.allow is False, flag
+        assert d.reason == "malformed_action:is_password", flag
+
+    # CONTROL: real booleans still work, both ways round.
+    d = await _check(db, element_name="Text Area", control_type="Edit", is_password=False)
+    assert d.allow is True and d.reason == "session_grant"
+    d = await _check(db, element_name="Password", control_type="Edit", is_password=True)
+    assert d.allow is False and d.reason == "password_field"
 
 
 @pytest.mark.asyncio

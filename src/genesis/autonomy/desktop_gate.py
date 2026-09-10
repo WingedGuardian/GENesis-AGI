@@ -575,12 +575,21 @@ class DesktopTakeoverGate:
         # and this runs inside `async def`, so each extra read blocks the loop.
         now = datetime.now(UTC)
         mode = effective_mode()
-        grant_ttl = timedelta(minutes=grant_ttl_minutes())
 
         # 1. Not armed at all — a refusal, never a hold. An unarmed capability
         #    must not queue work for the owner to approve later.
         if mode == "off":
             return DesktopGateDecision(allow=False, reason="not_armed", mode=mode)
+
+        # The TTL is read AFTER the off-return, and that order is the point.
+        # `effective_mode()` checks the env kill switch BEFORE reading any YAML,
+        # precisely so an unparseable config cannot be a way around the stop —
+        # and the single-read change above briefly put `grant_ttl_minutes()`,
+        # which reloads base + overlay, in FRONT of that return. The emergency
+        # disable would then have waited on the very files it exists to bypass,
+        # and every ordinary off-mode check paid ~3ms of synchronous file I/O
+        # for a value it never uses.
+        grant_ttl = timedelta(minutes=grant_ttl_minutes())
 
         # 2. The call itself must be well-formed. Refused in BOTH modes with
         #    the real reason: shadow is the mode that actually ships, so it is
@@ -1153,6 +1162,17 @@ def _validate_call(
         # PR-3 hands the gate an adapter or a duck-typed object.
         if not isinstance(getattr(action, field, None), str):
             return f"malformed_action:{field}"
+
+    # `is_password` is the one field on this object with NO approval path — it
+    # is a refusal flag, not a risk level. So it gets the same strictness as the
+    # textual fields and the pid, which it did not have: the loop above covers
+    # seven strings, `_coerce_pid` covers the int, and this boolean was simply
+    # missed. A JSON `0`, `None` or `""` from a future transport would then be
+    # accepted, `bool(...)` would read it as False, and a generically-named
+    # password control would classify STANDARD and pass under a live grant
+    # instead of being refused as malformed.
+    if not isinstance(getattr(action, "is_password", None), bool):
+        return "malformed_action:is_password"
 
     if not str(action.window_handle or "").strip():
         return "malformed_action:window_handle"
