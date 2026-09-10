@@ -1,0 +1,47 @@
+# Desktop takeover — the operator's own screen, keyboard and mouse.
+#
+# This is the highest-authority capability Genesis has: everything the operator
+# can do at their machine, Genesis can do while a grant is live. The gate
+# (src/genesis/autonomy/desktop_gate.py) re-reads this merged config (this file
+# + ~/.genesis/config/desktop_takeover.local.yaml) on EVERY check, so a hand
+# edit takes effect on the next action with no restart.
+#
+# ARMING IS DELIBERATELY AWKWARD. Two keys must BOTH be set, and neither is
+# accepted by settings_update() or the dashboard — arming desktop input must be
+# a conscious edit of the gitignored local overlay, never a single unconfirmed
+# API call. Every invalid value degrades toward LESS authority.
+
+# Master switch. Must be the boolean `true`; anything else (including the YAML
+# string "false", which is truthy in Python) reads as `off`.
+enabled: true
+
+# Mode: off | shadow | live
+#   off    — the gate refuses every action.
+#   shadow — (default, shipped posture) the gate classifies, records and logs
+#            what it WOULD decide, then refuses. Nothing reaches the machine.
+#   live   — the gate may allow a STANDARD action under a live session grant.
+#
+# `live` additionally requires live_opt_in: true below. An invalid mode
+# degrades to `shadow` — observable, never a silent `off`, never `live`.
+mode: shadow
+
+# Renewed opt-in for real input. `mode: live` alone grants nothing: a single
+# hand-edited or copied `mode: live` must not hand over the keyboard. Setting
+# both keys is the affirmative act.
+live_opt_in: false
+
+# How long the owner's session grant stays valid, measured from the moment they
+# approved it. A grant is session consent, not a standing one: a takeover
+# mission is minutes of work, and a grant nobody remembers giving must die on
+# its own rather than wait for a teardown that may never run. 30 minutes is
+# long enough for a multi-step mission with re-planning and short enough that a
+# forgotten grant is not a live one. Lower it freely; raising it lengthens the
+# window in which an unattended machine is controllable.
+grant_ttl_minutes: 30
+
+# Freshness stamped on each allowed action, and enforced on the DEVICE
+# (genesis-act.ps1 refuses a request past its expires_at). A desktop action
+# aims at coordinates on a screen that keeps moving, so an action that sat in
+# transit is not the action that was approved. This bounds container→SSH→device
+# transit, not owner think-time — the grant above covers that.
+action_ttl_seconds: 30

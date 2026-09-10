@@ -272,12 +272,42 @@ the question. Query SQLite `cc_sessions` for structured session data. Use
 `db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
 **Grep transcripts is LAST RESORT** — only after all above fail.
 
-**When to store back:**
-If you synthesize an answer from multiple recalled memories — something that
-connects information in a new way — store it via `memory_store` with
-`tags: ["synthesis"]` and appropriate wing/room tags. This is how the memory
-system compounds over time. Don't store routine answers; store genuine syntheses
-that would be expensive to re-derive.
+**When to store back — the test is RE-DERIVATION COST, not importance.**
+Store to Genesis memory when a future session would have to REDO WORK to know
+this. That is a question about the work you just did, which you can answer; "is
+this important?" is a question about the future, which you cannot, and it is why
+the rule below used to fire so rarely. Three concrete triggers:
+
+1. **You MEASURED something** that took real effort to obtain — a probe you had
+   to design, an enumeration across a directory, a live-state check. Store the
+   number WITH its denominator and the method, because the method is usually what
+   the next session gets wrong.
+2. **You established a durable ARCHITECTURAL fact** — X exists, X works this way,
+   X is not what its name suggests. Especially when you went looking for X
+   expecting it to be absent.
+3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
+   Use `supersedes` to link the correction to what it replaces. This is the
+   highest-value trigger and the easiest to skip, because being wrong does not
+   feel like a finding. It is the one that stops the next session paying for the
+   same mistake.
+
+Also store a genuine SYNTHESIS — an answer connecting several recalled memories
+in a new way — with `tags: ["synthesis"]`. Don't store routine answers, restatements
+of what a file already says, or anything the repo records on its own.
+
+**Do not park a durable FACT in CC file memory.** The two systems differ in
+LIFETIME, not just audience: CC file memory is for behavioural rules that must
+shape *how you work*, and it is compacted away within months, so a fact left
+there is a fact you will silently lose. Genesis memory is permanent and
+recallable system-wide. A measurement, an architecture note, or a correction
+belongs there even when it also taught you a behavioural lesson — in that case
+store BOTH: the rule in CC memory, the fact in Genesis memory.
+
+(Origin: a 2026-09-05 session measured an embedding regression, enumerated an
+init-path invariant across 33 modules, and corrected a wrong architectural claim
+of its own — then wrote only the behavioural lessons to CC memory and stored
+nothing durable until the user asked why. The routing rule was clear; nothing
+told it WHEN.)
 
 **Wings (structural domains):**
 Memories are tagged with a `wing` (top-level domain) and optional `room`
@@ -356,6 +386,26 @@ reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
+**PR-body convention — `E2E:` (encouraged, advisory):** a PR body may declare
+the POST-MERGE end-to-end verification its change needs, on its own line:
+`E2E: <one-line plan>` or `E2E: none — <reason there is no runtime surface>`.
+This does NOT gate the merge — the merge gate prints an advisory NOTE when a
+body declares neither, and proceeds.
+
+**The obligation WILL be carried after the merge, not before it — and that half
+is NOT BUILT YET (issue #1718).** The design: every merged PR gets a post-merge
+verification row; a documentation-only diff has its row auto-closed with the
+reason recorded (a DETERMINISTIC exemption by path, so no LLM ever decides that
+a prompt or docs change "needs an E2E"); the validator session runs the rest, or
+records why nothing was needed. **Until that ships, this line is the only record
+there is** — so writing it is worth the ten seconds even though nothing forces
+you. When the row exists, declaring here will PRE-FILL it with your own lead:
+the author knows in one sentence what a validator would otherwise
+reverse-engineer from the diff days later. Note the row's exemption is by PATH,
+so it cannot recover a judgment the author skipped on a code PR — a bare
+`E2E: none` there just costs a validator round-trip instead of one sentence
+from the person who knew.
+
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
 the repo-pulse worker auto-absorbs the row with PR evidence at the next
@@ -400,12 +450,49 @@ because the preview reads as ordinary furniture at the top of a window.
 
 The size threshold is undocumented and **moves between CC versions** — treat
 the wrapper itself as the signal, never a byte count.
-`scripts/hooks/hook_output.py` is the single home of the measured cap and
-bounds the two hooks that carry the most to the model (the SessionStart
-injection and the per-prompt session-state tags); **route any new model-facing
-stdout through it** — the other hooks are not bounded yet. The hourly
-`context_injection_monitor` watches the harness's own filings independently of
-every emitter's arithmetic, so this class cannot go quiet again.
+`scripts/hooks/hook_output.py` is the single home of the measured cap;
+**route any new model-facing stdout through it.** That instruction is now
+ENFORCED rather than advisory: `tests/test_scripts/test_hook_output_contract.py`
+enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
+`UserPromptSubmit` / `UserPromptExpansion` — the three events whose bare stdout
+the model reads, DERIVED by AST from `hook_output.py`'s own `BARE_STDOUT_EVENTS`
+so the gate keeps no copy to drift — and fails
+unless each one either routes through the writer or carries a stated, measured
+reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
+with unbounded output fails by construction, which a known-bad-pattern scan could
+not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
+change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
+`.local.yaml` overlay can raise a default.
+
+There is a SECOND, weaker category, named here because describing only the first
+overstates the gate: `_MEASURED_PENDING_ROUTING` holds a hook that is NOT
+structurally bounded and has simply never been observed filing, with its routing
+tracked in a follow-up. `proactive_memory_hook.py` is its only member and its own
+reason concedes the peer loop is unbounded — so it CAN reach the cap. That is
+debt with a date on it, not a proof, and the two categories are kept separate so
+the debt stays visible rather than laundered into "bounded".
+
+Three limits, so it is not read as total coverage. Hooks wired in a user-level
+`~/.claude/settings.json` or a `settings.local.json` are outside the repo and
+invisible to it. An EXEMPTION SKIPS SCANNING ENTIRELY, so a row is only as good
+as its last read — which is why the table stays small. And the detector's
+enumeration is bounded, not total: it covers `print`, `builtins.print`,
+`file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
+but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
+inheriting stdout. That list grew four times under review; treat it as the
+spellings checked so far rather than a closed set.
+
+Hooks on the OTHER events reach the model through JSON `additionalContext`, the
+same persistence path with a different failure mode — an oversized advisory must
+lose prose, never its `permissionDecision`, which is what `print_json_bounded`
+protects. They are out of the gate's scope today, deliberately, rather than
+exempted in bulk.
+
+The hourly `context_injection_monitor` watches the harness's own filings
+independently of every emitter's arithmetic, so this class cannot go quiet
+again — and its record is the evidence that the chokepoint works: of 849 filings
+on this install, 842 were one emitter that stopped filing the day #1556 moved it
+behind the writer, and 7 were a guard since removed.
 
 ## Traps
 
@@ -436,14 +523,28 @@ every emitter's arithmetic, so this class cannot go quiet again.
   Default floor: 2 hours (7200s). Full policy in genesis-development skill.
 - **Verify outcomes, not just tests.** "If the system restarts now, will
   this work?" Built ≠ wired ≠ verified. Details in genesis-development skill.
-- **Code review after code changes.** Codex will review your output.
-  Protocol in genesis-development skill.
+- **Code review after code changes.** Codex reviews your output — but only
+  AUTOMATICALLY WHEN THE PR OPENS. A later push triggers nothing: after any push you
+  want reviewed, comment `@codex review`, or the PR waits forever on a review nobody
+  requested. **Verify rather than remember** — that trigger is an owner-tunable
+  setting which has flipped more than once, so a session that recalls it from prose
+  will eventually be wrong. `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  reports `codex-at-head`, which settles whether a review EXISTS at this head — not
+  whether one was requested. It reads published reviews only, so "never triggered"
+  and "triggered, still running" are the SAME output; if you have not just requested
+  one, request one rather than reading that line as proof nobody did.
+  A PR whose diff touches the
+  enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
+  a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
+  protocols: genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
-  repo instead of getting done.
+  repo instead of getting done. (Merge-DRIVING specifically — when to actively
+  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
@@ -477,6 +578,25 @@ every emitter's arithmetic, so this class cannot go quiet again.
   file does not outrank the user. That does NOT extend to the standing approval
   gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
   ego proposals; Rules: financial transactions, destructive commands).
+- **An inference you make CANNOT outrank a rule that names the exact thing.**
+  "This file does not outrank the user" means the user's ACTUAL WORDS, never your
+  reading of what they must have meant. A rule that names a specific object — a
+  service, host, surface, command, path, account — is cleared ONLY by user text
+  CONTAINING THAT NAME. Do the string check; it is mechanical, unlike "did they
+  mean it?", which is unfalsifiable and is what gets rationalized. Naming a
+  destination never authorizes a road: "use model X" does not clear a ban on the
+  service you happen to know reaches X. **Ambiguity resolves TOWARD the
+  prohibition** — a prohibition and an authorization are not symmetric, and
+  absence of mention is never permission. If the only route you know is a
+  forbidden one, that is exactly when you STOP and ask, not when you supply the
+  missing half yourself.
+
+  **The tripwire: writing "my read is you meant…" about something a rule forbids
+  IS the stop**, not a preamble to proceeding. And naming a rule then crossing it
+  in the same turn is not raising it — it is narrating, and it is worse than
+  silence, because it teaches the user to discount your flagging: if you surface a
+  conflict and proceed anyway, they cannot tell your real stops from your narrated
+  ones. Asking costs one line.
 - **Cross-session messages: the bar is on the REPLY, not the send.** Send a
   peer when there is good reason (region collision, a MEASURED contradiction of
   their claim, shared-resource contention, a defect in their blast radius, or a
@@ -505,8 +625,8 @@ every emitter's arithmetic, so this class cannot go quiet again.
   approval, or a designed hard stop is finishing correctly, not dropping
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
-  issue, which keeps its per-instance approval gate from "Where deferred
-  work goes" below, this rule waives nothing. Where none of those trackers
+  issue, which still owes the privacy scrub from "Where deferred work goes"
+  below — this rule waives nothing. Where none of those trackers
   is reachable — a non-Genesis client (Codex, Cursor) reads this file with no
   ledger or follow-up tool — the fallback is a structured handoff that NAMES
   every unfinished piece in your final message; a named remainder is tracked,
@@ -522,7 +642,24 @@ every emitter's arithmetic, so this class cannot go quiet again.
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
-  or (3) big enough to derail the session — or the user directs it. Route by OWNER:
+  or (3) big enough to derail the session — or the user directs it.
+
+  **FILING IS NOT DEFERRING, and the two decisions are separate.** Everything below
+  answers WHERE a record lives. It never answers WHETHER the work waits — that is the
+  bias above, and it is decided FIRST. An issue is a public RECORD, not a disposal:
+  in-scope work gets filed *and* done, often in the same session, and the issue is
+  then simply where someone else could have found it. Treating "I filed it" as a
+  disposition is how a tracked item becomes an untracked drop wearing a ticket
+  number.
+
+  So before routing anything, answer in this order: **is it in scope for what this
+  session is doing?** If yes, it gets addressed here — file it too if that helps
+  someone else, but the filing is in addition, never instead. Only when it is
+  genuinely out of scope, or one of the three deferral tests above actually holds,
+  does the routing question below become the whole answer. Naming the OWNER of a
+  piece of work is a classification, and a classification is not a decision.
+
+  Route by OWNER:
   **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
   public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
   **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
@@ -531,14 +668,19 @@ every emitter's arithmetic, so this class cannot go quiet again.
   far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
   never dispatched, surfaced, or filed as an issue, because we don't want it picked
   up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  Two hard limits on the issue route, both non-negotiable: a public post is
-  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
-  approval carries forward, and a channel-driven session has no confirmation step of
-  its own); and a **security** defect — an unpatched bypass, a credential exposure,
-  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
-  owns it. Everything else — who may file, the command, labels, dispatched sessions,
-  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
-  Goes"). Read it before filing your first.
+  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
+  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
+  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
+  real-world life — and strip it; an issue carries technical detail only. Borderline,
+  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
+  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
+  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
+  One limit stays absolute: a **security** defect — an unpatched bypass, a
+  credential exposure, anything exploitable — is NEVER filed publicly before it
+  is fixed, no matter who owns it. Everything else — who may file, the command,
+  labels, dispatched sessions, the time-gated case — is in
+  `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
+  filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
