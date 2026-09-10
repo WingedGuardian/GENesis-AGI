@@ -63,6 +63,25 @@ def _age_path(path: Path, days: float) -> None:
             os.utime(item, (old, old))
 
 
+# Every module path the reaper WRITES to. Each is redirected below; the guard
+# test at the bottom fails if a new one is added without being listed here.
+_WRITABLE_PATH_CONSTANTS = ("TRASH_DIR", "LOG_DIR", "TOMBSTONE_INDEX", "BOARD_CACHE")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_write_targets(tmp_path, monkeypatch):
+    """Never let a test write into the operator's real ~/.genesis.
+
+    Autouse and module-wide on purpose. This leak has happened TWICE — first the
+    tombstone index, then the board cache — and both times it was silent: a write
+    to a file nobody was watching, from tests that call helpers directly rather
+    than going through ``_run_main``. Redirecting by NAME here, plus the guard
+    test below, is what makes a third instance impossible rather than unlikely.
+    """
+    for name in _WRITABLE_PATH_CONSTANTS:
+        monkeypatch.setattr(wl, name, tmp_path / f"isolated-{name.lower()}")
+
+
 @pytest.fixture
 def reaper_repo(tmp_path: Path):
     """A real repo with detached + branch worktrees in known merge states.
@@ -172,50 +191,143 @@ def _run_main(monkeypatch, repo: Path, trash: Path, *, argv=("worktree_lifecycle
     monkeypatch.setattr(wl, "_repo_root", lambda: repo)
     monkeypatch.setattr(wl, "TRASH_DIR", trash)
     monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    # TOMBSTONE_INDEX defaults to a path under the real ~/.genesis. Without this
+    # redirect every reaper test appends rows describing tmp_path worktrees to the
+    # operator's live index — measured, 20 junk rows from one run.
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", trash / "tombstones.jsonl")
     monkeypatch.setattr(sys, "argv", list(argv))
     return wl.main()
 
 
-def test_main_reaps_detached_merged_only(reaper_repo, tmp_path, monkeypatch):
+def _tombstones(trash: Path) -> list[dict]:
+    """Rows the run appended to the (redirected) tombstone index."""
+    import json
+
+    f = trash / "tombstones.jsonl"
+    if not f.exists():
+        return []
+    return [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+
+
+def test_main_archives_both_lanes_and_deletes_nothing(reaper_repo, tmp_path, monkeypatch):
+    """Every reaped worktree becomes a recoverable archive. NOTHING is deleted.
+
+    All three fixtures are 20 days idle, so merged and unmerged alike are past
+    their thresholds. The point of this test is that the two lanes differ only in
+    the LABEL they carry, never in whether the work survives: a merged worktree
+    is a duplicate of main and an unmerged one may be the only copy, but the
+    reaper is not the thing that decides either is expendable.
+    """
     trash = tmp_path / "trash"
     rc = _run_main(monkeypatch, reaper_repo.repo, trash)
     assert rc == 0
 
-    # Detached-at-merged and branch-merged: reaped (moved out of place).
-    assert not reaper_repo.wt_det_merged.exists()
-    assert not reaper_repo.wt_branch_merged.exists()
-    # Detached-at-unmerged: kept (fail-safe).
-    assert reaper_repo.wt_det_unmerged.exists()
+    # All three left their working paths...
+    for wt in (reaper_repo.wt_det_merged,
+               reaper_repo.wt_branch_merged,
+               reaper_repo.wt_det_unmerged):
+        assert not wt.exists(), f"{wt.name} should have been reaped"
 
-    # The detached entry landed in trash with detached metadata + real commit sha.
+    # ...and all three are recoverable archives, not holes.
+    archives = sorted(a.name for a in trash.glob("*.tar.gz"))
+    assert len(archives) == 3, f"expected 3 archives, got {archives}"
+    for stem in ("wt_det_merged", "wt_branch_merged", "wt_det_unmerged"):
+        assert any(a.startswith(stem) for a in archives), f"{stem} missing from {archives}"
+
+    # The branch of a MERGED worktree is left alone. An earlier revision deleted
+    # it; a branch ref is the cheapest handle onto the commits a session made.
+    assert _git(reaper_repo.repo, "branch", "--list", "merged-br").strip() != ""
+
+
+def test_lane_is_recorded_but_changes_no_outcome(reaper_repo, tmp_path, monkeypatch):
+    """Lane survives as provenance on the metadata, distinguishing the two cases."""
     import json
 
-    metas = list(trash.glob("wt_det_merged-*/.trash_meta.json"))
-    assert len(metas) == 1, f"expected one trashed detached worktree, got {metas}"
-    meta = json.loads(metas[0].read_text())
-    assert meta["detached"] is True
-    assert meta["commit"] == reaper_repo.c0
+    trash = tmp_path / "trash"
+    _run_main(monkeypatch, reaper_repo.repo, trash)
+
+    metas = [json.loads(f.read_text()) for f in trash.glob("*.meta.json")]
+    assert metas, f"no sidecar metadata written: {list(trash.iterdir())}"
+    got = {m["original_path"].rsplit("/", 1)[-1]: m["lane"] for m in metas}
+    assert got["wt_det_unmerged"] == "unmerged"
+    assert got["wt_det_merged"] == "merged"
+    assert got["wt_branch_merged"] == "merged"
+
+
+def test_tombstone_index_records_every_reap(reaper_repo, tmp_path, monkeypatch):
+    """The index is what makes the trash greppable without unpacking archives.
+
+    It must carry the facts that die with the worktree: which branch, which
+    commit, which lane, and the commits that exist nowhere but here.
+    """
+    trash = tmp_path / "trash"
+    _run_main(monkeypatch, reaper_repo.repo, trash)
+
+    rows = _tombstones(trash)
+    assert len(rows) == 3, f"expected one tombstone per reap, got {len(rows)}"
+
+    by_name = {r["original_path"].rsplit("/", 1)[-1]: r for r in rows}
+    unmerged = by_name["wt_det_unmerged"]
+    assert unmerged["lane"] == "unmerged"
+    assert unmerged["commit"] == reaper_repo.c_side
+    assert unmerged["archive"].endswith(".tar.gz")
+    # The unmerged detached commit is not in main, so it is exactly the work a
+    # tombstone exists to name.
+    assert any(reaper_repo.c_side[:7] in c for c in unmerged["unique_commits"]), \
+        f"unique commits should name c_side, got {unmerged['unique_commits']}"
+
+    merged = by_name["wt_branch_merged"]
+    assert merged["lane"] == "merged"
+    assert merged["unique_commits"] == []
+
+
+def test_archive_is_verified_before_the_directory_goes(reaper_repo, tmp_path, monkeypatch):
+    """A failed compression keeps the uncompressed directory rather than losing it.
+
+    This is the invariant that makes compression safe to add at all: it is an
+    optimisation, and it must never be the reason a recovery is impossible.
+    """
+    trash = tmp_path / "trash"
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wl.tarfile, "open", _boom)
+    _run_main(monkeypatch, reaper_repo.repo, trash)
+
+    assert not list(trash.glob("*.tar.gz")), "no archive should survive a failed write"
+    dirs = [d for d in trash.iterdir() if d.is_dir() and d.name != "logs"]
+    assert len(dirs) == 3, f"all three must remain as directories, got {dirs}"
+    for d in dirs:
+        assert (d / ".trash_meta.json").exists()
 
 
 # ─── _recover: detached round-trip (Part 3) ──────────────────────────────────
 
 
 def test_recover_detached_roundtrip(reaper_repo, tmp_path, monkeypatch):
+    """Detached round-trip, now exercised on the UNMERGED worktree.
+
+    Retargeted deliberately: the merged detached worktree no longer reaches the
+    trash at all (it is deleted outright), so the unmerged one is the only
+    detached entry a recovery can be tested against — and it is also the case
+    that actually matters, since its commit is reachable from nowhere else.
+    """
     trash = tmp_path / "trash"
     _run_main(monkeypatch, reaper_repo.repo, trash)
-    assert not reaper_repo.wt_det_merged.exists()
+    assert not reaper_repo.wt_det_unmerged.exists()
 
     # Recover it — must come back as a DETACHED worktree at the original commit,
     # not a plain-directory move.
-    ok = wl._recover("wt_det_merged", reaper_repo.repo)
+    ok = wl._recover("wt_det_unmerged", reaper_repo.repo)
     assert ok is True
-    assert reaper_repo.wt_det_merged.exists()
+    assert reaper_repo.wt_det_unmerged.exists()
 
-    head = _git(reaper_repo.wt_det_merged, "rev-parse", "HEAD").strip()
-    assert head == reaper_repo.c0
+    head = _git(reaper_repo.wt_det_unmerged, "rev-parse", "HEAD").strip()
+    assert head == reaper_repo.c_side
     # Detached HEAD: symbolic-ref for HEAD fails (not on a branch).
     detached = subprocess.run(
-        ["git", "-C", str(reaper_repo.wt_det_merged), "symbolic-ref", "-q", "HEAD"],
+        ["git", "-C", str(reaper_repo.wt_det_unmerged), "symbolic-ref", "-q", "HEAD"],
         capture_output=True,
     )
     assert detached.returncode != 0, "recovered worktree should be detached, not on a branch"
@@ -493,3 +605,231 @@ def test_skip_worktree_containing_nested(reaper_repo, tmp_path, monkeypatch):
 
     assert wl.main() == 0
     assert parent.exists(), "worktree containing a nested worktree must not be reaped"
+
+
+# ─── the guard: no test may write into the real ~/.genesis ───────────────────
+
+
+def test_every_writable_path_is_redirected_during_tests():
+    """Enumerate the module's Path constants; none may point at the real store.
+
+    This is the CLASS fix for a leak that shipped twice. It runs under the
+    autouse fixture, so it sees the post-redirect state: a newly added constant
+    that nobody added to _WRITABLE_PATH_CONSTANTS still points into the real
+    ~/.genesis and fails here, instead of silently polluting an operator's data.
+    """
+    real = Path.home() / ".genesis"
+    leaked = sorted(
+        name
+        for name, val in vars(wl).items()
+        if name.isupper()
+        and isinstance(val, Path)
+        and (val == real or real in val.parents)
+    )
+    assert not leaked, (
+        f"these module paths still point inside {real} during tests: {leaked}. "
+        f"Add them to _WRITABLE_PATH_CONSTANTS if the reaper writes to them."
+    )
+
+
+# ─── the gaps a green suite left open ────────────────────────────────────────
+#
+# Every one of these covers a defect that a full test run did NOT catch. They are
+# grouped because they share a root cause: inserting a COMPRESS step between the
+# worktree and its resting place blinded guards written against the pre-compression
+# name and shape, and a verify-before-delete that SAMPLED the artifact rather than
+# reading it whole was never a verification at all.
+
+
+def test_a_truncated_archive_is_rejected_and_the_source_survives(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """B1: verification must read the WHOLE archive, not its first header.
+
+    `tarfile.next()` reads one member header and stops, so gzip's trailing
+    CRC32/ISIZE check — the only proof the stream is complete — is never reached.
+    MEASURED: a 61-member archive truncated to 50% passed that check while a full
+    walk raised EOFError. The source directory was removed immediately after.
+
+    The assertion is the OUTCOME, not the mechanism: whatever the failure mode, a
+    bad archive must never be the last copy.
+    """
+    real_open = wl.tarfile.open
+
+    def truncating_open(name=None, mode="r", **kw):
+        tf = real_open(name, mode, **kw)
+        if "w" in str(mode):
+            orig_close = tf.close
+
+            def close_then_truncate():
+                orig_close()
+                f = Path(str(name))
+                data = f.read_bytes()
+                f.write_bytes(data[: len(data) // 2])
+
+            tf.close = close_then_truncate
+        return tf
+
+    monkeypatch.setattr(wl.tarfile, "open", truncating_open)
+
+    trash = tmp_path / "trash"
+    _run_main(monkeypatch, reaper_repo.repo, trash)
+
+    assert not list(trash.glob("*.tar.gz")), "a corrupt archive must not be kept"
+    dirs = [d for d in trash.iterdir() if d.is_dir() and d.name != "logs"]
+    assert dirs, "the uncompressed directory must survive a failed archive"
+    for d in dirs:
+        assert (d / ".trash_meta.json").exists(), "and it must still be recoverable"
+
+
+def test_a_second_reap_of_the_same_basename_does_not_overwrite_an_archive(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """B2: the collision guard must see ARCHIVED entries, not just directories.
+
+    `_compress_entry` removes the directory, so `trash_path.exists()` is False for
+    every already-archived entry. MEASURED: the loop re-picked the same name and
+    `tarfile.open(..., "w:gz")` truncated the existing tarball — a silent,
+    irreversible loss inside a module whose contract is that it deletes nothing.
+
+    Two worktrees deliberately share a BASENAME while living under different
+    parents, which is the shape that makes this reachable.
+    """
+    repo = reaper_repo.repo
+    trash = tmp_path / "trash"
+    wl_trash = trash
+
+    first = tmp_path / "alpha" / "dup"
+    second = tmp_path / "beta" / "dup"
+    for i, (path, branch) in enumerate(((first, "dup-a"), (second, "dup-b"))):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _git(repo, "branch", branch, reaper_repo.c0)  # merged: ancestor of main
+        _git(repo, "worktree", "add", "-q", str(path), branch)
+        (path / f"marker{i}.txt").write_text(f"worktree {i}")
+        _age_path(path, 20)
+
+    monkeypatch.setattr(wl, "TRASH_DIR", wl_trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", trash / "tomb.jsonl")
+    wl_trash.mkdir(parents=True, exist_ok=True)
+
+    worktrees = wl._list_worktrees(repo)
+    for path in (first, second):
+        wt = next(w for w in worktrees if Path(w["path"]) == path)
+        cls = wl._classify(wt, worktrees, repo)
+        wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+
+    archives = sorted(trash.glob("dup-*.tar.gz"))
+    assert len(archives) == 2, (
+        f"each reap needs its own archive; got {[a.name for a in archives]}"
+    )
+    # And the first one still holds ITS content, not the second's.
+    import tarfile as _tf
+
+    names = set()
+    for a in archives:
+        with _tf.open(a, "r:gz") as fh:
+            names |= {Path(m.name).name for m in fh.getmembers()}
+    assert {"marker0.txt", "marker1.txt"} <= names, (
+        f"both worktrees' content must survive; archive holds {sorted(names)}"
+    )
+
+
+def test_an_archive_with_an_absolute_symlink_round_trips(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """B3: recovery must survive our own `secrets.env -> /abs/path` convention.
+
+    `extractall(filter="data")` raises AbsoluteLinkError on the first absolute
+    link and ABORTS PARTWAY, leaving a directory that looks restored and is not.
+    MEASURED 2026-09-10: 3 of the 48 worktrees due for archiving carry exactly
+    that link, so this is a live path, not a hypothetical one.
+    """
+    wt = reaper_repo.wt_branch_merged
+    link = wt / "secrets.env"
+    os.symlink("/home/ubuntu/genesis/secrets.env", link)
+    (wt / "untracked-note.txt").write_text("keep me")
+    _age_path(wt, 20)
+
+    trash = tmp_path / "trash"
+    _run_main(monkeypatch, reaper_repo.repo, trash)
+    assert not wt.exists()
+    assert list(trash.glob("wt_branch_merged-*.tar.gz")), "should have archived"
+
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    assert wt.exists(), "recovery must restore the worktree"
+    assert (wt / "untracked-note.txt").exists(), (
+        "a partial extraction would drop members after the absolute link"
+    )
+    restored = wt / "secrets.env"
+    assert restored.is_symlink(), "the link must come back AS a link, not a copy"
+    assert os.readlink(restored) == "/home/ubuntu/genesis/secrets.env"
+
+
+def test_a_non_utf8_diff_does_not_abort_the_run(reaper_repo, tmp_path, monkeypatch):
+    """S1: UnicodeDecodeError is a ValueError, outside every except tuple.
+
+    It propagated out of main(), so one worktree holding a latin-1 file stopped
+    every worktree after it from being processed — and disk_hygiene.sh swallows
+    the traceback into a single `|| echo` line, so nobody would see why.
+    """
+    wt = reaper_repo.wt_branch_merged
+    f = wt / "latin.txt"
+    f.write_bytes(b"caf\xe9 non-utf8 \xe9\xe8\xea\n")  # tracked + modified
+    _git(wt, "add", "latin.txt")
+    _git(wt, "commit", "-q", "-m", "add latin file")
+    f.write_bytes(b"caf\xe9 CHANGED \xe9\xe8\xea\n")  # now dirty, non-UTF-8 diff
+    _age_path(wt, 20)
+
+    trash = tmp_path / "trash"
+    rc = _run_main(monkeypatch, reaper_repo.repo, trash)  # must not raise
+    assert rc == 0
+
+    # And the other worktrees were still processed — the real damage was the
+    # silent truncation of the run, not the one failed patch.
+    assert not reaper_repo.wt_det_unmerged.exists(), (
+        "worktrees after the failing one must still be reaped"
+    )
+
+
+def test_dry_run_writes_nothing_at_all(reaper_repo, tmp_path, monkeypatch):
+    """S5: --dry-run's entire contract is that it changes nothing on disk."""
+    trash = tmp_path / "trash"
+    cache = tmp_path / "board.json"
+    monkeypatch.setattr(wl, "BOARD_CACHE", cache)
+    _run_main(monkeypatch, reaper_repo.repo, trash,
+              argv=("worktree_lifecycle.py", "--dry-run"))
+
+    assert not cache.exists(), "--dry-run must not publish the board cache"
+    assert reaper_repo.wt_branch_merged.exists(), "--dry-run must not reap"
+    assert not list(trash.glob("*.tar.gz"))
+
+
+def test_a_worktree_that_becomes_active_mid_run_is_not_reaped(
+    reaper_repo, tmp_path, monkeypatch,
+):
+    """S2: liveness must be re-checked at ACT time, not only at classify time.
+
+    Classification now happens for every worktree up front (measured 19-41s over
+    191), and archiving adds seconds each, so the window between "nothing is using
+    this" and the move is minutes. Someone opening an old worktree during the scan
+    is precisely what the process check exists to protect.
+    """
+    calls = {"n": 0}
+    target = str(reaper_repo.wt_branch_merged)
+    real = wl._find_processes_in_dir
+
+    def busy_on_second_look(path):
+        if path == target:
+            calls["n"] += 1
+            return [] if calls["n"] == 1 else [999999]  # idle at classify, busy at reap
+        return real(path)
+
+    monkeypatch.setattr(wl, "_find_processes_in_dir", busy_on_second_look)
+    trash = tmp_path / "trash"
+    _run_main(monkeypatch, reaper_repo.repo, trash)
+
+    assert calls["n"] >= 2, "the reap path must re-check liveness independently"
+    assert reaper_repo.wt_branch_merged.exists(), (
+        "a worktree that became busy after classification must be left alone"
+    )
+    assert not list(trash.glob("wt_branch_merged-*")), "and nothing of it stored"

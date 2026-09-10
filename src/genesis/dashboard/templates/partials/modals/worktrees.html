@@ -1,0 +1,117 @@
+
+
+  <!-- Worktree Board Modal — committed work in flight, and what happens to it -->
+  <div class="config-modal-overlay" x-show="$store.genesisDashboard.worktreeModal.open"
+       @click.self="$store.genesisDashboard.worktreeModal.open = false" x-transition>
+    <div class="config-modal" style="max-width: 1100px;">
+      <div class="config-modal-header">
+        <span>Worktree Board</span>
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.worktreeModal)}`"></span>
+          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.worktreeModal)"></span>
+        </span>
+        <button @click="$store.genesisDashboard.worktreeModal.open = false">&times;</button>
+      </div>
+      <div class="config-modal-body">
+
+        <div x-show="$store.genesisDashboard.worktreeModal.fetch.state === 'loading' && !$store.genesisDashboard.worktreeModal.data"
+             style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
+
+        <template x-if="$store.genesisDashboard.worktreeModal.fetch.error">
+          <div style="font-size: 0.78rem; color: #d9534f; margin-bottom: 0.6rem;"
+               x-text="$store.genesisDashboard.worktreeModal.fetch.error"></div>
+        </template>
+
+        <!-- No cache yet: say so and say what produces one. Never guess. -->
+        <template x-if="$store.genesisDashboard.worktreeModal.data && !$store.genesisDashboard.worktreeModal.data.available">
+          <div class="empty-state" style="padding: 1.5rem; text-align: center;">
+            <div style="margin-bottom: 0.5rem;">The board has not been generated yet.</div>
+            <div style="font-size: 0.76rem; color: var(--color-text-secondary);">
+              It is written by the daily worktree reaper. Refresh below to build it now
+              (classification only &mdash; nothing is archived).
+            </div>
+          </div>
+        </template>
+
+        <template x-if="$store.genesisDashboard.worktreeModal.data && $store.genesisDashboard.worktreeModal.data.available">
+          <div>
+            <!-- Summary chips double as filters -->
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 0.6rem; flex-wrap: wrap;">
+              <template x-for="st in ['at_risk','reap_unmerged','reap_merged','in_use','protected','fresh']" :key="st">
+                <div x-show="($store.genesisDashboard.worktreeModal.data.counts?.[st] || 0) > 0"
+                     style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                     :style="`background: ${$store.genesisDashboard.worktreeStateColor(st)}22; color: ${$store.genesisDashboard.worktreeStateColor(st)}; opacity: ${!$store.genesisDashboard.worktreeModal.filter || $store.genesisDashboard.worktreeModal.filter === st ? '1' : '0.45'}`"
+                     :title="$store.genesisDashboard.worktreeModal.data.state_labels?.[st] || st"
+                     @click="$store.genesisDashboard.worktreeModal.filter = $store.genesisDashboard.worktreeModal.filter === st ? null : st">
+                  <span x-text="$store.genesisDashboard.worktreeModal.data.counts?.[st] || 0"></span>
+                  <span x-text="' ' + st.replace(/_/g, ' ')"></span>
+                </div>
+              </template>
+            </div>
+
+            <!-- Provenance line: how old this answer is, and what the archive holds -->
+            <div style="font-size: 0.74rem; color: var(--color-text-secondary); margin-bottom: 0.9rem;">
+              <span x-text="$store.genesisDashboard.worktreeModal.data.total + ' worktrees · board ' + $store.genesisDashboard.worktreeBoardAge()"></span>
+              <span x-text="' · ' + ($store.genesisDashboard.worktreeModal.data.due_for_archiving || 0) + ' due for archiving'"></span>
+              <template x-if="$store.genesisDashboard.worktreeModal.data.trash?.available">
+                <span x-text="' · archive: ' + ($store.genesisDashboard.worktreeModal.data.trash.entries || 0) + ' entries, ' + Math.round((($store.genesisDashboard.worktreeModal.data.trash.bytes || 0) / 1048576)) + ' MB'"></span>
+              </template>
+              <button style="margin-left: 0.6rem; font-size: 0.72rem; padding: 0.15rem 0.5rem;"
+                      :disabled="$store.genesisDashboard.worktreeModal.refreshing"
+                      @click="$store.genesisDashboard.refreshWorktreeBoard(true)"
+                      title="Re-classify every worktree. Report-only — nothing is archived. Takes ~20s.">
+                <span x-text="$store.genesisDashboard.worktreeModal.refreshing ? 'Refreshing…' : 'Refresh'"></span>
+              </button>
+            </div>
+
+            <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-bottom: 0.6rem;">
+              Nothing here is ever deleted. A reaped worktree becomes a compressed archive
+              plus a tombstone row, recoverable with
+              <code>worktree_lifecycle.py --recover &lt;name&gt;</code>.
+            </div>
+
+            <template x-if="$store.genesisDashboard.worktreeRows().length === 0">
+              <div style="font-size: 0.78rem; color: var(--color-text-secondary); padding: 1rem; text-align: center;">
+                No worktrees match this filter.
+              </div>
+            </template>
+
+            <table x-show="$store.genesisDashboard.worktreeRows().length > 0"
+                   style="width: 100%; border-collapse: collapse; font-size: 0.78rem;">
+              <thead>
+                <tr style="text-align: left; color: var(--color-text-secondary);">
+                  <th style="padding: 0.3rem 0.4rem;">State</th>
+                  <th style="padding: 0.3rem 0.4rem;">Branch</th>
+                  <th style="padding: 0.3rem 0.4rem; text-align: right;">Idle</th>
+                  <th style="padding: 0.3rem 0.4rem;">In main?</th>
+                  <th style="padding: 0.3rem 0.4rem;">Why</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="w in $store.genesisDashboard.worktreeRows()" :key="w.location">
+                  <tr style="border-top: 1px solid var(--color-border);">
+                    <td style="padding: 0.3rem 0.4rem; white-space: nowrap;">
+                      <span class="status-dot" :style="`background:${$store.genesisDashboard.worktreeStateColor(w.state)}`"></span>
+                      <span x-text="(w.state || '').replace(/_/g, ' ')"
+                            :title="$store.genesisDashboard.worktreeModal.data.state_labels?.[w.state] || ''"></span>
+                    </td>
+                    <td style="padding: 0.3rem 0.4rem;">
+                      <span x-text="w.branch || ('detached ' + (w.head || '').slice(0, 8))"></span>
+                      <span x-show="w.dirty" style="color: #f0ad4e;" title="Has uncommitted changes">&#9679;</span>
+                      <div style="font-size: 0.68rem; color: var(--color-text-secondary);" x-text="w.location"></div>
+                    </td>
+                    <td style="padding: 0.3rem 0.4rem; text-align: right; white-space: nowrap;"
+                        x-text="w.age_days === null || w.age_days === undefined ? '—' : Math.round(w.age_days) + 'd'"></td>
+                    <td style="padding: 0.3rem 0.4rem; white-space: nowrap;"
+                        :title="w.merge_method ? ('proved by: ' + w.merge_method) : 'no method proved this is in main'"
+                        x-text="w.merged ? ('yes (' + w.merge_method + ')') : 'no'"></td>
+                    <td style="padding: 0.3rem 0.4rem; color: var(--color-text-secondary);" x-text="w.reason"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>

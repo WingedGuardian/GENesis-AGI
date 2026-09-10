@@ -488,7 +488,16 @@ every emitter's arithmetic, so this class cannot go quiet again.
   this work?" Built ≠ wired ≠ verified. Details in genesis-development skill.
 - **Code review after code changes.** Codex will review your output.
   Protocol in genesis-development skill.
-- **Commit continuously**: uncommitted = invisible = lost.
+- **Commit continuously**: uncommitted = invisible = lost. The COMMIT is the
+  checkpoint; the PUSH is publication. They are different decisions.
+- **Do not push until you are opening the PR.** For a branch's FIRST
+  publication use `gh pr create` (implicit form, no `--head`) — it pushes the
+  branch and opens the PR in one gated action. Not a bare `git push` first: a
+  branch pushed with no PR gets **no CI at all**, because `ci.yml` fires on
+  `push: [main]` and `pull_request: [main]` and a feature branch with no PR
+  matches neither — so the leak scan never runs on it. Once the PR is open,
+  push freely to it. Unlanded work is made visible by the ledger, follow-ups
+  and the worktree board — never by publishing it early.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
@@ -587,8 +596,11 @@ every emitter's arithmetic, so this class cannot go quiet again.
   anything the user's prompt makes urgent — before taking on discretionary
   new work. The answer to "what has fallen through the cracks?" is MADE
   zero: enumerate, then fix or file what the enumeration finds. (Origin
-  2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
-  days because it was recorded only in a plan file nothing reads back.)
+  2026-09-04: finished, tested code sat on a local branch for 1.5 days
+  because it was recorded only in a plan file nothing reads back. The defect
+  was the missing ROW, not a missing push — tracking is what makes work
+  visible. Publishing it early does not, and skips the CI that only a PR
+  triggers.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
   what was learned. If it's not committed, it doesn't exist.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked

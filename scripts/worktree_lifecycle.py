@@ -1,30 +1,55 @@
 #!/usr/bin/env python3
-"""Worktree lifecycle manager — automated stale cleanup with trash bin.
+"""Worktree lifecycle manager — archives stale worktrees, deletes nothing.
 
-Identifies and trashes worktrees that are:
-1. Not in use by any process (no /proc/*/cwd inside them)
-2. Not locked (`git worktree lock`), with no in-progress Git operation
-   (rebase/merge/cherry-pick/revert/bisect), and not containing a nested
-   worktree — each signals deliberate/in-progress work to preserve
-3. Inactive for 14+ days (no file modifications)
-4. Merged into main — branch merged (PR on GitHub) OR zero unique commits.
-   A detached-HEAD worktree (no branch) is judged by whether its HEAD commit
-   is already in main; without this it would default to branch "unknown" and
-   never be reaped.
+A worktree is only ever touched when it is unused, unlocked, has no paused Git
+operation, and contains no nested worktree. Past those protections it is
+ARCHIVED into the trash as a gzip tarball, together with a tombstone row. It is
+never deleted, and nothing in the trash expires.
 
-Trashed worktrees are recoverable for 7 days (see _recover for the recovery
-contract). After that, permanently deleted along with their branches.
+That is a deliberate reversal of an earlier design that deleted merged
+worktrees outright. The reason is that a worktree can hold the only surviving
+trace of the session that produced it: MEASURED 2026-09-10, the session that
+authored PR #1702 has no ``cc_sessions`` row and no transcript in any of 532 CC
+project directories, so its commits are the entire record of its existence.
+Whether a piece of context will matter later is not a judgement a daily timer
+is in a position to make, and the storage does not justify guessing — the 192
+worktrees present that day were ~11 GB raw, ~2.9 GB archived, against 265 GB
+free.
+
+Two lanes remain, but they now differ only in WHEN and in the label they carry,
+never in whether the work survives:
+
+  MERGED (7+ days idle)     content is also in main, so it drains sooner
+  UNMERGED (14+ days idle)  may be the only copy, so it is held longer
+
+Between day 7 and day 14 an unmerged worktree reports as ``at_risk``: a
+bounded, draining window that surfaces work about to be archived, rather than a
+list that grows forever.
+
+A detached-HEAD worktree (no branch) is judged by whether its HEAD commit is
+already in main; without this it would default to branch "unknown" and never be
+considered at all.
+
+Every fate is decided in one place (``_classify`` / ``classify_all``) and merely
+carried out by ``main``. ``--report-json`` renders that same classification, so
+a dashboard cannot describe a worktree one way while the reaper treats it
+another.
 
 Usage:
-    worktree_lifecycle.py                    # Run: trash stale, purge old trash
+    worktree_lifecycle.py                    # Run: archive stale worktrees
     worktree_lifecycle.py --dry-run          # Show what would happen
-    worktree_lifecycle.py --list-trash       # Show trash contents with age
-    worktree_lifecycle.py --recover <name>   # Recover a trashed worktree
+    worktree_lifecycle.py --report-json      # Classify everything, change nothing
+    worktree_lifecycle.py --no-network       # Skip the one gh call (faster, safe)
+    worktree_lifecycle.py --list-trash       # Show archives with age, lane, size
+    worktree_lifecycle.py --recover <name>   # Restore an archived worktree
 
 Run daily by the genesis-disk-hygiene.timer systemd unit (via
 scripts/disk_hygiene.sh, alongside disk_reclaim.py). Also runnable by hand.
 
-Stdlib-only (no genesis package imports). Uses gh CLI for PR status.
+Stdlib-only (no genesis package imports) — disk_hygiene.sh falls back to the
+system python3 when the venv is absent, so an import from the genesis package
+would break the reaper on exactly the box that needs it. Uses gh CLI for PR
+status.
 """
 
 from __future__ import annotations
@@ -36,12 +61,39 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-STALE_DAYS = 14
-TRASH_RETENTION_DAYS = 7
+# Two lanes, by whether the work is already in main (owner ruling 2026-09-10).
+# MERGED work is a duplicate of main, so it drains fast. UNMERGED work may be the
+# only copy, so it is held longer AND is never auto-purged from the trash.
+MERGED_STALE_DAYS = 7
+UNMERGED_STALE_DAYS = 14
+STALE_DAYS = UNMERGED_STALE_DAYS  # back-compat alias (the conservative bound)
+
+# Nothing here is ever deleted, so a reaped worktree is compressed instead.
+# gzip, not xz, and the reason is measured rather than habitual: on a 58 MB
+# worktree from this install (2026-09-10) xz preset 6 gave 10.6 MB in 46.6s
+# while gzip gave 14.9 MB in 6.6s. Across the 192 worktrees present that day
+# xz would buy ~0.9 GB for ~2 extra hours of CPU, against 265 GB free. When
+# disk is the abundant resource and time is not, the weaker ratio is correct.
+COMPRESS_LEVEL = 6
+
+# Append-only, one JSON object per reaped worktree, never rewritten. It exists
+# so the trash is GREPPABLE: answering "which branch touched X" from the
+# archives alone would mean unpacking every one of them. Kilobytes, and it
+# outlives the archive it describes.
+TOMBSTONE_INDEX = Path.home() / ".genesis" / "worktree-tombstones.jsonl"
+
+# The classification, cached for readers that cannot afford to compute it.
+# MEASURED 2026-09-10: classifying the 191 linked worktrees on this install cost
+# 20s without the network check and 48s with — dominated by seven `git rev-parse`
+# calls per worktree in the in-progress check. That is not a session-start or a
+# web-request budget, so the session-context block and the dashboard board both
+# read THIS file instead of re-deriving. One producer, so they cannot disagree.
+BOARD_CACHE = Path.home() / ".genesis" / "worktree-board.json"
 TRASH_DIR = Path.home() / ".genesis" / "worktree-trash"
 LOG_DIR = Path.home() / ".genesis" / "logs"
 
@@ -174,8 +226,39 @@ def _last_activity_time(worktree_path: str) -> float:
     return latest
 
 
+class _SkipNetwork(Exception):
+    """Internal sentinel: method 2 was skipped because network use was refused."""
+
+
 def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
-    """Check whether a worktree's work is already in ``main``.
+    """Whether a worktree's work is already in ``main`` (any method).
+
+    Thin bool wrapper over :func:`_merge_verdict`. Kept because callers that only
+    need the yes/no answer should not have to know the method names.
+    """
+    return bool(_merge_verdict(ref, repo_root, is_branch=is_branch))
+
+
+def _merge_verdict(
+    ref: str, repo_root: Path, *, is_branch: bool = True, allow_network: bool = True,
+) -> str:
+    """Return WHICH method proved the work is in ``main`` — or "" if none did.
+
+    One of ``"ancestor"``, ``"pr"``, ``"patch-id"``, or ``""`` (not merged).
+
+    The method matters because only ``"ancestor"`` is safe to act on
+    IRREVERSIBLY. It means the ref is genuinely reachable from main's history,
+    so the commits survive any GC. The other two are inferences: ``"pr"`` trusts
+    GitHub's merged flag, and ``"patch-id"`` trusts ``git cherry``, whose own
+    blind spot is documented below (it omits merge commits entirely, so a unique
+    merge commit reads as "no unique work"). MEASURED on this repo 2026-09-10:
+    it squash-merges, so 20 of 26 merged verdicts came from ``patch-id``.
+    Irreversibility must not rest on the method with a known blind spot — see
+    the tombstone index, which records what a reaped worktree uniquely held.
+
+    ``allow_network=False`` skips method 2 (the only method that hits the
+    network), for callers on a latency budget. It can only ever turn a ``"pr"``
+    verdict into ``""`` or ``"patch-id"``; it never invents a merged verdict.
 
     ``ref`` is a branch name (``is_branch=True``) or, for a detached-HEAD
     worktree, its HEAD commit SHA (``is_branch=False``).
@@ -196,7 +279,8 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
     work reached main only by squash/rebase (patch-equal but not an ancestor) is
     kept, never reaped.
 
-    Returns False on any error (fail-safe: keep the worktree).
+    Returns "" on any error (fail-safe: an unproven ref is treated as unmerged,
+    which routes it to the slower, recoverable lane).
     """
     # Method 1: git merge-base (branch ref or raw SHA) — the ONLY method for a
     # detached HEAD (see docstring: patch-id/PR methods are unsafe for a bare SHA).
@@ -206,15 +290,17 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
             capture_output=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
-            return True
+            return "ancestor"
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
     if not is_branch:
-        return False  # detached HEAD: ancestor-only, no patch-id/PR fallbacks
+        return ""  # detached HEAD: ancestor-only, no patch-id/PR fallbacks
 
     # Method 2: gh pr list (handles squash merges) — branch heads only.
     try:
+        if not allow_network:
+            raise _SkipNetwork
         result = subprocess.run(
             ["gh", "pr", "list", "--head", ref, "--state", "merged",
              "--limit", "1", "--json", "number"],
@@ -223,8 +309,9 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
         if result.returncode == 0:
             prs = json.loads(result.stdout)
             if prs:
-                return True
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+                return "pr"
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError,
+            _SkipNetwork):
         pass
 
     # Method 3: zero unique commits (patch-id equivalence) — branch heads only.
@@ -238,11 +325,11 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
             unique = [line for line in result.stdout.strip().splitlines()
                       if line.startswith("+")]
             if not unique:
-                return True
+                return "patch-id"
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    return False
+    return ""
 
 
 # Per-worktree admin-dir markers for an in-progress Git operation. Each lives
@@ -285,15 +372,403 @@ def _has_in_progress_op(worktree_path: str) -> bool:
     return False
 
 
+def _has_uncommitted_changes(worktree_path: str) -> bool:
+    """True if the worktree has ANY uncommitted state (tracked edits or untracked).
+
+    Fail-CLOSED: any error returns True. A "dirty" verdict only ever routes a
+    worktree to the gentler lane (trash instead of permanent delete), so being
+    wrong in this direction costs disk, while being wrong the other way destroys
+    work that exists nowhere else.
+
+    Untracked files count as dirty on purpose: a forced worktree removal deletes
+    them, and an untracked file in a merged worktree is exactly the kind of
+    unreferenced work that no branch protects.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=worktree_path, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
+def _dirty_patch(worktree_path: str) -> bytes:
+    """A patch of tracked uncommitted changes, or b"" if none/unavailable.
+
+    Saved alongside a trashed worktree so ``--recover`` has something to hand a
+    human, since the recovery contract deliberately does not reapply dirty state.
+    Untracked files are not in the patch — the trash keeps those as real files.
+
+    BYTES, deliberately. A patch must round-trip exactly, so neither decoding nor
+    an ``errors="replace"`` substitution is acceptable here: a worktree holding a
+    latin-1 file would have its patch silently corrupted. It also removes the
+    crash — with ``text=True`` a non-UTF-8 diff raised UnicodeDecodeError, which
+    is a ValueError and so was outside every except tuple on the path; it
+    propagated out of main() and every worktree after it in the list was never
+    processed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "HEAD", "--binary"],
+            capture_output=True, cwd=worktree_path, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        return b""
+    return result.stdout if result.returncode == 0 else b""
+
+
+# ---------------------------------------------------------------------------
+# Classification — the single source of truth for both reaping and reporting
+# ---------------------------------------------------------------------------
+
+# What a worktree is, as one word. Both the reaper and the dashboard board read
+# these, so a worktree can never be described one way and reaped another.
+STATE_IN_USE = "in_use"            # a live process is sitting in it
+STATE_PROTECTED = "protected"      # locked / mid-rebase / contains a nested worktree
+STATE_FRESH = "fresh"              # touched within MERGED_STALE_DAYS
+STATE_AT_RISK = "at_risk"          # unmerged, aging, NOT yet reapable  <- the alert set
+STATE_REAP_MERGED = "reap_merged"  # merged and old enough — archive now
+STATE_REAP_UNMERGED = "reap_unmerged"  # unmerged, past the long window — trash now
+
+
+def _classify(
+    wt: dict, worktrees: list[dict], repo_root: Path, *,
+    allow_network: bool = True, now: float | None = None,
+) -> dict:
+    """Decide what a worktree IS and what should happen to it. No mutation.
+
+    The ordering matters and is not arbitrary: the cheap local protections come
+    first, then the age test, and only then the merge verdict — which is the one
+    step that can hit the network. A worktree younger than MERGED_STALE_DAYS is
+    not reapable in EITHER lane, so returning before the verdict keeps a routine
+    run from making one ``gh`` call per worktree (MEASURED 2026-09-10: 181
+    linked worktrees on this install, so that ordering is the difference between
+    a fast run and a multi-minute one).
+    """
+    now = time.time() if now is None else now
+    wt_path = wt.get("path", "")
+    branch = wt.get("branch")  # None for a detached HEAD
+    head = wt.get("head", "")
+
+    out = {
+        "path": wt_path,
+        "branch": branch or "",
+        "detached": bool(wt.get("detached")),
+        "head": head,
+        "age_days": None,
+        "merge_method": "",
+        "merged": False,
+        "dirty": None,
+        "state": "",
+        "reason": "",
+        "action": "none",  # none | trash
+    }
+
+    if not wt_path or not Path(wt_path).exists():
+        out["state"] = STATE_PROTECTED
+        out["reason"] = "directory does not exist (ghost entry)"
+        return out
+
+    if wt.get("locked"):
+        out["state"] = STATE_PROTECTED
+        out["reason"] = "locked (git worktree lock)"
+        return out
+    if _has_in_progress_op(wt_path):
+        out["state"] = STATE_PROTECTED
+        out["reason"] = "in-progress or unresolvable git state (rebase/merge/broken .git)"
+        return out
+
+    wt_prefix = wt_path.rstrip("/") + os.sep
+    nested = [o["path"] for o in worktrees
+              if o.get("path") and o["path"] != wt_path
+              and o["path"].rstrip("/").startswith(wt_prefix)]
+    if nested:
+        out["state"] = STATE_PROTECTED
+        out["reason"] = f"contains nested worktree(s): {', '.join(nested[:3])}"
+        return out
+
+    pids = _find_processes_in_dir(wt_path)
+    if pids:
+        out["state"] = STATE_IN_USE
+        out["reason"] = f"active processes (PIDs: {', '.join(str(p) for p in pids[:5])})"
+        return out
+
+    try:
+        age_days = (now - _last_activity_time(wt_path)) / 86400
+    except OSError as e:
+        out["state"] = STATE_PROTECTED
+        out["reason"] = f"cannot read activity time: {e}"
+        return out
+    out["age_days"] = round(age_days, 1)
+
+    # Younger than the SHORTER of the two thresholds — nothing to decide yet, and
+    # deciding would cost a network call per worktree.
+    if age_days < MERGED_STALE_DAYS:
+        out["state"] = STATE_FRESH
+        out["reason"] = f"activity {age_days:.0f}d ago (< {MERGED_STALE_DAYS}d)"
+        return out
+
+    ref, is_branch = (branch, True) if branch else (head, False)
+    verdict = _merge_verdict(
+        ref, repo_root, is_branch=is_branch, allow_network=allow_network,
+    ) if ref else ""
+    out["merge_method"] = verdict
+    out["merged"] = bool(verdict)
+
+    if not verdict:
+        # Dirty state matters MORE on this lane, not less: unmerged content may be
+        # the only copy. It was previously computed only for merged worktrees.
+        out["dirty"] = _has_uncommitted_changes(wt_path)
+        if age_days < UNMERGED_STALE_DAYS:
+            out["state"] = STATE_AT_RISK
+            out["reason"] = (
+                f"unmerged, {age_days:.0f}d cold — reaped to trash at "
+                f"{UNMERGED_STALE_DAYS}d"
+            )
+            return out
+        out["state"] = STATE_REAP_UNMERGED
+        out["action"] = "trash"
+        out["reason"] = f"unmerged and {age_days:.0f}d cold (>= {UNMERGED_STALE_DAYS}d)"
+        return out
+
+    out["state"] = STATE_REAP_MERGED
+    out["dirty"] = _has_uncommitted_changes(wt_path)
+    out["action"] = "trash"
+    out["reason"] = (
+        f"merged via {verdict}, {age_days:.0f}d cold"
+        + (" (has uncommitted changes)" if out["dirty"] else "")
+    )
+    return out
+
+
+def classify_all(
+    repo_root: Path, *, allow_network: bool = True,
+) -> list[dict]:
+    """Classify every linked worktree. The board and the reaper both call this."""
+    worktrees = _list_worktrees(repo_root)
+    return [
+        _classify(wt, worktrees, repo_root, allow_network=allow_network)
+        for wt in worktrees
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Archiving + the tombstone index
+# ---------------------------------------------------------------------------
+
+ARCHIVE_SUFFIX = ".tar.gz"
+
+
+def _archive_path(trash_path: Path) -> Path:
+    """Sibling archive for a trash entry. Built by APPENDING, not by replacing a
+    suffix — entry names embed a date and can contain dots, and
+    ``Path.with_suffix`` would eat the last segment of one."""
+    return Path(str(trash_path) + ARCHIVE_SUFFIX)
+
+
+def _sidecar_meta_path(trash_path: Path) -> Path:
+    """Metadata kept OUTSIDE the archive so listing never has to decompress."""
+    return Path(str(trash_path) + ".meta.json")
+
+
+def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
+    """Replace a trashed directory with a gzip tarball. Returns the archive path.
+
+    The original directory is removed ONLY after the archive is written AND read
+    back with at least one member. A failure at any point leaves the uncompressed
+    directory exactly where it was and returns None: compression is an
+    optimisation, and it must never be the reason a recovery is impossible.
+    """
+    archive = _archive_path(trash_path)
+    try:
+        with tarfile.open(archive, "w:gz", compresslevel=COMPRESS_LEVEL) as tf:
+            tf.add(str(trash_path), arcname=trash_path.name)
+    except (OSError, tarfile.TarError) as e:
+        _log(f"WARN compress failed for {trash_path.name}: {e} — kept uncompressed")
+        with contextlib.suppress(OSError):
+            archive.unlink()
+        return None
+
+    # Read the archive back IN FULL before trusting it, and compare the member
+    # count against the source.
+    #
+    # An earlier version checked `tf.next() is not None` — one member HEADER — and
+    # that is not a verification. MEASURED: a 61-member archive truncated to 50%
+    # passes a first-header read while a full walk raises EOFError, so the check
+    # said "clean" and the source directory was then destroyed. Walking every
+    # member is what forces gzip's trailing CRC32/ISIZE check, which is the only
+    # thing that proves the stream is whole. EOFError is NOT an OSError and must
+    # be caught explicitly — leaving it out is how the truncation escaped.
+    expected = sum(1 for _ in trash_path.rglob("*")) + 1  # + the root dir member
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            got = sum(1 for _ in tf)
+        if got < expected:
+            raise tarfile.TarError(
+                f"archive holds {got} members, source had {expected}"
+            )
+    except (OSError, tarfile.TarError, EOFError) as e:
+        _log(f"WARN archive verify failed for {trash_path.name}: {e} — kept uncompressed")
+        with contextlib.suppress(OSError):
+            archive.unlink()
+        return None
+
+    with contextlib.suppress(OSError):
+        _sidecar_meta_path(trash_path).write_text(json.dumps(meta, indent=2))
+
+    try:
+        shutil.rmtree(str(trash_path))
+    except OSError as e:
+        # Leaving the directory AND the archive makes `_iter_trash_entries` yield
+        # two entries sharing a name prefix, and `_recover` then refuses both as
+        # ambiguous — with no more-specific string available, since the names
+        # differ only by suffix. One form must win, and it is the directory: it is
+        # the original, and the archive is only ever a copy of it.
+        _log(f"WARN could not remove {trash_path} after archiving: {e} — kept uncompressed")
+        with contextlib.suppress(OSError):
+            archive.unlink()
+        with contextlib.suppress(OSError):
+            _sidecar_meta_path(trash_path).unlink()
+        return None
+
+    return archive
+
+
+def _write_board_cache(results: list[dict]) -> None:
+    """Publish the classification for readers on a latency budget.
+
+    Written atomically (temp file + replace) because the readers are a
+    session-start hook and a web request: a half-written file would be parsed by
+    whoever looked next, and a board that reads as "no worktrees" is
+    indistinguishable from a clean tree. Best-effort — failing to publish must
+    never abort a reap.
+    """
+    payload = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "worktrees": results,
+    }
+    try:
+        BOARD_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        # The temp name carries the pid: `replace` is atomic, but a SHARED temp
+        # path is not — two writers interleave inside it and the loser publishes a
+        # half-written document under the winner's name. The dashboard's refresh
+        # endpoint made concurrent writers ordinary rather than theoretical.
+        tmp = BOARD_CACHE.with_name(f"{BOARD_CACHE.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(BOARD_CACHE)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+    except OSError as e:
+        _log(f"WARN could not write board cache {BOARD_CACHE}: {e}")
+
+
+def _append_tombstone(record: dict) -> None:
+    """Append one line to the tombstone index. Best-effort and never fatal.
+
+    Failing to write a tombstone must not abort a reap — the archive is the
+    durable artifact and this is the index over it.
+    """
+    try:
+        TOMBSTONE_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        with TOMBSTONE_INDEX.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError as e:
+        _log(f"WARN could not append tombstone for {record.get('name')}: {e}")
+
+
+def _unique_commits(ref: str, repo_root: Path, limit: int = 50) -> list[str]:
+    """Subjects of commits on ``ref`` that are not in main — what would be lost.
+
+    Recorded in the tombstone because it is the one fact about a reaped worktree
+    that cannot be reconstructed once the branch ref is gone.
+    """
+    if not ref:
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%h %s", f"main..{ref}"],
+            capture_output=True, text=True, errors="replace",
+            cwd=str(repo_root), timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+        # errors="replace" makes a UnicodeDecodeError unreachable here, but the
+        # ValueError stays in the tuple: this is display text on a path whose
+        # failure would otherwise abort the whole run mid-list.
+        return []
+    if result.returncode != 0:
+        return []
+    lines = result.stdout.strip().splitlines()
+    if len(lines) > limit:
+        # Bounded by MEANING: keep whole subjects and say how many were omitted,
+        # rather than cutting the list at an arbitrary character count.
+        return [*lines[:limit], f"<omitted: {len(lines) - limit} more commits>"]
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Trash operations
 # ---------------------------------------------------------------------------
 
 
+# Filenames that would be a credential if they held real content. Checked so a
+# reap can SAY it is archiving one; never used to exclude files, because a
+# recovery that silently omits members is worse than one that warns.
+_SECRET_SHAPED = (".env", "secrets.env", ".pem", ".key", "id_rsa", ".p12", ".pfx")
+
+
+def _secret_shaped_files(worktree_path: Path) -> list[str]:
+    """Real (non-symlink) files whose name says "credential". Names only.
+
+    Symlinks are excluded deliberately: a tarball stores the LINK, not the target,
+    so `secrets.env -> /repo/secrets.env` archives a dangling pointer rather than
+    a credential. That distinction is the difference between a warning worth
+    printing and noise on every single reap.
+    """
+    found: list[str] = []
+    try:
+        for child in worktree_path.rglob("*"):
+            if ".git" in child.parts or child.is_symlink() or not child.is_file():
+                continue
+            name = child.name
+            if any(name == s or name.endswith(s) for s in _SECRET_SHAPED):
+                found.append(str(child.relative_to(worktree_path)))
+                if len(found) >= 20:
+                    break
+    except OSError:
+        return found
+    return found
+
+
+def _trash_name_taken(trash_path: Path) -> bool:
+    """Whether a trash name is claimed in ANY of the forms a reap can leave.
+
+    A reaped worktree ends up as a directory, an archive, or (transiently) both,
+    plus a metadata sidecar. A guard that knows only one of those shapes stops
+    protecting the others the moment a post-processing step is introduced.
+    """
+    return (
+        trash_path.exists()
+        or _archive_path(trash_path).exists()
+        or _sidecar_meta_path(trash_path).exists()
+    )
+
+
 def _trash_worktree(
     wt: dict, repo_root: Path, *, dry_run: bool = False,
+    lane: str = "merged", merge_method: str = "",
 ) -> bool:
     """Move a worktree to the trash directory.
+
+    ``lane`` records WHY it was reaped: ``"unmerged"`` content exists nowhere
+    else, while ``"merged"`` content is a duplicate of main. Nothing expires on
+    either lane — the field is provenance for a human reading ``--list-trash``,
+    not a retention switch.
 
     Returns True if trashed (or would be trashed in dry-run).
     """
@@ -305,15 +780,35 @@ def _trash_worktree(
     trash_name = f"{name}-{date_str}"
     trash_path = TRASH_DIR / trash_name
 
-    # Avoid name collisions
+    # Avoid name collisions — against EVERY form a previous reap may have left.
+    #
+    # Probing only `trash_path.exists()` was blind to the entire archived
+    # population, because `_compress_entry` removes the directory and leaves
+    # `<name>.tar.gz`. MEASURED: after one archive cycle the loop re-picked the
+    # same name and `tarfile.open(..., "w:gz")` truncated the existing tarball,
+    # destroying the earlier worktree's only copy — silently, and with no undo in
+    # a module whose contract is that it deletes nothing.
     counter = 1
-    while trash_path.exists():
+    while _trash_name_taken(trash_path):
         trash_path = TRASH_DIR / f"{name}-{date_str}-{counter}"
         counter += 1
 
     if dry_run:
         _log(f"WOULD TRASH {wt_path}: → {trash_path}")
         return True
+
+    # Re-check liveness HERE, not just at classification time. Classification now
+    # happens for every worktree up front (MEASURED: 19-41s over 191 worktrees),
+    # and the archive step adds seconds more per entry, so the gap between "no
+    # process is in this worktree" and the move is minutes rather than
+    # milliseconds. A session that opens an old worktree during the scan is
+    # exactly what `_find_processes_in_dir` exists to protect.
+    if not wt_path.exists():
+        _log(f"SKIP {wt_path}: disappeared between classification and reap")
+        return False
+    if _find_processes_in_dir(str(wt_path)) or _has_in_progress_op(str(wt_path)):
+        _log(f"SKIP {wt_path}: became active or protected between classification and reap")
+        return False
 
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
@@ -322,15 +817,38 @@ def _trash_worktree(
         # fails we just have a harmless orphan file. If the process
         # dies after the move but before metadata lands inside the
         # trash dir, we still have it at the staging path.
+        # Assembled COMPLETE up front, because it is written three times — the
+        # staging file, the copy that ends up inside the archive, and the sidecar
+        # beside it. Fields added after the first write produced three copies of
+        # "the metadata" and no complete one.
+        patch_text = _dirty_patch(str(wt_path))
         meta = {
             "original_path": str(wt_path),
             "branch": branch,
             "commit": wt.get("head", ""),
             "detached": detached,
             "trashed_at": datetime.now(UTC).isoformat(),
+            "lane": lane,
+            "merge_method": merge_method,
+            "name": trash_path.name,
+            "unique_commits": _unique_commits(branch or wt.get("head", ""), repo_root),
+            "had_uncommitted_changes": bool(patch_text),
+            "secret_files": _secret_shaped_files(wt_path),
         }
+        # Both the patch and the commit list above are captured BEFORE the move:
+        # once the directory leaves its registered path, `git diff` and
+        # `git log main..<ref>` no longer resolve against it.
         staging_meta = TRASH_DIR / f".{trash_path.name}.meta.staging"
         staging_meta.write_text(json.dumps(meta, indent=2))
+
+        if meta["secret_files"]:
+            # S9: nothing here expires any more, so an archived credential lives
+            # indefinitely. Say so at reap time rather than discovering it later.
+            # MEASURED 2026-09-10: 0 real secret files across the 48 worktrees due
+            # for archiving (the `secrets.env` entries are symlinks, so the LINK
+            # is stored, never the content) — this warns if that ever changes.
+            _log(f"  NOTE {trash_path.name} archives secret-shaped file(s): "
+                 f"{', '.join(meta['secret_files'][:5])} — retained indefinitely")
 
         # Move worktree to trash
         shutil.move(str(wt_path), str(trash_path))
@@ -339,6 +857,17 @@ def _trash_worktree(
         final_meta = trash_path / ".trash_meta.json"
         staging_meta.rename(final_meta)
 
+        if patch_text:
+            # N1: the success log used to sit INSIDE the suppress, so a failed
+            # write produced no output at all while the tombstone still recorded
+            # had_uncommitted_changes=True — an index claiming a patch that is not
+            # there. Report both outcomes.
+            try:
+                (trash_path / ".dirty.patch").write_bytes(patch_text)
+                _log(f"  saved uncommitted tracked changes → {trash_path}/.dirty.patch")
+            except OSError as e:
+                _log(f"  WARN could not save .dirty.patch for {trash_path.name}: {e}")
+
         # Clean git's worktree registration
         subprocess.run(
             ["git", "worktree", "prune"],
@@ -346,75 +875,19 @@ def _trash_worktree(
         )
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
-        _log(f"TRASH {wt_path}: {ref_label}, recoverable for {TRASH_RETENTION_DAYS}d at {trash_path}")
+
+        archive = _compress_entry(trash_path, meta)
+        stored = archive if archive is not None else trash_path
+
+        meta["archive"] = str(archive) if archive else ""
+        meta["stored_at"] = str(stored)
+        _append_tombstone(meta)
+
+        _log(f"TRASH {wt_path}: {ref_label} [{lane}] → {stored}")
         return True
     except (OSError, shutil.Error) as e:
         _log(f"ERROR trashing {wt_path}: {e}")
         return False
-
-
-def _purge_old_trash(repo_root: Path, *, dry_run: bool = False) -> None:
-    """Permanently delete trash entries older than TRASH_RETENTION_DAYS."""
-    if not TRASH_DIR.exists():
-        return
-
-    now = time.time()
-
-    for entry in sorted(TRASH_DIR.iterdir()):
-        if not entry.is_dir():
-            continue
-
-        meta_path = entry / ".trash_meta.json"
-        trashed_at: float | None = None
-
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-                trashed_at_str = meta.get("trashed_at", "")
-                if trashed_at_str:
-                    dt = datetime.fromisoformat(trashed_at_str)
-                    trashed_at = dt.timestamp()
-            except (json.JSONDecodeError, ValueError, OSError):
-                pass
-
-        # Fallback: use the directory's mtime
-        if trashed_at is None:
-            try:
-                trashed_at = entry.stat().st_mtime
-            except OSError:
-                continue
-
-        age_days = (now - trashed_at) / 86400
-        if age_days < TRASH_RETENTION_DAYS:
-            continue
-
-        # Old enough to purge
-        branch = ""
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-                branch = meta.get("branch", "")
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        if dry_run:
-            _log(f"WOULD PURGE {entry.name}: trashed {age_days:.0f}d ago"
-                 + (f", branch={branch}" if branch else ""))
-            continue
-
-        try:
-            shutil.rmtree(str(entry))
-            _log(f"PURGE {entry.name}: trashed {age_days:.0f}d ago")
-        except OSError as e:
-            _log(f"ERROR purging {entry.name}: {e}")
-            continue
-
-        # Delete the branch if it still exists
-        if branch:
-            subprocess.run(
-                ["git", "branch", "-D", branch],
-                capture_output=True, cwd=str(repo_root), timeout=10,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +896,84 @@ def _purge_old_trash(repo_root: Path, *, dry_run: bool = False) -> None:
 
 
 def _recover(name: str, repo_root: Path) -> bool:
-    """Recover a worktree from the trash.
+    """Resolve a trash entry by name prefix and restore it.
+
+    A stored entry is either a directory or a ``.tar.gz``. Archives are extracted
+    to a scratch directory and then handed to the SAME restore path a directory
+    takes — the restore logic carries hard-won symlink-safety invariants, and
+    forking it for archives would be the obvious way to lose one of them.
+
+    An ARCHIVE is kept after a successful recovery — the restore is a copy, and
+    the archive stays as the durable record. A LEGACY plain-directory entry is
+    consumed instead: `_restore_from_dir` moves its contents back and removes the
+    entry, because for those the trash directory IS the only copy and leaving a
+    duplicate would double the disk for no benefit.
+    """
+    if not TRASH_DIR.exists():
+        print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
+        return False
+
+    matches = [
+        stored for stored, _ in _iter_trash_entries() if stored.name.startswith(name)
+    ]
+    if not matches:
+        print(f"No trash entry matching '{name}'", file=sys.stderr)
+        return False
+    if len(matches) > 1:
+        print(f"Multiple matches for '{name}':", file=sys.stderr)
+        for m in matches:
+            print(f"  {m.name}", file=sys.stderr)
+        print("Be more specific.", file=sys.stderr)
+        return False
+
+    stored = matches[0]
+    if stored.is_dir():
+        return _restore_from_dir(stored, repo_root)
+
+    scratch = TRASH_DIR / f".extract-{stored.name}"
+    try:
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True, exist_ok=True)
+        # filter="data" refuses absolute paths, ".." escapes, and device nodes.
+        # It also refuses OUR OWN worktrees: the standing convention symlinks
+        # `secrets.env` to the repo root, and `data` raises AbsoluteLinkError on
+        # the first such link, ABORTING the extraction partway — leaving a
+        # directory that looks restored and is not. MEASURED 2026-09-10: 3 of the
+        # 48 worktrees due for archiving carry exactly that link.
+        #
+        # So fall back to `tar`, which preserves absolute links instead of
+        # refusing them, and rely on the containment invariants `_restore_from_dir`
+        # applies per-destination anyway (lexists, realpath-under-root, symlinks
+        # recreated as symlinks). Those are the real defense; `data` was a second
+        # layer, and a second layer that destroys the first is not worth keeping.
+        try:
+            try:
+                with tarfile.open(stored, "r:gz") as tf:
+                    tf.extractall(str(scratch), filter="data")
+            except tarfile.AbsoluteLinkError:
+                shutil.rmtree(scratch, ignore_errors=True)
+                scratch.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(stored, "r:gz") as tf:
+                    tf.extractall(str(scratch), filter="tar")
+        except (OSError, tarfile.TarError, EOFError, TypeError, ValueError) as e:
+            print(f"Failed to extract {stored}: {e}", file=sys.stderr)
+            return False
+
+        inner = [c for c in scratch.iterdir() if c.is_dir()]
+        if len(inner) != 1:
+            print(f"Unexpected archive layout in {stored}: {inner}", file=sys.stderr)
+            return False
+
+        ok = _restore_from_dir(inner[0], repo_root)
+        if ok:
+            print(f"Archive kept at {stored} (recovery copies; it does not consume)")
+        return ok
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
+    """Recreate a worktree from an UNPACKED trash directory.
 
     Recovery contract: recreates the worktree at its recorded ref (the branch, or
     for a detached HEAD its commit) and restores untracked files that were in the
@@ -435,24 +985,6 @@ def _recover(name: str, repo_root: Path) -> bool:
     (Full working-state recovery would require preserving the git admin dir at trash
     time via ``git worktree move`` instead of ``shutil.move`` + ``git worktree prune``.)
     """
-    if not TRASH_DIR.exists():
-        print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
-        return False
-
-    # Find matching trash entry
-    matches = [e for e in TRASH_DIR.iterdir()
-               if e.is_dir() and e.name.startswith(name)]
-    if not matches:
-        print(f"No trash entry matching '{name}'", file=sys.stderr)
-        return False
-    if len(matches) > 1:
-        print(f"Multiple matches for '{name}':", file=sys.stderr)
-        for m in matches:
-            print(f"  {m.name}", file=sys.stderr)
-        print("Be more specific.", file=sys.stderr)
-        return False
-
-    trash_path = matches[0]
     meta_path = trash_path / ".trash_meta.json"
 
     if not meta_path.exists():
@@ -555,51 +1087,77 @@ def _recover(name: str, repo_root: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _list_trash() -> None:
-    """Show trash contents with age and metadata."""
-    if not TRASH_DIR.exists():
-        print("No trash directory found.")
-        return
+def _iter_trash_entries() -> list[tuple[Path, Path]]:
+    """Every trash entry as ``(stored_path, meta_path)``.
 
-    entries = sorted(TRASH_DIR.iterdir())
+    An entry is either a plain directory (metadata inside it) or a ``.tar.gz``
+    archive (metadata in a sidecar next to it, so a listing never has to
+    decompress). Sidecar files are not themselves entries.
+    """
+    out: list[tuple[Path, Path]] = []
+    if not TRASH_DIR.exists():
+        return out
+    for e in sorted(TRASH_DIR.iterdir()):
+        if e.name.endswith(".meta.json") or e.name.startswith("."):
+            continue
+        if e.is_dir():
+            out.append((e, e / ".trash_meta.json"))
+        elif e.name.endswith(ARCHIVE_SUFFIX):
+            base = Path(str(e)[: -len(ARCHIVE_SUFFIX)])
+            out.append((e, _sidecar_meta_path(base)))
+    return out
+
+
+def _list_trash() -> None:
+    """Show trash contents with age, lane, and size.
+
+    There is no "purge in Nd" column any more, because nothing here expires. The
+    columns that replace it are the ones a reader actually needs: which LANE an
+    entry came from (merged content is a duplicate of main; unmerged content is
+    not, and is the only copy) and how much space it occupies.
+    """
+    entries = _iter_trash_entries()
     if not entries:
-        print("Trash is empty.")
+        print("Trash is empty." if TRASH_DIR.exists() else "No trash directory found.")
         return
 
     now = time.time()
-    print(f"{'Name':<40} {'Age':>6} {'Branch':<30} {'Original Path'}")
-    print("-" * 120)
+    total_mb = 0.0
+    print(f"{'Name':<44} {'Age':>5} {'Lane':<9} {'Size':>8}  {'Branch':<28} Original Path")
+    print("-" * 130)
 
-    for entry in entries:
-        if not entry.is_dir():
-            continue
-
-        meta_path = entry / ".trash_meta.json"
-        branch = ""
-        original = ""
+    for stored, meta_path in entries:
+        branch = original = ""
+        lane = "?"
         age_days = 0.0
-
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text())
-                branch = meta.get("branch", "")
+                branch = meta.get("branch", "") or ("detached " + meta.get("commit", "")[:8])
                 original = meta.get("original_path", "")
-                trashed_at_str = meta.get("trashed_at", "")
-                if trashed_at_str:
-                    dt = datetime.fromisoformat(trashed_at_str)
-                    age_days = (now - dt.timestamp()) / 86400
+                lane = meta.get("lane") or "merged"
+                ts = meta.get("trashed_at", "")
+                if ts:
+                    age_days = (now - datetime.fromisoformat(ts).timestamp()) / 86400
             except (json.JSONDecodeError, ValueError, OSError):
                 pass
 
         if age_days == 0:
             with contextlib.suppress(OSError):
-                age_days = (now - entry.stat().st_mtime) / 86400
+                age_days = (now - stored.stat().st_mtime) / 86400
 
-        purge_in = TRASH_RETENTION_DAYS - age_days
-        age_str = f"{age_days:.0f}d"
-        status = f" (purge in {purge_in:.0f}d)" if purge_in > 0 else " (OVERDUE)"
+        size_mb = 0.0
+        if stored.is_file():
+            with contextlib.suppress(OSError):
+                size_mb = stored.stat().st_size / 1048576
+        total_mb += size_mb
+        size_str = f"{size_mb:.1f}M" if size_mb else "dir"
 
-        print(f"{entry.name:<40} {age_str:>6}{status}  {branch:<30} {original}")
+        print(f"{stored.name:<44} {age_days:>4.0f}d {lane:<9} {size_str:>8}  "
+              f"{branch:<28} {original}")
+
+    print(f"\n{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}, "
+          f"{total_mb:.0f} MB archived. Nothing here is deleted on a timer.")
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +1173,13 @@ def main() -> int:
                         help="Show trash contents")
     parser.add_argument("--recover", metavar="NAME",
                         help="Recover a trashed worktree")
+    parser.add_argument("--report-json", action="store_true",
+                        help="Print the classification of every worktree as JSON "
+                             "and exit, changing nothing")
+    parser.add_argument("--no-network", action="store_true",
+                        help="Skip the one merge check that hits the network "
+                             "(gh pr list). Faster, and can only ever under-report "
+                             "a branch as unmerged — never the reverse")
     args = parser.parse_args()
 
     if args.list_trash:
@@ -626,69 +1191,61 @@ def main() -> int:
     if args.recover:
         return 0 if _recover(args.recover, repo_root) else 1
 
-    # Normal run: trash stale worktrees + purge old trash
+    if args.report_json:
+        results = classify_all(repo_root, allow_network=not args.no_network)
+        _write_board_cache(results)
+        print(json.dumps(results, indent=2))
+        return 0
+
+    # Normal run: archive stale worktrees into the trash. Nothing is deleted.
     _log("Worktree lifecycle check starting")
 
-    worktrees = _list_worktrees(repo_root)
-    _log(f"Found {len(worktrees)} linked worktree(s)")
+    results = classify_all(repo_root, allow_network=not args.no_network)
+    _log(f"Found {len(results)} linked worktree(s)")
+    # Publish BEFORE acting: if a reap below fails partway, the board still
+    # describes the tree the run actually saw. NOT under --dry-run, whose whole
+    # contract is that it changes nothing on disk.
+    if not args.dry_run:
+        _write_board_cache(results)
 
-    for wt in worktrees:
-        wt_path = wt.get("path", "")
-        branch = wt.get("branch")  # None for a detached HEAD
-        head = wt.get("head", "")
-
-        if not wt_path or not Path(wt_path).exists():
-            _log(f"SKIP {wt_path}: directory does not exist (ghost entry)")
+    # The classification above is the ONLY place a fate is decided; this loop
+    # just carries it out. That is deliberate — `--report-json` renders the very
+    # same list, so the board cannot describe a worktree one way while the reaper
+    # treats it another.
+    #
+    # There is exactly one destructive action available here, and it is
+    # reversible: archive into the trash. The reaper does not delete. A worktree
+    # can hold the only surviving trace of the session that produced it —
+    # MEASURED 2026-09-10, session 59b971ca authored PR #1702 and has no
+    # cc_sessions row and no transcript in any of 532 CC project directories, so
+    # its commits are the whole record. A timer must not be what ends that.
+    for r in results:
+        if r["action"] == "none":
+            _log(f"SKIP {r['path']}: {r['reason']}")
             continue
+        _trash_worktree(
+            r, repo_root, dry_run=args.dry_run,
+            lane="merged" if r["merged"] else "unmerged",
+            merge_method=r["merge_method"],
+        )
 
-        # Operator protection: never reap a locked worktree or one with a paused
-        # Git operation (rebase/merge/…). Both signal deliberate/in-progress work;
-        # reaping would discard a `git worktree lock` or destroy sequencer state.
-        if wt.get("locked"):
-            _log(f"SKIP {wt_path}: locked (git worktree lock)")
-            continue
-        if _has_in_progress_op(wt_path):
-            _log(f"SKIP {wt_path}: in-progress or unresolvable git state (rebase/merge/broken .git)")
-            continue
+    # Republish AFTER acting. The pre-flight publish above is for crash-safety;
+    # left alone it would advertise `action: trash` for the next 24 hours against
+    # worktrees that were archived seconds later and no longer exist. Reclassifying
+    # would cost another full scan, so the acted-on rows are simply retired in
+    # place — which is exactly what the dashboard needs to stop showing ghosts.
+    if not args.dry_run:
+        for r in results:
+            if r["action"] != "none" and not Path(r["path"]).exists():
+                r["state"] = "archived"
+                r["action"] = "none"
+                r["reason"] = "archived by this run; recover with --recover"
+        _write_board_cache(results)
 
-        # Never reap a worktree that CONTAINS another linked worktree: trashing
-        # moves the whole directory, dragging the nested worktree (and bypassing
-        # ITS locked/in-progress protections, which are checked on its own row).
-        wt_prefix = wt_path.rstrip("/") + os.sep
-        nested = [o["path"] for o in worktrees
-                  if o.get("path") and o["path"] != wt_path
-                  and o["path"].rstrip("/").startswith(wt_prefix)]
-        if nested:
-            _log(f"SKIP {wt_path}: contains nested worktree(s): {', '.join(nested[:3])}")
-            continue
-
-        # Check 1: active processes
-        pids = _find_processes_in_dir(wt_path)
-        if pids:
-            pid_str = ", ".join(str(p) for p in pids[:5])
-            _log(f"SKIP {wt_path}: active processes (PIDs: {pid_str})")
-            continue
-
-        # Check 2: recent activity
-        last_activity = _last_activity_time(wt_path)
-        age_days = (time.time() - last_activity) / 86400
-        if age_days < STALE_DAYS:
-            _log(f"SKIP {wt_path}: activity {age_days:.0f}d ago (< {STALE_DAYS}d)")
-            continue
-
-        # Check 3: work already merged into main. A detached HEAD (no branch)
-        # is judged by its HEAD commit, not the missing branch name.
-        ref, is_branch = (branch, True) if branch else (head, False)
-        if not ref or not _is_merged(ref, repo_root, is_branch=is_branch):
-            label = f"branch '{branch}'" if branch else f"detached HEAD {head[:8]}"
-            _log(f"SKIP {wt_path}: {label} not merged")
-            continue
-
-        # All checks passed — trash it
-        _trash_worktree(wt, repo_root, dry_run=args.dry_run)
-
-    # Purge old trash entries
-    _purge_old_trash(repo_root, dry_run=args.dry_run)
+    tally: dict[str, int] = {}
+    for r in results:
+        tally[r["state"]] = tally.get(r["state"], 0) + 1
+    _log("States: " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items())))
 
     _log("Worktree lifecycle check complete")
     return 0

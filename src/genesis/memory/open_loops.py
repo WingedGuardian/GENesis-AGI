@@ -18,9 +18,10 @@ Consumed by ``scripts/genesis_session_context.py`` (foreground branch only).
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,10 +30,23 @@ from genesis.db.crud.task_states import list_active
 logger = logging.getLogger(__name__)
 
 _MAX_TASKS = 5
-_MAX_WORKTREES = 8
 _MAX_PLANS = 3
 _MAX_CHARS = 2000
 _MAX_DESC = 80
+
+# The worktree board, as computed by scripts/worktree_lifecycle.py. This block
+# READS that cache rather than classifying worktrees itself, and the reason is
+# measured: classification costs ~12s for the 191 linked worktrees on this
+# install (2026-09-10), dominated by seven `git rev-parse` calls per worktree in
+# the in-progress-operation check. Twelve seconds is not a session-start budget.
+# The reaper already does this work daily, so reading its answer keeps ONE source
+# of truth and pays a single file read.
+_BOARD_CACHE = Path.home() / ".genesis" / "worktree-board.json"
+_AT_RISK_SEEN = Path.home() / ".genesis" / "worktree-at-risk-seen.json"
+_MAX_NAMED_AT_RISK = 5
+# Beyond this the cache describes a tree that has moved on; say so rather than
+# reporting stale branch names as if they were current.
+_BOARD_STALE_HOURS = 48
 
 # Copied (not imported) from outreach.morning_report._relative_age: that module's
 # top-level imports pull in the content/routing chain (ContentDrafter, etc.),
@@ -67,75 +81,62 @@ def _safe_mtime(path: str) -> float:
         return 0.0
 
 
-def _worktree_activity(path: str) -> float:
-    """Best-effort recency for a linked worktree.
+def _read_board() -> tuple[list[dict], float | None]:
+    """The reaper's cached classification as ``(rows, age_hours)``.
 
-    The worktree *directory* mtime alone is a poor activity signal — it only
-    changes when entries are added/removed directly in the worktree root, not
-    when files are edited/committed under ``src/``, ``tests/``, etc. Instead use
-    the newest mtime among the worktree's git metadata (``index``/``HEAD``/
-    ``ORIG_HEAD`` in its private gitdir, which update on checkout/commit/stage),
-    falling back to the directory mtime. A few cheap stats per worktree.
+    ``([], None)`` means no usable cache — which is a real answer, not an error:
+    on a box where the daily timer has never run there is nothing to report and
+    guessing would be worse than saying so.
     """
-    best = _safe_mtime(path)
     try:
-        with open(os.path.join(path, ".git"), encoding="utf-8") as fh:
-            content = fh.read(4096).strip()
+        raw = json.loads(_BOARD_CACHE.read_text())
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return [], None
+    if not isinstance(raw, dict):
+        return [], None
+    rows = raw.get("worktrees")
+    if not isinstance(rows, list):
+        return [], None
+    age_h: float | None = None
+    try:
+        gen = datetime.fromisoformat(str(raw.get("generated_at") or ""))
+        age_h = (datetime.now(UTC) - gen).total_seconds() / 3600
+    except (ValueError, TypeError):
+        age_h = None
+    return rows, age_h
+
+
+def _newly_at_risk(current: set[str]) -> set[str]:
+    """Which at-risk branches are new since the last session read this.
+
+    The CHANGE is the signal. A static list of two dozen aging branches is the
+    "+178 more" failure with a smaller number — identical every session, so it
+    stops being read. Naming only the arrivals keeps the line worth looking at.
+
+    Best-effort on both sides: an unreadable state file means everything reads as
+    new (noisy once, never wrong), and an unwritable one means the same set is
+    reported again next session. Neither is worth failing a session start over.
+    """
+    try:
+        prior = json.loads(_AT_RISK_SEEN.read_text())
+        seen = set(prior.get("at_risk", [])) if isinstance(prior, dict) else set()
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        seen = set()
+    try:
+        _AT_RISK_SEEN.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic: concurrent sessions start at the same moment often enough, and a
+        # half-written file degrades to "everything is new" — noisy, and noisy in
+        # the one line whose value is that it is quiet when nothing changed.
+        tmp = _AT_RISK_SEEN.with_name(f"{_AT_RISK_SEEN.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps({"at_risk": sorted(current)}))
+            tmp.replace(_AT_RISK_SEEN)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
     except OSError:
-        return best
-    # Linked worktree: .git is a file "gitdir: <abs path to private gitdir>".
-    if content.startswith("gitdir:"):
-        gitdir = content[len("gitdir:"):].strip()
-        for name in ("index", "HEAD", "ORIG_HEAD"):
-            best = max(best, _safe_mtime(os.path.join(gitdir, name)))
-    return best
-
-
-def _list_worktrees(repo_root: Path) -> list[dict]:
-    """Parse ``git worktree list --porcelain`` into structured data.
-
-    Returns list of dicts with keys: path, head, branch (branch absent for a
-    detached HEAD). Excludes the main worktree (the first porcelain entry).
-
-    Copied from ``scripts/worktree_lifecycle.py:_list_worktrees`` (scripts/ is
-    not an importable package) with the subprocess timeout tightened from 10s
-    to 2s for the session-start hook budget. Follow-up: extract a shared util
-    so this logic is not maintained in two places.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=2,
-        )
-        if result.returncode != 0:
-            return []
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return []
-
-    worktrees: list[dict] = []
-    current: dict = {}
-    is_first = True
-
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            if current and "path" in current and not is_first:
-                worktrees.append(current)
-            current = {"path": line[len("worktree "):]}
-        elif line.startswith("HEAD "):
-            current["head"] = line[len("HEAD "):]
-        elif line.startswith("branch "):
-            ref = line[len("branch "):]
-            current["branch"] = ref.removeprefix("refs/heads/")
-        elif line == "":
-            if current and "path" in current and not is_first:
-                worktrees.append(current)
-            is_first = False
-            current = {}
-
-    if current and "path" in current and not is_first:
-        worktrees.append(current)
-
-    return worktrees
+        logger.debug("in-flight: could not persist at-risk state", exc_info=True)
+    return current - seen
 
 
 async def _task_lines(db) -> list[str]:
@@ -157,17 +158,54 @@ async def _task_lines(db) -> list[str]:
 
 
 def _worktree_lines(repo_root: Path) -> list[str]:
-    """Live git worktrees (main tree excluded), by recent git activity first."""
-    wts = _list_worktrees(repo_root)
-    wts.sort(key=lambda w: _worktree_activity(w.get("path", "")), reverse=True)
+    """Unlanded work that is AT RISK — a triage, not a roster.
+
+    At risk means: not merged, idle past the first threshold, and not yet reaped.
+    That set is bounded by construction — it drains into the archive at the
+    second threshold — so unlike a full worktree listing it cannot grow without
+    limit. Merged and fresh worktrees are deliberately invisible here: nothing
+    about them needs a human, and listing them is what made the old block
+    unreadable.
+
+    Returns [] when there is nothing to say, so the section disappears rather
+    than reassuring anyone that it ran.
+    """
+    rows, age_h = _read_board()
+    if not rows:
+        return []
+
+    if age_h is not None and age_h > _BOARD_STALE_HOURS:
+        return [
+            f"- board is {age_h / 24:.0f}d stale — branch names below would be "
+            f"guesses; run `python3 scripts/worktree_lifecycle.py --report-json`",
+        ]
+
+    at_risk = [r for r in rows if isinstance(r, dict) and r.get("state") == "at_risk"]
+    if not at_risk:
+        return []
+
+    def _label(r: dict) -> str:
+        return str(r.get("branch") or "").strip() or Path(str(r.get("path", ""))).name
+
+    labels = {_label(r) for r in at_risk if _label(r)}
+    arrivals = sorted(_newly_at_risk(labels))
+
     lines: list[str] = []
-    for w in wts[:_MAX_WORKTREES]:
-        branch = w.get("branch") or Path(w.get("path", "")).name or "detached"
-        head = (w.get("head") or "")[:8]
-        lines.append(f"- {branch} @ {head}")
-    extra = len(wts) - _MAX_WORKTREES
-    if extra > 0:
-        lines.append(f"- …(+{extra} more)")
+    if arrivals:
+        shown = arrivals[:_MAX_NAMED_AT_RISK]
+        more = len(arrivals) - len(shown)
+        suffix = f" (+{more} more new)" if more else ""
+        lines.append(f"- {len(arrivals)} newly at risk: {', '.join(shown)}{suffix}")
+
+    aging = len(labels) - len(arrivals)
+    if aging > 0:
+        lines.append(f"- {aging} more aging, unmerged and idle")
+
+    due = sum(1 for r in rows if isinstance(r, dict) and r.get("action") == "trash")
+    tail = f"- {len(rows)} worktrees tracked · {due} due for archiving"
+    if age_h is not None:
+        tail += f" · board {age_h:.0f}h old"
+    lines.append(tail)
     return lines
 
 
@@ -221,7 +259,7 @@ async def build_inflight_block(db, *, repo_root: Path, plans_dir: Path) -> str:
     if tasks:
         parts.append("\n**Active autonomy tasks:**\n" + "\n".join(tasks))
     if worktrees:
-        parts.append("\n**Live worktrees:**\n" + "\n".join(worktrees))
+        parts.append("\n**Unlanded work at risk:**\n" + "\n".join(worktrees))
     if plans:
         parts.append("\n**Recent plans:**\n" + "\n".join(plans))
 

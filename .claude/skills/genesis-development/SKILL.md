@@ -1893,8 +1893,13 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push                                          # approve the dialog on a branch's first push
-gh pr create ...
+gh pr create ...                                  # FIRST publication — implicit form (no --head):
+                                                  # pushes AND opens the PR in ONE gated action.
+                                                  # Never a bare `git push` first: a branch with
+                                                  # no PR gets NO CI at all (ci.yml fires only on
+                                                  # push:[main] / pull_request:[main]), so the
+                                                  # leak scan never runs on it.
+git push                                          # subsequent pushes, once the PR is open
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
@@ -1933,8 +1938,11 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   git command. `cd "$VAR" && git commit` fails closed with a *branch-verification*
   message, which reads like a branch problem and is not: use a literal path.
 - **Worktree removal is not yours to do.** `git worktree remove` is blocked;
-  `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
-  unchanged worktrees on a daily timer. Leave a dead worktree alone.
+  `scripts/worktree_lifecycle.py` owns it. It ARCHIVES (never deletes): a stale
+  worktree becomes a gzip tarball in the trash plus a tombstone row, recoverable
+  indefinitely via `--recover`. Merged work is archived after 7 idle days,
+  unmerged after 14. Leave a dead worktree alone; `--report-json` shows what the
+  daily timer thinks of every one of them.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`), and editing `scripts/hooks/*` changes
   nothing until `sync-hooks.sh` copies it into `.git/hooks/`.

@@ -92,6 +92,13 @@
           filter: null,
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
+        worktreeModal: {
+          open: false,
+          data: null,
+          filter: null,
+          refreshing: false,
+          fetch: { state: "idle", lastSuccess: null, error: null },
+        },
         sessionsTab: {
           data: null,
           filter: null,
@@ -4769,6 +4776,97 @@
           } catch {
             this.failModalFetch("ccSessionsModal", "CC session detail unavailable");
           }
+        },
+
+        async fetchWorktreeBoard() {
+          this.startModalFetch("worktreeModal");
+          try {
+            const resp = await fetchApi("/api/genesis/worktrees");
+            if (resp?.ok) {
+              this.worktreeModal.data = await resp.json();
+              this.finishModalFetch("worktreeModal");
+            } else {
+              this.failModalFetch("worktreeModal", "Worktree board unavailable");
+            }
+          } catch {
+            this.failModalFetch("worktreeModal", "Worktree board unavailable");
+          }
+        },
+
+        // Recompute the board. REPORT-ONLY on the server: the reaper is invoked
+        // with --report-json, which classifies and caches without touching a
+        // worktree, so this button cannot reap anything. It is slow by nature
+        // (measured 20s without the network check, 48s with), which is why it is
+        // an explicit user action and not something the modal does on open.
+        async refreshWorktreeBoard(noNetwork = true) {
+          if (this.worktreeModal.refreshing) return;
+          this.worktreeModal.refreshing = true;
+          this.worktreeModal.fetch.error = null;
+          try {
+            const resp = await fetchApi("/api/genesis/worktrees/refresh", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ no_network: noNetwork }),
+            });
+            const payload = resp ? await resp.json() : null;
+            // The server returns the (possibly stale) board alongside an error,
+            // so render whatever came back rather than blanking the modal.
+            if (payload && Array.isArray(payload.worktrees)) {
+              this.worktreeModal.data = payload;
+            }
+            if (!resp?.ok) {
+              this.worktreeModal.fetch.error = payload?.error || "Refresh failed";
+            }
+          } catch {
+            this.worktreeModal.fetch.error = "Refresh failed";
+          } finally {
+            this.worktreeModal.refreshing = false;
+          }
+        },
+
+        // Most urgent first, then coldest within a group: at-risk work is the
+        // reason to open this modal, and fresh worktrees are noise here.
+        worktreeRows() {
+          const rows = this.worktreeModal.data?.worktrees;
+          if (!Array.isArray(rows)) return [];
+          const f = this.worktreeModal.filter;
+          const shown = f ? rows.filter((r) => r?.state === f) : rows;
+          const rank = {
+            at_risk: 0,
+            reap_unmerged: 1,
+            reap_merged: 2,
+            in_use: 3,
+            protected: 4,
+            fresh: 5,
+          };
+          return [...shown].sort((a, b) => {
+            const byState = (rank[a?.state] ?? 9) - (rank[b?.state] ?? 9);
+            if (byState !== 0) return byState;
+            return (b?.age_days ?? 0) - (a?.age_days ?? 0);
+          });
+        },
+
+        worktreeStateColor(state) {
+          return (
+            {
+              at_risk: "#f0ad4e",
+              reap_unmerged: "#d9534f",
+              reap_merged: "#64748b",
+              in_use: "#4caf50",
+              protected: "#3b82f6",
+              fresh: "#94a3b8",
+            }[state] || "#94a3b8"
+          );
+        },
+
+        worktreeBoardAge() {
+          const gen = this.worktreeModal.data?.generated_at;
+          if (!gen) return "never generated";
+          const h = (Date.now() - new Date(gen).getTime()) / 3600000;
+          if (!Number.isFinite(h)) return "unknown age";
+          if (h < 1) return `${Math.round(h * 60)}m old`;
+          if (h < 48) return `${Math.round(h)}h old`;
+          return `${Math.round(h / 24)}d old`;
         },
 
         // ── Sessions tab (session-manager PR-4b cockpit) ──
