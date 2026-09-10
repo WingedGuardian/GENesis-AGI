@@ -746,7 +746,12 @@ def test_an_archive_with_an_absolute_symlink_round_trips(
     """
     wt = reaper_repo.wt_branch_merged
     link = wt / "secrets.env"
-    os.symlink("/home/ubuntu/genesis/secrets.env", link)
+    # Any ABSOLUTE target reproduces this: the filter refuses the link by its
+    # shape, never by what it points at, and the target need not exist. Kept
+    # install-generic on purpose — a real home path in a fixture is a portability
+    # hit and puts a username in the public repo for no test value.
+    abs_target = "/opt/genesis-fixture/secrets.env"
+    os.symlink(abs_target, link)
     (wt / "untracked-note.txt").write_text("keep me")
     _age_path(wt, 20)
 
@@ -762,7 +767,7 @@ def test_an_archive_with_an_absolute_symlink_round_trips(
     )
     restored = wt / "secrets.env"
     assert restored.is_symlink(), "the link must come back AS a link, not a copy"
-    assert os.readlink(restored) == "/home/ubuntu/genesis/secrets.env"
+    assert os.readlink(restored) == abs_target
 
 
 def test_a_non_utf8_diff_does_not_abort_the_run(reaper_repo, tmp_path, monkeypatch):

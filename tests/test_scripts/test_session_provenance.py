@@ -91,7 +91,7 @@ Genesis-Session: 745814ce
 
 ---------
 
-Co-authored-by: Someone <someone@users.noreply.github.com>
+Co-authored-by: Someone <someone@example.invalid>
 """
 
 
