@@ -147,8 +147,8 @@ _VALID = (
 # order: shallowest depth, then strongest last hop, then link_type as a
 # deterministic tie-break. That tie-break is not cosmetic -- 106 of 139 live
 # multi-type pairs carry EQUAL strengths, so strength alone would leave the
-# reported label to row order, which is the very defect PR #1628 fixes in the
-# NetworkX store.
+# reported label to row order — the defect the NetworkX walk carried until it
+# became level-synchronous best-parent-wins (merged 2026-09-09).
 #
 # `link_type` must come from the SAME edge as `strength`. Returning
 # `max(strength)` and the type separately would pair a strength with another
@@ -226,6 +226,19 @@ def _project_lock(graph_key: str) -> asyncio.Lock:
     single-threaded event loop two coroutines cannot both create one.
     """
     return _PROJECT_LOCKS.setdefault(graph_key, asyncio.Lock())
+
+
+class _LeaseLost(GraphUnavailableError):
+    """The publication lease was gone at swap time — NOT an engine failure.
+
+    A distinct type because the two are told apart by an `except` clause and not
+    by their message. `_bounded` converts every engine error into
+    `GraphUnavailableError`, so a caller that discriminates on the public type
+    catches both and the more specific diagnostic below it becomes unreachable —
+    which is exactly what happened when this raised the public type: a swap that
+    failed after a 13-second build reported as a generic key-op error instead of
+    saying the projection was built and only the swap failed.
+    """
 
 
 class FalkorGraphStore:
@@ -445,6 +458,57 @@ class FalkorGraphStore:
                 timeout=_PROJECT_TIMEOUT_S,
             )
 
+    async def _publish_swap(self, staging: str, token: str | None) -> None:
+        """Swap the staging graph onto the live key ONLY while we still hold the lease.
+
+        The lease bounds the BUILD; without this it does not bound the
+        PUBLICATION, and the gap between those two is where the race this lock
+        exists to close comes back. `SET NX EX` has a fixed TTL, and a build is
+        not fixed-length — many batches each finishing just inside the
+        per-operation timeout can outrun it. Once it expires another run may
+        acquire it and publish; an unconditional `RENAME` here then lets THIS
+        run, holding the older snapshot, overwrite the newer projection and walk
+        the live graph backwards.
+
+        So the check and the rename happen in one server-side script, the same
+        shape as the compare-and-delete in `_release_publish_lock`: separating
+        them just moves the race somewhere narrower.
+
+        Losing the lease means DISCARDING this build rather than publishing it.
+        That is the point — whoever holds the lease now has a snapshot at least
+        as new as ours, and the caller's `except BaseException` cleans the
+        staging copy up. A projection refused is recoverable; a projection
+        silently rolled backwards is not.
+        """
+        if token is None:
+            # No lease was taken (a caller that already serialises publication).
+            # Nothing to fence against, so the plain rename is the whole action.
+            await self._key_op("rename", staging, self._graph_key, timeout=_PROJECT_TIMEOUT_S)
+            return
+
+        # `eval` is the ENGINE's EVAL — a fixed Lua literal, keys and token
+        # bound as KEYS/ARGV. Same parameterised form as the release script.
+        result = await self._key_op(
+            "eval",
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('rename', KEYS[2], KEYS[3]) else return false end",
+            3,
+            self._publish_lock_key,
+            staging,
+            self._graph_key,
+            token,
+            timeout=_PROJECT_TIMEOUT_S,
+        )
+        if not result:
+            raise _LeaseLost(
+                f"the publication lease on {self._graph_key!r} was gone at swap "
+                "time — either another run holds it, or it simply expired with "
+                "nobody behind it. Either way this projection is DISCARDED "
+                "rather than published: whoever holds it read at least as "
+                "recently, and a refused projection is recoverable where a live "
+                "graph rolled backwards is not."
+            )
+
     # ── GraphStore protocol ───────────────────────────────────────────
 
     async def traverse(
@@ -465,31 +529,34 @@ class FalkorGraphStore:
         The reported strength is the strongest LAST hop among the shortest paths
         reaching a node — best-parent-wins.
 
-        THAT DIVERGES FROM THE INCUMBENT TODAY, and the divergence is measured
-        rather than estimated. The NetworkX store in this tree marks a node
-        visited through whichever parent the queue reached first
-        (`graphstore_nx.py`, which documents the row-order dependence and defers
-        the fix); PR #1628 changes it to best-parent-wins, and #1628 is OPEN, not
-        merged. So until it lands the two backends AGREE on the node SET and can
-        DISAGREE on a multi-parent node's reported label.
+        THE INCUMBENT NOW AGREES, and this paragraph used to say the opposite.
+        When this store was written the NetworkX walk marked a node visited
+        through whichever parent the queue reached first, so the two backends
+        agreed on the node SET and could disagree on a multi-parent node's
+        reported label. That was true until 2026-09-09, when the walk became
+        level-synchronous best-parent-wins and this branch picked it up in the
+        reconcile with main.
 
-        MEASURED 2026-09-08 against the live graph (72,876 nodes / 269,187
-        edges): 400 roots sampled with a fixed seed from the 2,000 highest
-        out-degree source ids, replayed through both stores at the real call
-        parameters (`max_depth=2, min_strength=0.3`). Node-SET differences
-        0/400. Top-5 slice differs on 13/400, reported strength somewhere on
-        240/400. `mcp/memory/core.py` shows the model `nodes[:5]`, so the 13 is
-        the number a reader would actually notice.
+        RE-DERIVED against the merged walk rather than assumed: both take the
+        maximum `(strength, link_type)` over the whole LEVEL, so both credit a
+        node its strongest reaching edge; and both emit `(depth, -strength, id)`
+        — the walk by committing each level in `(-strength, id)` order beneath a
+        stable sort on `(depth, -strength)`, this store by sorting on all three
+        explicitly. Same rule, same order.
 
-        The two divergence counts move with the sample and with the data — an
-        earlier run on a different sample read 39 and 179 — so treat them as the
-        SCALE of the divergence, not as a trend. The 0 is the invariant, and it
-        is the one this pass re-ran to protect.
+        So the cutover precondition this docstring used to state as OPEN is MET.
+        The label-divergence counts an earlier revision carried (13/400 top-5,
+        240/400 reported strength, MEASURED 2026-09-08) were measured against the
+        PRE-merge walk and no longer describe anything — they are removed rather
+        than restated, because a stale measurement in permanent record reads
+        exactly like a current one.
 
-        This store is not the side to change: best-parent-wins is the correct
-        semantics and #1628 is what makes the incumbent agree. Recorded here so
-        the cutover order is a decision rather than a surprise — #1628 lands
-        before the lever moves, or the label divergence ships with it knowingly.
+        WHAT SURVIVES is the invariant that mattered all along: node-SET
+        differences 0/400, MEASURED 2026-09-08 against the live graph (72,876
+        nodes / 269,187 edges) over 400 roots sampled with a fixed seed from the
+        2,000 highest out-degree source ids, at the real call parameters
+        (`max_depth=2, min_strength=0.3`). Which backend answers must not change
+        which memories are shown, and it does not.
         """
         if max_depth < 1:
             return []
@@ -717,17 +784,63 @@ class FalkorGraphStore:
                     "graph backwards. Wait for it to finish, or re-run once it has."
                 )
             try:
-                return await self._project_locked(db)
+                return await self._project_locked(db, token)
             finally:
                 await self._release_publish_lock(token)
 
-    async def _project_locked(self, db: aiosqlite.Connection) -> dict[str, int]:
+    async def _project_locked(
+        self, db: aiosqlite.Connection, token: str | None
+    ) -> dict[str, int]:
         """The body of `project()`, run under its per-key lock."""
-        cursor = await db.execute(
-            "SELECT source_id, target_id, link_type, strength FROM memory_links"
-        )
-        edges = list(await cursor.fetchall())
-        meta = await self._metadata(db)
+        # ONE SNAPSHOT for both reads. These are two statements, and in
+        # autocommit each takes its own WAL read snapshot — so a writer
+        # committing between them is seen by the second and not the first, and
+        # the projection published is a state the database was never in. The
+        # concrete shape: a dream rollback deletes a memory's links and its
+        # metadata in one transaction; land it between these two reads and the
+        # edge survives into the projection while the metadata that would have
+        # hidden its endpoint does not.
+        #
+        # `graphstore_nx.py` documents the same two-snapshot gap and ACCEPTS it,
+        # which is right there and wrong here: that store stamps its freshness
+        # token ahead of both reads, so the next read rebuilds. A published
+        # projection has no such correction — it persists until the next
+        # projector run, which may be an hour away.
+        #
+        # An explicit deferred transaction pins the snapshot at the first read
+        # and holds it across both. The connection is opened `mode=ro`, so this
+        # takes no write lock and blocks no writer.
+        try:
+            await db.execute("BEGIN")
+            try:
+                cursor = await db.execute(
+                    "SELECT source_id, target_id, link_type, strength FROM memory_links"
+                )
+                edges = list(await cursor.fetchall())
+                meta = await self._metadata(db)
+            finally:
+                # Read-only, so rollback is the ordinary exit rather than an error
+                # path — and it genuinely raises when no transaction is active,
+                # which is what the suppress is for. It cannot mask the body's
+                # exception (a suppressed raise inside `finally` lets the original
+                # through); what it can do on the SUCCESS path is leave the read
+                # transaction open if the rollback itself failed. Bounded here
+                # because the only caller closes the connection immediately after
+                # — hand `project()` a long-lived connection and that becomes a
+                # held read-mark WAL cannot checkpoint past.
+                with contextlib.suppress(Exception):
+                    await db.execute("ROLLBACK")
+        except Exception as exc:
+            # The seam's contract, honoured at the layer that owns the reads
+            # rather than at the CLI above it. The sibling NetworkX store was
+            # fixed for this exact class — a locked, closed or corrupt database
+            # escaping as a raw aiosqlite error past a facade that catches only
+            # GraphUnavailableError — and this store must not reintroduce it on
+            # its own projection path.
+            raise GraphUnavailableError(
+                f"the memory database cannot be read — the projection cannot "
+                f"be built: {exc}"
+            ) from exc
         now = time.time()
 
         ids = sorted({e[0] for e in edges} | {e[1] for e in edges})
@@ -808,7 +921,9 @@ class FalkorGraphStore:
             )
 
             try:
-                await self._key_op("rename", staging, self._graph_key, timeout=_PROJECT_TIMEOUT_S)
+                await self._publish_swap(staging, token)
+            except _LeaseLost:
+                raise
             except Exception as exc:
                 raise GraphUnavailableError(
                     f"projection built but the swap onto {self._graph_key!r} failed: {exc}"
@@ -889,8 +1004,24 @@ class FalkorGraphStore:
         out: dict[str, tuple[float | None, int]] = {}
         for memory_id, invalid_at, deprecated in await cursor.fetchall():
             epoch = _to_epoch(invalid_at)
-            if epoch is None and invalid_at:
-                # Unparseable and non-null. Ask what SQLite would say.
+            if epoch is None and invalid_at is not None:
+                # Non-null and not usable as an epoch. Ask what SQLite would say.
+                #
+                # `is not None`, NOT truthiness. The value that slips through a
+                # truthiness test is `''`: non-NULL, falsy in Python, and hidden
+                # by SQLite — which never parses this column at all, it compares
+                # the raw TEXT lexicographically against an ISO `now`, and the
+                # empty string sorts first. A truthiness test skipped it and left
+                # the epoch None ("never expires"), so the two backends disagreed
+                # about one row, which is the one thing the seam exists to stop.
+                #
+                # NOT because "SQLite orders INTEGER before TEXT" — an earlier
+                # revision of this comment said that and it is wrong. The column
+                # is DECLARED TEXT, so TEXT AFFINITY coerces anything numeric on
+                # INSERT: MEASURED, an inserted integer 0 is stored as '0' with
+                # `typeof()` 'text' and comes back here as a `str`. This column
+                # cannot hold an integer, so type-ordering never arises. The
+                # falsy non-NULL shapes it CAN hold are `''` and `b''`.
                 epoch = 0.0 if str(invalid_at) <= now_iso else None
             out[memory_id] = (epoch, 1 if deprecated else 0)
         return out

@@ -50,9 +50,31 @@ async def build(graph_key: str = GRAPH_KEY) -> dict[str, int]:
     # earlier revision of this comment said "~20", read off a truncated grep;
     # the count above is the full one.) This fixes the instance this PR
     # introduced rather than shipping a new member of a known class.
-    db = await aiosqlite.connect(f"file:{quote(str(db_path), safe='/')}?mode=ro", uri=True)
+    #
+    # The DATABASE side of this command fails as unavailability too, not as a
+    # traceback. `main()` catches `GraphUnavailableError` and turns it into one
+    # line and an exit code; a missing file, an unreadable one, or a database
+    # without the expected tables raises `sqlite3.OperationalError` straight
+    # through it, so the operator-facing command answered a routine mistake —
+    # an unset or wrong `GENESIS_DB_PATH` — with a stack trace. The engine and
+    # the database are both "the projector could not reach what it needs", and
+    # this command has exactly one way to say that.
+    try:
+        db = await aiosqlite.connect(
+            f"file:{quote(str(db_path), safe='/')}?mode=ro", uri=True
+        )
+    except Exception as exc:
+        raise GraphUnavailableError(
+            f"the memory database at {db_path} cannot be opened: {exc}"
+        ) from exc
     try:
         return await store.project(db)
+    except GraphUnavailableError:
+        raise
+    except Exception as exc:
+        raise GraphUnavailableError(
+            f"the memory database at {db_path} cannot be read: {exc}"
+        ) from exc
     finally:
         await db.close()
 

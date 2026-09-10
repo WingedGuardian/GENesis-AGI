@@ -44,6 +44,7 @@ come back into range.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -1314,3 +1315,251 @@ async def test_a_built_but_empty_projection_answers_rather_than_raising(tmp_path
         conn = await store._connection()
         await conn.delete("test_f2_built_empty")
         await db.close()
+
+
+# ─── the invalid_at value space, enumerated ──────────────────────────────────
+#
+# Three review rounds each found ONE value this boundary got wrong — a malformed
+# timestamp, then sub-second precision, then the empty string. Three point fixes
+# invite a fourth finding, so this pins the SPACE instead of another point, and
+# it settles each case against REAL SQLite rather than against a belief about
+# what SQLite does. SQLite is dynamically typed and compares across storage
+# classes (NULL < INTEGER < TEXT), so the interesting values are not only the
+# malformed strings — a bare `0` is non-NULL, falsy in Python, and sorts BEFORE
+# any ISO timestamp, which makes it "expired" to the incumbent predicate.
+_INVALID_AT_SPACE = [
+    ("null", None),
+    ("empty_string", ""),
+    ("zero_int", 0),
+    ("zero_text", "0"),
+    ("unparseable", "not-a-timestamp"),
+    ("past", "2020-01-01T00:00:00+00:00"),
+    ("future", "2099-01-01T00:00:00+00:00"),
+    ("subsecond_past", "2020-01-01T00:00:00.900000+00:00"),
+    ("subsecond_future", "2099-01-01T00:00:00.100000+00:00"),
+]
+
+
+async def test_the_projection_hides_exactly_what_sqlite_hides_across_invalid_at(tmp_path):
+    """Whichever backend answers must not change which memories are shown.
+
+    The reference is not a table in this file — it is `invalid_memory_ids`, the
+    query the incumbent path actually runs, executed against the same rows. So
+    this cannot drift from the thing it claims parity with, and it cannot be
+    satisfied by encoding my own reading of SQLite's comparison rules.
+    """
+    from datetime import UTC, datetime
+
+    import aiosqlite
+
+    from genesis.memory.graphstore import invalid_memory_ids
+    from genesis.memory.graphstore_falkor import _is_hidden
+
+    db = await aiosqlite.connect(str(tmp_path / "space.db"))
+    try:
+        await db.execute(
+            "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+        )
+        await db.executemany(
+            "INSERT INTO memory_metadata VALUES (?, ?, 0)",
+            [(name, value) for name, value in _INVALID_AT_SPACE],
+        )
+        await db.commit()
+
+        sqlite_hidden = await invalid_memory_ids(db)
+
+        meta = await FalkorGraphStore._metadata(db)
+        now = datetime.now(UTC).timestamp()
+        falkor_hidden = {
+            name for name, _ in _INVALID_AT_SPACE if _is_hidden(meta.get(name), now)
+        }
+
+        assert falkor_hidden == sqlite_hidden, (
+            "the two backends disagree about which memories are visible.\n"
+            f"  only SQLite hides : {sorted(sqlite_hidden - falkor_hidden)}\n"
+            f"  only Falkor hides : {sorted(falkor_hidden - sqlite_hidden)}"
+        )
+
+        # Non-vacuity: the space must actually contain both outcomes, or two
+        # empty sets would compare equal and prove nothing.
+        assert sqlite_hidden, "fixture pins nothing — SQLite hid none of them"
+        assert len(sqlite_hidden) < len(_INVALID_AT_SPACE), (
+            "fixture pins nothing — SQLite hid all of them"
+        )
+    finally:
+        await db.close()
+
+
+async def test_the_swap_is_refused_when_the_lease_was_lost():
+    """A build that outran its lease must be DISCARDED, not published.
+
+    The lease bounds the build; without a check at publication it does not bound
+    the publication, and that gap is the race the lock exists to close. A run
+    whose lease expired is holding a snapshot no newer than whoever owns the
+    lease now, so renaming over the live key walks the graph backwards — the one
+    failure here that is not self-correcting, because nothing notices.
+
+    The engine reports the lost lease by returning falsey from the guarded
+    script; this pins that the store treats that as unavailability rather than
+    as a successful swap.
+    """
+    store = FalkorGraphStore(graph_key="test_lease_fence")
+    calls = []
+
+    async def _lost_lease(op, *args, **kwargs):
+        calls.append(op)
+        return False  # the CAS found a different token
+
+    store._key_op = _lost_lease  # type: ignore[method-assign]
+
+    with pytest.raises(GraphUnavailableError) as err:
+        await store._publish_swap("test_lease_fence_staging", "pid:123")
+
+    message = str(err.value).lower()
+    assert "lease" in message and "discarded" in message, (
+        f"the refusal must say WHY it refused and what became of the build: {message}"
+    )
+    assert calls == ["eval"], (
+        f"the swap must go through the guarded script, not a bare rename: {calls}"
+    )
+
+
+async def test_the_swap_is_a_plain_rename_when_no_lease_was_taken():
+    """The negative control, without which the test above passes for free.
+
+    A fence that refused unconditionally would satisfy the assertion above while
+    making every projection fail. Callers that already serialise publication
+    pass no token, and those must still swap.
+    """
+    store = FalkorGraphStore(graph_key="test_no_lease")
+    calls = []
+
+    async def _record(op, *args, **kwargs):
+        calls.append(op)
+        return "OK"
+
+    store._key_op = _record  # type: ignore[method-assign]
+
+    await store._publish_swap("test_no_lease_staging", None)
+    assert calls == ["rename"], f"expected a plain rename, got {calls}"
+
+
+async def test_both_projection_reads_see_one_database_snapshot(tmp_path):
+    """A commit landing between the two reads must be invisible to the second.
+
+    In autocommit each statement takes its own WAL read snapshot, so a writer
+    committing between the edge fetch and the metadata fetch is seen by one and
+    not the other — and the projection published is a state the database was
+    never in. The concrete case: a dream rollback deletes a memory's links and
+    its metadata in one transaction, so the edge survives into the projection
+    while the metadata that would have hidden its endpoint does not.
+
+    Driven by committing from a SECOND connection at exactly that point, which
+    is the real mechanism rather than an assertion about `BEGIN` appearing in
+    the source.
+    """
+    import aiosqlite
+
+    path = tmp_path / "snap.db"
+    setup = await aiosqlite.connect(str(path))
+    await setup.execute("PRAGMA journal_mode=WAL")
+    await setup.execute(
+        "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, link_type TEXT, strength REAL)"
+    )
+    await setup.execute(
+        "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+    )
+    await setup.execute("INSERT INTO memory_links VALUES ('A', 'B', 'supports', 0.9)")
+    await setup.execute("INSERT INTO memory_metadata VALUES ('A', NULL, 0)")
+    await setup.execute("INSERT INTO memory_metadata VALUES ('B', NULL, 0)")
+    await setup.commit()
+    await setup.close()
+
+    reader = await aiosqlite.connect(f"file:{path}?mode=ro", uri=True)
+    writer = await aiosqlite.connect(str(path))
+    store = FalkorGraphStore(graph_key="test_snapshot")
+
+    seen = {}
+    original = FalkorGraphStore._metadata
+
+    async def _commit_then_read(db):
+        # Land a whole transaction between the two reads.
+        await writer.execute("UPDATE memory_metadata SET deprecated = 1 WHERE memory_id = 'B'")
+        await writer.commit()
+        seen["meta"] = await original(db)
+        return seen["meta"]
+
+    try:
+        store._metadata = _commit_then_read  # type: ignore[method-assign]
+        # Stop after the reads; the engine is not what is under test here.
+        with contextlib.suppress(Exception):
+            await store._project_locked(reader, None)
+
+        assert "meta" in seen, "the metadata read never happened"
+        assert seen["meta"]["B"][1] == 0, (
+            "the second read saw a commit the first could not — the two reads are "
+            "on different snapshots, so a published projection can represent a "
+            "state the database was never in"
+        )
+    finally:
+        await reader.close()
+        await writer.close()
+
+
+async def test_the_facade_reaches_sql_when_both_stores_are_down(monkeypatch):
+    """The leg the reconcile CREATED: falkordb down AND networkx down.
+
+    The CTE guard and the falkordb tier arrived from opposite sides of the merge
+    with main. Each side is covered on its own — a sibling test drives
+    falkordb -> networkx where NetworkX answers, and the NetworkX store's own
+    suite drives the guard in default mode, where the falkordb tier is skipped
+    entirely. Their COMPOSITION is what nothing reached.
+
+    The surviving mutation that proves it: change `nodes = None` to `nodes = []`
+    above the CTE call. The chain then ends one tier early and hands recall
+    "no neighbours" instead of the degraded answer, and every other test in both
+    files still passes.
+    """
+    calls: list[str] = []
+
+    class _Down:
+        def __init__(self, tag: str) -> None:
+            self.name = tag
+
+        async def traverse(self, *a, **k):
+            calls.append(self.name)
+            raise GraphUnavailableError(f"{self.name} down")
+
+        async def centrality(self, *a, **k):
+            raise GraphUnavailableError(f"{self.name} down")
+
+        def invalidate(self) -> None:
+            return None
+
+    async def _cte(*a, **k):
+        calls.append("cte")
+        return [GraphNode(memory_id="m", link_type="related_to", depth=1, strength=0.5)]
+
+    monkeypatch.setattr(graph_mod, "_store", _Down("networkx"))
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _Down("falkordb"))
+    monkeypatch.setattr(graph_mod, "_traverse_cte", _cte)
+
+    result = await graph_mod.traverse(None, "root", max_depth=2, min_strength=0.3)
+    assert calls == ["falkordb", "networkx", "cte"], (
+        f"the degrade chain stopped early instead of reaching SQL: {calls}"
+    )
+    assert [n.memory_id for n in result.nodes] == ["m"]
+
+    # And with the last tier dead too, the typed error must survive the extra
+    # tier rather than the raw one escaping — which is the other half of what
+    # the union preserved.
+    calls.clear()
+
+    async def _dead_cte(*a, **k):
+        calls.append("cte")
+        raise ValueError("no active connection")
+
+    monkeypatch.setattr(graph_mod, "_traverse_cte", _dead_cte)
+    with pytest.raises(GraphUnavailableError, match="both failed"):
+        await graph_mod.traverse(None, "root", max_depth=2, min_strength=0.3)
+    assert calls == ["falkordb", "networkx", "cte"]

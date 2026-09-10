@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from typing import TYPE_CHECKING
 
 from genesis.memory.graphstore import (
@@ -46,6 +45,50 @@ except ImportError:  # pragma: no cover
     _NX_AVAILABLE = False
 
 
+def _connection_identity(db: object) -> object:
+    """The object whose replacement means "this is a different connection".
+
+    NOT `db` itself. Production passes a `SerializedConnection` PROXY, and its
+    recovery path swaps the connection it wraps IN PLACE — `db/connection.py`
+    closes the old handle and rebinds `_conn` via `object.__setattr__` — while
+    the proxy's own identity never changes. So an identity check on `db` cannot
+    fire after a reconnect, and the `data_version` comparison below then reads a
+    FRESH connection's counter against one stamped from the connection that was
+    just closed. Those counters are per-connection and unrelated, so staleness
+    detection silently stops working at exactly the moment the database has just
+    recovered from errors.
+
+    Unwrapping is uniform rather than a special case: a bare
+    `aiosqlite.Connection` also exposes `_conn` (its underlying sqlite3 handle),
+    and in both cases that attribute changes precisely when the real connection
+    underneath does. `_conn` is in `SerializedConnection._OWN_ATTRS`, so reading
+    it returns the proxy's own wrapped handle and is never delegated onward.
+
+    Two proxies sharing one underlying connection deliberately compare EQUAL —
+    same connection, same data, nothing to rebuild.
+
+    NON-THROWING BY CONTRACT, and `getattr`'s default is not enough for that:
+    on `aiosqlite.Connection` this attribute is a PROPERTY that raises
+    `ValueError("no active connection")` once the handle is closed, and a
+    default only covers `AttributeError`. This runs inside `_is_stale()`, which
+    is BEFORE the guarded reads, so an unhandled raise here escapes `traverse()`
+    as a bare `ValueError` — exactly the raw-error leak the seam's typed contract
+    exists to prevent, reintroduced one layer above the guard that fixed it.
+
+    Falling back to `db` on a closed handle is the right answer rather than
+    merely a safe one: the stored token is the connection captured while it was
+    OPEN, so `db` compares unequal, the projection is treated as stale, and the
+    rebuild runs straight into the guarded reads — which fail the way the
+    contract says, as `GraphUnavailableError`.
+    """
+    try:
+        return db._conn  # type: ignore[attr-defined]
+    except AttributeError:
+        return db        # a plain object with no wrapped handle: it IS the token
+    except Exception:
+        return db        # closed/unusable: force a rebuild into the guarded path
+
+
 def _bfs_with_strength(
     G: object,  # nx.MultiDiGraph
     root_id: str,
@@ -63,13 +106,11 @@ def _bfs_with_strength(
         return []
 
     visited: set[str] = {root_id}
-    queue: deque[tuple[str, int]] = deque([(root_id, 0)])
+    frontier: list[str] = [root_id]
     results: list[GraphNode] = []
+    depth = 0
 
-    while queue:
-        node, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
+    while frontier and depth < max_depth:
 
         # A pair may carry several typed edges (MultiDiGraph), so out_edges
         # yields one tuple per parallel edge. Consider them all and keep the
@@ -100,43 +141,90 @@ def _bfs_with_strength(
         # not a semantic ranking; it happens to demote `contradicts` (which sorts
         # early), the safe direction. 0 of the 106 tied pairs carries one.
         #
-        # This makes the choice WITHIN one (source, target) pair well-defined. It
-        # does NOT make the traversal's reported labels row-order independent, and
-        # nothing here claims that: the `visited` check below means a node
-        # reachable from several parents is claimed by whichever parent the queue
-        # reaches first, and queue order follows row order. MEASURED 2026-09-02 on
-        # the live graph: ~15.8% of reported labels flip under a reversed row
-        # order. Attribution at 500 roots traced every flip to multi-parent claim
-        # order and none to ties — but that zero is a SUBSAMPLE BOUND, not an
-        # absolute: at 3000 roots the tie-break itself removes 16 of 21,486 flips
-        # (~0.07%). Ties are a rounding error on this surface, not nil.
+        # `best` is scoped to the whole LEVEL, not to one expanding parent, and
+        # that is the point. Per-parent, a node reachable from several parents was
+        # claimed by whichever one the queue happened to reach first — so the
+        # reported edge followed the loader's row order (its SELECT has no ORDER
+        # BY) and could be the WEAKER of the two. That is not cosmetic: `strength`
+        # is put in front of the model AND is what the consumers sort on before
+        # taking the top five, so a node credited to a weaker parent sinks in that
+        # order and can leave the slice entirely.
         #
-        # Pre-existing (~15.8% before the multigraph change too) and tracked as
-        # follow-up ab0d0c28 rather than changed here, since best-parent-wins is a
-        # traversal-semantics change needing its own blast-radius measurement.
-        # "Reach-set-neutral (0 delta)" holds for THIS function's full output, but
-        # not for what the model sees: core.py:437,:709 slice nodes[:5] after a
-        # stable sort on (depth, -strength), so on 3.5% of roots a different SET
-        # of five memories reaches the context depending on row order. Same root
-        # cause, same follow-up — stated here so the bound is not read as wider
-        # than it is.
+        # MEASURED on main@36000ebbc against `memory/graph.py`, whose loader
+        # applies NO visibility filter — carried here verbatim with the function.
+        # THIS module's loader drops every edge with a hidden endpoint first
+        # (29,868 of 264,191, 11.3%), so 256,063 links and 66,856 roots are not
+        # its denominators and the rates below are UPPER BOUNDS on the filtered
+        # graph, not measurements of it. The direction and the mechanism carry
+        # over unchanged; only the magnitudes are someone else's population.
+        # Old vs new, over that unfiltered population, at the real call
+        # parameters max_depth=2, min_strength=0.3:
+        #   68,330 of 1,066,912 reported nodes (6.40%) gained a higher, truer
+        #     strength, across 50.4% of roots; 0 were ever lowered.
+        #   top-five SET churn between a forward and a reversed row order: 3.09%
+        #     before, 0 after; the full output is likewise identical under both.
+        #   reach-set unchanged (0 roots) and no reported depth changed (0 nodes).
+        # Draining the level is what allows the cross-parent comparison.
+        #
+        # State the DENOMINATOR when quoting any of this. 6.40% is over every node
+        # the walk computes (~16 per root); restricted to the five that actually
+        # reach the model it is 0.16% of surfaced nodes and 0.7% of lookups. The
+        # blast radius at that slice is separate again: the surfaced SET changes on
+        # 1.94% of roots and its ORDER on 8.15%. An earlier revision of this comment
+        # quoted a 1,000-root sample and read an order of magnitude high on the
+        # surfaced surface — which is why every figure here is a population count.
+        #
+        # Sample-drawn figures also drift between runs on an unchanged table: the
+        # loader's SELECT has no ORDER BY, so node insertion order — and any sample
+        # drawn from it — varies per rebuild. Prefer the population numbers above.
+        #
+        # The commit below is ordered by a TOTAL key, and that alone is what makes
+        # the whole output deterministic: it fixes the append sequence, and the
+        # final sort is stable, so equal `(depth, -strength)` keys keep that
+        # sequence rather than the row order they used to keep. Note `drift.py`
+        # consumes that sequence as a RANKED list for RRF (its `local_ids`,
+        # drift.py:202) even though it reads no labels, so the ordering here is
+        # load-bearing for a second consumer, not just for the sliced view.
+        #
+        # A total key on the FINAL sort as well was tried and dropped. It is
+        # redundant by construction — a stable sort of an already-deterministic
+        # list cannot reintroduce nondeterminism — and measured redundant too
+        # (0 differences either way across 1,447 live roots). Keeping it would only
+        # have reordered ties gratuitously and widened the divergence from the CTE
+        # fallback's documented `(depth, strength DESC)`.
         best: dict[str, tuple[float, str]] = {}
-        for _, neighbor, data in G.out_edges(node, data=True):
-            if neighbor in visited:
-                continue
-            strength = data.get("strength", 0.0)
-            edge_type = data.get("link_type", "")
+        for node in frontier:
+            for _, neighbor, data in G.out_edges(node, data=True):
+                if neighbor in visited:
+                    continue
+                strength = data.get("strength", 0.0)
+                edge_type = data.get("link_type", "")
 
-            if strength < min_strength:
-                continue
-            if link_type_filter and edge_type != link_type_filter:
-                continue
+                if strength < min_strength:
+                    continue
+                if link_type_filter and edge_type != link_type_filter:
+                    continue
 
-            current = best.get(neighbor)
-            if current is None or (strength, edge_type) > current:
-                best[neighbor] = (strength, edge_type)
+                current = best.get(neighbor)
+                if current is None or (strength, edge_type) > current:
+                    best[neighbor] = (strength, edge_type)
 
-        for neighbor, (strength, edge_type) in best.items():
+        next_frontier: list[str] = []
+        # Key is (-strength, neighbour_id) and DELIBERATELY excludes link_type,
+        # unlike the within-pair comparison above. The id alone already makes the
+        # key total, so link_type buys no determinism here — and it is not neutral:
+        # sorting equal-strength neighbours alphabetically by TYPE front-loads
+        # early-sorting relationships in the order the model reads. MEASURED over
+        # all 66,856 roots, 13.8% of which carry a (depth, strength) tie group:
+        # including link_type moved the reported top-1 type by +32.8%
+        # (categorized_as), +31.8% (action_item_for), -23.8% (preceded_by) and
+        # -39.6% (succeeded_by) against the id-only key. Memory ids are UUIDs, so
+        # they carry no such correlation. The within-pair key above is a different
+        # case: there the two candidates are the SAME pair and a type must be
+        # picked, so a stated rule beats an arbitrary one.
+        for neighbor, (strength, edge_type) in sorted(
+            best.items(), key=lambda kv: (-kv[1][0], kv[0])
+        ):
             visited.add(neighbor)
             results.append(GraphNode(
                 memory_id=neighbor,
@@ -144,9 +232,13 @@ def _bfs_with_strength(
                 depth=depth + 1,
                 strength=strength,
             ))
-            queue.append((neighbor, depth + 1))
+            next_frontier.append(neighbor)
+        frontier = next_frontier
+        depth += 1
 
-    # Match CTE output order: depth ascending, strength descending
+    # Match CTE output order: depth ascending, strength descending. Deliberately
+    # left as a partial key — ties now resolve to the deterministic commit order
+    # established above, so no further tiebreak is needed to make this stable.
     results.sort(key=lambda n: (n.depth, -n.strength))
     return results
 
@@ -215,7 +307,7 @@ class NetworkxGraphStore:
         # of those processes would turn this into a rebuild storm on a
         # 264k-edge graph (seconds per rebuild) — that invariant is
         # load-bearing and worth re-checking before adding one.
-        if db is not self._built_conn:
+        if _connection_identity(db) is not self._built_conn:
             return True
         if self._built_data_version is None:
             return False
@@ -259,15 +351,35 @@ class NetworkxGraphStore:
         #    an edge committed between them is filtered against an invalid-set
         #    read just before it. Self-healing — pre_load_version is stamped
         #    ahead of BOTH, so the next read rebuilds.
-        invalid = await invalid_memory_ids(db)
-        cursor = await db.execute(
-            "SELECT source_id, target_id, link_type, strength FROM memory_links"
-        )
-        rows = [
-            row
-            for row in await cursor.fetchall()
-            if row[0] not in invalid and row[1] not in invalid
-        ]
+        # The two DB reads are wrapped TOGETHER, and only they. The seam's
+        # contract says a store that cannot reach its backend raises
+        # GraphUnavailableError — and this store honoured that for exactly one
+        # cause, a missing NetworkX. Everything else escaped raw: a locked,
+        # closed or corrupt connection came out of `traverse()` as an aiosqlite
+        # error, or (measured) a bare `ValueError: no active connection`.
+        # `graph.py` catches only GraphUnavailableError, so those bypassed the
+        # facade's entire degrade chain — no fallback to the CTE, no warning,
+        # the raw error surfacing at whatever called `traverse()`. `drift.py`
+        # and `dream_centrality.py` are the exposed readers; `mcp/memory/core.py`
+        # survives only on a bare `except`.
+        #
+        # Scoped to the READS on purpose. A failure in the graph BUILD below is
+        # a defect in this module, not an unreachable backend, and laundering it
+        # into "unavailable" would send a caller to a fallback for a bug that
+        # the fallback shares. `_data_version` guards itself already and
+        # degrades to None rather than raising, which is its own documented
+        # choice and is left alone.
+        try:
+            invalid = await invalid_memory_ids(db)
+            cursor = await db.execute(
+                "SELECT source_id, target_id, link_type, strength FROM memory_links"
+            )
+            fetched = await cursor.fetchall()
+        except Exception as exc:
+            raise GraphUnavailableError(
+                f"the memory database cannot be read — the graph cannot be built: {exc}"
+            ) from exc
+        rows = [row for row in fetched if row[0] not in invalid and row[1] not in invalid]
 
         # MultiDiGraph, not DiGraph: memory_links' primary key is
         # (source_id, target_id, link_type), so one pair may legitimately carry
@@ -310,7 +422,7 @@ class NetworkxGraphStore:
         # and have it cleared on the next line with nothing else left to notice.
         # Locked by test_a_same_connection_write_is_seen_by_the_load_that_races_it.
         self._dirty = False
-        self._built_conn = db
+        self._built_conn = _connection_identity(db)
         self._built_data_version = pre_load_version
         return G
 
