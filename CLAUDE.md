@@ -286,7 +286,8 @@ the rule below used to fire so rarely. Three concrete triggers:
    X is not what its name suggests. Especially when you went looking for X
    expecting it to be absent.
 3. **You CORRECTED a belief** — your own, a prior session's, or a written note's.
-   Use `supersedes` to link the correction to what it replaces. This is the
+   Use `supersedes` to link the correction to what it replaces, or
+   `memory_supersede(old_id, new_id)` when both memories already exist. This is the
    highest-value trigger and the easiest to skip, because being wrong does not
    feel like a finding. It is the one that stops the next session paying for the
    same mistake.
