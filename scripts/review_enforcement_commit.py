@@ -638,12 +638,21 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
         return ""
     if gate == "depth":
         return (
-            "\n\nNOTE: a merge/rebase appears to be in progress. This gate "
-            "classifies substantiality from the staged diff, so pulling upstream "
-            "in reads as a large authored change even though the merged code "
-            "arrived already reviewed on its own PR. If this commit IS only that "
-            "merge, say so in the depth-ack — the audit it asks for would be an "
-            "audit of somebody else's landed work, not of yours."
+            "\n\nNOTE: a git sequencer sentinel is present — a merge, rebase, "
+            "cherry-pick or revert is in progress. Content that operation brought "
+            "in counts toward substantiality exactly like code you wrote (via the "
+            "staged diff on a normal commit, via the recorded marker level on an "
+            "-a/pathspec one), which is why a commit that is only the operation "
+            "can land here.\n"
+            "That is NOT an exemption, and this hook cannot tell the two apart: "
+            "only content that arrived already reviewed on its own PR is somebody "
+            "else's audited work. A cherry-pick, a revert, and every conflict "
+            "resolution are YOURS and still need the audit — ack only once you "
+            "have checked there is no local delta in the staged set.\n"
+            "The ack also clears THIS gate alone: the same operation restages the "
+            "diff, so the review marker no longer binds it and the review-current "
+            "gate blocks next. A merge-only commit therefore needs BOTH sigils in "
+            "one trailing comment:  # depth-ack review-override"
         )
     return (
         "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "

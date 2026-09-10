@@ -1581,7 +1581,7 @@ def test_depth_denial_carries_the_merge_hint(repo: Path, home: Path) -> None:
     res = _run_hook('git commit -m "merge main"', repo, home)
     assert res.returncode == 2
     assert "review depth" in res.stderr.lower()
-    assert "merge/rebase appears to be in progress" in res.stderr
+    assert "sequencer sentinel is present" in res.stderr
 
 
 def test_depth_hint_describes_the_DEPTH_failure_not_the_round_counter(
@@ -1593,16 +1593,61 @@ def test_depth_hint_describes_the_DEPTH_failure_not_the_round_counter(
     _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
     _begin_merge(repo)
     res = _run_hook('git commit -m "merge main"', repo, home)
-    assert "classifies substantiality" in res.stderr
-    assert "already reviewed on its own PR" in res.stderr
+    assert "counts toward substantiality" in res.stderr
     assert "round counter" not in res.stderr, "that is the OTHER gate's explanation"
+
+
+def test_depth_hint_names_both_classification_sources(repo: Path, home: Path) -> None:
+    """Rule 2.5 does NOT always classify the staged diff: when the commit may add
+    content beyond the index (`-am`, a pathspec) it uses the RECORDED marker level
+    instead (review_enforcement_commit.py, the `if commit_may_add_content:` branch).
+    A merge committed that way would read a note claiming a source the gate did not
+    use, and go looking at the wrong artifact."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "staged diff" in res.stderr
+    assert "recorded marker level" in res.stderr
+
+
+def test_depth_hint_does_not_call_a_local_delta_somebody_elses_work(repo: Path, home: Path) -> None:
+    """The detector fires on FIVE sequencer states, only one of which implies an
+    already-reviewed upstream merge. A cherry-pick, a revert, and any conflict
+    resolution stage code the author wrote or chose. The note must not tell that
+    reader the audit belongs to somebody else — that would launder unreviewed
+    code through an ack the gate logs as honest."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    (repo / ".git" / "CHERRY_PICK_HEAD").write_text("0" * 40 + "\n")
+    res = _run_hook('git commit -m "cherry-pick"', repo, home)
+    assert res.returncode == 2
+    assert "sequencer sentinel is present" in res.stderr
+    assert "cherry-pick" in res.stderr
+    assert "conflict resolution" in res.stderr
+    assert "NOT an exemption" in res.stderr
+
+
+def test_depth_hint_names_every_sigil_the_advertised_route_needs(repo: Path, home: Path) -> None:
+    """MEASURED before the fix: `# depth-ack` alone cleared Rule 2.5 and was then
+    blocked by the review-current gate (rc=2), so the note advertised a route that
+    dead-ends one step later. The note must name the whole route, and the route it
+    names must actually complete."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "# depth-ack review-override" in res.stderr
+
+    # The advertised route completes end-to-end.
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    done = _run_hook('git commit -m "merge main"  # depth-ack review-override', repo, home)
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_no_merge_hint_when_no_merge_in_flight(repo: Path, home: Path) -> None:
     _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
     res = _run_hook('git commit -m "prompt"', repo, home)
     assert res.returncode == 2
-    assert "merge/rebase appears to be in progress" not in res.stderr
+    assert "sequencer sentinel is present" not in res.stderr
 
 
 def test_merge_sentinel_does_not_become_an_exemption(repo: Path, home: Path) -> None:
