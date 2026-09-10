@@ -24,12 +24,20 @@ from __future__ import annotations
 
 import hashlib
 
-# GROUNDWORK(ledger-escalation): the WRITER — the sweep that promotes an
-# undisposed ledger row into a follow_ups row — is not built yet. Today the only
-# consumers are the two READ-side hooks, which render "-> escalated: follow_up
-# <id>" beside an open row and correctly degrade to nothing while no such row
-# exists. Landing the formula here first means that sweep is a pure add rather
-# than a change to two import-free hook scripts. Do not delete as dead code.
+# GROUNDWORK(ledger-escalation) — SATISFIED 2026-09-06. The WRITER this note
+# was waiting for now exists: `session_awareness/ledger_escalation.py`, an
+# hourly learning-scheduler sweep that promotes an undisposed ledger row into a
+# follow_ups row and completes it again when the row is disposed. The bet paid
+# off exactly as intended — landing the formula here first made that sweep a
+# pure add, with no change to either import-free hook script.
+#
+# The other three consumers still hold and still constrain any edit here: the
+# two READ-side hooks (`scripts/genesis_session_context.py`,
+# `scripts/genesis_urgent_alerts.py`) inline this same formula because they
+# cannot import Genesis, and a parity test asserts the inlined form equals this
+# one. Change the formula and every existing link silently breaks — the sweep
+# would re-escalate rows that already have a follow-up, and the hooks would stop
+# rendering the link. Do not delete as dead code.
 ESCALATION_SOURCE = "ledger_escalation"
 
 
