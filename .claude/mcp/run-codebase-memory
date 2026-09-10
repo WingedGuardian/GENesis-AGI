@@ -33,6 +33,15 @@ if [[ -z "$BINARY" ]]; then
         BINARY="$(command -v codebase-memory-mcp)"
     fi
 fi
+# DELIBERATELY 2G, and deliberately NOT the same as the index job's cap
+# (scripts/lib/code_intel_index.sh, raised to a measured 4G) — different job,
+# different requirement, so this divergence is a decision, not drift.
+# This caps a LONG-LIVED MCP SERVER against an upstream unbounded-memory leak
+# (DeusData/codebase-memory-mcp#581); live instances measure 1.5-29 MB, so 2G is
+# already enormous headroom and its purpose is to bound a leak, not to fit a
+# workload. The INDEX job is a short-lived batch whose peak is set by the repo
+# being indexed (measured 2,836 MB on this repo) — sizing the two together would
+# either starve the indexer or hand the leak 4G to grow into.
 MEM_MAX="${CODEBASE_MEMORY_MCP_MEMORY_MAX:-2G}"
 
 if [[ -z "$BINARY" || ! -x "$BINARY" ]]; then
