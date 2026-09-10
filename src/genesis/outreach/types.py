@@ -213,17 +213,19 @@ class FreshEyesResult:
 
 #: Discord SUB-CHANNEL names. The outreach pipeline routes by ADAPTER name
 #: ("discord"); which channel inside the server a message lands in is the
-#: *recipient*, and for the webhook adapter a recipient is a webhook name
-#: derived from `DISCORD_WEBHOOK_<NAME>` in the environment.
+#: *recipient*, and for the webhook adapter a recipient is a webhook name whose
+#: env-var naming rule lives in `runtime/init/outreach.py` — spelled out ONLY
+#: there, because `check_external_io.py` line-greps those names and this module
+#: is not an egress door.
 #:
 #: Lives here rather than in scheduler.py because it now has two readers — the
 #: campaign scheduler and `outreach_send` — and two copies of a list like this
 #: is a defect waiting for someone to add a channel to one of them.
 #:
-#: Adding a name here is not enough on its own: without a matching
-#: `DISCORD_WEBHOOK_<NAME>` the adapter falls back to `DISCORD_WEBHOOK_URL`,
-#: which posts to the DEFAULT channel rather than failing. That fallback is the
-#: reason a caller can believe it targeted one channel and hit another.
+#: Adding a name here is not enough on its own: with no per-channel webhook for
+#: it the adapter falls back to the DEFAULT webhook, which posts to the DEFAULT
+#: channel rather than failing — the reason a caller can believe it targeted one
+#: channel and hit another.
 DISCORD_CHANNELS: frozenset[str] = frozenset(
     {
         "announcements",
