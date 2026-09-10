@@ -116,15 +116,49 @@ MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 # which is admission control and is deliberately NOT claimed here as present.
 _CI_MEM_TARGET_MB=4096   # the 2,836 MB measurement + ~40% headroom
 _CI_MEM_CONTAINER_FRACTION=60  # percent of the container limit the cap may take
+# ...AND never come within this much of the container limit. The fraction alone
+# is not enough: 60% of a 4 GiB minimum install is 2,457M, which leaves 1,639M
+# for genesis-server + Qdrant + a CC session together — so the parent cgroup can
+# still reach its own OOM before the scope boundary, which is the failure the
+# bound exists to prevent. A reserve states the invariant directly ("always leave
+# this much for everything else") instead of hoping a percentage happens to.
+# 2 GiB is the rough floor for server + Qdrant + one session on this reference
+# install; it is not a measurement of a minimum install, and is deliberately
+# conservative because being wrong small costs a stale index, while being wrong
+# large costs the container.
+_CI_MEM_RESERVE_MB=2048
 
+# What this CANNOT do, stated so nobody reads more into it: no static cap can
+# guarantee the scope fires before the container, because the headroom at the
+# moment of pressure depends on what everything else is doing. That guarantee
+# needs admission control — refusing to START a job that cannot fit — which is
+# NOT built (issue tracked separately) and is NOT claimed here. What the bound
+# does deliver is that the cap can never approach the container limit, and the
+# oom_score_adj below makes the indexer the preferred victim if the container
+# does hit its own OOM.
 _derive_mem_max() {
     # Container limit from cgroup v2, then v1. "max" (uncapped) or unreadable
     # means nothing bounds us, so the measured target stands.
+    #
+    # Read with the `read` BUILTIN, not `cat`: this entrypoint can run with a
+    # minimal PATH (the rlimit-fallback environment its own tests construct), and
+    # `cat` missing there made the read fail, empty the value, and silently
+    # return the UNBOUNDED target — restoring a cap equal to the parent limit on
+    # exactly the constrained install the bound protects. A builtin cannot go
+    # missing. Failure now `continue`s to the next candidate instead of breaking
+    # out of the loop, so an unreadable v2 path still lets v1 be tried.
     local limit_bytes="" f
-    for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    for f in "${CODE_INTEL_FAKE_CGROUP_LIMIT_FILE:-/sys/fs/cgroup/memory.max}" \
+             /sys/fs/cgroup/memory/memory.limit_in_bytes; do
         [ -r "$f" ] || continue
-        limit_bytes="$(cat "$f" 2>/dev/null)" || limit_bytes=""
-        break
+        # Do NOT gate on read's exit status: `read` returns non-zero at EOF when
+        # the file has no trailing newline, even though it HAS set the variable.
+        # Gating on it made a newline-less memory.max look unreadable and fall
+        # through to the unbounded target — the exact fail-open this bound
+        # exists to prevent. The value being non-empty is the real success test.
+        read -r limit_bytes < "$f" 2>/dev/null || true
+        [ -n "$limit_bytes" ] && break
+        limit_bytes=""
     done
     case "$limit_bytes" in
         '' | max | *[!0-9]*)
@@ -138,12 +172,23 @@ _derive_mem_max() {
         printf '%sM\n' "$_CI_MEM_TARGET_MB"
         return 0
     fi
-    local bounded=$(( limit_mb * _CI_MEM_CONTAINER_FRACTION / 100 ))
-    if [ "$bounded" -lt "$_CI_MEM_TARGET_MB" ]; then
-        printf '%sM\n' "$bounded"
-    else
-        printf '%sM\n' "$_CI_MEM_TARGET_MB"
-    fi
+
+    # The cap is the SMALLEST of: the measured target, the container fraction,
+    # and whatever is left after the reserve.
+    local cap=$_CI_MEM_TARGET_MB
+    local by_fraction=$(( limit_mb * _CI_MEM_CONTAINER_FRACTION / 100 ))
+    [ "$by_fraction" -lt "$cap" ] && cap=$by_fraction
+    local by_reserve=$(( limit_mb - _CI_MEM_RESERVE_MB ))
+    [ "$by_reserve" -lt "$cap" ] && cap=$by_reserve
+
+    # A container smaller than the reserve makes by_reserve <= 0. Emit a small
+    # positive floor rather than "0M" or a negative: systemd would reject the
+    # malformed value and the scope would carry NO cap at all, which is the
+    # fail-open-to-worse this whole block exists to avoid. Such a host cannot
+    # run an index that needs 2.8 GiB regardless — it will be killed at its
+    # scope, which is the correct failure (the container survives).
+    [ "$cap" -lt 256 ] && cap=256
+    printf '%sM\n' "$cap"
 }
 
 MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-$(_derive_mem_max)}"
@@ -158,10 +203,17 @@ _log() { printf '[code-intel-index] %s\n' "$*"; }
 # a bigger consumer, and the thing that must never be killed instead of this one
 # is a CC session holding a user's in-flight work.
 #
-# Mechanics, all MEASURED 2026-09-08 rather than assumed:
-#  * RAISING oom_score_adj needs no privilege; LOWERING it is refused
-#    (oom_score_adj_min is 0, inherited from init), so 500 applies and a
-#    negative value never would. Only non-negative values are accepted below.
+# Mechanics, all MEASURED rather than assumed:
+#  * CORRECTION (MEASURED 2026-09-09, replacing what this comment said before):
+#    lowering oom_score_adj is NOT refused. The only constraint is
+#    oom_score_adj_min, which is 0 here (inherited from init) — so an unprivileged
+#    task may set ANY value in 0..1000, in either direction, and only a NEGATIVE
+#    value is refused. Verified directly: 500 -> 321 accepted, 321 -> 0 accepted,
+#    -1 refused. The earlier "raising works, lowering never does" was wrong, and
+#    it mattered: an unconditional write would silently LOWER an inherited higher
+#    value, making this job LESS likely to be chosen than its parent intended.
+#    The raise-only contract therefore has to be enforced here, in code, because
+#    the kernel does not enforce it. See the inherited-value check below.
 #  * `-p OOMScoreAdjust=` is INVALID on `systemd-run --scope` ("Unknown
 #    assignment") because a scope does not exec, so Exec properties do not
 #    apply. A self-write is the mechanism that works while KEEPING --scope,
@@ -198,14 +250,50 @@ _apply_oom_score_adj() {
             return 0
             ;;
     esac
-    # 10# forces base-10 so "0500" means five hundred, not octal 320.
-    local canonical=$((10#$want))
+
+    # Reject oversized input BEFORE any arithmetic. All-digit is not the same as
+    # in-range: $((10#$want)) on a value past bash's signed 64-bit range WRAPS,
+    # so "18446744073709551616" evaluates to 0, passes a `> 1000` check, and is
+    # written and logged as accepted. Strip leading zeros textually, then bound by
+    # LENGTH first — a decimal string of more than 4 digits cannot be <= 1000, and
+    # a length test cannot overflow.
+    local digits="${want#"${want%%[!0]*}"}"   # drop leading zeros
+    [ -n "$digits" ] || digits=0
+    if [ "${#digits}" -gt 4 ]; then
+        _log "WARNING: CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' exceeds the kernel maximum of 1000 — kill order unchanged"
+        return 0
+    fi
+    # 10# forces base-10 so "0500" means five hundred, not octal 320 — the kernel
+    # parses this file with base autodetection, so a zero-padded value would
+    # silently apply a WEAKER preference while the log echoed the operator's
+    # string back as though it took.
+    local canonical=$((10#$digits))
     if [ "$canonical" -gt 1000 ]; then
         _log "WARNING: CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' exceeds the kernel maximum of 1000 — kill order unchanged"
         return 0
     fi
+
+    # Raise-only, enforced HERE because the kernel does not enforce it (see the
+    # correction above). If we inherited a value at or above what we want, keep
+    # it: a parent that raised us to 1000 wanted this job even more killable than
+    # our default does, and writing 900 over it would quietly reverse that.
+    local current=""
+    read -r current < /proc/self/oom_score_adj 2>/dev/null || current=""
+    case "$current" in
+        '' | *[!0-9]*) current="" ;;   # unreadable or negative — no opinion
+    esac
+    if [ -n "$current" ] && [ "$current" -ge "$canonical" ]; then
+        _log "oom_score_adj=$current inherited (>= the requested $canonical) — kept, raise-only"
+        return 0
+    fi
+
     if printf '%s\n' "$canonical" > /proc/self/oom_score_adj 2>/dev/null; then
-        _log "oom_score_adj=$canonical (killed before a CC subprocess at 500, the server at 100, or a session at 0)"
+        # Deliberately does NOT name other units' scores. An earlier version said
+        # "the server at 100", which no shipped configuration set — the unit
+        # template declared -500 (a value the user manager silently refuses, which
+        # is a separate fix). Quoting a number this script does not own turns an
+        # operational log line into a false claim about kill ordering.
+        _log "oom_score_adj=$canonical — this job is the preferred OOM victim, ahead of CC subprocesses, the server and the session"
     else
         # Not fatal: an unwritable /proc (odd sandbox) costs kill-order
         # preference, never the index itself.

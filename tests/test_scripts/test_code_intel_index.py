@@ -93,11 +93,37 @@ def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None
     _write_exec(bindir / "systemd-run", body)
 
 
+_FAKE_CONTAINER_BYTES = 32 * 1024**3  # 32 GiB — big enough that the target wins
+
+
+def _fake_cgroup_limit(tmp_path: Path, total_bytes: int = _FAKE_CONTAINER_BYTES) -> Path:
+    """A stand-in for /sys/fs/cgroup/memory.max.
+
+    Required for determinism, not convenience. The cap is now derived as
+    min(measured target, a fraction of the container, container - reserve), so a
+    bare assertion of "4096M" silently depends on the size of whatever machine
+    runs the suite: on a container below ~6.8 GiB production correctly derives
+    LESS, and the test would fail while the code was right. Pinning the input is
+    what makes these cells environment-independent, which the module docstring
+    already claims of the rest of the file.
+    """
+    # Named by SIZE. A single shared filename collides: _run_entry builds its
+    # default env (writing the 32 GiB value) AFTER a test has written its own
+    # smaller one, silently overwriting it — so the test would exercise 32 GiB
+    # while believing it had set 4 GiB, and pass or fail for the wrong reason.
+    p = tmp_path / f"fake_memory_max_{total_bytes}"
+    p.write_text(f"{total_bytes}\n", encoding="utf-8")
+    return p
+
+
 def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
     env = {
         "PATH": path,
         "HOME": str(tmp_path),
         "GENESIS_HOME": str(tmp_path / ".genesis"),
+        # Pin the container limit so cap derivation is deterministic; individual
+        # tests override it to exercise the bound.
+        "CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(_fake_cgroup_limit(tmp_path)),
         # Fast, never-pausing watchdog by default so a fast fake tool doesn't
         # idle on the real 15s sample gap; watchdog tests override these.
         "CODE_INTEL_WATCHDOG_INTERVAL": "1",
@@ -416,9 +442,12 @@ def test_no_systemd_fallback_applies_rlimit(tmp_path):
 # The larger measured MemoryMax makes this job a bigger consumer, so it must
 # also become the kernel's PREFERRED victim — otherwise a bigger cap makes a
 # container-wide OOM more likely to take the server or a CC session instead.
-# Raising oom_score_adj needs no privilege on Linux (only LOWERING does, gated
-# by oom_score_adj_min / CAP_SYS_RESOURCE), so these assert the raised value
-# directly rather than hedging on the environment.
+# CORRECTED 2026-09-09 (this comment previously had it wrong): raising needs no
+# privilege, and neither does LOWERING, as long as the target stays at or above
+# oom_score_adj_min (0 here, inherited from init). MEASURED directly: 500 -> 321
+# accepted, 321 -> 0 accepted, only -1 refused. So the kernel does NOT enforce a
+# raise-only contract — the script has to, which is what
+# test_oom_score_adj_keeps_a_higher_inherited_value pins.
 
 
 def test_oom_score_adj_reaches_the_indexer(tmp_path):
@@ -487,6 +516,145 @@ def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "ignoring non-numeric" in res.stdout
     assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()  # unchanged
+
+
+def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
+    """Raise-only must be enforced in code, because the kernel does not enforce it.
+
+    MEASURED: an unprivileged task may LOWER oom_score_adj freely as long as it
+    stays >= oom_score_adj_min (0 here) — 500 -> 321 and 321 -> 0 both succeed.
+    So an unconditional write of the 900 default would quietly UNDO a parent that
+    had deliberately raised this job to 1000, making it less likely to be chosen
+    than the parent intended. The script reads the current value and keeps it when
+    it is already at least what was requested.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    # Raise this process first; the entrypoint inherits it.
+    Path("/proc/self/oom_score_adj").write_text("1000\n")
+    try:
+        res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    finally:
+        Path("/proc/self/oom_score_adj").write_text("0\n")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:1000" in log.read_text(), (
+        "the inherited 1000 was lowered to the 900 default — raise-only broken"
+    )
+    assert "inherited" in res.stdout and "raise-only" in res.stdout
+
+
+def test_oom_score_adj_oversized_value_is_rejected_not_wrapped(tmp_path):
+    """All-digit is not in-range. $((10#$v)) WRAPS past bash's signed 64-bit
+    range, so this value evaluates to 0, would sail through a `> 1000` check, and
+    would be written and logged as accepted — a silent downgrade to the least
+    preferred setting, from an input that looks like an obvious typo.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "18446744073709551616"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "exceeds the kernel maximum" in res.stdout
+    assert f"OOM_ADJ:{_inherited_oom_adj()}" in log.read_text()  # untouched
+    assert "codebase-memory-mcp ARGS:" in log.read_text()  # index still ran
+
+
+def test_success_log_does_not_quote_other_units_oom_scores(tmp_path):
+    """The log line must not name scores this script does not own.
+
+    It used to read "the server at 100" while the shipped unit template declared
+    -500 — a number that existed nowhere, presenting a kill ordering that was not
+    real. An operational log that invents its own facts is worse than a terse one,
+    because OOM diagnosis is exactly when someone trusts it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stderr
+    assert "oom_score_adj=900" in res.stdout
+    for claim in ("the server at 100", "at 500", "at 0)"):
+        assert claim not in res.stdout, f"log still asserts a foreign score: {claim!r}"
+
+
+# ── 3c. the cap is bounded by the container ────────────────────────────────
+# A cap equal to the container limit is not a cap: the parent cgroup reaches its
+# own OOM before the scope boundary is ever hit, taking the server or a session
+# with it. host-setup.sh floors an install at 4 GiB, so an absolute 4G default
+# was exactly that on a minimum install.
+
+
+def test_cap_leaves_a_reserve_on_a_small_container(tmp_path):
+    """On a 4 GiB install the cap must stay well below the limit.
+
+    The container fraction alone was not sufficient: 60% of 4 GiB is 2,457M,
+    leaving 1,639M for genesis-server + Qdrant + a session together. The reserve
+    states the invariant directly, and lands this install on 2048M — no worse
+    than the pre-existing 2G default, so nothing regresses for small hosts.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    limit = _fake_cgroup_limit(tmp_path, 4 * 1024**3)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(limit)},
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=2048M" in slog.read_text(), slog.read_text()
+
+
+def test_cap_never_emits_a_nonpositive_value(tmp_path):
+    """A container smaller than the reserve must not produce "0M" or a negative.
+
+    systemd would reject a malformed value and the scope would then carry NO cap
+    at all — failing open to something strictly worse than the bug. A small
+    positive floor keeps the scope real; such a host cannot run this index
+    regardless, and being killed at its own scope is the correct outcome.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    limit = _fake_cgroup_limit(tmp_path, 1 * 1024**3)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(limit)},
+    )
+    assert res.returncode == 0, res.stderr
+    calls = slog.read_text()
+    assert "MemoryMax=256M" in calls, calls
+    assert "MemoryMax=0M" not in calls and "MemoryMax=-" not in calls
+
+
+def test_cap_is_derived_without_depending_on_PATH(tmp_path):
+    """The limit is read with a shell BUILTIN, not `cat`.
+
+    This entrypoint runs with a minimal PATH in the no-systemd fallback (the
+    environment _minimal_path builds). With `cat` absent the read failed, emptied
+    the value, and returned the UNBOUNDED target — restoring a cap equal to the
+    parent limit on precisely the constrained install the bound protects. A
+    builtin cannot go missing.
+    """
+    minbin = _minimal_path(tmp_path)
+    log = tmp_path / "tools.log"
+    _fake_tools(minbin, log)
+    repo = _make_repo(tmp_path)
+    limit = _fake_cgroup_limit(tmp_path, 4 * 1024**3)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=str(minbin),
+        env_extra={"CODE_INTEL_FAKE_CGROUP_LIMIT_FILE": str(limit)},
+    )
+    assert res.returncode == 0, res.stderr
+    # 2048M in KB — the BOUNDED value, proving the read succeeded without `cat`.
+    assert "ULIMIT_V:2097152" in log.read_text(), log.read_text()
 
 
 # ── 4. pressure watchdog ──────────────────────────────────────────────────
@@ -673,7 +841,11 @@ def test_cap_is_bounded_by_the_container_limit(tmp_path):
     """A minimum install must not get a cap equal to its whole container."""
     gib = 1024 * 1024 * 1024
     # 4 GiB minimum install: the absolute 4096M target would BE the container.
-    assert _derive_mem_max(str(4 * gib), tmp_path) == "2457M"
+    # 2048M, not 60%-of-4GiB (2457M): the reserve is the binding constraint here.
+    # 2457M would leave only 1,639M for genesis-server + Qdrant + a session
+    # together, so the parent cgroup could still OOM before the scope boundary —
+    # which is the whole failure this bound exists to prevent. See _CI_MEM_RESERVE_MB.
+    assert _derive_mem_max(str(4 * gib), tmp_path) == "2048M"
     # 32 GiB: the measured target is well under the bound, so it stands.
     assert _derive_mem_max(str(32 * gib), tmp_path) == "4096M"
     # Uncapped container ("max") or unreadable: nothing bounds us, target stands.
