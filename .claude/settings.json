@@ -351,6 +351,26 @@
                 ]
             },
             {
+                "matcher": "ExitPlanMode",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook adopt_first_gate.py --plan",
+                        "timeout": 15
+                    }
+                ]
+            },
+            {
+                "matcher": "Write|Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook adopt_first_gate.py --new-file",
+                        "timeout": 15
+                    }
+                ]
+            },
+            {
                 "matcher": "ExitWorktree",
                 "hooks": [
                     {
