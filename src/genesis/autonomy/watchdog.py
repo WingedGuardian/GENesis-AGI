@@ -237,20 +237,20 @@ class WatchdogChecker:
                 # ...but `uptime_s` belongs to whichever process WROTE the
                 # file. When a restart lands while the previous status.json is
                 # still inside the freshness window, that file is retained: its
-                # `uptime_s` is the PRIOR runtime's (stamped from that
-                # process's own bootstrap — see resilience/status_writer.py's
-                # `_bootstrap_completed_at` arithmetic) and its scheduler
-                # heartbeats describe a runtime that no longer exists. A large
-                # `uptime_s` therefore cannot establish that THIS process is
-                # old, and the first tick after boot would restart a healthy,
-                # still-bootstrapping server — the same defect the stale branch
-                # below closes, reached through the fresh/zombie path instead.
+                # `uptime_s` is the PRIOR runtime's (stamped from that process's
+                # own bootstrap — see status_writer.py `_bootstrap_completed_at`)
+                # and its scheduler heartbeats describe a runtime that no longer
+                # exists. A large `uptime_s` therefore cannot establish that THIS
+                # process is old, and the first tick after boot would restart a
+                # healthy, still-bootstrapping server — the same defect the stale
+                # branch below closes, via the fresh/zombie path instead.
                 # systemd's clock is the only reading tied to the CURRENT
-                # activation: a status file older than the unit's own uptime
-                # was written before the service started. (The comparison mixes
-                # a wall-clock age with a monotonic one; a wall-clock step can
-                # only inflate `staleness_s`, i.e. err toward suppressing, and
-                # the shared counter bounds that.)
+                # activation: a status file older than the unit's own uptime was
+                # written before the service started. (Mixed clock domains, and
+                # CLOCK_REALTIME steps BOTH ways: a forward step inflates
+                # `staleness_s`, erring toward suppression, which the counter
+                # bounds; a backward step deflates it, so the grace simply does
+                # not fire and this branch restarts as it did before it existed.)
                 service_uptime = self._service_uptime_s()
                 if (
                     service_uptime is not None
@@ -304,12 +304,12 @@ class WatchdogChecker:
         # activation, so a crash-loop that stays `active` at tick time would
         # renew the grace forever — which is why the grace is bounded by an
         # explicit skip counter (like every other suppression in this file),
-        # not by uptime alone. The counter clears with the rest of the state
-        # when a genuinely fresh status file appears (_reset_state), so a
-        # healthy bootstrap spends at most one skip. A failed probe suppresses
-        # nothing. The zombie branch above needs no equivalent — it only runs
-        # on a FRESH file, whose uptime_s field it already checks against
-        # stabilization_s.
+        # not by uptime alone. The counter clears with the rest of the state at
+        # _reset_state's FULL-reset branch (its post-restart stabilization
+        # cooldown branch preserves the count on purpose, exactly like
+        # consecutive_failures), so a healthy bootstrap spends at most one skip.
+        # A failed probe suppresses nothing. The zombie branch needs no
+        # equivalent: it runs only on a FRESH file, already uptime_s-checked.
         service_uptime = self._service_uptime_s()
         if (
             service_uptime is not None
@@ -345,7 +345,7 @@ class WatchdogChecker:
         freshness window, but carrying the previous process's heartbeats and
         `uptime_s`). They share ONE counter deliberately — a crash loop must
         not get a fresh budget per branch, and the counter clears for both when
-        a genuinely fresh status file appears (``_reset_state``).
+        a fresh status file reaches ``_reset_state``'s full-reset branch.
 
         Returns False — do not suppress — in exactly two cases: the bound is
         spent (logged + alerted once), or the incremented counter did not
