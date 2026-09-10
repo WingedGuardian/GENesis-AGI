@@ -705,6 +705,29 @@ class OutreachScheduler:
                             )
                             continue
 
+                    # Re-read the cancel state immediately before committing to a
+                    # send. `drain` took a snapshot up to 20 rows ago, and each
+                    # row ahead of this one can cost an LLM draft plus an adapter
+                    # round-trip — so the snapshot is stale by seconds to minutes,
+                    # and that is precisely the window in which someone cancels
+                    # (they cancel because the message is about to go out). Without
+                    # this, `pending_outreach.cancel` returns "cancelled" and the
+                    # message ships anyway, leaving a row recorded as both
+                    # cancelled and delivered. A narrow race remains between this
+                    # read and the send itself; that one is inherent without row
+                    # locking, and it is microseconds rather than minutes.
+                    _cancel_cursor = await self._db.execute(
+                        "SELECT cancelled_at FROM pending_outreach WHERE rowid = ?",
+                        (row["rowid"],),
+                    )
+                    _cancel_row = await _cancel_cursor.fetchone()
+                    if _cancel_row is not None and _cancel_row[0] is not None:
+                        logger.info(
+                            "Pending outreach %s cancelled after drain — not sending",
+                            row.get("id") or f"rowid:{row.get('rowid')}",
+                        )
+                        continue
+
                     # Validate category — map known non-enum values, fall
                     # back to DIGEST (not ALERT) for truly unknown ones.
                     _CATEGORY_ALIASES = {

@@ -517,6 +517,45 @@ Genesis hooks read input through `scripts/hooks/hook_input.py`
 stdin, extracts the `tool_input`-nested fields, and warns on a malformed payload
 so a broken contract can't silently fail open again.
 
+#### Hook OUTPUT: a decision channel and a context channel, capped differently
+
+These are separate, and conflating them produces a plausible-but-wrong safety
+worry. CC **files** a hook's stdout above a per-hook-entry size cap (10,000
+characters on 2.1.246 — version-volatile; it sat near the high-20s K on 2.1.218)
+and shows the model a ~2 KB preview. That cap governs stdout as **model-visible
+context**.
+
+It does **not** gate the control-plane parse of `hookSpecificOutput`. A
+PreToolUse `deny` is parsed and honoured however long its
+`permissionDecisionReason` is — so an oversized reason does **not** cause the
+gate to fail open.
+
+MEASURED 2026-09-03 on CC 2.1.246, via `claude -p --settings <probe>` with a
+PreToolUse hook emitting a `deny` whose reason length was varied, discriminating
+on a **disk side effect** (the denied command writes a marker file) rather than
+on wording:
+
+| reason chars | hook stdout bytes | marker written | verdict |
+|---|---|---|---|
+| 500 | 617 | no | BLOCKED (control) |
+| 15,000 | 15,117 | no | BLOCKED |
+| 200,000 | 200,117 | no | BLOCKED |
+
+The small-reason control arm is load-bearing: without it, "not blocked" at the
+large size is indistinguishable from a probe that never worked. In all three
+arms the reason also reached the model, so it is not silently discarded.
+
+Two cautions. **Re-measure both numbers after a CC pin bump** — the stdout cap
+has already moved once across a version bump, and this one could too. And do not
+transfer either result to the other channel, or to a tool result: per-tool
+`maxResultSizeChars` is a third budget again.
+
+Genesis's own gates are unaffected either way: every blocking hook uses **exit
+code 2 with the reason on stderr**, whose verdict comes from the exit status and
+therefore cannot be weakened by a long reason. `permissionDecision` appears in
+the tree only as `allow` and `ask`. The measurement matters for any future hook
+that denies via JSON.
+
 `session_id` is a special case: a dozen hooks interpolate it into a filesystem
 path (`~/.genesis/sessions/<id>/`), and several `mkdir(parents=True)` — so an id
 carrying `/` or `..` would not merely read the wrong file, it would CREATE
@@ -1014,6 +1053,171 @@ already catches `CCError` on resumes and recovers via `_recover_stale_resume()`.
 Mitigated, not eliminated.
 
 ---
+
+### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
+
+**Undocumented in the hooks reference, settings reference, troubleshooting and
+error docs, and not configurable** (no settings key, env var or flag — the
+`MAX_MCP_OUTPUT_TOKENS` lever is for MCP tools only). Above the threshold the
+harness writes the hook's whole stdout to
+`~/.claude/projects/<slug>/<session>/tool-results/hook-<uuid>-stdout.txt` and
+hands the model a `<persisted-output>` wrapper with a **2,000-character
+preview**. Nothing errors. The session simply runs without whatever sat below
+the preview.
+
+**Measured on this install's pinned binary, via ~25 real probe sessions**
+(`GENESIS_CTX_PROBE_BYTES=<n>` makes `scripts/genesis_session_context.py` emit
+exactly n filler characters; classify from the new session's transcript —
+inline vs `Output too large`):
+
+| Fact | Value | Evidence |
+|---|---|---|
+| Threshold | **exactly 10,000 chars** | 10,000 inline / 10,001 filed |
+| Unit | **characters**, not bytes | 6,000 two-byte chars (12,044 B) inline |
+| Scope | **per hook entry** | two SessionStart hooks × 9,000 chars → both inline |
+| Mode | same in `-p` and interactive | both file at 10,001 |
+| Version volatility | **yes** | on 2.1.218 the threshold sat near the high 20 Ks (filings were rare, 28–32 KB); the 2.1.246 update dropped it to 10 K and the filing rate on this box tripled the same day (2–6/day → 16–21/day) |
+| Remote tunability | **UNVERIFIED — do not assume either way** | CC does use remote feature gates generally (the `we("tengu_<name>", <default>)` idiom appears throughout the bundle), and the TOOL-result threshold resolver consults a per-name override map. But the hook path does not visibly go through that resolver, and the minified symbol is reused across bundles, so nothing ties a remote gate to THIS threshold. Treat a cap change as possible without a version bump, and rely on the filings watcher rather than on the pin, but do not state remote tunability as fact |
+
+**Ordering between hook entries is COMPLETION order, not declaration order**
+(MEASURED 2026-08-30, 6 real sessions). The part doing a subprocess + a DB read
+lands last in 6/6 runs even though it is declared first, and the two disk-only
+parts swap between runs. So do not reason about where one hook's block sits
+relative to another's — and note this cannot be measured by "read the newest
+transcript": with concurrent sessions on the box that picks someone else's, which
+briefly produced a phantom "the charter part vanished" result here. Attribute a
+probe to its own transcript by before/after set difference.
+
+**Which hook events can put stdout in front of the model at all** (READ from
+the bundle's attachment renderer, 2.1.246, and corroborated by the published
+hooks reference): only **SessionStart**, **UserPromptSubmit**,
+**UserPromptExpansion** — the docs additionally name `PostModelSwitch`. Every
+other event (PreToolUse, PostToolUse, **Stop**, SubagentStop, PreCompact,
+SessionEnd) reaches the model ONLY through JSON `additionalContext` /
+`systemMessage`, and each of those strings is run through the SAME 10,000-char
+persistence path. Two consequences worth stating plainly: a Stop hook that
+`print`s advice on exit 0 is **inert** (its stdout goes to the debug log), and
+an oversized JSON advisory can lose its *decision*, not merely its prose —
+which is why `scripts/hooks/hook_output.py` trims named free-text fields and
+never the envelope.
+
+**Reading a filed payload back is safe and idempotent.** The Read tool's
+`maxResultSizeChars` is `Infinity` (it short-circuits the threshold resolver
+and is exempt from the ~200,000-char per-message aggregate budget), so a 30 KB
+filed part comes back whole, once, and cannot be re-persisted. Its real limits
+are 2,000 lines / 25,000 tokens, and exceeding those is an *error*, not a
+silent wrapper. That is what makes "Read the path the wrapper names" a viable
+recovery instruction rather than a loop.
+
+**Identity via CLAUDE.md `@import` was evaluated as an alternative and
+REJECTED** (measured 2026-08-30, real `claude -p` probes). Imports do work:
+they survive `-p` and `--system-prompt`, and a 14,430-char imported file
+arrives whole. Two disqualifiers: (1) a **missing import is a SILENT skip** —
+no warning, no note — and `src/genesis/identity/USER.md` is gitignored and
+absent on a fresh clone, so every clone would silently lose the user profile,
+which is precisely this class of bug; (2) the only suppression lever,
+`--setting-sources user`, drops project **hooks** along with project CLAUDE.md
+(controlled: with the flag both a project hook sentinel and a CLAUDE.md
+sentinel disappear; without it both appear), so executor/eval lanes — which run
+with a worktree cwd — would lose their guards. `--bare` also skips CLAUDE.md
+auto-discovery but forces `ANTHROPIC_API_KEY`-only auth, which this install
+does not use. CLAUDE.md itself has a 4 MiB ceiling and is dropped whole above
+it (no truncation); the docs recommend under 200 lines for adherence.
+
+Consequence: the SessionStart injection ships as **four hook entries**
+(`--part charter | identity-core | identity-user | knowledge`), each held under
+`_PART_BUDGET = 9_800` — enforced at a single chokepoint (`BoundedStdout` in
+`scripts/hooks/hook_output.py`) so a block that forgets to check its budget
+cannot overrun. The DEGRADE decisions live there too: a caller says what the
+fallback looks like (`emit_or_degrade(pointer=…, notice=…)`) and never computes
+characters, because every number it used to compute by hand — the divider,
+`print`'s newline, the closing-line reserve, the room remaining — was found
+wrong by review at least once. The full intended text is mirrored to
+`~/.genesis/sessions/<sid>/context-<part>.md` so an in-band cut stays
+recoverable. Each part opens with a `[genesis-ctx:<part> · mirror: …]` recovery
+header, which sits inside the harness's 2 KB preview by construction — the one
+place a filed part is still visible. Backed by an awareness watcher over the
+harness's own filings (`context_injection_monitor`, critical → Telegram) that
+never reads our constant.
+**After any CC bump, re-run the probe** at 9,978 / 9,979 (the exact edge
+including the 22-char probe wrapper) and at two-hook 9 K + 9 K; if either
+moves, the constants to revisit are `HOOK_STDOUT_CAP` in
+`scripts/hooks/hook_output.py` — its ONE home, which every emitter reads — and
+the part budgets. Do NOT edit `genesis_session_context._HOOK_STDOUT_CAP`: it is
+a re-export assigned from that constant, so changing it moves nothing while
+looking like it did.
+
+Measurement traps met while establishing this, so the next person does not
+repeat them: (1) the `Output too large (NNkB)` parenthetical is the OUTPUT's
+size, not the cap; (2) a Bash TOOL result probe does not transfer to hooks
+(tools carry per-tool `maxResultSizeChars`); (3) an interactive probe with no
+typed turn writes no transcript, and "newest transcript" mis-attributes a
+concurrent session's — identify your own transcript by before/after set
+difference and send a real turn.
+
+### Bypass/auto mode tells the agent to edit via Bash — safe for reads, NOT for writes (measured 2.1.246, 2026-09-05)
+
+In bypass or auto permission mode the CC binary injects a meta message:
+> Do your work through the Bash tool wherever it can accomplish the job: read
+> files with cat, head, or sed -n, search with grep and find, and **make file
+> changes with sed, heredocs, or short scripts**, rather than using the
+> dedicated Read, Edit, or Write tools. Fall back to a dedicated tool only when
+> Bash genuinely cannot do the job.
+
+**Provenance (established, not inferred):** the text is compiled into the CC
+binary; it is in no `settings.json`, `CLAUDE.md`, output-style, or agent file.
+
+**It reaches a session by three routes, not one.** The selector falls through
+the bypass flag, then the steer-only flag, then — and this is the one that
+matters — a `bashFirst` flag, which is a COHORT assignment
+(`bashFirstSessionAssignment`, resolving to forced/cohort/none) rather than a
+permission mode. **A default-mode session can therefore receive this message.**
+An earlier draft of this section said it was emitted purely on permission mode;
+that was read off a truncated transcription and is wrong.
+
+It is still an **efficiency heuristic** making no correctness claim — but that
+follows from what the message SAYS, not from where it is gated: it is phrased as
+a preference and carries its own escape hatch back to the dedicated tools. The
+same is true of the sibling `AgentTool`/workflows restriction lines: also in the
+binary (`grep -c -a -F` → 2 occurrences each), also not install config. Neither
+is install-specific; both apply to every CC user of this version.
+
+**Reads: follow it.** `cat`/`sed -n`/`grep`/`find` are cheaper round-trips and
+carry no correctness cost.
+
+**Writes to source: do NOT use bare `sed -i`. Prefer Edit/Write.** Measured
+contrast (fixtures + results kept locally under `~/tmp/edit-probe/`, pre-registered
+decision rule):
+
+| case | `sed -i` | Edit |
+|---|---|---|
+| anchor absent | exit 0, file unchanged, **no error** (silent no-op) | refuses: "String to replace not found" |
+| anchor non-unique (×3) | exit 0, **replaces all 3**, incl. unrelated lines | refuses, names the count, demands `replace_all` |
+| anchor with regex metachar, literal intent | exit 0, **wrong-target rewrite or silent no-op** | applied correctly (literal match) |
+| control: valid unique anchor | applied | applied |
+
+Three reasons the split is correct HERE specifically (all universal to any
+Genesis clone, since the machinery is tracked):
+1. **`sed`'s silent-failure contract** above is `sed`, not this box — a
+   mis-anchored edit that changes nothing, or the wrong thing, returns exit 0.
+2. **`Edit`/`Write` fire five EDIT-SPECIFIC PostToolUse hooks** wired in the tracked
+   `.claude/settings.json` (`edit_verify_advisory`, `file_modification_audit`,
+   `edit_failure_sensor`, `subsystem_traps`, `file_context`); a `Bash` write
+   fires none of them, so the repo's own post-edit verification plane never
+   sees the change.
+3. **Heredoc writes sit in blocked-compound blast radius** — a PreToolUse block
+   discards the whole call including the heredoc, silently.
+MEASURED cost of ignoring this in practice, **and state the dialect or the
+number means nothing**: `sed` uses BRE by default, where `+ ? | ( ) { }` are
+literal. Counting only the characters BRE actually treats as special
+(`. * [ ] ^ $ \`), **54.9% of realistic edit anchors in this repo carry one**
+(2,750 / 5,013 removed lines ≥8 chars over the last 200 non-merge commits on
+`src/` + `scripts/`; re-derivable, 2026-09-06). The same corpus scores 74.0%
+against an ERE set, which is what an earlier revision of this line reported as
+"75.2%" — a real number for the wrong dialect. Either way the unsafe case is the
+common
+one, not a tail. A "short script" that does a literal `str.replace` AND asserts
+its occurrence count is acceptable — it re-implements Edit's two checks by hand.
 
 ## Known Risks
 
