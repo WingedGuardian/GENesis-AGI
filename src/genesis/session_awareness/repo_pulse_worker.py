@@ -69,7 +69,6 @@ from genesis.session_awareness.repo_pulse_gh import (
     list_open_prs,
     list_pr_files,
     resolve_default_branch,
-    resolve_repo,
 )
 
 CURSOR_FILENAME = "cursor.json"
@@ -129,6 +128,7 @@ def _write_cursor(
     merged_at: str | None,
     verification_through: str | None = None,
     verification_repo: str | None = None,
+    verification_reset: bool = False,
 ) -> None:
     """Update the cursor after a RECORDED run.
 
@@ -153,6 +153,24 @@ def _write_cursor(
     if merged_at is not None:
         last = max(str(last), merged_at) if last else merged_at
     verif = prior.get("verification_through")
+    if verification_reset:
+        # The repository changed under this cursor. CLEAR the watermark rather
+        # than advancing or preserving it: a foreign timestamp is not
+        # information about this repository, and the next tick then derives its
+        # window from the plain lookback and re-covers correctly.
+        _atomic_write_json(
+            root / CURSOR_FILENAME,
+            {
+                "last_merged_at": (
+                    max(str(last), merged_at) if (last and merged_at) else (merged_at or last)
+                ),
+                "last_run_ts": _now(),
+                "runs": int(prior.get("runs") or 0) + 1,
+                "verification_through": None,
+                "verification_repo": verification_repo,
+            },
+        )
+        return
     if verification_through is not None:
         # The monotonic max is only valid WITHIN one repository. Across a
         # change of repo it carries the FOREIGN watermark forward whenever the
@@ -726,22 +744,18 @@ async def _run_locked(
     # When the lane is disabled its watermark is irrelevant: nothing will read
     # those PRs, so paying for a wider gh query would be waste.
     verification_on = knob_bool(cfg, "verification_enabled")
-    # THE IDENTITY CHECK RUNS BEFORE ANY WINDOW IS DERIVED FROM THE WATERMARK.
-    # It used to sit AFTER the fetch, which made it the fourth instance of this
-    # PR's recurring class: the reset was applied to the FILTER and not to the
-    # FETCH WINDOW that feeds it, so on a retarget or rename `since` still came
-    # from the shared cursor's date instead of the lookback — and merges in the
-    # NEW repository older than that date got no obligation row, ever. The
-    # comment below promised the lane "re-covers its lookback"; measured, it did
-    # not (audit, PR #1836).
-    # `resolve_repo()` costs no extra API call: `list_merged_prs` calls it on
-    # page 1 anyway, and the resolved slug is threaded back in below.
-    repo = await resolve_repo()
-    if verification_repo and repo and verification_repo != repo:
-        detail_notes.append(
-            f"verification_watermark_reset: recorded for {verification_repo}, now {repo}"
-        )
-        verification_before = None
+    # THE WINDOW CANNOT BE TRUSTED WHEN THE REPOSITORY MAY HAVE CHANGED, and the
+    # identity is not known until the fetch returns. An earlier attempt hoisted
+    # `resolve_repo()` above the window to learn it early; that added a live API
+    # call and a NEW failure mode to this path — CI has no gh auth, so it
+    # returned None, the reset never fired, and the tests only passed locally
+    # because of ambient credentials. A check that silently stops checking is
+    # worse than a late one.
+    # So the check stays AFTER the fetch, and the recovery takes one extra tick
+    # instead of one extra call: on a repo change the watermark is RESET IN THE
+    # CURSOR (see `verification_reset` below), so the NEXT tick derives its
+    # window from the plain lookback and re-covers correctly. No API call, no
+    # new failure mode, and self-healing without operator action.
     fetch_from = cursor_before
     if verification_on and (verification_before is None or not cursor_before):
         fetch_from = None  # fall back to the plain lookback (bounded)
@@ -758,6 +772,7 @@ async def _run_locked(
     # merged on one day), the run FAILS loudly and the cursor stays put —
     # retryable, never a silent hole.
     prs_by_number: dict[int, dict] = {}
+    repo: str | None = None
     until: str | None = None
     pages = 0
     dropped_rows = 0
@@ -829,7 +844,17 @@ async def _run_locked(
     # because advancing past a dropped merge strands it forever — nothing
     # re-presents a PR the watermark has passed. The capped-window case cannot
     # reach here at all: `limit_hit_unresolved` already returns above.
-    verification_window_complete = dropped_rows == 0
+    verification_reset = bool(verification_repo and repo and verification_repo != repo)
+    if verification_reset:
+        detail_notes.append(
+            f"verification_watermark_reset: recorded for {verification_repo}, now {repo}"
+        )
+        verification_before = None
+    # A reset tick never ADVANCES the watermark: the window it fetched was
+    # derived from the OLD repository's cursor and may be narrower than the
+    # lookback, so anything older would be skipped. It clears the stored value
+    # instead, and the next tick re-covers from the lookback.
+    verification_window_complete = dropped_rows == 0 and not verification_reset
     if dropped_rows:
         detail_notes.append(f"verification_window_incomplete: {dropped_rows} row(s) dropped")
     verif_prs: list[dict] = []
@@ -1364,6 +1389,7 @@ async def _run_locked(
             merged_at=new_max_merged,
             verification_through=verif_through,
             verification_repo=repo,
+            verification_reset=verification_reset,
         )
     else:
         detail_notes.append("pulse_write_failed_cursor_preserved")

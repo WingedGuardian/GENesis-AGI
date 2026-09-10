@@ -601,7 +601,18 @@ async def test_a_newer_foreign_watermark_is_not_carried_forward(
     )
     assert out["status"] == "ok"
     cursor = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
-    assert cursor["verification_through"] == MERGED, (
-        "the foreign repository's newer watermark must be DISCARDED, not max'd"
+    assert cursor["verification_through"] is None, (
+        "a reset tick CLEARS the watermark — it does not advance it, because the "
+        "window it fetched came from the OLD repository's cursor and may be "
+        "narrower than the lookback"
     )
-    assert cursor["verification_repo"] == REPO
+    assert cursor["verification_repo"] == REPO, "and it records whose repo it now is"
+
+    # THE RECOVERY, which is the half that matters: the next tick derives its
+    # window from the plain lookback and re-covers, with no API call and no
+    # operator action.
+    files2 = _files({84: {"files": ["src/b.py"]}})
+    out2 = await _run(db_path, monkeypatch, gh=_gh([_pr(84)]), files=files2)
+    assert out2["status"] == "ok"
+    cursor2 = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
+    assert cursor2["verification_through"] == MERGED, "the watermark advances again"
