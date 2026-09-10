@@ -103,6 +103,7 @@ import base64
 import contextlib
 import datetime as _dt
 import hashlib
+import html
 import json
 import os
 import re
@@ -1300,7 +1301,26 @@ _CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 
 
 def _cr_markup_mask(body: str) -> list[bool]:
-    """Per line: True when it sits inside a fenced block or a ``<details>`` section.
+    """Per line: True when it sits inside a fenced block OR a ``<details>`` section.
+
+    The union, for callers that treat both as quoted content. A caller that must
+    keep ``<details>`` VISIBLE — the outside-diff parser, whose findings are
+    nested two levels deep inside them by construction — takes the fence half
+    alone from ``_cr_masks``. Both halves come from one implementation on
+    purpose: fence tracking is subtle (CommonMark close rules, the four-backtick
+    suggestion case, the unclosed-fence recovery), and a second copy of it is
+    how #1677 would come back on a surface nobody re-reads.
+    """
+    fence_mask, details_mask = _cr_masks(body)
+    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
+
+
+def _cr_masks(
+    body: str, bq_depths: list[int] | None = None
+) -> tuple[list[bool], list[bool]]:
+    """``(fence_mask, details_mask)`` per line — the two kept SEPARATE.
+
+    Per line: True when it sits inside a fenced block or a ``<details>`` section.
 
     Shared by the splitter and the title extractor because they MUST agree about
     what is quoted content. They did not: the title extractor skipped fences while
@@ -1328,9 +1348,16 @@ def _cr_markup_mask(body: str) -> list[bool]:
     fence_char: str | None = None
     fence_len = 0
     fence_opened_at: int | None = None
+    # The blockquote depth the OPEN fence was opened at. A renderer scopes a
+    # fence to its container, so only a delimiter in the SAME container can
+    # close it; `bq_depths` is None for callers reading text that never had a
+    # quote prefix stripped, and every depth is then 0, which is exactly the
+    # previous behaviour.
+    fence_bq = 0
     details_depth = 0
     details_opened_at: int | None = None
     for idx, line in enumerate(lines):
+        depth = bq_depths[idx] if bq_depths is not None and idx < len(bq_depths) else 0
         stripped = line.strip()
         # CommonMark gives fence DELIMITERS at most three leading spaces; a
         # 4+-space-indented backtick run is code CONTENT. Stripping first and
@@ -1342,7 +1369,13 @@ def _cr_markup_mask(body: str) -> list[bool]:
             run, info = fence.group(1), fence.group(2).strip()
             if fence_char is None:
                 fence_char, fence_len, fence_opened_at = run[0], len(run), idx
-            elif run[0] == fence_char and len(run) >= fence_len and not info:
+                fence_bq = depth
+            elif (
+                depth == fence_bq
+                and run[0] == fence_char
+                and len(run) >= fence_len
+                and not info
+            ):
                 # CommonMark: a closing fence uses the SAME character, is at
                 # least as long as the opener, and carries NO info string.
                 # Toggling on any fence line broke on CodeRabbit's own output:
@@ -1396,7 +1429,7 @@ def _cr_markup_mask(body: str) -> list[bool]:
         # the same reason the fence recovery accepts it (Codex P2, PR #1677).
         for i in range(details_opened_at, len(lines)):
             details_mask[i] = False
-    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
+    return fence_mask, details_mask
 
 
 def _cr_findings(body: str) -> list[str]:
@@ -1466,6 +1499,498 @@ def _coderabbit_title(body: str) -> str:
         if stripped.startswith("**") and stripped.rstrip("*").strip():
             return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
     return _inline_title(body)
+
+
+# ── CodeRabbit findings delivered in the REVIEW BODY, not inline ──
+#
+# When a finding's anchor line falls outside the PR's diff HUNKS, CodeRabbit
+# cannot create an inline review comment for it, so it puts the finding in the
+# review BODY under a collapsible section instead. NEITHER existing scan sees
+# these: `_check_inline_review_findings` reads `pulls/N/comments` (a different
+# endpoint entirely), and `_check_pr_review_findings` gates on `_REVIEW_BOTS`,
+# which does not contain CodeRabbit.
+#
+# MEASURED 2026-09-07, all 84 then-open non-draft PRs: 27 deduped findings
+# across 23 PRs — 15 Major, 12 Minor, 0 Critical — none of which any gate could
+# see. Two were floor-class: a silent-write-loss Major (#1806
+# `memory/store.py`) and a privacy Major (#1820 `inbox/monitor.py`), on PRs
+# that read `inline-findings: ok`.
+#
+# Three shapes the parser must survive, each verified against a live body:
+#   1. The section appears BLOCKQUOTED (`> <summary>…`) when nested inside an
+#      outer <details>, and bare otherwise — so nothing here anchors to `^`.
+#   2. A PR can carry SEVERAL CodeRabbit reviews and the section may exist in
+#      only one of them (#1834: absent from review 1, present in review 2), so
+#      every review is read, never just the newest.
+#   3. Section headers and FILE headers share the `<summary>NAME (N)</summary>`
+#      shape; the section names are a closed set, so a summary matching one is
+#      a section and anything else carrying a count is a file.
+_CR_SECTION_NAMES = (
+    "Outside diff range comments",
+    "Duplicate comments",
+    "Nitpick comments",
+    "Additional comments",
+)
+_CR_SECTION_RE = re.compile(
+    r"<summary>[^<>]*?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r")[^<>]*?</summary>"
+)
+# The declared count is read from the matched summary SEPARATELY rather than as
+# an optional group inside the pattern above: with lazy quantifiers on both
+# sides, an optional `(?:\((\d+)\))?` is simply skipped — the match succeeds and
+# the group is always None, so every count silently read as absent and the
+# reconciliation could never fire. Caught by its own test.
+_CR_SECTION_COUNT_RE = re.compile(r"\((\d+)\)")
+# A file header inside a section: `<summary>path/to/file.py (2)</summary>`.
+_CR_FILE_HEADER_RE = re.compile(r"<summary>([^<>]+?)\s+\((\d+)\)</summary>")
+# One finding entry: a backticked line or line-range, a colon, then the
+# severity header on the SAME line (unlike the inline form, where the header
+# occupies its own line). Example:
+#   `169-174`: _🗄️ Data Integrity_ | _🟠 Major_ | _🏗️ Heavy lift_
+# Anchored to line START (modulo whitespace): CodeRabbit emits the entry line
+# as its own line, and an UNanchored search also matched entry-shaped text
+# inside a finding's PROSE ("the source contains `99`: _cat_ | _🔴 Critical_"),
+# manufacturing a phantom finding (Codex P2, PR #1847). If the live format ever
+# gains a leading bullet this stops matching — and the declared-count
+# reconciliation then blocks LOUDLY on the shortfall rather than degrading.
+_CR_ENTRY_RE = re.compile(r"^\s*`(\d+(?:-\d+)?)`:\s*(.+)")
+# The <details> depth at which each role occurs. MEASURED over 23 live bodies
+# carrying an outside-diff section: every section summary sits at depth 1 and
+# every one of 113 file summaries at depth 2, with no exceptions.
+_CR_SECTION_DEPTH = 1
+_CR_FILE_DEPTH = 2
+# Line separators Python's str.split("\n") does NOT break on. `gh --jq` emits
+# U+0085 (NEL) literally inside JSON strings — `_fetch_comments_paged` splits on
+# "\n" only for exactly that reason — so it genuinely reaches this parser, and a
+# PR author can put one in a source file for the reviewer to quote back. Left
+# unnormalised, an entry lands on the SAME line as its file header, the header
+# branch consumes the line, and the finding is never seen. Normalised here (in
+# this caller, not in the shared mask, whose other consumers read inline comment
+# bodies where changing line-splitting would be a behaviour change in the
+# fail-open direction).
+_CR_LINE_SEPARATORS = ("", " ", " ")
+# A blockquote prefix, possibly repeated: `> `, `>> `, `   > `. MEASURED: 23 of
+# 23 live bodies carry blockquoted lines, and 74 real fence lines went UNMASKED
+# because `_cr_masks` matches `<details>` and fence delimiters with startswith on
+# the stripped line, which a `> ` prefix defeats. Stripped here so the shared
+# mask sees the structure it was written to read.
+_CR_BLOCKQUOTE_RE = re.compile(r"^(?:\s*>)+ ?")
+# A `<details …>` OPENER ending the text before a `<summary>`. HTML requires
+# <summary> to be the first child of its <details>, so this adjacency is what
+# separates real structure from a tag's text appearing in prose.
+_CR_DETAILS_OPEN_TAIL_RE = re.compile(r"<details[^<>]*>\s*$")
+
+# A backtick code span: a run of backticks closed by an equal run. CommonMark
+# lets a span contain a newline (it terminates at a blank line, not at a line
+# end), so `[^`]` deliberately does NOT exclude "\n" — an earlier revision did,
+# and a span broken across two lines then went entirely unmasked, re-opening
+# the depth-poisoning this mask exists to close. Masking is applied
+# paragraph-wise for the same reason.
+#
+# The failure direction of a mis-sized span is OVER-masking, which costs a
+# missed finding that the declared-count reconciliation then blocks on — never
+# a tag silently honoured.
+_CR_INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
+
+
+def _cr_mask_inline_code_lines(lines: list[str]) -> list[str]:
+    """``lines`` with backtick code spans blanked, LENGTH- AND LINE-PRESERVING.
+
+    A renderer treats ```</details>``` as text, not as a closing tag — but
+    ``str.count`` does not, so a finding whose PROSE quotes a tag in inline
+    code moved the document's depth. Everything after it then read at the
+    wrong level: the next genuine file header failed its depth test,
+    ``current_file`` kept the previous path, and a Critical on a real source
+    file was misattributed to a doc path and skipped — with declared ==
+    parsed, so the shortfall canary stayed quiet (Codex P1, PR #1847).
+
+    Spans become spaces of the same length rather than being removed, so every
+    index computed on a masked line (``find("<summary")`` positions, head
+    slices) still addresses the original text. Only the tag-structure readers
+    (`_cr_details_depths`, `_cr_summary_structural`) consume this — the ENTRY
+    regex depends on backticks (`` `169-174`: … ``) and keeps reading raw.
+
+    Masks over each BLANK-LINE-DELIMITED paragraph rather than per line,
+    because a code span may span a newline. Splitting first and masking each
+    line alone cannot see such a span at all, so it left the quoted tag inside
+    it live (adversarial-audit SHOULD-FIX, PR #1847). Line count and every
+    line's length are preserved, so all downstream indices still address the
+    original text.
+    """
+    masked: list[str] = []
+    para: list[str] = []
+
+    def flush() -> None:
+        if not para:
+            return
+        block = _CR_INLINE_CODE_RE.sub(
+            lambda m: re.sub(r"[^\n]", " ", m.group(0)), "\n".join(para)
+        )
+        masked.extend(block.split("\n"))
+        para.clear()
+
+    for line in lines:
+        if line.strip():
+            para.append(line)
+        else:
+            flush()
+            masked.append(line)
+    flush()
+    return masked
+
+
+def _cr_normalize_review_body(body: str) -> tuple[str, list[int]]:
+    """``(text, blockquote_depths)`` — separators and quote prefixes normalised.
+
+    Both normalisations are STRUCTURAL — they make the document read the way a
+    markdown renderer reads it — and both are applied BEFORE any mask or split,
+    so every downstream index (fence mask, depths, line list) stays aligned.
+
+    THE DEPTHS ARE RETURNED, NOT DISCARDED, and that is the whole point of the
+    second return value. Stripping the prefix is right — it is what let the
+    mask see structure that quoting had hidden — but the prefix also carries
+    the line's CONTAINER, and a renderer scopes a fence to its container. Drop
+    that and a quoted ``> ``` `` line, which a renderer treats as ordinary
+    CONTENT inside a document-level fence (it cannot close one: the ``>`` is
+    not indentation), becomes a valid closer here. The mask then INVERTS: the
+    real closer opens a phantom fence, everything after it is masked, and the
+    masked region includes the section header carrying the declared count — so
+    ``declared`` and ``parsed`` are both 0 and NO canary fires. Verified
+    end-to-end against a control: a floor-class Critical went from blocking to
+    not blocking, silently (adversarial audit, PR #1847). Depth travels with
+    the text so `_cr_masks` can bind each delimiter to the container that
+    opened it.
+
+    This remains far from the "never normalise before a blind-spot probe" case:
+    nothing here deletes evidence a probe looks for. The lesson is narrower and
+    sharper — normalising away a CONTAINER MARKER is not free, because the
+    marker is what scopes the constructs inside it.
+    """
+    for sep in _CR_LINE_SEPARATORS:
+        body = body.replace(sep, "\n")
+    lines = body.split("\n")
+    depths = []
+    stripped = []
+    for line in lines:
+        prefix = _CR_BLOCKQUOTE_RE.match(line)
+        depths.append(prefix.group(0).count(">") if prefix else 0)
+        stripped.append(_CR_BLOCKQUOTE_RE.sub("", line))
+    return "\n".join(stripped), depths
+
+
+def _cr_details_depths(lines: list[str], fence_mask: list[bool]) -> list[int]:
+    """The ``<details>`` nesting depth at each line's first ``<summary>``.
+
+    Depth alone does NOT identify a role, and an earlier revision of this parser
+    believed it did. An injected ``<summary>`` sitting in ordinary prose INSIDE a
+    genuine file block reports the same depth as that block's own header, so
+    depth-gating let it reassign the current file exactly as before. Depth
+    answers "which level", never "is this structure" — ``_cr_summary_structural``
+    answers the second question, and both must agree before a tag is honoured.
+
+    The depth reported for a line is the depth AT ITS FIRST ``<summary>``, not
+    after the whole line — only openers appearing BEFORE that tag are counted.
+    Live bodies put ``<details>`` on its own line, but a renderer does not care,
+    and counting the whole line would record depth 2 for a section summary the
+    moment CodeRabbit emitted ``<details><summary>…`` together. A parser that
+    silently matches NOTHING when its input is reformatted is a fail-open, so
+    the rule is anchored to the tag's position rather than to a layout.
+
+    Tags inside a fence are quoted content and move nothing — otherwise an
+    author could shift the document's depth from inside a suggestion block and
+    relocate every role by one level. Tags inside INLINE CODE are quoted
+    content too, at a smaller granularity the fence mask cannot see — masked
+    per line by ``_cr_mask_inline_code`` for the same reason.
+    """
+    # Casefold + mask ONCE, over the whole list, so a code span that crosses a
+    # newline is seen (a per-line mask cannot close one) and every index below
+    # still addresses the original text.
+    lines = _cr_mask_inline_code_lines([ln.casefold() for ln in lines])
+    depths: list[int] = []
+    depth = 0
+    for line, quoted in zip(lines, fence_mask, strict=True):
+        if quoted:
+            depths.append(depth)
+            continue
+        low = line
+        cut = low.find("<summary")
+        head = low if cut < 0 else low[:cut]
+        depths.append(depth + head.count("<details"))
+        depth = max(0, depth + low.count("<details") - low.count("</details"))
+    return depths
+
+
+def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[bool]:
+    """Per line: True when its first ``<summary>`` is really a ``<details>`` header.
+
+    HTML requires ``<summary>`` to be the FIRST child of its ``<details>``, and
+    that is the invariant CodeRabbit's generator satisfies and an injection
+    cannot. Anything else carrying the tag's TEXT — a sentence quoting it, a
+    fenced example, a finding description that mentions it — has content between
+    the opener and the tag, so it is prose that looks like structure.
+
+    This is the check that actually closes the misattribution hole. Depth-gating
+    alone did not: a bare ``<summary>CHANGELOG.md (1)</summary>`` written in prose
+    INSIDE a real file block reports that block's own depth, so it passed the
+    depth test and still reassigned the current file — a real Critical was
+    attributed to a doc path, silently doc-skipped, and did not block, with
+    declared == parsed so the shortfall canary stayed quiet too.
+    """
+    # Same mask as `_cr_details_depths`, for the same reason and applied the
+    # same way — the two readers must never disagree about what is quoted.
+    lines = _cr_mask_inline_code_lines([ln.casefold() for ln in lines])
+    structural: list[bool] = []
+    prev_opener = False  # the previous non-blank unfenced line ENDS with a <details> opener
+    for line, quoted in zip(lines, fence_mask, strict=True):
+        low = line
+        cut = -1 if quoted else low.find("<summary")
+        if cut < 0:
+            structural.append(False)
+        else:
+            head = low[:cut].rstrip()
+            # Same line (`<details><summary>…`) or the line before (`<details>` alone).
+            structural.append(
+                bool(_CR_DETAILS_OPEN_TAIL_RE.search(head)) if head.strip() else prev_opener
+            )
+        stripped = low.strip()
+        if not quoted and stripped:
+            prev_opener = bool(_CR_DETAILS_OPEN_TAIL_RE.search(stripped))
+    return structural
+
+
+def _cr_outside_diff_entries(
+    body: str,
+) -> tuple[list[tuple[str, str, str, str]], int, bool]:
+    """Findings from the 'Outside diff range comments' sections of ONE review body.
+
+    Returns ``(entries, declared, declared_known)`` — the parsed findings, the
+    total this body's own section headers SAY it carries, and whether EVERY
+    matched section header actually stated a count. ``declared_known`` is what
+    licenses the SURPLUS comparison: with any count absent, ``declared`` is an
+    underestimate, so parsed-exceeds-declared would fire on well-formed input.
+    The shortfall comparison needs no such licence — an underestimate can only
+    make it more lenient, never false-positive. The format states its own counts
+    ("Outside diff range comments (3)"), which is the one closed-set fact
+    available about a third-party document nobody controls: it turns "did I
+    parse everything?" from an unanswerable question into a comparison. Reading
+    2 of 3 is the SILENT direction of failure on a merge gate, and every other
+    CodeRabbit helper here carries a canary for what it read but did not
+    recognise (``cr_unknown``, ``unmatched_bot``, ``header_seen``); without the
+    declared count this one would have none. ``declared`` is 0 when a header
+    omits its count — absent, not zero findings, and the caller only ever acts
+    on a SHORTFALL.
+
+    Each entry is ``(path, lines, severity, title)``, severity lower-cased
+    and drawn from the SAME vocabulary as the inline path (``_CR_SEVERITIES``)
+    so the two cannot drift into disagreeing about what 'major' means. A finding
+    whose severity cannot be read is returned with severity ``""`` — surfaced by
+    the caller as a canary, never silently dropped and never guessed at (the
+    ``cr_unknown`` contract, one section over).
+
+    The section runs from its own ``<summary>`` to the next SECTION summary or
+    to end-of-body, so the tail of a body whose outside-diff section comes last
+    gets walked — and MEASURED on live data that is the NORMAL case (3 of 5
+    bodies), not an edge.
+
+    What makes the tail walk safe is ONE guard, not two, and an earlier version
+    of this docstring claimed two. CodeRabbit's trailing furniture DOES carry
+    the file-header shape — ``<summary>📒 Files selected for processing (11)
+    </summary>`` matches ``_CR_FILE_HEADER_RE``, in 11 of 11 real reviews — so
+    ``current_file`` really is reassigned to a furniture heading on every live
+    run. The only thing preventing a phantom finding is that no furniture line
+    matches ``_CR_ENTRY_RE`` (a backticked line-range then a colon then a
+    severity). That is a thin margin held by a single condition, which is why
+    the declared-count reconciliation above exists: it monitors the margin
+    instead of asserting it.
+    """
+    out: list[tuple[str, str, str, str]] = []
+    declared = 0
+    declared_known = True
+    depth_drift: list[str] = []
+    body, bq_depths = _cr_normalize_review_body(body)
+    lines = body.split("\n")
+    # FENCE half only. A review body is a code-bearing document: it quotes diffs
+    # and embeds ```suggestion blocks, so a `<summary>` or an entry line inside a
+    # fence is QUOTED CONTENT, not structure. The DETAILS half is deliberately
+    # NOT applied — these findings sit two <details> deep by construction, so the
+    # union mask would hide every real one.
+    fence_mask, _details_mask = _cr_masks(body, bq_depths)
+    depths = _cr_details_depths(lines, fence_mask)
+    structural = _cr_summary_structural(lines, fence_mask)
+    current_file: str | None = None
+    in_section = False
+    for pos, line in enumerate(lines):
+        if fence_mask[pos]:
+            continue
+        # STRUCTURE IS ATTRIBUTED BY POSITION IN THE <details> TREE, never by
+        # matching tag text wherever it appears. Both roles were reconstructed
+        # from text before, and both were forgeable from content a PR author
+        # controls (their own source, quoted back by the reviewer):
+        #   - a bare `<summary>CHANGELOG.md (1)</summary>` in ORDINARY PROSE
+        #     reassigned the current file, so a real Critical was attributed to a
+        #     doc path, silently doc-skipped, and did not block — and because the
+        #     finding was still COUNTED, declared == parsed and the shortfall
+        #     canary could not see it either;
+        #   - a `<summary>Nitpick comments (9)</summary>` inside a fence ended the
+        #     section early and dropped every finding after it.
+        # MEASURED over 23 live bodies (113 file headers): section summaries occur
+        # at depth 1 and file summaries at depth 2, without exception. Injected
+        # text sits deeper, or inside a fence, and now matches neither role.
+        section = _CR_SECTION_RE.search(line)
+        if (
+            section
+            and structural[pos]
+            and depths[pos] != _CR_SECTION_DEPTH
+            and section.group(1) == "Outside diff range comments"
+        ):
+            # REAL STRUCTURE at an unexpected level. The depth pin is a
+            # MEASURED constant of a document nobody controls (23/23 live
+            # bodies put a section at depth 1), and the reconciliation cannot
+            # notice when it stops holding: `declared` is read from the same
+            # match that licenses parsing, so a section one <details> deeper
+            # yields declared == parsed == 0 — a silent clean read, on every
+            # PR, forever. That is the vacuous green this whole channel exists
+            # to remove, reintroduced one layer up (adversarial audit, #1847).
+            # Reported as a shortfall so the caller BLOCKS as unreadable.
+            # Prose and fenced mentions cannot reach here: `structural` already
+            # requires a real <details> opener adjacent to the tag.
+            depth_drift.append(f"outside-diff section at <details> depth {depths[pos]}")
+            continue
+        if section and structural[pos] and depths[pos] == _CR_SECTION_DEPTH:
+            in_section = section.group(1) == "Outside diff range comments"
+            current_file = None
+            if in_section:
+                count = _CR_SECTION_COUNT_RE.search(section.group(0))
+                if count:
+                    declared += int(count.group(1))
+                else:
+                    declared_known = False
+            continue
+        if not in_section:
+            continue
+        header = _CR_FILE_HEADER_RE.search(line)
+        if header and structural[pos] and depths[pos] == _CR_FILE_DEPTH:
+            # UNESCAPED, because this string is an IDENTITY, not display text:
+            # it is compared against the raw path GitHub returns, by `_off_diff`
+            # and `_is_doc_path`. A path holding a markup-significant character
+            # arrives HTML-escaped inside the summary (`docs/Q&amp;A.md`,
+            # `src/a&lt;b.py`), so the comparison failed and routed even a
+            # Critical to the non-scoring off-diff lane — a merge allowed on a
+            # finding that was read correctly and then attributed to nobody
+            # (Codex P2, PR #1847). `&` is the likely one in practice; `<` is
+            # the one that is obvious.
+            current_file = html.unescape(header.group(1).strip())
+            continue
+        entry = _CR_ENTRY_RE.search(line)
+        if entry and current_file is not None:
+            severity, _seen = _cr_severity_inline(entry.group(2))
+            # The title is the first BOLD line beneath the entry, and the search
+            # STOPS at the next entry or file header — a line bound alone is not
+            # enough. With only a distance bound, a titleless finding walks past
+            # the next entry line and adopts ITS title, so the report names the
+            # wrong defect at the right line: worse than no title, because it
+            # reads as information. An empty title is honest; a stolen one is not.
+            title = ""
+            budget = 5  # CONTENT lines, not raw lines
+            for offset in range(pos + 1, len(lines)):
+                if fence_mask[offset]:
+                    continue  # quoted bold is not this finding's title
+                if budget <= 0:
+                    break
+                budget -= 1
+                look = lines[offset]
+                if _CR_ENTRY_RE.search(look) or _CR_FILE_HEADER_RE.search(look):
+                    break
+                bold = _CR_INLINE_BOLD_RE.search(look)
+                if bold:
+                    title = bold.group(1).strip()[:120]
+                    break
+            out.append((current_file, entry.group(1), severity or "", title))
+    return out, declared, declared_known, depth_drift
+
+
+_CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# Severity ORDER, for merging one finding restated across several reviews.
+# A dedupe that assigns (`seen[key] = severity`) is last-write-wins, and reviews
+# arrive oldest-first — so a Critical restated later as Minor, or restated with
+# the severity field missing (a shape `_cr_severity`'s own docstring records),
+# silently stopped blocking. MEASURED before this: Critical-then-Minor -> no
+# block, Minor-then-Critical -> block; order decided the verdict, which is a
+# defect and not a policy. Merging by MAX makes the channel's severity rule
+# point the same way as its presence rule, which already keeps a finding that
+# stops being restated. `""` (unreadable) ranks LOWEST so it can never displace
+# a level that was actually read.
+_CR_SEVERITY_RANK = {"": 0, "info": 1, "trivial": 2, "minor": 3, "major": 4, "critical": 5}
+
+
+def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
+    """Severity from an inline `… | _🟠 Major_ | …` header. (level, header_seen).
+
+    Mirrors ``_cr_severity``'s contract — the SAME field discipline and the
+    SAME ambiguity adjudication, not just the same vocabulary. An earlier
+    revision searched the whole text for the first severity-looking italic
+    span, and first-match-wins read `_Business Critical_ | _🟡 Minor_` as
+    Critical (a false block), while a category field containing `Major` could
+    demote a later real Critical to the non-blocking lane (Codex P2, PR #1847
+    — the exact shape `_cr_severity`'s own docstring already adjudicates).
+
+    So: split on `|`, accept only chunks that are COMPLETE italic fields
+    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    field's LAST word, and adjudicate as `_cr_severity` does — exactly one
+    DISTINCT level wins (unanimous duplicates included); two distinct levels
+    are a format this code cannot adjudicate and land in the caller's
+    unknown-severity canary rather than being guessed into a weight.
+
+    One deliberate divergence from the anchored parser: a chunk that is NOT a
+    complete italic field is skipped rather than invalidating the whole read,
+    because an inline header can share its line with trailing prose the
+    whole-line parser never sees — requiring all-italic here would push every
+    such finding into the canary and weaken the channel, the fail-open
+    direction for a merge gate.
+    """
+    hits: list[str] = []
+    for chunk in text.split("|"):
+        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
+        if not fld:
+            continue
+        words = fld.group(1).split()
+        if words and words[-1].casefold() in _CR_SEVERITIES:
+            hits.append(words[-1].casefold())
+    if hits and len(set(hits)) == 1:
+        return hits[0], True
+    return None, bool(text.strip())
+
+
+def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, bool]:
+    """Every review's ``{login, body, state}`` for a PR, paginated and fail-closed.
+
+    Reuses ``_fetch_comments_paged`` for the hardened parts — page loop, the
+    shared merge-deadline check BETWEEN pages, NEL-safe JSONL splitting, and the
+    (None, False) / (partial, False) / (all, True) contract. Tests inject via
+    ``_TEST_GH_PR_REVIEW_BODIES`` (one JSON object per line) rather than through
+    the test suite's subprocess router, which dispatches on an endpoint ending
+    in ``/comments`` and would return NOTHING for this one — a silent empty read
+    is exactly the vacuous-green this scan exists to remove.
+    """
+    raw = os.environ.get("_TEST_GH_PR_REVIEW_BODIES")
+    if raw is not None:
+        objs: list[dict] = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except (ValueError, TypeError):
+                return None, False
+            if isinstance(parsed, dict):
+                objs.append(parsed)
+        return objs, True
+    return _fetch_comments_paged(
+        f"pulls/{pr_num}/reviews",
+        pr_num,
+        repo,
+        ".[] | {login: .user.login, body: .body, state: .state}",
+    )
 
 
 def _scan_unreadable(what: str) -> tuple[bool, str]:
@@ -1605,7 +2130,27 @@ def _check_inline_review_findings(
     force: bool = False,
     repo: str | None = None,
 ) -> tuple[bool, str]:
-    """Scan INLINE review comments for P1/P2 badge findings and apply a weighted score.
+    """Scan review findings from BOTH delivery channels and apply a weighted score.
+
+    Despite the name, this reads two endpoints. ``pulls/N/comments`` carries
+    findings anchored inside the diff. ``pulls/N/reviews`` carries the ones
+    CodeRabbit could NOT anchor inline (an "Outside diff range comments"
+    section in the review body) — a channel no gate could see until 2026-09-07,
+    when 27 findings across 23 open PRs were measured invisible, 15 of them
+    Major and two floor-class.
+
+    THE TWO CHANNELS ARE NOT SYMMETRIC. Only the INLINE channel feeds the score
+    and the threshold. The review-body channel is ADVISORY AT EVERY SEVERITY —
+    surfaced, never scored — and its incomplete-read canaries print a NOTE
+    rather than blocking. That is a deliberate design decision taken at the
+    escalation cap (2026-09-09): every fail-open this parser produced was
+    reachable only because a mis-read of a third-party rendered document could
+    move a blocking verdict, and the scoring path had never once fired on live
+    data (0 Criticals in those 27 findings). An earlier version of this
+    docstring described the symmetric design and outlived it by one commit —
+    which is the failure mode a stale contract statement always has: a
+    maintainer relies on enforcement the gate no longer provides.
+
 
     Returns (should_block, message). Each unresolved finding contributes to a review
     score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
@@ -1818,6 +2363,173 @@ def _check_inline_review_findings(
             # the blindness. The point is that it can no longer be INVISIBLE.
             unmatched_bot.append((login, _inline_title(body)))
 
+    # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
+    # Read from pulls/N/reviews (a different endpoint from the loop above) and
+    # folded into THIS scan's accumulators rather than given a blocking path of
+    # their own — the one-score-one-threshold policy at `_CR_BLOCKING_WEIGHT`.
+    #
+    # SEVERITY POLICY, and it deliberately differs from the inline path: only
+    # Critical scores. A Major here is surfaced loudly and does NOT block, because
+    # an undelivered finding has NO COMMENT THREAD — the maintainer-reply
+    # engagement route that clears every other finding in this function does not
+    # exist for it. Making it block would create findings satisfiable only by
+    # fixing, never by disagreeing, on PRs anchored to lines they never touched.
+    # The floor (Critical) still binds, so the safety direction is kept while the
+    # disposition mechanism is built. MEASURED across the live queue when this
+    # shipped: 15 Major, 12 Minor, 0 Critical.
+    outside_critical: list[tuple[str, str]] = []  # surfaced, NEVER scored
+    outside_major: list[tuple[str, str]] = []  # Major — surfaced loudly, 0.0
+    # (label, path, severity) — the severity is carried so the report can
+    # name the level the reviewer gave rather than one bucket for all of them.
+    outside_minor: list[tuple[str, str, str]] = []  # below Major — surfaced, 0.0
+    # A body that declares more findings than this parser read: an INCOMPLETE
+    # scan, which blocks like any other incomplete read.
+    outside_shortfall: list[str] = []
+    reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
+    # An unreadable second channel still BLOCKS — but at the END, next to the
+    # incomplete-read check, not by returning from here. Returning early would
+    # discard every list the inline loop just built (p1, p2, cr_block,
+    # cr_unknown, off-diff, doc-skipped, unmatched_bot) BEFORE any of them is
+    # printed, so one transient `gh` failure would replace the whole pre-merge
+    # report with a single "UNREADABLE" line. Same fail direction, far less
+    # information — and this function's docstring promises nothing unaddressed
+    # is dropped.
+    reviews_unreadable = reviews is None
+    if reviews is None:
+        reviews = []
+    # Union across ALL non-dismissed reviews, deduped on (path, lines, title).
+    # CodeRabbit restates an undelivered finding on every re-review, so an
+    # undeduped count inflates; conversely a finding present in one review and
+    # absent from the next is KEPT, because "stopped restating" and "resolved"
+    # are indistinguishable from here and the safe reading of an ambiguity is
+    # the one that keeps the obligation. Over-surfacing costs a printed line;
+    # under-surfacing is the defect this whole scan exists to remove.
+    outside_seen: dict[tuple[str, str, str], str] = {}
+    for review in reviews:
+        # Same deadline discipline as the fetch loop this follows: the parse is
+        # the one CPU-bound phase here, and a PR with many re-reviews multiplies
+        # it. Measured at single-digit ms per body today, so this is consistency
+        # rather than a live risk — but a future change to the walk would
+        # otherwise lose the protection silently. Out of budget => the read is
+        # INCOMPLETE, which blocks below.
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            reviews_complete = False
+            break
+        if (review.get("state") or "").upper() == "DISMISSED":
+            # A dismissal is treated as engagement, and the bar is DELIBERATELY
+            # weaker than the inline path's maintainer-reply check — stated
+            # rather than implied, because the code cannot verify it. GitHub
+            # requires write access to dismiss a review, but the reviews API
+            # carries no dismisser, so honouring this rests entirely on that
+            # platform permission, not on anything checked here. Identifying the
+            # actor would need the timeline endpoint and another call on the
+            # merge clock; that trade is open, not settled.
+            continue
+        if (review.get("login") or "") not in _CODERABBIT_LOGINS:
+            continue
+        parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
+            review.get("body") or ""
+        )
+        # A section found as REAL STRUCTURE at an unexpected <details> depth is
+        # a layout change in a document we do not control. Nothing else can see
+        # it — the count reconciliation reads its numbers from the very match
+        # this drift prevents — so it blocks as unreadable rather than letting
+        # the scan report clean.
+        outside_shortfall.extend(depth_drift)
+        if declared_known and len(parsed) > declared:
+            # The OTHER direction of the same reconciliation: more entries than
+            # the body's own headers declare means prose was mis-parsed as a
+            # finding — the phantom-Critical shape (Codex P2, PR #1847). We
+            # cannot tell WHICH entries are phantoms, so the read is unreliable
+            # rather than merely noisy, and it blocks as unreadable exactly
+            # like the shortfall — an explained stop beats a false block that
+            # names a finding nobody wrote. Only licensed when every section
+            # header stated its count (`declared_known`).
+            outside_shortfall.append(
+                f"outside-diff section declares {declared} finding(s) but "
+                f"{len(parsed)} were parsed — surplus entries indicate prose "
+                f"mis-read as findings"
+            )
+            # QUARANTINE the batch rather than merging it. Without this the
+            # entries still reached the score, and a phantom Critical among
+            # them returned the ordinary block message NAMING it as a real
+            # finding — the score branch returns before the shortfall check —
+            # so this check's own explained stop never surfaced in exactly the
+            # case it was written for. Both directions still block; what this
+            # buys is that the message is true. The asymmetry with the
+            # shortfall branch below is deliberate: an UNDER-parse's entries
+            # were read correctly and should still block on their own terms,
+            # while a SURPLUS means some entry in this batch is fictional and
+            # nothing here can say which.
+            continue
+        if declared > len(parsed):
+            # The body's own header says it carries more than this parser found,
+            # so the read is INCOMPLETE — and an incomplete finding scan blocks
+            # here exactly as `_scan_unreadable` does, rather than degrading to
+            # a note. Under-parsing is the fail-OPEN direction: a format shift,
+            # or content crafted to hide a finding from the parser, both surface
+            # as a quiet reduction in findings that looks just like a cleaner PR.
+            #
+            # This is also the backstop for the one suppression shape the fence
+            # mask cannot judge: a BALANCED fence spanning a real finding is
+            # indistinguishable from legitimately quoted content, so the mask
+            # correctly hides it — and the count is what notices it went missing.
+            outside_shortfall.append(
+                f"outside-diff section declares {declared} finding(s), parsed "
+                f"{len(parsed)}"
+            )
+        for path, line_range, severity, title in parsed:
+            key = (path, line_range, title)
+            prev = outside_seen.get(key)
+            if prev is None or _CR_SEVERITY_RANK.get(severity, 0) > _CR_SEVERITY_RANK.get(
+                prev, 0
+            ):
+                outside_seen[key] = severity
+    for (path, line_range, title), severity in outside_seen.items():
+        label = f"{title or '(untitled)'} ({path}:{line_range})"
+        if not severity:
+            cr_unknown.append(label)
+        elif severity == "critical":
+            outside_critical.append((label, path))
+        elif severity == "major":
+            outside_major.append((label, path))
+        else:
+            # Keep the level the reviewer actually assigned. Collapsing
+            # Info and Trivial into "Minor" costs nothing in SCORE — all three
+            # are 0.0 — but the report is an inventory, and an inventory that
+            # rounds a level UP overstates the reviewer and misinforms the
+            # operator deciding what to spend time on (Codex P3, PR #1847).
+            outside_minor.append((label, path, severity))
+
+    if outside_critical or outside_major or outside_minor:
+        # Count what this block ITEMISES, not every deduped finding: entries
+        # routed to the unknown-severity lane are reported by that lane's own
+        # NOTE, so `len(outside_seen)` would claim a total larger than the list
+        # beneath it and read as findings gone missing.
+        itemised = len(outside_critical) + len(outside_major) + len(outside_minor)
+        print(
+            f"NOTE: PR #{pr_num} — {itemised} CodeRabbit finding(s) delivered in "
+            f"the REVIEW BODY because their anchor falls outside this PR's diff "
+            f"hunks. These are invisible to the inline endpoint and are SURFACED, "
+            f"NEVER SCORED — read them and decide; this channel cannot block a "
+            f"merge. {len(outside_critical)} Critical, {len(outside_major)} Major, "
+            f"{len(outside_minor)} below-Major:",
+            file=sys.stderr,
+        )
+        # PRINT EVERY ONE. The inline channel can afford a display cap because
+        # its findings also reach a SCORE, so a clipped list still blocks. This
+        # channel scores nothing, so the printed inventory is its ONLY output —
+        # a silently dropped entry is a finding that never reaches the operator
+        # at all, which is precisely the amputation CLAUDE.md forbids: cutting
+        # the only copy. Bounded by what CodeRabbit chose to report, and 27
+        # findings across 23 PRs was the whole measured population.
+        for label, _p in outside_critical:
+            print(f"  [outside-diff Critical] {label}", file=sys.stderr)
+        for label, _p in outside_major:
+            print(f"  [outside-diff Major] {label}", file=sys.stderr)
+        for label, _p, sev in outside_minor:
+            print(f"  [outside-diff {sev.capitalize() or 'Minor'}] {label}", file=sys.stderr)
+
     if unmatched_bot:
         print(
             f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
@@ -1898,8 +2610,19 @@ def _check_inline_review_findings(
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
     # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
+    # The REVIEW-BODY channel contributes NOTHING to this sum, at any severity.
+    # It is surfaced and never scored — owner decision at the escalation cap,
+    # 2026-09-09. Every fail-open this parser produced across four review rounds
+    # was reachable only because a mis-read of a third-party rendered document
+    # could move a BLOCKING verdict; with no blocking verdict to move, the whole
+    # class is unreachable rather than patched. The measured cost is nil: 0
+    # Criticals in 27 findings across 23 PRs (2026-09-07, all 84 then-open
+    # non-draft PRs), so this path has never once fired on live data, while the
+    # surfacing keeps 100% of the value the channel was built for.
     score = (
-        len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2) + _CR_BLOCKING_WEIGHT * len(cr_block)
+        len(p1)
+        + _INLINE_P2_SCORE_WEIGHT * len(p2)
+        + _CR_BLOCKING_WEIGHT * len(cr_block)
     )
     if cr_advisory:
         print(
@@ -1948,6 +2671,32 @@ def _check_inline_review_findings(
     # than report a clean scan.
     if not complete:
         return _scan_unreadable("inline review comments (incomplete read)")
+    # The review-body read gets the SAME treatment: a later page that failed
+    # could carry the Critical this scan just reported not finding. Checked
+    # after the score so a finding already READ still blocks with its own
+    # message rather than being flattened into "unreadable".
+    # THE REVIEW-BODY CHANNEL NO LONGER BLOCKS ON AN INCOMPLETE READ, and that
+    # is a consequence of the advisory decision rather than a separate one. Every
+    # fail-closed check here — unreadable fetch, declared-count shortfall, count
+    # surplus, section-depth drift — existed for ONE reason: this channel could
+    # move a blocking verdict, so a mis-read had to stop the merge instead of
+    # quietly passing it. With the verdict gone the premise is gone, and keeping
+    # them would mean a third-party document's formatting could still hard-block
+    # a merge while contributing nothing to the decision — the fail-CLOSED twin
+    # of the defect being removed, and one this parser has already produced once
+    # (a file legitimately named after the section header tripped the drift
+    # canary and blocked as unreadable, Codex P2, #1847).
+    # They stay as NOTES: an operator still learns the channel may be
+    # under-reporting, which is the whole value a canary had here.
+    if reviews_unreadable or not reviews_complete or outside_shortfall:
+        detail = "; ".join(outside_shortfall) if outside_shortfall else "the read did not complete"
+        print(
+            f"NOTE: PR #{pr_num} — the CodeRabbit review-body channel may be "
+            f"UNDER-REPORTING ({detail}). It is advisory and never scored, so "
+            f"this does not affect the verdict; read the review bodies directly "
+            f"if this PR's outside-diff findings matter to you.",
+            file=sys.stderr,
+        )
     return False, ""
 
 
