@@ -1893,12 +1893,18 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-gh pr create ...                                  # FIRST publication — implicit form (no --head):
-                                                  # pushes AND opens the PR in ONE gated action.
-                                                  # Never a bare `git push` first: a branch with
-                                                  # no PR gets NO CI at all (ci.yml fires only on
-                                                  # push:[main] / pull_request:[main]), so the
-                                                  # leak scan never runs on it.
+git push -u origin HEAD                           # FIRST publication, step 1 — approve the dialog
+gh pr create ...                                  # step 2 — run it IMMEDIATELY, nothing between.
+                                                  # A branch left pushed with no PR gets NO CI at
+                                                  # all (ci.yml fires only on push:[main] /
+                                                  # pull_request:[main]), so the leak scan never
+                                                  # runs on it.
+                                                  # MEASURED 2026-09-10 — do NOT "simplify" these
+                                                  # into one command: a bare create does not push
+                                                  # (gh 2.98.0 aborts non-interactively; its
+                                                  # implicit push needs a prompt), and joining
+                                                  # them with && is refused by the push guard by
+                                                  # design, so each publish is approved on its own.
 git push                                          # subsequent pushes, once the PR is open
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>

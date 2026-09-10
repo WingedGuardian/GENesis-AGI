@@ -490,14 +490,22 @@ every emitter's arithmetic, so this class cannot go quiet again.
   Protocol in genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost. The COMMIT is the
   checkpoint; the PUSH is publication. They are different decisions.
-- **Do not push until you are opening the PR.** For a branch's FIRST
-  publication use `gh pr create` (implicit form, no `--head`) — it pushes the
-  branch and opens the PR in one gated action. Not a bare `git push` first: a
-  branch pushed with no PR gets **no CI at all**, because `ci.yml` fires on
-  `push: [main]` and `pull_request: [main]` and a feature branch with no PR
-  matches neither — so the leak scan never runs on it. Once the PR is open,
-  push freely to it. Unlanded work is made visible by the ledger, follow-ups
-  and the worktree board — never by publishing it early.
+- **Do not push until you are opening the PR.** A branch pushed with no PR gets
+  **no CI at all** — `ci.yml` fires on `push: [main]` and `pull_request: [main]`,
+  and a feature branch with no PR matches neither, so the leak scan never runs
+  on it. Publishing is therefore two commands that belong together, run back to
+  back with nothing in between: the push (which the gate prompts for), then the
+  create as the very next thing you do.
+
+  Two things this is NOT, both MEASURED 2026-09-10 so nobody re-derives them:
+  a bare create does not push for you (gh 2.98.0 aborts with *"you must first
+  push the current branch"* — its implicit push needs an interactive prompt);
+  and chaining the two with `&&` is refused by the push guard on purpose, so
+  that each publish gets its own approval rather than sharing one. So the
+  adjacency is a DISCIPLINE, not something a single atomic action can enforce.
+
+  Once the PR is open, push freely to it. Unlanded work is made visible by the
+  ledger, follow-ups and the worktree board — never by publishing it early.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
