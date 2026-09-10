@@ -216,6 +216,35 @@ string ends in `\n`). The acceptance replay is what exposed it. A matcher that
 finds nothing is indistinguishable from a matcher that looks at nothing —
 only replaying a known-positive tells them apart.
 
+**A null result is a LEAD, never a clearance — and it travels with its blind
+spot attached or it does not travel.** The paragraph above is about an
+instrument that looked at nothing. This is the harder case: the instrument
+worked, the reading was clean, and the reading was still wrong. Three null
+results from one session were wrong the same way, and every one was overturned
+by CONSTRUCTION rather than by more sampling:
+
+- *"Brace expansion always emits ≥2 words, so it self-corrupts any command it
+  appears in."* Generalised from three COMMA-form samples. The RANGE form with
+  identical endpoints — `pus{h..h}` — expands to exactly one word, so argv
+  survives intact and the construct is a working force-push.
+- *"Zero over-block flips across 129,179 real commands."* The regression was
+  CONSTRUCTIBLE, and a later worker constructed it: a `BLOCK → ALLOW` flip on
+  an `rm -rf` of the production database's parent directory.
+- *"Zero regressions, verified three ways."* All three ways were the same axis —
+  see the resource-defect bullet under Test-First Discipline.
+
+A corpus measures what has been TYPED. It says nothing about what is TYPEABLE.
+For a SAFETY property the question is therefore never "did I observe a failure"
+but "can one be CONSTRUCTED", and only the second question has an answer that
+clears anything. **So when a null result is handed to anyone — a subagent, a
+peer session, a PR body, the user — state the DENOMINATOR and the METHOD'S BLIND
+SPOT in the same breath as the number, and say in words that it is not proof.**
+Then name the recipient's job: the person best placed to construct the
+counterexample is whoever is about to rely on the null result, and they will not
+go looking unless you tell them the search is still open. A null passed on bare
+is read as a clearance by everyone downstream, which is how one unproven
+sentence becomes the premise of three later decisions.
+
 ### Select, don't amputate — truncation is the absence of a decision
 
 **Scope first, because bounding is often correct.** What makes something an
@@ -778,6 +807,53 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   canonical parser, which fails on shapes nobody enumerated. Skip a cell only
   with an explicit reason recorded in the skip, since a silent skip and a hole
   look identical.
+
+  **Generate the cells from the GRAMMAR of what the rule flags, not from
+  history.** The axes above are the shape; this is where they come from. MEASURED
+  2026-09-09, after three corpus-based measurements had each missed a real
+  regression: enumerating {program} × {option form} × {construct} × {position} —
+  the axes the rule itself keys on — and running EVERY cell through real `bash`
+  via an argv-printing shim AND through the real guard subprocesses on BOTH trees
+  produced 746 cells and, more to the point, a control that MOVED: `main` 744
+  ALLOW / 2 BLOCK, PR head 339 / 407, after the fix 534 / 212. That surfaced 206
+  over-blocks which a 129,179-command corpus had shown none of. A second sweep
+  built 384 cells over the same four axes. Run the matrix against main as well as
+  against your branch — if the two verdict distributions are identical, the
+  harness is measuring nothing and the finding is about your harness.
+  **Instrument the probe before you trust 746 of anything.** These guards emit
+  ASK as JSON on stdout with EXIT CODE 0, so a probe reading only the return code
+  cannot tell ASK from ALLOW — and ASK is precisely the state a newly added flag
+  usually produces, so the sweep reports "no change" while the new flag fires on
+  every cell. Read the verdict out of the payload, and prove the harness can
+  DISTINGUISH all three outcomes on known inputs before believing any aggregate
+  it prints.
+- **A correctness test cannot see a RESOURCE defect — and on a path the harness
+  can SIGKILL, that defect is a bypass.** Verifying a change three ways is ONE
+  verification when all three ask the same question. MEASURED 2026-09-09 on an
+  in-flight guard fix that added a brace-expansion detector to
+  `scripts/hooks/shell_parse.py`: it was checked at the parser level, at the guard
+  level, and against the specific exploit it existed for — three passes, all
+  CORRECTNESS, all green — while the function was O(n²), because its outer loop
+  scanned for `{` and its inner loop ran to end-of-token whenever nothing closed
+  it. The same lengths without braces: 0.004s throughout. With braces: 8,000
+  chars → 4.85s, 20,000 → 29.8s, 48,000 → 173s. `.claude/settings.json` runs
+  PreToolUse hooks on 5/10/30/60s timeouts, and this repo's own guard code says
+  what a blown timeout means — "a SIGKILL disengages ALL gates at once", "which
+  fails open on every gate" (`scripts/hooks/git_push_guard.py`, verified
+  2026-09-10) — and `shell_parse` is imported by NINE hook modules (MEASURED:
+  `grep -l shell_parse scripts/hooks/*.py` → 9, 2026-09-10). So roughly 20,000
+  attacker-chosen characters inside one token switch every gate off at once, and a
+  FOURTH correctness check would have passed too.
+  So, for any code the harness can kill: ask the three questions the correctness
+  suite never asks — what is its complexity, what input maximises it, and what
+  does the system do when it does not finish. Where "does not finish" means
+  PERMIT, a super-linear scan over attacker-influenced input IS the defect,
+  however correct its output. Pin it with a TIMING test — a worst-case input
+  asserted to complete well inside the SMALLEST timeout on its path — because no
+  correctness test in the suite can go red on this class. (The Generalizability
+  Gate's "retention machinery does not belong on a hook path" is the same
+  mechanism met from the other end: work that scales with the input, on a path
+  whose deadline is a security boundary.)
 - **Anti-patterns (binding):** never assert on a mock's behavior when the real
   code path can run; never add test-only methods/branches to production
   classes; fakes implement the real contract (real method names, real return
@@ -1571,6 +1647,21 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   re-review comment naming head), but a trivial NON-hook delta may still merge on a stale
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
+
+  **And the verdict is a function of the TREE YOU RAN IT FROM.** `--check-pr` is
+  (remote PR state × LOCAL gate code) — it executes the `git_push_guard.py` sitting
+  in your working copy, not the one on `main`. Run from a worktree carrying an
+  unmerged change to the gate, it reports what WOULD be true once that change lands:
+  a correct verification OF THE FIX, and a false statement about the PR. MEASURED
+  2026-09-09: a session reported a peer's PR as one blocker from green on exactly
+  that confusion. So say which tree produced any verdict you pass on, and for a
+  claim about a PR's CURRENT state, run it from a tree at `origin/main`. The
+  bounding check is cheap enough to make a habit —
+  `git log --since=<window> origin/main -- scripts/hooks/git_push_guard.py` (add
+  whichever modules the checker imports) — because if the checker did not change
+  inside the window, every verdict taken in that window used identical logic and
+  this cannot have bitten. The same reasoning applies to any local checker whose
+  answer is about a remote object.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
   A PR touching the enforcement-hook surface (the guard code itself) gets almost no
   stale-review leniency: the merge gate (1) never classifies a post-review delta that
@@ -1898,6 +1989,23 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   approval gate) is a STOP-and-discuss, never an auto-fix. Chasing a reviewer's
   green checkmark with a change you believe is wrong is a discipline failure.
   No performative agreement — state the verified fix, or the reasoned pushback.
+- **Refuting a finding is itself a CLAIM, and it meets the same evidence bar you
+  just held the finding to.** The bullet above is about pushing back when the
+  reviewer is wrong; this is the cost of pushing back when YOU are. MEASURED
+  2026-09-09: a reviewer session refuted a cross-model reviewer's severity
+  assessment with a structural argument — "brace expansion always corrupts argv,
+  so the exploit cannot exist" — which covered three sampled instances rather than
+  the construct's grammar; a builder session then refuted the refutation with a
+  working construction, and the original severity was right all along. The tell
+  was sitting in the refutation's own text: it said *"I have NOT proven no clean
+  construction exists"* and stated the conclusion in the next sentence.
+  **An acknowledged gap in a proof is the reason NOT to state the conclusion —
+  never a hedge that licenses stating it.** So: a structural refutation must cover
+  the CONSTRUCT'S GRAMMAR — every form the syntax admits — not a sample of its
+  instances. Where it cannot, the finding STANDS and gets fixed or escalated on
+  its own merits; "I could not construct one" is a null result and clears nothing
+  (see the acceptance-bar section). Downgrading a severity is a refutation too,
+  and costs exactly the same evidence as dismissing the finding outright.
 - **Waiving the review GATE is not waiving the FINDINGS.** When the user says
   "skip the review" for a trivial change, that waives the blocking *ceremony*
   (the gate and its `*-override` sigils — note `# review-override` is the one
@@ -2308,6 +2416,35 @@ closing-shaped work (answering, merging green PRs, the handoff row). What
 this rule removes is only the WATCHING — unprompted gate-polling and
 review-soliciting between a push and the next external event. When you do
 merge, the Pre-Merge Gate below governs unchanged.
+
+### Which one first — prefer a `fix`, because it is usually SMALLER (standing user rule, 2026-09-10)
+
+The section above says WHEN driving is justified. When several PRs qualify at
+once, the owner's stated preference is the tiebreak: **a fix restores existing
+functionality that is broken; new functionality can wait.** This is ONE axis in
+a larger calculus — a gated PR, a live hazard, a user's named request all still
+outrank it — not a hard ordering.
+
+MEASURED across the 65 open `fix`/`feat` PRs on this repo, 2026-09-10:
+
+| kind | n | mean added lines | ≥1000 lines | findings-blocked | mean findings score |
+|---|---|---|---|---|---|
+| `feat` | 30 | 2,024 | 67% | 77% | 3.00 |
+| `fix` | 35 | 804 | 29% | 66% | 2.77 |
+
+Chained to the round data: **86% of PRs over 1,000 lines reach 3+ Codex rounds,
+against 6% under 200.** So the mechanism is `feat` → bigger → more rounds → more
+of the maintainer's conscious decisions consumed, because past the escalation cap
+every additional round costs a fresh human sign-off.
+
+**The honest limit, which changes how to apply this.** The findings-score gap is
+modest (3.00 vs 2.77; 77% vs 66% blocked), so *"feats attract more findings per
+se"* is WEAKLY supported. *"Feats are bigger, and size drives rounds"* is
+STRONGLY supported. The rule is therefore the SIZE axis wearing a `feat:` prefix
+— which means **a small feat is not deprioritised, and a 2,000-line fix does not
+get a pass.** Read the diffstat, not the prefix; a rule keyed on the prefix
+rather than on the property would be wrong on exactly the cases where the
+tiebreak matters.
 
 ### Never RETIRE a PR you are not the one reviving (standing user rule, 2026-09-08)
 
