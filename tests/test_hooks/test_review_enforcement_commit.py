@@ -1661,3 +1661,68 @@ def test_merge_sentinel_does_not_become_an_exemption(repo: Path, home: Path) -> 
     res = _run_hook('git commit -m "merge main"', repo, home)
     assert res.returncode == 2, "a forged merge sentinel must NOT allow the commit"
     assert "BLOCKED" in res.stderr
+
+
+# ─── round-2: the note's own claims about the route ──────────────────────────
+
+
+def test_depth_hint_does_not_prescribe_the_second_sigil_unconditionally(
+    repo: Path, home: Path
+) -> None:
+    """`review-override` is needed only when the review-current gate ACTUALLY
+    fires. A merge usually leaves the marker stale, but not if the author
+    re-marked afterwards: with a CURRENT-but-non-adversarial marker, Rule 2.5
+    still denies while Rule 2 is satisfied, so `# depth-ack` alone succeeds.
+
+    MEASURED in that state before this wording: rc=0 for depth-ack alone, while
+    the note said BOTH sigils were required. Prescribing `review-override` there
+    is not merely redundant — it records findings as accepted when there were
+    none, in a log that is meant to be evidence.
+    """
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    _mark(repo, home)  # current marker, but not an adversarial audit
+
+    denied = _run_hook('git commit -m "merge main"', repo, home)
+    assert denied.returncode == 2
+    assert "review depth" in denied.stderr.lower()
+    assert "ONLY once that gate actually fires" in denied.stderr
+
+    # ...and in this state the single sigil really is enough.
+    allowed = _run_hook('git commit -m "merge main"  # depth-ack', repo, home)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+
+
+def test_depth_hint_says_sigils_bind_per_commit_segment(
+    repo: Path, home: Path
+) -> None:
+    """`has_trailing_override` binds a comment to the segment it terminates, and
+    the depth check requires the sigil on EVERY commit segment
+    (`all(... for s in commit_segs)`). So "one trailing comment" is right for a
+    single commit and wrong for the supported chained shape
+    (`git commit … && git commit --amend …`), where it binds only the last.
+
+    MEASURED: chained with one trailing comment -> rc=2; the same chain with the
+    sigil run repeated on each segment -> rc=0.
+    """
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _begin_merge(repo)
+    res = _run_hook('git commit -m "merge main"', repo, home)
+    assert "PER COMMIT SEGMENT" in res.stderr
+    assert "binds only the" in res.stderr
+
+    chained = (
+        'git commit -m "merge main" && '
+        "git commit --amend --no-edit  # depth-ack review-override"
+    )
+    assert _run_hook(chained, repo, home).returncode == 2, (
+        "one trailing comment on a chain must NOT clear the gate"
+    )
+
+    per_segment = (
+        'git commit -m "merge main"  # depth-ack review-override && '
+        "git commit --amend --no-edit  # depth-ack review-override"
+    )
+    assert _run_hook(per_segment, repo, home).returncode == 0, (
+        "the shape the note now prescribes must actually work"
+    )
