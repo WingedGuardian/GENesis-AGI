@@ -53,7 +53,30 @@ def _gh_json(args: list[str]) -> object:
     proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {proc.stderr.strip()}")
-    return json.loads(proc.stdout or "null")
+    out = proc.stdout or "null"
+    if "--paginate" in args and "--slurp" in args:
+        # `--paginate` alone emits each page as its OWN top-level JSON value,
+        # so `json.loads` on the concatenated stdout raises the moment a second
+        # page exists — turning the pagination fix into a hard failure at
+        # exactly the scale it was added for (Codex P2, PR #1907). `--slurp`
+        # wraps the pages in ONE array, so the pages arrive as a list of
+        # per-page arrays and are flattened back to the caller's expected
+        # shape here.
+        pages = json.loads(out)
+        if not isinstance(pages, list) or not all(isinstance(pg, list) for pg in pages):
+            # RAISE rather than return the container unflattened. Returning it
+            # let a page that is a DICT (an error object) reach the caller's
+            # row loop, where `.get("target")` is None and the entry is silently
+            # SKIPPED — so `live` came back empty, every declared ruleset read
+            # ABSENT, and `--apply` would POST duplicates of rulesets that
+            # already exist. That is precisely the degrade this function's own
+            # docstring forbids (audit, PR #1907).
+            raise RuntimeError(
+                f"gh {' '.join(args)}: --slurp returned {type(pages).__name__}, "
+                "expected a list of per-page lists — refusing to guess"
+            )
+        return [row for pg in pages for row in pg]
+    return json.loads(out)
 
 
 def _resolve_repo(explicit: str | None) -> str:
@@ -109,7 +132,7 @@ def _live_definitions(repo: str) -> dict[str, dict]:
     # This repo is user-owned so neither bites here; other installs are the
     # point (Codex P2 ×2, PR #1907).
     listing = _gh_json(
-        ["api", "--paginate", f"repos/{repo}/rulesets?includes_parents=false"]
+        ["api", "--paginate", "--slurp", f"repos/{repo}/rulesets?includes_parents=false"]
     )
     live: dict[str, dict] = {}
     for row in listing or []:
@@ -142,6 +165,29 @@ def _normalise(value: object) -> object:
     return value
 
 
+def _protection_first(item: tuple[str, dict]) -> tuple[int, str]:
+    """Sort key: a ruleset granting NO bypass is reconciled FIRST.
+
+    MODULE SCOPE ON PURPOSE. Nested inside `main()` this was untestable, and
+    the test written for it re-declared the same lambda — so inverting or
+    deleting the shipped sort left the suite fully green while the property it
+    exists to guarantee was gone (audit, PR #1907). A test grading a private
+    copy of the code is the "my green is not evidence" shape, landing on the
+    very fix that closed a P1.
+
+    WHAT IT DOES NOT GUARANTEE, because the comment here used to over-claim it:
+    this orders by which RULESET grants a bypass, never by which DIRECTION a
+    change goes. Sound for adding a no-bypass ruleset beside a bypassed one —
+    this migration — since the create lands before the update that removes the
+    duplicate. It does NOT cover moving a rule OUT of the no-bypass set into
+    the bypassed one: that writes the removal first and reopens the same gap a
+    third time. Do that as two PRs — add to the destination, land, then remove
+    from the source.
+    """
+    name, definition = item
+    return (1 if definition.get("bypass_actors") else 0, name)
+
+
 def _differences(local: dict, live: dict) -> list[str]:
     return [
         field for field in _COMPARED if _normalise(local.get(field)) != _normalise(live.get(field))
@@ -166,28 +212,12 @@ def main() -> int:
 
     print(f"repository: {repo}")
 
-    # CREATIONS FIRST, then updates. There is no transaction here — each
-    # ruleset is its own API call — so the ORDER decides what a mid-run failure
-    # leaves behind. Applying alphabetically put the approvals UPDATE (which
-    # removes required_status_checks from the old combined ruleset) before the
-    # checks CREATE: a failure in between left the repository with required
-    # checks in NEITHER ruleset, i.e. weaker than before the run, while the
-    # error message talked only about the create. Adding protection before
+    # Creations before updates, and within each phase the no-bypass ruleset
+    # first (`_protection_first`, whose docstring states exactly what that
+    # does and does not guarantee). There is no transaction here, so ORDER
+    # decides what a mid-run failure leaves behind: adding protection before
     # removing it makes the worst case a DUPLICATE rule — briefly stricter —
-    # instead of a gap.
-    # WITHIN each phase, a ruleset that grants NO bypass goes first. Filename
-    # order put the approvals update — which REMOVES the old combined
-    # status-check rule — ahead of the checks update, so on a repo where both
-    # already exist a failure between the two PUTs left required checks
-    # enforced nowhere: the very gap the create-first ordering was added to
-    # close, reached by the other path (Codex P1, PR #1907). Ordering by
-    # bypass-emptiness is not a heuristic about filenames — it is the same test
-    # that decides which ruleset a rule belongs in, so the strengthening write
-    # always lands before the weakening one.
-    def _protection_first(item: tuple[str, dict]) -> tuple[int, str]:
-        name, definition = item
-        return (1 if definition.get("bypass_actors") else 0, name)
-
+    # instead of a gap with required checks enforced nowhere.
     ordered = sorted(local.items(), key=_protection_first)
     absent = [(n, d) for n, d in ordered if n not in live]
     present = [(n, d) for n, d in ordered if n in live]

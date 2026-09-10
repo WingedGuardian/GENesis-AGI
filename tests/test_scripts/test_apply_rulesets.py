@@ -353,12 +353,12 @@ def test_a_no_bypass_ruleset_is_applied_before_a_bypassed_one(mod):
     exactly the order that left required checks enforced NOWHERE when a PUT
     failed between the two (Codex P1, PR #1907).
     """
+    # The SHIPPED key, not a re-declared copy. The previous version of this
+    # test built its own lambda, so inverting or deleting the production sort
+    # left the whole suite green — a test grading a private copy of the code,
+    # on the very fix that closed a P1 (audit, PR #1907).
     local = mod._local_definitions()
-    ordered = sorted(
-        local.items(),
-        key=lambda item: (1 if item[1].get("bypass_actors") else 0, item[0]),
-    )
-    names = [name for name, _ in ordered]
+    names = [name for name, _ in sorted(local.items(), key=mod._protection_first)]
     assert names[0] == "Genesis Required Checks", (
         f"the no-bypass ruleset must be reconciled first; got {names}"
     )
@@ -379,3 +379,129 @@ def test_a_real_value_still_differs_from_an_absent_one(mod):
     local = {"rules": [{"type": "x"}]}
     live = {"rules": [{"type": "x", "parameters": {"b": 5}}]}
     assert "rules" in mod._differences(local, live)
+
+
+def test_paginated_pages_are_flattened_not_concatenated(mod, monkeypatch):
+    """`--paginate` emits each page as its OWN top-level JSON value.
+
+    VERIFY-RED: drop `--slurp` and feed two adjacent arrays to `json.loads` and
+    it raises — which is what the pagination fix would have done at exactly the
+    scale it was added for, taking both dry-run and apply to exit 2 without
+    reconciling anything (Codex P2, PR #1907).
+    """
+
+    class _Ok:
+        returncode = 0
+        stderr = ""
+        stdout = '[[{"id": 1}, {"id": 2}], [{"id": 3}]]'  # --slurp shape
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Ok())
+    rows = mod._gh_json(["api", "--paginate", "--slurp", "repos/o/n/rulesets"])
+    assert rows == [{"id": 1}, {"id": 2}, {"id": 3}], "pages must be flattened"
+
+
+def test_a_single_unslurped_call_is_untouched(mod, monkeypatch):
+    """The negative control: the flattening applies ONLY to a slurped
+    paginated call, so an ordinary single-object read is unaffected."""
+
+    class _Ok:
+        returncode = 0
+        stderr = ""
+        stdout = '{"nameWithOwner": "o/n"}'
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Ok())
+    assert mod._gh_json(["repo", "view", "--json", "nameWithOwner"]) == {"nameWithOwner": "o/n"}
+
+
+def test_creations_are_applied_before_updates(mod, monkeypatch):
+    """The ORDER itself, graded end-to-end through `main()`.
+
+    The sort key having the right shape is not the property that matters; what
+    matters is that a create lands before an update that can remove protection.
+    Nothing exercised `main()`'s apply path at all before this — the dry-run
+    test makes both writers RAISE, which proves read-only-ness and nothing
+    about sequence.
+    """
+    seq: list[tuple[str, str]] = []
+    monkeypatch.setattr(mod, "_post", lambda repo, d: seq.append(("POST", d["name"])))
+    monkeypatch.setattr(mod, "_put", lambda repo, i, d: seq.append(("PUT", d["name"])))
+    monkeypatch.setattr(mod, "_resolve_repo", lambda explicit: "owner/name")
+    monkeypatch.setattr(
+        mod,
+        "_live_definitions",
+        lambda repo: {"Genesis Main Ruleset": {"id": 1, "rules": [], "bypass_actors": []}},
+    )
+    monkeypatch.setattr(sys, "argv", ["apply_rulesets.py", "--apply"])
+    assert mod.main() == 0
+    assert seq == [
+        ("POST", "Genesis Required Checks"),
+        ("PUT", "Genesis Main Ruleset"),
+    ], f"protection must be created before anything is updated; got {seq}"
+
+
+def test_a_slurped_non_list_page_raises_rather_than_degrading(mod, monkeypatch):
+    """A page that is a dict (an error object) must NOT reach the row loop.
+
+    Returning the container unflattened let `.get("target")` be None on it, so
+    the entry was silently skipped, `live` came back empty, every declared
+    ruleset read ABSENT, and `--apply` would POST duplicates of rulesets that
+    already exist — the fail-soft degrade this function's docstring forbids.
+    """
+
+    class _Ok:
+        returncode = 0
+        stderr = ""
+        stdout = '{"message": "Not Found"}'
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Ok())
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        mod._gh_json(["api", "--paginate", "--slurp", "repos/o/n/rulesets"])
+
+
+def test_the_documentation_rule_is_one_clause_over_the_classifier_sets():
+    """Grade the label rule against `_is_doc_path`'s OWN sets, structurally.
+
+    This clause has been wrong three times — matching every `.txt`; then as TWO
+    `all-globs-to-all-files` clauses, which each demand the WHOLE diff satisfy
+    them, so a PR touching `docs/x.md` AND `LICENSE` matched neither and went
+    unlabelled. Every wrong version was reasoned about rather than checked.
+
+    Deliberately NOT a glob-matching test: evaluating minimatch semantics in
+    Python means reimplementing a matcher, which is the hand-rolled-parser trap
+    this repo has paid for elsewhere. Instead this asserts the two things that
+    were actually wrong — the CLAUSE COUNT (structure) and the EXTENSION/STEM
+    SETS (content) — read from the classifier rather than restated here.
+
+    Residual, stated: this cannot prove the glob's runtime semantics, only that
+    it is one clause carrying the right vocabulary. The action's own run on this
+    PR is the end-to-end check.
+    """
+    import re
+
+    import yaml
+
+    config = yaml.safe_load((_REPO / ".github" / "labeler.yml").read_text())
+    clauses = config["documentation"]
+    assert len(clauses) == 1, (
+        "ONE clause: `all-globs-to-all-files` demands every glob match every "
+        "changed file, so two clauses are an OR of whole-diff tests, not a union "
+        "— a mixed docs-only PR then matches neither"
+    )
+    (patterns,) = clauses[0]["changed-files"]
+    (glob,) = patterns["all-globs-to-all-files"]
+
+    guard = (_REPO / "scripts" / "hooks" / "git_push_guard.py").read_text()
+    doc_exts = set(
+        re.search(r"_DOC_EXTS = \{([^}]*)\}", guard).group(1).replace('"', "").split(", ")
+    )
+    doc_stems = {
+        m.strip().strip('",')
+        for m in re.search(r"_DOC_STEMS = \{(.*?)\}", guard, re.S).group(1).split("\n")
+        if m.strip().strip('",')
+    }
+
+    lowered = glob.lower()
+    missing_exts = [e for e in doc_exts if f".{e}" not in lowered and e not in lowered]
+    assert not missing_exts, f"prose extensions the classifier accepts are unmatched: {missing_exts}"
+    missing_stems = [st for st in doc_stems if st not in lowered]
+    assert not missing_stems, f"documentation stems the classifier accepts are unmatched: {missing_stems}"

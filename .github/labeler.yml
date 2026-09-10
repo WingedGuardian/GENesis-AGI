@@ -65,13 +65,17 @@ ci-config:
 # diff at merge time, never read from here.
 documentation:
   - changed-files:
-      # POSITIVE matching, mirroring what the merge gate's `_is_doc_path`
-      # actually accepts: prose extensions, and the conventional root document
-      # names. An exclusion-only rule labelled anything that dodged the negated
-      # globs — `.claude/settings.json`, a hook, `pyproject.toml` — as
-      # documentation, so a hook change could carry BOTH `gate-surface` and
-      # `documentation` (Codex P3, PR #1907). The label is an annotation and
-      # decides nothing; it should still not say the opposite of the classifier
-      # it names.
+      # ONE clause with a nested-brace union, because `all-globs-to-all-files`
+      # means "every glob matches EVERY changed file" — so two such clauses
+      # OR'd is NOT the union. A PR touching both `docs/x.md` and `LICENSE`
+      # satisfied NEITHER and went unlabelled, which is the third wrong version
+      # of this rule (audit, PR #1907). The comment then under-stated the miss
+      # it had just introduced, naming only case-insensitive stems.
+      #
+      # Mirrors `_is_doc_path` (git_push_guard.py): any prose extension at any
+      # depth, plus a known documentation STEM with `.txt` or no extension.
+      # Verified by the test below against the classifier over `git ls-files`,
+      # rather than by reasoning about globs — which is what got this wrong
+      # twice.
       - all-globs-to-all-files:
-          - '**/*.{md,rst,txt}'
+          - '**/{*.{md,markdown,rst,adoc,MD,RST,ADOC},{CHANGELOG,README,LICENSE,NOTICE,COPYING,AUTHORS,CONTRIBUTING}{,.txt}}'
