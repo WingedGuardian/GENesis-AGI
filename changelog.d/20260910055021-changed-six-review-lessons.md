@@ -16,7 +16,11 @@
   bar, and an admitted gap in the argument is the reason not to state the
   conclusion. And a local checker's verdict about a remote pull request depends
   on the tree it ran in, so a claim about a PR's current state has to come from a
-  tree at the default branch.
+  tree at the default branch. Recorded alongside the first of those: a lesson
+  about a vulnerability does not need the vulnerability's parameters — the shape
+  of the failure is what teaches, while exact inputs, thresholds and affected
+  counts only compose into a recipe that keeps working for anyone still on the
+  unfixed code.
 
 - **The guide now says which pull request to pick up first when several are
   eligible.** A fix restores functionality that is already broken, so it goes

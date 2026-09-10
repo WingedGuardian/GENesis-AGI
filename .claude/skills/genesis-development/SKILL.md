@@ -223,10 +223,12 @@ worked, the reading was clean, and the reading was still wrong. Three null
 results from one session were wrong the same way, and every one was overturned
 by CONSTRUCTION rather than by more sampling:
 
-- *"Brace expansion always emits ≥2 words, so it self-corrupts any command it
-  appears in."* Generalised from three COMMA-form samples. The RANGE form with
-  identical endpoints — `pus{h..h}` — expands to exactly one word, so argv
-  survives intact and the construct is a working force-push.
+- *"An expansion in verb position always emits ≥2 words, so it self-corrupts any
+  command it appears in."* Generalised from a handful of samples of ONE of the
+  construct's spellings. Another spelling admits a degenerate case that emits
+  exactly one word — so argv survives intact, and the parse resolves a verb bash
+  never runs. Stated abstractly on purpose; see the note under the
+  resource-defect bullet in Test-First Discipline.
 - *"Zero over-block flips across 129,179 real commands."* The regression was
   CONSTRUCTIBLE, and a later worker constructed it: a `BLOCK → ALLOW` flip on
   an `rm -rf` of the production database's parent directory.
@@ -830,20 +832,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
 - **A correctness test cannot see a RESOURCE defect — and on a path the harness
   can SIGKILL, that defect is a bypass.** Verifying a change three ways is ONE
   verification when all three ask the same question. MEASURED 2026-09-09 on an
-  in-flight guard fix that added a brace-expansion detector to
-  `scripts/hooks/shell_parse.py`: it was checked at the parser level, at the guard
-  level, and against the specific exploit it existed for — three passes, all
-  CORRECTNESS, all green — while the function was O(n²), because its outer loop
-  scanned for `{` and its inner loop ran to end-of-token whenever nothing closed
-  it. The same lengths without braces: 0.004s throughout. With braces: 8,000
-  chars → 4.85s, 20,000 → 29.8s, 48,000 → 173s. `.claude/settings.json` runs
-  PreToolUse hooks on 5/10/30/60s timeouts, and this repo's own guard code says
-  what a blown timeout means — "a SIGKILL disengages ALL gates at once", "which
-  fails open on every gate" (`scripts/hooks/git_push_guard.py`, verified
-  2026-09-10) — and `shell_parse` is imported by NINE hook modules (MEASURED:
-  `grep -l shell_parse scripts/hooks/*.py` → 9, 2026-09-10). So roughly 20,000
-  attacker-chosen characters inside one token switch every gate off at once, and a
-  FOURTH correctness check would have passed too.
+  in-flight fix that added a new scan to the shell parser the hook stack shares:
+  it was checked at the parser level, at the guard level, and against the
+  specific exploit it existed for — three passes, all CORRECTNESS, all green —
+  while the scan itself was quadratic in the length of a SINGLE token, the
+  ordinary accidental-O(n²) shape of a nested scan with no early exit. On the
+  linear form it stayed sub-millisecond at every length; on the pathological one
+  it ran to SECONDS, then minutes, at input sizes a caller can simply type. A
+  PreToolUse hook that overruns its wall-clock is SIGKILLed, and a killed hook
+  fails OPEN — the guard code says as much in its own comments — so a scan that
+  can be made slow enough disarms the gate rather than tripping it, and because
+  the parser is shared it does not stop at the one guard being edited. A FOURTH
+  correctness check would have passed too.
   So, for any code the harness can kill: ask the three questions the correctness
   suite never asks — what is its complexity, what input maximises it, and what
   does the system do when it does not finish. Where "does not finish" means
@@ -854,6 +854,15 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   Gate's "retention machinery does not belong on a hook path" is the same
   mechanism met from the other end: work that scales with the input, on a path
   whose deadline is a security boundary.)
+  **This bullet is deliberately imprecise, and that is the second rule in it: a
+  lesson about a vulnerability does not need the vulnerability's parameters.**
+  The shape teaches — super-linear on attacker-chosen input, measured at seconds
+  where the linear form is sub-millisecond, on a path that fails open. The exact
+  input sizes, the timeout tier they defeat, the count of guards behind the
+  shared parser and the quoted fail-open line teach nothing further; they only
+  compose into a working recipe, and one that keeps working for every install
+  still on the pre-fix code. Nor does "the fix has landed" license the specifics
+  — check whether it landed on `main`, not whether a PR for it exists.
 - **Anti-patterns (binding):** never assert on a mock's behavior when the real
   code path can run; never add test-only methods/branches to production
   classes; fakes implement the real contract (real method names, real return
@@ -1993,8 +2002,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   just held the finding to.** The bullet above is about pushing back when the
   reviewer is wrong; this is the cost of pushing back when YOU are. MEASURED
   2026-09-09: a reviewer session refuted a cross-model reviewer's severity
-  assessment with a structural argument — "brace expansion always corrupts argv,
-  so the exploit cannot exist" — which covered three sampled instances rather than
+  assessment with a structural argument — "an expansion in verb position always
+  corrupts argv, so the exploit cannot exist" — which covered a few sampled
+  instances of one spelling rather than
   the construct's grammar; a builder session then refuted the refutation with a
   working construction, and the original severity was right all along. The tell
   was sitting in the refutation's own text: it said *"I have NOT proven no clean
