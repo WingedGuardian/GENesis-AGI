@@ -531,17 +531,58 @@ def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
     repo = _make_repo(tmp_path)
-    # Raise this process first; the entrypoint inherits it.
-    Path("/proc/self/oom_score_adj").write_text("1000\n")
+    # Raise THIS process; the entrypoint inherits it. Restore the ORIGINAL value,
+    # not a hardcoded 0 — this is global process state shared with every later
+    # test in the session, and the value is not 0 everywhere: a GitHub runner
+    # starts at 500 (measured), so resetting to 0 would silently change what
+    # _inherited_oom_adj() returns for the cells that assert on it.
+    adj = Path("/proc/self/oom_score_adj")
+    original = adj.read_text().strip()
+    adj.write_text("1000\n")
     try:
         res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     finally:
-        Path("/proc/self/oom_score_adj").write_text("0\n")
+        adj.write_text(f"{original}\n")
     assert res.returncode == 0, res.stderr
     assert "OOM_ADJ:1000" in log.read_text(), (
         "the inherited 1000 was lowered to the 900 default — raise-only broken"
     )
     assert "inherited" in res.stdout and "raise-only" in res.stdout
+
+
+def test_explicit_override_wins_over_raise_only_even_when_it_lowers(tmp_path):
+    """Raise-only guards the DEFAULT; an explicit lever is obeyed.
+
+    Found by CI, not locally: a GitHub runner starts at oom_score_adj=500, so
+    test_oom_score_adj_override_reaches_the_indexer (which asks for 321) failed
+    once raise-only was added — the script kept 500 and ignored the operator.
+    Locally the process starts at 0, so 321 was a raise and nothing showed.
+
+    The finding that prompted raise-only named "this unconditional write of the
+    DEFAULT 900", and that scoping is the correct one: the risk is this script's
+    own default undoing a parent's deliberate raise, not a human being overruled
+    by their own tool. An ignored lever is its own surprise. The override is
+    honoured and the lowering is logged, so a later OOM post-mortem can see it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    adj = Path("/proc/self/oom_score_adj")
+    original = adj.read_text().strip()
+    adj.write_text("800\n")
+    try:
+        res = _run_entry(
+            tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+            env_extra={"CODE_INTEL_INDEX_OOM_SCORE_ADJ": "321"},
+        )
+    finally:
+        adj.write_text(f"{original}\n")
+    assert res.returncode == 0, res.stderr
+    assert "OOM_ADJ:321" in log.read_text(), (
+        "an EXPLICIT override was silently ignored because it lowered the "
+        "inherited value — raise-only must scope to the default only"
+    )
+    assert "LOWERS the inherited 800" in res.stdout, "the lowering was not logged"
 
 
 def test_oom_score_adj_oversized_value_is_rejected_not_wrapped(tmp_path):

@@ -243,7 +243,20 @@ _log() { printf '[code-intel-index] %s\n' "$*"; }
 # values are achievable here (lowering is refused), so anything above 1000 or
 # non-numeric is rejected at the lever rather than written and misapplied.
 _apply_oom_score_adj() {
-    local want="${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-900}"
+    # Raise-only guards the DEFAULT, not an operator's explicit instruction —
+    # that distinction is the whole point. The risk being fixed is this script's
+    # own 900 silently undoing a parent that deliberately raised the job higher.
+    # Someone who exports CODE_INTEL_INDEX_OOM_SCORE_ADJ has stated an intent,
+    # and quietly ignoring a lever because it happens to lower the value would
+    # be its own surprise — the lever exists to be obeyed. So: explicit wins and
+    # says what it did; the default defers to a higher inherited value.
+    local want explicit=0
+    if [ -n "${CODE_INTEL_INDEX_OOM_SCORE_ADJ:-}" ]; then
+        want="$CODE_INTEL_INDEX_OOM_SCORE_ADJ"
+        explicit=1
+    else
+        want=900
+    fi
     case "$want" in
         '' | *[!0-9]*)
             _log "WARNING: ignoring non-numeric CODE_INTEL_INDEX_OOM_SCORE_ADJ='$want' — kill order unchanged"
@@ -282,9 +295,15 @@ _apply_oom_score_adj() {
     case "$current" in
         '' | *[!0-9]*) current="" ;;   # unreadable or negative — no opinion
     esac
-    if [ -n "$current" ] && [ "$current" -ge "$canonical" ]; then
-        _log "oom_score_adj=$current inherited (>= the requested $canonical) — kept, raise-only"
+    if [ "$explicit" = "0" ] && [ -n "$current" ] && [ "$current" -ge "$canonical" ]; then
+        _log "oom_score_adj=$current inherited (>= the default $canonical) — kept, raise-only"
         return 0
+    fi
+    if [ "$explicit" = "1" ] && [ -n "$current" ] && [ "$current" -gt "$canonical" ]; then
+        # Say it out loud. An explicit lever that lowers the inherited preference
+        # is honoured, but it is also the kind of thing someone wants to see in a
+        # log when they are working out why a kill went the way it did.
+        _log "note: CODE_INTEL_INDEX_OOM_SCORE_ADJ=$canonical LOWERS the inherited $current (explicit override wins over raise-only)"
     fi
 
     if printf '%s\n' "$canonical" > /proc/self/oom_score_adj 2>/dev/null; then
