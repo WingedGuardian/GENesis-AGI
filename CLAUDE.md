@@ -486,8 +486,20 @@ every emitter's arithmetic, so this class cannot go quiet again.
   Default floor: 2 hours (7200s). Full policy in genesis-development skill.
 - **Verify outcomes, not just tests.** "If the system restarts now, will
   this work?" Built ≠ wired ≠ verified. Details in genesis-development skill.
-- **Code review after code changes.** Codex will review your output.
-  Protocol in genesis-development skill.
+- **Code review after code changes.** Codex reviews your output — but only
+  AUTOMATICALLY WHEN THE PR OPENS. A later push triggers nothing: after any push you
+  want reviewed, comment `@codex review`, or the PR waits forever on a review nobody
+  requested. **Verify rather than remember** — that trigger is an owner-tunable
+  setting which has flipped more than once, so a session that recalls it from prose
+  will eventually be wrong. `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  reports `codex-at-head`, which settles whether a review EXISTS at this head — not
+  whether one was requested. It reads published reviews only, so "never triggered"
+  and "triggered, still running" are the SAME output; if you have not just requested
+  one, request one rather than reading that line as proof nobody did.
+  A PR whose diff touches the
+  enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
+  a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
+  protocols: genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
