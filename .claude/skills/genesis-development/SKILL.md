@@ -2131,6 +2131,26 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 
 **Traps with a real cost, each one measured:**
 
+- **ANSWERING A FINDING TAKES AN IN-THREAD REPLY. A top-level PR comment
+  engages NOTHING.** The gate clears a finding from the score only when a
+  MAINTAINER account replied IN ITS THREAD: it reads `in_reply_to_id` from
+  `pulls/N/comments`, so a reply is matched to the inline comment it answers.
+  `gh pr comment N --body ...` creates an ISSUE comment, which has no
+  `in_reply_to_id` and answers nothing however thorough it is. Use:
+
+      gh api repos/<owner>/<repo>/pulls/<N>/comments \
+        -f body='verified and fixed at <sha>: …' -F in_reply_to=<comment_id>
+
+  (comment ids from `gh api repos/<owner>/<repo>/pulls/<N>/comments`.)
+  MEASURED 2026-09-09: switching to this form took two PRs from
+  `inline-findings: BLOCK` to `ok` with NO code change — 4 findings on #1847 and
+  5 on #1836 had been fixed for hours and still scored, because every reply was
+  top-level. The symptom is a score that will not fall while you are certain
+  you fixed everything; reach for this before you reach for an override.
+  TWO FINDINGS HAVE NO THREAD AT ALL and cannot be engaged this way: one
+  delivered in a review BODY rather than as an inline comment, and anything a
+  locally-run secondary reviewer raised. Document those in the PR body.
+
 - **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
   heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
   Run gate-adjacent steps as separate calls.
