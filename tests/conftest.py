@@ -315,6 +315,47 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from writing REAL merge-override audit rows ───────
+@pytest.fixture(autouse=True)
+def _isolate_override_log(tmp_path):
+    """Redirect the merge gate's override STORE to tmp for ALL tests.
+
+    Any test that drives ``git_push_guard`` with an override sigil in the command
+    now produces a durable audit row, and the default path is the live log the
+    operator reads. MEASURED before this existed: four rows describing a PR that
+    does not exist — one blocked command retried during development — reached the
+    real store and had to be removed by hand. A store nobody isolated records
+    fiction before it records anything true.
+
+    Repo-wide rather than under ``tests/test_hooks/``: ``tests/test_scripts/``
+    also drives these hooks (some as subprocesses), and a bare local
+    ``git merge x  # merge-to-main-override`` is enough to write a row — no PR,
+    no network. Set on the environment so subprocess-launched hooks inherit it.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real log — mirrors
+    ``_isolate_alert_queue``.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GENESIS_MERGE_OVERRIDE_DIR", str(tmp_path / "merge_overrides"))
+    # The discard guard's recovery store, for the SAME reason and by the same
+    # argument: tests/test_scripts/ drives that hook too, some as subprocesses, and
+    # its live default is ~/.genesis/git_discard_snapshots. Today only
+    # test_git_discard_guard.py sets it locally, so nothing leaks — this is here so
+    # the NEXT test that drives that guard cannot write to the operator's real
+    # recovery store. Isolating one of two sibling stores was the gap.
+    mp.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(tmp_path / "git_discard_snapshots"))
+    # And the SUPERSEDED knob, which is config the operator may still carry. It no
+    # longer steers the store, but setting it now makes the guard print a migration
+    # notice — so leaving it inherited means the suite's stderr depends on the
+    # developer's environment. Same gap as the sibling store above, one level up:
+    # isolating the store but not the config that talks about it.
+    mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
 @pytest.fixture(autouse=True)
 def _isolate_genesis_db_path(tmp_path):
@@ -503,6 +544,42 @@ def _guard_db_crud_not_mocked():
             "or `with patch(...)` so the patch is restored, or set the mock on a "
             "local mock object — never assign to the real module attribute."
         )
+
+
+def require_access_denied(path) -> None:
+    """Skip unless THIS process is actually stopped by ``path``'s mode bits.
+
+    Probes the path that was chmod'd, not some writable neighbour of it — a
+    probe aimed at the wrong path reports "denied" from a directory nobody
+    restricted, which skips every run and pins nothing. Directories are probed
+    by listing, files by opening, because those are the operations the callers
+    rely on being refused.
+
+    Any test that chmods a directory or file and then asserts on the failure is
+    resting on a premise the environment can void: root and anything holding
+    CAP_DAC_OVERRIDE write straight through mode bits, and CI containers
+    routinely run as root. There the operation SUCCEEDS, and the test either
+    fails for an unrelated reason or — worse — passes vacuously, having
+    asserted that nothing went wrong in a run where nothing was ever blocked.
+
+    Shared rather than repeated: the same premise underpins several chmod-based
+    tests across the suite, and a lesson applied only where it was learned
+    leaves the rest of the population exactly as it was.
+
+    Restores nothing and mutates nothing — call it AFTER chmod, before the
+    assertions, and let the caller's own ``finally`` restore the mode.
+    """
+    import pathlib
+
+    p = pathlib.Path(path)
+    try:
+        if p.is_dir():
+            list(p.iterdir())
+        else:
+            p.open("rb").close()
+    except OSError:
+        return  # genuinely denied — the premise holds
+    pytest.skip(f"this process reads through mode bits on {p} (root / CAP_DAC_OVERRIDE)")
 
 
 @pytest.fixture

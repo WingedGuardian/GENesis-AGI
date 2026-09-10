@@ -550,6 +550,13 @@ _KNOWN_SIGILS = (
     # missing declaration nor an unwarranted one can ship unnoticed.
     "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
     "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
+    # THIRD occurrence of the class the comment above describes, caught by that
+    # test rather than in review: the round-7 terminal shipped its sigil query
+    # without this line, and the terminal's own block message printed the losing
+    # token order. At streak>=3 AND lifetime>=7 — a reachable state, since the
+    # terminal does not reset the streak — `# final-round-accept escalation-ack`
+    # was refused while `# escalation-ack final-round-accept` passed.
+    "final-round-accept",  # review_enforcement_commit: the round-7 lifetime terminal
 )
 
 
@@ -613,9 +620,136 @@ def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _has_trailing_override(seg, sigil)
 
 
+def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
+    """Locate bash ANSI-C ``$'...'`` quoting spans in SHELL-WORD context.
+
+    Returns ``(start, end, content, has_escape)`` per span, where ``end`` is the
+    index past the closing ``'`` and ``content`` is the raw bytes between the
+    quotes. ``has_escape`` is True if the span contains a backslash escape.
+
+    Only spans OUTSIDE single- and double-quoted regions are ANSI-C: bash does
+    NOT treat ``$'...'`` as ANSI-C inside ``"..."`` (there it is a literal ``$``
+    followed by a quoted string), and everything inside ``'...'`` is literal.
+    Getting this dq/sq state right is what keeps the scan off heredoc-body and
+    quoted text. MEASURED to matter (author, 2026-09-04, over a corpus of 38,140
+    real Bash commands harvested from this install's CC transcripts): a naive
+    ``$'`` scan flagged 89, dq-awareness cut that to 45, and the residue is
+    almost entirely heredoc bodies. Heredoc bodies are NOT excluded here, and
+    saying so plainly matters: :func:`parse_segments` has no heredoc state, so a
+    body line is already segmented as a command TODAY — MEASURED on origin/main,
+    a ``cat <<'EOF'`` body line holding a plain gated git command resolves to a
+    ``('git', <verb>)`` segment and is over-blocked with or without this decode.
+    The decode makes the ANSI-C form CONSISTENT with that pre-existing plain-form
+    over-block; it does not create the class, and the direction is over-block,
+    never fail-open. Heredoc-awareness belongs in :func:`parse_segments` (where
+    it fixes both forms at once, and must distinguish a DATA receiver like
+    ``cat`` from an EXECUTING one like ``bash <<'EOF'``, whose body bash really
+    does run) — tracked separately, not bolted on here. The counts are provenance
+    for the design choice, not a runtime invariant; the invariant is the
+    dq/sq/backslash state machine below, which a security review verified against
+    bash's own rules.
+    """
+    spans: list[tuple[int, int, str, bool]] = []
+    i, n = 0, len(text)
+    in_sq = in_dq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if c == "\\" and i + 1 < n:  # backslash escapes the next char in "..."
+                i += 2
+                continue
+            if c == '"':
+                in_dq = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:  # word-level escape, e.g. \$ — not an opener
+            i += 2
+            continue
+        if c == '"':
+            in_dq = True
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            j = i + 2
+            content: list[str] = []
+            has_escape = False
+            while j < n and text[j] != "'":
+                if text[j] == "\\" and j + 1 < n:  # ANSI-C escape (incl. \' \\)
+                    has_escape = True
+                    content.append(text[j : j + 2])
+                    j += 2
+                    continue
+                content.append(text[j])
+                j += 1
+            if j >= n:
+                # UNTERMINATED ``$'...`` — bash rejects the whole command, so
+                # there is no "verb bash runs" to decode. Recording a span here
+                # would turn invalid syntax into valid argv
+                # (``--$'no-verify`` -> ``--no-verify``) and hand a hard policy
+                # verdict to a command that never runs. Leaving it untouched
+                # makes shlex fail, so :func:`untokenizable` routes the command
+                # to the caller's fail-closed/approval net, which is where an
+                # unparseable command belongs. Nothing after an unterminated
+                # opener can be a further span, so stop scanning.
+                break
+            end = j + 1
+            spans.append((i, end, "".join(content), has_escape))
+            i = end
+            continue
+        if c == "'":
+            in_sq = True
+            i += 1
+            continue
+        i += 1
+    return spans
+
+
+def _decode_escape_free_ansi_c(text: str) -> str:
+    """Rewrite ESCAPE-FREE ``$'...'`` spans to a plain-quoted literal of content.
+
+    shlex does not implement ANSI-C decoding: it strips the quotes from
+    ``$'push'`` but LEAVES the ``$``, yielding the token ``$push`` — one
+    character off from what bash runs (``push``). That is enough to hide a verb
+    (``git $'push'``) or a flag (``git commit --$'no-verify'``) from every gate
+    that reads the resolved subcommand/flag. Rewriting the span to what bash
+    would produce restores the parser's fidelity to the shell, so the ordinary
+    gate fires its ordinary verdict.
+
+    ONLY the escape-free case is rewritten, and deliberately so: a span with a
+    backslash (``$'\\x70...'`` hex, ``$'\\n'``) needs the full bash ANSI-C escape
+    grammar to decode, and a PARTIAL decoder is the exact "false confidence from
+    partial coverage" failure a sibling review flagged. Escape-bearing spans are
+    left untouched here and reported untrustworthy by :func:`untokenizable`, so
+    they route to the caller's fail-closed net rather than a guessed decode.
+    """
+    spans = _ansi_c_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    last = 0
+    for start, end, content, has_escape in spans:
+        out.append(text[last:start])
+        out.append(text[start:end] if has_escape else shlex.quote(content))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _argv(seg: str) -> list[str]:
-    """shlex argv of a comment-stripped segment; naive split on tokenizer error."""
-    core = _strip_trailing_comment(seg)
+    """shlex argv of a comment-stripped segment; naive split on tokenizer error.
+
+    ANSI-C ``$'...'`` spans are decoded to their bash value FIRST, so a verb or
+    flag hidden in one (``git $'push'``, ``--$'no-verify'``) resolves to the
+    token bash actually runs rather than the ``$``-prefixed token shlex leaves.
+    Decoding precedes comment-stripping so a ``#`` inside a decoded span is
+    re-quoted and cannot be mistaken for a trailing comment.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
     try:
         return shlex.split(core)
     except ValueError:
@@ -658,12 +792,382 @@ def untokenizable(command: str) -> bool:
     MEASURED over 12,099 real commands: folding and not folding classify
     IDENTICALLY (339 un-tokenizable either way, zero commands differ), so the
     normalization bought nothing and is removed rather than documented.
+
+    ANSI-C ``$'...'`` is handled in the analyze path, NOT here. shlex SUCCEEDS on
+    ``$'push'`` but leaves the ``$`` (a token one char off from what bash runs),
+    so :func:`_decode_escape_free_ansi_c` rewrites the escape-free case to what
+    bash produces BEFORE tokenizing — the verb/flag then resolves normally and
+    the ordinary gate fires. This function is deliberately NOT broadened to flag
+    ANSI-C, because a benign ``$'...'`` in a MESSAGE argument
+    (``git commit -m $'l1\\nl2'``) is legitimate and flagging it would over-ask;
+    distinguishing verb-position from argument-position is exactly what the
+    per-segment analyze path can do and a whole-command probe cannot. The one
+    residual — a HEX-encoded verb (``$'\\x70\\x75\\x73\\x68'``), which the
+    escape-free decode does not touch — is tracked separately rather than closed
+    here with a message-hostile broadening.
     """
     try:
         shlex.split(command)
         return False
     except ValueError:
         return True
+
+
+# WHY THIS MODULE HAS COST BOUNDS AT ALL
+#
+# Every guard is a hook registered with a wall clock (10s for the destructive and
+# protected-path guards, 60s for the push guard). The official hook contract is
+# explicit that a timed-out hook "doesn't block the tool call … don't count on a
+# stalled hook to act as a gate". A guard that runs out of clock does not refuse — it
+# PERMITS. So cost on this path is a correctness property, not a performance one.
+#
+# Cost has TWO independent axes and each needs its own bound, because neither
+# subsumes the other. MEASURED, this parser, on `echo` + a pad:
+#
+#     one long token   65K 0.30s | 250K 2.65s | 450K 9.14s   (0.46 -> 2.03 s/100K)
+#     many small tokens 65K 0.12s | 250K 0.48s | 450K 0.87s   (flat 0.19 s/100K)
+#
+# So cost is SUPERLINEAR in the length of a single token, and a 450K command with NO
+# nesting at all costs 9.14s against a 10s registration. That cost is spent in the
+# FIRST pass, before any recursion — which is why a budget checked between recursion
+# levels cannot bound it, and why an earlier draft that tried to was abandoned.
+
+#: The largest command this module will read. Bounds the unavoidable first pass.
+#:
+#: Calibrated against the TIGHTEST real path, which is not the one the individual
+#: guards are registered on. `bash_safety_hook.sh` is registered at **5 seconds** and
+#: delegates to `destructive_command_guard` AND `protected_paths_guard` SEQUENTIALLY,
+#: so two full parses of the same command share a 5s budget. Sizing against a single
+#: guard's 10s registration would have been calibrating against the loosest path and
+#: calling it a margin.
+#:
+#: THIS CAP AND :data:`MAX_SUBSTITUTION_DEPTH` ARE CHOSEN TOGETHER, and neither
+#: number means anything alone. The parser re-scans the remaining text at every level,
+#: so the worst case an attacker can force is a command at exactly this cap nested to
+#: exactly that bound — cost is length x levels. Measuring length at depth 0 and
+#: calling it the cost curve is the specific mistake that produced a 64 KiB cap here,
+#: which measured 0.86s at depth 0 and 5.46s at depth 8: OVER the 5s budget, i.e. the
+#: fail-open this module exists to close, reintroduced by its own fix.
+#:
+#: AND THE DIVISOR IS FIVE PARSES, NOT TWO. `bash_safety_hook.sh` delegates to THREE
+#: guards over the same command (destructive_command_guard, protected_paths_guard,
+#: git_discard_guard), and git_discard_guard reaches three consumers that each analyse
+#: it. An earlier revision of this comment claimed "two guards, two parses" and sized
+#: the cap against that; MEASURED end to end, the pair it chose ran 6.12s against a 5s
+#: registration. Two of those three duplicate parses are now memoised away
+#: (`git_discard_guard._parse_once`), because bounding the INPUT does not help if the
+#: same work is done three times.
+#:
+#: MEASURED end to end through the real hook — worst payload INSIDE both bounds (so
+#: nothing short-circuits), ALLOWED by every guard (so nothing exits early), and
+#: naming rm AND clean AND recurse so every delegation arm runs. Cap fixed at 48 KiB,
+#: which is the floor set by the longest real command:
+#:
+#:     depth 6   3.08s   62% of budget   1.6x margin
+#:     depth 5   2.67s   53%             1.9x margin   <- chosen
+#:     depth 4   2.52s   50%             2.0x margin
+#:
+#: THIS TABLE IS THE ONLY PLACE THESE FIGURES ARE DERIVED. Two other files and a test
+#: docstring used to restate the depth-5 row from memory, as 2.92s and 3.19s, so one
+#: measurement appeared with three values and nothing said which was current — they
+#: now point here instead. The reason a copy drifts is that the figure is
+#: load-dependent: re-measured 2026-09-08 through the same path on a box under heavy
+#: concurrent load, the depth-5 row came out at a 2.84s median over three runs with a
+#: 2.80-3.25s spread, which is the same decision and a different number. Treat the row
+#: as the scale at which the bound was chosen, and RE-MEASURE before quoting it as a
+#: current fact.
+#:
+#: Depth 4 buys almost no time for meaningfully less headroom, so 5 is the balance:
+#: 1.9x on the clock and 1.25x over the deepest nesting any real command reaches. That
+#: second ratio read 1.67x, from a corpus whose deepest command was 3; the re-derivation
+#: below finds one at 4, and a margin term is quoted against the DEEPEST observation
+#: available, never the friendliest. Nothing reaches 5 in either corpus, so the bound
+#: itself does not move — only the honesty of the margin does.
+#: The asymmetry decides which side to buy margin on — exceeding a bound fails CLOSED
+#: (a refusal), while exceeding the hook timeout fails OPEN (the command runs
+#: unchecked), so the clock is the side that must not be shaved.
+#:
+#: Headroom: over 45,956 distinct real Bash commands from this install's history the
+#: longest is 43,480 chars, so the cap is 1.13x that and fires on 0 of them. The cap
+#: CANNOT go lower without refusing real work, which is why depth carries the tuning.
+#:
+#: THAT MAXIMUM IS METHOD-UNRECORDED and is deliberately no longer labelled MEASURED.
+#: The re-derivation below, which DOES carry its method, finds a longest of 40,925 over
+#: a corpus 2.65x larger — and a superset harvested the same way cannot have a smaller
+#: maximum, so the two harvests are not the same population and 43,480 cannot be
+#: re-checked from anything written down. It is kept rather than replaced because it is
+#: the LARGER of the two, and every claim resting on it (the cap clears the longest real
+#: command; the fixtures assert `longest_real < cap`) is the more conservative for using
+#: it. The ratio is what the choice costs: 1.13x against 43,480, 1.20x against 40,925.
+#: Quote whichever you can defend, and never present the unrecorded one as measured.
+#:
+#: RE-DERIVED 2026-09-08 with the method stated, because a denominator whose method is
+#: not recorded cannot be checked — and this one could not be: two harvests taken in
+#: the same session left 45,956 and 45,358 side by side in these files with nothing to
+#: arbitrate them. Method: every `Bash` tool_use `input.command` in this install's CC
+#: transcripts (`~/.claude/projects` and `~/.genesis/background-sessions`, 11,298
+#: `.jsonl` files), deduplicated by exact string. That yields 121,927 distinct
+#: commands, longest 40,925 chars: 0 above this cap, 9 above the old 32,768 one, and a
+#: `Segment.depth` distribution of 91.4% / 7.9% / 0.7% / 16 commands / 1 command at
+#: depths 0-4. Exactly one command in the whole corpus trips a bound, and it is a probe
+#: typed while writing this note. So both bounds still fire on 0 real work at 2.65x the
+#: denominator they were chosen on.
+#:
+#: READ THAT AS A SECOND OPINION, NOT AS A CORRECTION, because the two are not nested:
+#: this harvest has 2.65x the COUNT and a SHORTER longest command (40,925 vs 43,480).
+#: A corpus that merely grew could not do that, so the harvests differ in what they
+#: admit, not only in when they were taken — which is the whole argument for recording
+#: a method beside a denominator. Neither number is wrong; they are different
+#: populations, and the cap sits above the longest command in BOTH.
+#:
+#: THIS CAP WAS 32,768 AND THAT WAS TOO SMALL — recorded because the mistake is
+#: instructive rather than embarrassing. It was sized against an earlier corpus of
+#: 20,514 commands whose longest was 14,682 chars, whence a claimed "2.2x headroom
+#: and 0 fires". The full corpus is 2.2x larger and contains three commands ABOVE
+#: 32,768 — all of them `cat > … <<EOF` here-docs writing review prose, a shape this
+#: very workflow generates and the earlier corpus had simply not accumulated yet. A
+#: cap is only as good as the corpus it was sized against, and a corpus keeps growing
+#: after you measure it. The length headroom here is deliberately modest (1.13x)
+#: because exceeding this bound ASKS rather than refuses — see _BLIND_OVER_LONG.
+MAX_COMMAND_CHARS = 49_152
+
+#: How deep :func:`analyze` will follow nested scripts and command substitutions.
+#:
+#: The second axis. The parser re-runs its whole scanner battery on near-identical
+#: text at every level, so a command inside the length cap still multiplies by its
+#: nesting depth — the cap alone leaves that unbounded, exactly as the depth bound
+#: alone leaves the first pass unbounded. MEASURED end to end against the real
+#: ``protected_paths_guard``, on a payload it genuinely refuses (a protected data
+#: directory) padded with a quoted string to 65,400 chars, under its 10s timeout:
+#:
+#:     depth   0  exit 2 refused   0.46s
+#:     depth  32  exit 2 refused   6.78s
+#:     depth  48  exit 2 refused   9.96s
+#:     depth 128  KILLED at 10s -> non-2 -> the tool call PROCEEDS
+#:
+#: With the bound the same payloads are flat at 2.0-2.1s and refused at every depth.
+#: (Padding SHAPE moves these by 3.4x, so a depth quoted without a length AND a shape
+#: is not a measurement.)
+#:
+#: 5 is chosen from data, not taste, and JOINTLY with :data:`MAX_COMMAND_CHARS` — see
+#: the cost table there, because cost is length x levels and neither limit can be set
+#: without the other. MEASURED over 45,956 distinct real commands, counting the depth
+#: ``analyze`` ACTUALLY recurses to (``Segment.depth``, so ``bash -c`` wrappers and
+#: substitutions both): 87.5% reach depth 0, 11.7% depth 1, 0.79% depth 2, and 7
+#: commands reach depth 3. Nothing reaches 5. Re-derived 2026-09-08 over the larger
+#: corpus recorded with :data:`MAX_COMMAND_CHARS`: 91.4% / 7.9% / 0.7%, 16 commands at
+#: depth 3 and ONE at depth 4. Still nothing at 5, which is the clause the bound rests
+#: on — but the deepest real command is 4 rather than 3, so quote the margin as 1.25x.
+#:
+#: This was 8, and came down twice: once when the cap went up, and again when the
+#: end-to-end budget turned out to carry FIVE parses rather than two. The cap cannot
+#: move (it is pinned above the longest real command), so this bound is the only
+#: tuning lever left — see the measured table in MAX_COMMAND_CHARS.
+#:
+#: Note the units — this bound counts ``Segment.depth``, NOT how deep a command looks,
+#: and the two differ per syntax because ``bash -c "$(…)"`` descends twice per level
+#: while a bare ``$(…)`` descends once. MEASURED at this bound, the first nesting
+#: level that reports over_nested:
+#:
+#:     bash -c "$(…)" x N   ->  N = 4
+#:     $(…) x N             ->  N = 6
+#:
+#: (An earlier revision of this comment asserted 3, which was simply wrong — measure
+#: it rather than deriving it from "twice per level", since the descent is not the
+#: only thing that consumes a level.) Compare the bound against the measured
+#: ``Segment.depth`` distribution above, never against an eyeballed nesting level.
+MAX_SUBSTITUTION_DEPTH = 5
+
+
+class BlindSpot(NamedTuple):
+    """A reason this module cannot see everything a command would execute.
+
+    ``cause`` is the phrase a guard drops into "this command <cause> and mentions
+    …"; ``hint`` is the way OUT, which differs per cause and is the half that makes
+    a refusal actionable rather than a wall. Guards supply their own op-specific
+    framing around both — what counts as gated is theirs to say, why the parse is
+    blind is ours.
+
+    THE POLICY LIVES HERE, NOT IN THE CONSUMERS. The one remaining DECISION field (of
+    the three fields below) is a verdict this module has already made, so a guard obeys
+    a single boolean instead of re-deriving one from a string:
+
+    ``bounds_induced`` — a BOUND stopped this parse, as opposed to the pre-existing
+    ``untokenizable`` case. "Blind" is not one thing: every guard's behaviour for an
+    untokenizable command was already settled before the bounds existed, so a guard
+    restoring what a bound took away must act on ``bounds_induced`` only. Widening to
+    all three causes is a new over-block wearing the costume of a regression fix, and
+    it was MEASURED as one: 209 of 1,367 real clean-mentioning commands and 161 of
+    3,222 pytest-mentioning ones.
+
+    THERE IS DELIBERATELY NO PER-AXIS SEVERITY FIELD. One existed briefly — a
+    ``refuse`` flag letting the length bound ask where the depth bound refused — and
+    removing it is the whole lesson of this design. It was wired into guards whose
+    only verdicts are BLOCK and ALLOW, where "don't refuse" does not mean "ask", it
+    means PERMIT: MEASURED, a real ``git clean -fd`` and a real
+    ``git checkout --recurse-submodules .``, each padded past the length cap, went
+    BLOCK -> ALLOW through both the guard and the shell hook — the first being the
+    operation that guard's own header calls unrecoverable.
+
+    That flag cost two review rounds and produced a fail-open in the very change meant
+    to close fail-opens, and its entire benefit was hypothetical: it protected a long
+    here-doc that MEASURES at 0 of 45,956 real commands. A distinction that no real
+    input exercises, which every one of six call sites must choose correctly, and
+    whose wrong choice is silent, is a defect generator rather than a feature. So the
+    module answers exactly ONE question, the same way for everyone: was this parse cut
+    short by a bound? A consumer that fails closed does so on that alone, and cannot
+    pick the wrong axis because there is no axis to pick.
+
+    THERE IS NO ``kind`` FIELD, deliberately. It was a string discriminator that
+    consumers compared as ``kind != "untokenizable"``, and that comparison silently
+    failed OPEN in two ways at once: it could not express "a bound fired AND
+    tokenization failed", and a consumer that forgot it kept the old behaviour with
+    no signal. Removing it makes every stale comparison an AttributeError at test
+    time — loud, at the one moment a silent fail-open is affordable to catch.
+    """
+
+    cause: str
+    hint: str
+    bounds_induced: bool
+
+
+_BLIND_UNTOKENIZABLE = BlindSpot(
+    bounds_induced=False,  # predates the bounds; guards' behaviour already settled
+    cause="cannot be parsed safely (e.g. ANSI-C $'...' quoting)",
+    hint=(
+        "an apostrophe in ordinary prose is what makes this unparseable, and "
+        "re-quoting the here-doc cannot fix that — write the text to a file instead"
+    ),
+)
+
+#: Deliberately does NOT name the depth, because there is no single true number to
+#: name. The bound counts `Segment.depth`, and how many of those a level costs depends
+#: on the syntax: MEASURED at the current bound, `bash -c "$(…)"` first trips at 4
+#: nesting levels and a bare `$(…)` at 6 — the same figures the MAX_SUBSTITUTION_DEPTH
+#: comment above records, which is the point of citing them in one place. (This said 5
+#: and 7 and was simply wrong: two comments quoting the same measurement disagreed, so
+#: a reader could not tell which was current. Re-measured through `analyze_checked` and
+#: `over_nested`, which agree.) Any figure in this message would still be wrong for one
+#: of the two shapes, and a reader can measure it — so describe the condition, not the
+#: count.
+_BLIND_OVER_NESTED = BlindSpot(
+    bounds_induced=True,
+    cause="nests scripts or command substitutions deeper than this parser follows",
+    hint=(
+        "flatten it — run the inner command as its own step, or write the text to a "
+        "file. The parser stops descending so a crafted command cannot stall the "
+        "guard past its timeout, and a guard killed by its timeout does not refuse"
+    ),
+)
+
+_BLIND_OVER_LONG = BlindSpot(
+    bounds_induced=True,
+    cause=f"is longer than the {MAX_COMMAND_CHARS} characters this parser reads",
+    hint=(
+        "split it into separate steps, or write the payload to a file and pass the "
+        "path. Nothing is parsed at all past this length — a prefix of a shell "
+        "command is not a partial answer, it is a wrong one"
+    ),
+)
+
+#: Every blind spot this module can report. Exported so a test can enforce the
+#: invariant `refuse ⟹ bounds_induced` over the WHOLE domain rather than over the
+#: examples a test author happened to think of.
+#:
+#: Deliberately NOT enforced here by an `assert` or an import-time raise. An assert
+#: vanishes under `python -O`, and a guard that raises during import exits non-zero —
+#: which the hook contract reads as NON-BLOCKING, so the invariant check would itself
+#: become a fail-open. The enforcement point for an invariant is a test, which fails
+#: loudly at the one moment nothing is at stake.
+_ALL_BLIND_SPOTS = (_BLIND_UNTOKENIZABLE, _BLIND_OVER_NESTED, _BLIND_OVER_LONG)
+
+
+def over_nested(command: str) -> bool:
+    """True when :func:`analyze` stopped descending before it ran out of command.
+
+    The companion to :func:`untokenizable`, and it exists for the identical reason:
+    ``analyze`` cannot otherwise report its own blind spot. A truncated parse and a
+    clean one are indistinguishable in its return value, so a caller that reads "no
+    gated segment found" as "no gated command present" fails OPEN — here by
+    concluding a deeply-buried ``rm`` is not there, when the parser simply stopped
+    looking.
+
+    Bounding the recursion WITHOUT this signal would trade one fail-open for a worse
+    one: today an over-deep command runs the guard out of clock, which is at least
+    loud; a silent cap would have it return a confident, wrong all-clear.
+
+    THE ANSWER COMES FROM THE PARSE ITSELF, never from a second opinion about it. An
+    earlier revision of this function was a hand-written depth counter that predicted
+    what ``analyze`` would do — and two shapes DEFEATED it, both measured: parens
+    inside a double-quoted string, and ``$(( … ))`` arithmetic, each of which
+    depressed the counter below the real depth while ``analyze`` truncated anyway. A
+    hidden ``rm -rf`` was then invisible to the parse AND unreported by the probe,
+    which is precisely the silent all-clear this signal exists to prevent. Two
+    parsers means two answers, and the gap between them is the vulnerability; see
+    :func:`_analyze_bounded`, which is the only thing that can answer this exactly.
+
+    Reports the DEPTH bound specifically. A command refused for LENGTH is a different
+    blind spot with a different remedy; ask :func:`analyze_checked` for either.
+    """
+    return _analyze_bounded(command)[1] == "depth"
+
+
+def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
+    """:func:`analyze`, plus the single question a guard must ask: am I blind here?
+
+    Returns ``(segments, blind_spot)``. ``blind_spot`` is None when neither of the
+    blind spots this module CAN detect fired, and otherwise says which did, in the two
+    halves a guard needs to write a message.
+
+    That is deliberately weaker than "the parse was complete", and the difference
+    matters because five guards now hang their fail-closed decision on it. MEASURED,
+    each returning no ``rm`` segment AND ``blind_spot`` None: ``eval "rm -rf …"``,
+    process substitution ``cat <(rm -rf …)``, and ``env -S 'rm -rf …'``. Those forms
+    are not parsed and cannot be reported — the module does not know it missed them.
+    Pre-existing, documented at :func:`_substitutions`, and not a promise this
+    function can make.
+
+    ONE call for every consumer that fails closed on an unreadable command — not one
+    call per probe. A blind spot discovered later is then wired in HERE, once, rather
+    than in each guard that has to remember it; "every call site must remember" is
+    the shape that has repeatedly shipped guards importing a probe they never
+    consult. It is also strictly CHEAPER than what the guards did before: one parse,
+    where they previously ran a separate tokenize probe and then parsed anyway.
+
+    A BOUNDED PARSE RETURNS NO SEGMENTS. Not the ones it managed to reach — none.
+    This is the single most load-bearing line in the module, so it gets the reason:
+    a partial segment list is "found something AND stopped looking", and every guard
+    here decides by SEARCHING that list, treating "not found" as "not present". A
+    partial list therefore turns a bound into a fail-open at an index the author of
+    the command chooses. MEASURED, base vs a version that returned partial segments:
+
+        git commit -m ok && <9-deep git commit --no-verify>   BLOCK -> ALLOW
+        git push origin feature && <9-deep git push +main>    BLOCK -> ask
+
+    Both are decoys — one visible benign operation filling the list so the not-found
+    branch, where the blind-spot net lives, is never reached. Returning nothing makes
+    "not found" trustworthy again, which is what every consumer already assumed, and
+    fixes both without a line of per-consumer logic. The length bound always worked
+    this way ("a prefix of a shell command is not a partial answer"); the depth bound
+    did not, and the whole defect class lived in that inconsistency.
+
+    Order is deliberate, and it is NOT the order this function first shipped with.
+    Both bounds outrank :func:`untokenizable`, because a consumer restoring what a
+    bound took away asks ``bounds_induced`` — so reporting the untokenizable cause for
+    a command that is ALSO over a bound hands that consumer the one answer it is
+    documented to ignore. MEASURED: appending a trailing ``# don't`` to a nested
+    command flipped three guards from BLOCK to ALLOW, because an apostrophe in a
+    comment is valid shell that shlex cannot tokenize. Reversing the order costs
+    2 of 45,956 real commands a reclassification and no change of verdict.
+    """
+    segments, reason = _analyze_bounded(command)
+    if reason == "length":
+        return [], _BLIND_OVER_LONG
+    if reason == "depth":
+        return [], _BLIND_OVER_NESTED
+    if untokenizable(command):
+        return segments, _BLIND_UNTOKENIZABLE
+    return segments, None
 
 
 def _basename(token: str) -> str:
@@ -787,8 +1291,59 @@ def analyze(command: str) -> list[Segment]:
     and env-assignments stripped), and whether a ``# review-override`` comment
     is bound to that segment. ``bash -c 'script'`` is recursed into so the inner
     commands are surfaced (the parent's override propagates to them).
+
+    The descent stops at :data:`MAX_SUBSTITUTION_DEPTH`, which is a SECURITY bound
+    rather than a performance one — see the constant. A DEPTH-truncated parse returns
+    the segments it DID resolve, so this signature and its result are unchanged for
+    every caller that does not care.
+
+    THE OTHER BOUND BEHAVES DIFFERENTLY, and this docstring used to omit it entirely
+    while asserting the depth bound's behaviour as if it were the whole story. Over
+    :data:`MAX_COMMAND_CHARS` this returns NO segments at all, silently — not a prefix,
+    not what it managed to reach, nothing. The two bounds are therefore NOT
+    interchangeable in any argument about what a caller sees, which is exactly the axis
+    the exemptions in ``_BARE_ANALYZE_ALLOWED`` reason on.
+
+    A caller that must not be BLIND wants :func:`analyze_checked`, which returns the
+    same segments plus WHY they might be incomplete, from the same single parse. That
+    exists for the reason :func:`untokenizable` does: this return value cannot
+    distinguish "found nothing" from "stopped looking", and a guard that conflates
+    the two fails OPEN.
     """
+    return _analyze_bounded(command)[0]
+
+
+def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], str | None]:
+    """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
+
+    Returns ``(segments, reason)`` where reason is None, ``"length"`` or ``"depth"``.
+    ``"depth"`` is reported only when there was something left to descend INTO and the
+    bound refused it — reaching the bound with nothing nested below is a complete
+    parse, not a truncated one.
+
+    Both facts come from ONE traversal, on purpose. Answering "did this truncate?"
+    with a separate pass means a second model of shell syntax, and any disagreement
+    between the two is a silent fail-open: the parse stops early, the predictor says
+    it did not, and a buried command is invisible to both. That is not hypothetical —
+    it is what the hand-written counter this replaced actually did, on two measured
+    shapes. One parse, one answer.
+
+    The length cap lives HERE rather than in :func:`analyze_checked` so that
+    :func:`analyze` is bounded too. Putting it only on the checked path would leave
+    every bare-``analyze`` caller paying the unbounded first pass — which is the same
+    "unmigrated consumer" hole the checked path exists to close.
+
+    ``_depth`` is internal bookkeeping; every caller passes a command and nothing else.
+    """
+    # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
+    # the quoting state for everything after the cut, so a prefix parse is not a
+    # partial answer, it is a confidently wrong one — and the guards match on the
+    # resolved exe and argv. An empty list plus the reason is the honest result, and
+    # every consumer that must not be blind is already asking for the reason.
+    if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
+        return [], "length"
     out: list[Segment] = []
+    truncated = False
     for seg in parse_segments(command):
         raw = seg.raw
         override = _has_trailing_override(raw)
@@ -807,8 +1362,22 @@ def analyze(command: str) -> list[Segment]:
         # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
         # expansion redirect target, so a nested command stays visible to the guards.
         nested.extend(_substitutions(raw))
+        if not nested:
+            continue
+        # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
+        # again on near-identical text at each level (MEASURED: a character at the
+        # centre of a depth-48 command is scanned 293 times by six full-text
+        # scanners), so cost is length x depth and a guard runs out of clock. Depth 0
+        # is unaffected by construction, which is what keeps `[s.raw for s in
+        # analyze(cmd) if s.depth == 0] == split_segments(cmd)` byte-identical for
+        # the cwd consumers.
+        if _depth >= MAX_SUBSTITUTION_DEPTH:
+            truncated = True
+            continue
         for script in nested:
-            for inner in analyze(script):
+            inner_segs, inner_reason = _analyze_bounded(script, _depth=_depth + 1)
+            truncated = truncated or inner_reason == "depth"
+            for inner in inner_segs:
                 out.append(
                     Segment(
                         exe=inner.exe,
@@ -819,7 +1388,7 @@ def analyze(command: str) -> list[Segment]:
                         redirects=inner.redirects,
                     )
                 )
-    return out
+    return out, ("depth" if truncated else None)
 
 
 def is_pytest_invocation(seg: Segment) -> bool:
@@ -906,30 +1475,50 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str]) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Handles a bare ``-c`` (script is the next token), a combined short bundle
-    where ``c`` is last (``-lc 'script'`` → next token), and an inline value
-    (``-c'script'`` → the rest of the token after ``c``).
+    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
+    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
+    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
+
+    An earlier version read a bundle whose ``c`` was not last as an INLINE value
+    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
+    parser then reported a segment whose executable was ``e``, and a guard keyed
+    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
+
+    MEASURED 2026-09-06 against the real interpreters, both directions:
+    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
+    token, while the glued spelling that branch modelled is refused outright —
+    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
+    So the branch modelled a form none of these shells accepts and dropped one
+    they all do, and deleting it is strictly a widening.
     """
     for i, tok in enumerate(argv[1:], 1):
         if not tok.startswith("-") or tok.startswith("--"):
             continue
-        pos = tok.find("c")
-        if pos <= 0:
+        if "c" not in tok[1:]:
             continue
-        if pos == len(tok) - 1:  # 'c' is the last flag in the bundle
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        else:  # inline script glued after the 'c'
-            return tok[pos + 1 :]
+        if i + 1 < len(argv):
+            return argv[i + 1]
     return ""
 
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand(argv: list[str]) -> str | None:
-    """The git subcommand for an argv whose executable is git, skipping git
-    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+def git_subcommand_index(argv: list[str]) -> int | None:
+    """Index of the git subcommand token in ``argv``, or None.
+
+    Exposed alongside :func:`git_subcommand` because a caller that needs the
+    OPERANDS after the subcommand cannot recover this index on its own.
+    ``argv.index(name)`` returns the FIRST token equal to the name, and a global
+    option's operand may equal the subcommand's own name — ``git -C worktree worktree
+    remove /tmp/x`` selects the ``-C`` operand, so the operand list starts one
+    token early, the removal is not recognised, and the guard falls OPEN. Found
+    by cross-model review, 2026-09-03.
+
+    The alternative was for the caller to repeat the option-skipping loop below.
+    That is replica drift: two copies of one rule, diverging silently the next
+    time the option table grows. One scan, one source of truth.
+    """
     if not argv or _basename(argv[0]) != "git":
         return None
     i = 1
@@ -941,8 +1530,15 @@ def git_subcommand(argv: list[str]) -> str | None:
         if t.startswith("-"):
             i += 1
             continue
-        return t
+        return i
     return None
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git
+    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+    i = git_subcommand_index(argv)
+    return None if i is None else argv[i]
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:
