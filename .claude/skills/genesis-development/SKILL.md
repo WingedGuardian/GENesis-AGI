@@ -1385,8 +1385,13 @@ COMPUTES substantiality from the staged diff
 whose review marker is not an ADVERSARIAL audit (`review_enforcement_commit.py`
 Rule 2.5). Substantiality is a surface-area × risk model — ≥50 reviewable lines OR
 >1 code file OR an auth/api/migrations file OR an **executable prompt/agent/skill
-surface** (`.claude/agents|commands|skills/*`, `src/genesis/skills/*`), so the
-"Prompt / LLM behavior → both + extra scrutiny" row above is machine-enforced (a
+surface** — and that last set is WIDER than it used to say here: read
+`review_enforcement_commit._PROMPT_SURFACE_PREFIXES` + `_is_prompt_surface` rather
+than a copied list. It covers `.claude/agents|commands|skills/*`,
+`src/genesis/skills/*`, **`src/genesis/identity/`**, and **any**
+`src/genesis/**/prompts/` path — so editing `identity/CODE_AUDITOR.md` or an
+executor prompt forces `substantial` even at one line, which the old list denied.
+So the "Prompt / LLM behavior → both + extra scrutiny" row above is machine-enforced (a
 trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
 (`SOUL.md`/`USER.md`/`CLAUDE.md`) are exempt. Clearance binds the marker to the
 reviewed diff's FULL content, so re-staging different content after the audit
@@ -1396,10 +1401,20 @@ substantial change — not clearance. Depth is override-exempt: a findings
 does (announced, not RECORDED — nothing persists it, unlike the four PR-merge sigils
 below, whose rows survive the session; the word "logged" now means a durable row) (the
 audited escape for a genuine format mismatch). "Adversarial" is verified
-STRUCTURALLY — a severity ladder (BLOCKER/SHOULD-FIX/NOTE, CRITICAL/HIGH/LOW,
-P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substance —
-so run the real recall-tuned audit (`genesis-architect` / `CODE_AUDITOR.md`); do not
-hand-write a soft prompt.
+STRUCTURALLY, and the recognised vocabulary is NOT what an earlier version of this
+line said. `review_state._LADDER_LABEL_RE` accepts
+**BLOCKER · SHOULD-FIX · CRITICAL · HIGH · MEDIUM · LOW · P1/P2/P3** — **`NOTE` is
+not in it, and `MEDIUM` is** (the old text had that exactly backwards). A second
+pattern, `_LADDER_PHRASE_RE`, also accepts a `"severity":` key or the phrase
+`scope check`, which is why a `genesis-architect` audit clears the LADDER test even
+when every finding is NOTE-level: it emits a `Scope Check:` block. That is ONE of
+THREE tests, all required — `_evidence_is_adversarial` is a conjunction, so the
+gate also demands `file:line` engagement (or the CODE_AUDITOR JSON's `"file"` +
+`"line"` pair) and at least `_MIN_EVIDENCE_CHARS` of substance. A scope-check
+header alone does NOT pass. The trap is a HAND-WRITTEN audit that is all
+NOTE-level and carries neither marker — it fails on the ladder test before the
+other two are reached. So run the real recall-tuned audit (`genesis-architect` /
+`CODE_AUDITOR.md`); do not hand-write a soft prompt.
 
 **Honest enforcement model — VERIFY IT, do not assume it.** This section used to
 claim the enforcing teeth were "the independent cloud reviewer + a required human
@@ -1411,8 +1426,9 @@ actually rely on:
 - `GET /repos/{owner}/{repo}/branches/main/protection` → **404, not protected**.
   The protection the claim rested on did not exist. A *ruleset* did — a different
   API, invisible to the branch-protection endpoint.
-- That ruleset required **one status check** (`test`), not the ten other blocking
-  CI jobs. Lint, leak-detector and the rest were never server-side required.
+- That ruleset required **one status check** (`test`), not the ten other CI jobs
+  that blocked AT THE TIME (the suite is 15 jobs / 13 blocking today — see the CI
+  paragraph below; this whole bullet is a dated measurement, not current state). Lint, leak-detector and the rest were never server-side required.
 - It carried `bypass_actors: [{actor_type: RepositoryRole, actor_id: 5 (admin),
   bypass_mode: always}]`. **A bypass entry voids the rule for that actor.** The
   sole author is the repo admin, and the merge command this skill mandates
@@ -1421,6 +1437,21 @@ actually rely on:
 ⇒ For the actor who merges, the server-side backstop was **void**, and the local
 `git_push_guard.py` merge gate was the *only* real enforcement — precisely the
 layer the old text told you to discount.
+
+**⇒ THAT MEASUREMENT IS NOW HISTORY, and this is what the rules below are for.**
+Since PR #1907 (applied 2026-09-10) the rules are SPLIT into two rulesets, and
+the split is exactly the property the 2026-08-27 measurement found missing:
+`.github/rulesets/checks.json` carries `"bypass_actors": []` and requires `test`,
+`leak-detector` and `lint`, so **those three now bind an `--admin` merge
+server-side** — GitHub reports `current_user_can_bypass: "never"` for the owner
+on that ruleset. `approvals.json` keeps the admin bypass deliberately, because a
+sole maintainer cannot approve their own pull request; it carries `pull_request`,
+`update` and `creation` only. Rationale and the accepted residual:
+`.github/rulesets/README.md`.
+Kept rather than rewritten, because the reasoning is the lesson and the state is
+the perishable part. Do not read the paragraph above as current — read it as what
+you find when you finally query, and note that this correction itself has a date
+on it.
 
 **Two rules follow.**
 
@@ -1841,7 +1872,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   it matters, and they differ two-to-one rather than the other way round. Only
   `_required_scheduled_review_kinds` defaults to its MAXIMAL set, so a discard there
   TIGHTENS. The other two can LOOSEN: `_doc_findings_mode` defaults to `skip`
-  (`git_push_guard.py:1143`), scoring fewer findings and saying nothing about it; and
+  (`_DEFAULT_DOC_FINDINGS_MODE`; cite the SYMBOL — the line this used to name now holds a sibling constant), scoring fewer findings and saying nothing about it; and
   `_required_ci_workflows` falls back to the shipped `("CI",)`, which is NARROWER than
   any larger required set an install declared — it does print a NOTE, so that one is
   loud rather than silent, but it is still a relaxation (Codex P2, #1903). The rule below
@@ -2252,14 +2283,44 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
   unchanged worktrees on a daily timer. Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
-  (`scripts/update_hook_versions.sh`), and editing `scripts/hooks/*` changes
-  nothing until `sync-hooks.sh` copies it into `.git/hooks/`.
-- **`.github/**` and prompt surfaces are never "docs"** for substantiality
-  purposes — they always reach the depth gate.
+  (`scripts/update_hook_versions.sh`).
+- **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**
+  `sync-hooks.sh` copies only the five GIT hooks (`commit-msg`, `post-commit`,
+  `pre-commit`, `prepare-commit-msg`, `pre-push`) plus one helper into
+  `.git/hooks/`. Everything else — `git_push_guard.py`, `shell_parse.py`,
+  `hook_output.py` — is launched by `.claude/hooks/genesis-hook`, which resolves
+  `HOOK_ROOT` to the **MAIN worktree**, not the tree you are sitting in
+  (`HOOK_ROOT="$MAIN_ROOT"` unless `GENESIS_HOOK_DEV_LOCAL=1`). That is
+  deliberate — it stops per-branch hook drift, measured 2026-08 at 60 of 70
+  worktrees running a stale `full_suite_guard`. Three consequences:
+  (a) editing a guard in a worktree changes NOTHING until the branch reaches main;
+  (b) to exercise a guard change in place, set `GENESIS_HOOK_DEV_LOCAL=1` — it
+  runs the worktree copy and ANNOUNCES itself on stderr, so it is never a silent
+  downgrade; (c) **a main checkout behind `origin/main` runs a STALE gate in every
+  worktree** — MEASURED 2026-09-10 at 7,535 lines local vs 8,971 on `origin/main`,
+  a 1,436-line divergence that had been silently deciding every gate call. After
+  merging a PR, sync the main checkout, or the gate you are testing against is not
+  the gate that ships.
+  Two earlier versions of this bullet were wrong in opposite directions: one said
+  such an edit "changes nothing until `sync-hooks.sh` copies it" (wrong mechanism),
+  the replacement said it is "live on the very next Bash call" (wrong in every
+  worktree, which is where this repo mandates you work).
+- **`.github/**` and prompt surfaces are never "docs"** for the doc/config
+  auto-allow (`_is_docs_or_config` returns False for both). They are NOT
+  equivalent beyond that: only a PROMPT surface forces `substantial` and thereby
+  the depth gate. A lone sub-50-line `.github/` workflow edit classifies as
+  `inline` (its `_scope_tag` is `config`, which is not domain-sensitive), so
+  Rule 2.5 demands nothing. An earlier version said both "always reach the depth
+  gate", which over-states the workflow half.
 
-**CI is not one check.** Ten of eleven jobs block; only `review-depth-check` is
-advisory. Several are reproducible locally BEFORE pushing, which is far cheaper
-than a red PR:
+**CI is not one check.** `ci.yml` defines **15** jobs, of which **13 block** and
+**2 are `Advisory BY DESIGN` (exit 0 always)** — `review-depth-check` and
+`cc-pin-receipts`. (An earlier version said "ten of eleven … only
+`review-depth-check`", wrong on both halves; count the `jobs:` keys rather than
+trusting any prose figure, including this one.) Note that only THREE of the 13 —
+`test`, `leak-detector`, `lint` — are server-side REQUIRED status checks, so a
+red job outside that trio blocks the local gate but not GitHub. Several are
+reproducible locally BEFORE pushing, which is far cheaper than a red PR:
 
 ```bash
 ruff check src/ tests/ scripts/
@@ -2379,7 +2440,7 @@ written as GitHub config is one versioned thing that binds identically for
 everyone and cannot drift between installs. MEASURED on this repo: hook WIRING
 had silently diverged between two installs in a security hook, which is
 invisible to CI because the scripts are tracked and the wiring is not.
-`git_push_guard.py` is 8,222 lines (measured 2026-09-09), and the fraction of it that only reads GitHub
+`git_push_guard.py` is 8,971 lines (measured 2026-09-10; it was 8,222 on 09-09 — a figure in a durable doc is a claim with a date, re-measure rather than quote), and the fraction of it that only reads GitHub
 state is the fraction that never needed to be local.
 
 **How the layers actually split** — this is a division of labour, not a
@@ -2688,8 +2749,9 @@ the rest of it goes.
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
 BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses, in the gate's own order
 (mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
-Codex-freshness → head-binding → review-body → inline findings →
-scheduled-Claude-review), so the two read the same state —
+Codex-freshness → scheduled-Claude-review → review-body → inline findings),
+so the two read the same state — note this is the REPORT's order; the merge arm
+additionally applies the `--match-head-commit` binding, which has no report row —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
 before any merge** — never hand-roll a
@@ -2802,14 +2864,23 @@ findings below, a gated `gh pr merge`:
   canonical repo `absent`/`incomplete` fail open too (another repo may
   legitimately have no CI, or a differently-named suite). Waive with
   `# ci-override` (never `--admin`).
-- **Override sigils are split by boundary** so one waiver can't silently disarm
-  an unrelated gate: `# review-override` waives ONLY the finding scans
-  (review-body + inline P1s); `# stale-review-override` waives ONLY the
-  review-context gates (Codex-at-head freshness + base-invariant);
-  `# scheduled-review-override` waives ONLY the scheduled-Claude-review gate; CI is
-  `# ci-override`. Append several sigils in one trailing comment when several
-  waivers are genuinely intended — but the right fix for a stale review is
-  `@codex review`, not the sigil.
+- **Override sigils are split by boundary** — `# review-override` waives ONLY the
+  finding scans (review-body + inline P1s); `# scheduled-review-override` waives
+  ONLY the scheduled-Claude-review gate; CI is `# ci-override`. Append several in
+  one trailing comment when several waivers are genuinely intended.
+  **`# stale-review-override` is the EXCEPTION and is wider than its name.**
+  Besides Codex-at-head freshness and the base invariant, it also drops the
+  `--match-head-commit` TOCTOU binding — the guard's own module docstring says it
+  "waives that binding for ALL gates" — and un-pins the scheduled-review check
+  from head, making it point-in-time. Mechanically the merge arm only enforces
+  the binding `if verified_head:`, and the force path leaves that `None`. So
+  reaching for this sigil while believing the merge is still pinned to the
+  reviewed head is exactly the unsafe read: a concurrent push CAN swap in an
+  unreviewed head. It is a conscious "merge without current verification"
+  choice, and the right fix for a stale review is `@codex review`, not the sigil.
+  ⚠ An earlier version of this bullet claimed the split meant one waiver "can't
+  silently disarm an unrelated gate", and listed this sigil as waiving "ONLY"
+  the review-context gates. Both were false of this one sigil.
 
 The review-findings gate specifically:
 
@@ -2817,22 +2888,40 @@ The review-findings gate specifically:
    for automated review findings (ERROR, [P1], HARD BLOCK).
 2. If review present with **blocking findings** → merge is **BLOCKED**
    by the hook (exit code 2). Fix the findings first.
-3. Inline findings are SCORED — P1 = 1.0, P2 = 0.5 — and the gate blocks at
-   score >= 1.0 (a P1 on a code path, OR >= 2 P2s). A lone P2 is advisory (0.5,
-   allowed). A finding is excluded from the score when a MAINTAINER reply engages
-   it, or when it is on a DOCUMENTATION path — and the doc-path exclusion covers
-   **P1s as well as P2s** (`_is_doc_path`: CHANGELOG/README/LICENSE/NOTICE, any
-   `*.rst`, and `*.md` under a top-level `docs/`). Codex is a CODE reviewer by
-   standing user directive (2026-08-10, PR #1362), and that exclusion is how the
-   directive is enforced — but it is an ALLOWLIST OF PATHS, not a judgement about
-   prose, so "its prose findings never block" is broader than the gate. Prose
-   OUTSIDE the list still blocks, and the near misses are the files this repo
-   edits constantly: `AGENTS.md`, `.claude/skills/**/SKILL.md`, `.claude/**/*.md`
-   and any `*.md` outside a top-level `docs/` all return False from
-   `_is_doc_path`, so a P1 anchored on one contributes its full 1.0. Read the
-   PATH, not the file type — the paragraph below exists because a broader claim
-   than the code cost a session, and this sentence was the same mistake one
-   clause over. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
+3. Inline findings are SCORED and the gate blocks at score **>= 1.0**. THREE
+   things carry weight, and the third is missing from every prompt surface in
+   this repo — including, until 2026-09-10, this one:
+   **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR Major = 1.0 each**
+   (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`, `_CR_BLOCKING_WEIGHT = 1.0`).
+   So a lone Codex P2 is advisory (0.5), two block — and **a single CodeRabbit
+   Critical or Major blocks on its own, but ONLY from the INLINE endpoint.**
+   `_check_inline_review_findings` reads two channels and they are NOT symmetric:
+   `pulls/N/comments` (findings anchored inline) feeds the score, while the review
+   BODY — CodeRabbit's "Outside diff range comments", the findings it could not
+   anchor — is surfaced loudly and scores **0.0 at every severity**. The
+   `outside_critical` / `outside_major` accumulators appear in no term of
+   `score = len(p1) + 0.5*len(p2) + 1.0*len(cr_block)`, deliberately: an
+   undelivered finding has no comment thread, so there is no maintainer-reply
+   route to clear it. Read them anyway; nothing there will stop a merge. The
+   gate's own block message prints the whole formula; read it rather than
+   reciting this.
+   A finding is excluded from the score when a MAINTAINER reply engages it, or
+   when it is on a DOCUMENTATION path.
+   **`_is_doc_path` is ANY prose extension at ANY depth — not an allowlist of
+   directories.** OWNER DECISION 2026-09-04 (`815e0dbd2`, #1689) widened it:
+   `.md`/`.markdown`/`.rst`/`.adoc` anywhere, plus a known doc STEM
+   (CHANGELOG/README/LICENSE/…) with `.txt` or no extension. So `AGENTS.md`,
+   every `SKILL.md`, `CLAUDE.md` and all of `.claude/**/*.md` ARE doc paths — and
+   with the default `_DEFAULT_DOC_FINDINGS_MODE = "skip"` a finding on one NEVER
+   scores, at any severity. Findings are still SURFACED in every mode; the lever
+   decides only whether they COUNT.
+   ⚠ This paragraph previously stated the exact opposite — that those files
+   "return False from `_is_doc_path`, so a P1 anchored on one contributes its
+   full 1.0" — describing the pre-#1689 world. It was itself a correction of an
+   earlier error (see the callout below) and went stale the same way, which is
+   the point: **verify a gate claim against the symbol before relying on it, and
+   distrust this file most where it sounds most certain.**
+   Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
 
    **This paragraph used to say "any P1" blocks, which was FALSE, and the
    divergence cost a whole session.** A P1 anchored on `CHANGELOG.md` merged
@@ -2848,8 +2937,17 @@ The review-findings gate specifically:
    anchored on the sentence "the quiet path is a hand-edited overlay", which was
    false: the settings writer persisted `default: glm-5.2` alone, so settings-UI
    users hit the quiet path too. Correctly non-blocking; still needed fixing.
-4. If no review comments at all (quota exhausted) → merge allowed
-   on CI alone. Note in PR that review was quota-limited.
+4. **An ABSENT review BLOCKS — it does not merge on CI alone.**
+   `_check_codex_reviewed_head` returns a block for `if not reviewed`, whatever
+   the reason for the absence (quota, never triggered, still running). The only
+   things that clear it are a review at head, a clean re-review comment naming
+   head, a provably review-trivial delta since a stale review, or a conscious
+   `# stale-review-override`.
+   ⚠ This item previously read "no review comments at all (quota exhausted) →
+   merge allowed on CI alone", which is FALSE and contradicted the Pre-Merge Gate
+   section above ("an ABSENT review always blocks") four hundred lines earlier.
+   A quota message is evidence about ONE channel at ONE moment, never a licence
+   to merge unreviewed — re-trigger and check the INLINE endpoint.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
    The override is logged — one metadata row per sigil, written as one file per

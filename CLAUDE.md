@@ -496,6 +496,12 @@ every emitter's arithmetic, so this class cannot go quiet again.
   whether one was requested. It reads published reviews only, so "never triggered"
   and "triggered, still running" are the SAME output; if you have not just requested
   one, request one rather than reading that line as proof nobody did.
+  **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
+  own schedule, and a single CodeRabbit **Critical or Major** scores 1.0 — enough to
+  block a merge by itself, the same weight as a Codex P1. Until 2026-09-10 it was
+  named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
+  "review is clear" and were surprised by the score. Read the `inline-findings` row,
+  not just the Codex row.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
