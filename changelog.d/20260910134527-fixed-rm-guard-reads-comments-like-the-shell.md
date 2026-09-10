@@ -39,11 +39,11 @@
   belonging to that nested command does not close the word around it — and a
   single quote-state slot read the nested opener as the outer closer, left
   quote mode early, and then mistook ordinary quoted data for the start of a
-  comment. That suppressed a real line continuation, which is the same
-  bypass direction as above: the flags split across the newline and the delete
-  stopped being recognised. Both spellings of the construct are handled, along
+  comment. The join was then skipped where the shell performs one, failing in
+  the same direction as above: the flags split across the newline and the
+  delete stopped being recognised. Both spellings of the construct are handled, along
   with parameter expansion, where the shell never starts a comment at all.
   Each was measured against the shell one at a time rather than generalised
   from the first, and the state each opens is asserted to close again — a
   context that never resets would disable comment recognition for the rest of
-  the command, which is a bypass in the other direction.
+  the command, which fails in the other direction.
