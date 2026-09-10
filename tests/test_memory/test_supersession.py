@@ -483,3 +483,74 @@ async def test_failed_supersede_link_does_not_invalidate(store, db):
         await store.store("new fact", "conversation", supersedes=old_id)
 
     assert not calls, "a failed link create must not dirty the cache"
+
+
+@pytest.mark.asyncio()
+async def test_dedup_short_circuit_still_supersedes(store, db):
+    """The dedup early-return skipped the supersede entirely.
+
+    ``store()`` returns at the dedup check ~300 lines above the supersede
+    block, so a correction whose content already existed deprecated nothing
+    while the caller was told the store succeeded. It is also the LIKELIEST
+    path, because retrying a failed supersede re-sends the same content.
+    """
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links, \
+         patch.object(MemoryStore, "_mark_superseded", new=AsyncMock()) as ms:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        # The content is already stored — the dedup short-circuit fires.
+        mock_mem.find_exact_duplicate = AsyncMock(return_value="pre-existing-id")
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        out = await store.store(
+            "a correction", "conversation", supersedes="old-memory-id",
+        )
+
+    assert out == "pre-existing-id"
+    ms.assert_awaited_once()
+    # and it must supersede TOWARD the memory that actually exists
+    assert ms.await_args[0][1] == "pre-existing-id"
+    # ...with the successor check ON, because that successor was chosen by
+    # find_exact_duplicate rather than minted by this call.
+    assert ms.await_args.kwargs["verify_successor"] is True
+
+
+@pytest.mark.asyncio()
+async def test_dedup_path_supersede_failure_does_not_duplicate(store, db):
+    """A supersede failure on the dedup path must not reach the store pipeline.
+
+    Found in review of PR #1831. The supersede call added to the dedup path sat
+    INSIDE the ``try`` whose handler is a bare ``except Exception``, so a
+    supersede failure was caught there, logged as "Dedup check failed"
+    (misattributing the cause to a lookup that had just succeeded), and fell
+    through into the full store pipeline — writing a SECOND copy of content the
+    lookup had proved already existed.
+
+    ``create_metadata.assert_not_awaited()`` is the duplication itself, not a
+    proxy for it.
+    """
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        # The content is already stored — the dedup short-circuit fires.
+        mock_mem.find_exact_duplicate = AsyncMock(return_value="pre-existing-id")
+        # ...and the handle names no memory: the resolver's NOT_FOUND verdict.
+        mock_mem.resolve_id = AsyncMock(return_value=([], "not_found"))
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        out = await store.store(
+            "a correction", "conversation", supersedes="deadbeef",
+        )
+
+    mock_mem.create_metadata.assert_not_awaited()
+    assert out == "pre-existing-id", "the surviving memory must be returned"
+    mock_mem.mark_superseded.assert_not_awaited()

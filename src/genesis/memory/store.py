@@ -76,7 +76,11 @@ _COLLECTION_MAP = {
 
 
 class SupersedeUnresolved(Exception):
-    """``supersedes`` named no memory, or named several.
+    """A supersede could not be performed on the pair it was given.
+
+    Either ``supersedes`` named no memory or named several, or the SUCCESSOR
+    cannot carry the correction (it is the target itself, or already
+    deprecated).
 
     Raised BEFORE ``_mark_superseded`` writes anything, and — on the ``store()``
     path — AFTER the new memory is durably stored, so it describes a partial
@@ -97,7 +101,11 @@ class SupersedeUnresolved(Exception):
         truncated: bool = False,
     ):
         self.raw_id = raw_id
-        self.reason = reason  # "not_found" | "ambiguous"
+        # "not_found" | "ambiguous" | "self_supersede" | "successor_deprecated".
+        # The last two are validation of the SUCCESSOR rather than the target,
+        # and they exist because the dedup short-circuit supplies an EXISTING
+        # memory as the successor — one the caller never chose and never saw.
+        self.reason = reason
         # The memory that DID land. Carried so a reporting layer can hand the
         # caller its id without a second lookup — without it the caller has a
         # failure and no handle on the content it just wrote.
@@ -212,17 +220,52 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
+        # Dedup: skip if exact content already stored (any collection).
+        # The LOOKUP is what is best-effort, and only the lookup is inside this
+        # guard. The supersede below deliberately sits OUTSIDE it: a handler
+        # wrapped around both would catch a supersede failure, mislabel it
+        # "Dedup check failed", and fall through into the full store pipeline —
+        # writing a SECOND copy of content the lookup had just proved already
+        # exists. That is on the exact path a caller retries a correction on.
+        existing: str | None = None
         try:
             existing = await memory_crud.find_exact_duplicate(
                 self._db, content=content,
             )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                return existing
         except Exception:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+            existing = None
+
+        if existing:
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            if supersedes:
+                # The supersede still has to happen. This early return sits
+                # ~300 lines above the supersede block, so a correction whose
+                # content already exists deprecated NOTHING while the caller
+                # was told the store succeeded. And it is the LIKELIEST path:
+                # retrying a failed supersede re-sends the same content with a
+                # corrected id, which lands exactly here.
+                try:
+                    # verify_successor: on THIS path the successor is not a
+                    # memory we just wrote — it is whatever find_exact_duplicate
+                    # matched, which consults neither the supersede target nor
+                    # the deprecation column. It can therefore be the target
+                    # itself, or an already-deprecated row. See _mark_superseded.
+                    await self._mark_superseded(
+                        supersedes, existing, datetime.now(UTC).isoformat(),
+                        verify_successor=True,
+                    )
+                except Exception:
+                    # Mirrors the normal supersede path below: a failed
+                    # deprecation must not turn a durable store into a raised
+                    # error, which reads as "the store failed" and invites a
+                    # duplicating retry.
+                    logger.warning(
+                        "Failed to mark memory %s as superseded by %s",
+                        supersedes, existing, exc_info=True,
+                    )
+            return existing
 
         # Surface form normalization: expand known aliases before embedding
         try:
@@ -545,6 +588,8 @@ class MemoryStore:
         old_id: str,
         new_id: str,
         timestamp: str,
+        *,
+        verify_successor: bool = False,
     ) -> None:
         """Mark *old_id* as superseded by *new_id* in both SQLite and Qdrant.
 
@@ -557,6 +602,16 @@ class MemoryStore:
         unresolvable handle can no longer leave a ``succeeded_by`` edge whose
         source is not a memory (the only artifact the broken path used to
         produce).
+
+        ``verify_successor`` — check that *new_id* is a live memory before
+        deprecating anything. OFF by default because the normal path passes a
+        uuid4 it has just written, so the check would be a query per supersede
+        to prove something structurally guaranteed. The DEDUP path is the one
+        that needs it: there the successor is whatever ``find_exact_duplicate``
+        matched, and that query (``crud/memory.py``) selects on content length
+        and prefix ONLY — it consults neither *old_id* nor the ``deprecated``
+        column, so it can hand back the supersede target itself or an already
+        deprecated row.
         """
         # Resolve short handles FIRST. The proactive hook prints memories as
         # `id:<8-char>` and memory_expand resolves those on the read side, so
@@ -571,6 +626,26 @@ class MemoryStore:
         if outcome == _NOT_FOUND:
             raise SupersedeUnresolved(old_id, "not_found", new_id)
         old_id = matches[0]
+
+        # A memory cannot replace itself. Checked AFTER resolution, because the
+        # collision arrives through a HANDLE: the caller sends content identical
+        # to memory X with supersedes=<prefix of X>, the dedup short-circuit
+        # matches X, and old and new are the same row. MEASURED before the
+        # guard: deprecated=1, superseded_by pointing at itself, and a
+        # self-referential succeeded_by edge. The memory is then invisible to
+        # recall and names itself as its own correction.
+        if old_id == new_id:
+            raise SupersedeUnresolved(old_id, "self_supersede", new_id)
+
+        # The successor must be able to CARRY the correction. A deprecated row
+        # is filtered out of normal recall, so superseding onto one deprecates
+        # the target and leaves the correction unreachable — both halves gone.
+        # Only the dedup path can produce this (see the ``verify_successor``
+        # note above), so only it pays for the lookup.
+        if verify_successor:
+            new_meta = await memory_crud.get_metadata(self._db, new_id)
+            if new_meta is None or new_meta["deprecated"]:
+                raise SupersedeUnresolved(old_id, "successor_deprecated", new_id)
 
         # SQLite: mark deprecated + record successor (via CRUD module).
         # The return value says whether the row was FOUND — discarding it was
