@@ -877,8 +877,11 @@ verified: 788dd9a9 2026-09-06
   independent, same tick, own sidecar cursor) additionally surfaces activity
   BEYOND owned repos — @mentions anywhere plus responses on the owner's OUTBOUND
   contributions (`reason=author` on non-owned repos; owner-repo author items are
-  dropped as the deep-poll already has them) — resolving the actor via the
-  notification's `latest_comment_url` and pinging immediately in `live`.
+  dropped as the deep-poll already has them). It reports a thread only when
+  somebody who is NOT the owner and NOT automation acted on it inside the window
+  the notification covers, reading the thread's comment, review and timeline
+  surfaces to decide; a read it could not complete yields a digest row rather
+  than a drop, since dropping asserts absence. Pings immediately in `live`.
   `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
 - **recon/career_outreach.py** (`CareerOutreachMonitor`) — the recon entry that
