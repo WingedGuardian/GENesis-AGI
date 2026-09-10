@@ -11,6 +11,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Four job-management tools were missing from Claude Code sessions entirely.**
+  `user_job_create`, `user_job_list`, `user_job_control` and `user_job_history`
+  were written, tested and wired into the server — but never reached the tool
+  registry a session actually sees, so calling them was impossible. Nothing
+  reported an error; they simply were not there. They appear at the next session
+  start. Two guards were added so a tool cannot ship invisible this way again,
+  and the second of them found eleven startup steps that had been reporting
+  success without checking anything.
+
+- **A module's configured timeout is now honoured for shell operations.** Any
+  module talking to another machine over SSH had its `timeout:` setting ignored
+  for shell commands and was capped at 30 seconds regardless — so a module
+  configured for five minutes was quietly cut off at thirty seconds, and the
+  error looked like an ordinary timeout rather than a setting being overridden.
+  Health checks keep a short budget of their own, so a machine that stops
+  responding cannot hold up the modules page. Timeout errors now say how long
+  they waited, and a connection that goes silent mid-command gives up in about
+  fifteen seconds instead of waiting for the network to time out.
+
+- **Output from another machine can no longer crash the caller.** If a remote
+  command returned anything that was not valid UTF-8 — routine on Windows, where
+  the console re-encodes text on its way out — the failure escaped as an
+  unhandled exception instead of the error result every caller expects.
+
 - **SECURITY.md described a posture the code left behind two months ago.** The
   security policy told operators to treat the dashboard API as
   "unauthenticated administrative access" and said the dashboard password

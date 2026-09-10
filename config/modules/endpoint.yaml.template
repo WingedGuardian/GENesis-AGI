@@ -1,0 +1,79 @@
+# Endpoint module — a MACHINE Genesis operates on, not a service it calls.
+#
+# TEMPLATE ONLY. Copy this to ~/.genesis/config/modules/<machine>.yaml and fill
+# it in there. Real instances never live in the repo: they carry credentials and
+# machine identities, which is the same reason the live external modules are
+# declared in the install overlay rather than here.
+#
+# ONE FILE PER MACHINE. The archetype is cloned by copying this file, not by
+# subclassing — a second machine is a second YAML with its own identity and
+# network. The loader dedupes by FILENAME and the registry keys by `name`, so
+# both must be distinct per instance.
+
+name: My Endpoint            # unique per instance; the registry key
+type: external
+adapter: windows-endpoint    # selects WindowsEndpointAdapter. An UNKNOWN value
+                             # here is refused outright rather than falling back
+                             # to a plain module — a module that registers and
+                             # cannot dispatch is the least debuggable failure
+                             # there is. Named by DIALECT: the commands are
+                             # PowerShell and the byte budget is a cmd.exe
+                             # number, so a POSIX endpoint needs its own adapter.
+description: >
+  A machine Genesis can dispatch missions to over SSH.
+
+ipc:
+  method: ssh
+  ssh_host: "user@host-or-ip"    # key on a STABLE identity, never a DHCP lease
+  ssh_key: "~/.ssh/id_ed25519"
+  ssh_connect_timeout: 10
+  timeout: 120                   # honoured by SHELL operations
+
+endpoint:
+  # WINDOWS PATHS: use SINGLE quotes (or none). In a DOUBLE-quoted YAML scalar a
+  # backslash starts an escape sequence, so "C:\Users\..." fails to parse the
+  # WHOLE file (\U wants 8 hex digits) and the module is skipped with a warning
+  # you may not notice. Single-quoted YAML has no escapes at all.
+  #
+  # Where the device reads its request and writes its reply. It is embedded in a
+  # remote cmd.exe -> PowerShell string literal, so quote characters (including
+  # the smart-quote homoglyphs a copy-paste introduces), '%' and control
+  # characters are REFUSED rather than escaped. All three were measured on
+  # hardware: U+2019 terminates the literal, and cmd.exe expands %VAR% before
+  # PowerShell ever sees the path.
+  state_dir: 'C:\Users\<user>\AppData\Local\Genesis\desktop'
+
+  # The STATIC command that runs one mission. Parameters do NOT travel here —
+  # the payload is written to request.json first, because a SHELL operation's
+  # `data` is dropped by the transport and a manifest command is static by
+  # construction.
+  mission_command: 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\scripts\genesis-act.ps1'
+
+  # STABLE per-machine identity, and it must NOT be a hostname. Two machines on
+  # one install can share a Windows COMPUTERNAME, in which case anything keyed
+  # on hostname merges them and one machine's state overwrites the other's.
+  # Windows: (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid
+  # Linux:   /etc/machine-id
+  machine_id: "REPLACE-WITH-A-UNIQUE-PER-MACHINE-ID"
+
+  # Reachability is enforced, not assumed. A host on neither list is refused,
+  # and so is one that does not resolve — an endpoint is a machine we operate,
+  # never a public address.
+  allowed_networks: [lan, tailnet]
+
+# NO health_check BLOCK, deliberately. Configuring one activates the inherited
+# SSH probe, which runs `<remote_claude_path> --version` — a Claude Code check,
+# not a machine check. On a Windows endpoint that returns non-zero, so the module
+# would register permanently unhealthy and refuse every operation while the
+# dashboard showed an error. WindowsEndpointAdapter overrides check_health with a
+# probe that asks the right question (is the state dir reachable), which is
+# exactly the precondition a mission needs.
+
+lifecycle:
+  ssh_host: "user@host-or-ip"
+  ssh_key: "~/.ssh/id_ed25519"
+  source_dir: "C:\\scripts"
+
+# Ships DISABLED. Enable deliberately, per machine, once its device-side scripts
+# are deployed and verified.
+enabled: false
