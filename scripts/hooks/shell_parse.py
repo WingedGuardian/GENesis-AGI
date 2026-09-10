@@ -1402,11 +1402,31 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #: hex-encoded verb "the one residual" and was already wrong when written. An
 #: earlier revision of THIS comment claimed the two characters covered the class
 #: and was falsified in review by BRACE expansion, which generates words without
-#: either of them. So the honest statement is the constructs COVERED, each named,
-#: and the ones deliberately left, each with its reason:
+#: either of them. A LATER revision then listed brace expansion as COVERED without
+#: qualification, and was falsified the same way: it is covered in VERB POSITION,
+#: and a brace group in an option's VALUE slot is a different, open case. Twice is
+#: a pattern, so the columns below name a POSITION as well as a construct.
 #:
-#:   COVERED  substitution        here, via these two characters
-#:   COVERED  brace expansion     :func:`_has_brace_expansion` — ``{a,b}``, ``{a..b}``
+#:   COVERED  substitution        in verb position, via these two characters
+#:   COVERED  brace expansion     in verb position, via :func:`_has_brace_expansion`
+#:                                — ``{a,b}``, ``{a..b}``
+#:   LEFT     ANY expansion in a  A value-taking option's value is skipped unread
+#:            VALUE slot          (see :func:`_verb_unresolved`), so an expansion
+#:                                there can INJECT a verb the parse never sees —
+#:                                ``git -C <expansion producing "x <verb>"> …`` runs
+#:                                the verb with argv intact. PRE-EXISTING and not
+#:                                made worse here: measured base-vs-branch, these
+#:                                shapes are ALLOW on both. Left because the price is
+#:                                the wrong shape — MEASURED over 129,179 real
+#:                                commands, flagging a non-literal value slot fires on
+#:                                711 of them (0.55%, 0.44% of invocations), against
+#:                                15 for everything this module currently moves. The
+#:                                dominant shape is ``git -C $WT`` on a worktree path,
+#:                                which is ordinary work here, so closing it would
+#:                                trade a 47x over-block for a residual nothing in the
+#:                                corpus exercises. `_word_continues` covers only the
+#:                                narrow sub-case where the value is the unterminated
+#:                                HEAD of a split word.
 #:   LEFT     tilde expansion     applies only at the start of a word and only up to
 #:                                the first ``/``, which is strictly ahead of the
 #:                                basename :func:`_basename` reads. ``~/venv/bin/python``
@@ -1560,7 +1580,21 @@ def _word_continues(token: str) -> bool:
     parentheses NOT opened by ``$`` — ``--format=%(refname)`` is data, and treating
     its parens as syntax is how a rule like this starts flagging ordinary work.
     MEASURED over 129,179 real commands: this adds ZERO flags on top of the verb
-    rule, so it closes the position-shift case at no cost at all.
+    rule.
+
+    WHAT IT CLOSES, stated narrowly because a wider claim was wrong. It closes the
+    case where the skipped value is the unterminated HEAD of a split word — nothing
+    more. It does NOT close "the position-shift case" in general, which an earlier
+    revision of this docstring claimed: a value that is a plain ``$VAR`` or a brace
+    group is a single, terminated token, so neither test here fires, and the walk
+    skips it and runs out of words. A value that EXPANDS to several words then
+    injects a verb the parse never sees at all. That is the LEFT-column entry beside
+    :data:`_EXPANSION_MARKS`, it is PRE-EXISTING rather than introduced here, and the
+    711-command price of closing it is recorded there.
+
+    Zero added flags is therefore not evidence of coverage. It is what a narrow test
+    costs, and the two facts are easy to confuse — which is how the wider claim got
+    written next to the smaller number in the first place.
     """
     depth = 0
     saw_sub = False

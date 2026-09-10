@@ -1080,6 +1080,18 @@ _HIDDEN_GH_VERB = [
 # and a rule that flagged it would be switched off within a week.
 _BENIGN_EXPANSIONS = [
     ("message_argument", f'{GIT} {COMMIT} -m "$MSG"'),
+    # CHARACTERIZATION, NOT A REQUIREMENT. A value-taking option's value is
+    # skipped unread, so an expansion there can inject a verb the parse never
+    # sees. That residual is PRE-EXISTING — measured base-vs-branch, these shapes
+    # are ALLOW on both — and left deliberately: flagging a non-literal value slot
+    # fires on 711 of 129,179 real commands (0.55%), dominated by `-C $WT` on a
+    # worktree path, against 15 for everything this module currently moves.
+    #
+    # This row pins what the guard does TODAY so the measured cost stays honest.
+    # It does NOT say the shape ought to pass. Anyone closing the residual should
+    # DELETE this row and add the shape to the hidden-verb list above — not argue
+    # with a green test. The reasoning and the price are beside
+    # `shell_parse._EXPANSION_MARKS`, in its LEFT column.
     ("dash_C_value", f"{GIT} -C $DIR status"),
     ("gh_api_endpoint", "gh api repos/o/r/issues/$n/comments --jq .[].body"),
     ("tilde_exe_path", "~/venv/bin/python -m pytest tests/x.py"),
