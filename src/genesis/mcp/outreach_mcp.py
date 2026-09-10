@@ -501,7 +501,7 @@ async def outreach_queue(
 
 
 @mcp.tool()
-async def outreach_pending() -> list[dict]:
+async def outreach_pending(limit: int = 50, offset: int = 0) -> dict:
     """List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
 
     Deliberately a separate tool from ``outreach_queue``, which reads
@@ -516,26 +516,51 @@ async def outreach_pending() -> list[dict]:
     next drain tick", so it sorts FIRST — ordering on ``deliver_after`` directly
     would push the imminent messages behind everything scheduled for next month,
     and the LIMIT would then drop exactly the ones worth cancelling.
+
+    PAGED, with a denominator. Returns
+    ``{items, total, offset, limit, truncated}`` — never a bare list. A bare list
+    capped at 50 is indistinguishable from a complete one, so a caller with 60
+    queued messages would have concluded it had seen them all and that the missing
+    ten did not exist; and since every id worth cancelling comes from this tool,
+    the invisible ones were also the uncancellable ones. ``total`` is the real
+    count and ``truncated`` says outright whether more remain; page with ``offset``.
     """
     if not _db:
-        return [{"error": "not initialized"}]
+        return {"error": "not initialized"}
+    try:
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
     try:
         from genesis.db.crud import pending_outreach
 
         await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        where = "WHERE delivered = 0 AND cancelled_at IS NULL"
+        count_cursor = await _db.execute(
+            f"SELECT COUNT(*) FROM pending_outreach {where}"  # noqa: S608 — literal
+        )
+        total = int((await count_cursor.fetchone())[0])
         cursor = await _db.execute(
-            """SELECT id, category, channel, urgency, deliver_after, created_at,
+            f"""SELECT id, category, channel, urgency, deliver_after, created_at,
                       substr(message, 1, 160) AS message_preview
                  FROM pending_outreach
-                WHERE delivered = 0
-                  AND cancelled_at IS NULL
+                {where}
                 ORDER BY COALESCE(deliver_after, created_at) ASC, created_at ASC
-                LIMIT 50"""
+                LIMIT ? OFFSET ?""",  # noqa: S608 — `where` is a literal above
+            (limit, offset),
         )
         columns = [d[0] for d in cursor.description]
-        return [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
+        items = [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(items) < total,
+        }
     except Exception as exc:
-        return [{"error": f"Query failed: {exc}"}]
+        return {"error": f"Query failed: {exc}"}
 
 
 @mcp.tool()
@@ -560,7 +585,7 @@ async def outreach_cancel(pending_id: str) -> str:
                           cannot verify.
       unknown_id        — no such pending message
 
-    Get ids from ``outreach_pending``.
+    Get ids from ``outreach_pending`` (paged: check its ``truncated`` flag).
     """
     if not _db:
         return json.dumps({"error": "not initialized"})

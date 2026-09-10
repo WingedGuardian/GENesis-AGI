@@ -1000,3 +1000,34 @@ async def test_perimeter_profiles_deny_every_outreach_tool_but_the_reply_actuato
             "attacker-controlled inbound content. Add each to a _NO_OUTREACH_* group, "
             "or to _PERIMETER_ALLOWED_OUTREACH with a written reason."
         )
+
+
+def test_no_background_profile_can_read_or_cancel_the_pending_queue():
+    """EVERY background profile must deny the queue controls — allowed set is empty.
+
+    PROFILES governs background sessions only; the owner's own interactive session
+    does not go through it. No background session has business reading what the
+    owner has scheduled or retracting it, so this is stated over ALL profiles
+    rather than over a hand-maintained perimeter list.
+
+    That distinction is the finding: enumerating the perimeter profile-by-profile
+    left `steward` reachable, and steward ingests external GitHub PR content and
+    can publish `gh` comments — so an injected PR body could read queued-message
+    previews out through a comment, or silently cancel the owner's alerts.
+    `interact` (arbitrary browser pages) and `campaign` (external platform
+    replies) have the same shape. Iterating PROFILES removes the judgement call,
+    and a NEW profile is covered the moment it is added.
+    """
+    queue_controls = {
+        "mcp__genesis-outreach__outreach_pending",
+        "mcp__genesis-outreach__outreach_cancel",
+    }
+    gaps = {
+        profile: sorted(queue_controls - set(denied))
+        for profile, denied in PROFILES.items()
+        if queue_controls - set(denied)
+    }
+    assert not gaps, (
+        "background profile(s) can reach the pending-queue controls: "
+        f"{gaps}. Add _NO_OUTREACH_QUEUE_CONTROL to each."
+    )

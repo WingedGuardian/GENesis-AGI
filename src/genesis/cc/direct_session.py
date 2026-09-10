@@ -223,13 +223,6 @@ _NO_OUTREACH_ENGAGEMENT = [
     "mcp__genesis-outreach__outreach_engagement",
     "mcp__genesis-outreach__outreach_preferences",
     "mcp__genesis-outreach__outreach_queue",
-    # outreach_pending lists the QUEUED messages (id + a message preview) and
-    # outreach_cancel retracts one. Denied alongside outreach_queue for the same
-    # reason: a profile that may not read delivered history has no business
-    # reading the pending queue either, and cancel is a destructive write on
-    # owner-facing alerts.
-    "mcp__genesis-outreach__outreach_pending",
-    "mcp__genesis-outreach__outreach_cancel",
 ]
 
 _NO_RECON_WRITES = [
@@ -256,10 +249,26 @@ _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-outreach__outreach_poll",
     "mcp__genesis-outreach__outreach_digest",
-    # Queue introspection is an exfiltration surface — outreach_pending returns
-    # up to 50 queued messages with a preview of each, which an injected inbound
-    # message could have echoed back through the profile's own reply tool. Cancel
-    # is worse: it silently retracts the owner's queued reminders and alerts.
+]
+
+# The pending-queue controls: read what the owner has scheduled, or retract it.
+#
+# Denied on EVERY background profile, which is broader than the perimeter groups
+# above and deliberately so. PROFILES governs background sessions only — the
+# owner's own interactive session does not go through it — and no background
+# session has business reading or cancelling the owner's queued messages. So the
+# allowed set here is EMPTY, which makes the rule trivial to state and to test,
+# and costs nothing: both tools are new in this change, so nothing depends on
+# them.
+#
+# Scoped this way after review found `steward` still reachable: it ingests
+# external GitHub PR content and can publish `gh` comments, so an injected PR
+# body could read queued-message previews out through a comment or silently
+# cancel the owner's alerts. `interact` (arbitrary browser page content) and
+# `campaign` (external platform replies) carry the same shape. Enumerating the
+# perimeter profile-by-profile is what let steward slip; denying everywhere and
+# testing for it removes the judgement call entirely.
+_NO_OUTREACH_QUEUE_CONTROL = [
     "mcp__genesis-outreach__outreach_pending",
     "mcp__genesis-outreach__outreach_cancel",
 ]
@@ -315,16 +324,19 @@ PROFILES: dict[str, list[str]] = {
         + _NO_OUTREACH_ENGAGEMENT
         + _NO_RECON_WRITES
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     "research": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
-    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
+    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
     # grants Bash (so it can run `gh`) — every other profile blocks Bash.
@@ -337,6 +349,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_BROWSER_INTERACTION
         + _NO_FILE_WRITE
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
@@ -361,6 +374,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_OUTREACH_EXTRAS
         + _NO_PROVISIONING
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -380,6 +394,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_OUTREACH_EXTRAS
         + _NO_PROVISIONING
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
 }
 
