@@ -36,6 +36,12 @@ automation_denylist: []
 # Loud-truncation cap: activity events processed per tick.
 max_events_per_tick: 100
 
+# Separate cap for the account-level notifications lane. Resolving ONE
+# notification reads up to four comment/action surfaces plus the thread object,
+# so this is deliberately much smaller than max_events_per_tick above — reusing
+# that value would mean hundreds of serial `gh` invocations in a single tick.
+max_notifications_per_tick: 25
+
 # Account-level notifications lane — surfaces activity BEYOND the flagship repos:
 # @mentions of the owner anywhere, and responses on issues/PRs the owner authored
 # on OTHER people's repos (their outbound contributions). The flagship deep-poll

@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.test_hooks.conftest import OffDiffLock
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_pr_files(monkeypatch):
@@ -102,6 +104,26 @@ def _rc(code: int) -> subprocess.CompletedProcess:
 def _proc(code: int, out: str = "") -> subprocess.CompletedProcess:
     """A fake CompletedProcess carrying a returncode and stdout."""
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=out)
+
+
+def _argv_for_endpoint(run_mock, endpoint: str) -> list[str]:
+    """The argv of the mocked ``subprocess.run`` call that fetched ``endpoint``.
+
+    The inline finding scan issues MORE THAN ONE gh call (``pulls/N/comments``
+    for inline findings, ``pulls/N/reviews`` for the outside-diff channel), so
+    ``run_mock.call_args`` — the LAST call — is not reliably the one a given
+    assertion is about. Selecting by endpoint makes the test say which request
+    it grades; a test that graded whichever call happened to be last would go
+    green or red for reasons unrelated to its own name.
+    """
+    for call in run_mock.call_args_list:
+        argv = call[0][0] if call[0] else []
+        if any(endpoint in str(tok) for tok in argv):
+            return list(argv)
+    raise AssertionError(
+        f"no mocked subprocess call fetched {endpoint!r}; "
+        f"calls were: {[c[0][0] if c[0] else [] for c in run_mock.call_args_list]}"
+    )
 
 
 def _config_run(values: dict, default: tuple = (1, "")):
@@ -1207,6 +1229,72 @@ class TestCheckInlineReviewFindings:
     boilerplate — 173 findings passed the gate unseen before this
     (2026-07-10 audit)."""
 
+    # Every path this class anchors a finding on. Pinned as IN the PR's diff
+    # by the autouse fixture below.
+    _FINDING_PATHS = [
+        "src/benign.py",
+        "src/genesis/foo.py",
+        "src/genesis/a.py",
+        "src/genesis/router.py",
+        "CHANGELOG.md",
+        "README.md",
+        "NOTES.md",
+        "AGENTS.md",
+        "LICENSE",
+        "LICENSE.txt",
+        "README.txt",
+        "guide.rst",
+        "docs/CURRENT.md",
+        "docs/architecture/x.md",
+        "docs/conf.py",
+        "docs/conf.py\n",
+        "docs/build.rs",
+        "docs/config.yaml",
+        "docs/notebook.ipynb",
+        "docs/init.sql",
+        "docs/Script.java",
+        "docs/deploy.ps1",
+        "docs/Makefile",
+        "docs/requirements.txt",
+        "docs/constraints.txt",
+        "docs/CMakeLists.txt",
+        "docs/meson_options.txt",
+        "docs/guide.txt",
+        "docs/README.txt",
+        "docs/guide\x7f.md",
+        "docs/guide\x85.md",
+        "docs/guide\x9f.md",
+        # changelog.d/ — the fragment directory this branch introduces. Both are
+        # required here, and for different reasons: without the .md entry the
+        # not-block test passes through the OFF-DIFF lane and proves nothing about
+        # the documentation exemption it exists to pin, and without the .py entry
+        # the still-blocks test simply fails.
+        "changelog.d/20260904210000-fixed-thing.md",
+        "changelog.d/generate.py",
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _findings_are_in_diff(self, monkeypatch):
+        """Pin this class's finding paths as IN the PR's changed-file set.
+
+        This class tests severity parsing, engagement, and the doc-path lever —
+        all semantics of findings on files the PR touches. Diff SCOPING is
+        ``TestDiffScopedInlineFindings``' subject (issue #1728); without this
+        fixture its arrival would divert these cases to the off-diff lane and
+        they would test nothing they name. A new test anchoring a finding on a
+        new path adds it to ``_FINDING_PATHS``. A miss fails loudly ONLY in a
+        test that asserts a block or a lane marker — the off-diff lane also
+        yields ``not block``, so a bare not-block assertion passes vacuously on
+        an unlisted path. That is why every not-block doc-path test below ALSO
+        asserts its doc-lane marker in stderr."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": p, "previous_filename": None})
+                for p in self._FINDING_PATHS
+            ),
+        )
+
     def _mock(self, guard_module, comments, rc=0):
         # gh api --paginate with a per-element jq filter emits one
         # compact JSON object per line across ALL result pages.
@@ -1416,17 +1504,24 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
 
-    def test_coderabbit_major_on_doc_path_does_not_block(self, guard_module):
+    def test_coderabbit_major_on_doc_path_does_not_block(self, guard_module, capsys):
         """Same doc-path treatment the Codex path already gets.
 
         Without this the two reviewers are inconsistent: a finding on CHANGELOG.md
         would block from one and not the other, for no stated reason.
+
+        The lane marker is asserted, not just the not-block: the OFF-DIFF lane
+        also yields ``not block``, so on its own ``assert not block`` would pass
+        whether the doc exemption fired or the path merely fell out of
+        ``_FINDING_PATHS``. The conftest lock catches that too; this assertion
+        states which lane the test is actually about.
         """
         with self._mock(
             guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="CHANGELOG.md")]
         ):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc CodeRabbit Critical/Major]" in capsys.readouterr().err
 
     # ── the body is a CODE-BEARING document, so the severity read is anchored ──
     #
@@ -1853,7 +1948,7 @@ class TestCheckInlineReviewFindings:
         assert "[doc P1]" in capsys.readouterr().err, "surfaced, never silently dropped"
 
     def test_p1_only_mode_a_doc_p1_blocks_but_a_doc_p2_does_not(
-        self, guard_module, monkeypatch
+        self, guard_module, monkeypatch, capsys
     ):
         """The middle setting, so it can be dialled back without another PR."""
         monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "p1_only")
@@ -1861,9 +1956,10 @@ class TestCheckInlineReviewFindings:
             assert guard_module._check_inline_review_findings("100")[0] is True
         with self._mock(guard_module, [self._codex(2, _P2_BODY, path="AGENTS.md")]):
             assert guard_module._check_inline_review_findings("100")[0] is False
+        assert "[doc P2]" in capsys.readouterr().err  # the doc lane, not off-diff
 
     def test_stricter_modes_apply_to_coderabbit_doc_findings_too(
-        self, guard_module, monkeypatch
+        self, guard_module, monkeypatch, capsys
     ):
         """The mode lever must govern BOTH reviewers (Codex P2, PR #1677 round 4).
 
@@ -1881,6 +1977,7 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="AGENTS.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block, "the default must keep doc findings non-blocking"
+        assert "[doc CodeRabbit Critical/Major]" in capsys.readouterr().err
 
     def test_score_mode_restores_the_old_behaviour(self, guard_module, monkeypatch):
         """Two doc P2s = 1.0 → blocks, exactly as two code P2s would."""
@@ -1968,7 +2065,11 @@ class TestCheckInlineReviewFindings:
         # page, which sequential pagination reaches.
         with self._mock(guard_module, []) as run_mock:
             guard_module._check_inline_review_findings("100")
-        argv = run_mock.call_args[0][0]
+        # Select the COMMENTS fetch explicitly. The scan also fetches
+        # pulls/N/reviews (the outside-diff channel), so `call_args` — the LAST
+        # call — is no longer this one; asserting against it silently graded the
+        # wrong request.
+        argv = _argv_for_endpoint(run_mock, "pulls/100/comments")
         assert "sort=created" not in argv
         assert "direction=desc" not in argv
         assert any("pulls/100/comments" in tok for tok in argv)
@@ -2015,22 +2116,60 @@ class TestCheckInlineReviewFindings:
         assert not block
         assert "documentation" in capsys.readouterr().err.lower()
 
-    def test_inline_p1_on_readme_does_not_block(self, guard_module):
+    # Every not-block doc-path test asserts its DOC-LANE marker too: the
+    # off-diff lane (issue #1728) also returns not-block, so the verdict alone
+    # cannot tell "exempt as documentation" from "diverted by an unlisted
+    # path in _FINDING_PATHS" (architect SF, 2026-09-06).
+
+    def test_inline_p1_on_readme_does_not_block(self, guard_module, capsys):
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="README.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
-    def test_inline_p1_under_docs_dir_does_not_block(self, guard_module):
+    def test_inline_p1_under_docs_dir_does_not_block(self, guard_module, capsys):
         with self._mock(
             guard_module, [self._codex(1, _P1_BODY, path="docs/architecture/x.md")]
         ):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
-    def test_inline_p1_on_rst_does_not_block(self, guard_module):
+    def test_inline_p1_on_rst_does_not_block(self, guard_module, capsys):
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="guide.rst")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
+
+    def test_inline_p1_on_a_changelog_fragment_does_not_block(self, guard_module, capsys):
+        # changelog.d/ holds one changelog entry per file — the same prose that
+        # would otherwise be a bullet in CHANGELOG.md. Covered by the general
+        # Markdown rule rather than by a rule of its own; pinned here because a
+        # PR carrying a fragment must never be blocked by a wording nit.
+        #
+        # THIS TEST IS WHY THE CONFTEST LOCK EXISTS. Measured on PR #1690: with
+        # the fragment path absent from _FINDING_PATHS it passed through the
+        # OFF-DIFF lane and proved nothing about the doc exemption it names.
+        # The `[doc P1]` assertion is what distinguishes the two lanes here.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/20260904210000-fixed-thing.md")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "[doc P1]" in capsys.readouterr().err
+
+    def test_inline_p1_on_a_non_markdown_file_in_changelog_d_still_blocks(
+        self, guard_module
+    ):
+        # The allowlist is extension-based, so a script that lands in that
+        # directory is not prose and must not inherit the exemption.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/generate.py")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
 
     def test_inline_p1_on_code_path_still_blocks(self, guard_module):
         with self._mock(
@@ -2040,7 +2179,7 @@ class TestCheckInlineReviewFindings:
         assert block
         assert "Make queue claim atomic" in msg
 
-    def test_inline_p1_on_a_markdown_file_no_longer_blocks(self, guard_module):
+    def test_inline_p1_on_a_markdown_file_no_longer_blocks(self, guard_module, capsys):
         """DELIBERATE REVERSAL (owner decision, 2026-09-04) of the old default.
 
         This test previously locked the opposite: a `*.md` outside `docs/` was NOT a
@@ -2061,6 +2200,7 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="NOTES.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     def test_inline_p1_on_code_under_docs_still_blocks(self, guard_module):
         # docs/conf.py is executable Python — a finding there must still block.
@@ -2095,8 +2235,26 @@ class TestCheckInlineReviewFindings:
         # the production fetch sends includes `path: .path`.
         with self._mock(guard_module, []) as run_mock:
             guard_module._check_inline_review_findings("100")
-        argv = run_mock.call_args[0][0]
+        argv = _argv_for_endpoint(run_mock, "pulls/100/comments")
         assert any("path: .path" in tok for tok in argv)
+
+    def test_outside_diff_channel_pins_its_endpoint_and_projection(
+        self, guard_module, monkeypatch
+    ):
+        """The PRODUCTION fetch for the review-body channel, not the test seam.
+
+        Without this, mutating either the endpoint path or the jq projection to
+        garbage leaves the whole suite green (measured: 456 passed with both
+        wrong) while the channel returns zero findings on every PR forever — a
+        silent clean read on a merge gate, which is the exact vacuous-green the
+        channel was built to remove. The seam that makes the other tests
+        hermetic is what hides this, so it is deleted for this one case."""
+        monkeypatch.delenv("_TEST_GH_PR_REVIEW_BODIES", raising=False)
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        argv = _argv_for_endpoint(run_mock, "pulls/100/reviews")
+        for field in ("login: .user.login", "body: .body", "state: .state"):
+            assert any(field in tok for tok in argv), f"projection lost {field!r}"
 
     # Fail-closed allowlist (security review HIGH): a NON-prose extension under
     # docs/ must still block — the exemption is an allowlist of doc extensions,
@@ -2124,10 +2282,11 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert block
 
-    def test_inline_p1_on_license_no_ext_does_not_block(self, guard_module):
+    def test_inline_p1_on_license_no_ext_does_not_block(self, guard_module, capsys):
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="LICENSE")]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     @pytest.mark.parametrize(
         "path",
@@ -2149,11 +2308,12 @@ class TestCheckInlineReviewFindings:
         assert block, f"{path!r} is an ambiguous .txt — must block"
 
     @pytest.mark.parametrize("path", ["LICENSE.txt", "README.txt", "docs/README.txt"])
-    def test_inline_p1_known_stem_txt_does_not_block(self, guard_module, path):
+    def test_inline_p1_known_stem_txt_does_not_block(self, guard_module, path, capsys):
         # A doc-named STEM pins the file as prose, so .txt is safe there.
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        assert "[doc P1]" in capsys.readouterr().err
 
     @pytest.mark.parametrize(
         "path",
@@ -2168,6 +2328,463 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert block
+
+
+# ── Diff-scoped inline findings (issue #1728) ─────────────────────────────
+#
+# Module-level comment factories for the class below. Same shapes as
+# TestCheckInlineReviewFindings' bound helpers (which carry no state);
+# duplicated as module functions rather than inherited, because subclassing
+# that class would re-run its entire suite under a second name.
+
+
+def _cr_c(cid, body, reply_to=None, path=None):
+    d = {
+        "id": cid,
+        "reply_to": reply_to,
+        "login": "coderabbitai[bot]",
+        "type": "Bot",
+        "body": body,
+    }
+    if path is not None:
+        d["path"] = path
+    return d
+
+
+def _codex_c(cid, body, reply_to=None, path=None):
+    d = {
+        "id": cid,
+        "reply_to": reply_to,
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot",
+        "body": body,
+    }
+    if path is not None:
+        d["path"] = path
+    return d
+
+
+def _mock_inline(guard_module, comments, rc=0):
+    return patch.object(
+        guard_module.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess(
+            args=[],
+            returncode=rc,
+            stdout="\n".join(json.dumps(c) for c in comments),
+            stderr="",
+        ),
+    )
+
+
+def _cr_major(title: str) -> str:
+    """A CodeRabbit Major body in the verbatim live header format, custom title."""
+    return f"_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_\n\n**{title}**\n\nDetails."
+
+
+class TestDiffScopedInlineFindings:
+    """A finding is SCORED only when its path is inside the PR's diff (issue #1728).
+
+    MEASURED on live PR #1541 (gate run 2026-09-05): the inline score reached 7.0
+    with 4 of 7 CodeRabbit Critical/Major findings anchored on files ABSENT from
+    the PR's diff — base-branch content stamped onto the PR by a merge of main.
+    The gate scored them at full weight because nothing compared a finding's
+    ``path`` to the PR's changed-file set.
+
+    The contract under test: off-diff findings are surfaced (labeled base-branch)
+    and excluded from the score; a missing/null path is always scored (a pathless
+    finding must never be silently discounted); an unreadable changed-file set
+    scores everything (status quo) and says so. The autouse ``_hermetic_pr_files``
+    fixture pins the changed-file set to ``src/benign.py``, the in-diff control.
+    """
+
+    # The off-diff vacuity lock (tests/test_hooks/conftest.py) is declared PER
+    # TEST below, never once for the class. A class-level blanket was written
+    # first and rejected in review: it exempted all 11 tests including future
+    # ones, and it was already covering a real instance of the very defect the
+    # lock exists for — `test_off_diff_codex_p2_pair_not_scored` asserted only
+    # `not block`, with nothing to distinguish "the P2s were correctly
+    # unscored" from "the P2 pattern stopped matching and there were no
+    # findings at all". Declaring per test keeps each exemption attached to the
+    # test that earned it.
+
+    def test_off_diff_coderabbit_major_not_scored(self, guard_module, capsys, offdiff_lock):
+        """RED before the fix: an off-diff Major blocked at full weight."""
+        offdiff_lock.expected()
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"off-diff CodeRabbit Major was scored: {msg}"
+        err = capsys.readouterr().err
+        assert "outside this PR's diff" in err
+        assert "src/other.py" in err
+
+    def test_in_diff_coderabbit_major_still_blocks(self, guard_module):
+        """The control: scoping must not blind the gate to in-diff findings."""
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/benign.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Track unresolved reparsing prefixes" in msg
+
+    def test_pathless_coderabbit_major_still_blocks(self, guard_module):
+        """No ``path`` key at all (file-level/outdated comment) → scored.
+
+        A pathless finding must never be silently discounted by a check that
+        needs a path to run.
+        """
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_null_path_coderabbit_major_still_blocks(self, guard_module):
+        """Explicit ``path: null`` (GitHub emits it on outdated comments) → scored."""
+        c = _cr_c(1, _CR_MAJOR_BODY)
+        c["path"] = None
+        with _mock_inline(guard_module, [c]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_unreadable_file_set_scores_everything_with_note(
+        self, guard_module, capsys, monkeypatch
+    ):
+        """Changed-file set unreadable → status quo (score all) + a loud NOTE.
+
+        Fail direction chosen deliberately: scoring everything is the STRICTER
+        direction, so an API failure can never let a real finding through —
+        it can only re-create the pre-fix behavior, announced.
+        """
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, "unreadable file set must keep the old scoring, not skip it"
+        assert "diff scoping unavailable" in capsys.readouterr().err
+
+    def test_off_diff_codex_p1_not_scored(self, guard_module, capsys, offdiff_lock):
+        """Codex findings get the same scoping — the mechanism is reviewer-agnostic."""
+        offdiff_lock.expected()
+        with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/other.py")]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"off-diff Codex P1 was scored: {msg}"
+        assert "outside this PR's diff" in capsys.readouterr().err
+
+    def test_off_diff_codex_p2_pair_not_scored(self, guard_module, capsys, offdiff_lock):
+        """Two off-diff P2s would sum to the 1.0 threshold — neither may score.
+
+        The `[off-diff P2]` assertion is load-bearing, not decoration: without
+        it, `not block` holds just as well when `_INLINE_P2_RE` stops matching
+        `_P2_BODY` and there are no findings at all. That is the vacuity this
+        file's lock exists to catch, and this test was a live instance of it
+        until a review round 2026-09-08 found it hiding under a class-wide
+        exemption.
+        """
+        offdiff_lock.expected()
+        comments = [
+            _codex_c(1, _P2_BODY, path="src/other.py"),
+            _codex_c(2, _P2_BODY, path="src/third.py"),
+        ]
+        with _mock_inline(guard_module, comments):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"off-diff P2 pair reached the threshold: {msg}"
+        assert "[off-diff P2]" in capsys.readouterr().err
+
+    def test_maintainer_replied_off_diff_excluded_silently(self, guard_module, capsys):
+        """Engagement is checked FIRST: a replied off-diff finding is already
+        handled, so it must not be re-listed in the off-diff NOTE either."""
+        comments = [
+            _cr_c(1, _CR_MAJOR_BODY, path="src/other.py"),
+            {
+                "id": 2,
+                "reply_to": 1,
+                "login": "owner",
+                "type": "User",
+                "assoc": "OWNER",
+                "body": "acknowledged — tracked in the base-branch issue",
+            },
+        ]
+        with _mock_inline(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "outside this PR's diff" not in capsys.readouterr().err
+
+    def test_empty_changed_file_set_scores_everything_with_note(
+        self, guard_module, monkeypatch, capsys
+    ):
+        """An EMPTY file set is treated as UNRESOLVABLE, not as an answer
+        (security review HIGH, 2026-09-06): a 200-with-zero-rows response is
+        indistinguishable from a transiently-degraded one, and the ambiguous
+        reading must never discount every finding on the PR. Scoped to this
+        check only — the hook-surface consumer keeps ``[]`` = "no hook files"
+        (an empty PR truly has none, and it fails closed on ``None``)."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "")
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/other.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, "empty file set must fail toward scoring, never discounting"
+        assert "diff scoping unavailable" in capsys.readouterr().err
+
+    def test_rename_source_counts_as_in_diff(self, guard_module, monkeypatch):
+        """A comment left on the pre-rename path still scores — the changed-file
+        set includes rename SOURCES via ``previous_filename``."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "src/new_name.py", "previous_filename": "src/old_name.py"}',
+        )
+        with _mock_inline(guard_module, [_cr_c(1, _CR_MAJOR_BODY, path="src/old_name.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    # ── Acceptance replay: PR #1541, the measured motivating case ──────────
+
+    # The PR's REAL changed-file list (gh api pulls/1541/files, 2026-09-06;
+    # 24 files, no renames) and the REAL paths of its 8 top-level CodeRabbit
+    # Major findings: 3 on files in the diff, 5 on base-branch files stamped
+    # by merges of main. Bodies use the verbatim live header format with
+    # synthetic titles — the load-bearing data here is the path set.
+    _PR1541_FILES = [
+        "CHANGELOG.md",
+        "config/model_routing.yaml",
+        "config/session_ledger_shadow.yaml",
+        "docs/architecture/CURRENT.md",
+        "scripts/genesis_precompact.py",
+        "scripts/ledger_shadow_report.py",
+        "src/genesis/db/crud/session_charters.py",
+        "src/genesis/db/crud/session_ledger_shadow.py",
+        "src/genesis/db/migrations/20260904231054_session_ledger_ambient_extractor.py",
+        "src/genesis/db/schema/_tables.py",
+        "src/genesis/mcp/health/session_charter_tools.py",
+        "src/genesis/mcp/health/settings.py",
+        "src/genesis/session_awareness/ledger_extractor.py",
+        "src/genesis/session_awareness/ledger_shadow_config.py",
+        "src/genesis/session_awareness/ledger_worker.py",
+        "src/genesis/session_awareness/repo_pulse_worker.py",
+        "src/genesis/session_charter.py",
+        "tests/test_db/test_migration_0059_session_ledger_shadow.py",
+        "tests/test_db/test_migration_ambient_extractor.py",
+        "tests/test_db/test_session_charters_crud.py",
+        "tests/test_scripts/test_ledger_shadow_report.py",
+        "tests/test_session_awareness/test_ledger_extractor.py",
+        "tests/test_session_awareness/test_ledger_shadow_config.py",
+        "tests/test_session_awareness/test_ledger_worker.py",
+    ]
+    _PR1541_IN_DIFF_MAJORS = [
+        "src/genesis/session_awareness/ledger_shadow_config.py",
+        "src/genesis/session_awareness/ledger_worker.py",
+        "src/genesis/session_awareness/ledger_worker.py",
+    ]
+    _PR1541_OFF_DIFF_MAJORS = [
+        ".github/workflows/ci.yml",
+        "scripts/genesis_session_context.py",
+        "src/genesis/db/crud/ego_intentions.py",
+        "src/genesis/db/migrations/0088_ego_intentions_origin.py",
+        "src/genesis/session_awareness/repo_pulse_gh.py",
+    ]
+
+    def test_acceptance_replay_pr1541(self, guard_module, capsys, monkeypatch, offdiff_lock):
+        """Replay #1728's measured defect: base-branch Majors drop from the
+        score, in-diff Majors still block.
+
+        With the full current comment set (8 Majors: 3 in-diff, 5 off-diff,
+        none replied) the pre-fix score is 8.0; scoped, it is 3.0 — still a
+        block, on exactly the findings that are this PR's to answer.
+        """
+        offdiff_lock.expected()  # 5 of the 8 Majors route off-diff by design
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps({"filename": f, "previous_filename": None})
+                for f in self._PR1541_FILES
+            ),
+        )
+        comments = []
+        for i, path in enumerate(self._PR1541_IN_DIFF_MAJORS):
+            comments.append(_cr_c(100 + i, _cr_major(f"in-diff finding {i}"), path=path))
+        for i, path in enumerate(self._PR1541_OFF_DIFF_MAJORS):
+            comments.append(_cr_c(200 + i, _cr_major(f"base-branch finding {i}"), path=path))
+        with _mock_inline(guard_module, comments):
+            block, msg = guard_module._check_inline_review_findings("1541")
+        assert block, "the 3 in-diff Majors must still block"
+        assert "review score 3.0" in msg
+        assert "3 CodeRabbit" in msg
+        err = capsys.readouterr().err
+        assert "5 CodeRabbit" in err and "outside this PR's diff" in err
+        assert "0088_ego_intentions_origin" in err
+
+
+class TestOffDiffLockItself:
+    """The lock is test infrastructure, so it needs its own lock.
+
+    ``OffDiffLock.MARKER`` is a string copied out of the guard's stderr format.
+    If that label is ever reworded, the lock stops matching and goes SILENTLY
+    blind — every vacuous test it exists to catch starts passing again, with no
+    failure anywhere to say so. That is the same class of silent-blindness the
+    lock was built to close, one layer up, so it is pinned against the guard's
+    REAL output rather than against a hand-copied literal.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _this_class_drives_the_off_diff_lane_on_purpose(self, offdiff_lock):
+        offdiff_lock.expected()
+
+    # EVERY discount lane, not just one. `_check_inline_review_findings` has
+    # three `_off_diff(...) -> continue` sites feeding three lists, each with
+    # its own printed label. A drift test that exercises only one proves
+    # `MARKER` matches THAT lane and says nothing about the others — so
+    # rewording the CodeRabbit label alone (the HIGHEST-weight lane, 1.0 each
+    # against a 1.0 block threshold) would leave the test green while the lock
+    # went blind exactly where it matters most. Found in review 2026-09-08.
+    @pytest.mark.parametrize(
+        ("comment_factory", "label"),
+        [
+            (lambda: _cr_c(1, _CR_MAJOR_BODY, path="src/not_in_the_diff.py"),
+             "[off-diff CodeRabbit Critical/Major]"),
+            (lambda: _codex_c(1, _P1_BODY, path="src/not_in_the_diff.py"), "[off-diff P1]"),
+            (lambda: _codex_c(1, _P2_BODY, path="src/not_in_the_diff.py"), "[off-diff P2]"),
+        ],
+        ids=["coderabbit_major", "codex_p1", "codex_p2"],
+    )
+    def test_marker_matches_the_guard_s_real_off_diff_output(
+        self, guard_module, capsys, comment_factory, label
+    ):
+        """Drift guard: run each real lane, match the real bytes.
+
+        RED if anyone rewords an `[off-diff …]` label without updating MARKER.
+        """
+        with _mock_inline(guard_module, [comment_factory()]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block, "precondition: an off-diff finding is not scored"
+
+        err = capsys.readouterr().err
+        assert label in err, f"lane label drifted: {label!r} is no longer printed"
+        probe = OffDiffLock()
+        probe.record(err)
+        assert probe.routed_off_diff, (
+            f"OffDiffLock.MARKER no longer covers the {label} lane — "
+            "the lock is blind there and every vacuous test now passes silently"
+        )
+
+    def test_an_in_diff_finding_trips_nothing(self, guard_module, capsys):
+        """Negative control: without it, a MARKER of '' would pass the test above."""
+        with _mock_inline(guard_module, [_codex_c(1, _P1_BODY, path="src/benign.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, "precondition: an in-diff P1 blocks"
+
+        probe = OffDiffLock()
+        probe.record(capsys.readouterr().err)
+        assert not probe.routed_off_diff
+
+    def test_declaring_is_what_separates_intent_from_accident(self):
+        """The opt-in is a declaration, and nothing else sets it."""
+        probe = OffDiffLock()
+        probe.record("  [off-diff P1] something (src/x.py)")
+        assert probe.routed_off_diff
+        assert not probe.declared, "a lock must not declare itself"
+        probe.expected()
+        assert probe.declared
+
+    # ── Does the lock actually FAIL a run? Only an exit code proves that. ──
+    #
+    # Every assertion above grades the lock's BOOKKEEPING. None of them would
+    # notice if the `pytest.fail` were deleted, because a disarmed lock leaves
+    # this whole suite green — which is the exact shape ("green while the thing
+    # it claims is false") the lock exists to stop. So the enforcement is proved
+    # the only way it can be: run pytest as a child process over a throwaway
+    # test and read the exit code.
+
+    @staticmethod
+    def _run_child_pytest(tmp_path, body: str) -> subprocess.CompletedProcess:
+        """Run one generated test under a COPY of the real conftest.
+
+        The env is SCRUBBED of this suite's own seams: the conftest fixtures set
+        ``_TEST_*`` via ``monkeypatch.setenv``, which mutates ``os.environ`` in
+        this process, and a plain ``subprocess.run`` would hand the child a
+        parent-state inheritance nobody chose. ``PYTEST_ADDOPTS`` goes too — CI
+        sets it, and a child that silently picks up extra options is a child
+        that can pass or fail for a reason the test never states.
+        """
+        conftest_src = Path(__file__).resolve().parent / "conftest.py"
+        (tmp_path / "conftest.py").write_text(conftest_src.read_text())
+        (tmp_path / "test_generated.py").write_text(body)
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("_TEST_") and k != "PYTEST_ADDOPTS"
+        }
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            # MEASURED 0.63-0.77s per child. 120s is ~160x that: headroom for a
+            # loaded shared box, not a guess about how long pytest takes.
+            timeout=120,
+            cwd=str(tmp_path),
+            env=env,
+        )
+
+    def test_an_undeclared_off_diff_test_actually_fails(self, tmp_path):
+        """The load-bearing one: a vacuous test must NOT come out green."""
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_looks_fine():\n"
+            "    print('  [off-diff P1] x (src/a.py)', file=sys.stderr)\n"
+            "    assert True  # the bare not-block assertion, in miniature\n",
+        )
+        assert result.returncode != 0, (
+            "the lock did not fail an undeclared off-diff test — it is DISARMED\n"
+            f"stdout:\n{result.stdout}"
+        )
+        assert "OFF-DIFF lane" in result.stdout
+
+    def test_it_fails_even_when_the_test_drains_its_own_stderr(self, tmp_path):
+        """The drain case — this is why the mechanism is what it is.
+
+        ~20 of the exposed tests call ``capsys.readouterr()`` in the body, which
+        EMPTIES the buffer. A teardown-only read sees nothing in exactly those
+        tests, and a ``sys.stderr`` wrapper installed at fixture-setup time is
+        discarded when pytest reinstalls capture for the call phase (MEASURED: 0
+        chunks recorded). Wrapping ``readouterr`` is what survives a drain, and
+        this test is what would go RED if someone "simplified" it back.
+        """
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_drains_its_own_stderr(capsys):\n"
+            "    print('  [off-diff P1] x (src/a.py)', file=sys.stderr)\n"
+            "    assert '[off-diff' in capsys.readouterr().err\n",
+        )
+        assert result.returncode != 0, (
+            "a test that drained its own stderr slipped the lock — the recording "
+            f"mechanism no longer survives readouterr()\nstdout:\n{result.stdout}"
+        )
+        # A nonzero exit alone is NOT enough: a conftest that stops importing in
+        # the copied tmp_path exits 4, which satisfies `!= 0` while this test
+        # silently stops discriminating the readouterr wrap from a sys.stderr
+        # wrap — the single thing it exists to pin.
+        assert "OFF-DIFF lane" in result.stdout, (
+            f"the child failed for some reason other than the lock firing:\n{result.stdout}"
+        )
+
+    def test_a_declared_off_diff_test_passes(self, tmp_path):
+        """Control: the opt-in must actually let a legitimate test through.
+
+        Without this, a lock that failed EVERY test would satisfy the case above.
+        """
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_off_diff_is_my_subject(offdiff_lock):\n"
+            "    offdiff_lock.expected()\n"
+            "    print('  [off-diff P1] x (src/a.py)', file=sys.stderr)\n",
+        )
+        assert result.returncode == 0, f"the opt-in did not clear the lock\n{result.stdout}"
+
+    def test_a_clean_test_passes(self, tmp_path):
+        """Second control: the lock must be inert on ordinary tests."""
+        result = self._run_child_pytest(
+            tmp_path,
+            "import sys\n"
+            "def test_ordinary():\n"
+            "    print('nothing off-diff here', file=sys.stderr)\n",
+        )
+        assert result.returncode == 0, f"the lock fired on a clean test\n{result.stdout}"
 
 
 class TestResolvePrNumber:

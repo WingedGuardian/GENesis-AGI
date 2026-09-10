@@ -238,10 +238,57 @@ _NO_WEB_TOOLS = [
 ]
 
 # Perimeter sessions: block outreach tools beyond basic send.
+#
+# NOTE ON POLARITY — this is a DENY list, so a tool nobody enumerates is
+# ALLOWED. The `mail` profile's comment claims "only outreach_send is
+# available"; that is a description of the intended result, not something the
+# mechanism enforces. Every new genesis-outreach tool is reachable from the
+# untrusted-inbound perimeter until it is named here. Add new tools to this list
+# as part of adding them, not afterwards.
 _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-outreach__outreach_poll",
     "mcp__genesis-outreach__outreach_digest",
+]
+
+# The pending-queue controls: read what the owner has scheduled, or retract it.
+#
+# Denied on EVERY background profile, which is broader than the perimeter groups
+# above and deliberately so. PROFILES governs background sessions only — the
+# owner's own interactive session does not go through it — and no background
+# session has business reading or cancelling the owner's queued messages. So the
+# allowed set here is EMPTY, which makes the rule trivial to state and to test,
+# and costs nothing: both tools are new in this change, so nothing depends on
+# them.
+#
+# Scoped this way after review found `steward` still reachable: it ingests
+# external GitHub PR content and can publish `gh` comments, so an injected PR
+# body could read queued-message previews out through a comment or silently
+# cancel the owner's alerts. `interact` (arbitrary browser page content) and
+# `campaign` (external platform replies) carry the same shape. Enumerating the
+# perimeter profile-by-profile is what let steward slip; denying everywhere and
+# testing for it removes the judgement call entirely.
+_NO_OUTREACH_QUEUE_CONTROL = [
+    "mcp__genesis-outreach__outreach_pending",
+    "mcp__genesis-outreach__outreach_cancel",
+]
+
+# Host-capacity actuators. They live on the genesis-outreach server (it owns the
+# owner-approval channel they use), so a profile that mounts that server for its
+# reply tool gets these too unless they are named here — which is how they were
+# reachable from the untrusted-inbound perimeter until the allowlist-polarity test
+# in tests/test_cc/test_direct_session_profiles.py surfaced them.
+#
+# Both are approval-gated (an APPROVE/DENY request goes to the owner's channel and
+# nothing mutates without it), so this is not a silent-compromise path. It is still
+# wrong: injected inbound content should not be able to raise plausible-looking
+# infrastructure approval prompts in the owner's channel, and the gate is defence
+# in depth rather than a reason to leave the actuator reachable. Denied on the
+# perimeter only — an autonomous working session asking the owner to grow a disk is
+# the intended use.
+_NO_PROVISIONING = [
+    "mcp__genesis-outreach__provision_grow",
+    "mcp__genesis-outreach__provision_vzdump",
 ]
 
 # Cold-marketing tools. marketing_send resolves its recipient in-code from the
@@ -277,16 +324,19 @@ PROFILES: dict[str, list[str]] = {
         + _NO_OUTREACH_ENGAGEMENT
         + _NO_RECON_WRITES
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     "research": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
-    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
+    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
     # grants Bash (so it can run `gh`) — every other profile blocks Bash.
@@ -299,18 +349,32 @@ PROFILES: dict[str, list[str]] = {
         + _NO_BROWSER_INTERACTION
         + _NO_FILE_WRITE
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
+    # Also a perimeter profile — it reads external Discord messages (see
+    # _PROFILE_ORIGIN below, which classifies it as external-ingesting). It mounts
+    # genesis-outreach (session_config.py) but carried NEITHER outreach deny group,
+    # so the whole outreach surface beyond send — digest, queue, poll,
+    # send_and_wait, engagement, preferences — plus both host-capacity actuators
+    # were reachable from attacker-controlled Discord content. `mail` had the same
+    # shape and was covered; this profile was simply never given the same groups.
+    # Surfaced by the allowlist-polarity test, which is the point of stating the
+    # boundary as an allowlist: an `in`-based test cannot fail for an omission.
     "community-responder": (
         _UNIVERSAL_DISALLOW
         + _NO_BROWSER_INTERACTION
         + _NO_MEMORY_WRITES
         + _NO_FOLLOW_UPS
+        + _NO_OUTREACH_ENGAGEMENT
+        + _NO_OUTREACH_EXTRAS
+        + _NO_PROVISIONING
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -328,7 +392,9 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_WEB_TOOLS
         + _NO_OUTREACH_EXTRAS
+        + _NO_PROVISIONING
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
 }
 

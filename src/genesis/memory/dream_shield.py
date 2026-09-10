@@ -176,13 +176,15 @@ async def compute_shield_state(
 
     activation_threshold = _percentile(list(activation_by_id.values()), act_pct)
 
-    # Centrality percentile over the LIVE population only. centrality_cache is
-    # built from the full memory_links graph (deprecated nodes included — dream
-    # soft-deletes keep metadata/links for rollback), so restrict to the current
-    # point ids before thresholding — otherwise stale high-centrality deprecated
-    # rows inflate the bar and a live bridge that should be protected stays
-    # mergeable (activation uses only these live points, so the populations must
-    # match).
+    # Centrality percentile over the LIVE population only. NOTE (2026-09-06):
+    # centrality_cache is no longer built from the full memory_links graph —
+    # the graph loader now applies recall's visibility predicate, so deprecated
+    # and bitemporally-expired nodes are gone BEFORE betweenness runs. The
+    # original reason for this restriction (stale high-centrality deprecated
+    # rows inflating the bar) is therefore largely handled upstream. The
+    # restriction still stands on its own: activation uses only these live
+    # points, so the two populations must match, and a memory can be outside
+    # this dream slice without being hidden from recall.
     point_ids = {pt["id"] for pt in points}
     full_centrality = await _centrality_map(db)
     centrality_by_id = {mid: v for mid, v in full_centrality.items() if mid in point_ids}
