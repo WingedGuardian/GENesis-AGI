@@ -2380,3 +2380,70 @@ async def test_memory_store_does_not_report_a_supersede_nobody_asked_for():
             f"supersedes={empty!r} produced a supersede report: {result!r}"
         )
         assert isinstance(result, str), "the bare-id shape is what a non-request returns"
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_reports_a_partially_applied_supersede():
+    """A supersede that half-landed must not report as fully landed.
+
+    The Qdrant payload write and the link create are best-effort and swallow
+    their own exceptions. The vector leg of hybrid recall filters on that
+    Qdrant `deprecated` payload while FTS filters on the SQLite column, so a
+    swallowed payload write leaves the memory hidden from one leg and live in
+    the other — reported, before this, as `superseded: True`.
+    """
+    from genesis.mcp.memory import core
+
+    async def _store_with_degradation(*a, **kw):
+        kw["supersede_degraded"].append("qdrant_payload")
+        return "new-id"
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(side_effect=_store_with_degradation)
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234-0000-4000-8000-000000000001"
+        )
+
+    assert result["memory_id"] == "new-id"
+    assert result["partial"] == ["qdrant_payload"]
+    assert result["superseded"] is True, (
+        "the SQLite deprecation DID land — a partial is not a total failure"
+    )
+    assert "vector recall" in result["warning"]
+
+
+@pytest.mark.asyncio()
+async def test_memory_store_does_not_report_success_for_a_failed_supersede():
+    """An outright supersede failure must not arrive as `superseded: True`.
+
+    The two `except Exception` handlers in ``store()`` catch anything that is
+    not ``SupersedeUnresolved`` — a SQLite fault in resolve_id, mark_superseded
+    or get_metadata — so the exception never reaches this layer. They logged and
+    left the out-param empty, and the unconditional `superseded: True` then told
+    the caller a deprecation that provably had not run had landed. The marker is
+    what distinguishes "threw before the deprecation" from the post-deprecation
+    partials, which legitimately stay `superseded: True`.
+    """
+    from genesis.mcp.memory import core
+    from genesis.memory.store import SUPERSEDE_FAILED
+
+    async def _store_that_failed(*a, **kw):
+        kw["supersede_degraded"].append(SUPERSEDE_FAILED)
+        return "new-id"
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(side_effect=_store_that_failed)
+        result = await tools["memory_store"].fn(
+            "content", "src", supersedes="abcd1234-0000-4000-8000-000000000001"
+        )
+
+    assert result["memory_id"] == "new-id", "the content is still durable"
+    assert result["superseded"] is False, (
+        "reported a supersede that threw before touching SQLite as successful"
+    )
+    assert "FAILED" in result["warning"]
+    assert "not be duplicated" in result["warning"], "the retry must stay safe"

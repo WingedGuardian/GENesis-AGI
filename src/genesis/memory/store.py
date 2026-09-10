@@ -75,6 +75,18 @@ _COLLECTION_MAP = {
 }
 
 
+# Degradation marker for a supersede that failed OUTRIGHT with an unexpected
+# error (a SQLite fault in resolve_id / mark_superseded / get_metadata), as
+# opposed to the post-deprecation partial failures the other markers name.
+# Without it, both `except Exception` handlers below logged and left the
+# out-param empty, and the MCP layer's unconditional `superseded: True` then
+# told the caller a supersede that provably had not happened had succeeded —
+# the same class of lie, arriving by a different door. MEASURED: a raise from
+# resolve_id left the target at deprecated=0 with degraded=[] and the report
+# saying superseded=True.
+SUPERSEDE_FAILED = "supersede_failed"
+
+
 class SupersedeUnresolved(Exception):
     """A supersede could not be performed on the pair it was given.
 
@@ -183,6 +195,7 @@ class MemoryStore:
         life_domain: str | None = None,
         project_type: str | None = None,
         supersedes: str | None = None,
+        supersede_degraded: list[str] | None = None,  # out-param: see below
         origin_class: str | None = None,
         speech_act: str | None = None,
         speech_act_confidence: float | None = None,
@@ -252,10 +265,12 @@ class MemoryStore:
                     # matched, which consults neither the supersede target nor
                     # the deprecation column. It can therefore be the target
                     # itself, or an already-deprecated row. See _mark_superseded.
-                    await self._mark_superseded(
+                    _deg = await self._mark_superseded(
                         supersedes, existing, datetime.now(UTC).isoformat(),
                         verify_successor=True,
                     )
+                    if supersede_degraded is not None:
+                        supersede_degraded.extend(_deg)
                 except SupersedeUnresolved:
                     # Escapes to the reporting layer exactly as it does on the
                     # normal path below. The `existing` id it carries is the
@@ -266,7 +281,11 @@ class MemoryStore:
                     # Mirrors the normal supersede path below: a failed
                     # deprecation must not turn a durable store into a raised
                     # error, which reads as "the store failed" and invites a
-                    # duplicating retry.
+                    # duplicating retry. It must still be REPORTED, though —
+                    # logging alone left the out-param empty and the MCP layer
+                    # said `superseded: True` about a deprecation that never ran.
+                    if supersede_degraded is not None:
+                        supersede_degraded.append(SUPERSEDE_FAILED)
                     logger.warning(
                         "Failed to mark memory %s as superseded by %s",
                         supersedes, existing, exc_info=True,
@@ -580,7 +599,9 @@ class MemoryStore:
         # Supersession: mark old memory as deprecated, link to this one
         if supersedes:
             try:
-                await self._mark_superseded(supersedes, memory_id, now_iso)
+                _deg = await self._mark_superseded(supersedes, memory_id, now_iso)
+                if supersede_degraded is not None:
+                    supersede_degraded.extend(_deg)
             except SupersedeUnresolved:
                 # Deliberately NOT swallowed. The memory above is already
                 # durable, so this is a partial outcome the caller must see —
@@ -589,6 +610,10 @@ class MemoryStore:
                 # memory_id so the MCP layer can report both halves.
                 raise
             except Exception:
+                # Reported, not just logged — see the twin clause on the dedup
+                # path. An empty out-param here becomes `superseded: True`.
+                if supersede_degraded is not None:
+                    supersede_degraded.append(SUPERSEDE_FAILED)
                 logger.warning(
                     "Failed to mark memory %s as superseded by %s",
                     supersedes, memory_id, exc_info=True,
@@ -603,12 +628,20 @@ class MemoryStore:
         timestamp: str,
         *,
         verify_successor: bool = False,
-    ) -> None:
+    ) -> list[str]:
         """Mark *old_id* as superseded by *new_id* in both SQLite and Qdrant.
 
         Sets ``deprecated=1``, ``superseded_by``, and ``superseded_at`` in
         SQLite.  Sets ``deprecated=True`` and ``merged_into`` in the Qdrant
         payload.  Creates a ``succeeded_by`` link from old to new.
+
+        Returns the names of the steps that FAILED — empty means fully applied.
+        The two steps after the SQLite update are best-effort and swallow their
+        exceptions, so without this the caller could be told the correction
+        landed while a stale vector still answered recall: the vector leg of
+        hybrid search filters on the Qdrant ``deprecated`` payload, not on the
+        SQLite column, so a swallowed payload write leaves the memory hidden
+        from FTS and still visible from Qdrant.
 
         Raises ``SupersedeUnresolved`` — BEFORE any write — when *old_id* names
         no memory or names several. Nothing is mutated on that path, so an
@@ -668,6 +701,43 @@ class MemoryStore:
         if not await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp):
             raise SupersedeUnresolved(old_id, "not_found", new_id)
 
+        # ── PAST THE POINT OF NO RETURN ──────────────────────────────────────
+        # The deprecation is COMMITTED (crud.mark_superseded commits before it
+        # returns), so SQLite recall already excludes the old memory. Everything
+        # below is follow-up. An exception escaping from here would reach
+        # store()'s outer handler, which records SUPERSEDE_FAILED — and that
+        # marker means "did not land AT ALL", which would now be false: the
+        # caller would be told the old memory is probably still live when it is
+        # not. Anything that throws past this line is therefore a PARTIAL, named
+        # as such, and never allowed to escape.
+        degraded: list[str] = []
+        try:
+            degraded.extend(
+                await self._supersede_follow_up(old_id, new_id, timestamp)
+            )
+        except Exception:
+            degraded.append("post_deprecation")
+            logger.warning(
+                "Supersede follow-up failed after the deprecation committed "
+                "(%s -> %s); the SQLite deprecation DID apply",
+                old_id, new_id, exc_info=True,
+            )
+        return degraded
+
+    async def _supersede_follow_up(
+        self,
+        old_id: str,
+        new_id: str,
+        timestamp: str,
+    ) -> list[str]:
+        """The best-effort steps AFTER the SQLite deprecation has committed.
+
+        Split out so the caller can bound them: every failure in here is a
+        PARTIAL (the deprecation already landed), never a total failure.
+        Returns the names of the steps that failed.
+        """
+        degraded: list[str] = []
+
         # Qdrant: look up collection from metadata, then update payload.
         # Only touch Qdrant when a vector actually exists (status 'embedded').
         # 'fts5_only' (subsystem write), 'pending' (embed queued), and 'failed'
@@ -684,6 +754,7 @@ class MemoryStore:
                     payload={"deprecated": True, "merged_into": new_id},
                 )
             except Exception:
+                degraded.append("qdrant_payload")
                 logger.warning(
                     "Qdrant update_payload failed for superseded memory %s",
                     old_id, exc_info=True,
@@ -702,6 +773,7 @@ class MemoryStore:
         except Exception as link_exc:
             # PK collision is fine (link already exists); log unexpected errors
             if "UNIQUE constraint" not in str(link_exc):
+                degraded.append("succeeded_by_link")
                 logger.warning(
                     "Failed to create succeeded_by link %s → %s: %s",
                     old_id, new_id, link_exc,
@@ -722,6 +794,8 @@ class MemoryStore:
                 invalidate_graph_cache()
             except ImportError:
                 pass
+
+        return degraded
 
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.

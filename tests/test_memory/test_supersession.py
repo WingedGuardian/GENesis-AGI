@@ -498,7 +498,7 @@ async def test_dedup_short_circuit_still_supersedes(store, db):
          patch("genesis.memory.store.update_payload"), \
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.memory_links_crud") as mock_links, \
-         patch.object(MemoryStore, "_mark_superseded", new=AsyncMock()) as ms:
+         patch.object(MemoryStore, "_mark_superseded", new=AsyncMock(return_value=[])) as ms:
         mock_mem.upsert = AsyncMock(return_value="id")
         mock_mem.resolve_id = AsyncMock(
             side_effect=lambda _db, mid: ([mid], "passthrough")
@@ -600,3 +600,36 @@ async def test_store_lets_an_unresolved_supersede_out(store, db):
     # that is why the MCP layer reports instead of raising to the caller.
     assert exc.value.stored_memory_id
     mock_mem.mark_superseded.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+async def test_normal_path_records_an_unexpected_supersede_failure(store, db):
+    """The NORMAL supersede path's `except Exception` must report, not just log.
+
+    Twin of the dedup-path case in test_supersede_prefix_resolution. Both
+    handlers exist so a transient failure does not turn a durable store into a
+    raised error — but silence there became `superseded: True` at the MCP layer,
+    about a deprecation that never ran. Covered separately because deleting the
+    append from EITHER handler must produce a RED; one test cannot see both.
+    """
+    from genesis.memory.store import SUPERSEDE_FAILED
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=RuntimeError("simulated SQLite fault")
+        )
+        degraded: list[str] = []
+        result = await store.store(
+            "new content", "conversation",
+            supersedes="old-memory-id", supersede_degraded=degraded,
+        )
+
+    assert isinstance(result, str) and len(result) == 36, "the store must survive"
+    assert SUPERSEDE_FAILED in degraded, (
+        "the failure was logged and nothing else — the report would claim the "
+        "supersede landed"
+    )

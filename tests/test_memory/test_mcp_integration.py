@@ -80,6 +80,11 @@ async def test_memory_store_delegates(mock_deps, tools):
         room=None,
         collection=None,
         supersedes=None,
+        # Out-param the MCP layer always passes: store() appends the supersede
+        # steps that failed AFTER the SQLite deprecation landed, so a partial
+        # supersede is not reported as a complete one. Empty here because
+        # nothing was superseded.
+        supersede_degraded=[],
     )
 
 

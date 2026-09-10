@@ -833,7 +833,10 @@ async def memory_store(
     actually happened — because it can fail on its own while the store
     succeeds, and reporting only the id is what let that failure go unnoticed.
     ``reason`` names why a supersede did not happen, and the ``warning`` gives
-    advice that fits that reason.
+    advice that fits that reason. A partially-applied supersede adds ``partial``
+    naming the steps that did not land; ``partial`` containing
+    ``supersede_failed`` means it did not land AT ALL (an unexpected database
+    error), and ``superseded`` is False there.
 
     This tool is also reachable over HTTP as ``POST /api/t/memory_store``
     (``dashboard/routes/tool_api.py``), which accepts ``supersedes`` like any
@@ -865,7 +868,14 @@ async def memory_store(
     # external-influenced session's writes stop landing first_party via the
     # "conversation" pipeline. None (foreground/unset) → pipeline-derived.
     from genesis.memory.provenance import session_origin_from_env
-    from genesis.memory.store import SupersedeUnresolved
+    from genesis.memory.store import SUPERSEDE_FAILED, SupersedeUnresolved
+
+    # Collector for steps that failed AFTER the SQLite deprecation landed. The
+    # Qdrant payload write and the link create are best-effort and swallow
+    # their own exceptions, and the vector leg of hybrid recall filters on that
+    # Qdrant payload — so without this a partial supersede would be reported as
+    # a complete one, which is the class of lie this whole change exists to stop.
+    degraded: list[str] = []
 
     # An empty or all-whitespace handle is not a request. Both store-side
     # guards are truthiness tests (`if supersedes:`), so "" and "   " perform no
@@ -890,6 +900,7 @@ async def memory_store(
             room=room,
             collection=collection,
             supersedes=supersedes,
+            supersede_degraded=degraded,
         )
     except SupersedeUnresolved as exc:
         # The memory IS durable; only the deprecation failed. Report both
@@ -943,11 +954,38 @@ async def memory_store(
     if not supersedes:
         return memory_id
 
-    return {
+    report: dict = {
         "memory_id": memory_id,
         "superseded": True,
         "supersedes_requested": supersedes,
     }
+    if degraded:
+        report["partial"] = degraded
+        if SUPERSEDE_FAILED in degraded:
+            # The supersede did not merely half-apply — it threw before or
+            # during the SQLite deprecation, so we do NOT know that anything
+            # landed and must not claim it did. `superseded` flips to False for
+            # the same reason SupersedeUnresolved reports False: the caller's
+            # next decision depends on whether the old memory is still live.
+            report["superseded"] = False
+            report["warning"] = (
+                f"The memory WAS stored ({memory_id}), but the supersede FAILED "
+                "with an unexpected error (see the server log for the "
+                "traceback). The old memory is probably still live in recall. "
+                "Do NOT re-send this as a new memory — re-run memory_store with "
+                "the SAME content and the same supersedes id; the content will "
+                "not be duplicated."
+            )
+        else:
+            # The deprecation landed in SQLite but a later step did not. Say
+            # which, rather than letting "superseded: True" stand for a partial.
+            report["warning"] = (
+                "The SQLite deprecation applied, but these steps did NOT: "
+                + ", ".join(degraded)
+                + ". If 'qdrant_payload' is listed the old memory may still "
+                "surface in vector recall even though FTS now hides it."
+            )
+    return report
 
 
 @mcp.tool()

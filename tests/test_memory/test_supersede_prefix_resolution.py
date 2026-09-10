@@ -20,7 +20,7 @@ mocked connection would happily confirm whatever the test asserted.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -360,3 +360,134 @@ async def test_the_normal_path_does_not_pay_for_successor_verification(store, db
 
     assert (await _row(db, OLD))["deprecated"] == 1
     assert (OLD, NEW, "succeeded_by") in await _links(db)
+
+
+# ─── PARTIAL vs TOTAL failure ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio()
+async def test_an_unexpected_supersede_error_is_reported_not_swallowed(store, db):
+    """A supersede that throws something other than SupersedeUnresolved — a
+    SQLite fault in resolve_id / mark_superseded / get_metadata — used to be
+    logged while the out-param stayed empty, and the MCP layer then reported
+    `superseded: True` about a deprecation that provably never ran.
+
+    MEASURED before the fix: target left at deprecated=0, degraded=[].
+    """
+    import aiosqlite as _aiosqlite
+
+    import genesis.memory.store as store_mod
+    from genesis.memory.store import SUPERSEDE_FAILED
+
+    async def boom(*_a, **_k):
+        raise _aiosqlite.OperationalError("database is locked")
+
+    await _index(db, NEW, DUPE)
+    degraded: list[str] = []
+
+    with patch.object(store_mod.memory_crud, "resolve_id", boom):
+        returned = await store.store(
+            DUPE,
+            "conversation",
+            supersedes=OLD,
+            supersede_degraded=degraded,
+        )
+
+    assert returned == NEW, "the store itself must still succeed"
+    assert (await _row(db, OLD))["deprecated"] == 0, "nothing was deprecated"
+    assert SUPERSEDE_FAILED in degraded, (
+        "the failure left no trace, so the report claimed the supersede landed"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_a_failure_after_the_deprecation_commits_is_a_partial(store, db):
+    """`SUPERSEDE_FAILED` means "did not land AT ALL". Anything thrown after
+    `crud.mark_superseded` has COMMITTED makes that false: SQLite recall already
+    excludes the old memory, so reporting a total failure tells the caller the
+    old memory is probably still live when it is not.
+
+    MEASURED before the fix: `get_metadata` raising left `OLD.deprecated=1` and
+    `superseded_by` set, while the exception escaped `_mark_superseded` to
+    store()'s outer handler, which recorded SUPERSEDE_FAILED.
+    """
+    import genesis.memory.store as store_mod
+    from genesis.memory.store import SUPERSEDE_FAILED
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("simulated fault after the commit")
+
+    with patch.object(store_mod.memory_crud, "get_metadata", boom):
+        degraded = await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+
+    assert (await _row(db, OLD))["deprecated"] == 1, "the deprecation did commit"
+    assert "post_deprecation" in degraded, "reported as a partial, naming the step"
+    assert SUPERSEDE_FAILED not in degraded, (
+        "a post-commit fault must NOT be classified as a total failure"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_a_swallowed_qdrant_payload_write_is_named(store, db):
+    """The `qdrant_payload` marker, asserted from the real code path.
+
+    `update_payload` swallows its own exception by design — the supersede must
+    not fail because Qdrant is down. But the vector leg of hybrid recall filters
+    on that payload while FTS filters on the SQLite column, so a swallowed write
+    leaves the memory hidden from one leg and live in the other. Naming the step
+    is the only thing that stops that being reported as a complete supersede.
+    """
+    import genesis.memory.store as store_mod
+
+    # Qdrant is only touched for an 'embedded' row — fts5_only skips it, which
+    # is what the rest of this file's fixtures are.
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?", (OLD,)
+    )
+    await db.commit()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("qdrant unreachable")
+
+    with patch.object(store_mod, "update_payload", boom):
+        degraded = await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+
+    assert (await _row(db, OLD))["deprecated"] == 1, "the deprecation still applies"
+    assert degraded == ["qdrant_payload"]
+    assert (OLD, NEW, "succeeded_by") in await _links(db), (
+        "the link step must still run — one failed follow-up does not skip the rest"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_a_failed_succeeded_by_link_is_named(store, db):
+    """The `succeeded_by_link` marker, asserted from the real code path.
+
+    A UNIQUE-constraint failure means the link already exists and is NOT a
+    degradation; anything else is. Both branches are exercised here so the
+    marker cannot be appended unconditionally.
+    """
+    import genesis.memory.store as store_mod
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("link table write failed")
+
+    with patch.object(store_mod.memory_links_crud, "create", boom):
+        degraded = await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+
+    assert (await _row(db, OLD))["deprecated"] == 1
+    assert degraded == ["succeeded_by_link"]
+
+    # ...and a UNIQUE collision is not a degradation: the edge is already there.
+    async def already(*_a, **_k):
+        raise RuntimeError("UNIQUE constraint failed: memory_links.source_id")
+
+    await db.execute(
+        "UPDATE memory_metadata SET deprecated = 0, superseded_by = NULL WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+    with patch.object(store_mod.memory_links_crud, "create", already):
+        degraded = await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+
+    assert degraded == [], "an existing link is not a partial supersede"
