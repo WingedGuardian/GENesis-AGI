@@ -29,7 +29,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install ruff
-        run: pip install ruff
+        # PINNED. `lint` is a required status check with no bypass actor, so a
+        # new default rule in an unpinned release turns it red on a diff that
+        # touched nothing and blocks every merge in the repository — recoverable
+        # only by disabling the ruleset in the UI. See .github/rulesets/README.md.
+        # Pinned to the version this repo is developed against locally.
+        run: pip install 'ruff==0.15.10'
       - name: Lint
         run: ruff check src/ tests/ scripts/
 
@@ -123,8 +128,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install tools
+        # `detect-secrets` PINNED for the same reason `ruff` is: `leak-detector`
+        # is a required check with no bypass actor, it scans the WHOLE tree, and
+        # a new detector in an unpinned release would fire on pre-existing
+        # content and block every merge. See .github/rulesets/README.md.
         run: |
-          pip install detect-secrets
+          pip install 'detect-secrets==1.5.0'
           sudo apt-get install -y ripgrep
 
       - name: Secret scan (detect-secrets)
