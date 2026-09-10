@@ -167,7 +167,19 @@ async def list_merged_prs(
         and pr["mergedAt"]
     ]
     prs.sort(key=lambda p: p["mergedAt"])
-    return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
+    # A DROPPED row makes this listing INCOMPLETE, and saying so is the whole
+    # point: the filter above silently discards a merged PR whose `number` or
+    # `mergedAt` is missing or malformed, and a caller that advances a watermark
+    # over the survivors would move it PAST the dropped merge, which then never
+    # receives its row. Reporting the count lets the caller treat the window as
+    # incomplete instead of trusting a listing that quietly lost something
+    # (Codex P2, PR #1836).
+    return {
+        "repo": repo,
+        "prs": prs,
+        "limit_hit": len(raw) >= limit,
+        "dropped": len(raw) - len(prs),
+    }
 
 
 # GitHub caps pulls/N/files at 3000 entries; at the cap the listing MAY be

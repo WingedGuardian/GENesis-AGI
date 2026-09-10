@@ -41,23 +41,33 @@ STATUSES = ("open", "closed")
 _tables_verified: set[str] = set()
 
 
-def _db_key(db: aiosqlite.Connection) -> str:
-    # aiosqlite exposes the path it was constructed with; fall back to the
-    # object id so an unexpected shape degrades to "cache nothing" rather than
-    # aliasing two databases onto one key.
-    return str(getattr(db, "_conn_path", None) or getattr(db, "_path", None) or id(db))
+def _db_key(db: aiosqlite.Connection) -> str | None:
+    """The database's PATH, or None when it cannot be determined.
+
+    None means DO NOT CACHE, and that is the whole point. An earlier version
+    fell back to ``id(db)`` with a comment claiming it "degrades to cache
+    nothing" — it does the opposite. ``id`` is a perfectly good dict key, and
+    CPython REUSES the id of a closed object, so a later connection to a
+    DIFFERENT database can land on the same key and be told the tables are
+    present without ever consulting ``sqlite_master``. The promised no-op path
+    then raises `no such table` instead (Codex P2, PR #1836). Caching nothing
+    costs one `sqlite_master` query per call on an unrecognised connection
+    shape; caching wrongly costs correctness in a multi-database process.
+    """
+    path = getattr(db, "_conn_path", None) or getattr(db, "_path", None)
+    return str(path) if path else None
 
 
 async def _tables_available(db: aiosqlite.Connection) -> bool:
     key = _db_key(db)
-    if key in _tables_verified:
+    if key is not None and key in _tables_verified:
         return True
     cursor = await db.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'pr_verifications'"
     )
     row = await cursor.fetchone()
     exists = bool(row and row[0] == 1)
-    if exists:
+    if exists and key is not None:
         _tables_verified.add(key)
     return exists
 

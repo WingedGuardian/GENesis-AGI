@@ -498,3 +498,76 @@ async def test_an_absent_watermark_recovers_rather_than_writing_the_gap_off(
         "a PR BEHIND the shared cursor must still be recorded on the first "
         "tick, or the deploy writes off the very gap it fixes"
     )
+
+
+# ── The watermark advances only over a PROVEN-COMPLETE window ────────────────
+# One invariant behind five round-2 findings: the watermark was advancing from
+# whatever happened to be in hand, while every mechanism that verifies a window
+# IS complete had been written for the shared cursor and knew nothing about this
+# second window. These pin the invariant rather than the five ways to break it.
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_row_stops_the_watermark(pulse_root, db_path, monkeypatch):
+    """VERIFY-RED: drop `verification_window_complete` from the advance
+    condition and this passes wrongly.
+
+    `list_merged_prs` silently discards a merged PR whose `number` or
+    `mergedAt` is malformed. Advancing past it strands that merge forever —
+    nothing re-presents a PR the watermark has passed.
+    """
+
+    async def gh_with_dropped(**kwargs):
+        return {
+            "repo": REPO,
+            "prs": [_pr(80)],
+            "limit_hit": False,
+            "dropped": 1,  # one row the listing silently lost
+        }
+
+    out = await _run(
+        db_path, monkeypatch, gh=gh_with_dropped, files=_files({80: {"files": ["src/a.py"]}})
+    )
+    assert out["status"] == "ok"
+    cursor = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
+    assert cursor.get("verification_through") is None, (
+        "an incomplete window must not advance the lane's watermark"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_complete_window_does_advance_it(pulse_root, db_path, monkeypatch):
+    """The negative control. Without it, a watermark that never advanced would
+    pass the test above while breaking the lane entirely."""
+    out = await _run(
+        db_path, monkeypatch, gh=_gh([_pr(81)]), files=_files({81: {"files": ["src/a.py"]}})
+    )
+    assert out["status"] == "ok"
+    cursor = json.loads((pulse_root / rpw.CURSOR_FILENAME).read_text())
+    assert cursor.get("verification_through") == MERGED
+    assert cursor.get("verification_repo") == REPO, "the repo is stored WITH the watermark"
+
+
+@pytest.mark.asyncio
+async def test_a_watermark_from_another_repository_is_discarded(
+    pulse_root, db_path, monkeypatch
+):
+    """Obligation identity is (repo, pr_number); the watermark is a bare
+    timestamp. Retarget at a fork and the old repo's timestamp would silently
+    apply to the new one, omitting every merge at or before it — forever."""
+    rpw._atomic_write_json(
+        pulse_root / rpw.CURSOR_FILENAME,
+        {
+            "last_merged_at": None,
+            "last_run_ts": None,
+            "runs": 1,
+            "verification_through": "2026-09-08T00:00:00Z",
+            "verification_repo": "someone/else",
+        },
+    )
+    files = _files({82: {"files": ["src/a.py"]}})
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(82)]), files=files)
+    assert out["status"] == "ok"
+    assert [r["pr_number"] for r in await _rows(db_path)] == [82], (
+        "a PR older than ANOTHER repo's watermark must still be recorded here"
+    )
