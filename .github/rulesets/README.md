@@ -59,6 +59,24 @@ Not required, and each for a reason: `review-depth-check` is advisory by design;
 ours; the remaining `CI` jobs are worth keeping green but a stall in one should
 not hold the repository.
 
+## Squash only, in two places on purpose
+
+`allowed_merge_methods` is a parameter of the `pull_request` rule, which lives
+in the BYPASSED ruleset — so on its own it binds contributors and does nothing
+for the maintainer, exactly as the destructive rules did before they moved. It
+cannot be moved either: a second `pull_request` rule in the no-bypass set would
+make the approval requirement bind the maintainer too, which is the deadlock
+the split exists to avoid.
+
+So the repository SETTING carries the half the ruleset cannot. Repo
+merge-method settings are not bypassable, and `allow_rebase_merge` was `true`
+until 2026-09-09 — the declared squash-only policy was not actually enforced for
+anyone, including the maintainer. It is now `false`, alongside
+`allow_merge_commit: false`.
+
+Both, then: the ruleset is the reviewable record and the default a fresh
+install inherits; the setting is what binds today. Neither alone was enough.
+
 ## The cost, accepted with open eyes
 
 A required check that breaks — a workflow rename, a bad merge to `ci.yml`, a
