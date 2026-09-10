@@ -95,8 +95,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "Ambient session-ledger extractor (session-manager PR-3) — "
             "master `enabled` + `mode` off/shadow/live. Shadow logs "
-            "proposals only (live session_ledger never written); `live` is "
-            "reserved and coerced to shadow until the data-gated flip PR. "
+            "proposals only; `live` also promotes the qualifying ones "
+            "into the real ledger as added_by='ambient_ledger_extractor'. "
+            "Live requires BOTH mode=live and live_opt_in=true (renewed "
+            "opt-in — legacy overlays persisted `live` while it was "
+            "reserved). An invalid mode degrades to shadow, never to live. "
             "Read at worker startup — takes effect next compaction."
         ),
         config_filename="session_ledger_shadow.yaml",
@@ -220,6 +223,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per pass by skill_gate_config
     ),
+    "graphstore": SettingsDomain(
+        name="graphstore",
+        description=(
+            "Which backend answers memory-graph traversals — `enabled` plus "
+            "`mode` networkx/falkordb. networkx (default) is the in-process "
+            "projection and depends on nothing else; falkordb is a long-lived "
+            "server over a unix socket that needs the engine armed, the client "
+            "installed, and a projection built. Anything unreadable or "
+            "unrecognised degrades to networkx, and the facade falls back to it "
+            "at runtime rather than answering empty. Betweenness centrality "
+            "always stays on networkx — FalkorDB cannot compute it. Read live "
+            "on every traversal — takes effect immediately, no restart."
+        ),
+        config_filename="graphstore.yaml",
+        readonly=False,
+        needs_restart=False,  # load_config() is a fresh read per traversal
+    ),
     "entity_adjudication": SettingsDomain(
         name="entity_adjudication",
         description=(
@@ -318,6 +338,47 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Read live each hourly tick — no restart."
         ),
         config_filename="follow_up_watchdog.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "ledger_escalation": SettingsDomain(
+        name="ledger_escalation",
+        description=(
+            "Undisposed-ledger escalation sweep (learning scheduler, hourly) — "
+            "master `enabled` + `stale_days` / `quiet_days` / `max_per_run` / "
+            "`priority` / `escalate_added_by`. A session_ledger row untouched >= "
+            "stale_days whose owning session has been quiet >= quiet_days becomes "
+            "a `user_input_needed` follow-up asking for a disposition; disposing "
+            "the row auto-completes that follow-up. BOTH thresholds must pass — a "
+            "stale row in a LIVE session is that session's to dispose. WRITES "
+            "(creates follow-ups), never to session_ledger. `escalate_added_by` "
+            "is a provenance allow-list, foreground-only by default so the "
+            "ambient extractor's proposals cannot ask the owner to dispose of "
+            "something nobody committed to. off (or env "
+            "GENESIS_LEDGER_ESCALATION_DISABLED=1) silences it. Read live each "
+            "tick — no restart."
+        ),
+        config_filename="ledger_escalation.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "context_injection_watch": SettingsDomain(
+        name="context_injection_watch",
+        description=(
+            "Context-injection watcher (awareness hourly band) — master `enabled` + "
+            "`lookback_hours` / `max_listed` / `alert_priority`. Watches the GROUND "
+            "TRUTH of the silent-context-loss class: a hook-stdout file the Claude "
+            "Code harness persisted instead of injecting (the session then ran "
+            "without that hook's content, invisibly). Scoped to this install's "
+            "checkouts and attributed per producer, so another hook's filing is "
+            "reported too, with its own remedy. One deduped, self-resolving "
+            "infrastructure_alert; "
+            "default priority critical (~5-min Telegram path — this class ran "
+            "unnoticed for a month). Read-and-alert only. off (or env "
+            "GENESIS_CONTEXT_INJECTION_WATCH_DISABLED=1) silences it. Read live each "
+            "hourly tick — no restart."
+        ),
+        config_filename="context_injection_watch.yaml",
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
     ),
@@ -1228,11 +1289,11 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
 
     errors: list[str] = []
     for key, value in changes.items():
-        if key not in ("enabled", "mode"):
-            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
-        elif key == "enabled":
+        if key not in ("enabled", "mode", "live_opt_in"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode, live_opt_in")
+        elif key in ("enabled", "live_opt_in"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif value not in MODES:
             errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
@@ -1322,19 +1383,42 @@ def _validate_skill_evolution_gate(changes: dict) -> list[str]:
 def _validate_repo_pulse(changes: dict) -> list[str]:
     """Validate repo-pulse lever changes (see
     genesis.session_awareness.repo_pulse_config)."""
-    from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
+    from genesis.session_awareness.repo_pulse_config import (
+        _BOOL_KNOBS,
+        _INT_KNOBS,
+        MODES,
+    )
+    from genesis.session_awareness.repo_pulse_config import (
+        OPEN_PR_MAX_SURFACE_CAP as _OPEN_PR_CAP,
+    )
 
     errors: list[str] = []
-    valid_keys = ("enabled", "open_pr_enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
+    # Every BOOLEAN knob the config advertises must be listed here, or the
+    # settings API rejects the key and the switch is reachable only by hand
+    # editing the yaml — a lever that reads as operable and is not (Codex P2,
+    # PR #1836, on `verification_enabled`). `_BOOL_KNOBS` is the single source
+    # the config module already keeps, so a new knob cannot be added there and
+    # silently miss this validator.
+    valid_keys = ("mode", *_BOOL_KNOBS, *_INT_KNOBS, "inject_confidence_floor")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key in ("enabled", "open_pr_enabled"):
+        elif key in _BOOL_KNOBS:
             if not isinstance(value, bool):
                 errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "open_pr_max_surface" and (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value > _OPEN_PR_CAP
+        ):
+            # Same contract as pr_watch.max_surface — reject, never silently cap.
+            errors.append(
+                f"'open_pr_max_surface' must be <= {_OPEN_PR_CAP} (the surfacing "
+                "hook caps at that; a larger value would be accepted and ignored)"
+            )
         elif key == "inject_confidence_floor":
             if (
                 isinstance(value, bool)
@@ -1417,7 +1501,7 @@ def _validate_marketing_outreach(changes: dict) -> list[str]:
 def _validate_pr_watch(changes: dict) -> list[str]:
     """Validate pr-watch lever changes (see
     genesis.session_awareness.pr_watch_config)."""
-    from genesis.session_awareness.pr_watch_config import _INT_KNOBS
+    from genesis.session_awareness.pr_watch_config import _INT_KNOBS, MAX_SURFACE_CAP
 
     errors: list[str] = []
     valid_keys = ("enabled", *_INT_KNOBS)
@@ -1429,6 +1513,16 @@ def _validate_pr_watch(changes: dict) -> list[str]:
                 errors.append("'enabled' must be a boolean")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
+        elif key == "max_surface" and value > MAX_SURFACE_CAP:
+            # REJECT rather than silently clamp. The surfacing hook applies
+            # MAX_SURFACE_CAP regardless, so accepting 50 here meant reporting
+            # 50 back to an operator whose config had no effect. A settings
+            # surface that lies about what it accepted is worse than one that
+            # refuses: the operator has no way to notice.
+            errors.append(
+                f"'max_surface' must be <= {MAX_SURFACE_CAP} (the surfacing hook "
+                f"caps at that; a larger value would be accepted and ignored)"
+            )
     return errors
 
 
@@ -1484,6 +1578,61 @@ def _validate_memory_recall(changes: dict) -> list[str]:
         else:
             errors.append(
                 f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker"
+            )
+    return errors
+
+
+def _validate_graphstore(changes: dict) -> list[str]:
+    """Validate graph-store lever changes (see genesis.memory.graphstore_config)."""
+    from genesis.memory.graphstore_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+
+    # Precondition, not just shape validation: moving the lever to falkordb when
+    # the engine is not armed points every memory-graph read at a store that
+    # cannot answer. The facade does degrade back to NetworkX, loudly — but a
+    # dashboard toggle whose real meaning is "log an error on every recall" is
+    # not a setting anyone intends to make, so refuse it where the operator can
+    # still see why.
+    #
+    # The socket is the SYNC-checkable half. An armed engine holding an EMPTY
+    # projection needs an async query to detect, and is caught one layer down:
+    # FalkorGraphStore.traverse raises rather than reporting every root as
+    # neighbourless.
+    #
+    # JUDGE THE EFFECTIVE POST-UPDATE STATE, not the incoming keys. Testing
+    # `changes` alone was wrong in BOTH directions, and the two callers hit one
+    # each. The dashboard submits the whole current config, so an operator
+    # turning `enabled` off while the stored mode is falkordb still sends
+    # `mode: falkordb` — and if the socket has since disappeared, the check
+    # refused the save, trapping the install in a mode it could no longer leave.
+    # The MCP sends partial updates, so flipping `enabled` to true against a
+    # stored `mode: falkordb` carried no `mode` key at all and skipped the check
+    # entirely. The precondition belongs to the state the update RESULTS IN:
+    # required only when the effective config both enables the lever and selects
+    # falkordb, which also mirrors `effective_mode()`'s own `is True` test.
+    from genesis.memory.graphstore_config import load_config
+
+    effective = {**load_config(), **changes}
+    if effective.get("enabled", True) is True and effective.get("mode") == "falkordb":
+        from genesis.env import falkordb_socket_path
+
+        socket_path = falkordb_socket_path()
+        if not Path(socket_path).exists():
+            errors.append(
+                "'mode' cannot be set to falkordb: the graph engine is not armed "
+                f"(no socket at {socket_path}). Start it with "
+                "`systemctl --user start genesis-falkordb`, build the projection with "
+                "`python -m genesis.memory.graphstore_project`, then set the mode."
             )
     return errors
 
@@ -1709,6 +1858,70 @@ def _validate_follow_up_watchdog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_ledger_escalation(changes: dict) -> list[str]:
+    """Validate ledger-escalation lever changes (see
+    genesis.session_awareness.ledger_escalation_config)."""
+    from genesis.db.crud.session_charters import VALID_ADDED_BY
+    from genesis.session_awareness.ledger_escalation_config import (
+        _VALID_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "priority", "escalate_added_by", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "priority":
+            if value not in _VALID_PRIORITY:
+                errors.append(
+                    f"'priority' must be one of {', '.join(_VALID_PRIORITY)}; got {value!r}"
+                )
+        elif key == "escalate_added_by":
+            if not isinstance(value, list) or not value:
+                errors.append("'escalate_added_by' must be a non-empty list")
+            else:
+                unknown = [v for v in value if v not in VALID_ADDED_BY]
+                if unknown:
+                    errors.append(
+                        f"'escalate_added_by' has unknown provenance {unknown}; "
+                        f"valid: {', '.join(sorted(VALID_ADDED_BY))}"
+                    )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_context_injection_watch(changes: dict) -> list[str]:
+    """Validate context-injection watcher lever changes (see
+    genesis.awareness.context_injection_watch_config)."""
+    from genesis.awareness.context_injection_watch_config import (
+        _VALID_ALERT_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_provider_outage_notify(changes: dict) -> list[str]:
     """Validate dead-provider notify lever changes (see
     genesis.awareness.provider_notify_config)."""
@@ -1728,8 +1941,11 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
 
 
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "graphstore": _validate_graphstore,
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
+    "ledger_escalation": _validate_ledger_escalation,
+    "context_injection_watch": _validate_context_injection_watch,
     "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,

@@ -1,0 +1,1 @@
+- **Memory recall no longer fails on some ordinary prompts.** A query could be expanded into a search expression the text index refused to parse, which surfaced as an error instead of results. Expansion terms are now cleaned before they are combined, and a malformed expression falls back to a plain keyword search rather than failing the whole recall.
