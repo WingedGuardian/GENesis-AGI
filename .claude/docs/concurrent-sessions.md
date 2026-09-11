@@ -1,5 +1,20 @@
 # Concurrent Sessions & Worktrees — Expanded Reference
 
+## The [Concurrent] roster line
+
+Each prompt carries one line per peer session:
+`[Concurrent | <liveness> | <model> | <id8> | <branch> @<dir> | idle <dur>] <topic> · <recent tools>`.
+Liveness is OBSERVED at render time (process table + socket path), never
+stored: `live` (reachable), `live-no-sock` (alive but its messaging socket
+path is missing — SendMessage to it will fail locally), `gone` (row is
+recent but the process is dead), `unknown` (a row from before the identity
+upgrade). IDLE IS NOT DEAD: an idle session in an open terminal renders with
+its idle duration and stays listed however long it idles. The line caps at 8
+peers plus a `+K more` overflow. Treat `<branch> @<dir>` as the peer's
+region — if you are about to work in the same worktree, coordinate per the
+driver-claim protocol below.
+
+
 This expands on the concurrent session rules in CLAUDE.md with examples,
 edge cases, and the incidents that created each rule.
 

@@ -636,3 +636,157 @@ def test_an_extracted_topic_for_a_DIFFERENT_session_is_not_used(tmp_path):
     _seed(db, mission="ship the thing")
     _seed_cc(db, "not mine", sid="some-other-session")
     assert sh.resolve_topic(db, _SID) == "ship the thing"
+
+
+# ---------------------------------------------------------------------------
+# Roster identity helpers: claude_ancestor_pid + resolve_git_branch
+# ---------------------------------------------------------------------------
+
+
+def _fake_proc(tmp_path, chain):
+    """Build a fake /proc: chain = [(pid, comm, ppid), ...]."""
+    proc = tmp_path / "proc"
+    for pid, comm, ppid in chain:
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "comm").write_text(comm + "\n")
+        # stat: pid (comm) state ppid ... — comm may contain spaces/parens,
+        # which is exactly what the parser must survive.
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} 0 0 0")
+    return proc
+
+
+def test_ancestor_walk_finds_claude_past_intermediates(tmp_path):
+    from session_heartbeat import claude_ancestor_pid
+
+    proc = _fake_proc(
+        tmp_path,
+        [
+            (500, "python3", 400),
+            (400, "bash", 300),
+            (300, "claude", 200),
+            (200, "tmux: server", 1),
+        ],
+    )
+    assert claude_ancestor_pid(start_pid=500, proc_root=str(proc)) == 300
+
+
+def test_ancestor_walk_survives_hostile_comm_and_bounds(tmp_path):
+    """comm with ') ' inside must not derail the stat parse; a cycle must not
+    loop; absence of claude yields None (fail-open)."""
+    from session_heartbeat import claude_ancestor_pid
+
+    proc = _fake_proc(
+        tmp_path,
+        [
+            (500, "evil) 1 (x", 400),
+            (400, "bash", 500),  # cycle 500<->400, no claude anywhere
+        ],
+    )
+    assert claude_ancestor_pid(start_pid=500, proc_root=str(proc)) is None
+
+
+def test_ancestor_walk_unreadable_proc_is_none(tmp_path):
+    from session_heartbeat import claude_ancestor_pid
+
+    assert claude_ancestor_pid(start_pid=1234, proc_root=str(tmp_path / "nope")) is None
+
+
+def _git_repo(tmp_path, branch="main"):
+    """A minimal real .git layout — no git binary needed."""
+    repo = tmp_path / "repo"
+    gitdir = repo / ".git"
+    gitdir.mkdir(parents=True)
+    (gitdir / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+    return repo
+
+
+def test_branch_plain_repo_and_subdir(tmp_path):
+    from session_heartbeat import resolve_git_branch
+
+    repo = _git_repo(tmp_path, "feat/roster-spine")
+    sub = repo / "src" / "deep"
+    sub.mkdir(parents=True)
+    assert resolve_git_branch(str(repo)) == "feat/roster-spine"
+    assert resolve_git_branch(str(sub)) == "feat/roster-spine", (
+        "resolution must walk UP from a subdirectory"
+    )
+
+
+def test_branch_worktree_gitfile_indirection(tmp_path):
+    """A linked worktree's .git is a FILE pointing at the real gitdir."""
+    from session_heartbeat import resolve_git_branch
+
+    main = tmp_path / "main"
+    wt_gitdir = main / ".git" / "worktrees" / "wt1"
+    wt_gitdir.mkdir(parents=True)
+    (wt_gitdir / "HEAD").write_text("ref: refs/heads/fix/some-branch\n")
+
+    wt = tmp_path / "wt1"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {wt_gitdir}\n")
+    assert resolve_git_branch(str(wt)) == "fix/some-branch"
+
+    # relative gitdir form
+    wt2 = tmp_path / "wt2"
+    wt2.mkdir()
+    wt2_gitdir = main / ".git" / "worktrees" / "wt2"
+    wt2_gitdir.mkdir(parents=True)
+    (wt2_gitdir / "HEAD").write_text("ref: refs/heads/other\n")
+    rel = "../main/.git/worktrees/wt2"
+    (wt2 / ".git").write_text(f"gitdir: {rel}\n")
+    assert resolve_git_branch(str(wt2)) == "other"
+
+
+def test_branch_detached_and_nonrepo_are_empty_string(tmp_path):
+    """"" = KNOWN: no branch — distinct from None (resolution failed)."""
+    from session_heartbeat import resolve_git_branch
+
+    repo = _git_repo(tmp_path)
+    (repo / ".git" / "HEAD").write_text("a" * 40 + "\n")  # detached
+    assert resolve_git_branch(str(repo)) == ""
+
+    nonrepo = tmp_path / "plain"
+    nonrepo.mkdir()
+    assert resolve_git_branch(str(nonrepo)) == ""
+
+
+def test_branch_bad_input_is_none(tmp_path):
+    from session_heartbeat import resolve_git_branch
+
+    assert resolve_git_branch("") is None
+    assert resolve_git_branch(str(tmp_path / "does-not-exist")) is None
+
+
+def test_branch_depth_exhaustion_is_none_not_known(tmp_path):
+    """Giving up 30 levels deep is a FAILED resolution (None), never the
+    known-no-branch "" — the three-valued contract's other edge (review)."""
+    from session_heartbeat import resolve_git_branch
+
+    deep = tmp_path
+    for i in range(35):
+        deep = deep / f"d{i}"
+    deep.mkdir(parents=True)
+    assert resolve_git_branch(str(deep)) is None
+
+
+def test_branch_hostile_giant_files_bounded(tmp_path):
+    """Attacker-influenced .git/HEAD files are read BOUNDED (zero-swap box:
+    an unbounded read of a crafted huge file is a freeze, not a bug report)
+    and an absurd branch name stores as None, never a silent truncation."""
+    from session_heartbeat import resolve_git_branch
+
+    repo = tmp_path / "hostile"
+    gitdir = repo / ".git"
+    gitdir.mkdir(parents=True)
+    # HEAD whose first line names a megabyte-long "branch"
+    (gitdir / "HEAD").write_text("ref: refs/heads/" + "A" * 1_000_000 + "\n")
+    assert resolve_git_branch(str(repo)) is None, (
+        "absurd branch length must resolve to unknown, not store megabytes"
+    )
+
+    # .git FILE whose gitdir line exceeds the bounded read
+    wt = tmp_path / "hostilewt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: " + "B" * 10_000 + "\n")
+    assert resolve_git_branch(str(wt)) is None
