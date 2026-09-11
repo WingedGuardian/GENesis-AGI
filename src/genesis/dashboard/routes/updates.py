@@ -201,21 +201,23 @@ def update_check():
             "summary": None,
         })
 
-    # Different tags or no tags — count commits and build summary
-    commits_behind = 0
-    summary = None
-
-    if local_tag and origin_tag:
-        # Count between tags (meaningful range, ignores squash noise)
-        behind_str = _git("rev-list", "--count", f"{local_tag}..{origin_tag}")
-        commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 1
-        summary = _git("log", "--oneline", "--no-merges", f"{local_tag}..{origin_tag}")
-    else:
-        # Fallback to commit-based when tags are missing
-        behind_str = _git("rev-list", "--count", "HEAD..origin/main")
-        commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 0
-        if commits_behind > 0:
-            summary = _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
+    # Different tags or no tags — count from the DEPLOYED COMMIT, never between
+    # the release tags. The second copy of the same defect: this endpoint feeds a
+    # dashboard card reading "N commit(s) behind", and counting tag-to-tag made
+    # that number describe the release span rather than the reader. See the note
+    # in learning/signals/genesis_version.py for the measurement; the correct
+    # shape is observability/snapshots/deploy_health.py's
+    # `commits_behind_upstream`.
+    behind_str = _git("rev-list", "--count", "HEAD..origin/main")
+    # Preserve the existing differing-release fallback when git cannot count.
+    # A failed measurement must not clear a known update from the dashboard.
+    fallback = 1 if local_tag and origin_tag else 0
+    commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else fallback
+    summary = (
+        _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
+        if commits_behind > 0
+        else None
+    )
 
     return jsonify({
         "commits_behind": commits_behind,
