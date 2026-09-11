@@ -61,10 +61,36 @@ cat << SSHEOF
 # The RemoteCommand sets PATH (an ssh RemoteCommand does NOT source .bashrc), so
 # tmux resolves even where it is user-local — mirrors cc-slot.sh's toolchain PATH
 # so the lobby door matches the numeric-slot door's behavior.
+#
+# `respawn-pane -k` before the chooser is LOAD-BEARING, not tidiness. A tmux pane
+# mode belongs to the PANE, not the client, so choose-tree survives the client
+# going away: MEASURED 2026-09-11 on a live install, the lobby pane sat at
+# `in_mode=1 mode=tree-mode` with no client attached, and again on an isolated
+# socket after detaching a client. Re-issuing choose-tree does NOT reset it.
+#
+# What that does to the operator: the next connect lands inside the PREVIOUS
+# chooser, wherever it was left — so the screen shows some other session's
+# preview (an unrecognised session), keystrokes go to the chooser rather than to
+# the app (a "frozen" terminal), and tree-mode's search prompt sits in the status
+# line. Reported as intermittent because it depends on how the last visit ended.
+#
+# It also clears junk left at the shell prompt: the same pane held a terminal
+# Device-Attributes reply echoed as literal text (`1;4;6;7;` twice).
+#
+# respawn-pane is the only mechanism that works. `send-keys -X cancel`, plain
+# `send-keys q` and `send-keys Escape` were all MEASURED to leave in_mode=1 —
+# mode keys need a client context, and the stale pane has none, which is exactly
+# the state needing the reset. Unconditional rather than guarded on
+# `#{pane_in_mode}`: an if-shell adds another quoting layer through
+# ssh_config → remote shell → tmux, and quoting is already the documented
+# failure mode of this block. The lobby is a switchboard, not a work session
+# (see below), so restarting its shell costs nothing — the cc-* slots are
+# untouched. One caveat: a SECOND concurrent lobby window will reset the pane
+# under the first. Acceptable for a switchboard; noted so it is not a surprise.
 Host ${TS_HOSTNAME}-lobby
     HostName ${TS_IP}
     User ${REMOTE_USER}
-    RemoteCommand PATH="${REMOTE_HOME}/.n/bin:${REMOTE_HOME}/.bun/bin:${REMOTE_HOME}/.npm-global/bin:${REMOTE_HOME}/.local/bin:\$PATH" tmux -u new-session -A -s lobby \; choose-tree -Zs
+    RemoteCommand PATH="${REMOTE_HOME}/.n/bin:${REMOTE_HOME}/.bun/bin:${REMOTE_HOME}/.npm-global/bin:${REMOTE_HOME}/.local/bin:\$PATH" tmux -u new-session -A -s lobby \; respawn-pane -k -t lobby \; choose-tree -Zs
     RequestTTY yes
     ServerAliveInterval 30
     ServerAliveCountMax 6
