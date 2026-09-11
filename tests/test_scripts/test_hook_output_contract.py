@@ -163,19 +163,22 @@ _STRUCTURALLY_BOUNDED = {
     ),
 }
 
-#: NOT structurally bounded. Listed only because it has never been observed
-#: filing, with its routing tracked elsewhere. This category exists so that debt
-#: is VISIBLE rather than laundered into the table above, and it is meant to
-#: drain to empty. Every entry must name where its routing is tracked.
-_MEASURED_PENDING_ROUTING = {
-    "scripts/proactive_memory_hook.py": (
-        "7 model-facing print sites; get_active_sync (db/crud/session_heartbeats.py"
-        ":165-177) has no LIMIT, so the peer loop is unbounded. NEVER observed "
-        "filing (0 of 849 harness filings). Routing is tracked as its own PR "
-        "because this runs on every prompt in every session and its own comment "
-        "notes a broken read 'reads exactly like no concurrent sessions'."
-    ),
-}
+#: NOT structurally bounded. A hook belongs here only because it has never been
+#: observed filing, with its routing tracked elsewhere. This category exists so
+#: that debt is VISIBLE rather than laundered into the table above, and it is
+#: meant to drain to empty. Every entry must name where its routing is tracked.
+#:
+#: EMPTY, and that is the current state rather than an aspiration. Its only ever
+#: member was ``scripts/proactive_memory_hook.py``, whose reason conceded that
+#: its peer loop was unbounded — so it could reach the cap, which is exactly what
+#: this category admits. It now routes every model-facing write through
+#: BoundedStdout and bounds each contributing surface by meaning (keyword window,
+#: trail-line pivot selection, code-hint clip, peer LIMIT with a named overflow),
+#: so it needs no waiver of either kind. Kept rather than deleted: the next hook
+#: that genuinely has this shape needs a labelled place to sit with the rule
+#: attached, or the row gets filed under "structurally bounded", where it is a
+#: false claim instead of visible debt.
+_MEASURED_PENDING_ROUTING: dict[str, str] = {}
 
 #: hook_output.py is the writer itself; it legitimately calls bare print() to
 #: emit what every other hook hands it. Same shape as test_hook_input_contract's

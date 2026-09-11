@@ -464,13 +464,32 @@ not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
 change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
 `.local.yaml` overlay can raise a default.
 
-There is a SECOND, weaker category, named here because describing only the first
-overstates the gate: `_MEASURED_PENDING_ROUTING` holds a hook that is NOT
+There is a SECOND, weaker category, kept so that describing only the first does
+not overstate the gate: `_MEASURED_PENDING_ROUTING` is for a hook that is NOT
 structurally bounded and has simply never been observed filing, with its routing
-tracked in a follow-up. `proactive_memory_hook.py` is its only member and its own
-reason concedes the peer loop is unbounded — so it CAN reach the cap. That is
-debt with a date on it, not a proof, and the two categories are kept separate so
-the debt stays visible rather than laundered into "bounded".
+tracked elsewhere. It is **empty**. Its only ever member was
+`proactive_memory_hook.py`, whose own reason conceded an unbounded peer loop — so
+it could reach the cap, which is what that category admits rather than denies.
+It now routes every model-facing write through the writer and bounds each
+contributing surface **by meaning** rather than with one blanket cap: an
+upper length window on extracted keywords (the root — an unbroken alphanumeric
+run was otherwise one token of whatever was pasted), whole-pivot selection for
+the session-trail line, a clip on the code-hint signature that keeps the file
+location intact, and a `LIMIT` on the peer query whose overflow is NAMED rather
+than silently dropped. The category stays because the next hook that genuinely
+has that shape needs a labelled place to sit with the rule attached — a row
+filed under "structurally bounded" is a false claim instead of visible debt.
+
+One rule generalises out of that work and belongs here rather than in the hook's
+own doc: **a size bound must be measured in the unit the harness bills**
+(UTF-16 code units, via `utf16_len`/`clip_to_cost`), not in codepoints. Mixing
+them does not loosen a bound, it SKIPS it — an astral value short enough in
+`len` never reaches the clip at all, and the extremes hide it, so a probe that
+tries one huge value reports clean. `hook_output.py` fixed this class inside
+itself and its adopters reintroduced it at the GUARD rather than the clip. A
+bound on MEANING (is this token a word?) is the one case that stays in
+codepoints — say which one you are writing. The rest of that work's lessons live
+with the code, in `.claude/docs/proactive-memory-hook.md`.
 
 Three limits, so it is not read as total coverage. Hooks wired in a user-level
 `~/.claude/settings.json` or a `settings.local.json` are outside the repo and

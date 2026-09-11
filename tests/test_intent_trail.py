@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
-import importlib
 import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-# The hook script lives in scripts/, not a package — load it manually
+# The hook script lives in scripts/, not a package — put that dir on the path and
+# import it normally, exactly as tests/test_hooks/test_concurrent_tag_render.py
+# and test_proactive_memory_keywords.py do.
+#
+# This file used to build the module with importlib and ASSIGN it over
+# ``sys.modules["proactive_memory_hook"]``. That produced a SECOND module object
+# for the same source while its sibling test files kept a reference to the
+# first, so the two halves of the suite ran different copies of the hook — and a
+# fixture resetting module state on one could not see the other. Harmless while
+# the hook held no cross-call state; it stopped being harmless the moment the
+# hook gained a per-process stdout writer, at which point one file's flood test
+# left the OTHER file's writer closed and eight unrelated tests emitted nothing.
+# The old comment claimed this avoided auto-running the module or importing heavy
+# deps; ``exec_module`` runs the top level just as an import does, so it never
+# did either.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-_HOOK_PATH = _SCRIPTS_DIR / "proactive_memory_hook.py"
+sys.path.insert(0, str(_SCRIPTS_DIR))
 
-# Load the module from file path
-_spec = importlib.util.spec_from_file_location("proactive_memory_hook", _HOOK_PATH)
-_mod = importlib.util.module_from_spec(_spec)
-# Prevent the hook from auto-running or importing heavy deps at load time
-sys.modules["proactive_memory_hook"] = _mod
-_spec.loader.exec_module(_mod)
+import proactive_memory_hook as _mod  # noqa: E402
 
 _jaccard_similarity = _mod._jaccard_similarity
 _detect_pivot = _mod._detect_pivot

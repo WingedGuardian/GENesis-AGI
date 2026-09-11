@@ -117,6 +117,58 @@ does the least work needed to build the response and defers the rest:
   `GENESIS_RECALL_READ_POOL_OFF=1`. The query-embed call-site heartbeat
   is also fired off the hot path, so `embed` no longer blocks on that write.
 
+## Output budget — every model-facing write is bounded
+
+This is a `UserPromptSubmit` hook, so everything it prints is bare stdout that
+the model reads. The harness FILES a hook entry over `HOOK_STDOUT_CAP` behind a
+~2 KB preview, with no error and no exit-code change — so an overrun silently
+costs the window its peer list and its prompt-injection safety directive, and
+this hook's own code notes that a failed peer read "reads exactly like no
+concurrent sessions".
+
+Every write therefore goes through one `BoundedStdout`
+(`scripts/hooks/hook_output.py`), and each contributing surface is bounded **by
+meaning** rather than by one blanket character cap:
+
+| surface | bound | why that shape |
+|---|---|---|
+| extracted keywords | length window, `_MAX_KEYWORD_CHARS` | the ROOT. An identifier cannot get long here (every non-alphanumeric char becomes whitespace, so identifiers SPLIT), but an unbroken alphanumeric run — a pasted hash, token, or minified blob — is one token of whatever length. DROPPED, not truncated: a keyword is a KEY (`_detect_pivot` compares keyword sets), so a truncated id would collide with a different id sharing its prefix. |
+| `[Session trail]` | `_MAX_TRAIL_LINE_CHARS` | drops WHOLE oldest pivots and marks it with the `… →` prefix the count bound already uses. A truncated arrow chain would end in half a topic that reads like a whole one. |
+| `[Code]` hints | `_MAX_CODE_HINT_CHARS` | the largest surface on REAL data. Clips the signature and keeps the file location whole — the location is the actionable half. |
+| `[Concurrent]` peers | `_MAX_PEERS_SHOWN` (a query `LIMIT`) | bounded by COUNT so the safety directive that follows always has room. Overflow is NAMED from a `COUNT`, never inferred from a read that stopped at its own limit. |
+
+`tests/test_scripts/test_hook_output_contract.py` fails this hook if any
+model-facing `print` reappears; `tests/test_hooks/test_proactive_hook_bounded_output.py`
+pins the behaviour of each bound above.
+
+**Units.** The two SIZE bounds (trail line, code hint) are measured in UTF-16
+code units — what the harness bills — via `utf16_len` and `clip_to_cost`. The
+keyword window is deliberately in CODEPOINTS, because it asks whether a token is
+a word or a pasted blob, and billing a 20-character astral CJK word as 40 units
+would drop a real word for being non-Latin; `_detect_pivot`'s filter must use the
+same unit or the two disagree about what is in the window. Mixing the units does
+not loosen a bound, it skips it: the code hint originally billed in UTF-16 while
+deciding in `len`, so 200 emoji rendered 626 units against a stated 400 and were
+never clipped. The breach lives in the MIDDLE of the range — a huge value trips
+the guard and clips correctly — so any probe here sweeps widths.
+
+**Testing notes.**
+
+- The writer is a module-level singleton — correct in production (one hook run
+  per process), wrong under pytest, where every test would share one budget.
+  `tests/test_hooks/conftest.py` resets it per test, and warns loudly if it
+  cannot, because a silent failure there surfaces as an unrelated test failing on
+  a cut it did not cause.
+- That reset only works while there is ONE module object. A test file that
+  rebuilds the hook with `importlib` and assigns over `sys.modules` creates a
+  second copy, and the two halves of the suite then run different code —
+  `test_intent_trail.py` did this, and it cost eight unrelated tests their output
+  the moment the hook gained a writer.
+- Labels are PERSISTED and survive 60 days, so a trail written before these
+  bounds existed holds unbounded labels. Anything reading `intent_trail.json`
+  must assume it was written by older code — `_detect_pivot` and
+  `_render_trail_line` both do.
+
 ## Related
 
 - Endpoint + engine: `src/genesis/dashboard/routes/proactive.py`,
