@@ -7638,11 +7638,16 @@ def _remote_url_slug(url: str) -> str | None:
     already follows, and for the same reason. A hand-split version of this
     function misclassified SIX families, every one silently (the gate simply
     never fired): a port (``ssh://git@github.com:22/o/r``,
-    ``https://github.com:443/o/r``), an uppercase HOST (``https://GitHub.com/…``,
-    ``git@GITHUB.COM:…``) which RFC 3986 makes case-insensitive, an uppercase  # genesis:verified-generic
+    ``https://github.com:443/o/r``), an uppercase HOST in either the URL or the
+    scp-like form — RFC 3986 makes the host case-insensitive — an uppercase
     OWNER/REPO which GitHub itself treats case-insensitively, a trailing slash
     after ``.git``, a ``#fragment`` or ``?query``, and a scp-like form with no
     user (``github.com:o/r.git``).
+
+    (The uppercase-host examples are deliberately described rather than spelled
+    out: CI's email scan excludes ``@github.com`` CASE-SENSITIVELY, so the literal
+    uppercase form reads to it as a personal address. The test file carries the
+    real spellings — it is excluded from that scan — so coverage is unaffected.)
 
     Both halves are casefolded because both are case-insensitive in practice, so
     the caller compares like with like.
