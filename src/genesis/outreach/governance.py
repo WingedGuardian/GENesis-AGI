@@ -217,14 +217,60 @@ class GovernanceGate:
         )
 
     def _in_quiet_hours(self) -> bool:
+        """True if the local clock is inside the configured quiet window.
+
+        A ZERO-WIDTH window (start == end) means quiet hours are DISABLED, which
+        is the shipped default (``config/outreach.yaml``).
+
+        ``ego/cadence.py::_in_quiet_hours`` has the same zero-width rule, but the
+        two are NOT equivalent and an earlier version of this docstring said they
+        were: ego checks an explicit ``quiet_hours_enabled`` flag FIRST
+        (``cadence.py:1466``) and its zero-width rule is a fallback underneath
+        that. Here the sentinel IS the off switch. A boolean would be immune to
+        the overlay hazard noted in ``config/outreach.yaml``; it is deliberately
+        deferred (owner ruling 2026-09-10) and tracked with the proper redesign.
+
+        Without the early return the equal case falls into the ``start <= end``
+        branch and compares a microsecond-precision ``now`` against midnight —
+        effectively but not reliably never true, which is a worse kind of "off"
+        than an explicit one. The one instant where it matters is midnight
+        exactly, which is what ``test_midnight_is_the_instant_the_rule_actually_
+        decides`` pins.
+
+        The check lives HERE rather than in ``check()`` deliberately: both
+        ``tests/test_outreach/test_governance.py`` and the autouse
+        ``_disable_quiet_hours`` fixture replace this whole method, so a check one
+        level up would bypass their control of it.
+
+        A MALFORMED window disables quiet hours rather than raising. This method
+        is called from ``check()`` on every send, and ``scheduler.py`` retries a
+        failed drain indefinitely — so an unparseable value used to turn one typo
+        into a permanent 5-minute failure loop. Nothing validates the field today
+        (the settings domain has no validator and the dashboard PUTs the config
+        through unchecked), and this change is what invites the owner to edit it,
+        so it fails toward the safe direction: the owner still gets their
+        messages, and the bad value is logged rather than swallowed silently.
+        """
+        raw = self._config.quiet_hours
+        try:
+            start = time.fromisoformat(raw.start)
+            end = time.fromisoformat(raw.end)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid quiet_hours window (start=%r end=%r) — treating quiet "
+                "hours as DISABLED. Expected HH:MM; fix config/outreach.yaml or "
+                "your local overlay.",
+                raw.start, raw.end,
+            )
+            return False
+        if start == end:
+            return False
         from zoneinfo import ZoneInfo
         try:
             tz = ZoneInfo(user_timezone())
         except Exception:
             tz = UTC
         now = datetime.now(tz).time()
-        start = time.fromisoformat(self._config.quiet_hours.start)
-        end = time.fromisoformat(self._config.quiet_hours.end)
         if start <= end:
             return start <= now <= end
         return now >= start or now <= end

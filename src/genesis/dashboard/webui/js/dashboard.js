@@ -2831,8 +2831,8 @@
           effort: 'Processing depth: low (fast), medium (balanced), high (thorough), xhigh (deeper), or max (deepest)',
           timeout_s: 'Max seconds per inbox item processing before timeout',
           // Outreach
-          start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
-          end: 'Quiet hours end \u2014 outreach resumes after this time (e.g., 07:00)',
+          start: 'Quiet hours start \u2014 outreach is held until the window ends (e.g., 22:00). Set start = end (both 00:00, the default) to disable quiet hours entirely. Alerts and blockers always bypass it.',
+          end: 'Quiet hours end \u2014 held outreach resumes at this time (e.g., 07:00). A window that crosses midnight is fine. Equal to start means disabled.',
           default: 'Channel for general outreach (morning reports, digests)',
           blocker: 'Channel for blocking/critical alerts that need immediate attention',
           alert: 'Channel for non-blocking alerts and notifications',

@@ -3,14 +3,26 @@
 import tempfile
 from pathlib import Path
 
-from genesis.outreach.config import OutreachConfig, QuietHours, load_outreach_config
+from genesis.outreach.config import (
+    QUIET_HOURS_DISABLED,
+    OutreachConfig,
+    QuietHours,
+    load_outreach_config,
+)
 
 
 def test_default_config():
     config = load_outreach_config(Path("/nonexistent"))
     assert isinstance(config, OutreachConfig)
-    assert config.quiet_hours.start == "22:00"
-    assert config.quiet_hours.end == "07:00"
+    # Quiet hours ship DISABLED as a zero-width window (owner ruling 2026-09-10).
+    # This assertion used to pin 22:00/07:00; that default held an explicitly
+    # scheduled 01:30 owner reminder until 07:00, and the feature had no off
+    # switch. Full default-path coverage (no file / file without the key /
+    # shipped yaml) lives in test_governance.py, which also asserts the value
+    # actually READS as disabled — the half this assertion cannot see.
+    assert config.quiet_hours.start == QUIET_HOURS_DISABLED.start
+    assert config.quiet_hours.end == QUIET_HOURS_DISABLED.end
+    assert config.quiet_hours.start == config.quiet_hours.end, "zero-width = off"
     assert config.max_daily == 5
     assert config.surplus_daily == 1
 
