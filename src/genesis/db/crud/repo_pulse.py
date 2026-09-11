@@ -274,23 +274,79 @@ async def list_runs(db: aiosqlite.Connection, *, limit: int = 200) -> list[dict]
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def latest_annotation_per_item(
+    db: aiosqlite.Connection,
+    item_ids: list[str],
+    *,
+    status: str,
+    target_kind: str,
+) -> dict[str, dict]:
+    """The NEWEST matching annotation for each of *item_ids*, keyed by item id.
+
+    Exists because :func:`list_annotations` cannot answer this without a row cap,
+    and a cap is the wrong shape for a per-row lookup. Filtering that function by
+    ``item_ids`` bounds WHICH rows are considered but not HOW MANY results return:
+    with one item holding 500 newer annotations, a second item's older one falls
+    past the limit and its row comes back undecorated — indistinguishable from a
+    row with nothing to report, while the caller still reports the source as read.
+    Here the result is at most one row per requested id BY CONSTRUCTION, so there
+    is no cap to exceed and no truncation to detect.
+
+    Relies on SQLite's documented bare-column behaviour: in a ``GROUP BY`` query
+    using ``MAX()``, the non-aggregated columns come from the row holding that
+    maximum. Ties (identical ``observed_at`` within one item) resolve arbitrarily
+    but consistently — acceptable, since either row is equally "the newest".
+    Requires ``db.row_factory = aiosqlite.Row``.
+    """
+    if status not in ANNOTATION_STATUSES:
+        raise ValueError(f"invalid annotation status: {status!r}")
+    if target_kind not in TARGET_KINDS:
+        raise ValueError(f"invalid target_kind: {target_kind!r}")
+    if not item_ids:
+        return {}
+    placeholders = ",".join("?" * len(item_ids))
+    cursor = await db.execute(
+        "SELECT *, MAX(observed_at) AS _newest FROM repo_pulse_annotations "  # noqa: S608
+        f"WHERE status = ? AND target_kind = ? AND item_id IN ({placeholders}) "
+        "GROUP BY item_id",
+        (status, target_kind, *(str(i) for i in item_ids)),
+    )
+    return {str(r["item_id"]): dict(r) for r in await cursor.fetchall()}
+
+
 async def list_annotations(
     db: aiosqlite.Connection,
     *,
     session_id: str | None = None,
     status: str | None = None,
     target_kind: str | None = None,
+    item_ids: list[str] | None = None,
     limit: int = 500,
 ) -> list[dict]:
-    """Annotations newest first, optionally filtered by session, status, and/or
-    target_kind. Each returned dict carries ``target_kind`` (SELECT *), so a
-    caller may also dispatch per-row without pre-filtering."""
+    """Annotations newest first, optionally filtered by session, status,
+    target_kind, and/or a specific set of item ids. Each returned dict carries
+    ``target_kind`` (SELECT *), so a caller may also dispatch per-row without
+    pre-filtering.
+
+    ``item_ids`` exists so a caller decorating a KNOWN set of rows can bound the
+    query by that set instead of by ``limit``. Without it such a caller must scan
+    the global matching set and trust it fits under the cap — and a result AT the
+    cap is a truncated read, indistinguishable from a complete one, so rows past
+    the cut silently look like rows with nothing to report. An empty list is a
+    real filter (matches nothing), distinct from ``None`` (no filter).
+    """
     if status is not None and status not in ANNOTATION_STATUSES:
         raise ValueError(f"invalid annotation status: {status!r}")
     if target_kind is not None and target_kind not in TARGET_KINDS:
         raise ValueError(f"invalid target_kind: {target_kind!r}")
     lim = max(1, min(int(limit), 2000))
     clauses, params = [], []
+    if item_ids is not None:
+        if not item_ids:
+            return []
+        placeholders = ",".join("?" * len(item_ids))
+        clauses.append(f"item_id IN ({placeholders})")  # noqa: S608 — bound placeholders
+        params.extend(str(i) for i in item_ids)
     if session_id is not None:
         clauses.append("item_session_id = ?")
         params.append(session_id)

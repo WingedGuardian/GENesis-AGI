@@ -20,6 +20,12 @@
 #   scripts/capture_desktop.sh --out ~/tmp/shots  # where to land it locally
 set -euo pipefail
 
+if [[ -z "${HOME:-}" ]]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+  [[ -n "$HOME" ]] || { echo "Cannot resolve HOME; export it before running capture_desktop.sh" >&2; exit 1; }
+  export HOME
+fi
+
 MODE="screen"; MATCH=""; OUTDIR="${HOME}/tmp/genesis-captures"; TIMEOUT=60
 while [[ $# -gt 0 ]]; do
   case "$1" in

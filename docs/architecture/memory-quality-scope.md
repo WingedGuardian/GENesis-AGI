@@ -20,7 +20,7 @@ value is in naming the gaps, not hiding them.
   to FTS5-only (enforced)
 - **Observation/reflection confidence gates** — min 0.5 confidence,
   enforced (was 0.3 shadow-mode). *(Activated: PR 1)*
-- **Adversarial synthesis challenge** — different-provider LLM (Kimi)
+- **Adversarial synthesis challenge** — different-provider LLM (Kimi 3)
   reviews synthesis output (DeepSeek) for information loss before
   deprecating originals. Blocks on FAIL. *(Added: PR 1)*
 - **Adversarial entity challenge** — different-provider second opinion
