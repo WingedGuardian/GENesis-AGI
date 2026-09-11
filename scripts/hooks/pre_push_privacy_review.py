@@ -516,7 +516,8 @@ def main() -> None:
             + "\n".join(shown)
             + tail
             + "\n\nScrub the real value, or — if it is genuinely generic — mark the "
-            "line and push again:\n"
+            "line and push again. The marker must be ON the flagged line itself; "
+            "one on the line above does not count:\n"
             "    # pragma: allowlist secret   (a key-shaped placeholder)\n"
             "    # gitleaks:allow             (same, gitleaks' spelling)\n"
             "    # genesis:verified-generic   (a reserved domain, a CIDR constant, "

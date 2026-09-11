@@ -263,8 +263,8 @@ def _diff(*lines: str) -> str:
         ("openai key", 'KEY = "sk-' + "C" * 40 + '"'),
         ("aws access key id", 'AWS_ACCESS_KEY_ID = "AKIA' + "D" * 16 + '"'),
         ("groq key", 'KEY = "gsk_' + "E" * 40 + '"'),
-        ("url user:pass", 'URL = "https://admin:hunter2@internal.example.com/x"'),
-        ("hardcoded password", 'DATABASE_PASSWORD = "correct-horse-battery"'),
+        ("url user:pass", 'URL = "https://admin:hunter2@internal.example.com/x"'),  # genesis:verified-generic
+        ("hardcoded password", 'DATABASE_PASSWORD = "correct-horse-battery"'),  # genesis:verified-generic
     ],
 )
 def test_a_credential_shape_this_install_has_never_seen_is_caught(label, line):
@@ -325,7 +325,7 @@ def test_an_assignment_from_the_environment_is_not_a_secret():
 
 def test_a_hardcoded_literal_still_blocks():
     """The other side of the same filter — it must not have blinded the check."""
-    assert hook._scan(_diff('DATABASE_PASSWORD = "correct-horse-battery"'))
+    assert hook._scan(_diff('DATABASE_PASSWORD = "correct-horse-battery"'))  # genesis:verified-generic
 
 
 def test_findings_never_echo_the_matched_value():

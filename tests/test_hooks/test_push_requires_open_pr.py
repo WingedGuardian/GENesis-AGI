@@ -426,8 +426,7 @@ def test_gh_output_that_is_not_an_answer_fails_open(monkeypatch, stdout, rc, exp
         ("https://github.com/o/r.git/", "o/r"),  # trailing slash after .git
         ("https://github.com/o/r.git#frag", "o/r"),
         ("https://github.com/o/r.git?x=1", "o/r"),
-        # genesis:verified-generic — a synthetic userinfo form, not a credential
-        ("https://x-access-token:tok@github.com/o/r.git", "o/r"),
+        ("https://x-access-token:tok@github.com/o/r.git", "o/r"),  # genesis:verified-generic
         ("/plain/local/path", None),
         ("../relative/path", None),
         ("https://gitlab.com/o/r.git", None),
