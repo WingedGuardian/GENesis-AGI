@@ -296,6 +296,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per guarded call
     ),
+    "worktree_ownership": SettingsDomain(
+        name="worktree_ownership",
+        description=(
+            "Worktree ownership — master `enabled` + `mode` advisory/off. Records "
+            "which session holds which worktree as a `git worktree lock` reason, "
+            "which the reaper and `git worktree remove` already honour. advisory "
+            "(default) maintains those locks daily and warns on stderr when a "
+            "session edits a worktree another live session holds; off takes no "
+            "locks and releases none. Nothing is ever blocked. Read live per call "
+            "— takes effect immediately, no restart. Env kill switch "
+            "GENESIS_WORKTREE_OWNERSHIP=1 forces off. Note off does not release "
+            "locks already taken: run the sweeper once with --release-only first."
+        ),
+        config_filename="worktree_ownership.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per call
+    ),
     "ego_reconcile": SettingsDomain(
         name="ego_reconcile",
         description=(
@@ -1316,6 +1333,23 @@ def _validate_mcp_staleness_guard(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_worktree_ownership(changes: dict) -> list[str]:
+    """Validate worktree-ownership lever changes (see
+    genesis.observability.worktree_ownership_config)."""
+    from genesis.observability.worktree_ownership_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in ("enabled", "mode"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_ws2_ledger(changes: dict) -> list[str]:
     """Validate ws2_ledger consumer-lever changes (see
     genesis.ledger.ws2_ledger_config)."""
@@ -1953,6 +1987,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
+    "worktree_ownership": _validate_worktree_ownership,
     "voice_act": _validate_voice_act,
     "voice_recency_resume": _validate_voice_recency_resume,
     "tts": _validate_tts,

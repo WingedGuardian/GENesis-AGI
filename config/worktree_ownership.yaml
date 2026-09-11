@@ -1,0 +1,32 @@
+# Worktree ownership — records which session holds which worktree, so that one
+# session cannot edit or reap another's work by mistake.
+#
+# Ownership is written as a `git worktree lock` reason rather than a bespoke
+# claim file, because two enforcement points already honour that lock with no
+# code to add: the reaper (scripts/worktree_lifecycle.py) skips a locked
+# worktree, and `git worktree remove` refuses one unless given --force.
+#
+# The signal this replaces did not work. Both existing guards infer ownership by
+# scanning /proc/*/cwd for a process sitting inside the worktree, and sessions
+# `cd` per command, so their process CWD never leaves the main tree. Measured on
+# a live install: 0 of 200 worktrees had any process CWD inside them while 7
+# session processes were running.
+#
+# mode:
+#   advisory — (default) the sweeper maintains locks, and the edit hook warns on
+#              stderr when a session edits a worktree another live session holds.
+#              Nothing is ever blocked.
+#   off      — take no locks, release none, warn about nothing.
+# enabled: master switch; false is equivalent to off.
+#
+# An invalid mode degrades to `advisory`, not `off`: every surface here is
+# non-blocking, so the safest failure is to keep protecting rather than to stop.
+#
+# Read live per call. The env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces
+# off. Takes effect immediately, no restart.
+#
+# Note `off` does NOT release locks already taken — it stops the sweeper
+# entirely, including its release half. To unwind, run the sweeper once with
+# `--release-only` before switching it off.
+enabled: true
+mode: advisory
