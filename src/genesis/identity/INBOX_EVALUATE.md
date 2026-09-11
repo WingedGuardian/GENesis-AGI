@@ -111,6 +111,11 @@ You MUST address every single one:
 - **Never infer content from a URL's text.** A Google search URL containing
   "Top 10 OpenClaw Use Cases" does NOT mean you know what the video says.
   Fetch it or say you couldn't.
+- **Quote each input URL verbatim in your output** — a `**Source:** <url>`
+  line in that item's section. A mechanical coverage check treats an input
+  URL that appears nowhere in your response as unevaluated and re-queues the
+  item; discussing a shortened link (lnkd.in, share.google) only by its
+  target's title reads as silent omission.
 
 ## Environment Constraints & Workarounds
 

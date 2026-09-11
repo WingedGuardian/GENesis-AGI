@@ -37,12 +37,49 @@ inbox_monitor:
     assert cfg.response_dir == "_genesis"
     assert cfg.check_interval_seconds == 1800
     assert cfg.batch_size == 5
+    assert cfg.items_per_eval == 1
     assert cfg.model == "sonnet"
     assert cfg.effort == "high"
-    assert cfg.timeout_s == 600
+    assert cfg.timeout_s == 1200
     assert cfg.enabled is True
     assert cfg.max_retries == 3
     assert cfg.recursive is False
+    # The gate must default to SHADOW through the config LAYER, not only through
+    # the dataclass — this is the path an install takes whose inbox_monitor.yaml
+    # predates the key, which is every existing install on first pull.
+    assert cfg.url_coverage_mode == "shadow"
+
+
+def test_invalid_url_coverage_mode_coerces_to_shadow_loudly(caplog):
+    """An unrecognised value already degraded to shadow, but SILENTLY.
+
+    The monitor reads this as `!= "enforce"`, so a typo would leave the gate
+    observing forever while the operator believed it was live — and they only
+    touch this lever once they have decided to act on the shadow measurement.
+    The MCP settings validator rejects a bad value on its own path; this covers
+    a hand-edited YAML or a local overlay, which that validator never sees.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        cfg = load_inbox_config_from_string("""
+inbox_monitor:
+  watch_path: "/tmp/test"
+  url_coverage_mode: "enfoce"
+""")
+    assert cfg.url_coverage_mode == "shadow"
+    assert any("url_coverage_mode" in r.getMessage() for r in caplog.records), (
+        "an unrecognised mode must SAY it is falling back, not degrade in silence"
+    )
+
+
+def test_a_valid_url_coverage_mode_survives():
+    cfg = load_inbox_config_from_string("""
+inbox_monitor:
+  watch_path: "/tmp/test"
+  url_coverage_mode: "enforce"
+""")
+    assert cfg.url_coverage_mode == "enforce"
 
 
 def test_new_config_fields():

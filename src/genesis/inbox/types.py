@@ -39,12 +39,19 @@ class InboxConfig:
     # is segmented into items and grouped into batches of this size, so a
     # 16-URL drop becomes ~4 evals instead of one mega-batch. ``batch_size``
     # above is legacy (files-per-cycle) and no longer governs eval grouping.
-    items_per_eval: int = 5
+    items_per_eval: int = 1
     enabled: bool = True
     model: str = "sonnet"
     effort: str = "high"
-    timeout_s: int = 3600
+    timeout_s: int = 1200
     max_retries: int = 3
+    # "shadow" computes the URL-coverage verdict and logs it without acting;
+    # "enforce" re-queues an item whose response never quotes one of its URLs.
+    # Defaults to shadow because this gate is NEW (main has none) and a corpus
+    # replay says it would flag roughly half of legacy-shaped responses on day
+    # one, into a retry path that parks a file after 3 failures with no
+    # notification. Flip to enforce on measured compliance, not on hope.
+    url_coverage_mode: str = "shadow"
     recursive: bool = False
     # timezone removed — uses genesis.env.user_timezone()
     evaluation_cooldown_seconds: int = 3600

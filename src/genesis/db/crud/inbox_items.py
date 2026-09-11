@@ -41,14 +41,16 @@ async def create(
     batch_id: str | None = None,
     drop_id: str | None = None,
     batch_items: str | None = None,
+    error_message: str | None = None,
+    retry_count: int = 0,
 ) -> str:
     await db.execute(
         """INSERT INTO inbox_items
            (id, file_path, content_hash, status, batch_id, created_at,
-            drop_id, batch_items)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            drop_id, batch_items, error_message, retry_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, file_path, content_hash, status, batch_id, created_at,
-         drop_id, batch_items),
+         drop_id, batch_items, error_message, retry_count),
     )
     await db.commit()
     return id
@@ -466,20 +468,28 @@ async def count_url_failures(
     file_path: str,
     *,
     since_hours: int = 48,
+    min_retry_count: int = 0,
 ) -> int:
     """Count recent partial_url_failure items for a file path.
 
     Used for retry storm prevention — stop re-evaluating files that
     persistently fail URL fetches.
+
+    ``min_retry_count`` restricts the count to rows that have EXHAUSTED their
+    retries. Without it the count is "distinct failing rows", which is not
+    persistence: under one-item-per-evaluation a single drop produces one row
+    per URL, so three different URLs each failing ONCE tripped a threshold
+    meant for three retries of the same content — parking the whole file with
+    its other URLs never evaluated (adversarial audit, 2026-09-06).
     """
     from datetime import UTC, datetime, timedelta
 
     cutoff = (datetime.now(UTC) - timedelta(hours=since_hours)).isoformat()
     cursor = await db.execute(
         """SELECT COUNT(*) FROM inbox_items
-           WHERE file_path = ? AND error_message = 'partial_url_failure'
-             AND created_at > ?""",
-        (file_path, cutoff),
+           WHERE file_path = ? AND error_message LIKE 'partial_url_failure%'
+             AND created_at > ? AND retry_count >= ?""",
+        (file_path, cutoff, min_retry_count),
     )
     row = await cursor.fetchone()
     return row[0] if row else 0

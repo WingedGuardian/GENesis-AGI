@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import yaml
 
 from genesis.inbox.types import InboxConfig
+
+logger = logging.getLogger(__name__)
 
 
 def load_inbox_config(path: str | Path) -> InboxConfig:
@@ -45,6 +48,22 @@ def _parse(raw: dict) -> InboxConfig:
         msg = "inbox_monitor.watch_path is required"
         raise KeyError(msg)
 
+    # The monitor reads this as `!= "enforce"`, so an unrecognised value already
+    # degrades to shadow — the safe direction, but SILENTLY. Say so instead: an
+    # operator only touches this lever once they have decided to act on the
+    # shadow measurement, and a typo would leave the gate observing forever while
+    # they believed it was live. The MCP settings validator rejects a bad value
+    # on that path; this covers a hand-edited YAML or a local overlay, which the
+    # validator never sees.
+    coverage_mode = str(section.get("url_coverage_mode", "shadow"))
+    if coverage_mode not in {"shadow", "enforce"}:
+        logger.warning(
+            "inbox_monitor.url_coverage_mode=%r is not 'shadow' or 'enforce' — "
+            "running in shadow (the gate will observe and change nothing)",
+            coverage_mode,
+        )
+        coverage_mode = "shadow"
+
     return InboxConfig(
         watch_path=Path(
             os.environ.get("GENESIS_INBOX_PATH", section["watch_path"]),
@@ -52,12 +71,13 @@ def _parse(raw: dict) -> InboxConfig:
         response_dir=section.get("response_dir", "_genesis"),
         check_interval_seconds=int(section.get("check_interval_seconds", 1800)),
         batch_size=int(section.get("batch_size", 5)),
-        items_per_eval=int(section.get("items_per_eval", 5)),
+        items_per_eval=int(section.get("items_per_eval", 1)),
         enabled=bool(section.get("enabled", True)),
         model=str(section.get("model", "sonnet")),
         effort=str(section.get("effort", "high")),
-        timeout_s=int(section.get("timeout_s", 600)),
+        timeout_s=int(section.get("timeout_s", 1200)),
         max_retries=int(section.get("max_retries", 3)),
+        url_coverage_mode=coverage_mode,
         recursive=bool(section.get("recursive", False)),
         evaluation_cooldown_seconds=int(
             section.get("evaluation_cooldown_seconds", 3600),
