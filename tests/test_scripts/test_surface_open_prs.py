@@ -227,3 +227,66 @@ def test_seen_map_pruned_when_pr_no_longer_stalled(tmp_path):
     _write_cache(home, [_openpr(1379, 2)])  # 2d < 7d threshold
     _run(home)
     assert "o/r#1379" not in json.loads(_seen_path(home).read_text())["surfaced"]
+
+
+def test_a_failure_is_announced_IN_BAND_not_only_on_stderr(capsys, monkeypatch):
+    """A hook that fails silently is indistinguishable from one with nothing to
+    say -- and that is precisely the outage this handler exists to expose.
+
+    The first version wrote only a traceback to stderr, reasoning that stderr
+    "is not model-facing and so costs the session nothing". Which is exactly why
+    it achieved nothing: Claude Code DISCARDS an exit-0 hook's stderr. This is a
+    SessionStart hook, so stdout is the injected channel (the same contract
+    genesis_session_context.py cites when it routes its own mis-wire alert
+    in-band, and git_discard_guard.py when it uses additionalContext).
+
+    So a genesis/src version skew -- this block sits downstream of module
+    attribute reads -- read to the model as "no PRs to report". Silence that
+    means "broken" wearing the costume of silence that means "nothing".
+
+    The line is fixed-format on purpose: its only variable part is an exception
+    CLASS NAME, sliced, so it cannot approach the hook-output cap that this
+    hook's gate exemption depends on.
+    """
+    # This test drives main() IN-PROCESS, so unlike the subprocess `_run` helper
+    # it inherits the AMBIENT environment -- including the two kill switches
+    # main() checks BEFORE its try block. `_run` pops both for exactly this
+    # reason. MEASURED: without these deletions the test returns early, captures
+    # nothing, and fails -- and GENESIS_CC_SESSION=1 is what a Genesis-dispatched
+    # background session sets, so it would be green in CI and red precisely when
+    # an autonomous session ran the suite.
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    monkeypatch.delenv("GENESIS_REPO_PULSE_DISABLED", raising=False)
+    # main() prepends to sys.path; let monkeypatch own that so it is undone.
+    monkeypatch.syspath_prepend(str(_SRC))
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("surface_open_prs", _SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _skew(name, *a, **k):
+        if "session_awareness" in name:
+            raise AttributeError("simulated genesis/src version skew")
+        return real_import(name, *a, **k)
+
+    builtins.__import__ = _skew
+    try:
+        mod.main()  # fail-open: must not raise
+    finally:
+        builtins.__import__ = real_import
+
+    out = capsys.readouterr()
+    assert "open-PR surfacing FAILED" in out.out, (
+        "the failure never reached the model-facing channel"
+    )
+    assert "no open PRs" in out.out, (
+        "the line must say the absence is UNKNOWN, not zero"
+    )
+    assert "Traceback" in out.err, "the trace should still reach the debug log"
+    assert len(out.out) < 400, "the failure line must stay structurally bounded"

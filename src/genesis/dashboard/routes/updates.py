@@ -209,7 +209,10 @@ def update_check():
     # shape is observability/snapshots/deploy_health.py's
     # `commits_behind_upstream`.
     behind_str = _git("rev-list", "--count", "HEAD..origin/main")
-    commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 0
+    # Preserve the existing differing-release fallback when git cannot count.
+    # A failed measurement must not clear a known update from the dashboard.
+    fallback = 1 if local_tag and origin_tag else 0
+    commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else fallback
     summary = (
         _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
         if commits_behind > 0

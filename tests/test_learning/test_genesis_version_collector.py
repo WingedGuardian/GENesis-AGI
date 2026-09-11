@@ -597,8 +597,16 @@ async def test_the_count_is_the_distance_from_the_DEPLOYED_commit(tagged_repo, d
 async def test_the_untagged_fallback_measures_the_same_thing(tagged_repo, db):
     """The two branches previously measured different things, so which number a
     reader got depended on whether a tag happened to exist."""
-    _g(tagged_repo, "tag", "-d", "v1.0")
+    remote = _g(tagged_repo, "remote", "get-url", "origin")
+    _g(remote, "tag", "-d", "v1.0", "v2.0")
+    _g(tagged_repo, "tag", "-d", "v1.0", "v2.0")
     collector = GenesisVersionCollector(db)
-    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
+    with (
+        patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo),
+        patch.object(
+            collector, "_check_upstream_by_commits", wraps=collector._check_upstream_by_commits
+        ) as fallback,
+    ):
         behind, _ = await collector._check_upstream()
+    fallback.assert_awaited_once()
     assert behind == 2

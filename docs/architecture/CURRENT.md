@@ -72,7 +72,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: ef6eb541 2026-08-10
+verified: cd784816 2026-09-09
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -205,6 +205,66 @@ rose mid-week) and counts `shield_missing_thresholds` — which must be 0 before
 any live flip. Centrality persistence widened from top-500 to all-nonzero
 (`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
+
+**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
+run through a `GraphStore` protocol with one implementation today,
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+`memory/graph.py` is a facade that owns the single production instance and the
+backend choice. The contract, and the reason the seam exists: a read that cannot
+REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
+means genuinely empty. Collapsing the two is how a missing NetworkX import once
+disarmed the shield above (an empty result read as "no bridges", wiping
+`centrality_cache`). CI runs no type checker, so conformance is asserted by a
+test rather than the annotation. Cache freshness is cross-process: besides the
+`invalidate_graph_cache()` flag that every `memory_links` writer flips (13 call
+sites, 9 modules), the store compares SQLite's `PRAGMA data_version`, so a write
+committed by ANOTHER process is observed — previously the server served a
+projection predating any dream-job write until it happened to write a link
+itself. The token is stamped BEFORE the load on purpose: in WAL the read
+snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
+projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
+used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
+long-lived FalkorDB server reached over a unix socket, selected by
+`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
+the lever is inert until moved). It carries its own projection of
+`memory_links` and applies the SAME visibility predicate — but at QUERY time,
+over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
+future-`invalid_at` gap the NetworkX store states below. That closes the TIME
+half only, and the other half runs the other way: `deprecated` is a
+projection-time snapshot, so a memory deprecated after the last projection stays
+visible here until the next one, where NetworkX hides it on its next rebuild.
+Fresher on elapsed time, staler on every write — the write half bounded only by
+how often the projector runs. Traversal follows the
+lever and degrades falkordb → networkx → CTE; **centrality does NOT follow it**
+and is pinned to NetworkX, because FalkorDB cannot compute betweenness and
+`centrality_scores` has no fallback by design, so routing it through the lever
+would turn a mode flip into a silent shutdown of the importance shield.
+Three dialect facts were MEASURED against the live engine rather than read from
+docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
+engine has NO temporal types despite its own documentation listing them, and a
+loading engine answers `BusyLoadingError` — which is unavailable, never empty.
+Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+
+Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
+`memory_links` writers, while the visibility predicate below reads
+`memory_metadata`. Deprecation is covered incidentally (its writers rewire
+links); TIME-DRIVEN expiry is not — a future `invalid_at` arrives with no write
+event, so a quiet process serves the memory until an unrelated rebuild
+(measured exposure: 114 memories, 4 with edges).
+
+**Traversal is visibility-filtered (2026-09-06)** — every graph backend, and the
+recursive-CTE fallback, apply the SAME predicate normal recall applies:
+bitemporally-expired (`invalid_at <= now`) or `deprecated != 0` memories are
+absent from the graph, root and neighbours alike. Previously `traverse()`
+applied neither, and its consumer (`mcp/memory/core.py`) emits raw memory_ids
+into `graph_neighbors` with no hydration — so the model was shown, as live
+context, memories `search_ranked` and `graph_expansion` deliberately hide.
+MEASURED on the live graph: 11.3% of edges, 23.8% of top-5 slices, and 6.5% of
+roots whose neighbours were ENTIRELY hidden memories. The predicate deliberately
+ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
+rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
+the graph `centrality_scores` runs on, hence the shield's bridge-node
+population.
 
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
@@ -615,6 +675,54 @@ verified: 5808e7cd 2026-09-03
   the `approval_requests` row FIRST, then `pending_email_sends`; the
   `email_gate_watcher` job (every 5 min, learning scheduler) drains approved
   sends.
+- **Desktop takeover is gated before it exists** (`autonomy/desktop_gate.py`,
+  GROUNDWORK — no caller; the actuator is inert and the loop lands later).
+  Authority is per SESSION, not standing: an approved, unconsumed
+  `approval_requests` row (`desktop_takeover_gate`) carrying the session id AND
+  `context.kind == desktop_session_grant` (holds share the action_type, so
+  without the kind bar approving one held action would grant the whole
+  session), resolved through `DESKTOP_GRANT_RESOLVER_PREFIXES` — deliberately
+  NARROWER than `classify_resolver`'s human class, because `dashboard` is
+  stamped by a route any local process can reach with the internal token and
+  `user` is merely a default; neither proves a person acted. Bounded both ways
+  against a config TTL (a future-dated resolution would otherwise never
+  expire). SCOPE, stated because the obvious reading is stronger: that bar
+  closes the APP-LAYER path — no Genesis component using the sanctioned
+  approval APIs can mint itself desktop authority — but it does not make a
+  grant unforgeable, since `resolved_by` is a column and `genesis.db` is
+  writable by the uid every Genesis process runs as. That is a property of the
+  whole approval substrate, not of this gate, and closing it needs provenance
+  SQL cannot express. Screen-supplied text (window title, element name) is
+  passed through `strip_control_chars` and bounded before it reaches the
+  approval description a human reads, so a hostile window cannot forge lines or
+  reorder what is displayed away from what is approved. Desktop rows are also withheld from the generic dashboard approvals
+  queue, which renders every row as a CLI-fallback card, and refused by
+  `resolve_request` — the funnel for the per-item Approve button, Telegram
+  `cli_approve`, and the `cli_approve_all` button's own trigger row, which
+  resolves directly and so sidesteps the batch sweep's exclusion.
+  Classification reads the RESOLVED
+  TARGET from the accessibility tree, never the acting model's prose about its
+  own intent — and IDENTITY reads the control (window + element + type) rather
+  than the typed text, so ordinary typing is not held; only FINANCIAL also
+  reads text, because a card number is dangerous as content. A password field
+  is a REFUSAL with no approval path (matched on the target alone, so a window
+  named "Password Manager" does not make its controls unreachable); above
+  STANDARD holds per action; STANDARD under a live grant allows with an
+  `expires_at` the device re-checks and an audit log line + event, the one
+  outcome that actually acts. In `shadow` the gate classifies, records the cell
+  and logs the full verdict INCLUDING a missing grant — the state a shadow
+  install is actually in — then refuses, creating no approval row. A hold
+  queues NOTHING — there is no pending
+  table and no drain, because a held desktop action aims at a screen that has
+  moved, so every action executes against an observation taken after the last
+  approval. The capability cell (`desktop:control:*`) can DENY permanently but
+  can never GRANT: `desktop` is absent from `PROMOTABLE_DOMAINS`. Arming needs
+  BOTH `mode: live` and `live_opt_in: true` in
+  `config/desktop_takeover.yaml` (default `shadow`; env kill
+  `GENESIS_DESKTOP_TAKEOVER_DISABLED`), and the domain is deliberately absent
+  from the settings MCP so arming cannot happen through one API call. Excluded
+  from `approve_all_pending` and outside `_VOICE_GATED_TYPES`, so neither a
+  batch tap nor a bare spoken "approve" can hand over the keyboard.
 - **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
   `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
   observe-only into `capability_shadow`, best-effort so it can NEVER break the
@@ -801,7 +909,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: e425b35c 2026-08-21
+verified: 788dd9a9 2026-09-06
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -836,8 +944,11 @@ verified: e425b35c 2026-08-21
   independent, same tick, own sidecar cursor) additionally surfaces activity
   BEYOND owned repos — @mentions anywhere plus responses on the owner's OUTBOUND
   contributions (`reason=author` on non-owned repos; owner-repo author items are
-  dropped as the deep-poll already has them) — resolving the actor via the
-  notification's `latest_comment_url` and pinging immediately in `live`.
+  dropped as the deep-poll already has them). It reports a thread only when
+  somebody who is NOT the owner and NOT automation acted on it inside the window
+  the notification covers, reading the thread's comment, review and timeline
+  surfaces to decide; a read it could not complete yields a digest row rather
+  than a drop, since dropping asserts absence. Pings immediately in `live`.
   `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
 - **recon/career_outreach.py** (`CareerOutreachMonitor`) — the recon entry that
@@ -867,7 +978,53 @@ verified: e425b35c 2026-08-21
   same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
   per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
   config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
-  verify → stage), MEASURED ~5.5 min live.
+  verify → stage), MEASURED ~5.5 min live. **Bite-relay (independent capability on the
+  same daily tick):** its OWN `bite_relay_mode` lever (off/observe/live, ships off),
+  DECOUPLED from the auto-run above — it READS a structured HTTP `data_module`
+  (`pipeline` op, distinct from the SSH reasoning module) and pushes ONE owner Telegram
+  nudge when a company advances into an engaged stage ({in_conversation, interviewing,
+  offer}). Dedup is a PERMANENT per-(company, stage) `career_bite` observation (a
+  point event — `unresolved_only=False`, 365d TTL — unlike the re-emittable
+  `career_outreach_nudged` marker); observe SEEDS the ledger without nudging. Health-
+  gated on the DATA module SEPARATELY: an unhealthy/absent data bridge is a CLEAN SKIP
+  (not a job-health failure — the read service is legitimately down when the search is
+  dormant), while a read the service answered with an error IS a failure. Being a pure
+  read + owner-nudge (no CLI dispatch, no outreach send), it can run `live` while the
+  auto-run stays gated. Hardening: external company names are control-char-sanitized
+  (`strip_control_chars` — collapses newlines / Unicode line+paragraph separators /
+  zero-width+bidi) before the `parse_mode="HTML"` nudge, so a crafted name can't forge
+  or conceal notification lines; a present-but-wrong-type pipeline bucket/entry surfaces
+  as a job-health failure (distinct from a legitimately-absent stage) rather than a
+  silent "no advances"; EVERY malformed entry shape (non-dict, missing/null/blank/
+  whitespace-only id, or an id that is not `str`/`int` — `bool`, `float` and containers
+  are all rejected, since `9` vs `9.0` and a repr-ordered container both re-key the
+  marker) is decided by ONE validation choke point (`_bite_entry_id`), whose
+  normalization is hash-identical to `_bite_hash` so routing
+  through it never changes an existing marker's dedup identity; the
+  deliver-before-`_record_bite` crash-window is closed by a PERMANENT
+  `outreach_history` delivered-`(signal_type, topic)` lookup (`delivered_topic_exists`,
+  unwindowed — the outreach pipeline's own 24h dedup is NOT longer than this job's daily
+  retry interval, so the `REJECTED` branch is belt-and-suspenders, not the recovery), and
+  a recovery consumes no nudge-cap slot since it sends nothing and reports as ONE counted
+  summary line (never one detail per entry — `details` feeds job-health's unbounded
+  `last_error`); the per-tick scan ceiling
+  is a ROTATING window (contiguous windows, one whole ceiling per tick-DAY, no persistent
+  cursor) so an oversized response bounds work without permanently excluding the tail —
+  full coverage in `ceil(len/ceiling)` CONSECUTIVE tick-days, with a missed tick or the
+  live nudge cap deferring entries to a later cycle rather than dropping them; and the
+  auto-run no-progress warning excludes bite activity, since the two
+  sub-capabilities are independent. That independence is ENFORCED in `gather`: each
+  branch is awaited under its own guard, so a raise in one becomes that branch's
+  `errors=1` result and the other still runs — and because that also removes the raise
+  from the runner's own `except`, the exception rides out on `CareerOutreachResult.raised`
+  so the runner still emits the ERROR-severity `career_outreach_monitor.failed` event with
+  its traceback (an isolated crash must not go quiet in the ERROR stream). Misconfig fails LOUD, not
+  silent: an invalid `bite_relay_mode` fails **closed to `off`** (its `observe` seeds
+  permanent markers, so degrading to `observe` like the auto-run would silently suppress
+  the backlog); an ENABLED lever whose `data_module` is unset/unresolvable records a
+  job-health **failure** (not a green no-op); and pause is rechecked **before** the
+  pipeline read AND again after the data-module health probe (itself an awaited external
+  call), not only between nudges.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.
@@ -1168,7 +1325,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 9730efe9 2026-09-05
+verified: 788dd9a9 2026-09-06
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1383,6 +1540,23 @@ verified: 9730efe9 2026-09-05
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
+- **Post-merge verification obligations** (LIVE, producer only — issue #1718):
+  the pulse worker's verification lane opens one `pr_verifications` row per
+  MERGED PR, so "run the E2E after merge" survives the merge instead of living
+  in someone's memory. A documentation-only diff is auto-closed with the reason
+  recorded — DETERMINISTIC by path (`session_awareness/doc_paths.py`), never a
+  model call, so a prompt/skill change is exempted by rule rather than by
+  judgement. An unreadable changed-file list fails toward KEEPING the
+  obligation. Deliberately NOT `follow_ups`: its readers (ego dispatch via
+  `get_actionable`, morning report via `get_pending`) would surface these as
+  actionable work, and they are a ledger for a validator, not work — see the
+  `20260906234824_pr_verifications` migration docstring for the full
+  New-Store-Gate justification. The CONSUMER (the Wave-3 validator session) does
+  not exist yet; today's reader is
+  `scripts/repo_pulse_worker.py --verification-backlog`. `doc_paths.is_doc_path`
+  is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
+  import `scripts/`), held in parity by
+  `tests/test_session_awareness/test_doc_paths.py`.
 - **Session charter + ledger** (session-manager stages 1-2): the
   `session_charters` + `session_ledger` DB tables (migration 0058) are the
   canonical store; `~/.genesis/sessions/<sid>/charter.md` is the regenerated
@@ -1568,8 +1742,65 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 50b79ffb 2026-09-01
+verified: 788dd9a9 2026-09-06
 ```
+
+- **The graders are TOLD the response status; they must never infer it.** The
+  triage/outcome/delta graders each judge an `InteractionSummary`, and the
+  summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.
+  If it hands over a bare prefix, a response that stops mid-word is
+  indistinguishable from one the model abandoned — and the resulting verdict is
+  written to permanent record via `observation_writer` (tagged
+  `source_subsystem=reflection`, alongside the other self-observation sources).
+  So: `_MAX_RESPONSE_TEXT` is a SAFETY VALVE sized above real traffic, not a
+  working limit; anything elided is elided from the MIDDLE with an explicit
+  marker and the ENDING preserved, because the ending is what "did generation
+  finish" is judged from.
+- **A note about the response is emitted only on a POSITIVE signal.** The first
+  fix here asserted the opposite of `CCOutput.bg_truncated` as fact
+  ("COMPLETE — the model finished normally") and told the grader not to disagree.
+  That flag is one stderr substring match (`cc/invoker.py` `_stderr_bg_truncated`) whose producer
+  documents the match as version-drift tolerant, and a hand-built `CCOutput`
+  (e.g. `mail/monitor.py`) simply defaults it — so its `False` means "that
+  substring was absent", never "the model finished normally". Restating it as a
+  fact was the original defect with its sign flipped. `learning/response_context.py`
+  is now the single place that decides what the graders are told: silence by
+  default, a narrow note when the runtime really did kill background work, and a
+  note about elision driven by the character count the summarizer REPORTS. Both
+  signals travel out-of-band, on `InteractionSummary`. Deriving either one by
+  searching `response_text` puts the response in charge of the prompt's factual
+  claims about it — a debrief that describes this mechanism, or an inbox item
+  echoing a prompt back, would manufacture a pipeline-status claim that is
+  simply false. For the same reason the elision marker states only how many
+  characters were removed and makes no claim about whether the model stopped
+  early; that is the question the grader is there to answer. The same rule now
+  covers `tool_calls`: names come from the runtime's own `tool_use` events
+  (`CCOutput.tools_used`) when the invocation streamed, and the prompt says so.
+  `conversation.py` also uses the NON-streaming `run()`, where no such events
+  exist, so the text-scraping fallback stays — but a scraped list is presented
+  as "tool names found in the response text", never as tools that ran, because
+  the regex cannot tell a tool that ran from one the reply merely discussed.
+  KNOWN AND ACCEPTED, with both consumers named: `prefilter.should_skip` still
+  counts a scraped name, so a reply that only mentions tools can buy itself a
+  grading pass; and `pipeline.py`'s `session_tools_count` carries that count
+  into a stored procedure's `extraction_context`. Neither is a decision gate the
+  wrong way — `should_skip` can only cause MORE grading, never less, and
+  tightening it would skip real tool use on every non-streaming path. It also fences `response_text`, which is
+  unbounded untrusted content sitting next to authoritative lines — though the
+  fence delimiters are fixed literals, so a response containing them can still
+  break out; closing that is tracked separately. The three-state
+  `CCOutput.tools_used` (None = nothing watched, () = watched and saw none) is
+  what keeps "no report" from rendering as the finding "none".
+- **The REQUEST is sized the same way as the reply, by the same function.**
+  `_MAX_USER_TEXT` was 500 and was a working limit, not a valve: MEASURED on
+  this install, 222 of 1481 inbound messages (15.0%) exceeded it, the longest
+  5,924 characters, and `inbox`/`mail` pass whole-file and joined-subject
+  content that no messaging limit bounds. Each one reached `DeltaAssessor` —
+  the grader comparing what was asked against what was delivered — as a bare
+  prefix with nothing saying so, which reads as an underspecified request.
+  `summarizer._fit` is now one mechanism serving both texts, and
+  `user_text_elided_chars` carries the request's count out-of-band exactly as
+  the response's does.
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
   ~20+ jobs well beyond learning (recovery orchestrator, reapers, email-gate
