@@ -5,9 +5,49 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import warnings
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fresh_proactive_writer():
+    """Give every test its own BoundedStdout for the proactive memory hook.
+
+    That hook holds its writer in a module-level singleton, which is right in
+    PRODUCTION (one hook invocation per process) and wrong under pytest, where
+    one module is imported once and every test would then share — and slowly
+    spend — a single 9,800-character budget. The failure is the nastiest kind:
+    the test that happens to run when the budget runs out sees its output CUT
+    and fails for a reason that has nothing to do with what it asserts, and
+    which test that is depends on collection order.
+
+    Reset rather than reconstruct, so a test asserting on ``_writer()`` state
+    (emitted totals, whether a cut happened) starts from zero.
+
+    The import failure is AUDIBLE on purpose. Swallowing it silently reproduces
+    exactly the condition described above — the reset stops happening, and the
+    test that later exhausts the budget fails on an assertion about the hook,
+    with nothing anywhere pointing at the fixture. Demonstrated under review by
+    typo-ing this import: the suite went red on a product assertion and said
+    nothing about the reset. Narrow (`ImportError` only, since most
+    ``tests/test_hooks`` files never put ``scripts/`` on ``sys.path``) and loud.
+    """
+    try:
+        import proactive_memory_hook as pmh
+    except ImportError:
+        warnings.warn(
+            "proactive_memory_hook not importable — its bounded writer was NOT "
+            "reset, so its 9,800-unit budget is shared across every test in this "
+            "run. A later test may fail on a cut it did not cause.",
+            stacklevel=2,
+        )
+        yield
+        return
+    pmh._OUT = None
+    yield
+    pmh._OUT = None
 
 
 @pytest.fixture(autouse=True)
