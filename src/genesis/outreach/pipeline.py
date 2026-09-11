@@ -939,6 +939,24 @@ class OutreachPipeline:
         self, outreach_id: str, channel: str, content: str,
         request: OutreachRequest, reason: str,
     ) -> None:
+        """Hand the failed delivery to the deferred-work queue.
+
+        Returns early WITHOUT deferring when the caller carries its own durable
+        retry (``request.defer_retry=False`` — the alert-queue drain, or a
+        recovery re-submission whose row is still open), so two retriers never
+        own one delivery (issue #1781).
+
+        Deliberately returns nothing. An earlier draft returned a bool and
+        documented it as reaching callers via ``OutreachResult.retry_deferred``
+        — a field that does not exist on that dataclass, and neither call site
+        read the value. Ownership is decided by ``defer_retry`` on the way IN;
+        nothing downstream needs a signal on the way out.
+        """
+        if not request.defer_retry:
+            # The caller carries its OWN durable retry (alert-queue drain, or a
+            # recovery re-submission whose row is still open) — deferring here
+            # would put two retriers on one delivery (issue #1781).
+            return
         if not self._deferred_queue:
             return
         try:
@@ -959,6 +977,8 @@ class OutreachPipeline:
                     "topic %r already queued",
                     outreach_id, request.topic,
                 )
+                # Suppressed-as-duplicate still means recovery OWNS a retry for
+                # this topic — the open row's delivery covers this send.
                 return
             # "outreach_fallback" — deferred-queue work tag (not in model_routing.yaml).
             # No own routing chain; used for cost/event tracking only.

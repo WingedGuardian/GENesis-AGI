@@ -69,12 +69,39 @@ def _make_drainer(rt):
                 # namespace (never cross-suppressing a live guardian_alert).
                 signal_type="queued_alert",
                 source_id=identity,
+                # This drain IS the durable retry (14-day file queue, retried
+                # every awareness tick). The pipeline must not ALSO defer a
+                # retry to the recovery worker — its whole budget is ~82
+                # minutes before it discards the row, so handing ownership
+                # over would trade this queue's durability away, and keeping
+                # both owners double-delivers (issue #1781).
+                defer_retry=False,
             ),
         )
-        # DELIVERED and REJECTED are both TERMINAL → unlink. REJECTED means the
-        # pipeline's own dedup found it redundant; retrying would wedge the entry
-        # in the queue forever. FAILED/HELD/PENDING → keep + retry next tick.
-        return result.status in (OutreachStatus.DELIVERED, OutreachStatus.REJECTED)
+        # DELIVERED, REJECTED and HELD are all TERMINAL → unlink.
+        #  - REJECTED = the pipeline's own dedup found it redundant; retrying
+        #    would wedge the entry in the queue forever.
+        #  - HELD = the WS-8 email autonomy gate recorded a durable pending row
+        #    (`pipeline._deliver`, OutreachStatus.HELD) and its resolution
+        #    watcher owns delivery from there. `submit_raw`'s dedup consults
+        #    DELIVERED history only, so it does not suppress a second HOLD:
+        #    keeping the entry mints a fresh pending row every tick, and
+        #    approving them delivers the same alert once per hold. Terminal here
+        #    matches `resilience/outreach_recovery.py:170`, which already treats
+        #    HELD as terminal — and whose comment claims it "mirrors
+        #    alert_drain". It did not; this makes the claim true.
+        # FAILED/PENDING → keep + retry next tick, and because the request above
+        # carries `defer_retry=False`, a FAILED send leaves THIS queue as the
+        # delivery's ONLY retrier. Before that flag existed the pipeline also
+        # deferred its own retry, and two independent retriers owned one
+        # delivery: recovery delivered at 08:31:57 and the kept entry resent at
+        # 08:35:42 — one OOM alert, two pages (issue #1781, MEASURED from the
+        # journal + outreach rows).
+        return result.status in (
+            OutreachStatus.DELIVERED,
+            OutreachStatus.REJECTED,
+            OutreachStatus.HELD,
+        )
 
     async def _drainer() -> None:
         # Resolve at drain time (call-time) via the GENESIS_HOME-aware resolver,

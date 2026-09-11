@@ -30,11 +30,25 @@ logger = logging.getLogger(__name__)
 
 _PROC = "/proc"
 
-# Thresholds on the main `claude` process RSS (MB). Normal is ~0.7-1.0 GB, so
-# 4 GB WARN is ~4x baseline. Tunable — revisit once a week of dashboard data
-# lands (a very large long-lived session can legitimately reach 2-3 GB).
-SLOT_RSS_WARN_MB = 4096
-SLOT_RSS_CRIT_MB = 6144
+# Thresholds on the slot's WHOLE PROCESS TREE (MB) — see `slot_tree_rss_mb`.
+# They were previously applied to the main `claude` process alone, which is
+# about a third of a slot's real cost, so they could not fire in the regime
+# they exist for: a session whose tree had ballooned to 6 GB still reported a
+# ~0.8 GB `claude` process and read healthy.
+#
+# Rebased on a MEASURED per-slot DISTRIBUTION, not a mean — the mean of this
+# population is nobody's slot. 2026-09-05, 7 concurrent sessions, whole-tree MB
+# (two same-day measurements agreeing within drift): ~970/1030/1270 for idle
+# slots, ~3100-3470 for working ones — bimodal, idle ~1.0 GB vs working
+# ~3.1-3.5 GB. The threshold gates a per-slot MAX, so it is sized off the
+# observed healthy MAX (~3.5 GB): WARN 6144 = ~1.8x that max, CRIT 8192 =
+# ~2.4x. The old multiple is deliberately NOT preserved — 5x the healthy max
+# would be ~17 GB, past the point where a human should already have looked.
+# Tunable, and still deliberately coarse: this is leak DETECTION, not OOM
+# prevention. Revisit once a week of dashboard data lands under the new
+# denominator, since no history exists at this scale.
+SLOT_RSS_WARN_MB = 6144
+SLOT_RSS_CRIT_MB = 8192
 
 
 def read_proc_rss_mb(pid: int) -> float | None:
@@ -130,8 +144,79 @@ def _is_interactive(pid: int) -> bool:
     return b"-p" not in args and b"--print" not in args
 
 
+def _read_ppid(pid: int) -> int | None:
+    """Parent pid from ``/proc/<pid>/stat``, or None if gone/unreadable.
+
+    Same parse discipline as ``read_proc_start_iso``: ``comm`` (field 2) is
+    parenthesised and may itself contain spaces or ``)``, so the line is split
+    after the LAST ``)``. Everything after that starts at field 3 (state), which
+    puts ppid (field 4) at index 1. ``stat`` is world-readable, so unlike
+    ``environ`` this works inside genesis-server's sandbox.
+    """
+    try:
+        with open(f"{_PROC}/{pid}/stat") as f:
+            after = f.read().rsplit(")", 1)[1].split()
+        return int(after[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def build_child_map(pids: list[int]) -> dict[int, list[int]]:
+    """``{ppid: [child pid, ...]}`` over the given pids.
+
+    Built ONCE per enumeration and shared by every slot, so the /proc scan stays
+    O(processes) rather than O(slots x processes). Pids that vanish mid-walk are
+    simply absent — a dead child contributes no memory anyway. The asymmetric
+    case is a child spawned AFTER the /proc listing: it DOES hold memory but is
+    invisible until the next enumeration, so a brand-new session under-reports
+    for one tick. Self-correcting; stated so nobody reads one low tick as truth.
+    """
+    children: dict[int, list[int]] = {}
+    for pid in pids:
+        ppid = _read_ppid(pid)
+        if ppid is not None:
+            children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def slot_tree_rss_mb(pid: int, children: dict[int, list[int]]) -> float:
+    """Summed RSS (MB) of ``pid`` and every descendant.
+
+    A CC slot is not one process: each session also carries a Serena LSP server
+    and a fleet of ``genesis_mcp_server.py`` children that live for the life of
+    the session and, MEASURED, account for roughly two thirds of the slot's
+    memory. Counting only the root understates a slot ~3x.
+
+    RSS double-counts pages shared between parent and child, so this is an upper
+    bound rather than a proportional-set measure. That is the deliberate choice:
+    PSS via ``smaps_rollup`` is more accurate but costs a much larger read per
+    process, and for THRESHOLD purposes over-counting shared pages fails toward
+    looking, which is the safe direction for a leak detector. MEASURED
+    2026-09-05 (adversarial review, summed smaps_rollup Pss per tree): the
+    inflation is ~1.15x on heavy slots and 1.5-1.8x on idle ones — inversely
+    correlated with size, since a leaking slot's growth is private memory. So
+    near the threshold the over-count is ~15%, not a false-alarm generator.
+
+    Cycle-safe (a malformed ppid chain cannot loop forever) via an explicit
+    seen-set; unreadable descendants are skipped, never fatal.
+    """
+    total = 0.0
+    seen: set[int] = set()
+    stack = [pid]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        rss = read_proc_rss_mb(cur)
+        if rss is not None:
+            total += rss
+        stack.extend(children.get(cur, ()))
+    return round(total, 1)
+
+
 def slot_status(rss_mb: float) -> str:
-    """Map a slot's RSS (MB) to a health status."""
+    """Map a slot's TREE RSS (MB) to a health status."""
     if rss_mb >= SLOT_RSS_CRIT_MB:
         return "error"
     if rss_mb >= SLOT_RSS_WARN_MB:
@@ -140,7 +225,13 @@ def slot_status(rss_mb: float) -> str:
 
 
 def enumerate_cc_slots() -> list[dict]:
-    """One row per live CC session: ``{slot, pid, rss_mb, status, started_at}``.
+    """One row per live CC session: ``{slot, pid, rss_mb, proc_rss_mb, status,
+    started_at}``.
+
+    ``rss_mb`` is the slot's WHOLE PROCESS TREE (the `claude` process plus its
+    Serena and MCP children — see ``slot_tree_rss_mb``), which is what a slot
+    actually costs; ``proc_rss_mb`` is the root `claude` process alone, which is
+    what this function used to report as ``rss_mb``.
 
     Walks /proc for ``claude`` processes. A process is kept only if it is an
     INTERACTIVE session (``_is_interactive`` — not a headless ``claude -p``
@@ -185,6 +276,9 @@ def enumerate_cc_slots() -> list[dict]:
     except Exception:
         logger.debug("cc_slots: spawn-plane lookup failed", exc_info=True)
 
+    # One /proc scan for the whole enumeration (see `build_child_map`).
+    child_map = build_child_map(pids)
+
     rows: list[dict] = []
     for pid in pids:
         try:
@@ -202,6 +296,13 @@ def enumerate_cc_slots() -> list[dict]:
         rss = read_proc_rss_mb(pid)
         if rss is None:
             continue
+        # `rss_mb` is the WHOLE TREE, deliberately. The alert path reads that key
+        # directly (awareness/loop.py), so leaving it as the root process would
+        # have kept every existing consumer on the understated number while only
+        # a new key told the truth. Making the established name honest means a
+        # consumer that is never updated is right by default; the root-process
+        # figure stays available as `proc_rss_mb` for anyone who needs it.
+        tree_rss = slot_tree_rss_mb(pid, child_map)
         started_at = read_proc_start_iso(pid)
         # Slot label: environ (unsandboxed) first, else the spawn-file plane — but
         # only when the plane record's pid was NOT recycled (its spawn_at is
@@ -215,8 +316,9 @@ def enumerate_cc_slots() -> list[dict]:
             {
                 "slot": slot,
                 "pid": pid,
-                "rss_mb": rss,
-                "status": slot_status(rss),
+                "rss_mb": tree_rss,
+                "proc_rss_mb": rss,
+                "status": slot_status(tree_rss),
                 "started_at": started_at,
             }
         )

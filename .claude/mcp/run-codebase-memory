@@ -51,7 +51,14 @@ if command -v systemd-run >/dev/null 2>&1 \
     && systemd-run --user --scope --quiet \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
         -- /bin/true >/dev/null 2>&1; then
+    # Named unit (issue #1792): anonymous scopes render as run-<id>.scope,
+    # indistinguishable from CC session scopes — so this wrapper's by-design
+    # cap kill could never be classified as contained by the OOM attribution
+    # (tmp_watchgod.sh), and nothing could stop/freeze the scope by name.
+    # $$ makes the name unique per launch (a fixed name collides with a stale
+    # scope); the /bin/true probe above stays anonymous — it cannot OOM.
     exec systemd-run --user --scope --quiet \
+        --unit "cbm-mcp-$$" \
         --description="codebase-memory-mcp (MemoryMax=${MEM_MAX})" \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
         -- "$BINARY" "$@"

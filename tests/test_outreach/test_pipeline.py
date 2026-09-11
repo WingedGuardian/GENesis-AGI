@@ -1141,3 +1141,42 @@ async def test_inflight_awaited_released_after_timeout_allows_retry(config):
     _r2, reply2 = await pipeline.submit_raw_and_wait("txt", req, timeout_s=0.05)
     assert reply2 is None
     pipeline.submit_raw.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_defer_retry_false_suppresses_the_deferral(config, db, mock_drafter, mock_formatter):
+    """A caller with its own durable retry opts out of the pipeline's deferral.
+
+    The alert-queue drain and the recovery worker's re-submissions both set
+    defer_retry=False; without the gate the pipeline enqueued a SECOND retrier
+    for a delivery someone already owned, and each success was the other's
+    duplicate (issue #1781, measured double-page 2026-09-05).
+    """
+    failing_channel = AsyncMock()
+    failing_channel.send_message.side_effect = ConnectionError("Network down")
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": failing_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Defer test",
+        context="Will fail delivery; caller owns the retry",
+        salience_score=0.9,
+        signal_type="queued_alert",
+        defer_retry=False,
+    )
+    result = await pipeline.submit(req)
+    assert result.status == OutreachStatus.FAILED
+    mock_deferred.enqueue.assert_not_called()
+    mock_deferred.has_open.assert_not_awaited()  # gate sits ABOVE the dedup probe
