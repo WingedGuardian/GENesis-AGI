@@ -1,10 +1,14 @@
-"""Tests for the pre-push privacy ADVISORY hook.
+"""Tests for the pre-push privacy hook — two verdicts, split by confidence.
 
-The hook is non-blocking: it emits `hookSpecificOutput.additionalContext` on
-findings and ALWAYS exits 0. Fixtures use a generic CGNAT literal (100.64.0.1)
-that the contribution sanitizer's portability scanner flags but that is NOT
-this install's real address (so this test file leaks nothing and is not caught
-by the CI install-IP scan).
+The hook DENIES a push carrying a value this install actually has (a
+release-fingerprint literal or a personal email) and merely ADVISES on a generic
+private-range literal. That split is the point: a known value cannot be a
+placeholder, so refusing it has no false positives; a generic literal is
+legitimate constantly, so refusing THAT would make a check that cries wolf.
+
+Fixtures use generic literals (100.64.0.1, 8.8.8.8) and a synthetic fingerprint
+file, never this install's real values — so this file leaks nothing and the CI
+install-IP scan has nothing to find in it.
 """
 
 from __future__ import annotations
@@ -91,80 +95,132 @@ def test_effective_cwd_skips_super_prefix_to_find_dash_C():
 
 
 def test_scan_flags_install_pattern():
-    findings = hook._scan(_LEAK_DIFF)
-    assert findings, "portability scanner should flag the CGNAT literal"
-    # _scan now returns (file, line, message) tuples: the three layers it merges
-    # (install values, credential shapes, gitleaks) produce different objects, so
-    # a common shape is what lets them be deduped and reported together.
-    assert any(file == "x.py" for file, _line, _message in findings)
+    known, generic = hook._scan(_LEAK_DIFF)
+    assert generic, "portability scanner should flag the CGNAT literal"
+    assert any(getattr(f, "file", None) == "x.py" for f in generic)
+    assert known == [], "a generic literal is not one of this install's values"
 
 
 def test_scan_clean_diff_no_findings():
-    assert hook._scan(_CLEAN_DIFF) == []
+    known, generic = hook._scan(_CLEAN_DIFF)
+    assert known == []
+    assert generic == []
+
+
+def test_scan_puts_a_generic_literal_in_the_ADVISORY_half():
+    """A documentation address is not this install's — it must not be refused."""
+    known, generic = hook._scan(_LEAK_DIFF)
+    assert generic, "a CGNAT literal should be reported"
+    assert known == [], "a generic literal is not a known-value match"
 
 
 # ── main() end-to-end (git helpers monkeypatched) ──────────────────────
 
 
 def _run_main(monkeypatch, capsys, *, command, public, diff):
-    """Run the hook; return (stdout, stderr, exit_code).
-
-    The hook BLOCKS now, so it raises SystemExit(2) on a finding. Returning the
-    code rather than letting the exception escape keeps every caller able to
-    assert on the distinction that matters: a block (2) versus a pass (0).
-    """
     payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/tmp"}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     monkeypatch.setattr(hook, "_targets_public_repo", lambda remote, cwd: public)
-    monkeypatch.setattr(hook, "_outgoing_diff", lambda cwd: diff)
-    code = 0
-    try:
-        hook.main()
-    except SystemExit as e:
-        code = e.code if isinstance(e.code, int) else 1
-    cap = capsys.readouterr()
-    return cap.out, cap.err, code
+    monkeypatch.setattr(hook, "_outgoing_diff", lambda cwd, source_ref=None: diff)
+    hook.main()
+    return capsys.readouterr().out
 
 
-def test_main_blocks_a_public_push_carrying_a_leak(monkeypatch, capsys):
-    """It BLOCKS now, where it used to advise.
+def test_main_advises_but_does_not_block_a_generic_literal(monkeypatch, capsys):
+    out = _run_main(
+        monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
+    )
+    payload = json.loads(out)
+    ctx = payload["hookSpecificOutput"]["additionalContext"]
+    assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in payload["hookSpecificOutput"]
+    assert "Pre-push privacy review" in ctx
+    assert "x.py" in ctx
 
-    The advisory deferred enforcement to the CI leak-detector — which never runs
-    on a branch with no PR, i.e. exactly the branches that needed it. A safety net
-    hung on a job that does not execute is not a safety net.
+
+def test_the_advisory_does_not_promise_something_it_cannot_do(monkeypatch, capsys):
+    """An advisory reaches the model in the SAME result as the completed push.
+
+    Wording it as "confirm before it lands" describes a checkpoint that does not
+    exist, and that false confidence is what let a real value through once.
     """
-    out, err, code = _run_main(
+    out = _run_main(
         monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
     )
-    assert code == 2, "a finding must block"
-    assert "BLOCKED" in err
-    assert "x.py" in err
-    assert out == "", "a block goes to stderr; stdout is for the hook JSON contract"
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "Before it lands" not in ctx
+    assert "going ahead" in ctx
 
 
-def test_the_block_names_every_way_to_clear_it(monkeypatch, capsys):
-    """A block with no stated remedy is a trap, and gets switched off."""
-    _, err, _ = _run_main(
-        monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
+def _fingerprint_file(tmp_path, *literals):
+    fp = tmp_path / "release-fingerprints.txt"
+    fp.write_text("# synthetic\n" + "\n".join(literals) + "\n")
+    return fp
+
+
+def test_main_DENIES_a_push_carrying_a_known_install_value(monkeypatch, capsys, tmp_path):
+    """The acceptance bar: the exact defect this change exists for.
+
+    A value present in the install's fingerprint file has no placeholder
+    reading, so the push is refused rather than reported.
+    """
+    secret = "10.11.12.13"  # stands in for a real install literal
+    monkeypatch.setenv(
+        "GENESIS_RELEASE_FINGERPRINTS", str(_fingerprint_file(tmp_path, secret))
     )
-    assert "pragma: allowlist secret" in err
-    assert "gitleaks:allow" in err
-    assert "genesis:verified-generic" in err
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
+        f"+HOST = '{secret}'\n"
+    )
+    out = _run_main(monkeypatch, capsys, command="git push origin feat", public=True, diff=diff)
+    hso = json.loads(out)["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "deny"
+    assert "BLOCKED" in hso["permissionDecisionReason"]
+    assert "x.py" in hso["permissionDecisionReason"]
+    assert "additionalContext" not in hso, "a denial must not also emit advisory text"
+
+
+def test_a_known_value_denies_even_alongside_generic_hits(monkeypatch, capsys, tmp_path):
+    """The known-value verdict must not be diluted by ordinary noise."""
+    secret = "10.11.12.13"
+    monkeypatch.setenv(
+        "GENESIS_RELEASE_FINGERPRINTS", str(_fingerprint_file(tmp_path, secret))
+    )
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +2 @@\n"
+        "+GENERIC = '100.64.0.1'\n"
+        f"+HOST = '{secret}'\n"
+    )
+    out = _run_main(monkeypatch, capsys, command="git push origin feat", public=True, diff=diff)
+    assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_a_known_value_on_a_NON_public_push_is_not_blocked(monkeypatch, capsys, tmp_path):
+    """Real values are allowed on a private fork — that is what it is for."""
+    secret = "10.11.12.13"
+    monkeypatch.setenv(
+        "GENESIS_RELEASE_FINGERPRINTS", str(_fingerprint_file(tmp_path, secret))
+    )
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
+        f"+HOST = '{secret}'\n"
+    )
+    out = _run_main(monkeypatch, capsys, command="git push private feat", public=False, diff=diff)
+    assert out == ""
 
 
 def test_main_quiet_on_clean_diff(monkeypatch, capsys):
-    out, err, code = _run_main(
+    out = _run_main(
         monkeypatch, capsys, command="git push origin feat", public=True, diff=_CLEAN_DIFF
     )
-    assert (out, err, code) == ("", "", 0)
+    assert out == ""
 
 
 def test_main_noop_on_non_origin_push(monkeypatch, capsys):
-    """A private remote is where real install values are allowed to live."""
-    out, err, code = _run_main(
+    out = _run_main(
         monkeypatch, capsys, command="git push private feat", public=False, diff=_LEAK_DIFF
     )
-    assert (out, err, code) == ("", "", 0)
+    assert out == ""
 
 
 def test_main_noop_on_non_push(monkeypatch, capsys):
@@ -180,11 +236,10 @@ def test_main_never_raises_and_stays_quiet_on_error(monkeypatch, capsys):
         raise RuntimeError("scanner exploded")
 
     monkeypatch.setattr(hook, "_scan", _boom)
-    out, err, code = _run_main(
+    out = _run_main(
         monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
     )
-    assert code == 0, "FAIL OPEN on an error — a crashed scanner must not wedge pushes"
-    assert out == ""
+    assert out == ""  # swallowed, exit 0
 
 
 # ── shared git budget + URL normalization (review SHOULD-FIX + NOTE) ────
@@ -244,7 +299,146 @@ def test_targets_public_repo_normalizes_url(monkeypatch):
     assert hook._targets_public_repo("https://github.com/Org/Other", None) is False
 
 
-# ─── Part D: shape detection, annotation, and the whole-branch scan ──────────
+# ── the bypasses a security review found, each pinned ───────────────────────
+def test_the_deny_reason_never_echoes_the_offending_value():
+    """A block message that quotes the secret publishes what it is refusing.
+
+    `_check_emails` interpolates the address into `message`, and every scanner's
+    `detail` carries the raw source line — so the renderer prints LOCATION and
+    CATEGORY only. Verified against the scanner that actually interpolates,
+    because testing only the fingerprint path (whose message is a constant)
+    would pass while the leaking path went unchecked.
+    """
+    from genesis.contribution import sanitize
+
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
+        "+OWNER = 'realperson@personal.example'\n"
+    )
+    findings = sanitize._check_emails(sanitize.parse_diff(diff))
+    assert findings, "the email scanner should fire on this fixture"
+    assert any("realperson@personal.example" in f.message for f in findings), (
+        "precondition: the scanner DOES interpolate the literal"
+    )
+
+    rendered = "\n".join(hook._render(findings))
+    assert "realperson@personal.example" not in rendered
+    assert "x.py" in rendered
+
+
+def test_the_same_repo_via_ssh_and_https_is_the_same_destination():
+    """A second remote in the other URL form was a total bypass.
+
+    `_norm_url` alone compares the forms unequal, so a push to the identical
+    public repo over SSH resolved as "not origin" and skipped the scan entirely
+    — no deny, no advisory, no output at all.
+    """
+    https = "https://github.com/Owner/Repo.git"
+    ssh = "git@github.com:Owner/Repo.git"
+    assert hook._norm_url(https) != hook._norm_url(ssh), "precondition: strings differ"
+    assert hook._canonical_repo(https) == hook._canonical_repo(ssh)
+    assert hook._canonical_repo(https) != hook._canonical_repo(
+        "https://github.com/Other/Repo.git"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cmd", "expected"),
+    [
+        ("git push", None),
+        ("git push origin", None),
+        ("git push origin feature", "feature"),
+        ("git push origin mybranch:main", "mybranch"),
+        ("git push origin HEAD:refs/heads/x", "HEAD"),
+        ("git push origin +force:main", "force"),
+        ("git push -u origin feat", "feat"),
+        ("git push origin --delete old", ""),
+    ],
+)
+def test_the_scan_follows_the_ref_actually_being_pushed(cmd, expected):
+    """`git push origin other:main` sends a ref that is NOT checked out.
+
+    The scan diffed HEAD unconditionally, so pushing a branch you had not
+    checked out was measured against unrelated content and passed with no
+    signal.
+    """
+    assert hook._push_source_ref(cmd) == expected
+
+
+def test_an_unresolvable_diff_says_so_instead_of_going_quiet(monkeypatch, capsys):
+    """Silence must not be indistinguishable from "scanned, found nothing".
+
+    A shallow clone or an unfetched origin/main yields no diff, and the hook
+    used to return without a word — identical output to a clean push.
+    """
+    out = _run_main(
+        monkeypatch, capsys, command="git push origin feat", public=True, diff=""
+    )
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "NOTHING was scanned" in ctx
+    assert "not as clean" in ctx
+
+
+def test_a_branch_deletion_is_not_scanned(monkeypatch, capsys):
+    """Deleting a remote ref sends no content."""
+    out = _run_main(
+        monkeypatch, capsys, command="git push origin --delete old", public=True, diff=_LEAK_DIFF
+    )
+    assert out == ""
+
+
+def test_main_actually_passes_the_parsed_ref_to_the_scan(monkeypatch, capsys):
+    """Parsing the refspec is useless unless main() hands it to the diff.
+
+    Without this, deleting the argument from the call site leaves the parser
+    tests above green while the scan quietly goes back to diffing HEAD — the
+    built-but-not-wired shape, invisible because the unit under test still works.
+    """
+    seen: dict = {}
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push origin mybranch:main"},
+        "cwd": "/tmp",
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(hook, "_targets_public_repo", lambda remote, cwd: True)
+
+    def fake_diff(cwd, source_ref=None):
+        seen["ref"] = source_ref
+        return _CLEAN_DIFF
+
+    monkeypatch.setattr(hook, "_outgoing_diff", fake_diff)
+    hook.main()
+    capsys.readouterr()
+    assert seen["ref"] == "mybranch", "the scan did not follow the pushed ref"
+
+
+def test_targets_public_repo_uses_the_canonical_comparison(monkeypatch):
+    """The canonicaliser is useless unless the DECISION consults it.
+
+    Testing `_canonical_repo` alone leaves the call site free to drift back to
+    string equality, which is the bypass itself: a push to the same public repo
+    over SSH would again resolve as "not origin" and skip the scan.
+    """
+    def fake_git(args, cwd):
+        if args[:3] == ["remote", "get-url", "--push"]:
+            return "https://github.com/Owner/Repo.git"  # origin, HTTPS form
+        return ""
+
+    monkeypatch.setattr(hook, "_git", fake_git)
+    # An scp-style SSH literal for the SAME repo must be recognised as public.
+    assert hook._targets_public_repo("git@github.com:Owner/Repo.git", None) is True
+    # A genuinely different repo must not be.
+    assert hook._targets_public_repo("git@github.com:Someone/Else.git", None) is False
+
+
+# ─── Part D: credential SHAPES, annotation, and the whole-branch scan ────────
+#
+# These sit on top of #1924's two-verdict split rather than replacing it. That
+# split is the better precision design — it refuses only what this install
+# actually HAS and keeps generic RFC1918 shapes advisory — and the measurements
+# below are what convinced me of it: my own single-verdict version blocked 27.5%
+# of merged commits before scoping.
 
 
 def _diff(*lines: str) -> str:
@@ -267,14 +461,14 @@ def _diff(*lines: str) -> str:
         ("hardcoded password", 'DATABASE_PASSWORD = "correct-horse-battery"'),  # genesis:verified-generic
     ],
 )
-def test_a_credential_shape_this_install_has_never_seen_is_caught(label, line):
-    """SHAPE, not memory — the whole point of Part D.
+def test_a_credential_shape_this_install_has_never_seen_is_denied(label, line):
+    """SHAPE, not memory — and it lands in the DENY half, not the advisory one.
 
     None of these values exists on this box, so the install-specific scanners
-    (which only know values this install has seen) cannot reach them. Before this
-    change every one of them would have pushed silently.
+    cannot reach any of them. Before this, every one pushed silently.
     """
-    assert hook._scan(_diff(line)), f"{label} must be detected"
+    known, _generic = hook._scan(_diff(line))
+    assert known, f"{label} must be denied"
 
 
 @pytest.mark.parametrize(
@@ -282,36 +476,33 @@ def test_a_credential_shape_this_install_has_never_seen_is_caught(label, line):
     ["# pragma: allowlist secret", "# gitleaks:allow", "# genesis:verified-generic"],
 )
 def test_each_annotation_spelling_clears_a_line(marker):
-    """Three spellings because three tools are involved and none owns the others'.
-
-    Requiring only ours would mean re-annotating lines already marked for
-    detect-secrets or gitleaks.
-    """
+    """Three spellings because three tools are involved and none owns the others'."""
     line = 'TOKEN = "ghp_' + "A" * 40 + '"'
-    assert hook._scan(_diff(line)), "precondition: unannotated, it is caught"
-    assert not hook._scan(_diff(f"{line}  {marker}")), f"{marker} must clear it"
+    assert hook._scan(_diff(line))[0], "precondition: unannotated, it is denied"
+    assert not hook._scan(_diff(f"{line}  {marker}"))[0], f"{marker} must clear it"
 
 
 def test_annotation_also_clears_the_install_specific_scanners():
-    """The most legitimate hits come from those, so exempting only the new layers
-    would leave the common false positive unclearable — e.g. a CIDR constant in a
-    network classifier, or a reserved-domain fixture."""
-    leak = _LEAK_DIFF.replace("\n", "", 0)
-    assert hook._scan(leak), "precondition: the install pattern is caught"
+    """The install-known half produces the hits most likely to be legitimate —
+    a CIDR constant a classifier is made of, a reserved-domain fixture — so
+    exempting only the shape layers would leave them unclearable."""
+    known, generic = hook._scan(_LEAK_DIFF)
+    assert known or generic, "precondition: the install pattern is caught"
     annotated = "\n".join(
-        ln + "  # genesis:verified-generic" if ln.startswith("+") and not ln.startswith("+++")
+        ln + "  # genesis:verified-generic"
+        if ln.startswith("+") and not ln.startswith("+++")
         else ln
-        for ln in leak.splitlines()
+        for ln in _LEAK_DIFF.splitlines()
     )
-    assert not hook._scan(annotated + "\n")
+    k2, g2 = hook._scan(annotated + "\n")
+    assert not k2 and not g2
 
 
 def test_an_assignment_from_the_environment_is_not_a_secret():
     """`KEY = os.environ[...]` NAMES a credential; it does not contain one.
 
-    MEASURED: this class was 8 of 11 false blocks in the first pass over 40
-    merged commits, and it is the single most common credential-shaped line in
-    real source.
+    MEASURED: this class was 8 of 11 false blocks over 40 merged commits, and it
+    is the most common credential-shaped line in real source.
     """
     for line in (
         'ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]',
@@ -320,48 +511,53 @@ def test_an_assignment_from_the_environment_is_not_a_secret():
         "SECRET_TOKEN = None",
         'API_KEY = f"{prefix}-{suffix}"',
     ):
-        assert not hook._scan(_diff(line)), f"a reference must not block: {line}"
+        assert not hook._scan(_diff(line))[0], f"a reference must not deny: {line}"
 
 
-def test_a_hardcoded_literal_still_blocks():
-    """The other side of the same filter — it must not have blinded the check."""
-    assert hook._scan(_diff('DATABASE_PASSWORD = "correct-horse-battery"'))  # genesis:verified-generic
+def test_a_generic_private_ip_stays_ADVISORY_not_denied():
+    """#1924's central claim, re-asserted after folding the shape half in.
+
+    `192.168.1.5` in a test is correct constantly. If the shape work had pushed
+    this into the deny half, the gate would fire on correct code — which is the
+    failure mode the split exists to prevent.
+    """
+    known, generic = hook._scan(_diff('HOST = "192.168.1.5"'))
+    assert generic, "a generic RFC1918 literal must still be reported"
+    assert not known, "...but it must NEVER be denied"
 
 
 def test_findings_never_echo_the_matched_value():
-    """Reporting the secret to report the secret leaks it one place further.
+    """The renderer emits location + CATEGORY, never content.
 
-    This output reaches a terminal and a transcript.
+    `_check_emails` interpolates the offending address into its message, so
+    rendering messages would make this hook publish the very value it refuses —
+    into the model's context and the transcript. Asserted over the RENDERED
+    output, because that is what actually reaches a human.
     """
     secret = "ghp_" + "Z" * 40
-    found = hook._scan(_diff(f'TOKEN = "{secret}"'))
-    assert found
-    for _file, _line, message in found:
-        assert secret not in message
-        assert "ZZZZ" not in message
+    known, _ = hook._scan(_diff(f'TOKEN = "{secret}"'))
+    assert known
+    rendered = "\n".join(hook._render(known))
+    assert secret not in rendered
+    assert "ZZZZ" not in rendered
 
 
 def test_the_diff_is_the_whole_branch_not_the_unpushed_delta(monkeypatch):
     """Scanning only new commits makes already-pushed content invisible.
 
-    That produced the exact silence-then-noise this change fixes: the same lines
-    flagged on a first push and went quiet on every push after, so a re-push
-    reported clean on a branch that was not. The base must come from the
-    merge-base with main, never from origin/<branch>.
+    That produced silence-then-noise: the same lines flagged on a first push and
+    went quiet on every push after, so a re-push reported clean on a branch that
+    was not. #1924 kept the incremental base; this is Part D's fix to it.
     """
     calls = []
 
     def _fake_git(args, cwd=None):
         calls.append(args)
-        if args[:1] == ["merge-base"]:
-            return "abc123"
-        if args[:1] == ["diff"]:
-            return ""
-        return ""
+        return "abc123" if args[:1] == ["merge-base"] else ""
 
     monkeypatch.setattr(hook, "_git", _fake_git)
-    hook._outgoing_diff(None)
-    assert ["merge-base", "origin/main", "HEAD"] in calls
+    hook._outgoing_diff(None, None)
+    assert any(a[:1] == ["merge-base"] for a in calls)
     assert not any(
         a[:1] == ["rev-parse"] and any("origin/" in str(x) for x in a) for a in calls
     ), "must not resolve origin/<branch> — that is the incremental scan"
