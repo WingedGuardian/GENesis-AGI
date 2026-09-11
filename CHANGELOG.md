@@ -89,6 +89,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **A dead code index now says so.** The code indexer could give up on a
+  repository permanently and report it only into a log file: on one install the
+  main repo's index request was abandoned after five failed attempts, its
+  database sat corrupt for two weeks, and code-intelligence tools kept answering
+  from nothing — with no alert anywhere, because nothing read the indexer's
+  failure records. An hourly check now reads those records directly (abandoned
+  index requests, and whether an index actually exists for the path being
+  indexed) and raises one self-resolving alert that clears when the index comes
+  back. It reads the indexer's own files rather than asking the tool how it is
+  doing, since a crashed indexer cannot answer. Configurable via
+  `code_intel_health` (`enabled`, `indexed_path`, `alert_priority`); set
+  `indexed_path` to whatever the indexer is actually pointed at.
 - **Work you agreed to in a session that has since ended no longer goes quiet.**
   A session's ledger is its list of agreements, and it was only ever visible to
   that session — so when a session ended with items still open, they stopped
