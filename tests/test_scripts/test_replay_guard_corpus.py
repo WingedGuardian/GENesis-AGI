@@ -55,7 +55,12 @@ _ROWS = [("echo one", "/tmp"), ("echo two", "/tmp")]
 
 @pytest.fixture
 def cache(tmp_path, rgc, monkeypatch):
-    """Point the module at a throwaway cache and stub the 1.4 GB transcript walk."""
+    """Point the module at a throwaway cache and stub the transcript walk.
+
+    The real walk covers a multi-gigabyte tree that only grows (6.0 GB / 140,293
+    unique pairs on the origin install 2026-09-10, against ~1.4 GB / 51,052 five
+    days earlier), which is why no test ever runs it.
+    """
     path = tmp_path / "guard-corpus.jsonl"
     monkeypatch.setattr(rgc, "_CACHE", path)
     monkeypatch.setattr(rgc, "_extract_commands", lambda: list(_ROWS))
@@ -186,10 +191,10 @@ def test_each_command_is_replayed_from_the_directory_it_was_typed_in(cache, rgc)
         return 0
 
     mod = types.SimpleNamespace(main=fake_main, read_payload=lambda: None)
-    rgc._run_python_guard._loaded["fake_guard"] = mod
 
     before = os.getcwd()
-    rgc._run_python_guard("fake_guard", "echo hi", "/tmp")
+    with fake_loaded(rgc, "fake_guard", mod):
+        rgc._run_python_guard("fake_guard", "echo hi", "/tmp")
 
     assert seen["process_cwd"] == "/tmp", "the process cwd did not move"
     assert seen["payload_cwd"] == "/tmp", "the payload cwd did not move"
@@ -204,6 +209,55 @@ def test_a_vanished_directory_resolves_to_the_repo_root(cache, rgc):
 
     assert resolved == str(rgc._REPO)
     assert rgc._SUBSTITUTED_CWD["n"] == 1
+
+
+def test_the_pool_asks_for_fork_explicitly(cache, rgc, monkeypatch):
+    """The pooled path must not inherit the platform's default start method.
+
+    ``_probe`` resolves the guard out of the module-global ``GUARDS`` table, and
+    ``_INLINE_BLOB`` is read once at import. A spawn/forkserver worker re-imports
+    the module instead of inheriting it, so any entry registered at runtime is
+    simply absent there. MEASURED on this box (python 3.12) with a module global
+    set in the parent only:
+
+        fork        -> ('HIT', 99)
+        forkserver  -> KeyError
+        spawn       -> KeyError
+
+    ``_probe`` converts that KeyError into ``crashed=True``, so the whole run
+    reports as invalid rather than failing loudly. Python 3.14 makes forkserver
+    the Linux default while this project declares ``requires-python >=3.12``, so
+    leaving the context implicit means the tool behaves differently on two
+    supported interpreters.
+
+    This asserts the REQUEST, not the outcome: reverting to a bare
+    ``mp.Pool(jobs)`` never calls ``get_context`` and turns this red, which a
+    behavioural assertion could not do while fork is still the 3.12 default.
+    """
+    import multiprocessing as mp
+
+    asked: list[str] = []
+    real_get_context = mp.get_context
+
+    def recording_get_context(method=None):
+        asked.append(method)
+        return real_get_context(method)
+
+    monkeypatch.setattr(mp, "get_context", recording_get_context)
+
+    with fake_guard(
+        rgc,
+        "fake",
+        lambda c, w: False,
+        spawns_process=True,
+        safety=rgc.replay_safe("a test double; it touches nothing"),
+    ):
+        rgc.replay("fake", [("echo hi", "/tmp")] * 4, show=0, jobs=4)
+
+    assert "fork" in asked, (
+        "replay() did not request the fork start method — a spawn/forkserver "
+        f"worker cannot see runtime GUARDS entries. get_context calls: {asked}"
+    )
 
 
 @pytest.mark.parametrize("jobs", [1, 4])
@@ -264,7 +318,8 @@ def test_a_guard_that_only_crashes_cannot_report_a_clean_rate(cache, rgc, capsys
 def test_a_cache_truncated_mid_rebuild_names_itself_and_recovers(cache, rgc, capsys):
     """An interrupted rebuild used to brick the tool.
 
-    The build walks ~1.4 GB; a kill part-way leaves a truncated final line, and
+    The build walks the whole transcript tree; a kill part-way leaves a truncated
+    final line, and
     the next load died inside a list comprehension with a JSON error that named
     neither the cache nor the remedy. The file then had to be deleted by hand.
     """
@@ -282,14 +337,17 @@ def test_the_guard_child_never_inherits_a_dispatched_session_flag(rgc, monkeypat
 
     It used to pin a GENESIS_DISCARD_SNAPSHOT_LOG redirect, added after a
     MEASURED finding: replaying `bash_safety` reached git_discard_guard through a
-    delegation and wrote rows to the live recovery log, which self-trims at 1 MB
-    and would have evicted real recovery history. That redirect is gone, because
-    it was never sufficient — it moved the LOG but not the objects
+    delegation and wrote rows to the live recovery store, which is bounded and
+    would have evicted real recovery history. That redirect is gone, because it
+    was never sufficient — it moved the RECORDS but not the objects
     `git stash create` writes into whatever repository each row was recorded in.
     `bash_safety` is refused outright now, and the half-measure went with it.
+    (The knob itself has since been retired upstream; git_discard_guard prints
+    "GENESIS_DISCARD_SNAPSHOT_LOG is no longer read" and resolves
+    GENESIS_DISCARD_SNAPSHOT_DIR instead. The reasoning is unchanged.)
 
     What still matters on this path is the one variable measured to change a
-    VERDICT rather than a message. bash_safety_hook.sh:319 exits 0 when
+    VERDICT rather than a message: bash_safety_hook.sh exits 0 when
     `_in_genesis` is 1 and GENESIS_CC_SESSION is not exactly "1", so the same
     corpus yields a different rate depending on who ran the harness.
     """
@@ -319,6 +377,148 @@ def test_the_guard_child_never_inherits_a_dispatched_session_flag(rgc, monkeypat
     assert env.get("HOME"), "HOME was stripped from the child env"
 
 
+@pytest.mark.parametrize("var", ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "BASH_XTRACEFD"])
+def test_the_guard_child_never_inherits_a_shell_startup_channel(rgc, monkeypatch, var):
+    """The shell's OWN startup channel, which is not a variable the guard reads.
+
+    A non-interactive ``bash -c`` SOURCES $BASH_ENV before it runs anything, and
+    this path spawns one bash per corpus row plus nested shells and command
+    substitutions inside each. Inherited, an operator whose environment exports
+    BASH_ENV would have their startup file executed a few hundred thousand times
+    by a tool whose docstring says it replays local history. SHELLOPTS/BASHOPTS
+    are the same channel by another door: exported, they switch options on in the
+    child (errexit, xtrace, onecmd) and change what the guard DOES.
+
+    Distinct from the GENESIS_CC_SESSION case above, which is a variable the hook
+    itself reads. Nothing in the blob reads any of these — bash does.
+    """
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs.get("env") or {}
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(rgc.subprocess, "run", fake_run)
+    monkeypatch.setenv(var, "/tmp/would-be-sourced")
+
+    rgc._run_shell_guard(["bash", "-c", "true"], "echo hi", "/tmp")
+
+    assert var not in seen["env"], (
+        f"{var} reached the guard child; replaying a shell guard would trigger "
+        "the shell's startup path once per corpus row"
+    )
+    assert seen["env"].get("PATH"), "PATH was stripped from the child env"
+
+
+def test_the_in_process_guard_never_inherits_the_hosts_argv(rgc, monkeypatch):
+    """argv is ambient process state, and one of these guards branches on it.
+
+    worktree_cwd_guard.main() selects its Enter/ExitWorktree classifiers on
+    ``"--enter-worktree" in sys.argv``. replay() is a supported API, so for an
+    imported caller sys.argv is whatever ITS operator typed — a pytest
+    invocation, a wrapper script. Inherited, an unrelated flag puts every
+    ordinary Bash row through the wrong classifier.
+
+    Asserts three things, and the third is the one a refactor would silently
+    break. The pin uses SLICE ASSIGNMENT rather than rebinding, because a guard
+    written `from sys import argv` — or with a module-level `_ARGV = sys.argv` —
+    holds the list itself and never sees a rebind, so it would keep reading the
+    HOST's argv with the pin apparently in place and nothing to signal it. No
+    guard in scripts/hooks/ is spelled that way today; the point is that the pin
+    keeps working if one is.
+
+    So identity is asserted alongside content. Under rebinding
+    `sys.argv is host_argv` is False after the call, and a content-only
+    assertion would pass either way — which would make this test unable to tell
+    the two implementations apart, exactly the gap that lets a refactor through.
+    """
+    seen = {}
+
+    def fake_main():
+        seen["argv"] = list(sys.argv)
+        return 0
+
+    mod = types.SimpleNamespace(main=fake_main, read_payload=lambda: None)
+
+    host_argv = ["pytest", "--enter-worktree", "-k", "something"]
+    host_snapshot = list(host_argv)
+    monkeypatch.setattr(sys, "argv", host_argv)
+
+    with fake_loaded(rgc, "worktree_cwd_guard", mod):
+        rgc._run_python_guard("worktree_cwd_guard", "echo hi", "/tmp")
+
+    assert "--enter-worktree" not in seen["argv"], (
+        "the host's argv reached the guard; --enter-worktree makes every row "
+        f"block. guard saw: {seen['argv']}"
+    )
+    assert seen["argv"] == [str(rgc._HOOKS / "worktree_cwd_guard.py")], (
+        f"the guard did not see its production argv: {seen['argv']}"
+    )
+    assert sys.argv == host_snapshot, "the host's argv content was not restored"
+    assert sys.argv is host_argv, (
+        "the pin REBOUND sys.argv instead of slice-assigning it — a guard that "
+        "captured the list at import would still see the host's argv"
+    )
+
+
+def test_a_raising_restore_still_undoes_the_other_two_mutations(rgc, monkeypatch):
+    """The `finally` must not abandon its own remaining restores.
+
+    `_run_python_guard` mutates three pieces of ambient state and undoes them in
+    one `finally`. If a restore that CAN throw runs before the others, one throw
+    strands them — and `os.chdir(prior)` is exactly that: it raises when the
+    invocation directory has been removed, which is not exotic in a harness whose
+    subject is worktrees being removed.
+
+    MEASURED before the fix, with chdir restoring first and unwrapped: the
+    FileNotFoundError propagated out of the `finally`, `sys.argv` kept the pinned
+    value and `mod.read_payload` kept the patched lambda. `_probe` catches that
+    as one crash and the run CONTINUES — so every later row is classified against
+    this row's payload while the report discloses a single crash. A silently
+    wrong number is the one outcome this file exists to prevent, which is why the
+    cannot-throw restores now go first and chdir goes last, suppressed.
+    """
+
+    def sentinel():
+        return {"sentinel": True}
+
+    mod = types.SimpleNamespace(main=lambda: 0, read_payload=sentinel)
+
+    host_argv = ["pytest", "-k", "something"]
+    host_snapshot = list(host_argv)
+    monkeypatch.setattr(sys, "argv", host_argv)
+
+    real_chdir = os.chdir
+    calls = {"n": 0}
+
+    def chdir_that_fails_on_the_way_back(path):
+        calls["n"] += 1
+        if calls["n"] == 1:  # into the row's directory — must succeed
+            return real_chdir(path)
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(rgc.os, "chdir", chdir_that_fails_on_the_way_back)
+
+    before = real_chdir, os.getcwd()
+    with fake_loaded(rgc, "restore_raiser", mod):
+        rgc._run_python_guard("restore_raiser", "echo hi", "/tmp")
+
+    assert calls["n"] == 2, "the restore chdir never ran, so nothing was proven"
+    assert sys.argv == host_snapshot, (
+        "a raising chdir restore stranded the argv restore — every later row "
+        "would run with this row's pinned argv"
+    )
+    assert mod.read_payload is sentinel, (
+        "a raising chdir restore stranded the read_payload restore — every later "
+        "row would be classified against THIS row's payload"
+    )
+    real_chdir(before[1])
+
+
 # ── replay-safety declaration ────────────────────────────────────────────────
 #
 # The exclusions used to live in prose comments that reasoned about WHICH GUARD
@@ -332,7 +532,7 @@ _UNSET = object()
 
 
 @contextlib.contextmanager
-def fake_guard(rgc, name, fn, *, spawns_process=False, safety=_UNSET):
+def fake_guard(rgc, name, fn, *, spawns_process=False, safety=_UNSET, **extra):
     """Register a guard for one test and remove it afterwards.
 
     Replaces the old pattern of poking two globals (``GUARDS`` and
@@ -341,7 +541,7 @@ def fake_guard(rgc, name, fn, *, spawns_process=False, safety=_UNSET):
     test below, so the default here must stay "argument omitted" rather than
     "declared unsafe".
     """
-    kwargs = {"run": fn, "spawns_process": spawns_process}
+    kwargs = {"run": fn, "spawns_process": spawns_process, **extra}
     if safety is not _UNSET:
         kwargs["safety"] = safety
     rgc.GUARDS[name] = rgc.Guard(**kwargs)
@@ -349,6 +549,31 @@ def fake_guard(rgc, name, fn, *, spawns_process=False, safety=_UNSET):
         yield
     finally:
         rgc.GUARDS.pop(name, None)
+
+
+@contextlib.contextmanager
+def fake_loaded(rgc, name, mod):
+    """Put a double in the guard-import cache for ONE test, then take it out.
+
+    `_run_python_guard._loaded` is a process-global memo and the `rgc` fixture is
+    module-scoped, so an entry written by one test is visible to every later one.
+    That is harmless for an invented name and NOT harmless for a real guard name:
+    a later test — or the same tests under `-k`, a different order, or a plugin
+    that shuffles them — would silently run the double instead of the guard. The
+    leak is latent today only because nothing downstream happens to look it up,
+    which is a property of the current file rather than of the fixture.
+    """
+    loaded = rgc._run_python_guard._loaded
+    had = name in loaded
+    prior = loaded.get(name)
+    loaded[name] = mod
+    try:
+        yield mod
+    finally:
+        if had:
+            loaded[name] = prior
+        else:
+            loaded.pop(name, None)
 
 
 def _run_cli(rgc, monkeypatch, *argv):
@@ -403,7 +628,8 @@ def test_replay_refuses_an_unsafe_guard_even_when_called_directly(rgc):
 
 
 def test_a_declared_unsafe_guard_is_refused_before_the_corpus_is_built(rgc, monkeypatch, capsys):
-    """The corpus build walks ~1.4 GB. A refusal that arrives after it has spent
+    """The corpus build walks the whole transcript tree. A refusal that arrives
+    after it has spent
     those minutes is not a refusal, and the name stays in argparse `choices` so
     the answer is the reason rather than 'invalid choice'."""
     code = _run_cli(rgc, monkeypatch, "--guard", "bash_safety")
@@ -428,15 +654,16 @@ def test_an_in_process_guard_that_crashes_is_disclosed_not_scored(rgc, capsys):
     def boom_main():
         raise ImportError("shell_parse is not importable")
 
-    rgc._run_python_guard._loaded["crashy"] = types.SimpleNamespace(
-        main=boom_main, read_payload=lambda: None
-    )
+    crashy = types.SimpleNamespace(main=boom_main, read_payload=lambda: None)
     corpus = [("echo hi", "/tmp")] * 4
-    with fake_guard(
-        rgc,
-        "crashy",
-        lambda c, w: rgc._run_python_guard("crashy", c, w),
-        safety=rgc.replay_safe("a test double"),
+    with (
+        fake_loaded(rgc, "crashy", crashy),
+        fake_guard(
+            rgc,
+            "crashy",
+            lambda c, w: rgc._run_python_guard("crashy", c, w),
+            safety=rgc.replay_safe("a test double"),
+        ),
     ):
         rgc.replay("crashy", corpus, show=0, jobs=1)
 
@@ -466,10 +693,9 @@ def test_a_crashing_in_process_guard_still_restores_cwd_and_read_payload(rgc):
         return {"sentinel": True}
 
     mod = types.SimpleNamespace(main=boom_main, read_payload=sentinel)
-    rgc._run_python_guard._loaded["restorer"] = mod
     before = os.getcwd()
 
-    with pytest.raises(RuntimeError):
+    with fake_loaded(rgc, "restorer", mod), pytest.raises(RuntimeError):
         rgc._run_python_guard("restorer", "echo hi", "/tmp")
 
     assert os.getcwd() == before, "a crashing guard left the process in its cwd"
@@ -606,6 +832,76 @@ def test_all_with_nothing_safe_exits_2(rgc, monkeypatch):
     assert rgc.main() == 2
 
 
+def test_an_empty_corpus_exits_2_instead_of_printing_a_clean_zero(rgc, monkeypatch, capsys):
+    """The sibling of the refusal above, one level in.
+
+    An unreadable transcript tree, an empty cache file, or a tree holding no Bash
+    records all reach replay with ``corpus == []``. ``pct`` is defined as 0.0 when
+    n == 0 and nothing crashes, so every selected guard printed
+    ``blocked 0/0 (0.00%)`` and main() returned 0 — a measurement of NOTHING
+    wearing the grammar of a clean sweep, on the output most likely to be pasted
+    into a PR body.
+
+    The assertion is on the EXIT CODE and the absence of a rate line, not on the
+    prose: asserting the message alone would pass on a run that printed the
+    refusal and then measured anyway.
+    """
+    ran = []
+    monkeypatch.setattr(
+        rgc,
+        "GUARDS",
+        {
+            "safe_one": rgc.Guard(
+                run=lambda c, w: ran.append((c, w)) or False,
+                safety=rgc.replay_safe("a test double"),
+            )
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
+    monkeypatch.setattr(rgc, "load_corpus", lambda **kw: [])
+
+    code = rgc.main()
+
+    out = capsys.readouterr()
+    assert code == 2, "an empty corpus exited 0 — a run that measured nothing"
+    assert "0/0" not in out.out, "a 0/0 rate was printed for an empty corpus"
+    assert not ran, "a guard was replayed against an empty corpus"
+    assert "REFUSED" in out.err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--all", "--guard", "protected_paths"),
+        ("--list", "--all"),
+        ("--list", "--guard", "protected_paths"),
+    ],
+)
+def test_conflicting_selectors_are_refused_rather_than_partly_honoured(rgc, monkeypatch, argv):
+    """Every pairing produced a SUCCESSFUL PARTIAL RUN, which is the worst shape.
+
+    ``--all --guard <name>`` ran that one guard and exited 0 while the closing
+    ``NOT MEASURED`` line named only the REFUSED guards — so the other replayable
+    guards were missing from the run AND from the disclosure, which is the one
+    thing that line exists to prevent. ``--list`` with either simply won and
+    exited 0 having measured nothing.
+
+    argparse exits 2 on a mutually-exclusive violation, so this asserts SystemExit
+    rather than a return value.
+    """
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", *argv])
+    monkeypatch.setattr(
+        rgc,
+        "load_corpus",
+        lambda **kw: pytest.fail("the corpus was built for a conflicting selector"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        rgc.main()
+
+    assert exc.value.code == 2
+
+
 # ── review round 1 on this PR ────────────────────────────────────────────────
 
 
@@ -615,12 +911,21 @@ def test_the_protected_paths_declaration_does_not_deny_reading_the_environment(
     """The sharpest finding on this PR, whatever severity it was filed at.
 
     The declaration read "no environment reads". That is FALSE:
-    protected_paths_guard.py:90 runs expanduser(expandvars(token)) on each
-    operand, :225 expands again, and :145/:154/:159 resolve ~. The mechanism's
-    entire value is that each entry carries VERIFIED evidence — a declaration
-    with a false claim in it is worse than no declaration, because it reads as
-    protection while being wrong. That is the failure this design replaced,
-    committed inside the replacement.
+    `protected_paths_guard._expand` runs
+    `os.path.expanduser(os.path.expandvars(token))` on each operand, `main()`
+    expands again to spot a surviving `$`, and `_legacy_substring_block` /
+    `_protected_dirs` / `_protected_files` each resolve
+    `home = os.path.expanduser("~")`. The mechanism's entire value is that each
+    entry carries VERIFIED evidence — a declaration with a false claim in it is
+    worse than no declaration, because it reads as protection while being wrong.
+    That is the failure this design replaced, committed inside the replacement.
+
+    Cited by SYMBOL rather than line number, and this docstring is why the rule
+    exists rather than an application of it: the version above named
+    `:90`, `:225` and `:145/:154/:159`, and by the time a reviewer read it every
+    one of the five had drifted — `:90` onto a tuple of glob characters. A
+    docstring about stale evidence going stale is the whole argument for not
+    citing positions.
     """
     monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list"])
     rgc.main()
@@ -662,7 +967,8 @@ def test_other_wrong_cache_shapes_rebuild_rather_than_crash(cache, rgc, row):
 
 
 def test_one_malformed_transcript_record_does_not_abort_the_whole_walk(rgc, monkeypatch, tmp_path):
-    """The walk covers ~1.4 GB. Every other malformed record here is skipped; a
+    """The walk covers the whole transcript tree. Every other malformed record
+    here is skipped; a
     JSON line containing "Bash" but shaped as a LIST raised AttributeError from
     .get() and killed the entire rebuild — losing minutes of work to one bad
     line, at whatever point in the tree it happened to sit."""
@@ -725,6 +1031,211 @@ def test_a_negative_show_count_is_refused(rgc, monkeypatch):
     a slipped minus sign is a corpus dump to a terminal or a captured log."""
     monkeypatch.setattr(
         sys, "argv", ["replay_guard_corpus.py", "--guard", "protected_paths", "--show", "-1"]
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        rgc.main()
+
+    assert excinfo.value.code == 2
+
+
+# ── round 2: findings from the adversarial audit of this session's fixes ──────
+
+
+@pytest.mark.parametrize("jobs", ["0", "-4"])
+def test_a_jobs_count_below_one_is_refused(rgc, monkeypatch, jobs):
+    """The validation --show and --limit already had, and --jobs did not.
+
+    `jobs > 1` is the pool test, so 0 or a negative silently takes the SERIAL
+    path. On a shell guard that turns a ~14-minute pooled run into hours, with no
+    message — a wrong RUNTIME rather than a wrong number, which is why nothing
+    else in the output would have flagged it.
+    """
+    monkeypatch.setattr(
+        sys, "argv", ["replay_guard_corpus.py", "--guard", "protected_paths", "--jobs", jobs]
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        rgc.main()
+
+    assert excinfo.value.code == 2
+
+
+def test_rebuild_with_list_says_it_is_doing_nothing(rgc, monkeypatch, capsys):
+    """--list returns before load_corpus, so --rebuild on that path is a no-op.
+
+    Ignoring a flag is defensible; ignoring it SILENTLY is not, because the
+    operator who passed it is waiting for a rebuild that will never happen and
+    the next measurement still reads the stale cache.
+    """
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--list", "--rebuild"])
+
+    assert rgc.main() == 0
+
+    assert "--rebuild has no effect with --list" in capsys.readouterr().err
+
+
+def test_the_blocked_sample_comes_from_the_outcome_not_the_index(rgc, capsys):
+    """The pooled path must not recover its samples by position.
+
+    It used to do `blocked.append(corpus[i - 1])`, which is correct ONLY because
+    `imap` preserves order. A later switch to `imap_unordered` for speed would
+    silently attribute every printed sample to the wrong command — and the
+    samples are exactly what a human reads to turn a rate into a verdict, so the
+    corruption would land in the one output that gets pasted into a PR.
+
+    Pinned by making the guard block exactly ONE known row out of several.
+    """
+    corpus = [("echo alpha", "/tmp"), ("echo BLOCKME", "/tmp"), ("echo omega", "/tmp")]
+    with fake_guard(
+        rgc,
+        "picky",
+        lambda c, w: "BLOCKME" in c,
+        safety=rgc.replay_safe("a test double"),
+    ):
+        result = rgc.replay("picky", corpus, show=5, jobs=1)
+
+    out = capsys.readouterr().out
+    assert result.blocked == 1
+    assert "echo BLOCKME" in out, f"the sample did not name the blocked command: {out}"
+    assert "echo alpha" not in out and "echo omega" not in out, (
+        f"the sample named a command that was never blocked: {out}"
+    )
+
+
+def test_importing_the_module_survives_a_settings_file_with_no_inline_blob(tmp_path):
+    """The blob is read LAZILY, so its absence cannot take down the whole tool.
+
+    Read at import, a reworded hook or a malformed settings.json made
+    `import replay_guard_corpus` exit — killing --list, whose entire job is
+    EXPLAINING refusals, plus both in-process guards, replay() for library
+    callers, and this test module. Five of six invocations never need the string;
+    only the one guard that uses it should pay for it being gone.
+
+    The script is COPIED into a throwaway repo layout with a blob-less
+    settings.json and imported from there. Loading the real module and then
+    reassigning `_REPO` would not test this at all: `_REPO` derives from
+    `__file__` at import, so the real settings.json would already have been read
+    successfully and an eager implementation would pass. The copy is what makes
+    the import itself the thing under test.
+    """
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "scripts").mkdir(parents=True)
+    (fake_repo / ".claude").mkdir(parents=True)
+    (fake_repo / ".claude" / "settings.json").write_text('{"hooks": {}}')
+    target = fake_repo / "scripts" / "replay_guard_corpus.py"
+    target.write_text(_SCRIPT.read_text())
+
+    spec = importlib.util.spec_from_file_location("rgc_blobless", target)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["rgc_blobless"] = mod
+    try:
+        # THE PROPERTY: this line raised SystemExit before the read was made lazy.
+        spec.loader.exec_module(mod)
+
+        assert fake_repo == mod._REPO, "the copy did not resolve its own repo root"
+        # --list is the path that must survive, because explaining refusals is
+        # the whole reason a refused guard stays in the table.
+        assert "inline_blob" in mod.GUARDS
+        # ...and the one guard that genuinely needs the blob still fails loudly.
+        with pytest.raises(SystemExit):
+            mod._inline_blob()
+    finally:
+        sys.modules.pop("rgc_blobless", None)
+
+
+# ── round 3: findings from the cross-model reviewer ───────────────────────────
+
+
+def test_a_guard_that_exits_in_a_pool_worker_does_not_hang_the_run(cache, rgc, capsys):
+    """A BaseException in a worker must come back as a crash, not a deadlock.
+
+    `SystemExit` is a BaseException, so an `except Exception` in `_probe` misses
+    it — and so does `multiprocessing.pool.worker`'s. The worker dies WITHOUT
+    delivering a result and the parent blocks forever in `imap`'s `next()`.
+
+    MEASURED against the real CLI in a checkout whose settings.json carries no
+    inline blob: `--guard inline_blob --jobs 4` had to be killed at 25s, while
+    `--jobs 1` exited cleanly at 1 — so the failure also depended on the host's
+    core count, which is the platform-dependence the fork pin exists to remove.
+    Strictly worse than the eager read it replaced: that exited, this never did.
+
+    A guard is ALLOWED to exit rather than return — `run_guard` is built around
+    exactly that — so this is the guard contract, not one guard's quirk.
+    """
+
+    def exits_instead_of_returning(cmd, cwd):
+        raise SystemExit("the resource this guard needs is missing")
+
+    corpus = [("echo hi", "/tmp")] * 4
+    with fake_guard(
+        rgc,
+        "exiter",
+        exits_instead_of_returning,
+        spawns_process=True,
+        safety=rgc.replay_safe("a test double"),
+    ):
+        result = rgc.replay("exiter", corpus, show=0, jobs=4)
+
+    out = capsys.readouterr().out
+    assert result.valid is False, "a run where every row exited reported as valid"
+    assert "RAISED" in out, "the exits were not disclosed as crashes"
+    assert f"{len(corpus)}/{len(corpus)}" in out
+
+
+def test_a_guards_resource_is_resolved_in_the_parent_before_the_fan_out(cache, rgc):
+    """`prepare` runs ONCE, in the parent, before any worker exists.
+
+    Two properties in one hook. A resource resolved lazily inside `run` is
+    resolved by EVERY worker — which made the fork comment's "the parent parses
+    once and workers inherit it" false. And a resolution that RAISES is an
+    ordinary exception in the parent, where it used to be an undelivered result
+    and a blocked pool.
+    """
+    calls = []
+
+    with fake_guard(
+        rgc,
+        "prepared",
+        lambda c, w: False,
+        spawns_process=True,
+        safety=rgc.replay_safe("a test double"),
+        prepare=lambda: calls.append(1),
+    ):
+        rgc.replay("prepared", [("echo hi", "/tmp")] * 8, show=0, jobs=4)
+
+    assert calls == [1], f"prepare ran {len(calls)} times, expected exactly once"
+
+
+def test_an_unreadable_cache_does_not_also_blame_the_v1_format(cache, rgc, capsys):
+    """One cause per failure. The corrupt branch used to print two.
+
+    The unreadable branches signalled themselves by putting `[None]` into `rows`,
+    which then satisfied the v1-format check — so a cache truncated by an
+    interrupted rebuild printed its real cause AND a second line asserting a
+    false one, sending a reader after a format migration that does not exist.
+    """
+    cache.write_text('["echo one", "/tmp"]\n["echo tw')  # truncated mid-row
+
+    assert rgc.load_corpus() == _ROWS  # recovery is unchanged: rebuild
+
+    err = capsys.readouterr().err
+    assert "corrupt" in err, "the real cause was not named"
+    assert "predates the cwd field" not in err, (
+        f"an unreadable cache was also blamed on the v1 format: {err!r}"
+    )
+
+
+def test_limit_zero_is_refused_rather_than_meaning_no_limit(rgc, monkeypatch):
+    """`--limit 0` was falsy, so it ran the WHOLE corpus.
+
+    Meanwhile `--show 0` means "show none". An operator smoke-testing the
+    empty-corpus refusal with `--limit 0` got a full multi-minute run and no
+    message. The default is None now, so omitted and zero are different things.
+    """
+    monkeypatch.setattr(
+        sys, "argv", ["replay_guard_corpus.py", "--guard", "protected_paths", "--limit", "0"]
     )
 
     with pytest.raises(SystemExit) as excinfo:
