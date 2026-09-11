@@ -147,7 +147,7 @@ def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
         "do not touch",
         "migrating this by hand {not json}",
         '{"v": 999, "rule": "claim"}',
-        '{"v": 1, "rule": "something-else"}',
+        '{"v": 1, "rule": "something-else", "pid": 4242}',
         '{"v": 1}',
         '["v", 1]',
         # The case that made the namespace necessary. `v` and `rule` are ordinary
@@ -155,7 +155,7 @@ def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
         # without a namespace this parsed as OURS and became eligible for
         # auto-release -- silently breaking the one invariant this module rests
         # on. Found in review, not by the suite, which is why it is pinned here.
-        'manual hold {"v": 1, "rule": "dirty"}',
+        'manual hold {"v": 1, "rule": "claim", "pid": 4242}',
         'do not touch {"v": 1, "rule": "claim", "pid": 4242, "start": 1}',
         # Right namespace, malformed body: a claim with no usable pid has no
         # release condition, and treating it as ours would release it instantly.
@@ -163,7 +163,7 @@ def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
         '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": "4242"}',
         '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 1}',
         '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": "x"}',
-        '{"ns": "genesis.other-thing", "v": 1, "rule": "dirty"}',
+        '{"ns": "genesis.other-thing", "v": 1, "rule": "claim", "pid": 4242}',
     ],
 )
 def test_a_reason_that_is_not_ours_is_foreign(repo: Path, worktree: Path, reason: str) -> None:
@@ -198,7 +198,7 @@ def test_claude_code_agent_locks_are_named_but_still_foreign(repo: Path, worktre
     assert lock is not None
     assert lock.foreign is True
     assert wc.describe_foreign(lock.raw) == "claude agent"
-    assert wc.is_releasable(lock, worktree)[0] is False
+    assert wc.is_releasable(lock)[0] is False
 
 
 # ─── process identity ───────────────────────────────────────────────────────
@@ -288,12 +288,6 @@ def test_a_claim_without_a_resolvable_session_is_refused(monkeypatch) -> None:
     assert wc.build_payload("not-a-rule") is None
 
 
-def test_a_dirty_payload_needs_no_process(monkeypatch) -> None:
-    monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: None)
-    payload = wc.build_payload(wc.RULE_DIRTY)
-    assert payload == P("dirty")
-
-
 # ─── release rules ──────────────────────────────────────────────────────────
 
 
@@ -317,13 +311,13 @@ def test_a_claim_is_kept_while_its_session_lives_and_released_once_it_is_gone(
 
     monkeypatch.setattr(wc, "is_session_process", lambda pid: Path(f"/proc/{pid}").exists())
     try:
-        kept, why = wc.is_releasable(lock, worktree)
+        kept, why = wc.is_releasable(lock)
         assert kept is False, why
 
         proc.kill()
         proc.wait(timeout=10)
 
-        released, why = wc.is_releasable(lock, worktree)
+        released, why = wc.is_releasable(lock)
         assert released is True, why
         assert "gone" in why
     finally:
@@ -332,121 +326,7 @@ def test_a_claim_is_kept_while_its_session_lives_and_released_once_it_is_gone(
             proc.wait(timeout=10)
 
 
-def test_a_live_claim_still_releases_once_the_worktree_goes_idle(
-    repo: Path, worktree: Path, monkeypatch
-) -> None:
-    """Without this, ~9 long-running sessions pin their worktrees for their whole
-    life and the reaper never runs again. The idle window is the reaper's own
-    STALE_DAYS, not a second threshold invented here."""
-    monkeypatch.setattr(wc, "pid_is_live_session", lambda *a, **k: True)
-    payload = P("claim", pid=4242, start=1)
-    _lock(repo, worktree, wc.format_reason(payload))
-    lock = wc.read_lock(worktree)
-    assert lock is not None
-
-    fresh, _ = wc.is_releasable(lock, worktree, idle_seconds=3600, stale_seconds=14 * 86400)
-    assert fresh is False
-    stale, why = wc.is_releasable(lock, worktree, idle_seconds=15 * 86400, stale_seconds=14 * 86400)
-    assert stale is True
-    assert "idle" in why
-
-
-def test_a_dirty_lock_tracks_whether_tracked_changes_remain(repo: Path, worktree: Path) -> None:
-    """Both directions, because only the pair shows the predicate is reading the
-    worktree rather than returning a constant."""
-    (worktree / "f.txt").write_text("modified\n")
-    payload = P("dirty")
-    _lock(repo, worktree, wc.format_reason(payload))
-    lock = wc.read_lock(worktree)
-    assert lock is not None
-    assert wc.is_releasable(lock, worktree)[0] is False
-
-    _git(worktree, "checkout", "--", "f.txt")
-    assert wc.is_releasable(lock, worktree)[0] is True
-
-
-def test_untracked_files_do_not_count_as_work(worktree: Path) -> None:
-    """If they did, build output and editor droppings would keep every worktree
-    permanently locked, which is the blanket lock this design rejected."""
-    assert wc.has_tracked_changes(worktree) is False
-    (worktree / "scratch.log").write_text("noise\n")
-    (worktree / "node_modules").mkdir()
-    assert wc.has_tracked_changes(worktree) is False
-
-
-def test_an_unreadable_worktree_reports_dirty(tmp_path: Path) -> None:
-    """Fails CLOSED: a git failure keeps the lock rather than dropping protection."""
-    assert wc.has_tracked_changes(tmp_path / "does-not-exist") is True
-
-
 # ─── the Archon seam ────────────────────────────────────────────────────────
-
-
-def test_archon_paths_are_empty_when_archon_is_absent(tmp_path: Path) -> None:
-    assert wc.archon_active_paths(tmp_path / "nothing-here.db") == []
-
-
-def test_archon_paths_are_empty_when_the_database_is_corrupt(tmp_path: Path) -> None:
-    """Absent and broken are different branches and are tested separately: an
-    install can lose Archon, and it can also have a half-written database."""
-    broken = tmp_path / "archon.db"
-    broken.write_bytes(b"this is not a sqlite file" * 40)
-    assert wc.archon_active_paths(broken) == []
-
-
-def test_archon_paths_are_empty_when_the_table_is_missing(tmp_path: Path) -> None:
-    import sqlite3
-
-    db = tmp_path / "archon.db"
-    with sqlite3.connect(db) as conn:
-        conn.execute("CREATE TABLE unrelated (x INTEGER)")
-    assert wc.archon_active_paths(db) == []
-
-
-def test_there_is_no_archon_rule_and_one_cannot_be_written(repo: Path, worktree: Path) -> None:
-    """`archon` is not a rule, and a lock claiming to be one is FOREIGN.
-
-    This is the regression test for a deadlock that a green unit suite did not
-    catch and only an end-to-end run exposed. An `archon` rule DID exist: it held
-    a worktree while Archon reported the environment active, and released when it
-    stopped. Measured against a live install, that cycle never closes --
-    Archon's `complete` runs `git worktree remove`, the lock refuses it, so the
-    environment never leaves `status='active'`, so the release condition can
-    never fire. `archon complete` reported "0 completed, 1 failed" and only a
-    manual unlock recovered it.
-
-    It was redundant as well as deadlocking: a clean Archon worktree has nothing
-    for the reaper to destroy, and a dirty one is covered by the `dirty` rule --
-    which the next test exercises on an Archon-shaped path.
-    """
-    assert "archon" not in wc.RULES
-    assert wc.build_payload("archon") is None
-
-    _lock(repo, worktree, 'held by something {"v": 1, "rule": "archon"}')
-    lock = wc.read_lock(worktree)
-    assert lock is not None
-    assert lock.foreign is True, "an unknown rule must read as someone else's lock"
-    assert wc.is_releasable(lock, worktree)[0] is False
-
-
-def test_an_archon_worktree_is_protected_by_the_ordinary_dirty_rule(
-    repo: Path, worktree: Path
-) -> None:
-    """What replaces the removed rule: nothing special, which is the point.
-
-    Archon registers its worktrees against THIS repository, so they arrive in the
-    same enumeration as every other worktree and are judged by the same rules.
-    """
-    (worktree / "f.txt").write_text("work Archon has not committed yet\n")
-    assert wc.has_tracked_changes(worktree) is True
-
-    payload = wc.build_payload(wc.RULE_DIRTY)
-    assert wc.lock_worktree(worktree, payload) is True
-    lock = wc.read_lock(worktree)
-    assert wc.is_releasable(lock, worktree)[0] is False
-
-    _git(worktree, "checkout", "--", "f.txt")
-    assert wc.is_releasable(lock, worktree)[0] is True
 
 
 # ─── git's own behaviour, which the whole design rests on ───────────────────
@@ -461,7 +341,7 @@ def test_a_lock_stops_git_worktree_remove_and_unlocking_lets_it_through(
     that could not be removed for some unrelated reason, so the unlocked removal
     is what shows the lock is the cause.
     """
-    _lock(repo, worktree, wc.format_reason(P("dirty")))
+    _lock(repo, worktree, wc.format_reason(P("claim", pid=7, start=1)))
     blocked = _git(repo, "worktree", "remove", str(worktree))
     assert blocked.returncode != 0
     assert "locked" in blocked.stderr.lower()
@@ -480,8 +360,8 @@ def test_git_echoes_our_reason_when_it_refuses(repo: Path, worktree: Path) -> No
 
 
 def test_lock_and_unlock_round_trip(repo: Path, worktree: Path) -> None:
-    assert wc.lock_worktree(worktree, P("dirty")) is True
-    assert wc.read_lock(worktree).rule == "dirty"
+    assert wc.lock_worktree(worktree, P("claim", pid=4242, start=99)) is True
+    assert wc.read_lock(worktree).rule == "claim"
     assert wc.unlock_worktree(worktree) is True
     assert wc.read_lock(worktree) is None
     assert wc.unlock_worktree(worktree) is False
@@ -502,7 +382,7 @@ def test_an_existing_lock_is_not_even_offered_to_git(
     deterministic without spending a subprocess, and keeps the decision in this
     module rather than in git's exit codes.
     """
-    assert wc.lock_worktree(worktree, P("dirty")) is True
+    assert wc.lock_worktree(worktree, P("claim", pid=4242, start=99)) is True
 
     calls: list[tuple] = []
     real_git = wc._git
@@ -512,9 +392,9 @@ def test_an_existing_lock_is_not_even_offered_to_git(
         return real_git(root, *args)
 
     monkeypatch.setattr(wc, "_git", spy)
-    assert wc.lock_worktree(worktree, P("claim", pid=4242, start=1)) is False
+    assert wc.lock_worktree(worktree, P("claim", pid=9999, start=1)) is False
     assert calls == [], f"a second lock attempt shelled out to git: {calls}"
-    assert wc.read_lock(worktree).rule == "dirty"
+    assert wc.read_lock(worktree).rule == "claim"
 
 
 def test_a_foreign_lock_is_never_unlocked_by_us(repo: Path, worktree: Path) -> None:

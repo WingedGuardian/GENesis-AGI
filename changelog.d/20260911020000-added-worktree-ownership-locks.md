@@ -1,52 +1,30 @@
-- **Genesis now records which session is working in which worktree, instead of
-  guessing.** With many sessions sharing one repository, nothing said who held
-  what, so the daily cleanup could archive a worktree that still had another
-  session's unfinished work in it, and one session could edit another's files
-  without either noticing. Ownership is now written down when work is happening
-  there, using git's own "this worktree is in use" marker — which both the
-  cleanup job and git's own removal command already respect, so the protection
-  needs no new enforcement anywhere.
-- **The signal the previous guards relied on turned out not to exist.** Both of
-  them looked for a session whose working directory was inside the worktree, and
-  sessions change directory per command, so their working directory never leaves
-  the main checkout. Measured on a live install: none of 200 worktrees had a
-  session sitting in it, while seven sessions were running. Ownership is now
-  keyed on the session's process instead, recorded together with when that
-  process started, so a reused process number cannot be mistaken for the original
-  owner.
-- **Every ownership marker carries a condition under which it lifts**, and a
-  daily sweep applies it: the claiming session exiting, the worktree going quiet
-  for as long as the cleanup job already waits, uncommitted work being committed
-  or discarded. This is deliberate — a marker nobody can decide to remove would
-  stop the cleanup job permanently, so one that cannot be given a lifting
-  condition is never written in the first place. On the install this was
-  developed against the sweep marked 11 of 201 worktrees, leaving the other 190
-  untouched.
+- **Genesis now records which live session is using which worktree, instead of
+  guessing.** With many sessions sharing one repository, nothing said who was
+  where, so the daily cleanup could archive a worktree a session was still
+  working in — leaving that session broken and its unsaved work recoverable only
+  by hand. Ownership is now written down, using git's own "this worktree is in
+  use" marker, which the cleanup job already respects. Recording the fact is the
+  whole protection; nothing new enforces anything.
+- **Both signals the cleanup job had for "is anyone using this" turned out not to
+  work, and that is why this exists.** The first looked for a session whose
+  working directory was inside the worktree; sessions change directory per
+  command, so their working directory never leaves the main checkout — measured
+  as none of two hundred worktrees, while seven sessions were running. The second
+  asked how recently anything in the worktree changed, but only looked at the top
+  two levels of directories, and editing a file updates only that file. A
+  worktree whose source had just been edited still reported nineteen days idle
+  and eligible for cleanup; git could see the edit, the check could not. Nearly
+  all of this project's source sits below the level that check looks at, so this
+  was the ordinary case rather than an edge one.
+- **Exactly one thing is recorded: which live process is using the worktree.**
+  Whether there is unsaved work is deliberately NOT recorded — the cleanup job
+  can determine that itself, at the moment it decides, and does. Writing it down
+  in advance would mean checking it in one place and acting on it somewhere else,
+  and everything that had to be built to keep those two in agreement turned out
+  to be where the problems came from.
 - **A marker left by something else is reported, never touched.** A hand-written
-  one, or one belonging to another tool, is left exactly as found — and it is
-  identified by a marker specific enough that ordinary hand-written notes cannot
-  be mistaken for ours, so nothing we did not write can be cleared automatically.
-  If such a marker is still sitting on a worktree nothing has touched in weeks,
-  the sweep says so plainly, because that is the shape a crashed tool leaves
-  behind and it would otherwise keep that worktree out of the cleanup job's reach
-  forever.
-- **When a session's marker expires over work it never committed, protection is
-  handed over rather than dropped.** The cleanup job runs moments after the
-  sweep, in the same scheduled run, and restoring a cleaned-up worktree does not
-  bring back edits to tracked files. So a marker that lapses while uncommitted
-  work is still sitting there is replaced in the same pass by the "has
-  uncommitted work" marker, instead of leaving a gap measured in minutes.
-- **Turning the feature off from the settings interface now actually turns it
-  off.** Overrides made there are written to the user's own configuration
-  directory, which the daily sweep was not reading — so the setting reported
-  success, displayed correctly, and changed nothing.
-- **Worktrees created by the optional workflow runner get no special treatment,
-  and that is deliberate.** A dedicated rule for them was built and then removed
-  after testing it against a real run: the marker stopped that tool's own cleanup
-  from finishing, which meant the condition for lifting the marker — that tool
-  reporting the work finished — could never become true, and the worktree was
-  stuck until someone cleared it by hand. It turned out to protect nothing the
-  ordinary "has uncommitted work" rule did not already cover. Installs that do
-  not run that tool at all are unaffected either way; it is read only to report
-  how many of its environments are active, and a missing or damaged database
-  changes nothing.
+  one, or one belonging to another tool, is left exactly as found, and ours
+  carries an identifier specific enough that ordinary notes cannot be mistaken
+  for it. Claims are tied to a process and to when that process started, so a
+  recycled process number cannot be mistaken for the original owner, and a claim
+  that cannot be given a condition for lifting is never written at all.

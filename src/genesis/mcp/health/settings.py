@@ -300,18 +300,18 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="worktree_ownership",
         description=(
             "Worktree ownership — master `enabled` + `mode` advisory/off. Records "
-            "which session holds which worktree as a `git worktree lock` reason, "
-            "which the reaper and `git worktree remove` already honour. advisory "
-            "(default) runs the daily sweep: it locks worktrees holding "
-            "uncommitted tracked changes and releases every lock whose condition "
-            "has come true. off takes no locks and releases none. Nothing is ever "
-            "blocked. A `claim` is taken by the Edit/Write hook on a session's first "
-            "write into a worktree, and that hook also warns on stderr when a "
-            "session edits a worktree another live session holds. Read live per "
-            "call — takes effect immediately, no "
-            "restart. Env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces off. "
-            "Note off does not release locks already taken: run the sweeper once "
-            "with --release-only first."
+            "which LIVE SESSION is using which worktree, as a `git worktree lock` "
+            "reason the reaper already treats as protected. It replaces two "
+            "signals measured dead: /proc/*/cwd ownership (0 of 200 worktrees had "
+            "a process CWD inside them while 7 sessions ran) and mtime staleness "
+            "(the activity walk misses any edit deeper than two directory levels, "
+            "which is most of src/). advisory (default) claims a worktree on a "
+            "session's first write into it, warns on stderr when a session writes "
+            "into one another live session holds, and releases a claim once its "
+            "process is gone; off does none of that. Dirtiness is deliberately "
+            "NOT recorded here — the reaper computes it at decision time. Nothing "
+            "is ever blocked. Read live per call — takes effect immediately, no "
+            "restart. Env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces off."
         ),
         config_filename="worktree_ownership.yaml",
         readonly=False,
