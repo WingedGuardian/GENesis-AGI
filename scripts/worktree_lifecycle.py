@@ -1193,7 +1193,19 @@ def main() -> int:
 
     if args.report_json:
         results = classify_all(repo_root, allow_network=not args.no_network)
-        _write_board_cache(results)
+        # Publish ONLY a network-complete classification. --no-network skips the
+        # gh PR check, which can only ever demote a merged branch to "unmerged" —
+        # harmless for the caller who asked for it, corrosive as SHARED state.
+        # MEASURED on this install: the degraded run reported 42 at-risk where
+        # the complete one reported 11, so publishing it would have put 31
+        # false alarms into the session-start block and the dashboard, which
+        # cannot tell a degraded board from a current one.
+        if args.no_network:
+            _log("NOTE --no-network: printing only; the shared board cache is "
+                 "left as it was (a degraded classification must not become the "
+                 "board other surfaces read).")
+        else:
+            _write_board_cache(results)
         print(json.dumps(results, indent=2))
         return 0
 
@@ -1205,7 +1217,7 @@ def main() -> int:
     # Publish BEFORE acting: if a reap below fails partway, the board still
     # describes the tree the run actually saw. NOT under --dry-run, whose whole
     # contract is that it changes nothing on disk.
-    if not args.dry_run:
+    if not args.dry_run and not args.no_network:
         _write_board_cache(results)
 
     # The classification above is the ONLY place a fate is decided; this loop
@@ -1234,7 +1246,7 @@ def main() -> int:
     # worktrees that were archived seconds later and no longer exist. Reclassifying
     # would cost another full scan, so the acted-on rows are simply retired in
     # place — which is exactly what the dashboard needs to stop showing ghosts.
-    if not args.dry_run:
+    if not args.dry_run and not args.no_network:
         for r in results:
             if r["action"] != "none" and not Path(r["path"]).exists():
                 r["state"] = "archived"

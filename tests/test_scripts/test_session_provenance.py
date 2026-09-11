@@ -264,3 +264,55 @@ def test_scan_distinguishes_git_failure_from_an_empty_range(repo):
     assert sp.scan("main", limit=1) != []          # real content
     assert sp.scan("main..main") == []             # empty range, git succeeded
     assert sp.scan("definitely-not-a-ref") is None  # git failed
+
+
+# ─── the two fail-open paths an external reviewer found ──────────────────────
+
+
+def test_a_pr_outside_the_scan_window_is_not_reported_as_open(repo, monkeypatch, capsys):
+    """The scan is BOUNDED, so "not found" can mean "older than the window".
+
+    Concluding OPEN from our own bound is the same fail-open shape as concluding
+    it from a git failure, one level subtler: here the scan SUCCEEDED and was
+    merely too short. A merged PR reported as open is a confident wrong answer.
+    """
+    monkeypatch.setattr(sp, "_pr_state_and_head", lambda n: ("MERGED", "feat/x"))
+    rc = sp.cmd_pr(999999)
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert "OPEN" not in out
+    assert "outside the" in err and "scan window" in err
+
+
+def test_an_open_pr_outside_the_window_still_resolves_via_its_branch(repo, monkeypatch, capsys):
+    """The fix must not break the case it was built for."""
+    _commit(repo, "a.txt", "feat: base\n\nGenesis-Session: 11111111\n")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 22222222\n")
+    monkeypatch.setattr(sp, "_pr_state_and_head", lambda n: ("OPEN", "feature"))
+    rc = sp.cmd_pr(4242)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "22222222" in out
+
+
+def test_an_unreadable_branch_makes_the_session_report_incomplete(repo, monkeypatch, capsys):
+    """A failed branch scan is not an empty one.
+
+    Swallowing it reports a SHORTER list of unlanded work than exists — the
+    wrong direction for a tool whose whole job is finding work that got lost.
+    """
+    _commit(repo, "a.txt", "feat: base\n\nGenesis-Session: 11111111\n")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 11111111\n")
+
+    real = sp.scan
+
+    def _fail_branch_scans(rev_range, limit=None):
+        return None if ".." in rev_range else real(rev_range, limit)
+
+    monkeypatch.setattr(sp, "scan", _fail_branch_scans)
+    rc = sp.cmd_session("11111111", 50)
+    err = capsys.readouterr().err
+    assert rc == 1, "an incomplete answer must not exit 0"
+    assert "INCOMPLETE" in err

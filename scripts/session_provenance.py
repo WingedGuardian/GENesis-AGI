@@ -249,9 +249,20 @@ def cmd_pr(number: int) -> int:
         _print_sessions(c["sessions"])
         return 0
 
-    # Not on main. It may be open, in which case the answer is on the branch —
-    # the case that matters, since an open PR is the one someone is asking about.
-    head = _pr_head_ref(number)
+    # Not found in the scanned window. That is NOT evidence the PR is open: the
+    # scan is bounded at _PR_SEARCH_LIMIT, so an older merge simply falls outside
+    # it. Ask GitHub for the state rather than inferring it from our own bound —
+    # the same fail-open shape as the git-failure case above, one level subtler
+    # because here the scan SUCCEEDED and was merely too short.
+    state, head = _pr_state_and_head(number)
+    if state == "MERGED":
+        print(
+            f"PR #{number} — MERGED, but its merge commit is outside the "
+            f"{_PR_SEARCH_LIMIT}-commit scan window. Re-run with a larger "
+            f"--limit to attribute it.",
+            file=sys.stderr,
+        )
+        return 1
     if not head:
         print(
             f"PR #{number}: no merge commit on main, and gh could not name its "
@@ -264,20 +275,28 @@ def cmd_pr(number: int) -> int:
     return cmd_branch(head, header=False)
 
 
-def _pr_head_ref(number: int) -> str:
+def _pr_state_and_head(number: int) -> tuple[str, str]:
+    """``(state, headRefName)`` for a PR, or ``("", "")`` when gh cannot say.
+
+    State is fetched alongside the head ref so a caller never has to INFER
+    "merged" or "open" from whether its own bounded scan happened to reach the
+    merge commit. That inference is wrong whenever the PR is older than the
+    window, and wrong in the confident direction.
+    """
     try:
         r = subprocess.run(
-            ["gh", "pr", "view", str(number), "--json", "headRefName"],
+            ["gh", "pr", "view", str(number), "--json", "headRefName,state"],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
             timeout=30,
         )
         if r.returncode == 0:
-            return json.loads(r.stdout).get("headRefName", "")
+            d = json.loads(r.stdout)
+            return str(d.get("state") or ""), str(d.get("headRefName") or "")
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, OSError):
         pass
-    return ""
+    return "", ""
 
 
 def cmd_branch(branch: str, header: bool = True) -> int:
@@ -343,11 +362,18 @@ def cmd_session(session_id: str, limit: int) -> int:
         print(f"  {c['short']}  {c['date']}  {pr:>6}  {c['subject'][:64]}")
 
     live: list[tuple[str, int]] = []
+    incomplete: list[str] = []
     for line in _git("for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
         b = line.strip()
         if not b or b == "main":
             continue
-        branch_commits = scan(f"main..{b}") or []
+        branch_commits = scan(f"main..{b}")
+        if branch_commits is None:
+            # A failed branch scan is not an empty one. Swallowing it here would
+            # report a SHORTER list of unlanded work than actually exists, which
+            # is the wrong direction for a tool whose job is finding lost work.
+            incomplete.append(b)
+            continue
         n = sum(1 for c in branch_commits if session_id in c["sessions"])
         if n:
             live.append((b, n))
@@ -355,6 +381,14 @@ def cmd_session(session_id: str, limit: int) -> int:
         print(f"\nunlanded branches carrying this session: {len(live)}")
         for b, n in sorted(live, key=lambda x: -x[1]):
             print(f"  {n:>3} commit(s)  {b}")
+    if incomplete:
+        print(
+            f"\nwarning: {len(incomplete)} branch(es) could not be read, so the "
+            f"list above is INCOMPLETE: {', '.join(incomplete[:5])}"
+            + (" ..." if len(incomplete) > 5 else ""),
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

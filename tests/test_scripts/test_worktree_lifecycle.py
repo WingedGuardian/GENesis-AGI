@@ -838,3 +838,32 @@ def test_a_worktree_that_becomes_active_mid_run_is_not_reaped(
         "a worktree that became busy after classification must be left alone"
     )
     assert not list(trash.glob("wt_branch_merged-*")), "and nothing of it stored"
+
+
+def test_no_network_never_publishes_the_shared_board(reaper_repo, tmp_path, monkeypatch):
+    """A degraded classification must not become the board other surfaces read.
+
+    --no-network skips the gh PR check, which can only demote a merged branch to
+    "unmerged". Harmless for the caller who asked for it; corrosive as SHARED
+    state, because neither the session-start block nor the dashboard can tell a
+    degraded board from a current one. MEASURED on the real tree: the degraded
+    run reported 42 at-risk where the complete one reported 11.
+    """
+    cache = tmp_path / "board.json"
+    monkeypatch.setattr(wl, "BOARD_CACHE", cache)
+    _run_main(
+        monkeypatch, reaper_repo.repo, tmp_path / "trash",
+        argv=("worktree_lifecycle.py", "--report-json", "--no-network"),
+    )
+    assert not cache.exists(), "--no-network must leave the shared board alone"
+
+
+def test_a_network_complete_report_does_publish(reaper_repo, tmp_path, monkeypatch):
+    """The negative control — otherwise the test above passes on a broken writer."""
+    cache = tmp_path / "board.json"
+    monkeypatch.setattr(wl, "BOARD_CACHE", cache)
+    _run_main(
+        monkeypatch, reaper_repo.repo, tmp_path / "trash",
+        argv=("worktree_lifecycle.py", "--report-json"),
+    )
+    assert cache.exists(), "a complete classification SHOULD be published"
