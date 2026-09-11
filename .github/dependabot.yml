@@ -5,7 +5,8 @@
 # fastmcp <3 for API stability, transitive secure floors) that automatic
 # version-update PRs would fight. GitHub's Dependabot *security* alerts are
 # already enabled for the repo and cover the pip CVE side; the pip-audit CI job
-# gates the resolved tree per-PR. So dependabot only keeps the Actions current.
+# reports on the resolved tree per-PR without blocking on audit findings.
+# Dependabot version updates here only keep the Actions current.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
