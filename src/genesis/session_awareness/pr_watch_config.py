@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_NAME = "pr_watch.yaml"
 
+#: Hard ceiling on `max_surface`, shared by the hook that CLAMPS to it and the
+#: settings validator that REJECTS above it. They were separate before: the
+#: validator accepted any positive int while the hook silently applied 20, so
+#: a config of 50 was accepted, reported back as 50, and had no effect. A
+#: settings surface that lies about what it accepted is worse than one that
+#: refuses -- the operator has no way to notice. One constant, two consumers,
+#: so they cannot drift apart again.
+MAX_SURFACE_CAP = 20
+
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     # How far back to look for steward notifications to (re)surface. Bounds the

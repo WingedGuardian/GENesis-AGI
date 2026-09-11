@@ -72,7 +72,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: f9555d2e 2026-09-09
+verified: cd784816 2026-09-09
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -222,9 +222,28 @@ committed by ANOTHER process is observed — previously the server served a
 projection predating any dream-job write until it happened to write a link
 itself. The token is stamped BEFORE the load on purpose: in WAL the read
 snapshot is fixed at the first SELECT step, so stamping afterwards can pin a
-projection that is missing a mid-load commit (MEASURED 2026-09-06). Prepared for
-the graph-DB adoption (issue #1641), where a server-backed engine becomes
-another `GraphStore` with no reader touched.
+projection that is missing a mid-load commit (MEASURED 2026-09-06). That preparation is now
+used: `graphstore_falkor.FalkorGraphStore` is the second implementation, a
+long-lived FalkorDB server reached over a unix socket, selected by
+`config/graphstore.yaml` (`mode: networkx|falkordb`, default **networkx**, so
+the lever is inert until moved). It carries its own projection of
+`memory_links` and applies the SAME visibility predicate — but at QUERY time,
+over mirrored `invalid_epoch`/`deprecated` node properties, which closes the
+future-`invalid_at` gap the NetworkX store states below. That closes the TIME
+half only, and the other half runs the other way: `deprecated` is a
+projection-time snapshot, so a memory deprecated after the last projection stays
+visible here until the next one, where NetworkX hides it on its next rebuild.
+Fresher on elapsed time, staler on every write — the write half bounded only by
+how often the projector runs. Traversal follows the
+lever and degrades falkordb → networkx → CTE; **centrality does NOT follow it**
+and is pinned to NetworkX, because FalkorDB cannot compute betweenness and
+`centrality_scores` has no fallback by design, so routing it through the lever
+would turn a mode flip into a silent shutdown of the importance shield.
+Three dialect facts were MEASURED against the live engine rather than read from
+docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
+engine has NO temporal types despite its own documentation listing them, and a
+loading engine answers `BusyLoadingError` — which is unavailable, never empty.
+Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -656,6 +675,54 @@ verified: 5808e7cd 2026-09-03
   the `approval_requests` row FIRST, then `pending_email_sends`; the
   `email_gate_watcher` job (every 5 min, learning scheduler) drains approved
   sends.
+- **Desktop takeover is gated before it exists** (`autonomy/desktop_gate.py`,
+  GROUNDWORK — no caller; the actuator is inert and the loop lands later).
+  Authority is per SESSION, not standing: an approved, unconsumed
+  `approval_requests` row (`desktop_takeover_gate`) carrying the session id AND
+  `context.kind == desktop_session_grant` (holds share the action_type, so
+  without the kind bar approving one held action would grant the whole
+  session), resolved through `DESKTOP_GRANT_RESOLVER_PREFIXES` — deliberately
+  NARROWER than `classify_resolver`'s human class, because `dashboard` is
+  stamped by a route any local process can reach with the internal token and
+  `user` is merely a default; neither proves a person acted. Bounded both ways
+  against a config TTL (a future-dated resolution would otherwise never
+  expire). SCOPE, stated because the obvious reading is stronger: that bar
+  closes the APP-LAYER path — no Genesis component using the sanctioned
+  approval APIs can mint itself desktop authority — but it does not make a
+  grant unforgeable, since `resolved_by` is a column and `genesis.db` is
+  writable by the uid every Genesis process runs as. That is a property of the
+  whole approval substrate, not of this gate, and closing it needs provenance
+  SQL cannot express. Screen-supplied text (window title, element name) is
+  passed through `strip_control_chars` and bounded before it reaches the
+  approval description a human reads, so a hostile window cannot forge lines or
+  reorder what is displayed away from what is approved. Desktop rows are also withheld from the generic dashboard approvals
+  queue, which renders every row as a CLI-fallback card, and refused by
+  `resolve_request` — the funnel for the per-item Approve button, Telegram
+  `cli_approve`, and the `cli_approve_all` button's own trigger row, which
+  resolves directly and so sidesteps the batch sweep's exclusion.
+  Classification reads the RESOLVED
+  TARGET from the accessibility tree, never the acting model's prose about its
+  own intent — and IDENTITY reads the control (window + element + type) rather
+  than the typed text, so ordinary typing is not held; only FINANCIAL also
+  reads text, because a card number is dangerous as content. A password field
+  is a REFUSAL with no approval path (matched on the target alone, so a window
+  named "Password Manager" does not make its controls unreachable); above
+  STANDARD holds per action; STANDARD under a live grant allows with an
+  `expires_at` the device re-checks and an audit log line + event, the one
+  outcome that actually acts. In `shadow` the gate classifies, records the cell
+  and logs the full verdict INCLUDING a missing grant — the state a shadow
+  install is actually in — then refuses, creating no approval row. A hold
+  queues NOTHING — there is no pending
+  table and no drain, because a held desktop action aims at a screen that has
+  moved, so every action executes against an observation taken after the last
+  approval. The capability cell (`desktop:control:*`) can DENY permanently but
+  can never GRANT: `desktop` is absent from `PROMOTABLE_DOMAINS`. Arming needs
+  BOTH `mode: live` and `live_opt_in: true` in
+  `config/desktop_takeover.yaml` (default `shadow`; env kill
+  `GENESIS_DESKTOP_TAKEOVER_DISABLED`), and the domain is deliberately absent
+  from the settings MCP so arming cannot happen through one API call. Excluded
+  from `approve_all_pending` and outside `_VOICE_GATED_TYPES`, so neither a
+  batch tap nor a bare spoken "approve" can hand over the keyboard.
 - **Discord is shadow-gated** (`autonomy/shadow_gate.py`): three doors —
   `pipeline._deliver`, `outreach_poll` webhook, discord-bot `send_reply` —
   observe-only into `capability_shadow`, best-effort so it can NEVER break the

@@ -58,7 +58,7 @@ LOG_DIR = HOME / ".genesis" / "logs"
 
 # Timeouts — each justified by a concrete failure mode, not "defense in depth":
 #   fsck --full recomputes SHA-1 over the whole object store; measured ~6s on the
-#   ~82MB .123 store, 3600s = ~600x headroom for a scarred pool under IO stress.
+#   ~82MB store of a live install, 3600s = ~600x headroom for a scarred pool under IO stress.
 #   --refetch re-downloads full history (~100MB); 1800s covers a slow link.
 #   ls-remote is a single network round-trip; 60s catches a dead origin fast.
 _FSCK_TIMEOUT_S = 3600
