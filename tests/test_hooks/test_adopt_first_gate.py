@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -88,10 +89,47 @@ def _plan_payload(path: Path) -> dict:
     }
 
 
+@pytest.mark.parametrize("mode", ["--plan", "--new-file"])
+def test_settings_launches_each_mode(mode: str, home: Path, repo: Path):
+    root = _HOOK.parents[2]
+    # CI installs Python globally; give the real launcher its install layout
+    # without depending on a developer checkout's .venv or main worktree.
+    (repo / ".claude/hooks").mkdir(parents=True)
+    shutil.copy2(root / ".claude/hooks/genesis-hook", repo / ".claude/hooks/genesis-hook")
+    (repo / "scripts").symlink_to(root / "scripts", target_is_directory=True)
+    (repo / ".venv/bin").mkdir(parents=True)
+    (repo / ".venv/bin/python").symlink_to(sys.executable)
+    settings = json.loads((root / ".claude/settings.json").read_text())
+    commands = [
+        hook["command"]
+        for entry in settings["hooks"]["PreToolUse"]
+        for hook in entry.get("hooks", [])
+        if "adopt_first_gate.py" in hook.get("command", "") and hook["command"].endswith(mode)
+    ]
+    assert len(commands) == 1
+    plan = _plan(home, "Create src/genesis/new_capability.py")
+    payload = {"cwd": str(repo), **_plan_payload(plan)}
+    if mode == "--new-file":
+        payload = {"cwd": str(repo), "tool_input": {"file_path": str(repo / "src/genesis/new.py")}}
+    result = subprocess.run(
+        ["bash", "-c", commands[0]],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "CLAUDE_PROJECT_DIR": str(repo)},
+    )
+    if mode == "--plan":
+        assert result.returncode == 2, result.stderr
+        assert "BLOCKED (adopt-first)" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "New module:" in json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
 # ── the plan gate ────────────────────────────────────────────────────────────
 
 
-def test_the_acceptance_bar_replay_the_real_defect(home: Path):
+def test_the_acceptance_bar_replay_the_real_defect(home: Path, repo: Path):
     """THE case this gate is made of, reconstructed.
 
     2026-09-09: a plan proposing `src/genesis/autonomy/desktop_gate.py` was
@@ -105,7 +143,7 @@ def test_the_acceptance_bar_replay_the_real_defect(home: Path):
         "Build the gate in `src/genesis/autonomy/desktop_gate.py`, with the\n"
         "classifier in `src/genesis/autonomy/classification.py`.\n",
     )
-    r = _run("--plan", _plan_payload(p), home)
+    r = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
     assert r.returncode == 2, r.stdout
     assert "adopt-first" in r.stderr
     assert "desktop_gate.py" in r.stderr, "name the files, so the block is checkable"
