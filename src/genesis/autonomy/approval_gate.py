@@ -506,13 +506,24 @@ class AutonomousCliApprovalGate:
 
         - WS-8 email capability-gate holds (each held email is one send).
         - Contributor Work-Log issue holds (each is one public-repo post).
+        - Desktop-takeover holds AND session grants. This one is the sharpest:
+          the sweep has no action-type allowlist, so without the exclusion a
+          single "Approve all" tap — from the dashboard button or Telegram
+          ``cli_approve_all`` — would hand Genesis control of the operator's
+          keyboard and mouse alongside whatever the owner actually meant to
+          approve. Desktop authority is never granted in a batch.
         """
         from genesis.autonomy.contributor_worklog_config import (
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
         )
+        from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
 
-        excluded = {EMAIL_GATE_ACTION_TYPE, CONTRIBUTOR_ISSUE_ACTION_TYPE}
+        excluded = {
+            EMAIL_GATE_ACTION_TYPE,
+            CONTRIBUTOR_ISSUE_ACTION_TYPE,
+            DESKTOP_GATE_ACTION_TYPE,
+        }
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
@@ -528,6 +539,28 @@ class AutonomousCliApprovalGate:
     async def resolve_request(
         self, request_id: str, *, decision: str, resolved_by: str,
     ) -> bool:
+        """Resolve one named approval — the generic per-item path.
+
+        Desktop-takeover rows are REFUSED here. This is the funnel for the
+        dashboard's per-item Approve button, Telegram ``cli_approve``, and the
+        ``cli_approve_all`` button's own trigger row — that last one resolves
+        directly, sidestepping ``approve_all_pending``'s exclusion set, so the
+        exclusion has to exist at both. Handing over the operator's keyboard
+        must come from the purpose-built consent path that names the target
+        window back to them, never from a generic "approve this id" button
+        whose card cannot say what it is granting.
+        """
+        from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
+
+        row = await self.get_request(request_id)
+        if row is not None and row.get("action_type") == DESKTOP_GATE_ACTION_TYPE:
+            logger.warning(
+                "Refusing to resolve desktop-takeover approval %s via the generic "
+                "per-item path (%s) — desktop consent has its own surface",
+                request_id,
+                resolved_by,
+            )
+            return False
         return await self._approval_manager.resolve(
             request_id, status=decision, resolved_by=resolved_by,
         )
