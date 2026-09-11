@@ -8,7 +8,11 @@ yesterday's. Also runnable by hand.
 The sweep does exactly two things, and the second matters more than the first:
 
   TAKE     lock a worktree holding uncommitted tracked work (`dirty`).
-  RELEASE  drop every lock whose release condition has come true.
+  RELEASE  drop every lock whose release condition has come true -- EXCEPT a
+           claim still sitting on uncommitted tracked work, which is handed off
+           to the `dirty` rule instead. The reaper runs next in the same script
+           and does not restore tracked modifications, so a plain release there
+           is a data-loss window measured in minutes, not days.
 
 Releasing is the half that keeps this from becoming a blanket lock. A lock with
 no release condition stops the reaper permanently, and 200 of those would quietly
@@ -69,8 +73,15 @@ def _log(msg: str) -> None:
 def _decide(root: Path, lock: wc.Lock | None, *, now: float) -> tuple[str, str]:
     """What should happen to this worktree: ``(action, reason)``.
 
-    ``action`` is one of ``take-dirty``, ``release``, ``keep``, ``foreign``,
-    ``foreign-stale`` or ``none``.
+    ``action`` is one of ``take-dirty``, ``retake-dirty``, ``release``,
+    ``keep``, ``foreign``, ``foreign-stale`` or ``none``.
+
+    ``retake-dirty`` is a HANDOFF: a claim whose release condition has come true
+    over a worktree that still holds uncommitted tracked work. Releasing it
+    outright would leave that work bare for the reaper, which runs from the same
+    disk_hygiene.sh invocation minutes later and does not restore tracked
+    modifications -- so the protection transfers to the `dirty` rule in the same
+    pass rather than lapsing until tomorrow.
     """
     try:
         idle = now - _last_activity_time(str(root))
@@ -99,6 +110,16 @@ def _decide(root: Path, lock: wc.Lock | None, *, now: float) -> tuple[str, str]:
             idle_seconds=idle,
             stale_seconds=STALE_DAYS * 86400,
         )
+        if releasable and wc.has_tracked_changes(root):
+            # HANDING OFF, NOT RELEASING. A claim goes releasable when its
+            # session exits or the worktree goes idle -- neither of which says
+            # anything about whether uncommitted work is still sitting there.
+            # Plainly unlocking would leave that work bare for the reaper, which
+            # runs from disk_hygiene.sh MINUTES after this sweep, and
+            # `_restore_from_dir` reconstructs untracked files only: tracked
+            # modifications do not come back. So the protection transfers to the
+            # `dirty` rule in the same pass rather than lapsing until tomorrow's.
+            return "retake-dirty", f"{why}, but uncommitted tracked changes remain"
         return ("release" if releasable else "keep"), why
 
     # An Archon worktree is NOT a special case here, and that is a decision with
@@ -154,7 +175,27 @@ def main() -> int:
             _log(f"  [{state:>8}] {root.name}: {why}")
             continue
 
-        if action == "release" and not args.take_only:
+        if action == "retake-dirty":
+            # Both halves or neither. `--take-only` must not release, and
+            # `--release-only` must not leave dirty work bare -- so in either
+            # single-sided mode the safe answer is to leave the claim standing.
+            if args.take_only or args.release_only:
+                _log(f"  KEPT {root.name}: {why} (single-sided sweep; handoff needs both)")
+                continue
+            if args.dry_run:
+                _log(f"  WOULD HAND OFF {root.name} claim -> dirty: {why}")
+                continue
+            payload = wc.build_payload(wc.RULE_DIRTY)
+            if payload is None or not wc.unlock_worktree(root):
+                _log(f"  handoff FAILED {root.name}, claim left in place: {why}")
+                continue
+            if wc.lock_worktree(root, payload):
+                _log(f"  HANDED OFF {root.name} claim -> dirty: {why}")
+            else:
+                # Unlocked but could not re-lock: say so loudly. The worktree is
+                # now unprotected and the reaper runs next in this same script.
+                _log(f"  *** {root.name} UNLOCKED but re-lock FAILED — now unprotected: {why}")
+        elif action == "release" and not args.take_only:
             if args.dry_run:
                 _log(f"  WOULD RELEASE {root.name}: {why}")
             elif wc.unlock_worktree(root):
