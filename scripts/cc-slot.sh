@@ -49,6 +49,41 @@ shift
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
 
+# Liveness verdict for the cosmetic slot map: ALIVE | POISONED | UNKNOWN |
+# TIMEOUT (empty on any failure). The map is purely informational and runs once
+# per listed slot on the interactive login path, so it must never be what makes
+# a login feel slow. Two budgets bound it: a short per-probe leash and a
+# WHOLE-MAP wall-clock ceiling. Defined here — above the manual-mode map that is
+# its only caller — because bash resolves a function only once its definition has
+# RUN; GENESIS_ROOT is set above. An unavailable probe prints nothing, and the
+# caller treats that as "no verdict".
+_MAP_PROBE_BUDGET=3
+_MAP_PROBE_GAVE_UP=0
+# A WHOLE-MAP wall-clock ceiling, not a per-probe one: N slots that each finish
+# just under the per-probe budget would otherwise delay a login by N x budget.
+# `SECONDS` is inherited by the `$(...)` subshell the probe runs in, so an
+# ABSOLUTE deadline is readable there even though a variable set inside it can
+# never travel back out.
+_MAP_TOTAL_BUDGET=6
+_MAP_DEADLINE=0
+_map_verdict() {
+    local out="" rc=0
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
+    [ "$_MAP_PROBE_GAVE_UP" = "1" ] && { printf '%s' ""; return 0; }
+    local _budget="$_MAP_PROBE_BUDGET" _rem
+    if [ "$_MAP_DEADLINE" -gt 0 ]; then
+        _rem=$(( _MAP_DEADLINE - SECONDS ))
+        # The map is COSMETIC; it must never be what makes a login feel slow.
+        [ "$_rem" -le 0 ] && { printf '%s' "TIMEOUT"; return 0; }
+        [ "$_rem" -lt "$_budget" ] && _budget="$_rem"
+    fi
+    out=$(timeout "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
+    # 124 is timeout(1)'s "deadline expired".
+    [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
+    printf '%s' "$out"
+}
+
 if [[ "$MODE_ARG" == "manual" ]]; then
     # Manual/dashboard door. Show what already exists so reattach is the
     # visible easy path, then take the lowest slot with no live session.
@@ -59,10 +94,71 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
     if [[ -n "$slot_map" ]]; then
         echo "Existing slots (reattach: tmux attach -t <name>):" >&2
+        # Arm the whole-map deadline HERE, immediately before the only loop that
+        # probes: every probe below shares it, so the map costs at most
+        # _MAP_TOTAL_BUDGET no matter how many slots exist.
+        _MAP_DEADLINE=$(( SECONDS + _MAP_TOTAL_BUDGET ))
         while IFS='|' read -r name attached activity; do
             state="detached"
             [[ "$attached" -ge 1 ]] && state="attached"
-            echo "  ${name}  ${state}  (last activity: ${activity})" >&2
+            # Say when a slot is alive but running NO claude, AND name an action
+            # that actually rebuilds it. Since the hostname door gained the
+            # consented kill-and-recreate below, re-entering THROUGH THE DOOR is
+            # that action: it detects the bare slot, discloses what it found,
+            # and rebuilds the pane with the slot's full environment on a yes.
+            # (This advice was deliberately DIFFERENT while the door could not
+            # heal — pointing at a door that silently re-attaches to the bare
+            # shell would loop the operator to the same prompt, which is the
+            # defect the whole slot-door effort exists to close.) One probe per
+            # listed slot; anything other than an explicit POISONED prints
+            # nothing, so an unavailable probe never renders as a verdict.
+            note=""
+            # `|| true` is load-bearing: under `set -euo pipefail` a
+            # `var=$(tmux ... | tr ...)` whose FIRST component fails takes the
+            # whole door down with no message (pipefail promotes it past `tr`,
+            # `set -e` exits). A listed session going away before it is inspected
+            # is ordinary — the tmux server shuts down the moment the last slot's
+            # claude exits, and `list-panes` on a missing session exits 1 — and on
+            # the manual door that would drop the operator at a bare prompt.
+            # BOUNDED, and charged to the SAME whole-map deadline as the probe
+            # below. A budget that covers only the probe is not a budget: this
+            # `list-panes` is a blocking round-trip to the tmux server, runs once
+            # per listed slot on the interactive login path, and a wedged server
+            # would hang the login here — before the launch — in a feature this
+            # code calls COSMETIC.
+            # Once the budget is SPENT, stop calling tmux altogether — do not
+            # substitute a shorter timeout. Every remaining slot would otherwise
+            # still pay a fresh round-trip (plus the -k grace), so the "whole-map
+            # ceiling" would not be a ceiling at all; it would just be a slower
+            # per-slot one. Skipping is also less code than the arithmetic it
+            # replaces, and it is bounded BY CONSTRUCTION: after exhaustion the
+            # loop makes zero further calls, so the map costs at most the budget
+            # plus the one call that overran it.
+            _map_v=""
+            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
+                _map_t="$_MAP_PROBE_BUDGET"
+                if [ "$_MAP_DEADLINE" -gt 0 ]; then
+                    _map_rem=$(( _MAP_DEADLINE - SECONDS ))
+                    if [ "$_map_rem" -le 0 ]; then
+                        _MAP_PROBE_GAVE_UP=1
+                    elif [ "$_map_rem" -lt "$_map_t" ]; then
+                        _map_t="$_map_rem"
+                    fi
+                fi
+            fi
+            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
+                # `-k` because timeout sends SIGTERM and then WAITS, which a
+                # process stuck in uninterruptible I/O outlives.
+                _map_pids=$(timeout -k 2 "$_map_t" tmux list-panes -s -t "=${name}" \
+                    -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+                [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
+            fi
+            # Set in the LOOP's shell, not inside the substitution above.
+            [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
+            if [[ "$_map_v" == "POISONED" ]]; then
+                note="  (no claude running — re-enter through this slot's door to rebuild it)"
+            fi
+            echo "  ${name}  ${state}  (last activity: ${activity})${note}" >&2
         done <<<"$slot_map"
     fi
     SLOT=1
@@ -337,6 +433,137 @@ _cap_fail_open() {
     _cap_list_slots
     exit 1
 }
+
+
+# ═══ Consent kill-and-recreate ═══════════════════════════════════════════════
+# A slot can exist as a BARE SHELL (its claude exited, or it was born bare) and
+# `new-session -A` below would silently attach to it, discarding the launch
+# command — the operator lands at a prompt instead of claude, every time, which
+# is the founding defect of the slot-door work. This block detects that state,
+# DISCLOSES it, and — only on an explicit yes at a real terminal — kills the
+# session BY ID so the untouched create path below rebuilds it properly.
+#
+# Placed ABOVE every latch and gate ON PURPOSE: `existing`, `_SESSION_EXISTS`,
+# the capacity gate, the OAuth gate and the exec all take their first and only
+# read AFTER this block, so no precondition is ever read before the destructive
+# action — the staleness class that killed the predecessor design (7 review
+# rounds) is retired by construction, not by re-checking.
+#
+# Manual/dashboard mode reaches here too but allocated a slot with NO existing
+# session, so the has-session guard makes this a structural no-op there — only
+# the hostname door (which targets a FIXED name) can meet an existing session.
+#
+# Safety rests on three MEASURED properties (tmux 3.4, scratch -L server):
+#   1. Within one server, session ids are never reused ($1 killed, recreate ->
+#      $2), and killing a stale id is a refused no-op that cannot touch a
+#      same-named successor — kill-by-id is a compare-and-swap.
+#   2. Across server GENERATIONS the id counter restarts at $0 — measured by
+#      falsifying the naive design: a stale $0 on a fresh server killed an
+#      innocent same-named session. The server-PID compare below is what makes
+#      that impossible here, and it is load-bearing, not belt-and-braces.
+#   3. One `list-panes -s` call is one round-trip to the single-threaded
+#      server = one consistent state. The human wait sits BETWEEN two such
+#      snapshots, never between a read and the kill.
+_S2_SNAP_FMT='#{pid}|#{session_id}|#{session_attached}|#{pane_pid}|#{pane_current_command}'
+_s2_snapshot() {
+    # Bounded like the slot-map probe and for the same reason: a blocking
+    # round-trip to a possibly-wedged server on the LOGIN path. `-k` because
+    # timeout SIGTERMs and then waits, which uninterruptible I/O outlives.
+    timeout -k 2 3 tmux list-panes -s -t "=${SESSION_NAME}" -F "$_S2_SNAP_FMT" 2>/dev/null || true
+    return 0
+}
+_s2_liveness() {
+    # slot_liveness verdict over a snapshot's pane pids; EMPTY on any failure —
+    # and empty is treated as "no verdict", which attaches. Fail toward attach.
+    #
+    # The 5s bound (vs the cosmetic map's 3s) names a specific failure mode: the
+    # probe walks /proc reading comm/cmdline, and a process wedged in
+    # uninterruptible I/O can stall that read — on the LOGIN path, before the
+    # launch. It is deliberately LONGER than the map's because a premature empty
+    # here costs a real capability (the operator loses the rebuild offer and
+    # lands back at the bare prompt), where the map only loses an annotation.
+    # It is bounded at all because the fail direction is safe: timing out yields
+    # "" -> no verdict -> attach, never a kill. NOT a reflexive default — a
+    # /proc walk over a handful of pids returns in milliseconds, so reaching 5s
+    # at all means something is genuinely stuck.
+    local _pids
+    _pids=$(printf '%s\n' "$1" | cut -d'|' -f4 | tr '\n' ' ') || true
+    [ -n "${_pids// /}" ] || { return 0; }
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { return 0; }
+    timeout 5 "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness $_pids 2>/dev/null | sed -n '1p' || true
+    return 0
+}
+if tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
+    _s2_snap1=$(_s2_snapshot)
+    _s2_verdict=$(_s2_liveness "$_s2_snap1")
+    _s2_srv1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f1)
+    _s2_sid1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f2)
+    # Only the literal verdict POISONED plus a sane `$N` session id may enter;
+    # ALIVE, UNKNOWN, empty, garbage, or a malformed id all mean plain attach.
+    # ANCHORED: a tmux session id is `$` followed by digits and NOTHING else.
+    # The obvious `case "$sid" in '$'[0-9]*)` is too loose — its trailing `*`
+    # also accepts a value with a semicolon and a command after the digit. Not
+    # exploitable (the value is quoted into `kill-session -t`, so there is no
+    # shell injection, and tmux would simply not match such a target), but a
+    # value we cannot fully account for must never reach the kill: this block's
+    # whole contract is that anything unrecognised falls through to attach.
+    _s2_sid_ok=0
+    [[ "$_s2_sid1" =~ ^\$[0-9]+$ ]] && _s2_sid_ok=1
+    if [ "$_s2_verdict" = "POISONED" ] && [ "$_s2_sid_ok" = "1" ]; then
+        # Detect-and-tell FIRST, so a decliner (or a no-tty entry) keeps the
+        # facts and the manual repair even though nothing is touched.
+        _s2_cmds=$(printf '%s\n' "$_s2_snap1" | cut -d'|' -f5 | sort -u | tr '\n' ' ') || true
+        echo "cc-slot: ${SESSION_NAME} exists but runs NO claude (pane: ${_s2_cmds:-unknown})." >&2
+        echo "cc-slot: rebuilding it ends whatever is in that pane; manual route: tmux attach -t ${SESSION_NAME}, then run claude yourself." >&2
+        if printf '%s\n' "$_s2_snap1" | cut -d'|' -f3 | grep -q '[1-9]'; then
+            echo "cc-slot: WARNING: another client is ATTACHED to it right now." >&2
+        fi
+        # No controlling terminal -> report-only (a dispatched/piped entry has
+        # nobody to consent). The subshell probe is the measured no-ctty shape.
+        if ( : >/dev/tty ) 2>/dev/null; then
+            printf 'cc-slot: rebuild %s now? This ENDS whatever is in that pane [y/N] ' "${SESSION_NAME}" >&2
+            _s2_ans=""
+            # Bounded read — a DELIBERATE divergence from _cap_reclaim's
+            # unbounded confirms: an automated caller that reaches this door
+            # WITH a tty but no operator would otherwise hang the login here
+            # forever; 120s converts that hang into a plain attach. A missed
+            # prompt costs one more login, never a kill (default is No).
+            IFS= read -r -t 120 _s2_ans < /dev/tty || true
+            if [ "$_s2_ans" = "y" ] || [ "$_s2_ans" = "Y" ]; then
+                # Consent was given for the DISCLOSED state, not for the slot:
+                # re-snapshot and require the server generation (#1), the id,
+                # and the consent projection — attachment + every pane's
+                # command, fields 3 on — to be STRING-IDENTICAL, and the slot
+                # to still probe POISONED. Anything moved -> stand down; the
+                # `-A` attach below absorbs every interleaving.
+                _s2_snap2=$(_s2_snapshot)
+                _s2_srv2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f1)
+                _s2_sid2=$(printf '%s\n' "$_s2_snap2" | sed -n '1p' | cut -d'|' -f2)
+                _s2_proj1=$(printf '%s\n' "$_s2_snap1" | cut -d'|' -f3-)
+                _s2_proj2=$(printf '%s\n' "$_s2_snap2" | cut -d'|' -f3-)
+                _s2_verdict2=$(_s2_liveness "$_s2_snap2")
+                if [ -n "$_s2_snap2" ] \
+                    && [ "$_s2_srv2" = "$_s2_srv1" ] \
+                    && [ "$_s2_sid2" = "$_s2_sid1" ] \
+                    && [ "$_s2_proj2" = "$_s2_proj1" ] \
+                    && [ "$_s2_verdict2" = "POISONED" ]; then
+                    if tmux kill-session -t "$_s2_sid1" 2>/dev/null; then
+                        echo "cc-slot: ${SESSION_NAME} ended — rebuilding it fresh." >&2
+                    else
+                        echo "cc-slot: could not end ${SESSION_NAME} (it may have just changed) — attaching instead." >&2
+                    fi
+                else
+                    echo "cc-slot: ${SESSION_NAME} changed while you decided — leaving it alone and attaching." >&2
+                fi
+            else
+                echo "cc-slot: leaving ${SESSION_NAME} as it is." >&2
+            fi
+        fi
+    fi
+    unset _s2_snap1 _s2_snap2 _s2_verdict _s2_verdict2 _s2_srv1 _s2_srv2 \
+          _s2_sid1 _s2_sid2 _s2_sid_ok _s2_proj1 _s2_proj2 _s2_cmds _s2_ans 2>/dev/null || true
+fi
 
 # Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old wrapper
 # (and any other cc-* stray) must not consume cap headroom — manual allocation
