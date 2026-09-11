@@ -24,6 +24,7 @@ from genesis.observability.snapshots.deploy_health import (
     collect_git_facts,
     collect_host_gateway,
     collect_missing_units,
+    collect_stale_units,
     collect_tier2_pending,
     derive_findings,
     last_success_update,
@@ -218,6 +219,52 @@ async def test_last_success_update_no_db():
 # ── findings contract ────────────────────────────────────────────────
 
 
+def test_stale_units_running_daemon_older_than_script(tmp_path):
+    """Acceptance bar — the inert-detector shape: a resident daemon whose
+    ExecMainStart predates its backing script's mtime reads as stale."""
+    script = tmp_path / "w.sh"
+    script.write_text("#!/bin/bash\n")
+    import os
+
+    os.utime(script, (2000, 2000))
+
+    def runner(unit: str) -> tuple[bool, float | None]:
+        assert unit == "genesis-tmp-watchgod.service"
+        return True, 1000.0
+
+    assert collect_stale_units(
+        {"genesis-tmp-watchgod.service": script}, probe=runner
+    ) == ["genesis-tmp-watchgod.service"]
+
+
+def test_stale_units_fresh_and_inactive_and_unreadable(tmp_path):
+    script = tmp_path / "w.sh"
+    script.write_text("#!/bin/bash\n")
+    import os
+
+    os.utime(script, (2000, 2000))
+    # Fresh daemon (started after the code arrived) → not stale.
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, 3000.0)) == []
+    # Inactive → never stale (starting it is bootstrap's decision).
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (False, None)) == []
+    # Unreadable start time → fail-open, not stale.
+    assert collect_stale_units({"u.service": script}, probe=lambda u: (True, None)) == []
+    # Missing script file → fail-open (None verdict for the unit is skipped).
+    gone = tmp_path / "missing.sh"
+    assert collect_stale_units({"u.service": gone}, probe=lambda u: (True, 1000.0)) == []
+
+
+def test_stale_units_probe_error_returns_none(tmp_path):
+    """A broken probe is 'could not determine', never a clean []."""
+
+    def boom(unit: str):
+        raise RuntimeError("systemctl unavailable")
+
+    script = tmp_path / "w.sh"
+    script.write_text("x")
+    assert collect_stale_units({"u.service": script}, probe=boom) is None
+
+
 def test_derive_findings_keys_are_stable():
     findings = derive_findings(
         missing_units=["b.timer", "a.service"],
@@ -225,9 +272,11 @@ def test_derive_findings_keys_are_stable():
         host_gateway={"status": "drift"},
         commits_behind=60,
         update_age_days=8.0,
+        stale_units=["genesis-tmp-watchgod.service"],
     )
     assert findings == [
         "missing_units:a.service,b.timer",  # sorted -> deterministic
+        "stale_units:genesis-tmp-watchgod.service",
         "tier2_pending:1",
         "host_guardian_drift",
         "stale_update:8.0d,60behind",
