@@ -620,9 +620,136 @@ def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _has_trailing_override(seg, sigil)
 
 
+def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
+    """Locate bash ANSI-C ``$'...'`` quoting spans in SHELL-WORD context.
+
+    Returns ``(start, end, content, has_escape)`` per span, where ``end`` is the
+    index past the closing ``'`` and ``content`` is the raw bytes between the
+    quotes. ``has_escape`` is True if the span contains a backslash escape.
+
+    Only spans OUTSIDE single- and double-quoted regions are ANSI-C: bash does
+    NOT treat ``$'...'`` as ANSI-C inside ``"..."`` (there it is a literal ``$``
+    followed by a quoted string), and everything inside ``'...'`` is literal.
+    Getting this dq/sq state right is what keeps the scan off heredoc-body and
+    quoted text. MEASURED to matter (author, 2026-09-04, over a corpus of 38,140
+    real Bash commands harvested from this install's CC transcripts): a naive
+    ``$'`` scan flagged 89, dq-awareness cut that to 45, and the residue is
+    almost entirely heredoc bodies. Heredoc bodies are NOT excluded here, and
+    saying so plainly matters: :func:`parse_segments` has no heredoc state, so a
+    body line is already segmented as a command TODAY — MEASURED on origin/main,
+    a ``cat <<'EOF'`` body line holding a plain gated git command resolves to a
+    ``('git', <verb>)`` segment and is over-blocked with or without this decode.
+    The decode makes the ANSI-C form CONSISTENT with that pre-existing plain-form
+    over-block; it does not create the class, and the direction is over-block,
+    never fail-open. Heredoc-awareness belongs in :func:`parse_segments` (where
+    it fixes both forms at once, and must distinguish a DATA receiver like
+    ``cat`` from an EXECUTING one like ``bash <<'EOF'``, whose body bash really
+    does run) — tracked separately, not bolted on here. The counts are provenance
+    for the design choice, not a runtime invariant; the invariant is the
+    dq/sq/backslash state machine below, which a security review verified against
+    bash's own rules.
+    """
+    spans: list[tuple[int, int, str, bool]] = []
+    i, n = 0, len(text)
+    in_sq = in_dq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if c == "\\" and i + 1 < n:  # backslash escapes the next char in "..."
+                i += 2
+                continue
+            if c == '"':
+                in_dq = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:  # word-level escape, e.g. \$ — not an opener
+            i += 2
+            continue
+        if c == '"':
+            in_dq = True
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            j = i + 2
+            content: list[str] = []
+            has_escape = False
+            while j < n and text[j] != "'":
+                if text[j] == "\\" and j + 1 < n:  # ANSI-C escape (incl. \' \\)
+                    has_escape = True
+                    content.append(text[j : j + 2])
+                    j += 2
+                    continue
+                content.append(text[j])
+                j += 1
+            if j >= n:
+                # UNTERMINATED ``$'...`` — bash rejects the whole command, so
+                # there is no "verb bash runs" to decode. Recording a span here
+                # would turn invalid syntax into valid argv
+                # (``--$'no-verify`` -> ``--no-verify``) and hand a hard policy
+                # verdict to a command that never runs. Leaving it untouched
+                # makes shlex fail, so :func:`untokenizable` routes the command
+                # to the caller's fail-closed/approval net, which is where an
+                # unparseable command belongs. Nothing after an unterminated
+                # opener can be a further span, so stop scanning.
+                break
+            end = j + 1
+            spans.append((i, end, "".join(content), has_escape))
+            i = end
+            continue
+        if c == "'":
+            in_sq = True
+            i += 1
+            continue
+        i += 1
+    return spans
+
+
+def _decode_escape_free_ansi_c(text: str) -> str:
+    """Rewrite ESCAPE-FREE ``$'...'`` spans to a plain-quoted literal of content.
+
+    shlex does not implement ANSI-C decoding: it strips the quotes from
+    ``$'push'`` but LEAVES the ``$``, yielding the token ``$push`` — one
+    character off from what bash runs (``push``). That is enough to hide a verb
+    (``git $'push'``) or a flag (``git commit --$'no-verify'``) from every gate
+    that reads the resolved subcommand/flag. Rewriting the span to what bash
+    would produce restores the parser's fidelity to the shell, so the ordinary
+    gate fires its ordinary verdict.
+
+    ONLY the escape-free case is rewritten, and deliberately so: a span with a
+    backslash (``$'\\x70...'`` hex, ``$'\\n'``) needs the full bash ANSI-C escape
+    grammar to decode, and a PARTIAL decoder is the exact "false confidence from
+    partial coverage" failure a sibling review flagged. Escape-bearing spans are
+    left untouched here and reported untrustworthy by :func:`untokenizable`, so
+    they route to the caller's fail-closed net rather than a guessed decode.
+    """
+    spans = _ansi_c_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    last = 0
+    for start, end, content, has_escape in spans:
+        out.append(text[last:start])
+        out.append(text[start:end] if has_escape else shlex.quote(content))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _argv(seg: str) -> list[str]:
-    """shlex argv of a comment-stripped segment; naive split on tokenizer error."""
-    core = _strip_trailing_comment(seg)
+    """shlex argv of a comment-stripped segment; naive split on tokenizer error.
+
+    ANSI-C ``$'...'`` spans are decoded to their bash value FIRST, so a verb or
+    flag hidden in one (``git $'push'``, ``--$'no-verify'``) resolves to the
+    token bash actually runs rather than the ``$``-prefixed token shlex leaves.
+    Decoding precedes comment-stripping so a ``#`` inside a decoded span is
+    re-quoted and cannot be mistaken for a trailing comment.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
     try:
         return shlex.split(core)
     except ValueError:
@@ -665,6 +792,19 @@ def untokenizable(command: str) -> bool:
     MEASURED over 12,099 real commands: folding and not folding classify
     IDENTICALLY (339 un-tokenizable either way, zero commands differ), so the
     normalization bought nothing and is removed rather than documented.
+
+    ANSI-C ``$'...'`` is handled in the analyze path, NOT here. shlex SUCCEEDS on
+    ``$'push'`` but leaves the ``$`` (a token one char off from what bash runs),
+    so :func:`_decode_escape_free_ansi_c` rewrites the escape-free case to what
+    bash produces BEFORE tokenizing — the verb/flag then resolves normally and
+    the ordinary gate fires. This function is deliberately NOT broadened to flag
+    ANSI-C, because a benign ``$'...'`` in a MESSAGE argument
+    (``git commit -m $'l1\\nl2'``) is legitimate and flagging it would over-ask;
+    distinguishing verb-position from argument-position is exactly what the
+    per-segment analyze path can do and a whole-command probe cannot. The one
+    residual — a HEX-encoded verb (``$'\\x70\\x75\\x73\\x68'``), which the
+    escape-free decode does not touch — is tracked separately rather than closed
+    here with a message-hostile broadening.
     """
     try:
         shlex.split(command)
@@ -1335,30 +1475,50 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str]) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Handles a bare ``-c`` (script is the next token), a combined short bundle
-    where ``c`` is last (``-lc 'script'`` → next token), and an inline value
-    (``-c'script'`` → the rest of the token after ``c``).
+    For every interpreter in ``_NESTED`` the script is the NEXT argv token, and
+    where ``c`` sits inside a short bundle does not change that: ``-c 'script'``,
+    ``-lc 'script'`` and ``-ce 'script'`` all take it from the following token.
+
+    An earlier version read a bundle whose ``c`` was not last as an INLINE value
+    (``-ce`` → the script ``"e"``), which lost the real script entirely: the
+    parser then reported a segment whose executable was ``e``, and a guard keyed
+    on the nested command fell OPEN. Found by cross-model review, 2026-09-03.
+
+    MEASURED 2026-09-06 against the real interpreters, both directions:
+    ``bash -ce '<cmd>'`` and ``bash -cx '<cmd>'`` RUN ``<cmd>`` from the next
+    token, while the glued spelling that branch modelled is refused outright —
+    ``bash -c'<cmd>'`` prints "invalid option", ``sh``/``dash`` "Illegal option".
+    So the branch modelled a form none of these shells accepts and dropped one
+    they all do, and deleting it is strictly a widening.
     """
     for i, tok in enumerate(argv[1:], 1):
         if not tok.startswith("-") or tok.startswith("--"):
             continue
-        pos = tok.find("c")
-        if pos <= 0:
+        if "c" not in tok[1:]:
             continue
-        if pos == len(tok) - 1:  # 'c' is the last flag in the bundle
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        else:  # inline script glued after the 'c'
-            return tok[pos + 1 :]
+        if i + 1 < len(argv):
+            return argv[i + 1]
     return ""
 
 
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand(argv: list[str]) -> str | None:
-    """The git subcommand for an argv whose executable is git, skipping git
-    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+def git_subcommand_index(argv: list[str]) -> int | None:
+    """Index of the git subcommand token in ``argv``, or None.
+
+    Exposed alongside :func:`git_subcommand` because a caller that needs the
+    OPERANDS after the subcommand cannot recover this index on its own.
+    ``argv.index(name)`` returns the FIRST token equal to the name, and a global
+    option's operand may equal the subcommand's own name — ``git -C worktree worktree
+    remove /tmp/x`` selects the ``-C`` operand, so the operand list starts one
+    token early, the removal is not recognised, and the guard falls OPEN. Found
+    by cross-model review, 2026-09-03.
+
+    The alternative was for the caller to repeat the option-skipping loop below.
+    That is replica drift: two copies of one rule, diverging silently the next
+    time the option table grows. One scan, one source of truth.
+    """
     if not argv or _basename(argv[0]) != "git":
         return None
     i = 1
@@ -1370,8 +1530,15 @@ def git_subcommand(argv: list[str]) -> str | None:
         if t.startswith("-"):
             i += 1
             continue
-        return t
+        return i
     return None
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git
+    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+    i = git_subcommand_index(argv)
+    return None if i is None else argv[i]
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:
