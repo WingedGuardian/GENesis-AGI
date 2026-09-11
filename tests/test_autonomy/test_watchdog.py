@@ -448,19 +448,19 @@ class TestStateCounterSanitization:
 
 class TestServiceUptimeProbe:
     """Drive the REAL _service_uptime_s body (the autouse fixture stubs it for
-    every other test, so nothing else executes the subprocess triage). Note the
-    subtlety pinned here: `systemctl show <nonexistent> --value` exits 0 with
-    output "0" (measured), so the `int(raw) == 0` clause — not the returncode
-    check — is the guard that actually rejects a never-activated unit.
+    every other test, so nothing else runs the subprocess triage). `systemctl
+    show <nonexistent> --value` exits 0 with "0" (measured), so `int(raw) == 0`
+    — not the returncode — rejects a never-activated unit. BOTH clocks are
+    injected below: a HOST-derived stamp went negative <42s after kernel boot.
     """
 
     def _real_uptime(self, checker: WatchdogChecker) -> float | None:
         return _REAL_SERVICE_UPTIME_S(checker)
 
-    def test_parses_monotonic_active_enter(self, tmp_path: Path, stale_status: Path):
+    def test_parses_monotonic_active_enter(self, tmp_path: Path, stale_status: Path, monkeypatch):
         checker = _make_checker(tmp_path, stale_status)
-        started = time.clock_gettime(time.CLOCK_MONOTONIC) - 42.0
-        fake = MagicMock(returncode=0, stdout=f"{int(started * 1e6)}\n")
+        monkeypatch.setattr(time, "clock_gettime", lambda _clock: 10_000.0)
+        fake = MagicMock(returncode=0, stdout=f"{int((10_000.0 - 42.0) * 1e6)}\n")
         with patch("genesis.autonomy.watchdog.subprocess.run", return_value=fake):
             uptime = self._real_uptime(checker)
         assert uptime is not None and 41.0 < uptime < 43.0
