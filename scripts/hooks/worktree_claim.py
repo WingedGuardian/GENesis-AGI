@@ -85,6 +85,13 @@ from pathlib import Path
 
 PAYLOAD_VERSION = 1
 
+# The namespace that makes a payload OURS. Without it, any lock reason ending in
+# generic JSON -- `manual hold {"v":1,"rule":"dirty"}` -- parses as ours and
+# becomes eligible for auto-release, which breaks the one invariant this module
+# is built on: a lock we did not write is never touched. `v` and `rule` are
+# common enough words to be written by accident; this is not.
+PAYLOAD_NAMESPACE = "genesis.worktree-ownership"
+
 RULE_CLAIM = "claim"
 RULE_DIRTY = "dirty"
 RULES = (RULE_CLAIM, RULE_DIRTY)
@@ -348,10 +355,27 @@ def _parse_payload(raw: str) -> dict | None:
         return None
     if not isinstance(payload, dict):
         return None
+    # The namespace comes FIRST and is the load-bearing check. Version and rule
+    # alone are words a human could plausibly write in a hand-made lock reason,
+    # and treating such a lock as ours would auto-release it and expose the work
+    # it was protecting.
+    if payload.get("ns") != PAYLOAD_NAMESPACE:
+        return None
     if payload.get("v") != PAYLOAD_VERSION:
         return None
-    if payload.get("rule") not in RULES:
+    rule = payload.get("rule")
+    if rule not in RULES:
         return None
+    # Validate the WHOLE payload, not just the discriminators. A `claim` missing
+    # its pid, or carrying a non-integer one, has no usable release condition --
+    # `pid_is_live_session` would read it as dead and release immediately, which
+    # is the opposite of what a malformed claim should do.
+    if rule == RULE_CLAIM:
+        if not isinstance(payload.get("pid"), int) or payload["pid"] <= 1:
+            return None
+        start_time = payload.get("start")
+        if start_time is not None and not isinstance(start_time, int):
+            return None
     return payload
 
 
@@ -401,7 +425,7 @@ def build_payload(rule: str, *, sid: str | None = None, pid: int | None = None) 
     """
     if rule not in RULES:
         return None
-    payload: dict = {"v": PAYLOAD_VERSION, "rule": rule}
+    payload: dict = {"ns": PAYLOAD_NAMESPACE, "v": PAYLOAD_VERSION, "rule": rule}
     if rule == RULE_CLAIM:
         if pid is None:
             pid = session_pid_from_ancestry()
@@ -574,6 +598,31 @@ def _config_path() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "config" / _CONFIG_NAME
 
 
+def _overlay_path() -> Path:
+    """The ``.local.yaml`` overlay, resolved USER-DIR-FIRST.
+
+    This precedence is not a preference, it is a correctness requirement, and
+    getting it wrong makes the whole lever silently inert: the settings API
+    writes overrides to ``~/.genesis/config/<stem>.local.yaml`` (deliberately, so
+    user config never lands in a PR), while an earlier version of this loader
+    looked only at the repository's ``config/`` directory. The result was that
+    ``settings_update("worktree_ownership", {"enabled": false})`` would report
+    success, ``settings_get`` would display the override, and the sweeper would
+    go on using the default -- a lever that appears to work and does nothing.
+
+    Mirrors ``genesis._config_overlay._resolve_overlay_path``, which cannot be
+    imported here: this module has to run under an interpreter with no
+    ``genesis`` package on its path. Any change to the precedence there belongs
+    here too, and ``test_the_overlay_precedence_matches_the_canonical_resolver``
+    fails if the two disagree.
+    """
+    local_name = _config_path().with_suffix(".local.yaml").name
+    user_path = Path.home() / ".genesis" / "config" / local_name
+    if user_path.is_file():
+        return user_path
+    return _config_path().with_suffix(".local.yaml")
+
+
 def load_config() -> dict:
     """The merged config, read fresh per call. Never raises.
 
@@ -590,7 +639,7 @@ def load_config() -> dict:
         import yaml
     except ImportError:
         return merged
-    for path in (_config_path(), _config_path().with_suffix(".local.yaml")):
+    for path in (_config_path(), _overlay_path()):
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except FileNotFoundError:

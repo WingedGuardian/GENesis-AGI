@@ -13,10 +13,17 @@
 # session processes were running.
 #
 # mode:
-#   advisory — (default) the sweeper maintains locks, and the edit hook warns on
-#              stderr when a session edits a worktree another live session holds.
-#              Nothing is ever blocked.
-#   off      — take no locks, release none, warn about nothing.
+#   advisory — (default) the daily sweeper maintains locks: it locks worktrees
+#              holding uncommitted tracked changes and releases every lock whose
+#              release condition has come true. Nothing is ever blocked.
+#   off      — take no locks, release none.
+#
+# SCOPE TODAY: the sweeper only RELEASES `claim` locks; nothing takes one yet.
+# Claims are taken by the Edit/Write hook, which ships separately, and the
+# stderr advisory for editing another session's worktree arrives with it. Until
+# then this lever governs dirty-worktree protection only. Said plainly here
+# because a setting that describes a protection it does not yet provide is worse
+# than one that describes less.
 # enabled: master switch; false is equivalent to off.
 #
 # An invalid mode degrades to `advisory`, not `off`: every surface here is

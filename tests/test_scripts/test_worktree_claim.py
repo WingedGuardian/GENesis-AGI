@@ -73,6 +73,16 @@ def worktree(repo: Path, tmp_path: Path) -> Path:
     return path
 
 
+def P(rule: str, **extra) -> dict:
+    """A well-formed ownership payload.
+
+    Built from the module's OWN namespace constant rather than a literal, so a
+    change to that constant cannot leave these tests quietly asserting a format
+    nothing writes any more.
+    """
+    return {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": rule, **extra}
+
+
 def _lock(repo: Path, path: Path, reason: str) -> None:
     result = _git(repo, "worktree", "lock", "--reason", reason, str(path))
     assert result.returncode == 0, result.stderr
@@ -109,7 +119,7 @@ def test_gitdir_resolves_to_the_admin_directory_holding_the_lock(worktree: Path)
 
 
 def test_a_lock_we_wrote_round_trips(repo: Path, worktree: Path) -> None:
-    payload = {"v": 1, "rule": "claim", "pid": 4242, "start": 99, "sid": "abc"}
+    payload = P("claim", pid=4242, start=99, sid="abc")
     _lock(repo, worktree, wc.format_reason(payload))
     lock = wc.read_lock(worktree)
     assert lock is not None
@@ -125,7 +135,7 @@ def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
     put the JSON first would still contain a sentence, and would still be
     unreadable at the moment it is shown.
     """
-    reason = wc.format_reason({"v": 1, "rule": "claim", "pid": 7, "start": 1})
+    reason = wc.format_reason(P("claim", pid=7, start=1))
     assert reason.index("{") > 20
     assert reason.startswith("Claimed by a live Claude Code session (pid 7)")
     assert json.loads(reason[reason.index("{") :])["pid"] == 7
@@ -140,14 +150,30 @@ def test_the_reason_leads_with_a_sentence_before_the_json() -> None:
         '{"v": 1, "rule": "something-else"}',
         '{"v": 1}',
         '["v", 1]',
+        # The case that made the namespace necessary. `v` and `rule` are ordinary
+        # words; an operator or another tool can write them by accident, and
+        # without a namespace this parsed as OURS and became eligible for
+        # auto-release -- silently breaking the one invariant this module rests
+        # on. Found in review, not by the suite, which is why it is pinned here.
+        'manual hold {"v": 1, "rule": "dirty"}',
+        'do not touch {"v": 1, "rule": "claim", "pid": 4242, "start": 1}',
+        # Right namespace, malformed body: a claim with no usable pid has no
+        # release condition, and treating it as ours would release it instantly.
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim"}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": "4242"}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 1}',
+        '{"ns": "genesis.worktree-ownership", "v": 1, "rule": "claim", "pid": 9, "start": "x"}',
+        '{"ns": "genesis.other-thing", "v": 1, "rule": "dirty"}',
     ],
 )
 def test_a_reason_that_is_not_ours_is_foreign(repo: Path, worktree: Path, reason: str) -> None:
     """Anything we cannot fully validate is someone else's lock, not a repairable one.
 
-    Covers the three ways a payload can be almost-ours -- wrong version, unknown
-    rule, missing rule -- plus valid JSON of the wrong TYPE. Misreading one of
-    these as ours is the single error that would auto-release work we do not own.
+    Covers every way a payload can be almost-ours -- wrong version, unknown rule,
+    missing rule, valid JSON of the wrong TYPE, generic JSON with no namespace,
+    a different namespace, and a correctly-namespaced claim whose body is
+    unusable. Misreading any of these as ours is the single error that would
+    auto-release work we do not own.
     """
     _lock(repo, worktree, reason)
     lock = wc.read_lock(worktree)
@@ -265,7 +291,7 @@ def test_a_claim_without_a_resolvable_session_is_refused(monkeypatch) -> None:
 def test_a_dirty_payload_needs_no_process(monkeypatch) -> None:
     monkeypatch.setattr(wc, "session_pid_from_ancestry", lambda *a, **k: None)
     payload = wc.build_payload(wc.RULE_DIRTY)
-    assert payload == {"v": 1, "rule": "dirty"}
+    assert payload == P("dirty")
 
 
 # ─── release rules ──────────────────────────────────────────────────────────
@@ -284,7 +310,7 @@ def test_a_claim_is_kept_while_its_session_lives_and_released_once_it_is_gone(
     """
     proc = subprocess.Popen(["sleep", "30"])
     start = wc.proc_starttime(proc.pid)
-    payload = {"v": 1, "rule": "claim", "pid": proc.pid, "start": start}
+    payload = P("claim", pid=proc.pid, start=start)
     _lock(repo, worktree, wc.format_reason(payload))
     lock = wc.read_lock(worktree)
     assert lock is not None
@@ -313,7 +339,7 @@ def test_a_live_claim_still_releases_once_the_worktree_goes_idle(
     life and the reaper never runs again. The idle window is the reaper's own
     STALE_DAYS, not a second threshold invented here."""
     monkeypatch.setattr(wc, "pid_is_live_session", lambda *a, **k: True)
-    payload = {"v": 1, "rule": "claim", "pid": 4242, "start": 1}
+    payload = P("claim", pid=4242, start=1)
     _lock(repo, worktree, wc.format_reason(payload))
     lock = wc.read_lock(worktree)
     assert lock is not None
@@ -329,7 +355,7 @@ def test_a_dirty_lock_tracks_whether_tracked_changes_remain(repo: Path, worktree
     """Both directions, because only the pair shows the predicate is reading the
     worktree rather than returning a constant."""
     (worktree / "f.txt").write_text("modified\n")
-    payload = {"v": 1, "rule": "dirty"}
+    payload = P("dirty")
     _lock(repo, worktree, wc.format_reason(payload))
     lock = wc.read_lock(worktree)
     assert lock is not None
@@ -435,7 +461,7 @@ def test_a_lock_stops_git_worktree_remove_and_unlocking_lets_it_through(
     that could not be removed for some unrelated reason, so the unlocked removal
     is what shows the lock is the cause.
     """
-    _lock(repo, worktree, wc.format_reason({"v": 1, "rule": "dirty"}))
+    _lock(repo, worktree, wc.format_reason(P("dirty")))
     blocked = _git(repo, "worktree", "remove", str(worktree))
     assert blocked.returncode != 0
     assert "locked" in blocked.stderr.lower()
@@ -447,14 +473,14 @@ def test_a_lock_stops_git_worktree_remove_and_unlocking_lets_it_through(
 
 def test_git_echoes_our_reason_when_it_refuses(repo: Path, worktree: Path) -> None:
     """Why the reason leads with a sentence: this text is what a blocked reader sees."""
-    _lock(repo, worktree, wc.format_reason({"v": 1, "rule": "claim", "pid": 7, "start": 1}))
+    _lock(repo, worktree, wc.format_reason(P("claim", pid=7, start=1)))
     blocked = _git(repo, "worktree", "remove", str(worktree))
     assert blocked.returncode != 0
     assert "Claimed by a live Claude Code session" in blocked.stderr
 
 
 def test_lock_and_unlock_round_trip(repo: Path, worktree: Path) -> None:
-    assert wc.lock_worktree(worktree, {"v": 1, "rule": "dirty"}) is True
+    assert wc.lock_worktree(worktree, P("dirty")) is True
     assert wc.read_lock(worktree).rule == "dirty"
     assert wc.unlock_worktree(worktree) is True
     assert wc.read_lock(worktree) is None
@@ -476,7 +502,7 @@ def test_an_existing_lock_is_not_even_offered_to_git(
     deterministic without spending a subprocess, and keeps the decision in this
     module rather than in git's exit codes.
     """
-    assert wc.lock_worktree(worktree, {"v": 1, "rule": "dirty"}) is True
+    assert wc.lock_worktree(worktree, P("dirty")) is True
 
     calls: list[tuple] = []
     real_git = wc._git
@@ -486,7 +512,7 @@ def test_an_existing_lock_is_not_even_offered_to_git(
         return real_git(root, *args)
 
     monkeypatch.setattr(wc, "_git", spy)
-    assert wc.lock_worktree(worktree, {"v": 1, "rule": "claim", "pid": 1, "start": 1}) is False
+    assert wc.lock_worktree(worktree, P("claim", pid=4242, start=1)) is False
     assert calls == [], f"a second lock attempt shelled out to git: {calls}"
     assert wc.read_lock(worktree).rule == "dirty"
 
@@ -530,6 +556,32 @@ def test_an_unquoted_yaml_off_is_honoured(monkeypatch) -> None:
     monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
     monkeypatch.setattr(wc, "load_config", lambda: {"enabled": True, "mode": False})
     assert wc.effective_mode() == "off"
+
+
+def test_the_overlay_precedence_matches_the_canonical_resolver(monkeypatch, tmp_path) -> None:
+    """The user-config overlay wins, exactly as genesis._config_overlay does.
+
+    This is not a preference. The settings API writes overrides to
+    ``~/.genesis/config/<stem>.local.yaml`` on purpose, so user config never
+    lands in a PR. A loader reading only the repo's ``config/`` directory makes
+    ``settings_update`` report success, ``settings_get`` show the override, and
+    the sweeper go on using the default -- a lever that looks live and is inert.
+    Found in review; pinned here so the two resolvers cannot drift apart.
+    """
+    home = tmp_path / "home"
+    (home / ".genesis" / "config").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    # No user overlay yet -> falls back to the repo-adjacent sibling.
+    assert wc._overlay_path() == wc._config_path().with_suffix(".local.yaml")
+
+    user_overlay = home / ".genesis" / "config" / "worktree_ownership.local.yaml"
+    user_overlay.write_text("enabled: false\n")
+    assert wc._overlay_path() == user_overlay
+
+    monkeypatch.delenv("GENESIS_WORKTREE_OWNERSHIP", raising=False)
+    assert wc.load_config()["enabled"] is False
+    assert wc.effective_mode() == "off", "a user-set override must actually take effect"
 
 
 def test_the_shipped_config_is_valid(monkeypatch) -> None:

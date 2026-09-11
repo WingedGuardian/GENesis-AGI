@@ -23,10 +23,23 @@
   developed against the sweep marked 11 of 201 worktrees, leaving the other 190
   untouched.
 - **A marker left by something else is reported, never touched.** A hand-written
-  one, or one belonging to another tool, is left exactly as found. If such a
-  marker is still sitting on a worktree nothing has touched in weeks, the sweep
-  says so plainly, because that is the shape a crashed tool leaves behind and it
-  would otherwise keep that worktree out of the cleanup job's reach forever.
+  one, or one belonging to another tool, is left exactly as found — and it is
+  identified by a marker specific enough that ordinary hand-written notes cannot
+  be mistaken for ours, so nothing we did not write can be cleared automatically.
+  If such a marker is still sitting on a worktree nothing has touched in weeks,
+  the sweep says so plainly, because that is the shape a crashed tool leaves
+  behind and it would otherwise keep that worktree out of the cleanup job's reach
+  forever.
+- **When a session's marker expires over work it never committed, protection is
+  handed over rather than dropped.** The cleanup job runs moments after the
+  sweep, in the same scheduled run, and restoring a cleaned-up worktree does not
+  bring back edits to tracked files. So a marker that lapses while uncommitted
+  work is still sitting there is replaced in the same pass by the "has
+  uncommitted work" marker, instead of leaving a gap measured in minutes.
+- **Turning the feature off from the settings interface now actually turns it
+  off.** Overrides made there are written to the user's own configuration
+  directory, which the daily sweep was not reading — so the setting reported
+  success, displayed correctly, and changed nothing.
 - **Worktrees created by the optional workflow runner get no special treatment,
   and that is deliberate.** A dedicated rule for them was built and then removed
   after testing it against a real run: the marker stopped that tool's own cleanup

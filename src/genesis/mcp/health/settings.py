@@ -302,12 +302,16 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Worktree ownership — master `enabled` + `mode` advisory/off. Records "
             "which session holds which worktree as a `git worktree lock` reason, "
             "which the reaper and `git worktree remove` already honour. advisory "
-            "(default) maintains those locks daily and warns on stderr when a "
-            "session edits a worktree another live session holds; off takes no "
-            "locks and releases none. Nothing is ever blocked. Read live per call "
-            "— takes effect immediately, no restart. Env kill switch "
-            "GENESIS_WORKTREE_OWNERSHIP=1 forces off. Note off does not release "
-            "locks already taken: run the sweeper once with --release-only first."
+            "(default) runs the daily sweep: it locks worktrees holding "
+            "uncommitted tracked changes and releases every lock whose condition "
+            "has come true. off takes no locks and releases none. Nothing is ever "
+            "blocked. TODAY THE SWEEP ONLY RELEASES `claim` LOCKS — nothing takes "
+            "one yet, because claims are taken by the edit hook that ships "
+            "separately; until that lands this lever governs dirty-worktree "
+            "protection only. Read live per call — takes effect immediately, no "
+            "restart. Env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces off. "
+            "Note off does not release locks already taken: run the sweeper once "
+            "with --release-only first."
         ),
         config_filename="worktree_ownership.yaml",
         readonly=False,
