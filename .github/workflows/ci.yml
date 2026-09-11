@@ -40,7 +40,7 @@ jobs:
 
   dependency-audit:
     # REPORTS known-vulnerable dependencies in the resolved runtime tree. It no
-    # longer FAILS the workflow — see continue-on-error below, which is the whole
+    # longer FAILS — see the step-level continue-on-error below, which is the whole
     # point of this job's current shape.
     #
     # It used to be a blocking check whose red run was "a SIGNAL to bump the dep
@@ -69,9 +69,6 @@ jobs:
     # they were judged unreachable; deleting it would discard that reasoning and
     # bury the genuinely-new IDs in a wall of known ones.
     runs-on: ubuntu-latest
-    # Report, never block. Job-level, so a failing pip-audit leaves the job green
-    # in the rollup instead of taking the CI workflow red with it.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -83,9 +80,19 @@ jobs:
           pip install -e .
           pip install pip-audit
       - name: Audit dependencies for known CVEs
+        # STEP level, not job level, and the difference is the whole mechanism.
+        # MEASURED on this PR's own first run: with `continue-on-error` on the
+        # JOB, the workflow no longer fails but the job's own check-run
+        # conclusion is still `failure`, so `gh pr checks` and the merge gate
+        # both still read it red — the block was unchanged. On the STEP, a
+        # failing pip-audit does not fail the job, so the rollup entry is green
+        # and the advisories are still printed in the log above it.
+        continue-on-error: true
         run: |
           # Triaged --ignore-vuln IDs (rationale of record: pyproject.toml pins).
-          # A NEW / untriaged advisory is NOT in this list and so fails the job.
+          # A NEW / untriaged advisory is NOT in this list, so it is REPORTED here —
+          # it no longer fails the job (see continue-on-error above). The list is
+          # kept so a genuinely-new ID stands out from the known ones.
           #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI /
           #     MCP-gateway vuln; Genesis uses acompletion/completion_cost only
           #     (no proxy server), so none are reachable. Pinned <1.83 also dodges
