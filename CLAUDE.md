@@ -534,8 +534,12 @@ behind the writer, and 7 were a guard since removed.
   and "triggered, still running" are the SAME output; if you have not just requested
   one, request one rather than reading that line as proof nobody did.
   **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
-  own schedule, and a single CodeRabbit **Critical or Major** scores 1.0 — enough to
-  block a merge by itself, the same weight as a Codex P1. Until 2026-09-10 it was
+  own schedule. An unresolved **Critical or Major** inline finding on a file in
+  the PR diff scores 1.0 — enough to block a merge by itself, the same weight as
+  a Codex P1 — unless the configured documentation-path exclusion applies.
+  Maintainer-replied findings and findings on files outside the PR diff do not
+  score; under the shipped `doc_findings: skip`, documentation findings do not
+  score either. Until 2026-09-10 it was
   named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
   "review is clear" and were surprised by the score. Read the `inline-findings` row,
   not just the Codex row.
