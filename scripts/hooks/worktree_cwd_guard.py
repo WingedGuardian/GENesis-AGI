@@ -40,7 +40,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, run_guard, tool_input  # noqa: E402
 from shell_parse import (  # noqa: E402
-    analyze,
+    analyze_checked,
     git_subcommand_index,
     untokenizable,
 )
@@ -146,7 +146,7 @@ def _legacy_targets(cmd: str) -> list[str]:
     return targets
 
 
-def _extract_worktree_targets(cmd: str) -> list[str]:
+def _extract_worktree_targets(segs: list) -> list[str]:
     """Target paths of every EXECUTED worktree-removal segment.
 
     Keyed on parsed structure, not on the phrase appearing in the text: the
@@ -163,7 +163,7 @@ def _extract_worktree_targets(cmd: str) -> list[str]:
     what covers that class.
     """
     targets: list[str] = []
-    for seg in analyze(cmd):
+    for seg in segs:
         if seg.exe != "git":
             continue
         # The INDEX from the parser's own scan, never `argv.index(_SUBCOMMAND)`:
@@ -185,7 +185,7 @@ def _extract_worktree_targets(cmd: str) -> list[str]:
     return targets
 
 
-def _carries_a_command(cmd: str) -> bool:
+def _carries_a_command(cmd: str, segs: list) -> bool:
     """Whether ``cmd`` hands a command STRING to something ``analyze`` skips.
 
     Asks the PARSER first, and the raw text only as a fallback. The regex above
@@ -200,7 +200,7 @@ def _carries_a_command(cmd: str) -> bool:
     once, for every spelling of a path, with no new name to guess. The regex is
     still consulted because a shell function definition has no executable at all.
     """
-    if any(seg.exe in _CARRIER_NAMES for seg in analyze(cmd)):
+    if any(seg.exe in _CARRIER_NAMES for seg in segs):
         return True
     return bool(_COMMAND_CARRIER.search(cmd))
 
@@ -309,10 +309,27 @@ def _handle_bash(data: dict) -> int:
     # the command was allowed — a branch whose comment claimed fail-closed while
     # the code fell open. `echo 'it's fine' ; git worktree remove /wt/X` is the
     # shape (an unbalanced quote collapses everything into one echo segment).
-    if untokenizable(cmd):
+    # ONE parse for this hook, per `analyze_checked`'s own contract: the blind
+    # spot is asked once here rather than remembered at each probe, which is the
+    # shape that has repeatedly shipped guards importing a check they never call.
+    segs, blind = analyze_checked(cmd)
+
+    # `blind is not None` joins `untokenizable` as a fail-CLOSED trigger, and the
+    # two are different failures. `untokenizable` means shlex could not read the
+    # command at all. A blind spot means a BOUND stopped the parse — and
+    # `analyze_checked` then returns NO segments rather than the ones it reached,
+    # precisely because this guard decides by SEARCHING that list and would read
+    # "stopped looking" as "no removal present". Without this branch a removal
+    # wrapped past the depth bound parses to [], `_extract_worktree_targets`
+    # finds nothing, and a guard whose whole job is blocking allows it — the
+    # BLOCK -> ALLOW shape `analyze_checked`'s docstring measured for the guards
+    # that already fail closed here. The legacy regex extractor is the same
+    # coarser reading the untokenizable case falls back to: weaker than the
+    # parser, but it reads the raw text, so a bound cannot hide anything from it.
+    if untokenizable(cmd) or blind is not None:
         targets = _legacy_targets(cmd)
     else:
-        targets = _extract_worktree_targets(cmd)
+        targets = _extract_worktree_targets(segs)
         # The text says a removal and the parser found none, in a command that
         # hands a command STRING to something. That is the carrier class: it
         # tokenizes cleanly, so the probe above cannot see it, and the parser
@@ -343,7 +360,7 @@ def _handle_bash(data: dict) -> int:
             not targets
             and _WORKTREE_REMOVE.search(cmd)
             and _GIT_TOKEN.search(cmd)
-            and _carries_a_command(cmd)
+            and _carries_a_command(cmd, segs)
         ):
             targets = _legacy_targets(cmd)
     if not targets:

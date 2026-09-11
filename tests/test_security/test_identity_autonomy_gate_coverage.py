@@ -233,6 +233,15 @@ AUTONOMY_GATE_SITES: dict[str, tuple[str, str]] = {
         "gated-via",
         "owner flags an autonomous send from the dashboard; threads origin_class='owner'",
     ),
+    "autonomy/desktop_gate.py::_classify_cell": (
+        "gated-via",
+        "CLASSIFY apply_event making the desktop cell visible in the matrix; "
+        "threads origin_class='first_party' (Genesis's own deterministic "
+        "classifier) into the crud choke emit. Records no success/correction "
+        "evidence: desktop is absent from PROMOTABLE_DOMAINS, so the cell can "
+        "never be promoted and banking evidence on it would be decoration with "
+        "a mutation surface attached",
+    ),
     "ego/cell_promotion.py::handle_cell_promotion_resolution": (
         "gated-via",
         "executes an OWNER-approved promotion proposal (APPROVE apply_event); "
