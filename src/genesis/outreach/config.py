@@ -18,6 +18,22 @@ class QuietHours:
     # timezone removed — uses genesis.env.user_timezone()
 
 
+#: Quiet hours DISABLED. A zero-width window is how "off" is expressed — see
+#: ``outreach/governance.py::_in_quiet_hours``, which returns False for
+#: ``start == end`` (the same rule ``ego/cadence.py`` already applies).
+#:
+#: This is the SHIPPED DEFAULT (owner ruling 2026-09-10): quiet hours had no off
+#: switch and held an explicitly-scheduled owner reminder for 5.5 hours. The
+#: feature is off until it is designed properly; re-enable by setting real times
+#: in ``config/outreach.yaml`` or a local overlay.
+#:
+#: Referenced from BOTH code default sites below, because there are three places a
+#: default can come from (this dataclass' users, the ``_DEFAULTS`` instance, and
+#: the per-key ``.get()`` fallbacks in ``load_outreach_config``) and setting only
+#: one leaves installs quieted on the other two paths.
+QUIET_HOURS_DISABLED = QuietHours(start="00:00", end="00:00")
+
+
 @dataclass(frozen=True)
 class OutreachConfig:
     quiet_hours: QuietHours
@@ -88,7 +104,9 @@ class OutreachConfig:
 
 
 _DEFAULTS = OutreachConfig(
-    quiet_hours=QuietHours(start="22:00", end="07:00"),
+    # Used when NO config file exists at all (a fresh install before
+    # setup-local-config.sh, or a stripped deployment).
+    quiet_hours=QUIET_HOURS_DISABLED,
     # Marketing is carried here (not just in config/outreach.yaml) so a pre-existing
     # saved ~/.genesis/config/outreach.yaml — written before this category existed —
     # still resolves it after load_outreach_config merges these defaults under the
@@ -248,9 +266,12 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
     raw = merge_local_overlay(raw, path)
     qh = raw.get("quiet_hours", {})
     return OutreachConfig(
+        # Per-key fallbacks, used when a config file EXISTS but carries no
+        # quiet_hours block — the third default path, and the one most likely to
+        # be missed (a saved config written before this key existed).
         quiet_hours=QuietHours(
-            start=qh.get("start", "22:00"),
-            end=qh.get("end", "07:00"),
+            start=qh.get("start", QUIET_HOURS_DISABLED.start),
+            end=qh.get("end", QUIET_HOURS_DISABLED.end),
         ),
         # Merge the shipped defaults UNDER the user's maps (user overrides win),
         # rather than taking a saved map wholesale — so a config saved before a

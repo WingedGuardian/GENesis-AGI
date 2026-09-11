@@ -663,10 +663,19 @@ Every autonomous action on the outside world funnels through deterministic
 in-code gates. Owner-facing delivery (Telegram/voice/email-to-owner) is NEVER
 gated — that contract is one-directional.
 
+**"Never gated" is about APPROVAL, not about timing.** Owner-facing delivery is
+never held for permission, but `outreach/governance.py` can still DELAY it: the
+quiet-hours window deferred every non-`ALERT`/`BLOCKER` category, which held an
+explicitly-scheduled 01:30 reminder until 07:00. Quiet hours now ship DISABLED
+(a zero-width `00:00`/`00:00` window in `config/outreach.yaml`; `_in_quiet_hours`
+treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
+owner-facing send by default. The salience thresholds and the shared daily cap
+are the other timing/volume controls on that path.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 5808e7cd 2026-09-03
+verified: d6edbcc6 2026-09-11
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths

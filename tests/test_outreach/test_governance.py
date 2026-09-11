@@ -780,3 +780,224 @@ async def test_provision_approval_never_deduped(db):
         result = await gate.check(req)
         assert result.verdict == GovernanceVerdict.BYPASS
         assert "dedup" not in result.checks_failed
+
+
+# ── Quiet hours: the zero-width DISABLED window (shipped default) ────────────
+#
+# CAPTURED AT IMPORT, BEFORE ANY FIXTURE RUNS. tests/test_outreach/conftest.py
+# has an AUTOUSE fixture that replaces GovernanceGate._in_quiet_hours with
+# `lambda self: False` to keep the rest of this suite off the wall clock. Every
+# test below would be VACUOUS against that stub -- it returns False for any
+# config, which is the very answer two of them assert. So these call the real
+# function object directly, and the guard-the-guard below proves we captured the
+# real one rather than the stub.
+_REAL_IN_QUIET_HOURS = GovernanceGate.__dict__["_in_quiet_hours"]
+
+
+class _QH:
+    """Minimal stand-in for GovernanceGate: _in_quiet_hours reads only this."""
+
+    def __init__(self, start: str, end: str) -> None:
+        self._config = OutreachConfig(
+            quiet_hours=QuietHours(start=start, end=end),
+            channel_preferences={"default": "telegram"},
+            thresholds={},
+            max_daily=5,
+            surplus_daily=1,
+            content_daily=3,
+            notification_daily=10,
+            morning_report_time="07:00",
+            engagement_timeout_hours=24,
+            engagement_poll_minutes=60,
+        )
+
+
+def test_captured_the_real_method_not_the_autouse_stub():
+    """Guard-the-guard: if this fails, every test below proves nothing."""
+    import inspect
+
+    src = inspect.getsource(_REAL_IN_QUIET_HOURS)
+    assert "quiet_hours" in src and "lambda" not in src.split("\n")[0], (
+        "captured the autouse fixture's stub instead of the real method — the "
+        "zero-width tests would pass for the wrong reason"
+    )
+
+
+def test_zero_width_window_disables_quiet_hours():
+    """start == end means OFF. This is the shipped default (owner ruling).
+
+    Without the rule the equal case falls into the `start <= end` branch and
+    compares a microsecond-precision `now` against midnight: effectively-never
+    true, but by accident rather than by contract.
+    """
+    assert _REAL_IN_QUIET_HOURS(_QH("00:00", "00:00")) is False
+    # Not special-cased to midnight — any equal pair is a zero-width window.
+    assert _REAL_IN_QUIET_HOURS(_QH("13:37", "13:37")) is False
+
+
+def test_a_window_containing_now_is_still_detected():
+    """THE FALSIFIER for 'did the new rule disable quiet hours entirely'.
+
+    Derived from the same clock the method reads, so it cannot flake: a window
+    spanning [now-1h, now+1h] must always contain now, including across midnight
+    (start > end then, which the wrap branch handles).
+    """
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from genesis.env import user_timezone
+
+    try:
+        tz = ZoneInfo(user_timezone())
+    except Exception:
+        tz = UTC
+    now = datetime.now(tz)
+    start = (now - timedelta(hours=1)).strftime("%H:%M")
+    end = (now + timedelta(hours=1)).strftime("%H:%M")
+
+    assert _REAL_IN_QUIET_HOURS(_QH(start, end)) is True, (
+        f"window {start}-{end} must contain now ({now:%H:%M}) — if this fails the "
+        f"zero-width rule has short-circuited the whole check"
+    )
+
+
+def test_a_window_not_containing_now_is_not_quiet():
+    """The other direction, same clock-derived construction."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from genesis.env import user_timezone
+
+    try:
+        tz = ZoneInfo(user_timezone())
+    except Exception:
+        tz = UTC
+    now = datetime.now(tz)
+    start = (now + timedelta(hours=2)).strftime("%H:%M")
+    end = (now + timedelta(hours=3)).strftime("%H:%M")
+
+    assert _REAL_IN_QUIET_HOURS(_QH(start, end)) is False
+
+
+def test_every_default_path_ships_quiet_hours_disabled(tmp_path):
+    """ONE test locking ALL THREE default paths.
+
+    A default can arrive from three places, and setting only one leaves installs
+    quieted on the other two:
+      1. no config file at all            -> _DEFAULTS
+      2. a file with no quiet_hours block -> the per-key .get() fallbacks
+      3. the shipped config/outreach.yaml -> the file itself
+    """
+    from pathlib import Path
+
+    from genesis.outreach.config import (
+        _DEFAULTS,
+        QUIET_HOURS_DISABLED,
+        load_outreach_config,
+    )
+
+    # 1. No file.
+    missing = load_outreach_config(tmp_path / "nope.yaml")
+    assert missing.quiet_hours == QUIET_HOURS_DISABLED, "no-file default is quieted"
+    assert _DEFAULTS.quiet_hours == QUIET_HOURS_DISABLED
+
+    # 2. A file that exists but declares no quiet_hours.
+    partial = tmp_path / "partial.yaml"
+    partial.write_text("rate_limits:\n  max_daily: 5\n")
+    assert load_outreach_config(partial).quiet_hours == QUIET_HOURS_DISABLED, (
+        "a config saved before this key existed must not re-enable quiet hours"
+    )
+
+    # 3. The SHIPPED repo config. Read the FILE, not load_outreach_config(file):
+    # the loader applies merge_local_overlay, so an install that legitimately
+    # re-enables quiet hours in outreach.local.yaml would turn this repo test red
+    # and blame the innocent shipped yaml. The claim here is about what the repo
+    # SHIPS, so assert on the shipped bytes.
+    import yaml
+
+    shipped = Path(__file__).resolve().parents[2] / "config" / "outreach.yaml"
+    assert shipped.exists(), shipped
+    shipped_qh = (yaml.safe_load(shipped.read_text()) or {}).get("quiet_hours", {})
+    assert shipped_qh.get("start") == QUIET_HOURS_DISABLED.start, shipped_qh
+    assert shipped_qh.get("end") == QUIET_HOURS_DISABLED.end, shipped_qh
+    assert shipped_qh["start"] == shipped_qh["end"], (
+        "config/outreach.yaml must ship a zero-width (disabled) window"
+    )
+
+    # And the disabled value must actually read as disabled.
+    assert _REAL_IN_QUIET_HOURS(
+        _QH(QUIET_HOURS_DISABLED.start, QUIET_HOURS_DISABLED.end)
+    ) is False
+
+
+def test_midnight_is_the_instant_the_rule_actually_decides(monkeypatch):
+    """The ONE case where the zero-width rule is load-bearing rather than cosmetic.
+
+    Honest about my own change: DELETING `if start == end: return False` is almost
+    a no-op, because a zero-width window then falls into the `start <= end` branch
+    and evaluates `00:00 <= now <= 00:00`, which is False at every instant except
+    exactly midnight. Measured: a mutation removing the early return left every
+    other test in this file GREEN.
+
+    So this test freezes the clock AT midnight, where the two behaviours diverge:
+    with the rule, quiet hours are off; without it, a disabled window silently
+    ENGAGES. That makes "zero-width means disabled" a contract the suite can
+    defend, rather than an accident of how the comparison happens to evaluate.
+    """
+    import datetime as _dt
+
+    class _MidnightDatetime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003 - signature must match
+            return _dt.datetime(2026, 9, 11, 0, 0, 0, 0, tzinfo=_dt.UTC)
+
+    monkeypatch.setattr("genesis.outreach.governance.datetime", _MidnightDatetime)
+
+    # Guard-the-guard: the patch must actually be in force, or this proves nothing.
+    from genesis.outreach import governance as gov_mod
+
+    assert gov_mod.datetime.now(UTC).hour == 0
+    assert gov_mod.datetime.now(UTC).minute == 0
+    assert gov_mod.datetime.now(UTC).microsecond == 0
+
+    assert _REAL_IN_QUIET_HOURS(_QH("00:00", "00:00")) is False, (
+        "at exactly midnight a zero-width window must still read as DISABLED — "
+        "this is the instant where removing the start == end rule would silently "
+        "turn quiet hours back on"
+    )
+    # Control: a REAL window containing midnight must still read as quiet, so the
+    # rule above is narrow rather than a blanket 'never quiet'.
+    assert _REAL_IN_QUIET_HOURS(_QH("22:00", "07:00")) is True
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        ("", ""),            # empty — what a cleared dashboard field sends
+        ("25:99", "07:00"),  # out of range
+        ("10 PM", "7 AM"),   # human-written, not HH:MM
+        (None, None),        # key present but null in yaml
+    ],
+)
+def test_a_malformed_window_disables_rather_than_raising(start, end, caplog):
+    """A typo must not brick outreach.
+
+    _in_quiet_hours runs from check() on EVERY send, and scheduler.py retries a
+    failed drain indefinitely — so an unparseable value turned one typo into a
+    permanent 5-minute failure loop. MEASURED before the fix: `""` raised
+    `ValueError: Invalid isoformat string: ''` and `"25:99"` raised
+    `ValueError: hour must be in 0..23`. Nothing validates this field (the
+    settings domain registers no validator and the dashboard PUTs the config
+    through unchecked), and this change is what invites editing it.
+
+    Fails toward DISABLED: the owner keeps getting their messages, and the bad
+    value is logged rather than swallowed.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="genesis.outreach.governance"):
+        assert _REAL_IN_QUIET_HOURS(_QH(start, end)) is False
+    assert any("Invalid quiet_hours" in r.message for r in caplog.records), (
+        "failing toward disabled must still be LOUD — a silently-ignored typo is "
+        "how someone concludes quiet hours works when it does not"
+    )
