@@ -41,6 +41,16 @@ _spec.loader.exec_module(hook)
 wc = hook.wc
 
 
+def P(rule: str, **extra) -> dict:
+    """A well-formed ownership payload, built from the module's own namespace.
+
+    Hand-written literals here went stale the moment the payload gained its
+    namespace, and two of these tests then passed while asserting a format
+    nothing writes. Deriving it removes that failure mode.
+    """
+    return {"ns": wc.PAYLOAD_NAMESPACE, "v": 1, "rule": rule, **extra}
+
+
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=60)
 
@@ -149,7 +159,7 @@ def test_the_first_edit_into_an_unclaimed_worktree_claims_it(worktree: Path, mon
     lock = wc.read_lock(worktree)
     assert lock is not None
     assert lock.foreign is False
-    assert lock.payload == {"v": 1, "rule": "claim", "pid": 4242, "start": 99, "sid": "abc123"}
+    assert lock.payload == P("claim", pid=4242, start=99, sid="abc123")
 
 
 def test_an_already_locked_worktree_skips_the_ancestry_walk_entirely(
@@ -207,7 +217,7 @@ def test_a_rejected_session_id_still_produces_a_usable_claim(worktree: Path, mon
 
 
 def _claim_for(worktree: Path, pid: int, start: int, sid: str = "otherses") -> None:
-    reason = wc.format_reason({"v": 1, "rule": "claim", "pid": pid, "start": start, "sid": sid})
+    reason = wc.format_reason(P("claim", pid=pid, start=start, sid=sid))
     _git(worktree, "worktree", "lock", "--reason", reason, str(worktree))
 
 
