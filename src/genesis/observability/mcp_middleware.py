@@ -13,12 +13,14 @@ import logging
 import time
 from typing import Any
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.commit_identity import (
     same_commit as _same_commit,  # noqa: F401 — re-exported for Part A's guard test
 )
+from genesis.observability.mcp_arg_diagnostics import absorbed_parameter_hint
 from genesis.observability.mcp_guarded_tools import GUARDED_MCP_TOOLS
 from genesis.observability.provider_activity import ProviderActivityTracker
 
@@ -48,9 +50,11 @@ class InstrumentationMiddleware(Middleware):
     here only closes a *trailing* read txn (it can never discard a tool's own
     write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
     clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
-    possibly-partial write instead of committing it. The boundary catches nothing;
-    every exception propagates unchanged. DB errors in this boundary never
-    propagate to the tool handler.
+    possibly-partial write instead of committing it. The boundary swallows
+    nothing: a ``BaseException`` is not caught at all, and the one ``except
+    Exception`` clause always re-raises — sometimes as a ``ToolError`` chained to
+    the original, when the argument diagnosis below can name a better cause. DB
+    errors in this boundary never propagate to the tool handler.
     """
 
     def __init__(
@@ -79,8 +83,8 @@ class InstrumentationMiddleware(Middleware):
         # or a ``BaseException`` no clause catches — ``asyncio.CancelledError``,
         # ``SystemExit``, ``KeyboardInterrupt``, ``GeneratorExit`` (follow-up
         # 3183405d — the old ``except Exception`` let all of those keep success=True
-        # and commit a partial). Nothing is caught here, so every exception,
-        # cancellation included, propagates unchanged.
+        # and commit a partial). Nothing is swallowed: the ``except Exception``
+        # below always re-raises, and a cancellation is not caught at all.
         success = False
         try:
             if tool_name in GUARDED_MCP_TOOLS:
@@ -91,6 +95,37 @@ class InstrumentationMiddleware(Middleware):
             result = await call_next(context)
             success = True
             return result
+        except Exception as exc:
+            # success stays False — it is only set True after a clean return, so
+            # there is nothing to reset here.
+            # A "missing argument" error is sometimes the WRONG explanation: if a
+            # long free-text argument was emitted with a mismatched closing tag,
+            # it swallowed every parameter after it, and those are then reported
+            # missing though they were sent. Replace the message with the real
+            # cause when the evidence is in the arguments themselves.
+            #
+            # Only ever runs on a call that is ALREADY failing, never alters
+            # arguments, and returns None on every uncertain path — so it cannot
+            # make a well-formed call fail, and a false positive costs only a
+            # slightly wrong explanation on a call that was refused regardless.
+            hint = None
+            try:
+                hint = absorbed_parameter_hint(
+                    exc,
+                    getattr(context.message, "arguments", None) or {},
+                    tool_name,
+                )
+            except Exception:  # diagnosis must never replace the real error
+                # WARNING, not debug: this only fires when the diagnosis ITSELF
+                # is broken, on a path that is already an error, so it cannot
+                # spam — and at debug a persistent bug here would stay invisible
+                # across all four servers.
+                logger.warning(
+                    "argument diagnosis failed for %s", provider, exc_info=True
+                )
+            if hint:
+                raise ToolError(hint) from exc
+            raise
         finally:
             # Nested try/finally so a BaseException raised by the DB step cannot
             # skip the tracker record below it. Cancellation is the reachable
@@ -159,8 +194,9 @@ class InstrumentationMiddleware(Middleware):
             )
             return
         # block (default; any unexpected mode already degraded to block upstream)
-        from fastmcp.exceptions import ToolError
-
+        # ToolError is imported at module level now (the absorbed-parameter
+        # diagnosis needs it too), so the local re-import here would shadow it
+        # with the identical symbol.
         from genesis.observability import mcp_spawn_identity as si
 
         raise ToolError(
