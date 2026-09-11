@@ -308,6 +308,55 @@ def _targets_public_repo(remote: str, cwd: str | None) -> bool:
     return _canonical_repo(target_url) == _canonical_repo(origin_url)
 
 
+def _push_source_refs(cmd: str, cwd: str | None) -> list[str] | None:
+    """EVERY local ref this push sends, or None for "just HEAD".
+
+    A push is not always about the checked-out branch. ``git push origin
+    otherbranch``, ``--all``, ``--mirror`` and ``--tags`` all publish refs that
+    are not HEAD, and scanning HEAD's history for them inspects unrelated
+    content — so a credential living only on a selected non-HEAD ref reached the
+    public remote past a BLOCKING scanner with no signal at all.
+
+    Returns ``[]`` for a pure deletion (nothing is sent, nothing to scan).
+    Falls back to None (scan HEAD) whenever the argv cannot be read, which keeps
+    the previous behaviour rather than failing open to "scan nothing".
+    """
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None
+    try:
+        i = argv.index("push")
+    except ValueError:
+        return None
+    rest = argv[i + 1 :]
+    if any(a in ("--delete", "-d") for a in rest):
+        return []
+
+    wants_all = any(a in ("--all", "--mirror") for a in rest)
+    wants_tags = any(a == "--tags" for a in rest)
+    refs: list[str] = []
+    if wants_all:
+        out = _git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd)
+        refs += [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if wants_tags:
+        out = _git(["for-each-ref", "--format=%(refname:short)", "refs/tags"], cwd)
+        refs += [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if refs:
+        return refs
+
+    positionals = [a for a in rest if not a.startswith("-")]
+    # positionals: [remote] [refspec ...] — every refspec from the second onward.
+    for spec in positionals[1:]:
+        s = spec[1:] if spec.startswith("+") else spec
+        src = s.split(":", 1)[0]
+        if src:
+            refs.append(src)
+        else:
+            return []  # ":dst" is a deletion
+    return refs or None
+
+
 def _push_source_ref(cmd: str) -> str | None:
     """The LOCAL ref a push actually sends, or None for "whatever HEAD is".
 
@@ -341,6 +390,13 @@ def _push_source_ref(cmd: str) -> str | None:
     return src or ""
 
 
+def _scan_range(cwd: str | None, source_ref: str | None = None) -> tuple[str, str] | None:
+    """``(base, tip)`` for one ref, or None when the base cannot be resolved."""
+    tip = source_ref or "HEAD"
+    base = _git(["merge-base", "origin/main", tip], cwd)
+    return (base, tip) if base else None
+
+
 def _outgoing_diff(cwd: str | None, source_ref: str | None = None) -> str:
     """The unified diff being pushed (local commits not yet on origin).
 
@@ -358,7 +414,20 @@ def _outgoing_diff(cwd: str | None, source_ref: str | None = None) -> str:
     base = _git(["merge-base", "origin/main", tip], cwd)
     if not base:
         return ""
-    return _git(["diff", f"{base}..{tip}"], cwd) or ""
+    # `git log -p --no-merges`, NOT `git diff base..tip`.
+    #
+    # The net tree difference hides an add-then-remove: a commit that adds a
+    # credential and a later commit that removes it cancel out, so the diff shows
+    # nothing — while `git push` publishes BOTH commits and the blob stays
+    # publicly recoverable. That is the ordinary shape of secret remediation, so
+    # the case is common rather than exotic.
+    #
+    # It is also not hypothetical here: this very branch failed CI's leak
+    # detector on exactly that pattern (a value added in one commit, replaced in
+    # a later one, net-clean, still in history) — and CI caught it precisely
+    # because it iterates commits while this hook did not. Same bug, opposite
+    # outcome; the instrument that scanned every commit won.
+    return _git(["log", "-p", "--no-merges", f"{base}..{tip}"], cwd) or ""
 
 
 #: A line carrying any of these is a value a human has already judged generic.
@@ -430,12 +499,33 @@ def _assignment_is_literal(text: str) -> bool:
     if not sep:
         return False
     rhs = rhs.strip()
-    if any(m in rhs.lower() for m in _RHS_REFERENCE_MARKERS):
-        return False
     if rhs[:1] not in ("'", '"'):
+        return False  # a bare identifier or call — not an inline literal
+
+    # Isolate the ASSIGNED EXPRESSION before testing for reference markers.
+    #
+    # Scanning the whole remainder of the line let any trailing text disarm the
+    # detector: `DATABASE_PASSWORD = "real-long-password"  # local config`
+    # contains "config", so the line was classified as an indirect reference and
+    # skipped — on exactly the low-entropy class the module's own comment records
+    # gitleaks as NOT covering. A comment must not be able to vouch for the code
+    # beside it.
+    quote = rhs[0]
+    end = rhs.find(quote, 1)
+    if end == -1:
+        return False  # unterminated literal — not something to judge
+    value = rhs[1:end]
+    remainder = rhs[end + 1 :].strip()
+
+    # Markers are honoured only when they belong to the EXPRESSION — e.g.
+    # `KEY = "x" + os.environ["Y"]` is still a reference — never when they merely
+    # appear later on the line as prose. A remainder that starts a comment is
+    # prose by construction.
+    expression_tail = "" if remainder.startswith("#") else remainder
+    if any(m in (value + " " + expression_tail).lower() for m in _RHS_REFERENCE_MARKERS):
         return False
-    value = rhs.strip("'\"").strip()
-    return len(value) >= 12 and not value.lower().startswith(
+
+    return len(value.strip()) >= 12 and not value.lower().startswith(
         ("xxx", "test", "dummy", "example")
     )
 
@@ -466,6 +556,52 @@ def _shape_findings(parsed) -> list:
             elif name not in _PUSH_SHAPE_PATTERNS:
                 continue
             out.append(_ShapeFinding(file, line_no, name))
+    return out
+
+
+def _gitleaks_range_findings(cwd: str | None, base: str, tip: str) -> list:
+    """gitleaks over a COMMIT RANGE, which is what closes two gaps at once.
+
+    ``--log-opts`` makes gitleaks walk every commit itself, so:
+
+    * an add-then-remove within the branch is still seen (the earlier commit's
+      blob is scanned), which a net-diff feed cannot do; and
+    * BINARY blobs are scanned, which the line-oriented layers cannot see at all
+      — ``parse_diff`` yields no added_lines for a binary file, so a credential
+      inside a NUL-containing config or an archive was previously invisible to
+      every layer and the blocking hook allowed it onto a public branch.
+
+    Returns [] on any failure (absent binary, non-zero exit, unparseable report,
+    timeout). This layer enriches; it must never be able to block a push by
+    breaking.
+    """
+    import shutil as _sh
+    import tempfile
+
+    exe = _sh.which("gitleaks")
+    if not exe or not base:
+        return []
+    out: list = []
+    try:
+        with tempfile.TemporaryDirectory(dir=os.path.expanduser("~/tmp")) as td:
+            report = Path(td) / "report.json"
+            subprocess.run(
+                [exe, "detect", "--source", cwd or ".",
+                 "--log-opts", f"{base}..{tip}",
+                 "--report-format", "json", "--report-path", str(report),
+                 "--no-banner", "--redact"],
+                capture_output=True, text=True, timeout=_GITLEAKS_BUDGET_S,
+            )
+            if not report.is_file():
+                return []
+            data = json.loads(report.read_text() or "[]")
+        for item in data if isinstance(data, list) else []:
+            f = item.get("File") or "?"
+            n = item.get("StartLine")
+            rule = item.get("RuleID") or item.get("Description") or "gitleaks"
+            out.append(_ShapeFinding(f, n if isinstance(n, int) else 0, f"gitleaks:{rule}"))
+    except Exception:
+        return []
     return out
 
 
@@ -525,7 +661,11 @@ def _gitleaks_findings(parsed) -> list:
     return out
 
 
-def _scan(diff_text: str) -> tuple[list, list]:
+def _scan(
+    diff_text: str,
+    cwd: str | None = None,
+    rng: tuple[str, str] | None = None,
+) -> tuple[list, list]:
     """Split the cheap sanitizer scanners by CONFIDENCE, not into one flat list.
 
     Returns ``(known, generic)``:
@@ -577,7 +717,14 @@ def _scan(diff_text: str) -> tuple[list, list]:
     # install-known half is only that these can appear in a legitimate test
     # fixture, which is precisely what the annotation path above is for.
     known += _shape_findings(parsed)
-    known += _gitleaks_findings(parsed)
+    # Prefer the RANGE scan when the caller knows the range: gitleaks then walks
+    # every commit itself and sees BINARY blobs, neither of which a line-oriented
+    # feed can do. The added-lines feed remains for callers (and tests) that only
+    # have a diff.
+    if rng is not None:
+        known += _gitleaks_range_findings(cwd, rng[0], rng[1])
+    else:
+        known += _gitleaks_findings(parsed)
     return known, generic
 
 
@@ -633,11 +780,36 @@ def main() -> None:
         cwd = _effective_cwd(cmd, payload_cwd)
         if not _targets_public_repo(remote, cwd):
             return  # private-fork / non-origin push — real IPs allowed there
-        source_ref = _push_source_ref(cmd)
+        selected = _push_source_refs(cmd, cwd)
+        if selected == []:
+            return  # a deletion sends no content
+        # None means "just HEAD" — the ordinary case, and the previous behaviour.
+        refs: list[str | None] = list(selected) if selected else [None]
+        source_ref = refs[0]
         if source_ref == "":
             return  # a deletion sends no content
-        diff_text = _outgoing_diff(cwd, source_ref)
-        if not diff_text:
+        # Scan EVERY selected ref and merge the results. One ref failing to
+        # resolve does not excuse the others, and a finding on any of them is a
+        # finding for this push.
+        diff_parts: list[str] = []
+        ranges: list[tuple[str, str]] = []
+        unresolved: list[str] = []
+        for ref in refs:
+            part = _outgoing_diff(cwd, ref)
+            if part:
+                diff_parts.append(part)
+            else:
+                unresolved.append(ref or "HEAD")
+            # The range is an ENHANCEMENT (it lets gitleaks walk commits and see
+            # binary blobs), never a precondition for scanning. A ref whose range
+            # will not resolve but whose diff does must still be scanned by the
+            # regex layers — gating on the range would turn a partial capability
+            # loss into scanning nothing at all.
+            r = _scan_range(cwd, ref)
+            if r is not None:
+                ranges.append(r)
+        diff_text = "\n".join(d for d in diff_parts if d)
+        if unresolved and not diff_text:
             # Silence here used to be indistinguishable from "scanned, clean" —
             # but an unresolvable diff (shallow clone, origin/main never fetched,
             # a brand-new orphan branch) means NOTHING was scanned. Say which one
@@ -648,7 +820,7 @@ def main() -> None:
                         "hookEventName": "PreToolUse",
                         "additionalContext": (
                             "[Pre-push privacy review] Could not resolve the outgoing "
-                            f"diff for '{source_ref or 'HEAD'}' — NOTHING was scanned "
+                            f"diff for {', '.join(unresolved)} — NOTHING was scanned "
                             "for private data on this push. Usually a shallow clone or "
                             "an origin/main that was never fetched. Treat this as "
                             "unchecked, not as clean."
@@ -658,7 +830,13 @@ def main() -> None:
                 sys.stdout,
             )
             return
-        known, generic = _scan(diff_text)
+        if not diff_text:
+            return
+        known, generic = _scan(diff_text, cwd, ranges[0] if len(ranges) == 1 else None)
+        if len(ranges) > 1:
+            # Several refs: run the range scan for each, since --log-opts takes one.
+            for r in ranges:
+                known += _gitleaks_range_findings(cwd, r[0], r[1])
         if not known and not generic:
             return
 
