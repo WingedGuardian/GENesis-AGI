@@ -1408,6 +1408,7 @@ def _heartbeat_write(
         model = cached_model(session_id)
         topic = resolve_topic(db_path, session_id)
 
+        from genesis.db.crud.cc_sessions import touch_terminal_session_row_sync
         from genesis.db.crud.session_heartbeats import upsert_sync
 
         upsert_sync(
@@ -1418,6 +1419,10 @@ def _heartbeat_write(
             user_summary=user_summary,
             genesis_summary=genesis_summary,
         )
+        # Prompt-time truth repair for the terminal session row: advance the
+        # reaper's idle clock and undo an adoption-era 'completed' lie the
+        # moment the user types (2026-09-04 ghost). Same best-effort posture.
+        touch_terminal_session_row_sync(str(db_path), session_id)
     except Exception:
         pass  # Best-effort — never block
 

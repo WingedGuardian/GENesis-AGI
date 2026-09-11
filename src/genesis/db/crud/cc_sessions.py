@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -112,13 +113,141 @@ async def update_status(
     id: str,
     *,
     status: str,
+    ts: str | None = None,
 ) -> bool:
-    cursor = await db.execute(
-        "UPDATE cc_sessions SET status = ? WHERE id = ?",
-        (status, id),
-    )
+    """Single status writer, with terminal-timestamp discipline.
+
+    Measured origin (2026-09-04): ``completed_at`` had ZERO writers across
+    4556 live rows because this function wrote ``status`` alone and every
+    complete/fail/expire path routes through it. The discipline lives HERE —
+    one writer — so all callers are fixed at once and a new caller cannot
+    reintroduce the omission:
+
+    - ``completed``/``failed``/``expired`` also stamp ``completed_at``
+      (``ts`` or UTC now — tests inject ``ts``).
+    - ``checkpointed`` also stamps ``checkpointed_at`` (fixes
+      SessionManager.checkpoint, which never stamped it; the reaper's
+      ``checkpoint_dark`` keeps its own rowcount-guarded variant).
+    - ``active`` (reopen) clears ``completed_at`` — the pair
+      (active, completed_at set) lies in both directions.
+      ``checkpointed_at`` is left as history, deliberately.
+    """
+    stamp = ts or datetime.now(UTC).isoformat()
+    if status in ("completed", "failed", "expired"):
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET status = ?, completed_at = ? WHERE id = ?",
+            (status, stamp, id),
+        )
+    elif status == "checkpointed":
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET status = ?, checkpointed_at = ? WHERE id = ?",
+            (status, stamp, id),
+        )
+    elif status == "active":
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET status = ?, completed_at = NULL WHERE id = ?",
+            (status, id),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET status = ? WHERE id = ?",
+            (status, id),
+        )
     await db.commit()
     return cursor.rowcount > 0
+
+
+def register_terminal_session_sync(
+    db_path: str,
+    cc_session_id: str,
+    *,
+    pid: int | None = None,
+    model: str | None = None,
+) -> None:
+    """SessionStart registration for a terminal CC session (sync, hook-safe).
+
+    The write half of the 2026-09-04 fix: terminal sessions had NO creation
+    event — a 2-hourly extraction poll adopted them late (and, before this
+    branch, as 'completed'). This registers an honest ``active`` row the
+    moment the session starts, with the ``id == cc_session_id`` terminal
+    convention and the claude process's pid (the reaper's death-evidence
+    key). INSERT OR IGNORE + the reopen UPDATE below make it idempotent
+    across --resume and adoption races in either order; the pid refresh is
+    unconditional on the terminal row (a resumed session has a NEW pid).
+
+    Hook conventions throughout: plain sqlite3, 1s timeout, silence on any
+    failure — registration degrades to the adoption backstop, never blocks
+    a session start. Never creates the DB file (pre-bootstrap empty-state:
+    the caller guards existence; the sqlite_master check below guards the
+    pre-migration window).
+    """
+    import sqlite3
+
+    now = datetime.now(UTC).isoformat()
+    try:
+        with sqlite3.connect(db_path, timeout=1.0) as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cc_sessions'"
+            )
+            if cur.fetchone() is None:
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO cc_sessions "
+                "(id, cc_session_id, session_type, model, source_tag, "
+                " status, pid, started_at, last_activity_at) "
+                "VALUES (?, ?, 'foreground', ?, 'foreground', 'active', ?, ?, ?)",
+                (cc_session_id, cc_session_id, model or "unknown", pid, now, now),
+            )
+            # Row already existed (--resume, or a prior adoption): reopen a
+            # non-active terminal row and refresh liveness facts. Same
+            # predicate as touch_terminal_session_row_sync, plus pid/model.
+            conn.execute(
+                "UPDATE cc_sessions SET status = 'active', completed_at = NULL, "
+                "last_activity_at = ?, pid = COALESCE(?, pid), "
+                "model = COALESCE(?, model) "
+                "WHERE id = ? AND id = cc_session_id "
+                "  AND COALESCE(source_tag, '') != 'voice' "
+                "  AND status IN ('active', 'checkpointed', 'completed', 'expired')",
+                (now, pid, model, cc_session_id),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        return
+
+
+def touch_terminal_session_row_sync(db_path: str, cc_session_id: str) -> None:
+    """Prompt-time truth repair for a TERMINAL session row (sync, hook-safe).
+
+    Called from the UserPromptSubmit heartbeat path, so it follows the
+    heartbeats plane's conventions exactly: plain sqlite3, 1s timeout,
+    swallow-and-return on any error — a locked or pre-migration DB must
+    never slow a prompt.
+
+    Terminal rows (``id == cc_session_id`` — the registration/adoption
+    convention; channel rows are uuid4-plus-link and managed by
+    SessionManager, voice by its own sweep) historically froze
+    ``last_activity_at`` at insert (measured 2026-09-04: 98% of 4556 rows),
+    starving the reaper's idle clock — and adoption-era rows could carry a
+    ``completed`` lie while the user is typing. Every prompt: advance the
+    clock, and if the row sits in a non-active state, reopen it (the user
+    IS here) and clear the terminal timestamp.
+    """
+    import sqlite3
+
+    now = datetime.now(UTC).isoformat()
+    try:
+        with sqlite3.connect(db_path, timeout=1.0) as conn:
+            conn.execute(
+                "UPDATE cc_sessions SET last_activity_at = ?, status = 'active', "
+                "completed_at = NULL "
+                "WHERE id = ? AND id = cc_session_id "
+                "  AND COALESCE(source_tag, '') != 'voice' "
+                "  AND status IN ('active', 'checkpointed', 'completed', 'expired')",
+                (now, cc_session_id),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        return
 
 
 async def update_activity(
@@ -183,6 +312,31 @@ async def query_stale_foreground(
            WHERE status = 'active'
              AND session_type = 'foreground'
              AND COALESCE(source_tag, '') != 'voice'
+             AND last_activity_at < ?
+           ORDER BY last_activity_at ASC""",
+        (older_than,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def query_dead_candidate_foreground(
+    db: aiosqlite.Connection,
+    *,
+    older_than: str,
+) -> list[dict]:
+    """Terminal-registered foreground rows eligible for the pid-evidence
+    fast path: ``pid`` known AND ``id == cc_session_id`` (the terminal-row
+    discriminator — channel rows are uuid4-plus-link, so a pid set on them
+    by the reflection bridge can never match here) AND idle since before
+    *older_than*. Voice excluded as in :func:`query_stale_foreground`.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM cc_sessions
+           WHERE status = 'active'
+             AND session_type = 'foreground'
+             AND COALESCE(source_tag, '') != 'voice'
+             AND pid IS NOT NULL
+             AND id = cc_session_id
              AND last_activity_at < ?
            ORDER BY last_activity_at ASC""",
         (older_than,),
@@ -476,19 +630,32 @@ async def register_from_filesystem(
     id: str,
     cc_session_id: str,
     started_at: str,
+    status: str = "completed",
+    completed_at: str | None = None,
 ) -> bool:
     """Auto-register a session discovered from filesystem transcripts.
 
     Uses INSERT OR IGNORE so duplicates are silently skipped.
     Returns True if a new row was inserted.
+
+    The CALLER decides ``status`` from liveness evidence (fresh heartbeat /
+    transcript mtime) — the old hardcoded ``'completed'`` recorded LIVE
+    sessions as finished (measured 2026-09-04: a session with a 4-second-old
+    heartbeat carried status='completed'). A dead adoption should pass
+    ``completed_at`` (best-known end = transcript mtime) so terminal rows
+    carry an honest timestamp.
+
+    Convention note (load-bearing): terminal-adopted/registered rows use
+    ``id == cc_session_id``, unlike ``create()``'s uuid4-plus-link — the
+    equality is the discriminator the reaper's pid fast path and the
+    heartbeat repair use to touch ONLY terminal rows.
     """
     cursor = await db.execute(
         "INSERT OR IGNORE INTO cc_sessions "
         "(id, cc_session_id, session_type, model, source_tag, "
-        " status, started_at, last_activity_at) "
-        "VALUES (?, ?, 'foreground', 'unknown', 'foreground', "
-        " 'completed', ?, ?)",
-        (id, cc_session_id, started_at, started_at),
+        " status, started_at, last_activity_at, completed_at) "
+        "VALUES (?, ?, 'foreground', 'unknown', 'foreground', ?, ?, ?, ?)",
+        (id, cc_session_id, status, started_at, started_at, completed_at),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -546,8 +713,12 @@ async def complete_orphaned_voice_sessions(
     that is live at heal time, so this is safe at boot AND from the daily
     hygiene job.
     """
+    # completed_at = the row's OWN last activity, not sweep time: the best-
+    # known end of an orphan is its last sign of life; sweep-time would
+    # inflate snapshot durations by up to the sweep interval.
     cursor = await db.execute(
-        "UPDATE cc_sessions SET status = 'completed' "
+        "UPDATE cc_sessions SET status = 'completed', "
+        "completed_at = last_activity_at "
         "WHERE source_tag = 'voice' AND status = 'active' "
         "  AND last_activity_at < ?",
         (idle_before,),

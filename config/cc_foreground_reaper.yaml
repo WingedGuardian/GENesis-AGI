@@ -21,3 +21,14 @@ idle_hours: 24
 
 # Loud-truncation cap on dark rows processed per reaper pass.
 max_per_tick: 200
+
+# Evidence fast path: a terminal-registered row (pid recorded at SessionStart,
+# id == cc_session_id) idle at least this long whose recorded process is
+# provably GONE (/proc entry absent, comm changed, or pid recycled) is
+# checkpointed without waiting out idle_hours. A fresh session heartbeat
+# always outranks pid evidence (alive-proof wins). Same target state as the
+# 24h path — this grants no new authority, so it rides the mode gate above.
+dead_process_minutes: 30
+
+# Lever for the fast path itself; anything but literal true degrades to off.
+close_dead: true

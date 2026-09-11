@@ -54,12 +54,21 @@ DEFAULTS: dict[str, Any] = {
     "idle_hours": 24,
     # Loud-truncation cap: dark rows processed per reaper pass.
     "max_per_tick": 200,
+    # Evidence fast path: a terminal-registered row idle this long whose
+    # recorded pid is provably gone is checkpointed without waiting out
+    # idle_hours. Grants no authority beyond the existing reap (same target
+    # state), so it rides the mode gate.
+    "dead_process_minutes": 30,
+    # Lever for the fast path itself. Anything but literal True degrades to
+    # OFF (less write authority), per the config family's damage doctrine.
+    "close_dead": True,
 }
 
 # Public: the settings-domain validator imports these to check knobs.
 INT_KNOBS = (
     "idle_hours",
     "max_per_tick",
+    "dead_process_minutes",
 )
 
 

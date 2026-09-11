@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -91,8 +91,9 @@ _EXCLUDED_SOURCE_TAGS = frozenset({
 # "reflection_light", "reflection_strategic"; "user_job:<uuid>"). NOTE: a
 # source_tag written via raw parameterized SQL (positional bind) rather than a
 # `source_tag="..."` keyword literal is invisible to the coverage-guard's regex
-# scan, so it MUST be registered here by hand — e.g. "priority_<n>" from
-# resilience/cc_budget.py's INSERT (budget-counter rows, not transcripts).
+# scan, so it MUST be registered here by hand — e.g. "priority_<n>" LEGACY
+# rows (their raw-SQL writer in resilience/cc_budget.py was deleted
+# 2026-09-04, but existing installs still carry the rows).
 _EXCLUDED_SOURCE_TAG_PREFIXES = ("reflection", "user_job", "priority")
 
 # Transcript directory
@@ -872,6 +873,12 @@ async def _exhaust_procedure_rebuild(db: aiosqlite.Connection, queue, item: dict
     )
 
 
+# Adoption liveness window: a transcript written within this window is a
+# live session (the heartbeats table uses the same 10-minute staleness
+# convention). Beyond it, only a fresh heartbeat proves life.
+_ADOPT_ALIVE_WINDOW = timedelta(minutes=10)
+
+
 async def _find_extractable_sessions(
     db: aiosqlite.Connection,
     transcript_dir: Path = _TRANSCRIPT_DIR,
@@ -910,11 +917,30 @@ async def _find_extractable_sessions(
                     jsonl_file.stat().st_mtime, tz=UTC,
                 )
                 mtime_iso = mtime.isoformat()
+                # Honest adoption status (2026-09-04: the old hardcoded
+                # 'completed' recorded LIVE sessions as finished — a
+                # 4-second-old session read as done). ALIVE evidence =
+                # a transcript still being written (fresh mtime), or a
+                # fresh heartbeat for this cc_session_id. Dead adoptions
+                # carry completed_at = mtime, the best-known end time.
+                alive = (datetime.now(UTC) - mtime) <= _ADOPT_ALIVE_WINDOW
+                if not alive:
+                    try:
+                        from genesis.db.crud import session_heartbeats
+
+                        hb = await session_heartbeats.get_active(db)
+                        alive = any(
+                            h.get("cc_session_id") == session_id for h in hb
+                        )
+                    except Exception:
+                        alive = False  # no heartbeat plane → mtime verdict stands
                 await sessions_crud.register_from_filesystem(
                     db,
                     id=session_id,
                     cc_session_id=session_id,
                     started_at=mtime_iso,
+                    status="active" if alive else "completed",
+                    completed_at=None if alive else mtime_iso,
                 )
         except Exception:
             logger.warning(
