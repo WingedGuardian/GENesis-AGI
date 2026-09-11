@@ -95,6 +95,11 @@ TOMBSTONE_INDEX = Path.home() / ".genesis" / "worktree-tombstones.jsonl"
 # read THIS file instead of re-deriving. One producer, so they cannot disagree.
 BOARD_CACHE = Path.home() / ".genesis" / "worktree-board.json"
 TRASH_DIR = Path.home() / ".genesis" / "worktree-trash"
+
+#: Tag namespace for a reaped DETACHED worktree's HEAD commit. Without an anchor
+#: the per-worktree HEAD is the only thing keeping that chain reachable, and
+#: pruning the registration makes it collectable.
+_DETACHED_ANCHOR_PREFIX = "worktree-archive/"
 LOG_DIR = Path.home() / ".genesis" / "logs"
 
 # ---------------------------------------------------------------------------
@@ -584,13 +589,22 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     optimisation, and it must never be the reason a recovery is impossible.
     """
     archive = _archive_path(trash_path)
+    # Written to a .part first and renamed only after it verifies. A tar.gz
+    # written in place is a valid-looking file for the whole time it is being
+    # written, so a timer killed mid-write (or a power loss) would leave a
+    # truncated archive sitting beside a source directory that the next run then
+    # deletes. os.replace is atomic within a filesystem, so a reader sees either
+    # no archive or a complete one.
+    partial = Path(str(archive) + ".part")
     try:
-        with tarfile.open(archive, "w:gz", compresslevel=COMPRESS_LEVEL) as tf:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        with tarfile.open(partial, "w:gz", compresslevel=COMPRESS_LEVEL) as tf:
             tf.add(str(trash_path), arcname=trash_path.name)
     except (OSError, tarfile.TarError) as e:
         _log(f"WARN compress failed for {trash_path.name}: {e} — kept uncompressed")
         with contextlib.suppress(OSError):
-            archive.unlink()
+            partial.unlink()
         return None
 
     # Read the archive back IN FULL before trusting it, and compare the member
@@ -605,7 +619,7 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     # be caught explicitly — leaving it out is how the truncation escaped.
     expected = sum(1 for _ in trash_path.rglob("*")) + 1  # + the root dir member
     try:
-        with tarfile.open(archive, "r:gz") as tf:
+        with tarfile.open(partial, "r:gz") as tf:
             got = sum(1 for _ in tf)
         if got < expected:
             raise tarfile.TarError(
@@ -614,7 +628,15 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     except (OSError, tarfile.TarError, EOFError) as e:
         _log(f"WARN archive verify failed for {trash_path.name}: {e} — kept uncompressed")
         with contextlib.suppress(OSError):
-            archive.unlink()
+            partial.unlink()
+        return None
+
+    try:
+        os.replace(partial, archive)  # atomic publish, only after verification
+    except OSError as e:
+        _log(f"WARN could not publish archive for {trash_path.name}: {e} — kept uncompressed")
+        with contextlib.suppress(OSError):
+            partial.unlink()
         return None
 
     with contextlib.suppress(OSError):
@@ -623,17 +645,20 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     try:
         shutil.rmtree(str(trash_path))
     except OSError as e:
-        # Leaving the directory AND the archive makes `_iter_trash_entries` yield
-        # two entries sharing a name prefix, and `_recover` then refuses both as
-        # ambiguous — with no more-specific string available, since the names
-        # differ only by suffix. One form must win, and it is the directory: it is
-        # the original, and the archive is only ever a copy of it.
-        _log(f"WARN could not remove {trash_path} after archiving: {e} — kept uncompressed")
-        with contextlib.suppress(OSError):
-            archive.unlink()
-        with contextlib.suppress(OSError):
-            _sidecar_meta_path(trash_path).unlink()
-        return None
+        # The directory is now in an UNKNOWN state: rmtree deletes as it walks, so
+        # a mid-walk failure leaves some members gone. Discarding the verified
+        # archive here — as an earlier version did, to avoid an ambiguous pair —
+        # would throw away the only COMPLETE copy in favour of a partially
+        # deleted one. Keep the archive; it was read back and member-counted
+        # before this point.
+        #
+        # The ambiguity that motivated discarding it is handled where it actually
+        # bites, in `_recover`: an archive and a directory sharing a base name now
+        # resolve to the archive rather than being refused as two matches.
+        _log(f"WARN could not fully remove {trash_path} after archiving: {e} — "
+             f"KEEPING the verified archive at {archive.name}; the leftover "
+             f"directory may be incomplete and should be removed by hand")
+        return archive
 
     return archive
 
@@ -745,6 +770,19 @@ def _secret_shaped_files(worktree_path: Path) -> list[str]:
     return found
 
 
+def _trash_name_taken_excluding_claim(trash_path: Path) -> bool:
+    """Like ``_trash_name_taken`` but ignoring the directory we just claimed.
+
+    After an atomic ``mkdir`` claim, the directory itself exists by construction,
+    so the plain check would always report the name as taken. What still matters
+    is whether an ARCHIVE or a SIDECAR under that name survives from an earlier
+    reap — those are the forms that would be overwritten.
+    """
+    return (
+        _archive_path(trash_path).exists() or _sidecar_meta_path(trash_path).exists()
+    )
+
+
 def _trash_name_taken(trash_path: Path) -> bool:
     """Whether a trash name is claimed in ANY of the forms a reap can leave.
 
@@ -788,13 +826,14 @@ def _trash_worktree(
     # same name and `tarfile.open(..., "w:gz")` truncated the existing tarball,
     # destroying the earlier worktree's only copy — silently, and with no undo in
     # a module whose contract is that it deletes nothing.
-    counter = 1
-    while _trash_name_taken(trash_path):
-        trash_path = TRASH_DIR / f"{name}-{date_str}-{counter}"
-        counter += 1
-
     if dry_run:
-        _log(f"WOULD TRASH {wt_path}: → {trash_path}")
+        # Report the name the loop below WOULD claim, without claiming it.
+        probe = trash_path
+        counter = 1
+        while _trash_name_taken(probe):
+            probe = TRASH_DIR / f"{name}-{date_str}-{counter}"
+            counter += 1
+        _log(f"WOULD TRASH {wt_path}: → {probe}")
         return True
 
     # Re-check liveness HERE, not just at classification time. Classification now
@@ -812,6 +851,41 @@ def _trash_worktree(
 
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Claim the name with mkdir(exist_ok=False), which is ATOMIC. The old
+        # check-then-act loop had a real window: two reaper invocations handling
+        # different worktrees that share a basename could both pass
+        # `_trash_name_taken` before either created the destination, and the
+        # second would then archive over the first. `shutil.move` onto an
+        # existing empty directory places the source INSIDE it, so the claimed
+        # directory is removed immediately before the move and re-created by it —
+        # the claim's only job is to win the race, not to survive it.
+        claimed = False
+        for counter in range(1000):  # bounded; a spin here would hang the timer
+            candidate = trash_path if counter == 0 else TRASH_DIR / f"{name}-{date_str}-{counter}"
+            try:
+                candidate.mkdir(exist_ok=False)
+            except FileExistsError:
+                continue
+            except OSError as e:
+                _log(f"ERROR claiming trash name for {wt_path}: {e}")
+                return False
+            # mkdir only proves no DIRECTORY held the name. A previous reap
+            # leaves an ARCHIVE and a SIDECAR and no directory, so those forms
+            # must be checked too — and checked HERE, inside the loop, so a
+            # collision advances to the next candidate instead of refusing the
+            # reap outright.
+            if _trash_name_taken_excluding_claim(candidate):
+                with contextlib.suppress(OSError):
+                    candidate.rmdir()
+                continue
+            trash_path = candidate
+            claimed = True
+            break
+        if not claimed:
+            _log(f"ERROR {wt_path}: could not claim a free trash name after 1000 tries")
+            return False
+        trash_path.rmdir()  # hand the name to shutil.move, which recreates it
 
         # Write metadata to staging file BEFORE the move. If the move
         # fails we just have a harmless orphan file. If the process
@@ -868,11 +942,39 @@ def _trash_worktree(
             except OSError as e:
                 _log(f"  WARN could not save .dirty.patch for {trash_path.name}: {e}")
 
-        # Clean git's worktree registration
-        subprocess.run(
-            ["git", "worktree", "prune"],
-            capture_output=True, cwd=str(repo_root), timeout=10,
-        )
+        # A DETACHED worktree's per-worktree HEAD is the ONLY ref keeping its
+        # commit chain reachable. `git worktree prune` removes that ref, after
+        # which nothing points at those commits and a GC can collect them — so
+        # the archive would survive while the history it refers to did not. In a
+        # module whose contract is that it deletes nothing, that is the worst
+        # available failure: silent, delayed, and invisible until a recovery.
+        #
+        # So anchor the commit in a real ref FIRST. A tag under a dedicated
+        # namespace is the cheapest durable anchor and does not pollute the
+        # branch list. If tagging fails we do NOT prune: leaving a stale worktree
+        # registration is recoverable, losing the commits is not.
+        pruned_safely = True
+        commit_sha = str(wt.get("head") or "")
+        if detached and commit_sha:
+            anchor = f"{_DETACHED_ANCHOR_PREFIX}{trash_path.name}"
+            tag = subprocess.run(
+                ["git", "tag", "-f", anchor, commit_sha],
+                capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+            )
+            if tag.returncode != 0:
+                pruned_safely = False
+                _log(f"  WARN could not anchor detached commit {commit_sha[:8]} "
+                     f"({tag.stderr.strip()}) — SKIPPING prune so the commits stay "
+                     f"reachable; `git worktree prune` by hand once anchored")
+            else:
+                meta["detached_anchor"] = anchor
+                _log(f"  anchored detached HEAD {commit_sha[:8]} at refs/tags/{anchor}")
+
+        if pruned_safely:
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                capture_output=True, cwd=str(repo_root), timeout=10,
+            )
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
 
@@ -919,6 +1021,17 @@ def _recover(name: str, repo_root: Path) -> bool:
     if not matches:
         print(f"No trash entry matching '{name}'", file=sys.stderr)
         return False
+    if len(matches) > 1:
+        # A directory and an archive sharing a base name is not real ambiguity:
+        # it is the partial-rmtree state above, where the archive is the verified
+        # COMPLETE copy and the directory may be missing members. Prefer the
+        # archive rather than refusing both.
+        archives = [m for m in matches if m.name.endswith(ARCHIVE_SUFFIX)]
+        bases = {m.name[: -len(ARCHIVE_SUFFIX)] for m in archives}
+        if len(archives) == 1 and all(
+            m in archives or m.name in bases for m in matches
+        ):
+            matches = archives
     if len(matches) > 1:
         print(f"Multiple matches for '{name}':", file=sys.stderr)
         for m in matches:

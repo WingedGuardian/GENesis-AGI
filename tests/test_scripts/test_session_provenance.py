@@ -316,3 +316,91 @@ def test_an_unreadable_branch_makes_the_session_report_incomplete(repo, monkeypa
     err = capsys.readouterr().err
     assert rc == 1, "an incomplete answer must not exit 0"
     assert "INCOMPLETE" in err
+
+
+# ─── P2 findings from the PR review, each pinned ─────────────────────────────
+
+
+def test_an_uppercase_session_id_is_still_attribution(repo):
+    """The hook preserves the CASE of the source env var.
+
+    An uppercase CLAUDE_CODE_SESSION_ID stamps `Genesis-Session: ABCDEF12`, which
+    a lowercase-only pattern reported as UNSTAMPED — silent under-attribution on
+    a tool whose entire job is attribution. Ids are normalised on capture so both
+    spellings resolve to one identity.
+    """
+    _commit(repo, "a.txt", "feat: x\n\nGenesis-Session: ABCDEF12\n")
+    assert sp.scan("main", limit=1)[0]["sessions"] == ["abcdef12"]
+
+
+def test_a_separator_inside_a_commit_body_does_not_split_the_record(repo):
+    """A commit message can legally contain any byte.
+
+    With single control characters as framing, a body carrying one split a real
+    commit into two records or truncated it at the body field — losing exactly
+    the provenance lines this tool reads.
+    """
+    _commit(
+        repo, "a.txt",
+        "feat: awkward\n\nbody with \x1e and \x1f inside it\n\nGenesis-Session: 0a1b2c3d\n",
+    )
+    found = sp.scan("main", limit=1)
+    assert len(found) == 1, "the commit must stay ONE record"
+    assert found[0]["sessions"] == ["0a1b2c3d"], "and its provenance must survive"
+
+
+def test_a_closed_unmerged_pr_is_not_reported_as_open(repo, monkeypatch, capsys):
+    """gh returns a head ref for a closed PR too, so the fall-through lied."""
+    monkeypatch.setattr(sp, "_pr_state_and_head", lambda n: ("CLOSED", ""))
+    rc = sp.cmd_pr(4242)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "CLOSED without merging" in out
+    assert "OPEN" not in out
+
+
+def test_an_invalid_revision_is_a_clean_error_not_a_traceback(repo, capsys):
+    """`check=True` returns None; calling .strip() on it raised AttributeError."""
+    rc = sp.cmd_commit("no-such-rev-exists")
+    assert rc == 1
+    assert "no such commit" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--limit", "--coverage"])
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_a_nonpositive_bound_is_refused(repo, monkeypatch, flag, bad):
+    """It previously OMITTED the bound, making the scan silently unbounded while
+    every message still described it as capped."""
+    argv = ["session_provenance.py", flag, bad]
+    if flag == "--limit":
+        argv += ["--session", "0a1b2c3d"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        sp.main()
+    assert exc.value.code != 0
+
+
+def test_a_squash_merged_branch_is_not_reported_as_unlanded(repo, monkeypatch, capsys):
+    """This repo squash-merges, so a merged branch's commits are not ancestors.
+
+    `main..<branch>` still returns them, and reporting those as unlanded would
+    manufacture lost work out of work that shipped — the opposite of the job.
+    """
+    _commit(repo, "base.txt", "feat: base\n\nGenesis-Session: 11111111\n")
+    _git(repo, "checkout", "-q", "-b", "shipped")
+    _commit(repo, "f.txt", "feat: work\n\nGenesis-Session: 22222222\n")
+    _git(repo, "checkout", "-q", "main")
+    # Squash the branch onto main: same content, different commit.
+    _git(repo, "merge", "--squash", "shipped")
+    _git(repo, "commit", "-q", "-m", "feat: work (#1) squashed")
+
+    assert sp._is_patch_merged("shipped") is True, "precondition: cherry sees it upstream"
+    sp.cmd_session("22222222", 50)
+    out = capsys.readouterr().out
+    assert "unlanded branches" not in out, "a shipped branch must not be called unlanded"
+
+
+def test_a_capped_ambiguity_count_says_at_least(repo):
+    """LIMIT-ed rows can only prove "at least N", and said "N" exactly."""
+    assert "at least" in sp._describe({"id": "x", "db": {"ambiguous": 3, "capped": True}})
+    assert "at least" not in sp._describe({"id": "x", "db": {"ambiguous": 2, "capped": False}})

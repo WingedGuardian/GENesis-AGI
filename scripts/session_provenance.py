@@ -58,8 +58,13 @@ DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # The hook shape-constrains both ids to exactly 8 lowercase hex characters.
-_SESSION_RE = re.compile(r"^\s*Genesis-Session:\s*([0-9a-f]{8})\s*$", re.MULTILINE)
-_INSTALL_RE = re.compile(r"^\s*Install:\s*([0-9a-f]{8})\s*$", re.MULTILINE)
+# Case-INSENSITIVE, then lowercased at the capture site. The hook shape-constrains
+# to 8 hex characters but preserves the case of the source env var, so an
+# uppercase CLAUDE_CODE_SESSION_ID stamps `Genesis-Session: ABCDEF12` — which a
+# lowercase-only pattern reports as UNSTAMPED. Silent under-attribution, on a
+# tool whose entire job is attribution.
+_SESSION_RE = re.compile(r"^\s*Genesis-Session:\s*([0-9a-fA-F]{8})\s*$", re.MULTILINE)
+_INSTALL_RE = re.compile(r"^\s*Install:\s*([0-9a-fA-F]{8})\s*$", re.MULTILINE)
 _PR_RE = re.compile(r"\(#(\d+)\)\s*$")
 # The hook shape-constrains ids to exactly 8 lowercase hex; anything else reaching
 # a glob or a SQL GLOB is a pattern, not an identifier.
@@ -71,8 +76,14 @@ _SESSION_ID_RE = re.compile(r"[0-9a-f]{8}")
 # one, on exactly the code path whose failure used to read as "the PR is open".
 _PR_SEARCH_LIMIT = 4000
 
-_SEP_FIELD = "\x1f"
-_SEP_REC = "\x1e"
+# Record/field framing. A commit MESSAGE can legally contain any byte, including
+# U+001E/U+001F, and a body carrying one would split a real commit into two
+# records or truncate it at `parts[3]` — losing exactly the provenance lines this
+# tool exists to read. So the separators are long random-ish sentinels rather than
+# single control characters: still impossible to produce accidentally, but no
+# longer a single byte a message might contain.
+_SEP_FIELD = "\x1fGXF\x1f"
+_SEP_REC = "\x1eGXR\x1e"
 
 
 def _git(*args: str, check: bool = False):
@@ -113,11 +124,11 @@ def sessions_in(text: str) -> list[str]:
     legitimately mention a trailer (this file's own docstring does), and a loose
     search would attribute a commit to a session merely discussed in it.
     """
-    return sorted(set(_SESSION_RE.findall(text)))
+    return sorted({m.lower() for m in _SESSION_RE.findall(text)})
 
 
 def installs_in(text: str) -> list[str]:
-    return sorted(set(_INSTALL_RE.findall(text)))
+    return sorted({m.lower() for m in _INSTALL_RE.findall(text)})
 
 
 def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
@@ -133,7 +144,13 @@ def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
         f"--format=%H{_SEP_FIELD}%ad{_SEP_FIELD}%s{_SEP_FIELD}%B{_SEP_REC}",
         "--date=short",
     ]
-    if limit and limit > 0:
+    if limit is not None:
+        # A nonpositive limit previously OMITTED the bound entirely, so the scan
+        # silently became unbounded while every message still described it as
+        # capped. Refuse instead: an unbounded scan the caller did not ask for is
+        # a different operation, not a lenient reading of the same one.
+        if limit <= 0:
+            raise ValueError(f"history limit must be positive, got {limit}")
         args.append(f"-{limit}")
     args.append(rev_range)
     raw = _git(*args, check=True)
@@ -173,6 +190,20 @@ def scan(rev_range: str, limit: int | None = None) -> list[dict] | None:
     return out
 
 
+def _is_patch_merged(branch: str) -> bool:
+    """Whether every commit on ``branch`` is already in main BY PATCH.
+
+    ``git cherry`` marks a commit ``-`` when an equivalent patch exists upstream,
+    which is what a squash merge produces. Fail-SAFE toward "not merged": on any
+    error the branch keeps being reported, since over-reporting unlanded work is
+    the harmless direction for a tool that exists to find it.
+    """
+    out = _git("cherry", "main", branch)
+    if not out:
+        return False
+    return not any(line.startswith("+") for line in out.splitlines())
+
+
 def enrich(session_id: str) -> dict:
     """Whatever else is known about a session id. Absence is a real answer.
 
@@ -187,9 +218,13 @@ def enrich(session_id: str) -> dict:
             try:
                 row = con.execute(
                     "SELECT id, session_type, channel, model, status, started_at, "
-                    "COALESCE(topic, '') FROM cc_sessions WHERE id GLOB ? LIMIT 2",
+                    "COALESCE(topic, '') FROM cc_sessions WHERE id GLOB ? LIMIT 3",
                     (session_id + "*",),
                 ).fetchall()
+            # NOTE the LIMIT below is 3, not 2: with LIMIT 2 the count could only
+            # ever be "at least 2", yet it was rendered as the exact sentence
+            # "2 sessions share this prefix". Fetching one more lets the message
+            # distinguish exactly-2 from more-than-2 honestly.
             finally:
                 con.close()
             if len(row) == 1:
@@ -197,8 +232,9 @@ def enrich(session_id: str) -> dict:
                 info["db"] = dict(zip(keys, row[0], strict=False))
             elif len(row) > 1:
                 # An 8-hex prefix is not guaranteed unique. Say so rather than
-                # picking one and presenting a guess as a fact.
-                info["db"] = {"ambiguous": len(row)}
+                # picking one and presenting a guess as a fact — and say whether
+                # the count is exact, since the query is capped.
+                info["db"] = {"ambiguous": len(row), "capped": len(row) >= 3}
         except sqlite3.Error:
             pass
 
@@ -216,7 +252,9 @@ def enrich(session_id: str) -> dict:
 def _describe(info: dict) -> str:
     db = info.get("db")
     if db and "ambiguous" in db:
-        return f"{db['ambiguous']} sessions share this prefix — ambiguous"
+        n = db["ambiguous"]
+        more = "at least " if db.get("capped") else ""
+        return f"{more}{n} sessions share this prefix — ambiguous"
     if db:
         topic = (db.get("topic") or "").strip()
         head = f"{db.get('type', '?')}/{db.get('status', '?')} started {db.get('started_at', '?')}"
@@ -255,6 +293,11 @@ def cmd_pr(number: int) -> int:
     # the same fail-open shape as the git-failure case above, one level subtler
     # because here the scan SUCCEEDED and was merely too short.
     state, head = _pr_state_and_head(number)
+    if state == "CLOSED":
+        # Closed without merging. gh still returns a head ref, so falling through
+        # would print "OPEN" for a PR that is demonstrably not open.
+        print(f"PR #{number} — CLOSED without merging (head branch {head or '?'})")
+        return cmd_branch(head, header=False) if head else 0
     if state == "MERGED":
         print(
             f"PR #{number} — MERGED, but its merge commit is outside the "
@@ -330,7 +373,14 @@ def cmd_branch(branch: str, header: bool = True) -> int:
 
 
 def cmd_commit(rev: str) -> int:
-    sha = _git("rev-parse", "--verify", rev, check=True).strip()
+    raw = _git("rev-parse", "--verify", rev, check=True)
+    if raw is None:
+        # `check=True` returns None on failure; `.strip()` on it raised an
+        # AttributeError traceback instead of the intended clean CLI error, for
+        # any misspelled or deleted revision.
+        print(f"no such commit: {rev}", file=sys.stderr)
+        return 1
+    sha = raw.strip()
     if not sha:
         return 1
     commits = scan(f"{sha}~1..{sha}") or scan(sha, limit=1)
@@ -363,9 +413,19 @@ def cmd_session(session_id: str, limit: int) -> int:
 
     live: list[tuple[str, int]] = []
     incomplete: list[str] = []
-    for line in _git("for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
+    refs = _git("for-each-ref", "--format=%(refname:short)", "refs/heads", check=True)
+    if refs is None:
+        print("could not enumerate local branches", file=sys.stderr)
+        return 1
+    for line in refs.splitlines():
         b = line.strip()
         if not b or b == "main":
+            continue
+        if _is_patch_merged(b):
+            # This repo SQUASH-merges, so a merged branch's original commits are
+            # not ancestors of main and `main..<branch>` still returns them.
+            # Reporting those as "unlanded" is the opposite of this tool's job:
+            # it would manufacture lost work out of work that shipped.
             continue
         branch_commits = scan(f"main..{b}")
         if branch_commits is None:
@@ -437,6 +497,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Trace work back to the session that produced it.",
     )
+    def _positive(v: str) -> int:
+        """argparse type: a history bound must be positive.
+
+        Validated at PARSE time rather than left to `scan` to raise, so a bad
+        value is a clean usage error instead of a traceback mid-run. A
+        nonpositive limit previously omitted the bound entirely, making the scan
+        silently unbounded while every message still described it as capped.
+        """
+        n = int(v)
+        if n <= 0:
+            raise argparse.ArgumentTypeError(f"must be a positive integer, got {n}")
+        return n
+
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--pr", type=int, help="PR number (open or merged)")
     g.add_argument("--commit", help="commit-ish")
@@ -446,12 +519,15 @@ def main() -> int:
         "--coverage",
         nargs="?",
         const=200,
-        type=int,
+        type=_positive,
         metavar="N",
         help="attribution rate over the last N commits",
     )
     ap.add_argument(
-        "--limit", type=int, default=400, help="commits of main to scan for --session (default 400)"
+        "--limit",
+        type=_positive,
+        default=400,
+        help="commits of main to scan for --session (default 400)",
     )
     args = ap.parse_args()
 
