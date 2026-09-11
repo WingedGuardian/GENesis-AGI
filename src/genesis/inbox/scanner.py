@@ -40,8 +40,16 @@ _URL_TRAILING_PUNCT = ".,;:!?)]}'\""
 def strip_tracking_params(url: str) -> str:
     """Remove tracking query params from a single URL; leave path/fragment intact.
 
-    Public because the coverage check also needs it: a utm campaign word must
-    not count as evidence that a specific URL was evaluated.
+    Used for DEDUP comparison (see :func:`normalize_url_line`) — the same
+    article re-pasted with different share params must compare equal.
+
+    NOT used by the coverage check, deliberately. An earlier revision of this
+    docstring claimed it was, which was never true and pointed a reader at a
+    tracking-awareness the gate does not have. MEASURED 2026-09-10: applying it
+    to both sides of the coverage comparison rescued 0 of 146 corpus URLs, and
+    stripping the whole query string instead would merge genuinely different
+    URLs (``watch?v=A`` with ``watch?v=B``) — a worse failure than the false
+    positive it would fix.
     """
     try:
         parts = urlsplit(url)

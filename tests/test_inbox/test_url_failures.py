@@ -13,6 +13,7 @@ from genesis.inbox.monitor import _has_url_failures, _uncovered_urls
 # _has_url_failures — heuristic detection
 # ---------------------------------------------------------------------------
 
+
 class TestHasUrlFailures:
     """Tested against all 8 real response files: 0 FP, 0 FN."""
 
@@ -28,17 +29,20 @@ class TestHasUrlFailures:
         """No URLs in input → never triggers, even if response has error language."""
         assert _has_url_failures("unfetchable video", "just a text note") is False
 
-    @pytest.mark.parametrize("pattern", [
-        "unfetchable",
-        "unreachable from this host",
-        "watch them yourself",
-        "cannot evaluate the video",
-        "cannot assess without content",
-        "could not be fetched",
-        "could not be accessed",
-        "i could not fetch",
-        "i could not access",
-    ])
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "unfetchable",
+            "unreachable from this host",
+            "watch them yourself",
+            "cannot evaluate the video",
+            "cannot assess without content",
+            "could not be fetched",
+            "could not be accessed",
+            "i could not fetch",
+            "i could not access",
+        ],
+    )
     def test_detects_failure_pattern(self, pattern):
         content = "See https://youtube.com/watch?v=abc123"
         response = f"The URL was {pattern} due to SSL errors."
@@ -80,228 +84,202 @@ class TestHasUrlFailures:
 # _uncovered_urls — per-URL coverage check (silent-omission detection)
 # ---------------------------------------------------------------------------
 
+
 class TestUncoveredUrls:
-    """Silent omission is invisible to _has_url_failures (no give-up language
-    is emitted for a URL the model never mentions). _uncovered_urls closes
-    that hole: every input URL must leave SOME trace in the response."""
+    """The gate is now ONE rule: the input URL must appear in the response.
 
-    def test_no_urls_returns_empty(self):
-        assert _uncovered_urls("any response", "just a note") == []
+    The prose-evidence ladder that used to sit under this (path segments,
+    distinctive tokens, domain aliases, stoplists) was deleted, not repaired.
+    MEASURED on the completed-evaluation corpus: it bought 6 of 146 URLs and
+    carried six defects, each of which let an undiscussed URL baseline
+    permanently. The cases below marked "Codex #1820" are those defects, kept as
+    regression tests so the ladder cannot come back by accident.
+    """
 
-    def test_silently_omitted_url_detected(self):
-        content = "https://example.com/first-article https://other.org/second-piece"
+    def test_verbatim_url_is_covered(self):
+        content = "https://example.com/some-article"
+        response = "# Inbox Evaluation\n**Source:** https://example.com/some-article\nGood piece."
+        assert _uncovered_urls(response, content) == []
+
+    def test_silently_omitted_url_is_flagged(self):
+        """The whole point: no give-up language, just absence."""
+        content = "https://example.com/one-thing\nhttps://other.org/two-thing"
+        response = "# Inbox Evaluation\n**Source:** https://example.com/one-thing\nOnly one."
+        assert _uncovered_urls(response, content) == ["https://other.org/two-thing"]
+
+    def test_coverage_ignores_scheme_www_and_trailing_slash(self):
+        content = "https://www.example.com/piece/"
+        response = "# Inbox Evaluation\nSee example.com/piece for details."
+        assert _uncovered_urls(response, content) == []
+
+    def test_a_verbatim_url_keeping_its_trailing_slash_is_covered(self):
+        """The needle has its trailing slash stripped, so the response's own
+        slash lands in the continuation tail. It is not a continuation."""
+        content = "https://www.example-tech.com/some-cluster-tool/"
         response = (
-            "# Inbox Evaluation\n\n## first-article\n"
-            "Deep discussion of the example.com piece only.\n"
-        )
-        assert _uncovered_urls(response, content) == [
-            "https://other.org/second-piece",
-        ]
-
-    def test_full_coverage_by_slug(self):
-        content = "https://example.com/first-article https://other.org/second-piece"
-        response = (
-            "# Inbox Evaluation\n## 1. first-article\n...\n"
-            "## 2. second-piece\n...\n"
+            "# Inbox Evaluation\n**Source:** https://www.example-tech.com/some-cluster-tool/\n"
         )
         assert _uncovered_urls(response, content) == []
-
-    def test_platform_name_is_not_evidence_for_a_path_bearing_url(self):
-        """A platform name identifies the SITE, never WHICH item on it.
-
-        Deliberate contract change (2026-09-06, CodeRabbit finding on #1820):
-        an earlier revision accepted "the LinkedIn post" as coverage for a
-        lone linkedin.com URL. MEASURED by probe: that let a response which
-        fetched nothing and named only the platform baseline its URL — the
-        exact silent-drop class this gate exists to catch. Domain-level
-        evidence now counts only when the domain IS the identity (no path).
-        """
-        content = "https://www.linkedin.com/posts/someone_zx9qv84k"
-        response = "# Inbox Evaluation\nThe LinkedIn post argues that agents..."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_platform_name_is_not_evidence_for_a_repo_url(self):
-        content = "https://github.com/OpenBMB/VoxCPM"
-        response = "# Inbox Evaluation\nA GitHub project worth noting."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_query_only_url_is_not_a_bare_domain(self):
-        """A query carries identity exactly as a path does.
-
-        The domain used to be split on "/" alone, so "example.com?v=abc" was
-        treated as the whole domain: the slug rung never ran and the domain
-        rung then passed on the stem "example". Same class as the platform-name
-        hole (CodeRabbit, #1820).
-        """
-        content = "https://example.com?v=abc123xyz"
-        response = "# Inbox Evaluation\nAn example of the pattern, discussed."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_fragment_only_url_is_not_a_bare_domain(self):
-        content = "https://example.com#deep-section-anchor"
-        response = "# Inbox Evaluation\nAn example worth noting."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_query_identity_counts_as_coverage(self):
-        """The flip side: a query value IS identity evidence when cited."""
-        content = "https://watch.tv?id=first-clip-9f2"
-        response = "# Inbox Evaluation\nThe first-clip-9f2 video is good."
-        assert _uncovered_urls(response, content) == []
-
-    def test_same_domain_guard_survives_query_only_urls(self):
-        """Two query-only URLs share a domain — one being discussed must not
-        vouch for the other (the count keyed on the query before the fix)."""
-        content = (
-            "https://watch.tv?id=first-clip-9f2 https://watch.tv?id=second-clip-3k8"
-        )
-        response = "# Inbox Evaluation\nThe first-clip-9f2 video is interesting."
-        assert _uncovered_urls(response, content) == [
-            "https://watch.tv?id=second-clip-3k8"
-        ]
-
-    def test_url_does_not_ride_a_siblings_coverage(self):
-        """Rung 1 is a substring test, so a URL that is a PREFIX of a sibling
-        used to pass on the sibling's quoted text — bypassing the same-domain
-        guard entirely (architect audit, measured 3/3)."""
-        content = "https://search.app/XYZ https://search.app/XYZW"
-        response = "# Inbox Evaluation\n**Source:** https://search.app/XYZW"
-        assert _uncovered_urls(response, content) == ["https://search.app/XYZ"]
-
-    def test_domain_only_url_does_not_ride_a_deeper_sibling(self):
-        content = "https://example.com https://example.com/deep/path-9f2"
-        response = "# Inbox Evaluation\nThe deep/path-9f2 piece is good."
-        assert _uncovered_urls(response, content) == ["https://example.com"]
-
-    @pytest.mark.parametrize(
-        "token",
-        ["news", "docs", "read", "share", "link", "open", "apps", "sites",
-         "mail", "medium"],
-    )
-    def test_generic_words_are_not_identity_as_path_segments(self, token):
-        """The stopword set must be the SAME on every rung — these words were
-        excluded as domain stems but still passed as path segments (10/10)."""
-        content = f"https://example.com/{token}"
-        response = f"# Inbox Evaluation\nA piece about {token} in general."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_tracking_param_is_not_identity(self):
-        """A utm campaign word must not vouch for the item, and must not make
-        the domain rung unreachable for a URL whose identity IS the domain."""
-        content = "https://example.com/?utm_source=newsletter"
-        response = "# Inbox Evaluation\nThis week's newsletter covers agents."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_bare_year_is_not_identity(self):
-        content = "https://example.com/2024/03/some-deep-article"
-        response = "# Inbox Evaluation\nA 2024 retrospective, broadly."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_slug_does_not_match_inside_a_longer_word(self):
-        content = "https://example.com/agent"
-        response = "# Inbox Evaluation\nAbout AI agents in general."
-        assert _uncovered_urls(response, content) == [content]
-
-    def test_malformed_ipv6_url_does_not_raise(self):
-        """urlsplit raises ValueError on a bracketed IPv6 literal; the scan
-        must not abort the whole inbox cycle (measured raise, no handler)."""
-        content = "check https://[fe80::1/report"
-        assert _uncovered_urls("# Inbox Evaluation\nnothing", content)
-
-    def test_schemeless_url_carrying_a_scheme_in_its_query(self):
-        """`"://" in u` is a substring test, not a scheme test — a scheme-less
-        URL whose QUERY contains :// folded its host into the remainder."""
-        content = "bit.ly/xk3?u=https://other.com/thing"
-        response = "# Inbox Evaluation\nThe xk3 link is a redirect."
-        assert _uncovered_urls(response, content) == []
-
-    def test_brace_wrapped_real_url_is_not_exempt(self):
-        """The {} placeholder exemption must not excuse a real URL that merely
-        got a trailing brace from the surrounding prose."""
-        content = "see {https://example.com/secret-slug-9f2}"
-        response = "# Inbox Evaluation\nI did nothing at all."
-        assert _uncovered_urls(response, content) != []
-
-    def test_bare_domain_url_is_covered_by_domain_evidence(self):
-        """When the URL carries no path the domain IS the identity, so
-        domain/stem evidence is genuine evidence — not a platform gesture."""
-        content = "https://voxcpm.ai"
-        response = "# Inbox Evaluation\nvoxcpm is a tokenizer-free TTS model."
-        assert _uncovered_urls(response, content) == []
-
-    def test_domain_alias_cannot_vouch_for_two_urls_on_same_domain(self):
-        # Two linkedin URLs; response covers one by slug and says "LinkedIn"
-        # generally — the alias must NOT mark the second one covered.
-        content = (
-            "https://linkedin.com/posts/a_first-post-zx9qv84k\n"
-            "https://linkedin.com/posts/b_other-topic-qq7ttv2m"
-        )
-        response = (
-            "# Inbox Evaluation\n## LinkedIn: first-post\n"
-            "Covers zx9qv84k in depth. LinkedIn content quality varies.\n"
-        )
-        uncovered = _uncovered_urls(response, content)
-        assert uncovered == ["https://linkedin.com/posts/b_other-topic-qq7ttv2m"]
 
     def test_coverage_is_case_insensitive(self):
         content = "https://github.com/OpenBMB/VoxCPM"
-        response = "# Inbox Evaluation\nvoxcpm is a tokenizer-free TTS model."
+        response = "# Inbox Evaluation\n**Source:** https://GITHUB.com/openbmb/voxcpm"
         assert _uncovered_urls(response, content) == []
 
-    def test_youtube_video_id_counts_as_coverage(self):
-        content = "https://youtube.com/watch?v=dQw4w9WgXcQ"
-        response = "# Inbox Evaluation\nThe video (dQw4w9WgXcQ) demonstrates..."
+    def test_a_sentence_period_after_the_url_does_not_break_the_match(self):
+        content = "https://example.com/piece"
+        response = "# Inbox Evaluation\nRead https://example.com/piece. It is good."
         assert _uncovered_urls(response, content) == []
 
-    def test_template_placeholder_urls_never_demand_coverage(self):
-        # A pasted API doc line like api.github.com/repos/{slug} is prose,
-        # not a fetchable URL (MEASURED: 1 such false flag in the 133-item
-        # historical corpus replay, 2026-09-06).
-        content = "Call https://api.github.com/repos/{repo_slug} to list them"
-        response = "# Inbox Evaluation\nA note about GitHub API usage."
-        assert _uncovered_urls(response, content) == []
+    # ---- Codex #1820 regressions -------------------------------------------
 
-    @pytest.mark.parametrize(
-        ("content", "response"),
-        [
-            # Reproductions from the adversarial review (5/5 passed the stem
-            # rung before _GENERIC_STEM_TOKENS): incidental English words
-            # matching a shortener's domain stem or alias are NOT evidence.
-            (
-                "https://search.app/nuXmqZ9",
-                "# Inbox Evaluation\nI ran a web search to verify the claim.",
-            ),
-            (
-                "https://share.google/XyZabQ7pL",
-                "# Inbox Evaluation\nPlease share feedback on this analysis.",
-            ),
-            (
-                "https://medium.com/@someone/deep-dive-abcdefgh",
-                "# Inbox Evaluation\nMedium confidence in this assessment.",
-            ),
-            (
-                "https://read.cv/someperson",
-                "# Inbox Evaluation\nA good read overall, worth noting.",
-            ),
-            (
-                "https://news.ycombinator.com/item?id=4159",
-                "# Inbox Evaluation\nNo real news here beyond the headline.",
-            ),
-        ],
-    )
-    def test_generic_stem_words_are_not_coverage_evidence(
-        self, content, response
-    ):
+    def test_a_sibling_url_does_not_vouch_for_its_prefix(self):
+        """Codex #1820 P1: the continuation test was a DENYLIST of URL
+        characters and could never be complete — ':', ';', '@', '+', '~', '!',
+        '$', ',', '*', "'", '(' and ')' are all legal in an RFC 3986 path, so a
+        response quoting only `.../foo:bar` vouched for an omitted `.../foo`."""
+        content = "https://example.com/foo"
+        for sep in (":", ";", "@", "+", ",", "!", "$", "*", "(", "~"):
+            response = f"# Inbox Evaluation\nSee https://example.com/foo{sep}bar here."
+            assert _uncovered_urls(response, content) == [content], f"leaked via {sep!r}"
+
+    def test_a_longer_sibling_does_not_vouch_for_its_prefix(self):
+        content = "https://search.app/XYZ"
+        response = "# Inbox Evaluation\n**Source:** https://search.app/XYZW"
         assert _uncovered_urls(response, content) == [content]
 
-    def test_shortener_covered_by_verbatim_source_line(self):
-        # The prompt now requires echoing each URL verbatim — the compliant
-        # form for opaque shorteners whose target is discussed by title.
-        content = "https://lnkd.in/p/eYssnmfd"
-        response = (
-            "# Inbox Evaluation\n## Some Article Title\n"
-            "**Source:** https://lnkd.in/p/eYssnmfd\nGreat piece about agents."
+    def test_a_different_host_ending_in_the_input_host_does_not_vouch(self):
+        """The LEFT boundary, and it is not symmetric with the right one.
+
+        The needle is scheme- and `www.`-stripped, so it is deliberately a
+        SUFFIX of what a response writes — which is why the left side cannot
+        mirror the right. With no left check at all, a citation of a DIFFERENT
+        host whose name merely ends in the input host covered it.
+        """
+        content = "https://example.com/article"
+        for other in (
+            "https://cdn.example.com/article",  # a subdomain is a different host
+            "https://notexample.com/article",  # no dot, still a different host
+            "https://my-example.com/article",
+        ):
+            response = f"# Inbox Evaluation\n**Source:** {other}"
+            assert _uncovered_urls(response, content) == [content], f"leaked via {other}"
+
+    def test_the_www_and_scheme_variants_still_count_as_the_same_url(self):
+        """The other side of the left boundary: these MUST still pass, and they
+        are exactly why it cannot be a plain word-boundary check."""
+        content = "https://example.com/article"
+        for same in (
+            "https://www.example.com/article",  # `www.` was stripped from the needle
+            "http://example.com/article",  # scheme-insensitive
+            "example.com/article",  # bare, at the very start of a line
+        ):
+            response = f"# Inbox Evaluation\n{same}"
+            assert _uncovered_urls(response, content) == [], f"false miss on {same}"
+
+    # Both boundary checks must cost O(1) per match, not O(response). There are
+    # TWO independent quadratics here and they need DIFFERENT input shapes to
+    # reach — a single test cannot pin both, which is how the first version of
+    # this passed against both defects. A shadow gate still COMPUTES its verdict,
+    # so `url_coverage_mode` mitigates neither: either would stall the event loop.
+
+    @staticmethod
+    def _scaling_ratio(build, content, k_small, k_large):
+        """Cost ratio between two input sizes, as a load-INVARIANT shape test.
+
+        An absolute wall-clock budget flakes: measured on this box, the same
+        assertion passed at 0.017s idle and failed at 2.415s under a load average
+        of 11 — a 140x swing with no code change. A RATIO cancels that, because
+        contention slows both measurements together. Linear work over a 4x input
+        gives ~4; quadratic gives ~16.
+
+        min-of-3 per size, because the timer's noise floor is one-sided: a run
+        can be arbitrarily slow (a scheduler preemption) but never faster than
+        the work takes.
+        """
+        import time
+
+        def best(k):
+            response = build(k)
+            runs = []
+            for _ in range(3):
+                start = time.perf_counter()
+                _uncovered_urls(response, content)
+                runs.append(time.perf_counter() - start)
+            return min(runs)
+
+        return best(k_large) / max(best(k_small), 1e-6)
+
+    def test_the_continuation_scan_stops_at_the_first_non_punctuation(self):
+        """Reaches the RIGHT-hand scan: separating repeats with `/` keeps every
+        match's left boundary legal, so each one runs the continuation scan.
+
+        MEASURED at k=2000 (50KB): consuming the whole run takes 7.3s, breaking
+        early takes 0.002s. Asserted as a ratio — see `_scaling_ratio`.
+        """
+        content = "https://example.com/some-article"
+        # The trailing "more" matters: without it the FINAL occurrence ends at
+        # end-of-string with only a slash after it, which IS a genuine citation,
+        # so the URL would be covered and no match would run the full scan.
+        ratio = self._scaling_ratio(
+            lambda k: "example.com/some-article/" * k + "more", content, 1000, 4000
         )
+        assert ratio < 8, f"continuation scan is not O(1) per match: 4x input cost {ratio:.1f}x"
+
+    def test_the_left_boundary_check_never_slices_the_prefix(self):
+        """Reaches the LEFT-hand check: joining repeats with no separator makes
+        every match illegal on the left, so each is rejected there before the
+        right-hand scan ever runs.
+
+        `lower[:m.start()]` copies the prefix on EVERY match. MEASURED at k=32000
+        (768KB): slicing ~1.8s, reading one character 0.017s.
+        """
+        content = "https://example.com/some-article"
+        ratio = self._scaling_ratio(lambda k: "example.com/some-article" * k, content, 8000, 32000)
+        assert ratio < 8, f"left-boundary check is not O(1) per match: 4x input cost {ratio:.1f}x"
+
+    def test_a_malformed_url_never_becomes_a_universal_match(self):
+        """Codex #1820 P2: `https:///` normalises to an empty needle, and an
+        empty pattern matches at every position — so a response saying nothing
+        at all "covered" it and it baselined."""
+        content = "https:///"
+        response = "# Inbox Evaluation\nThis says nothing about any link whatsoever."
+        assert _uncovered_urls(response, content) != []
+
+    def test_a_shared_slug_cannot_cover_two_different_urls(self):
+        """Codex #1820 P1: segment evidence was accepted without checking
+        whether the same segment identified another input URL, so one mention of
+        a shared slug covered BOTH — permanently baselining the omitted one.
+        Under a verbatim rule this cannot arise; pinned so it cannot return."""
+        content = "https://one.example/project-x9z7\nhttps://two.example/project-x9z7"
+        response = "# Inbox Evaluation\nSome notes on project-x9z7 and what it does."
+        assert len(_uncovered_urls(response, content)) == 2
+
+    def test_prose_mentioning_a_path_word_is_not_coverage(self):
+        """Codex #1820 P1: a whole path segment needed only 3 chars and absence
+        from a finite stoplist, so `/agents` was "covered" by any response that
+        discussed agents. No token-level rule can separate that from a real
+        identity like `voxcpm`, which is why the rung is gone."""
+        content = "https://example.com/agents"
+        response = "# Inbox Evaluation\nA general discussion about agents and how they work."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_a_port_bearing_url_is_not_covered_by_its_bare_domain(self):
+        """Codex #1820 P2: `hostname` dropped the port, so `example.com:8443`
+        collapsed to `example.com` and passed on a bare mention of the domain."""
+        content = "https://example.com:8443"
+        response = "# Inbox Evaluation\nA note about example.com and nothing else."
+        assert _uncovered_urls(response, content) == [content]
+
+    # ---- exemptions ---------------------------------------------------------
+
+    def test_template_placeholder_urls_never_demand_coverage(self):
+        content = "Call https://api.github.com/repos/{repo_slug} to list them"
+        response = "# Inbox Evaluation\nI did not fetch anything."
         assert _uncovered_urls(response, content) == []
+
+    def test_no_urls_means_nothing_to_cover(self):
+        assert _uncovered_urls("# Inbox Evaluation\nA plain note.", "just a text note") == []
 
 
 class TestRealEvaluatorOutputPasses:
@@ -331,10 +309,10 @@ class TestRealEvaluatorOutputPasses:
         assert _uncovered_urls(response, content) == []
 
     def test_opaque_shortener_quoted_verbatim(self):
-        content = "https://lnkd.in/p/eYssnmfd"
+        content = "https://lnkd.in/p/aB3xK9Qz"
         response = (
             "# Inbox Evaluation\n## Item 1 — Repowise (LinkedIn post)\n"
-            "**Source:** https://lnkd.in/p/eYssnmfd\n"
+            "**Source:** https://lnkd.in/p/aB3xK9Qz\n"
             "**Resolved to:** https://www.linkedin.com/posts/ai-agents-ugcPost-749\n"
         )
         assert _uncovered_urls(response, content) == []
@@ -353,10 +331,12 @@ class TestRealEvaluatorOutputPasses:
 # mark_url_failure CRUD
 # ---------------------------------------------------------------------------
 
+
 class TestMarkUrlFailure:
     @pytest.fixture
     async def db(self, tmp_path):
         import aiosqlite
+
         db_path = tmp_path / "test.db"
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -385,8 +365,11 @@ class TestMarkUrlFailure:
 
         item_id = str(uuid.uuid4())
         await inbox_items.create(
-            db, id=item_id, file_path="/test/f.md",
-            content_hash="abc", status="processing",
+            db,
+            id=item_id,
+            file_path="/test/f.md",
+            content_hash="abc",
+            status="processing",
             created_at=datetime.now(UTC).isoformat(),
         )
         # Simulate having evaluated_content from a prior eval
@@ -397,7 +380,8 @@ class TestMarkUrlFailure:
         await db.commit()
 
         result = await inbox_items.mark_url_failure(
-            db, item_id,
+            db,
+            item_id,
             response_path="/test/f.genesis.md",
             processed_at=datetime.now(UTC).isoformat(),
         )
@@ -416,12 +400,16 @@ class TestMarkUrlFailure:
 
         item_id = str(uuid.uuid4())
         await inbox_items.create(
-            db, id=item_id, file_path="/test/f.md",
-            content_hash="abc", status="processing",
+            db,
+            id=item_id,
+            file_path="/test/f.md",
+            content_hash="abc",
+            status="processing",
             created_at=datetime.now(UTC).isoformat(),
         )
         await inbox_items.mark_url_failure(
-            db, item_id,
+            db,
+            item_id,
             response_path="/test/f.genesis.md",
             processed_at=datetime.now(UTC).isoformat(),
         )
@@ -435,12 +423,16 @@ class TestMarkUrlFailure:
 
         item_id = str(uuid.uuid4())
         await inbox_items.create(
-            db, id=item_id, file_path="/test/f.md",
-            content_hash="abc", status="processing",
+            db,
+            id=item_id,
+            file_path="/test/f.md",
+            content_hash="abc",
+            status="processing",
             created_at=datetime.now(UTC).isoformat(),
         )
         await inbox_items.mark_url_failure(
-            db, item_id,
+            db,
+            item_id,
             processed_at=datetime.now(UTC).isoformat(),
         )
 
@@ -453,12 +445,16 @@ class TestMarkUrlFailure:
 
         item_id = str(uuid.uuid4())
         await inbox_items.create(
-            db, id=item_id, file_path="/test/f.md",
-            content_hash="abc", status="processing",
+            db,
+            id=item_id,
+            file_path="/test/f.md",
+            content_hash="abc",
+            status="processing",
             created_at=datetime.now(UTC).isoformat(),
         )
         await inbox_items.mark_url_failure(
-            db, item_id,
+            db,
+            item_id,
             response_path="/test/f.genesis.md",
             processed_at=datetime.now(UTC).isoformat(),
         )
@@ -471,10 +467,12 @@ class TestMarkUrlFailure:
 # count_url_failures (retry storm prevention)
 # ---------------------------------------------------------------------------
 
+
 class TestCountUrlFailures:
     @pytest.fixture
     async def db(self, tmp_path):
         import aiosqlite
+
         db_path = tmp_path / "test.db"
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -500,6 +498,7 @@ class TestCountUrlFailures:
 
     async def test_count_zero_when_no_failures(self, db):
         from genesis.db.crud import inbox_items
+
         count = await inbox_items.count_url_failures(db, "/test/f.md")
         assert count == 0
 
@@ -515,23 +514,32 @@ class TestCountUrlFailures:
         now = datetime.now(UTC)
         for i in range(3):
             await inbox_items.create(
-                db, id=str(uuid.uuid4()), file_path="/test/drop.md",
-                content_hash=f"h{i}", status="failed",
+                db,
+                id=str(uuid.uuid4()),
+                file_path="/test/drop.md",
+                content_hash=f"h{i}",
+                status="failed",
                 created_at=now.isoformat(),
             )
             await db.execute(
                 "UPDATE inbox_items SET error_message = "
                 "'partial_url_failure: uncovered https://x.com/a', "
-                "retry_count = 1 WHERE content_hash = ?", (f"h{i}",),
+                "retry_count = 1 WHERE content_hash = ?",
+                (f"h{i}",),
             )
         await db.commit()
 
         # Raw row count still sees three...
         assert await inbox_items.count_url_failures(db, "/test/drop.md") == 3
         # ...but none has exhausted its retries, so it is not a storm.
-        assert await inbox_items.count_url_failures(
-            db, "/test/drop.md", min_retry_count=3,
-        ) == 0
+        assert (
+            await inbox_items.count_url_failures(
+                db,
+                "/test/drop.md",
+                min_retry_count=3,
+            )
+            == 0
+        )
 
     async def test_exhausted_rows_still_count_as_a_storm(self, db):
         """The protection must survive the fix: genuinely persistent failure
@@ -541,15 +549,24 @@ class TestCountUrlFailures:
         now = datetime.now(UTC)
         for i in range(3):
             await inbox_items.create(
-                db, id=str(uuid.uuid4()), file_path="/test/drop.md",
-                content_hash=f"e{i}", status="failed",
+                db,
+                id=str(uuid.uuid4()),
+                file_path="/test/drop.md",
+                content_hash=f"e{i}",
+                status="failed",
                 created_at=now.isoformat(),
-                error_message="partial_url_failure", retry_count=3,
+                error_message="partial_url_failure",
+                retry_count=3,
             )
         await db.commit()
-        assert await inbox_items.count_url_failures(
-            db, "/test/drop.md", min_retry_count=3,
-        ) == 3
+        assert (
+            await inbox_items.count_url_failures(
+                db,
+                "/test/drop.md",
+                min_retry_count=3,
+            )
+            == 3
+        )
 
     async def test_counts_coverage_variant_messages(self, db):
         """The storm guard must also count coverage-gate failures — their
@@ -558,8 +575,11 @@ class TestCountUrlFailures:
 
         now = datetime.now(UTC)
         await inbox_items.create(
-            db, id=str(uuid.uuid4()), file_path="/test/f.md",
-            content_hash="h-cov", status="failed",
+            db,
+            id=str(uuid.uuid4()),
+            file_path="/test/f.md",
+            content_hash="h-cov",
+            status="failed",
             created_at=now.isoformat(),
         )
         await db.execute(
@@ -577,14 +597,18 @@ class TestCountUrlFailures:
         now = datetime.now(UTC)
         for i in range(3):
             await inbox_items.create(
-                db, id=str(uuid.uuid4()), file_path="/test/f.md",
-                content_hash=f"hash{i}", status="failed",
+                db,
+                id=str(uuid.uuid4()),
+                file_path="/test/f.md",
+                content_hash=f"hash{i}",
+                status="failed",
                 created_at=(now - timedelta(hours=i)).isoformat(),
             )
             # Set the error_message to partial_url_failure
             await db.execute(
                 "UPDATE inbox_items SET error_message = 'partial_url_failure' "
-                "WHERE content_hash = ?", (f"hash{i}",),
+                "WHERE content_hash = ?",
+                (f"hash{i}",),
             )
         await db.commit()
 
@@ -596,8 +620,12 @@ class TestCountUrlFailures:
 
         old_time = (datetime.now(UTC) - timedelta(hours=72)).isoformat()
         await inbox_items.create(
-            db, id=str(uuid.uuid4()), file_path="/test/f.md",
-            content_hash="old", status="failed", created_at=old_time,
+            db,
+            id=str(uuid.uuid4()),
+            file_path="/test/f.md",
+            content_hash="old",
+            status="failed",
+            created_at=old_time,
         )
         await db.execute(
             "UPDATE inbox_items SET error_message = 'partial_url_failure' "
@@ -612,13 +640,15 @@ class TestCountUrlFailures:
         from genesis.db.crud import inbox_items
 
         await inbox_items.create(
-            db, id=str(uuid.uuid4()), file_path="/test/other.md",
-            content_hash="x", status="failed",
+            db,
+            id=str(uuid.uuid4()),
+            file_path="/test/other.md",
+            content_hash="x",
+            status="failed",
             created_at=datetime.now(UTC).isoformat(),
         )
         await db.execute(
-            "UPDATE inbox_items SET error_message = 'partial_url_failure' "
-            "WHERE content_hash = 'x'",
+            "UPDATE inbox_items SET error_message = 'partial_url_failure' WHERE content_hash = 'x'",
         )
         await db.commit()
 
@@ -629,13 +659,15 @@ class TestCountUrlFailures:
         from genesis.db.crud import inbox_items
 
         await inbox_items.create(
-            db, id=str(uuid.uuid4()), file_path="/test/f.md",
-            content_hash="y", status="failed",
+            db,
+            id=str(uuid.uuid4()),
+            file_path="/test/f.md",
+            content_hash="y",
+            status="failed",
             created_at=datetime.now(UTC).isoformat(),
         )
         await db.execute(
-            "UPDATE inbox_items SET error_message = 'cc_invocation_error' "
-            "WHERE content_hash = 'y'",
+            "UPDATE inbox_items SET error_message = 'cc_invocation_error' WHERE content_hash = 'y'",
         )
         await db.commit()
 

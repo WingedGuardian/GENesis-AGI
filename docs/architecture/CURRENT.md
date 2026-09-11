@@ -925,8 +925,14 @@ verified: 788dd9a9 2026-09-06
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
   still references it (`count_live_rows_for_approval`); this replaced the old
-  4h staleness cancel that re-detected unchanged files and nagged. Coherence +
-  URL-failure heuristics gate dispatch.
+  4h staleness cancel that re-detected unchanged files and nagged. Three checks
+  sit between a response and the baseline: a coherence check (annotates, never
+  blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
+  requiring every input URL to appear in the response — that last one catches
+  SILENT omission, which the language check cannot see by construction. Coverage
+  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
+  its verdict and logs what it would have re-queued, acting on nothing until
+  compliance under the `**Source:**` prompt has been measured.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage

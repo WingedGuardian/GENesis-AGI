@@ -1,12 +1,28 @@
-- **An inbox evaluation that silently skips a URL is now re-queued instead of
-  lost.** The old accountability check only caught give-up *language* ("could
-  not be fetched"); a response that simply never mentioned one of its URLs
-  passed, and the omitted link was permanently absorbed into the evaluated
-  baseline — invisible, unrecoverable loss. A per-URL coverage check now
-  requires every input URL to leave a trace in the response (verbatim URL,
-  slug, or platform mention), the evaluation prompt requires each URL echoed
-  as a `**Source:**` line, and a miss re-queues the item through the existing
-  bounded retry path with the partial response preserved.
+- **The inbox now notices when an evaluation silently skips a URL — and says so
+  before it starts acting on it.** The accountability check only ever caught
+  give-up *language* ("could not be fetched"); a response that simply never
+  mentioned one of its URLs passed, and the omitted link was permanently
+  absorbed into the evaluated baseline — invisible, unrecoverable loss. A
+  coverage check now requires every input URL to APPEAR in the response
+  (scheme- and `www.`-insensitively), and the evaluation prompt requires each
+  URL echoed as a `**Source:**` line. It ships in **shadow**
+  (`url_coverage_mode: shadow` in `config/inbox_monitor.yaml`): it computes its
+  verdict and logs what it *would* have re-queued, and changes nothing. Set
+  `url_coverage_mode: enforce` to have a miss re-queue the item through the
+  existing bounded retry path with the partial response preserved.
+
+  Shadow is the default deliberately. The check is new, and replaying it over
+  this install's completed evaluations flags roughly half of older responses —
+  which would re-queue them into a retry path that parks a whole file after
+  `max_retries` with no notification. Watch the shadow log first; enforce when
+  the rate reflects responses written under the `**Source:**` prompt.
+
+  One known false positive, left documented rather than patched: a response that
+  cites a URL *without* its tracking or query parameters (the prompt asks for
+  verbatim) reads as a miss. Stripping tracking params does not fix it — measured
+  at 0 of 146 rescued — and stripping the whole query string would merge
+  genuinely different URLs (`watch?v=A` and `watch?v=B`), which is worse than the
+  false positive.
 
 - **A note written directly above a URL now travels with it.** The natural way
   to annotate a saved link — intent on one line, URL on the next — used to be

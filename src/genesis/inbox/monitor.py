@@ -10,7 +10,6 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -25,7 +24,6 @@ from genesis.inbox.scanner import (
     read_content,
     scan_folder,
     segment_items,
-    strip_tracking_params,
 )
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.observability.failure_details import failure_details
@@ -151,73 +149,6 @@ def _has_url_failures(response_text: str, input_content: str) -> bool:
     return any(p in lower for p in _URL_FAILURE_PATTERNS)
 
 
-# Tokens too generic to be EVIDENCE that a specific URL was evaluated: they
-# name a content TYPE or are ordinary English, so an incidental "I ran a web
-# search" / "medium confidence" / "a piece about news" must never vouch for
-# search.app, medium.com or example.com/news.
-#
-# ONE set, used on EVERY rung. It was briefly two (a stem set that was a strict
-# superset of a token set), and the wider one guarded only the domain rung —
-# so every word added to harden that rung stayed a free pass as a path segment
-# (MEASURED 10/10 by adversarial audit, 2026-09-06). Keep it single: an
-# asymmetry here is invisible and re-opens the hole it was added to close.
-_GENERIC_TOKENS: frozenset[str] = frozenset(
-    {
-        "about",
-        "amp",
-        "api",
-        "app",
-        "apps",
-        "article",
-        "articles",
-        "blog",
-        "channel",
-        "comments",
-        "docs",
-        "faq",
-        "feed",
-        "google",
-        "help",
-        "home",
-        "index",
-        "item",
-        "link",
-        "mail",
-        "medium",
-        "news",
-        "open",
-        "page",
-        "post",
-        "posts",
-        "profile",
-        "read",
-        "report",
-        "research",
-        "review",
-        "search",
-        "share",
-        "shorts",
-        "sites",
-        "status",
-        "tag",
-        "tags",
-        "user",
-        "www",
-        "stories",
-        "update",
-        "updates",
-        "video",
-        "watch",
-    }
-)
-
-# A bare year is a date path component (blogs, news archives), never identity.
-_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
-
-# A real scheme, anchored — `"://" in u` is a SUBSTRING test, and a
-# scheme-less URL can carry "://" inside its own query
-# (bit.ly/xk3?u=https://other.com/thing), which folded the host into the
-# remainder and made the domain rung unreachable.
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
 # A template placeholder, e.g. api.github.com/repos/{slug}. Requires a REAL
@@ -226,34 +157,46 @@ _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 # the whole gate.
 _PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
 
+# Characters that may legally continue a URL, per RFC 3986: unreserved,
+# sub-delims, and the path/query/fragment separators. Used as an ALLOWLIST —
+# see `_url_quoted` for why the previous denylist could not be completed.
+# Lower-case only: every comparison is against an already-lowered response.
+_URL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/?#%")
+# What a SENTENCE, not a URL, leaves after a link — plus the trailing slash the
+# needle has already had stripped from its own end. A run made only of these
+# means the URL ENDED there; any other character continues it.
+_TAIL_IGNORABLE = frozenset("/.,;:!?)'\"")
+# Characters that can appear in a HOSTNAME. A match preceded by one sits inside
+# a DIFFERENT host — `cdn.example.com/a` is not a citation of `example.com/a`.
+_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
+
 
 def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
-    """Return the input URLs the response shows NO evidence of covering.
+    """Return the input URLs the response never quotes.
 
-    ``_has_url_failures`` only catches give-up LANGUAGE — a model that
+    :func:`_has_url_failures` only catches give-up LANGUAGE — a model that
     silently omits a URL emits none, so omission was undetectable by
-    construction (the silent-drop hazard). This closes that hole: every URL
-    sent for evaluation must leave a trace in the response.
+    construction (the silent-drop hazard). This closes that hole with ONE rule:
+    every input URL must APPEAR in the response, scheme- and www-insensitively,
+    and must not merely be the prefix of a longer URL.
 
-    Evidence ladder, per URL (case-insensitive):
-    1. The full URL (scheme/www-insensitive) appears verbatim.
-    2. Its identity remainder — everything after the domain (path, query
-       and/or fragment) — appears, either whole or as a distinctive token:
-       len >= 6, or len >= 4 containing a digit (video ids, short slugs),
-       excluding :data:`_GENERIC_URL_TOKENS`.
-    3. Domain-level evidence (bare domain, platform alias from
-       :data:`_DOMAIN_TO_NAMES`, or the domain stem) — accepted ONLY for a
-       URL with NO remainder, where the domain IS the identity, and only when
-       the item carries a single URL on that domain. A platform name never
-       vouches for a URL that has a remainder: "the LinkedIn post" identifies
-       the site, not which post, so accepting it would pass a response that
-       fetched nothing. Aliases and stems that are common English words
-       (:data:`_GENERIC_STEM_TOKENS`) never count either — "medium
-       confidence" is not evidence about medium.com.
+    An earlier revision inferred coverage from prose instead — path segments,
+    distinctive tokens, domain aliases, stoplists. It was removed rather than
+    repaired, for two measured reasons. MEASURED over the completed-evaluation
+    corpus (85 items / 146 URLs readable, 2026-09-10): the ladder passed 64/146
+    where this rule alone passes 58/146, so roughly 200 lines of heuristic bought
+    SIX URLs — one of them a template placeholder that should never have demanded
+    coverage. And it carried six defects (Codex, PR #1820), every one of which
+    let a URL nobody had discussed pass as covered and be permanently baselined.
+
+    Repair was not possible at the token level: no rule separates ``voxcpm``
+    (identity) from ``second`` (prose) — six letters each, no digit, no
+    separator, in no stoplist — because the information is not in the token. It
+    is in whether the response CITED the URL, which is exactly what this rule
+    asks.
 
     A miss is deliberately cheap: the caller re-queues the item through the
-    existing partial-failure retry path (max_retries-capped) — it never
-    deletes data. Matching is therefore tuned generous-but-attributable.
+    existing bounded partial-failure retry path. It never deletes data.
     """
     urls = _extract_urls(input_content)
     if not urls:
@@ -261,113 +204,82 @@ def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
     lower = response_text.lower()
 
     def _bare(u: str) -> str:
-        b = _SCHEME_RE.sub("", u.lower())
-        return b.removeprefix("www.")
-
-    def _split(u: str) -> tuple[str, str]:
-        """(domain, identity-bearing remainder) for a URL.
-
-        Path, query AND fragment all carry item identity, so only the host is
-        the "domain" — splitting on "/" alone folded a query into the
-        "domain", which skipped the slug rung. Uses the canonical parser
-        rather than hand-rolled delimiters, with three guards learned by
-        measurement: an ANCHORED scheme test (``"://" in u`` is a substring
-        test that mis-parses a scheme-less URL carrying "://" in its query);
-        ``hostname`` rather than ``netloc`` (which would keep userinfo and
-        port); and tracking params stripped BEFORE the remainder becomes
-        evidence, so a utm campaign word is never identity and a URL whose
-        identity really is its domain keeps reaching the domain rung.
-        Returns ``("", ...)`` on an unparseable URL — no domain rung, never
-        a raise (a bracketed IPv6 literal used to abort the whole scan).
-        """
-        try:
-            parts = urlsplit(
-                strip_tracking_params(u) if _SCHEME_RE.match(u) else "//" + u,
-            )
-            domain = (parts.hostname or "").removeprefix("www.")
-        except ValueError:
-            return "", _bare(u).strip("/?#")
-        remainder = parts.path
-        if parts.query:
-            remainder += "?" + parts.query
-        if parts.fragment:
-            remainder += "#" + parts.fragment
-        return domain, remainder.lower().strip("/?#")
-
-    def _quoted(needle: str) -> bool:
-        """True when *needle* appears in the response as its OWN token.
-
-        Every rung matched with a bare ``in`` before, so a slug rode a longer
-        word ("/agent" covered by "agents") and a URL rode a sibling that
-        merely extended it ("search.app/XYZ" covered by ".../XYZW").
-        """
-        return re.search(r"(?<![\w\-])" + re.escape(needle) + r"(?![\w\-])", lower) is not None
+        return _SCHEME_RE.sub("", u.lower()).removeprefix("www.")
 
     def _url_quoted(bare_url: str) -> bool:
-        """Rung 1: the URL appears and does NOT continue into a longer one."""
-        return re.search(re.escape(bare_url) + r"(?![\w\-./?#=&%])", lower) is not None
+        """The URL appears and does NOT continue into a longer one.
 
-    def _is_identity(tok: str, *, min_len: int) -> bool:
-        return (
-            len(tok) >= min_len
-            and tok not in _GENERIC_TOKENS
-            and not _YEAR_RE.match(tok)
-            and _quoted(tok)
-        )
+        The continuation test is an ALLOWLIST of what may legally follow. It was
+        a denylist of URL characters, and a denylist of a character class is
+        always incomplete: it omitted ``:``, ``;``, ``@``, ``+``, ``~``, ``!``,
+        ``$``, ``,``, ``*``, ``'``, ``(`` and ``)``, all legal in an RFC 3986
+        path — so a response quoting only ``.../foo:bar`` vouched for an omitted
+        ``.../foo``. Patching in the three that were reported would have left the
+        other nine for the next review round.
 
-    domain_counts: dict[str, int] = {}
-    for u in urls:
-        d, _ = _split(u)
-        domain_counts[d] = domain_counts.get(d, 0) + 1
+        Inverted here: a character that a SENTENCE would not have put there
+        continues the URL. That closes the whole class, and also stops a
+        sentence-final ``.`` or ``,`` from breaking an otherwise exact match —
+        which the denylist got wrong in the other direction.
+
+        BOTH boundaries are checked, and they are not symmetric. The needle is
+        scheme- and ``www.``-stripped, so it is deliberately a SUFFIX of what a
+        response actually writes — which means the left side cannot simply
+        mirror the right. Without a left check, a response citing a DIFFERENT
+        host whose name merely ends in the input host vouched for it:
+        ``cdn.example.com/a`` and ``notexample.com/a`` both covered
+        ``example.com/a`` (MEASURED against this function, 2026-09-10).
+        """
+        if not bare_url:
+            # ``https:///`` normalises to an empty needle, and an empty pattern
+            # matches at every position — so every response "covered" it.
+            # Nothing can be evidence for a URL carrying no identity. Note this
+            # URL is therefore never satisfiable: under `enforce` it retries to
+            # the cap and parks, which is the correct end for a URL that carries
+            # no identity to check.
+            return False
+        for m in re.finditer(re.escape(bare_url), lower):
+            # LEFT: allow the stripped ``www.``, a scheme's ``//``, and any
+            # non-host character. Reject a host character — that is a different
+            # hostname, not a citation of this one.
+            #
+            # Read the ONE character before the match; never slice the prefix.
+            # `lower[:m.start()]` copies m.start() characters on EVERY match, so
+            # with many matches it is quadratic in the response length — the
+            # identical defect this loop's right-hand side was just fixed for,
+            # reintroduced on the left. MEASURED with the slice: 1.62 s on a
+            # 384 KB response; without it, 0.011 s. `str.endswith` takes bounds
+            # and copies nothing.
+            start = m.start()
+            if start and lower[start - 1] in _HOST_CHARS and not lower.endswith("www.", 0, start):
+                continue
+            # RIGHT: stop at the FIRST character a sentence would not leave,
+            # rather than consuming the whole run. That is exact — the question
+            # was only ever "does any non-punctuation character follow?" — and
+            # it is what keeps this loop linear. Consuming the run made the scan
+            # QUADRATIC in the match count: MEASURED 0.335 s on a 77 KB response
+            # of concatenated repeats, quadrupling on every doubling, which would
+            # stall the server's event loop. Shadow mode does NOT mitigate that,
+            # because a shadow gate still computes its verdict.
+            j, n = m.end(), len(lower)
+            continues = False
+            while j < n and lower[j] in _URL_CHARS:
+                if lower[j] not in _TAIL_IGNORABLE:
+                    continues = True
+                    break
+                j += 1
+            if not continues:
+                return True
+        return False
 
     uncovered: list[str] = []
     for u in urls:
         if _PLACEHOLDER_RE.search(u):
-            # A real template placeholder (api.github.com/repos/{slug}) is not
-            # a fetchable URL — never demand coverage.
+            # A real template placeholder (api.github.com/repos/{slug}) is not a
+            # fetchable URL — never demand coverage.
             continue
         if _url_quoted(_bare(u).rstrip("/")):
             continue
-        domain, remainder = _split(u)
-        if remainder:
-            # Whole segments first: a compound slug ("first-clip-9f2") is one
-            # identity, and shattering it into short tokens loses the match.
-            # A "key=value" segment's identity is the VALUE.
-            segments: list[str] = []
-            for seg in re.split(r"[?&/#]+", remainder):
-                if not seg:
-                    continue
-                segments.append(seg)
-                if "=" in seg:
-                    segments.append(seg.split("=", 1)[1])
-            # min_len 3 is safe BECAUSE matching is word-anchored: a short
-            # slug ("xk3") quoted as its own token is real identity evidence,
-            # where an unanchored substring test would have matched it inside
-            # any longer word. Generic short segments are excluded by name.
-            if any(_is_identity(s, min_len=3) for s in segments):
-                continue
-            # Then finer tokens, for a slug quoted only in part.
-            tokens = [t for t in re.split(r"[?&=/_\-.#]+", remainder) if t]
-            if any(
-                (len(t) >= 6 or (len(t) >= 4 and any(c.isdigit() for c in t)))
-                and _is_identity(t, min_len=4)
-                for t in tokens
-            ):
-                continue
-        elif domain and domain_counts[domain] == 1:
-            # Rung 3 runs ONLY when the URL has no identity remainder (the
-            # `elif`): there the domain IS the item's identity. Otherwise the
-            # remainder carries it, and a platform name ("the LinkedIn post",
-            # "a GitHub project") says nothing about WHICH item — accepting
-            # that let a response which fetched nothing baseline its URL.
-            if _quoted(domain):
-                continue
-            if any(
-                n not in _GENERIC_TOKENS and _quoted(n) for n in _DOMAIN_TO_NAMES.get(domain, [])
-            ):
-                continue
-            if _is_identity(domain.split(".")[0], min_len=4):
-                continue
         uncovered.append(u)
     return uncovered
 
@@ -2049,23 +1961,38 @@ class InboxMonitor:
             shown = ", ".join(uncovered[:5])
             if len(uncovered) > 5:
                 shown += f" (+{len(uncovered) - 5} more)"
-            logger.warning(
-                "Batch %s response covers no trace of %d URL(s) — "
-                "marking failed to retry (response kept): %s",
-                batch_id[:8],
-                len(uncovered),
-                shown,
-            )
-            await inbox_items.mark_url_failure(
-                self._db,
-                item.id,
-                response_path=str(response_path) if response_path else None,
-                processed_at=completed_at,
-                error_message="partial_url_failure: uncovered " + shown,
-            )
-            if session_id is not None:
-                await self._session_manager.complete(session_id)
-            return False
+            if self._config.url_coverage_mode != "enforce":
+                # SHADOW: the verdict is computed and recorded, and nothing acts
+                # on it. The gate is new — `main` has no coverage check at all —
+                # and a replay over the completed-evaluation corpus says it would
+                # flag roughly half of legacy-shaped responses on day one, into a
+                # retry path that parks a whole file after `max_retries` with no
+                # user notification. Enforcing on an unmeasured compliance rate
+                # would turn a silent-loss bug into a silent-stall one.
+                logger.warning(
+                    "url-coverage SHADOW: batch %s would have re-queued %d uncovered URL(s): %s",
+                    batch_id[:8],
+                    len(uncovered),
+                    shown,
+                )
+            else:
+                logger.warning(
+                    "Batch %s response covers no trace of %d URL(s) — "
+                    "marking failed to retry (response kept): %s",
+                    batch_id[:8],
+                    len(uncovered),
+                    shown,
+                )
+                await inbox_items.mark_url_failure(
+                    self._db,
+                    item.id,
+                    response_path=str(response_path) if response_path else None,
+                    processed_at=completed_at,
+                    error_message="partial_url_failure: uncovered " + shown,
+                )
+                if session_id is not None:
+                    await self._session_manager.complete(session_id)
+                return False
 
         # Success: baseline ONLY this batch's lines.
         await self._complete_batch_baseline(
