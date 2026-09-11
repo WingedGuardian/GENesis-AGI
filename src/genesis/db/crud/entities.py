@@ -118,9 +118,69 @@ async def get_by_norm_name(
         return None
     entity = _row_to_dict(db, rows[0])
     if entity["status"] == "merged" and entity["merged_into"]:
-        survivor = await get_entity(db, entity["merged_into"])
+        # Chain-safe: a single hop returned a STILL-MERGED row once chains
+        # formed (A→B→C), and mentions then attached to a tombstone. Walk to
+        # the active survivor; keep the old fallback-to-the-merged-row when
+        # the chain dead-ends (callers treat that row as read-only identity).
+        survivor = await resolve_active(db, entity["entity_id"])
         return survivor or entity
     return entity
+
+
+async def get_by_norm_name_in_types(
+    db: aiosqlite.Connection,
+    *,
+    norm_name: str,
+    types: frozenset[str] | set[str],
+) -> dict | None:
+    """Exact norm_name lookup restricted to a TYPE SET, merge-following.
+
+    The Tier-2 cross-type fold asked the untyped lookup for its single top row
+    and rejected when that row was non-cluster — so a person/org sharing the
+    norm SHADOWED a legitimate cluster fold, and an avoidable shard was minted
+    (adjudication reconciles it later, at LLM cost). Querying the cluster
+    explicitly makes the shadow impossible (MW-3 PR-2b, review NOTE N2)."""
+    if not types:
+        return None
+    placeholders = ",".join("?" for _ in types)
+    rows = await db.execute_fetchall(
+        f"SELECT {_SELECT_COLS} FROM entities "  # noqa: S608 — constant col list
+        f"WHERE norm_name = ? AND entity_type IN ({placeholders}) "
+        "ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'merged' THEN 1 "
+        "ELSE 2 END, created_at ASC, entity_id ASC",
+        (norm_name, *sorted(types)),
+    )
+    if not rows:
+        return None
+    entity = _row_to_dict(db, rows[0])
+    if entity["status"] == "merged" and entity["merged_into"]:
+        survivor = await resolve_active(db, entity["entity_id"])
+        return survivor or entity
+    return entity
+
+
+async def resolve_active(db: aiosqlite.Connection, entity_id: str) -> dict | None:
+    """Follow ``merged_into`` redirects to the ACTIVE survivor, or None when the
+    chain dead-ends (gone / merged-with-no-target / missing / a cycle).
+
+    Promoted from the adjudicator's private walk (MW-3 PR-2b, which now
+    aliases this): once merges apply, chains form (A→B→C), and every
+    single-hop follower returns a row that is itself merged — mentions then
+    attach to a tombstone. One shared, cycle-safe walk."""
+    seen: set[str] = set()
+    current = entity_id
+    while current and current not in seen:
+        seen.add(current)
+        ent = await get_entity(db, current)
+        if ent is None:
+            return None
+        if ent["status"] == "active":
+            return ent
+        if ent["status"] == "merged" and ent["merged_into"]:
+            current = ent["merged_into"]
+            continue
+        return None  # gone, or merged with no target
+    return None
 
 
 async def get_entity(db: aiosqlite.Connection, entity_id: str) -> dict | None:
@@ -520,6 +580,16 @@ async def merge_entity(
         "WHERE entity_id = ?",
         (survivor_id, now, loser_id),
     )
+    # Chain compaction (union-find re-point): rows that pointed at the loser
+    # now point straight at the survivor, so redirect chains stay one hop on
+    # the WRITE side; the read-side walk (resolve_active) covers any row this
+    # misses. The survivor itself is excluded defensively — it is active, but
+    # a corrupt merged_into=loser on it must not become a self-loop.
+    await db.execute(
+        "UPDATE entities SET merged_into = ?, updated_at = ? "
+        "WHERE merged_into = ? AND entity_id != ?",
+        (survivor_id, now, loser_id, survivor_id),
+    )
     if _commit:
         await db.commit()
 
@@ -613,14 +683,64 @@ async def delete_entities_cascade(
 _ADJUDICATION_ENQUEUE_ENABLED = True
 
 
+async def merged_norm_redirects(db: aiosqlite.Connection) -> dict[str, list[str]]:
+    """Map each merged-away surface form to its ACTIVE survivors' entity_ids.
+
+    The query lane builds its name map from active norms only, so the moment a
+    merge applies, every loser's surface form goes dark — a user asking by the
+    OLD name gets nothing (the gap entity_query's docstring recorded from day
+    one; MW-3 PR-2b closes it). Chains are resolved in-process over one scan;
+    dead-ended chains (gone / no target / cycle) are dropped. A norm ALSO
+    owned by an active row (legal across types under UNIQUE(norm_name,
+    entity_type)) still gets its redirect — the survivor rides ALONGSIDE the
+    live row, because suppressing it makes the merged entity unfindable by
+    its old surface form. A duplicate is harmless because the consumer keys its
+    result by entity_id — NOT because of its `not in` check, which is defensive
+    only: removing it changes no observable output (measured).
+    LIST-valued because UNIQUE(norm_name, entity_type) allows one norm on two
+    merged rows of different types with different survivors — a single pick
+    from an unordered scan would be nondeterministic, and would silently drop
+    one survivor. That one IS pinned."""
+    rows = await db.execute_fetchall(
+        "SELECT entity_id, norm_name, status, merged_into FROM entities"
+    )
+    by_id: dict[str, tuple[str, str | None]] = {}
+    merged: list[tuple[str, str]] = []  # (norm_name, merged_into)
+    for entity_id, norm_name, status, merged_into in rows:
+        by_id[entity_id] = (status, merged_into)
+        if status == "merged" and merged_into:
+            merged.append((norm_name, merged_into))
+    out: dict[str, list[str]] = {}
+    for norm_name, target in merged:
+        seen: set[str] = set()
+        current: str | None = target
+        while current and current not in seen:
+            seen.add(current)
+            status, nxt = by_id.get(current, (None, None))
+            if status == "active":
+                bucket = out.setdefault(norm_name, [])
+                if current not in bucket:
+                    bucket.append(current)
+                break
+            if status == "merged" and nxt:
+                current = nxt
+                continue
+            break  # dead end — drop
+    return out
+
+
 async def enqueue_adjudication(
     db: aiosqlite.Connection,
     *,
     entity_id: str,
     similar_entity_id: str,
     _commit: bool = True,
-) -> None:
+) -> bool:
     """Queue a fuzzy-match pair for the entity_adjudication drainer.
+
+    Returns True iff a queue row was actually inserted — False on the two
+    silent no-op paths (kill switch off, pending-row dedup) so callers can
+    count real enqueues instead of attempts.
 
     Inline INSERT rather than ``deferred_work.create`` — that helper
     commits unconditionally, which would break callers batching under
@@ -633,11 +753,11 @@ async def enqueue_adjudication(
     The caller's entity create + AMBIGUOUS status are unaffected.
     """
     if not _ADJUDICATION_ENQUEUE_ENABLED:
-        return
+        return False
     now = datetime.now(UTC).isoformat()
     payload_fwd = json.dumps({"entity_id": entity_id, "similar_entity_id": similar_entity_id})
     payload_rev = json.dumps({"entity_id": similar_entity_id, "similar_entity_id": entity_id})
-    await db.execute(
+    cursor = await db.execute(
         """INSERT INTO deferred_work_queue
            (id, work_type, call_site_id, priority, payload_json, deferred_at,
             deferred_reason, created_at)
@@ -657,8 +777,10 @@ async def enqueue_adjudication(
             payload_rev,
         ),
     )
+    inserted = cursor.rowcount > 0
     if _commit:
         await db.commit()
+    return inserted
 
 
 def _row_to_dict(db: aiosqlite.Connection, row) -> dict:
