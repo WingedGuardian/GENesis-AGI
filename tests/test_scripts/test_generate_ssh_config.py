@@ -67,8 +67,12 @@ class TestLobbyDoor:
         assert result.returncode == 0, result.stderr
         out = result.stdout
         assert "Host testbox-lobby" in out
-        # opens the session picker (choose-tree), not a bare shell
-        assert "tmux -u new-session -A -s lobby \\; choose-tree -Zs" in out
+        # opens the session picker (choose-tree), not a bare shell — and resets
+        # the pane first, see TestLobbyResetsStaleChooser for why that is here.
+        assert (
+            "tmux -u new-session -A -s lobby \\; respawn-pane -k -t lobby "
+            "\\; choose-tree -Zs" in out
+        )
         # PATH-prefixed so tmux resolves even when it's user-local (no .bashrc)
         assert 'RemoteCommand PATH="' in out and "/.local/bin:" in out
         assert "RequestTTY yes" in out
@@ -149,3 +153,71 @@ class TestSshResolution:
 class TestScriptHygiene:
     def test_syntax_clean(self):
         subprocess.run(["bash", "-n", str(_GEN)], check=True, timeout=10)
+
+
+class TestLobbyResetsStaleChooser:
+    """The lobby door must hand the operator a FRESH chooser every connect.
+
+    A tmux pane mode belongs to the PANE, not to the client, so `choose-tree`
+    outlives the client that opened it. MEASURED 2026-09-11, twice: the live
+    lobby pane read `in_mode=1 mode=tree-mode` with `attached=0`, and the same
+    state reproduced on an isolated socket after detaching a client. Re-issuing
+    `choose-tree` does not reset it.
+
+    The operator-visible result is the reported bug: the next connect lands
+    inside the PREVIOUS chooser, so the screen shows another session's preview,
+    keystrokes go to the chooser instead of the app ("frozen"), and tree-mode's
+    search prompt sits in the status line. Intermittent, because it depends on
+    how the previous visit ended.
+
+    `respawn-pane -k` is the only reset that works unconditionally:
+    `send-keys -X cancel`, `send-keys q` and `send-keys Escape` were each
+    measured leaving `in_mode=1`, because mode keys need a client context and
+    the stale pane has none — which is precisely the state needing the reset.
+    """
+
+    def test_lobby_resets_the_pane_before_opening_the_chooser(self, gen):
+        out = gen().stdout
+        lobby_cmd = next(
+            ln for ln in out.splitlines()
+            if "new-session -A -s lobby" in ln
+        )
+        assert "respawn-pane -k" in lobby_cmd, (
+            "without a pane reset the lobby inherits the previous chooser — the "
+            "'frozen unrecognised session' bug"
+        )
+
+    def test_the_reset_precedes_the_chooser(self, gen):
+        """ORDER is the invariant: respawn AFTER choose-tree would kill the
+        chooser the operator is meant to land in, turning the fix into a
+        different bug. Assert position, not mere presence."""
+        out = gen().stdout
+        lobby_cmd = next(
+            ln for ln in out.splitlines()
+            if "new-session -A -s lobby" in ln
+        )
+        assert lobby_cmd.index("respawn-pane") < lobby_cmd.index("choose-tree"), (
+            f"reset must come before the chooser: {lobby_cmd}"
+        )
+
+    def test_the_reset_targets_the_lobby_only(self, gen):
+        """The cc-* slots hold live Claude sessions. An untargeted respawn would
+        reset whatever pane tmux considered current — the one thing this door
+        must never touch."""
+        out = gen().stdout
+        lobby_cmd = next(
+            ln for ln in out.splitlines()
+            if "new-session -A -s lobby" in ln
+        )
+        assert "respawn-pane -k -t lobby" in lobby_cmd, (
+            f"respawn must be pinned to the lobby target: {lobby_cmd}"
+        )
+
+    def test_the_wildcard_slot_door_gains_no_respawn(self, gen):
+        """Guard the blast radius from the other side: the numeric-slot door
+        must be untouched, or connecting to a slot would kill its Claude."""
+        out = gen().stdout
+        wildcard = next(
+            ln for ln in out.splitlines() if "cc-slot.sh %n" in ln
+        )
+        assert "respawn-pane" not in wildcard, wildcard
