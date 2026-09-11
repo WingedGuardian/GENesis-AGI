@@ -313,16 +313,16 @@ def test_the_deny_reason_never_echoes_the_offending_value():
 
     diff = (
         "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
-        "+OWNER = 'realperson@personal.example'\n"
+        "+OWNER = 'realperson@personal.example'\n"  # genesis:verified-generic
     )
     findings = sanitize._check_emails(sanitize.parse_diff(diff))
     assert findings, "the email scanner should fire on this fixture"
-    assert any("realperson@personal.example" in f.message for f in findings), (
+    assert any("realperson@personal.example" in f.message for f in findings), (  # genesis:verified-generic
         "precondition: the scanner DOES interpolate the literal"
     )
 
     rendered = "\n".join(hook._render(findings))
-    assert "realperson@personal.example" not in rendered
+    assert "realperson@personal.example" not in rendered  # genesis:verified-generic
     assert "x.py" in rendered
 
 
