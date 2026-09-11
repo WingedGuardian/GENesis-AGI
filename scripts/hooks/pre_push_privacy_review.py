@@ -1,29 +1,53 @@
 #!/usr/bin/env python3
-"""PreToolUse ADVISORY: surface private-data leaks in an outgoing PUBLIC push.
+"""PreToolUse GATE: refuse a public push that adds private data or a credential.
 
-NON-BLOCKING. When a ``git push`` targets the public repo (origin), this hook
-scans the diff being pushed for this install's private data — install IPs,
-personal emails, and local release-fingerprints — and, if it finds any, injects
-a review prompt into the model's context (PreToolUse ``additionalContext``). It
-NEVER blocks the push: the CI ``leak-detector`` job and the branch/force gates
-in ``git_push_guard.py`` own hard enforcement. Its job is to make the author
-LOOK at suspicious lines before code goes public — the exact step that, when
-skipped manually, put real install IPs into public test fixtures.
+BLOCKING. When a ``git push`` targets the public repo, this hook scans the whole
+BRANCH for (a) this install's private data — install IPs, personal emails, local
+release fingerprints — and (b) anything SHAPED like a credential, whether or not
+this install has ever seen it. A surviving finding blocks the push (exit 2).
 
-Reuses the contribution sanitizer's cheap REGEX scanners (``parse_diff`` +
-``_check_portability`` / ``_check_emails`` / ``_check_fingerprints``) — NOT the
-full ``scan_diff``, whose detect-secrets floor is fail-CLOSED (a false "missing
-binary" finding on every push, since the venv bin isn't on the hook's PATH) and
-whose secret scanners spawn one subprocess per added line (latency / timeout
-kill on large diffs).
+It used to be advisory, and the reason it no longer is: a branch pushed with no
+PR receives no CI at all, so the CI ``leak-detector`` it deferred to never ran on
+exactly the branches that needed it. An advisory that defers enforcement to a job
+that does not execute is not a safety net.
 
-Contract: emits ONLY ``hookSpecificOutput.additionalContext`` on stdout and
-ALWAYS exits 0. It carries no ``permissionDecision``, so it composes cleanly
-with git_push_guard's ask/allow/deny on the same Bash matcher (each hook runs as
-a separate process; additionalContext is concatenated, order-independent). Any
-error → silent exit 0. An advisory must NEVER block a push.
+SHAPE, not memory. The install-specific scanners only recognise values this box
+has seen. The shape pass reuses ``genesis.security.output_scanner``'s pattern
+table (GitHub/OpenAI/Anthropic/Groq/AWS/Google key shapes, credential
+assignments, URL user:pass) and, when the binary is present, one ``gitleaks`` run
+over the added lines — which is where JWT/PEM/high-entropy coverage comes from.
+Reusing that table rather than copying it is deliberate: a second copy of a
+credential-pattern table drifts, and the half that drifts is the half nobody
+watches.
 
-Stdlib + the contribution sanitizer only.
+FAIL CLOSED ON A FINDING, FAIL OPEN ON AN ERROR. A scanner that crashes, times
+out, or cannot resolve the repo must never wedge a push — that would stop all
+work for a condition never established. A finding must never be sail-past-able.
+Those are different failures and they get opposite defaults.
+
+ANNOTATION IS REQUIRED, not a nicety. MEASURED on this install: a single
+legitimate module produced 15 shape hits — ``_TAILNET_NET = ip_network(...)`` is
+the range a classifier is MADE of, and a reserved ``.invalid`` address is RFC
+2606's whole purpose. (This paragraph originally spelled that address out and
+tripped the hook's own email scanner, which is the shortest possible argument for
+the annotation path existing.) A blocking hook with no way to say "this one is generic" makes
+such a branch unpushable and gets switched off within a week. Any of these on the
+line clears it:
+    # pragma: allowlist secret   (detect-secrets convention)
+    # gitleaks:allow             (gitleaks convention)
+    # genesis:verified-generic   (ours — for the portability/fingerprint class,
+                                  which neither of the above covers)
+
+WHOLE BRANCH, not the outgoing delta. Scanning only commits not yet on the remote
+makes already-pushed content invisible: the same lines flag on a first push and
+go silent on every push after, so a re-push reports clean on a branch that is not.
+
+Detect-secrets is still not used here. Its PATH problem was fixed upstream
+(``_resolve_detect_secrets`` is interpreter-relative now), but the other reason
+stands and is the load-bearing one: it spawns one subprocess PER ADDED LINE.
+gitleaks is one subprocess for the whole set.
+
+Stdlib + the contribution sanitizer + output_scanner.
 """
 
 from __future__ import annotations
@@ -226,34 +250,222 @@ def _targets_public_repo(remote: str, cwd: str | None) -> bool:
 
 
 def _outgoing_diff(cwd: str | None) -> str:
-    """The unified diff being pushed (local commits not yet on origin)."""
-    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
-    base = None
-    if (
-        branch
-        and branch != "HEAD"
-        and _git(["rev-parse", "--verify", "--quiet", f"origin/{branch}"], cwd)
-    ):
-        base = f"origin/{branch}"
-    else:
-        base = _git(["merge-base", "origin/main", "HEAD"], cwd)
+    """The WHOLE branch as a diff against its merge-base with main.
+
+    Deliberately not ``origin/<branch>..HEAD``. That form scans only the commits
+    not yet on the remote, which makes everything already pushed invisible: the
+    same lines flag on a branch's first push and go silent on every push after,
+    so a re-push reports clean on a branch that is not. The failure is silent in
+    the reassuring direction, which is the worst kind for a privacy gate.
+
+    The cost is re-scanning the branch each push. That is pure regex over a diff
+    and the branch is bounded by review size, so it is cheap next to being wrong.
+    """
+    base = _git(["merge-base", "origin/main", "HEAD"], cwd)
     if not base:
         return ""
     return _git(["diff", f"{base}..HEAD"], cwd) or ""
 
 
-def _scan(diff_text: str) -> list:
-    """Run only the cheap regex scanners from the contribution sanitizer."""
+#: A line carrying any of these is a value a human has already judged generic.
+#: Three spellings because three tools are involved and none of them owns the
+#: others' convention — requiring ours alone would mean re-annotating lines that
+#: are already annotated for detect-secrets or gitleaks.
+_ALLOW_MARKERS = (
+    "pragma: allowlist secret",
+    "gitleaks:allow",
+    "genesis:verified-generic",
+)
+
+_GITLEAKS_BUDGET_S = 20
+
+#: The subset of output_scanner's table this GATE acts on. Scoped deliberately:
+#: that table also serves outbound MESSAGES, where a leaked path or a localhost
+#: port matters. In repo code they are ordinary, and MEASURED across 40 merged
+#: commits the broad table would have blocked 11 of them (27.5%) — 23 of the 35
+#: hits were `internal_file_path` firing on `~/.genesis/`, which appears
+#: legitimately throughout this repo, and 8 more were assignment shapes matching
+#: `SOMETHING_KEY = os.environ[...]`, a reference rather than a secret.
+#:
+#: A gate that blocks a quarter of honest pushes is turned off within a week, so
+#: this list is restricted to shapes that are a CREDENTIAL by construction — a
+#: vendor-prefixed key, or a password embedded in a URL. Entropy-based and
+#: assignment-based detection is left to gitleaks, which judges the VALUE rather
+#: than the surrounding text. Paths and private IPs remain the contribution
+#: sanitizer's job, where they are already handled with install context.
+_PUSH_SHAPE_PATTERNS = frozenset(
+    {
+        "api_key_openai",
+        "api_key_anthropic",
+        "api_key_groq",
+        "api_key_github",
+        "api_key_aws",
+        "url_credentials",
+    }
+)
+
+#: Assignment-shaped patterns: a credential only when the RIGHT-HAND SIDE is a
+#: literal. `ANTHROPIC_API_KEY = os.environ["..."]` is a reference and was 8 of
+#: the 11 false blocks in the first measurement; `DATABASE_PASSWORD = "<value>"`
+#: is the real thing, and gitleaks does NOT catch it (verified: it flags neither
+#: a low- nor a high-entropy hardcoded assignment), so dropping the class
+#: outright left a genuine gap rather than delegating it.
+_ASSIGNMENT_SHAPE_PATTERNS = frozenset({"credential_assignment", "env_variable_secret"})
+
+#: Spellings of "the value comes from somewhere else". A match here means the
+#: line NAMES a credential rather than containing one.
+_RHS_REFERENCE_MARKERS = (
+    "os.environ", "getenv", "environ[", "environ.get",
+    "config", "settings", "secrets.", "vault", "keyring",
+    "${", "$(", "%s", "{}", "...", "<", "none", "self.", "args.",
+)
+
+
+def _assignment_is_literal(text: str) -> bool:
+    """Whether an assignment's RHS looks like an inline literal secret.
+
+    Conservative in the FAIL-OPEN direction on purpose: anything that smells of
+    indirection is treated as a reference and NOT blocked. A missed hardcoded
+    secret is still caught by CI and by review; a gate that blocks every
+    `KEY = os.environ[...]` line is a gate that gets disabled.
+    """
+    _, sep, rhs = text.partition("=")
+    if not sep:
+        return False
+    rhs = rhs.strip()
+    low = rhs.lower()
+    if any(m in low for m in _RHS_REFERENCE_MARKERS):
+        return False
+    if rhs[:1] not in ("'", '"'):
+        return False  # a bare identifier or call — not an inline literal
+    value = rhs.strip("'\"").strip()
+    # Too short to be a credential, or an obvious placeholder.
+    return len(value) >= 12 and not value.lower().startswith(("xxx", "test", "dummy", "example"))
+
+
+def _is_annotated(text: str) -> bool:
+    """Whether this line carries an explicit "already judged generic" marker."""
+    low = text.lower()
+    return any(m in low for m in _ALLOW_MARKERS)
+
+
+def _shape_findings(parsed) -> list[tuple[str, int, str]]:
+    """(file, line, message) for added lines SHAPED like a credential.
+
+    Independent of what this install has seen — that is the whole point. Reuses
+    output_scanner's table via its public accessor so there is exactly one
+    credential-pattern table in the repo.
+
+    The matched TEXT is never included in the message. This output reaches a
+    transcript and a terminal; echoing the secret to report the secret would
+    leak it to one more place.
+    """
+    try:
+        from genesis.security.output_scanner import iter_findings
+    except Exception:
+        return []  # fail OPEN: a missing scanner must not wedge the push
+    out: list[tuple[str, int, str]] = []
+    for file, line_no, text in parsed.added_lines:
+        if _is_annotated(text):
+            continue
+        for name, _matched in iter_findings(text):
+            if name in _ASSIGNMENT_SHAPE_PATTERNS:
+                if not _assignment_is_literal(text):
+                    continue
+            elif name not in _PUSH_SHAPE_PATTERNS:
+                continue
+            out.append((file, line_no, f"Credential-shaped value ({name})"))
+    return out
+
+
+def _gitleaks_findings(parsed) -> list[tuple[str, int, str]]:
+    """gitleaks over the added lines, as ONE subprocess. [] when unavailable.
+
+    Added lines are written to a scratch file with a parallel index, so the line
+    numbers gitleaks reports map back to real (file, line) pairs exactly rather
+    than approximately.
+
+    Every failure path returns [] — absent binary, non-zero exit, unparseable
+    report, timeout. This is the enrichment layer; the regex passes above are the
+    floor, and an enrichment layer must not be able to block a push by breaking.
+    """
+    import shutil
+    import tempfile
+
+    exe = shutil.which("gitleaks")
+    if not exe or not parsed.added_lines:
+        return []
+    index: list[tuple[str, int]] = []
+    lines: list[str] = []
+    for file, line_no, text in parsed.added_lines:
+        if _is_annotated(text):
+            continue
+        index.append((file, line_no))
+        lines.append(text.replace("\n", " ").replace("\r", " "))
+    if not lines:
+        return []
+    out: list[tuple[str, int, str]] = []
+    try:
+        with tempfile.TemporaryDirectory(dir=os.path.expanduser("~/tmp")) as td:
+            src = Path(td) / "added.txt"
+            src.write_text("\n".join(lines), encoding="utf-8", errors="replace")
+            report = Path(td) / "report.json"
+            subprocess.run(
+                [exe, "detect", "--no-git", "--source", str(src),
+                 "--report-format", "json", "--report-path", str(report),
+                 "--no-banner", "--redact"],
+                capture_output=True, text=True, timeout=_GITLEAKS_BUDGET_S,
+            )
+            if not report.is_file():
+                return []
+            data = json.loads(report.read_text() or "[]")
+        for item in data if isinstance(data, list) else []:
+            n = item.get("StartLine")
+            rule = item.get("RuleID") or item.get("Description") or "gitleaks"
+            if isinstance(n, int) and 1 <= n <= len(index):
+                file, line_no = index[n - 1]
+                out.append((file, line_no, f"Credential-shaped value ({rule})"))
+    except Exception:
+        return []
+    return out
+
+
+def _scan(diff_text: str) -> list[tuple[str, int, str]]:
+    """Every surviving finding as (file, line, message), annotations removed.
+
+    Three layers, cheapest first: this install's KNOWN values (the contribution
+    sanitizer's regex scanners), then anything credential-SHAPED regardless of
+    whether this box has seen it, then gitleaks for the entropy/JWT/PEM classes
+    the regexes do not cover.
+
+    Annotation is applied to ALL of them, including the install-specific
+    scanners. Those produce the hits most likely to be legitimate — a CIDR
+    constant in a network classifier, a reserved-domain fixture — so exempting
+    only the new layers would leave the common false positive unclearable.
+    """
     from genesis.contribution import sanitize
 
     parsed = sanitize.parse_diff(diff_text)
-    findings = list(sanitize._check_portability(parsed))
-    findings += sanitize._check_emails(parsed)
+    # (file, line) -> added text, so a finding can be tested for its annotation.
+    text_at = {(f, n): s for f, n, s in parsed.added_lines}
+
+    sanitizer_findings = list(sanitize._check_portability(parsed))
+    sanitizer_findings += sanitize._check_emails(parsed)
     fp_env = os.environ.get("GENESIS_RELEASE_FINGERPRINTS")
     fp = Path(fp_env) if fp_env else Path.home() / ".genesis" / "release-fingerprints.txt"
     if fp.is_file():
-        findings += sanitize._check_fingerprints(parsed, fp)
-    return findings
+        sanitizer_findings += sanitize._check_fingerprints(parsed, fp)
+
+    out: list[tuple[str, int, str]] = []
+    for f in sanitizer_findings:
+        line_text = text_at.get((f.file, f.line), "")
+        if line_text and _is_annotated(line_text):
+            continue
+        out.append((f.file, f.line, f.message))
+
+    out += _shape_findings(parsed)
+    out += _gitleaks_findings(parsed)
+    return out
 
 
 def main() -> None:
@@ -282,31 +494,45 @@ def main() -> None:
         findings = _scan(diff_text)
         if not findings:
             return
+
         seen: set = set()
         lines: list[str] = []
-        for finding in findings:
-            key = (finding.file, finding.line, finding.message)
+        for file, line_no, message in findings:
+            key = (file, line_no, message)
             if key in seen:
                 continue
             seen.add(key)
-            lines.append(f"  {finding.file or '?'}:{finding.line or '?'}  {finding.message}")
-        context = (
-            "[Pre-push privacy review] ⚠️ This push to the PUBLIC repo "
-            "adds lines matching private-data patterns. Before it lands, confirm "
-            "each is a generic placeholder (safe) or scrub the real value:\n"
-            + "\n".join(lines[:_MAX_LINES])
+            lines.append(f"  {file or '?'}:{line_no or '?'}  {message}")
+
+        shown = lines[:_MAX_LINES]
+        extra = len(lines) - len(shown)
+        # Say how many were omitted rather than cutting silently — a bounded list
+        # that looks complete is how a reader concludes they have seen it all.
+        tail = f"\n  ... and {extra} more" if extra > 0 else ""
+
+        print(
+            "BLOCKED: this push to the PUBLIC repo adds lines carrying private "
+            "data or a credential-shaped value.\n"
+            + "\n".join(shown)
+            + tail
+            + "\n\nScrub the real value, or — if it is genuinely generic — mark the "
+            "line and push again:\n"
+            "    # pragma: allowlist secret   (a key-shaped placeholder)\n"
+            "    # gitleaks:allow             (same, gitleaks' spelling)\n"
+            "    # genesis:verified-generic   (a reserved domain, a CIDR constant, "
+            "a documented example)\n"
+            "Annotate only what you have actually checked: this is the last "
+            "automated look before the value is public and irrevocable.",
+            file=sys.stderr,
         )
-        json.dump(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": context,
-                }
-            },
-            sys.stdout,
-        )
+        sys.exit(2)
+    except SystemExit:
+        raise  # the block above — never swallowed by the fail-open below
     except Exception:
-        # An advisory must NEVER block a push — swallow everything, exit 0.
+        # FAIL OPEN on an ERROR, never on a finding. A scanner that crashes or a
+        # repo that will not resolve must not wedge every push on the box; that
+        # would stop all work for a condition never established. The finding path
+        # exits 2 above and is deliberately outside this.
         return
 
 

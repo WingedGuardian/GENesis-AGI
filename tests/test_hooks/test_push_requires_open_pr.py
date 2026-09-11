@@ -420,13 +420,14 @@ def test_gh_output_that_is_not_an_answer_fails_open(monkeypatch, stdout, rc, exp
         ("ssh://git@github.com:22/o/r.git", "o/r"),  # port
         ("https://github.com:443/o/r.git", "o/r"),
         ("https://GitHub.com/o/r.git", "o/r"),  # host case (RFC 3986)
-        ("git@GITHUB.COM:o/r.git", "o/r"),
+        ("git@GITHUB.COM:o/r.git", "o/r"),  # genesis:verified-generic — a git SSH url, not a person
         ("https://github.com/O/R.git", "o/r"),  # owner/repo case
         ("github.com:o/r.git", "o/r"),  # scp-like with no user
         ("https://github.com/o/r.git/", "o/r"),  # trailing slash after .git
         ("https://github.com/o/r.git#frag", "o/r"),
         ("https://github.com/o/r.git?x=1", "o/r"),
-        ("https://x-access-token:tok@github.com/o/r.git", "o/r"),  # userinfo
+        # genesis:verified-generic — a synthetic userinfo form, not a credential
+        ("https://x-access-token:tok@github.com/o/r.git", "o/r"),
         ("/plain/local/path", None),
         ("../relative/path", None),
         ("https://gitlab.com/o/r.git", None),

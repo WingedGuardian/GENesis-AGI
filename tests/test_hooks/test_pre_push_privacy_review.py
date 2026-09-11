@@ -14,6 +14,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT / "scripts" / "hooks"))
 sys.path.insert(0, str(_ROOT / "src"))
@@ -91,7 +93,10 @@ def test_effective_cwd_skips_super_prefix_to_find_dash_C():
 def test_scan_flags_install_pattern():
     findings = hook._scan(_LEAK_DIFF)
     assert findings, "portability scanner should flag the CGNAT literal"
-    assert any(getattr(f, "file", None) == "x.py" for f in findings)
+    # _scan now returns (file, line, message) tuples: the three layers it merges
+    # (install values, credential shapes, gitleaks) produce different objects, so
+    # a common shape is what lets them be deduped and reported together.
+    assert any(file == "x.py" for file, _line, _message in findings)
 
 
 def test_scan_clean_diff_no_findings():
@@ -102,38 +107,64 @@ def test_scan_clean_diff_no_findings():
 
 
 def _run_main(monkeypatch, capsys, *, command, public, diff):
+    """Run the hook; return (stdout, stderr, exit_code).
+
+    The hook BLOCKS now, so it raises SystemExit(2) on a finding. Returning the
+    code rather than letting the exception escape keeps every caller able to
+    assert on the distinction that matters: a block (2) versus a pass (0).
+    """
     payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/tmp"}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     monkeypatch.setattr(hook, "_targets_public_repo", lambda remote, cwd: public)
     monkeypatch.setattr(hook, "_outgoing_diff", lambda cwd: diff)
-    hook.main()
-    return capsys.readouterr().out
+    code = 0
+    try:
+        hook.main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+    cap = capsys.readouterr()
+    return cap.out, cap.err, code
 
 
-def test_main_emits_advisory_on_public_push_with_leak(monkeypatch, capsys):
-    out = _run_main(
+def test_main_blocks_a_public_push_carrying_a_leak(monkeypatch, capsys):
+    """It BLOCKS now, where it used to advise.
+
+    The advisory deferred enforcement to the CI leak-detector — which never runs
+    on a branch with no PR, i.e. exactly the branches that needed it. A safety net
+    hung on a job that does not execute is not a safety net.
+    """
+    out, err, code = _run_main(
         monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
     )
-    payload = json.loads(out)
-    ctx = payload["hookSpecificOutput"]["additionalContext"]
-    assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-    assert "permissionDecision" not in payload["hookSpecificOutput"]
-    assert "Pre-push privacy review" in ctx
-    assert "x.py" in ctx
+    assert code == 2, "a finding must block"
+    assert "BLOCKED" in err
+    assert "x.py" in err
+    assert out == "", "a block goes to stderr; stdout is for the hook JSON contract"
+
+
+def test_the_block_names_every_way_to_clear_it(monkeypatch, capsys):
+    """A block with no stated remedy is a trap, and gets switched off."""
+    _, err, _ = _run_main(
+        monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
+    )
+    assert "pragma: allowlist secret" in err
+    assert "gitleaks:allow" in err
+    assert "genesis:verified-generic" in err
 
 
 def test_main_quiet_on_clean_diff(monkeypatch, capsys):
-    out = _run_main(
+    out, err, code = _run_main(
         monkeypatch, capsys, command="git push origin feat", public=True, diff=_CLEAN_DIFF
     )
-    assert out == ""
+    assert (out, err, code) == ("", "", 0)
 
 
 def test_main_noop_on_non_origin_push(monkeypatch, capsys):
-    out = _run_main(
+    """A private remote is where real install values are allowed to live."""
+    out, err, code = _run_main(
         monkeypatch, capsys, command="git push private feat", public=False, diff=_LEAK_DIFF
     )
-    assert out == ""
+    assert (out, err, code) == ("", "", 0)
 
 
 def test_main_noop_on_non_push(monkeypatch, capsys):
@@ -149,10 +180,11 @@ def test_main_never_raises_and_stays_quiet_on_error(monkeypatch, capsys):
         raise RuntimeError("scanner exploded")
 
     monkeypatch.setattr(hook, "_scan", _boom)
-    out = _run_main(
+    out, err, code = _run_main(
         monkeypatch, capsys, command="git push origin feat", public=True, diff=_LEAK_DIFF
     )
-    assert out == ""  # swallowed, exit 0
+    assert code == 0, "FAIL OPEN on an error — a crashed scanner must not wedge pushes"
+    assert out == ""
 
 
 # ── shared git budget + URL normalization (review SHOULD-FIX + NOTE) ────
@@ -210,3 +242,126 @@ def test_targets_public_repo_normalizes_url(monkeypatch):
     assert hook._targets_public_repo("https://github.com/Org/Repo", None) is True
     assert hook._targets_public_repo("https://github.com/Org/Repo/", None) is True
     assert hook._targets_public_repo("https://github.com/Org/Other", None) is False
+
+
+# ─── Part D: shape detection, annotation, and the whole-branch scan ──────────
+
+
+def _diff(*lines: str) -> str:
+    body = "".join(f"+{line}\n" for line in lines)
+    return (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n{body}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "line"),
+    [
+        ("github PAT", 'TOKEN = "ghp_' + "A" * 40 + '"'),
+        ("anthropic key", 'KEY = "sk-ant-' + "B" * 40 + '"'),
+        ("openai key", 'KEY = "sk-' + "C" * 40 + '"'),
+        ("aws access key id", 'AWS_ACCESS_KEY_ID = "AKIA' + "D" * 16 + '"'),
+        ("groq key", 'KEY = "gsk_' + "E" * 40 + '"'),
+        ("url user:pass", 'URL = "https://admin:hunter2@internal.example.com/x"'),
+        ("hardcoded password", 'DATABASE_PASSWORD = "correct-horse-battery"'),
+    ],
+)
+def test_a_credential_shape_this_install_has_never_seen_is_caught(label, line):
+    """SHAPE, not memory — the whole point of Part D.
+
+    None of these values exists on this box, so the install-specific scanners
+    (which only know values this install has seen) cannot reach them. Before this
+    change every one of them would have pushed silently.
+    """
+    assert hook._scan(_diff(line)), f"{label} must be detected"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["# pragma: allowlist secret", "# gitleaks:allow", "# genesis:verified-generic"],
+)
+def test_each_annotation_spelling_clears_a_line(marker):
+    """Three spellings because three tools are involved and none owns the others'.
+
+    Requiring only ours would mean re-annotating lines already marked for
+    detect-secrets or gitleaks.
+    """
+    line = 'TOKEN = "ghp_' + "A" * 40 + '"'
+    assert hook._scan(_diff(line)), "precondition: unannotated, it is caught"
+    assert not hook._scan(_diff(f"{line}  {marker}")), f"{marker} must clear it"
+
+
+def test_annotation_also_clears_the_install_specific_scanners():
+    """The most legitimate hits come from those, so exempting only the new layers
+    would leave the common false positive unclearable — e.g. a CIDR constant in a
+    network classifier, or a reserved-domain fixture."""
+    leak = _LEAK_DIFF.replace("\n", "", 0)
+    assert hook._scan(leak), "precondition: the install pattern is caught"
+    annotated = "\n".join(
+        ln + "  # genesis:verified-generic" if ln.startswith("+") and not ln.startswith("+++")
+        else ln
+        for ln in leak.splitlines()
+    )
+    assert not hook._scan(annotated + "\n")
+
+
+def test_an_assignment_from_the_environment_is_not_a_secret():
+    """`KEY = os.environ[...]` NAMES a credential; it does not contain one.
+
+    MEASURED: this class was 8 of 11 false blocks in the first pass over 40
+    merged commits, and it is the single most common credential-shaped line in
+    real source.
+    """
+    for line in (
+        'ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]',
+        "GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')",
+        "API_KEY = config.api_key",
+        "SECRET_TOKEN = None",
+        'API_KEY = f"{prefix}-{suffix}"',
+    ):
+        assert not hook._scan(_diff(line)), f"a reference must not block: {line}"
+
+
+def test_a_hardcoded_literal_still_blocks():
+    """The other side of the same filter — it must not have blinded the check."""
+    assert hook._scan(_diff('DATABASE_PASSWORD = "correct-horse-battery"'))
+
+
+def test_findings_never_echo_the_matched_value():
+    """Reporting the secret to report the secret leaks it one place further.
+
+    This output reaches a terminal and a transcript.
+    """
+    secret = "ghp_" + "Z" * 40
+    found = hook._scan(_diff(f'TOKEN = "{secret}"'))
+    assert found
+    for _file, _line, message in found:
+        assert secret not in message
+        assert "ZZZZ" not in message
+
+
+def test_the_diff_is_the_whole_branch_not_the_unpushed_delta(monkeypatch):
+    """Scanning only new commits makes already-pushed content invisible.
+
+    That produced the exact silence-then-noise this change fixes: the same lines
+    flagged on a first push and went quiet on every push after, so a re-push
+    reported clean on a branch that was not. The base must come from the
+    merge-base with main, never from origin/<branch>.
+    """
+    calls = []
+
+    def _fake_git(args, cwd=None):
+        calls.append(args)
+        if args[:1] == ["merge-base"]:
+            return "abc123"
+        if args[:1] == ["diff"]:
+            return ""
+        return ""
+
+    monkeypatch.setattr(hook, "_git", _fake_git)
+    hook._outgoing_diff(None)
+    assert ["merge-base", "origin/main", "HEAD"] in calls
+    assert not any(
+        a[:1] == ["rev-parse"] and any("origin/" in str(x) for x in a) for a in calls
+    ), "must not resolve origin/<branch> — that is the incremental scan"

@@ -7639,7 +7639,7 @@ def _remote_url_slug(url: str) -> str | None:
     function misclassified SIX families, every one silently (the gate simply
     never fired): a port (``ssh://git@github.com:22/o/r``,
     ``https://github.com:443/o/r``), an uppercase HOST (``https://GitHub.com/…``,
-    ``git@GITHUB.COM:…``) which RFC 3986 makes case-insensitive, an uppercase
+    ``git@GITHUB.COM:…``) which RFC 3986 makes case-insensitive, an uppercase  # genesis:verified-generic
     OWNER/REPO which GitHub itself treats case-insensitively, a trailing slash
     after ``.git``, a ``#fragment`` or ``?query``, and a scp-like form with no
     user (``github.com:o/r.git``).
