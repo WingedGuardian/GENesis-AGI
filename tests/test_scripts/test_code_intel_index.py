@@ -47,7 +47,7 @@ def _make_repo(tmp_path: Path, *, worktree: bool = False) -> Path:
 
 
 def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
-    """Fake codebase-memory-mcp + gitnexus that record args and ulimit -v."""
+    """Fake codebase-memory-mcp + gitnexus recording args and ulimit -v."""
     bindir.mkdir(exist_ok=True)
     for name in ("codebase-memory-mcp", "gitnexus"):
         _write_exec(
@@ -75,11 +75,57 @@ def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None
     _write_exec(bindir / "systemd-run", body)
 
 
+_FAKE_CONTAINER_BYTES = 32 * 1024**3  # 32 GiB — big enough that the target wins
+
+
+def _fake_cgroup_tree(tmp_path: Path, *levels: int) -> tuple[Path, Path]:
+    """Build a fake cgroup v2 tree and return ``(root, self_cgroup_file)``.
+
+    ``levels`` are memory.max byte values from the ROOT downward; 0 means "max"
+    (uncapped) at that level. The leaf is the deepest level, which is what
+    /proc/self/cgroup points at.
+
+    A TREE, not a single file, because the cap is derived by walking this
+    process's whole cgroup chain and taking the smallest finite limit — nested
+    v2 limits only restrict further, so a constrained ANCESTOR binds before the
+    root. Pinning only the root could not express that case at all.
+
+    Named by the level values: a single shared path collides, because _run_entry
+    builds its default env AFTER a test has written its own smaller tree and
+    would silently overwrite it — the test would then exercise the default while
+    believing it had set something else.
+    """
+    tag = "-".join(str(x) for x in levels) or "default"
+    root = tmp_path / f"cg-{tag}"
+    rel_parts = [f"level{i}" for i in range(1, len(levels))]
+    d = root
+    for i, val in enumerate(levels):
+        if i:
+            d = d / rel_parts[i - 1]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "memory.max").write_text(f"{val}\n" if val else "max\n", encoding="utf-8")
+    selfcg = tmp_path / f"selfcgroup-{tag}"
+    selfcg.write_text("0::/" + "/".join(rel_parts) + "\n", encoding="utf-8")
+    return root, selfcg
+
+
+def _fake_cgroup_env(tmp_path: Path, *levels: int) -> dict[str, str]:
+    """The two env vars pinning cap derivation to a fake tree."""
+    root, selfcg = _fake_cgroup_tree(tmp_path, *(levels or (_FAKE_CONTAINER_BYTES,)))
+    return {
+        "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+        "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+    }
+
+
 def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
     env = {
         "PATH": path,
         "HOME": str(tmp_path),
         "GENESIS_HOME": str(tmp_path / ".genesis"),
+        # Pin the cgroup chain so cap derivation is deterministic; individual
+        # tests override it to exercise the bound.
+        **_fake_cgroup_env(tmp_path),
         # Fast, never-pausing watchdog by default so a fast fake tool doesn't
         # idle on the real 15s sample gap; watchdog tests override these.
         "CODE_INTEL_WATCHDOG_INTERVAL": "1",
@@ -345,7 +391,7 @@ def test_scope_path_passes_all_properties(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=2G" in calls
+    assert "MemoryMax=4096M" in calls  # measured target, emitted as M (#1776)
     assert "MemorySwapMax=0" in calls
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
@@ -381,7 +427,7 @@ def test_probe_failure_falls_back_to_rlimit(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     assert slog.read_text().count("\n") == 1  # probe attempted exactly once
-    assert "ULIMIT_V:2097152" in log.read_text()  # 2G in KB
+    assert "ULIMIT_V:4194304" in log.read_text()  # 4G in KB (measured default)
 
 
 def test_no_systemd_fallback_applies_rlimit(tmp_path):
@@ -391,7 +437,80 @@ def test_no_systemd_fallback_applies_rlimit(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
     assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in log.read_text()
+    assert "ULIMIT_V:4194304" in log.read_text()  # 4G in KB
+
+
+# ── 3c. the cap is bounded by the container ────────────────────────────────
+# A cap equal to the container limit is not a cap: the parent cgroup reaches its
+# own OOM before the scope boundary is ever hit, taking the server or a session
+# with it. host-setup.sh floors an install at 4 GiB, so an absolute 4G default
+# was exactly that on a minimum install.
+
+
+def test_cap_leaves_a_reserve_on_a_small_container(tmp_path):
+    """On a 4 GiB install the cap must stay well below the limit.
+
+    The container fraction alone was not sufficient: 60% of 4 GiB is 2,457M,
+    leaving 1,639M for genesis-server + Qdrant + a session together. The reserve
+    states the invariant directly, and lands this install on 2048M — no worse
+    than the pre-existing 2G default, so nothing regresses for small hosts.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_env(tmp_path, 4 * 1024**3),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=2048M" in slog.read_text(), slog.read_text()
+
+
+def test_cap_never_emits_a_nonpositive_value(tmp_path):
+    """A container smaller than the reserve must not produce "0M" or a negative.
+
+    systemd would reject a malformed value and the scope would then carry NO cap
+    at all — failing open to something strictly worse than the bug. A small
+    positive floor keeps the scope real; such a host cannot run this index
+    regardless, and being killed at its own scope is the correct outcome.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_env(tmp_path, 1 * 1024**3),
+    )
+    assert res.returncode == 0, res.stderr
+    calls = slog.read_text()
+    assert "MemoryMax=256M" in calls, calls
+    assert "MemoryMax=0M" not in calls and "MemoryMax=-" not in calls
+
+
+def test_cap_is_derived_without_depending_on_PATH(tmp_path):
+    """The limit is read with a shell BUILTIN, not `cat`.
+
+    This entrypoint runs with a minimal PATH in the no-systemd fallback (the
+    environment _minimal_path builds). With `cat` absent the read failed, emptied
+    the value, and returned the UNBOUNDED target — restoring a cap equal to the
+    parent limit on precisely the constrained install the bound protects. A
+    builtin cannot go missing.
+    """
+    minbin = _minimal_path(tmp_path)
+    log = tmp_path / "tools.log"
+    _fake_tools(minbin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=str(minbin),
+        env_extra=_fake_cgroup_env(tmp_path, 4 * 1024**3),
+    )
+    assert res.returncode == 0, res.stderr
+    # 2048M in KB — the BOUNDED value, proving the read succeeded without `cat`.
+    assert "ULIMIT_V:2097152" in log.read_text(), log.read_text()
 
 
 # ── 4. pressure watchdog ──────────────────────────────────────────────────
@@ -542,3 +661,108 @@ def test_triggers_enqueue_markers_and_do_not_spawn():
         assert "code_intel_index.sh" not in text, (
             f"{rel} must NOT spawn the entrypoint directly — enqueue a marker"
         )
+
+
+# ── 3c. cap bounded by the container, and adj normalisation ──────────────────
+# Both from Codex P1/P2 on this PR. The cap was shipped as an absolute 4G, which
+# EQUALS the container limit on a minimum install (host-setup.sh floors an
+# install at 4 GiB) — a cap equal to the whole container isolates nothing.
+
+
+def _derive_mem_max(limit_bytes: str | None, tmp_path, *ancestors: str) -> str:
+    """Run the script's own _derive_mem_max against a faked cgroup chain.
+
+    Sources the real function rather than restating its arithmetic — a test that
+    reimplements the code under test passes while production stays broken.
+
+    ``limit_bytes`` is the ROOT level; ``ancestors`` are further levels below it,
+    innermost last, so a constrained intermediate slice can be expressed. ``None``
+    at the root means the file is absent entirely.
+    """
+    src = _ENTRYPOINT.read_text()
+    start = src.index("_CI_MEM_TARGET_MB=")
+    end = src.index("MEM_MAX=", start)
+    body = src[start:end]
+
+    root = tmp_path / "cg"
+    root.mkdir(exist_ok=True)
+    if limit_bytes is not None:
+        (root / "memory.max").write_text(limit_bytes)
+    d, rel = root, []
+    for i, val in enumerate(ancestors, 1):
+        d = d / f"level{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "memory.max").write_text(val)
+        rel.append(f"level{i}")
+    selfcg = tmp_path / "selfcg"
+    selfcg.write_text("0::/" + "/".join(rel) + "\n")
+
+    res = subprocess.run(
+        ["bash", "-c", body + "\n_derive_mem_max"],
+        capture_output=True, text=True, timeout=30,
+        env={
+            "PATH": _SYSTEM_PATH,
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    return res.stdout.strip()
+
+
+def test_cap_is_bounded_by_the_smallest_finite_limit_on_the_chain(tmp_path):
+    """A constrained ANCESTOR binds before the container root does.
+
+    cgroup v2 nested limits only restrict further and are enforced across the
+    subtree, so a 3 GiB user slice inside a 32 GiB container is the real ceiling.
+    Reading only /sys/fs/cgroup/memory.max derived 4096M for a scope that could
+    never fire before its own slice OOMed — strictly worse than the 2 GiB scope it
+    replaced, which at least isolated. This repo already walks the chain the same
+    way for pids.max (_collect_pid_budget in observability/snapshots/infrastructure).
+    """
+    gib = 1024 * 1024 * 1024
+    # A separate subdirectory per case: _derive_mem_max builds its fake tree at a
+    # fixed name under the directory it is given, so reusing one would have each
+    # case overwrite the last and silently test the same chain three times.
+    # (pytest's tmp_path, never an absolute home path — that is both unportable
+    # and a machine-specific value with no business in the repo.)
+    a, b, c = (tmp_path / "case1", tmp_path / "case2", tmp_path / "case3")
+    for d in (a, b, c):
+        d.mkdir()
+    # Root is generous; an intermediate slice is not. 3 GiB - 2 GiB reserve.
+    assert _derive_mem_max(str(32 * gib), a, str(3 * gib)) == "1024M"
+    # An uncapped intermediate level must not mask the root's real limit.
+    assert _derive_mem_max(str(4 * gib), b, "max") == "2048M"
+    # Deepest level binding, several levels down.
+    assert _derive_mem_max(str(32 * gib), c, "max", str(5 * gib)) == "3072M"
+
+
+def test_cap_is_bounded_by_the_container_limit(tmp_path):
+    """A minimum install must not get a cap equal to its whole container."""
+    gib = 1024 * 1024 * 1024
+    # 4 GiB minimum install: the absolute 4096M target would BE the container.
+    # 2048M, not 60%-of-4GiB (2457M): the reserve is the binding constraint here.
+    # 2457M would leave only 1,639M for genesis-server + Qdrant + a session
+    # together, so the parent cgroup could still OOM before the scope boundary —
+    # which is the whole failure this bound exists to prevent. See _CI_MEM_RESERVE_MB.
+    assert _derive_mem_max(str(4 * gib), tmp_path) == "2048M"
+    # 32 GiB: the measured target is well under the bound, so it stands.
+    assert _derive_mem_max(str(32 * gib), tmp_path) == "4096M"
+    # Uncapped container ("max") or unreadable: nothing bounds us, target stands.
+    assert _derive_mem_max("max", tmp_path) == "4096M"
+    assert _derive_mem_max(None, tmp_path) == "4096M"
+
+
+def test_cap_is_emitted_as_M_so_the_rlimit_fallback_can_parse_it(tmp_path):
+    """The bound must never be expressed as a percentage.
+
+    The rlimit fallback parses only <int>[.frac]G|M; a '%' falls through to
+    "running memory-uncapped", failing OPEN to something worse than the bug.
+    """
+    gib = 1024 * 1024 * 1024
+    for limit in (str(4 * gib), str(32 * gib), "max", None):
+        out = _derive_mem_max(limit, tmp_path)
+        assert out.endswith("M"), out
+        assert "%" not in out
+
+
