@@ -13,8 +13,11 @@ install-local), so any peer a test needs, it writes into its own overlay.
 """
 from __future__ import annotations
 
+import runpy
+import site
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 import pytest
@@ -112,22 +115,15 @@ def test_peer_routes_and_drops_api_key(hermetic_home):
 
 
 def _fake_repo(tmp_path, secrets_body):
-    """A repo-root-shaped dir with a REAL venv, so the re-exec has somewhere to go.
-
-    `.venv` is symlinked as a WHOLE DIRECTORY on purpose: the guard compares
-    `sys.prefix` to `<root>/.venv`, and after the exec `sys.prefix` is the real
-    venv. Symlinking only `bin/python` would leave the two unequal forever —
-    i.e. an infinite exec loop, which is exactly what the sentinel also guards.
-    """
+    """A disposable repo with its own venv, including when CI uses bare Python."""
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     (root / "scripts" / "gmodel").write_bytes(_GMODEL.read_bytes())
     (root / "scripts" / "gmodel").chmod(0o755)
-    # Point at the venv THIS test run is using (sys.prefix), not at
-    # `_REPO_ROOT/.venv`. A git worktree has no .venv of its own, so the
-    # repo-relative form made the load-bearing test SKIP — a silent pass on the
-    # one assertion that matters. sys.prefix is a venv wherever pytest runs.
-    (root / ".venv").symlink_to(Path(sys.prefix))
+    venv.EnvBuilder(with_pip=False, system_site_packages=True, symlinks=True).create(root / ".venv")
+    # Reuse installed test dependencies without network/package installation.
+    for packages in (root / ".venv" / "lib").glob("python*/site-packages"):
+        (packages / "test-dependencies.pth").write_text("\n".join(site.getsitepackages()) + "\n")
     (root / "src").symlink_to(_REPO_ROOT / "src")
     (root / "secrets.env").write_text(secrets_body)
     return root
@@ -145,9 +141,6 @@ def _overlay(home, auth_env):
 
 
 @pytest.mark.skipif(not _GMODEL.is_file(), reason="gmodel launcher not present")
-@pytest.mark.skipif(
-    sys.prefix == sys.base_prefix, reason="pytest is not running inside a venv"
-)
 def test_reexecs_into_venv_from_the_base_interpreter(tmp_path, hermetic_home):
     """THE regression. A key that IS configured must not be reported as missing.
 
@@ -162,13 +155,19 @@ def test_reexecs_into_venv_from_the_base_interpreter(tmp_path, hermetic_home):
     root = _fake_repo(tmp_path, "GENESIS_TEST_REEXEC_KEY=zk-from-secrets-env\n")
     _overlay(hermetic_home, "GENESIS_TEST_REEXEC_KEY")
 
-    base = str(Path(sys.executable).resolve())  # the bare `python3` case
+    (root / "scripts" / "sitecustomize.py").write_text(
+        "import sys\nprint('GMODEL_PREFIX=' + sys.prefix)\n"
+    )
+    base = getattr(sys, "_base_executable", sys.executable)
+    assert (root / ".venv" / "bin" / "python").resolve() == Path(base).resolve()
     r = subprocess.run(
         [base, str(root / "scripts" / "gmodel"), "--list"],
         capture_output=True, text=True, timeout=60,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(hermetic_home)},
+        env={"PATH": "/usr/bin:/bin", "HOME": str(hermetic_home),
+             "PYTHONPATH": str(root / "scripts")},
     )
     assert r.returncode == 0, r.stderr
+    assert f"GMODEL_PREFIX={root / '.venv'}" in r.stdout
     assert "key ✓" in r.stdout, (
         f"peer key read from secrets.env was not seen — re-exec did not happen.\n"
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
@@ -187,7 +186,14 @@ def test_reexec_sentinel_prevents_an_infinite_loop(tmp_path, hermetic_home):
     root = _fake_repo(tmp_path, "GENESIS_TEST_REEXEC_KEY=zk-from-secrets-env\n")
     _overlay(hermetic_home, "GENESIS_TEST_REEXEC_KEY")
 
-    base = str(Path(sys.executable).resolve())
+    (root / "scripts" / "dotenv.py").write_text("raise ImportError('forced missing dotenv')\n")
+    (root / "scripts" / "sitecustomize.py").write_text(
+        "import os\n"
+        "def forbidden_exec(*args):\n"
+        "    raise RuntimeError('sentinel failed to prevent re-exec')\n"
+        "os.execv = forbidden_exec\n"
+    )
+    base = getattr(sys, "_base_executable", sys.executable)
     r = subprocess.run(
         [base, str(root / "scripts" / "gmodel"), "--list"],
         capture_output=True, text=True, timeout=60,
@@ -195,6 +201,7 @@ def test_reexec_sentinel_prevents_an_infinite_loop(tmp_path, hermetic_home):
             "PATH": "/usr/bin:/bin",
             "HOME": str(hermetic_home),
             "GENESIS_GMODEL_REEXEC": "1",  # pretend a hop already happened
+            "PYTHONPATH": str(root / "scripts"),
         },
     )
     assert r.returncode == 0, r.stderr  # terminated, did not loop
@@ -202,3 +209,11 @@ def test_reexec_sentinel_prevents_an_infinite_loop(tmp_path, hermetic_home):
     # operator never configured one.
     assert "python-dotenv is unavailable" in r.stderr
     assert "cannot see your keys" in r.stderr
+
+
+def test_child_environment_drops_reexec_sentinel(monkeypatch, tmp_path):
+    root = _fake_repo(tmp_path, "")
+    monkeypatch.setenv("GENESIS_GMODEL_REEXEC", "1")
+    launcher = runpy.run_path(str(root / "scripts" / "gmodel"))
+    child = launcher["_build_child_env"]({}, "claude")
+    assert "GENESIS_GMODEL_REEXEC" not in child

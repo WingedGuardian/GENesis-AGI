@@ -135,6 +135,7 @@ def _build_child_env(overrides: dict, name: str) -> dict[str, str]:
     env = dict(os.environ)
     # Avoid CC-in-CC nesting confusion when launched from inside a CC session
     # (mirrors CCInvoker._build_env / experimentation.cc_router).
+    env.pop(_REEXEC_SENTINEL, None)
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     # ALWAYS drop the Anthropic API key:
