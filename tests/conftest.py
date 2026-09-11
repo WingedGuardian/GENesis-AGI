@@ -26,6 +26,7 @@
 # - This is the structural fix for the 2026-04-10 worktree-test-isolation
 #   footgun: before this guard, every sibling-worktree test run needed an
 #   explicit ``PYTHONPATH=src`` prefix or it silently tested main instead.
+import os
 import sys
 from pathlib import Path
 
@@ -38,7 +39,6 @@ if _WORKTREE_SRC.is_dir():
         sys.path.remove(_src_str)
     sys.path.insert(0, _src_str)
 
-import os  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
@@ -439,6 +439,75 @@ async def db():
     wrapped = SerializedConnection(conn)
     yield wrapped
     await wrapped.close()
+
+
+#: Entries a test is allowed to create at the top level of the real ``~/.genesis``.
+#: Deliberately EMPTY. It exists so that adding one is a visible, reviewed act
+#: rather than something a test does silently — if a case ever earns it, the name
+#: and the reason belong here.
+_GENESIS_HOME_WRITE_ALLOWLIST: frozenset[str] = frozenset()
+
+
+def _genesis_home_toplevel() -> set[str]:
+    """Top-level entry names in the REAL ``~/.genesis``, or empty if unreadable."""
+    try:
+        return {e.name for e in os.scandir(os.path.expanduser("~/.genesis"))}
+    except OSError:
+        return set()
+
+
+@pytest.fixture(autouse=True)
+def _guard_no_writes_to_the_real_genesis_home(request):
+    """Fail the test that creates state in the operator's real ``~/.genesis``.
+
+    THE CLASS THIS CLOSES, measured twice in one session. A module declares a
+    state path as a module-level constant::
+
+        TOMBSTONE_INDEX = Path.home() / ".genesis" / "worktree-tombstones.jsonl"
+
+    and its tests, which never think about that constant, append to the
+    OPERATOR'S real file. Both instances were silent: a write to a file nobody
+    was watching, discovered only because someone happened to look. Fixing the
+    first did not prevent the second, because the fix was a redirect of that one
+    name — and this file's existing isolation works the same way, redirecting a
+    KNOWN LIST (db path, alerts queue, snapshots, config). Every new state file
+    is therefore unprotected by default, which is exactly backwards.
+
+    WHY IT CHECKS ONLY NEW TOP-LEVEL ENTRIES, and why that is not laziness. This
+    box runs several concurrent sessions and a live server, all writing inside
+    ``~/.genesis`` continuously — so a watcher that flagged any modification
+    would fail constantly on other people's traffic and be disabled within a day.
+    New TOP-LEVEL entries are the quiet case: the churning paths (``cc-tmp``,
+    ``logs``, ``sessions``, ``alerts``) already exist, so live traffic lands
+    inside them and is invisible here, while a module constant of the shape above
+    creates a NEW name at the top level. That is the shape both real incidents
+    took.
+
+    What it therefore does NOT catch, stated so the coverage is not overread: a
+    test writing into an existing subdirectory, or overwriting an existing
+    top-level file. Those need the redirect that this guard's failure message
+    asks for; this catches the case that arrives with no warning at all.
+
+    Cost: two ``scandir`` calls per test (~0.2ms each, measured on 111 entries).
+    """
+    before = _genesis_home_toplevel()
+    yield
+    if not before:  # unreadable ~/.genesis — nothing to claim either way
+        return
+    created = _genesis_home_toplevel() - before - _GENESIS_HOME_WRITE_ALLOWLIST
+    if not created:
+        return
+    names = ", ".join(sorted(created))
+    raise AssertionError(
+        f"this test created {names} in the operator's REAL ~/.genesis.\n"
+        f"A module-level path constant is almost certainly the cause, e.g.\n"
+        f"    SOMETHING = Path.home() / '.genesis' / '<name>'\n"
+        f"Redirect it for the test — `monkeypatch.setattr(mod, 'SOMETHING', "
+        f"tmp_path / '<name>')` — rather than deleting the file afterwards: the "
+        f"next new constant would leak the same way.\n"
+        f"(Writes INTO existing subdirectories are invisible to this guard, so a "
+        f"clean run here is not proof of full isolation.)"
+    )
 
 
 @pytest.fixture(autouse=True)
