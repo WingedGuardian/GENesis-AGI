@@ -122,7 +122,16 @@ async def _handle_failure(
     await sched._queue.mark_failed(task.id, reason=reason)
     if emit_event and sched._event_bus:
         await sched._event_bus.emit(
-            Subsystem.SURPLUS, Severity.WARNING,
+            # ERROR, not WARNING: `task.failed` is a REFLEX-OWNED event type
+            # (`runtime/init/ego.py::_REFLEX_OWNED_EVENT_TYPES`) and the reflex
+            # ingestor subscribes at `min_severity=Severity.ERROR`
+            # (`reflex/ingest.py`). Emitted at WARNING it fell BELOW that floor,
+            # so the one subscriber the event exists for never saw it — while the
+            # ego gate correctly refused it as reflex-owned. The event went
+            # nowhere. Raising the severity only ADDS recipients (the two
+            # WARNING-floor subscribers already received it, and the ego returns
+            # immediately on the reflex gate), so this cannot wake anything new.
+            Subsystem.SURPLUS, Severity.ERROR,
             "task.failed",
             f"Surplus task {task.id} failed with exception",
             task_id=task.id, task_type=str(task.task_type),
