@@ -3,12 +3,6 @@
 #
 # Run by the genesis-disk-hygiene.timer systemd unit (also runnable by hand).
 # Best-effort steps — one failing must not skip the others:
-#   0. Refresh worktree ownership locks    → scripts/worktree_claim_sweep.py
-#      (numbered 0, not inserted as a new 1, because docs/architecture/CURRENT.md
-#      cites these steps BY NUMBER — "disk-hygiene step 8", "step 8b" — so
-#      renumbering here silently falsifies references in another file. It runs
-#      before step 1 on purpose: the reaper skips locked worktrees, so the locks
-#      it reads must be the ones this sweep just decided on.)
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
 #      (trash-bin with 7-day recovery; frees space when trash purges)
 #   2. Reclaim regenerable caches          → scripts/disk_reclaim.py
@@ -114,13 +108,6 @@ main() {
     fi
 
     echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
-
-    # Ownership locks first, so the reaper below reads the locks this sweep just
-    # decided on rather than yesterday's. Ordering is the whole reason these are
-    # adjacent: the sweep is what makes "locked" mean "someone is working here"
-    # instead of "someone was, once".
-    echo "--- worktree ownership sweep ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_claim_sweep.py" || echo "worktree_claim_sweep exited $?"
 
     echo "--- worktree reaping ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"

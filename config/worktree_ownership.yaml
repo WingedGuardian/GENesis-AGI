@@ -1,29 +1,32 @@
-# Worktree ownership — records which session holds which worktree, so that one
-# session cannot edit or reap another's work by mistake.
+# Worktree ownership — records which live session is using which worktree, so
+# that one session cannot quietly have its worktree reaped out from under it, or
+# edit another session's work by mistake.
 #
 # Ownership is written as a `git worktree lock` reason rather than a bespoke
-# claim file, because two enforcement points already honour that lock with no
-# code to add: the reaper (scripts/worktree_lifecycle.py) skips a locked
-# worktree, and `git worktree remove` refuses one unless given --force.
+# claim file, because the reaper already classifies a locked worktree as
+# protected and `git worktree remove` already refuses one. Recording the fact IS
+# the protection; there is no new enforcement anywhere.
 #
-# The signal this replaces did not work. Both existing guards infer ownership by
-# scanning /proc/*/cwd for a process sitting inside the worktree, and sessions
-# `cd` per command, so their process CWD never leaves the main tree. Measured on
-# a live install: 0 of 200 worktrees had any process CWD inside them while 7
-# session processes were running.
+# WHY THIS EXISTS: the two signals the reaper had are both measured dead.
+#   * /proc/*/cwd ownership — 0 of 200 worktrees had any process CWD inside them
+#     while 7 session processes ran. Sessions `cd` per command, so their process
+#     CWD never leaves the main checkout.
+#   * mtime staleness — the activity walk samples the worktree root and two
+#     directory levels, and editing a file moves only that file's mtime. A
+#     worktree whose src/genesis/**.py was just edited still reported 19 days
+#     idle and reapable; git saw the change, the walk did not.
+#
+# ONE THING IS RECORDED: which live process is using this worktree. Dirtiness is
+# NOT recorded — the reaper computes that itself, at the instant it decides.
+# A lock records what cannot be derived; everything derivable is derived at the
+# point of use.
 #
 # mode:
-#   advisory — (default) the daily sweeper maintains locks: it locks worktrees
-#              holding uncommitted tracked changes and releases every lock whose
-#              release condition has come true. Nothing is ever blocked.
-#   off      — take no locks, release none.
-#
-# SCOPE TODAY: the sweeper only RELEASES `claim` locks; nothing takes one yet.
-# Claims are taken by the Edit/Write hook, which ships separately, and the
-# stderr advisory for editing another session's worktree arrives with it. Until
-# then this lever governs dirty-worktree protection only. Said plainly here
-# because a setting that describes a protection it does not yet provide is worse
-# than one that describes less.
+#   advisory — (default) a session claims a worktree on its first write into it,
+#              and is warned on stderr when it writes into one another live
+#              session holds. Claims are released when the claiming process is
+#              gone. Nothing is ever blocked.
+#   off      — claim nothing, release nothing, warn about nothing.
 # enabled: master switch; false is equivalent to off.
 #
 # An invalid mode degrades to `advisory`, not `off`: every surface here is
@@ -32,8 +35,8 @@
 # Read live per call. The env kill switch GENESIS_WORKTREE_OWNERSHIP=1 forces
 # off. Takes effect immediately, no restart.
 #
-# Note `off` does NOT release locks already taken — it stops the sweeper
-# entirely, including its release half. To unwind, run the sweeper once with
-# `--release-only` before switching it off.
+# Note `off` does not release claims already taken. A claim releases when its
+# process exits regardless of this setting, so they drain on their own rather
+# than accumulating.
 enabled: true
 mode: advisory

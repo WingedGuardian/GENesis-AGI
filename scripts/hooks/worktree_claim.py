@@ -1,74 +1,59 @@
 #!/usr/bin/env python3
 """Worktree ownership: record who holds a worktree, as a fact rather than a guess.
 
-Many Claude Code sessions share one repository and its worktrees, and nothing
-records which session is working in which. Two guards already try to infer it the
-same way -- by scanning ``/proc/*/cwd`` for a process sitting inside the worktree
--- and that signal does not exist here: sessions ``cd`` per command, so a
-session's process CWD never leaves the main tree. MEASURED on a live install
-2026-09-10: 0 of 200 worktrees had any process CWD inside them, while 7 session
-processes were running.
+Many Claude Code sessions share one repository and 200+ worktrees, and nothing
+records which session is working in which. The reaper tries to infer it, and the
+signal it infers from does not exist here.
 
-So ownership is RECORDED instead of inferred, using git's own primitive:
+WHAT THIS MODULE IS FOR, precisely: a session can be working in a worktree while
+every signal the reaper has says nobody is. This records the one fact that
+settles it — which live process is using this worktree — in a form the reaper
+already honours.
 
-    git worktree lock --reason '<sentence> <json>'
+THE TWO SIGNALS IT REPLACES, both MEASURED DEAD rather than assumed:
 
-That was chosen over a bespoke claim file because two enforcement points already
-honour it, with no code to add to either:
+  * ``/proc/*/cwd`` ownership. ``worktree_cwd_guard.py`` and
+    ``worktree_lifecycle.py`` each scan for a process sitting inside the
+    worktree. 2026-09-10: 0 of 200 worktrees had any process CWD inside them
+    while 7 session processes were running. Sessions ``cd`` per command, so a
+    session's process CWD never leaves the main checkout.
+  * mtime staleness. ``_last_activity_time`` samples the worktree root and TWO
+    directory levels, and modifying a file updates that file's mtime only, never
+    its ancestors'. 2026-09-11, with a control that moves: a worktree backdated
+    19 days reported 19.0d; editing ``src/genesis/memory/store.py`` left it at
+    19.0d and still reapable; editing ``README.md`` (depth 1) correctly reported
+    0.0d. git saw the deep edit (``M src/genesis/memory/store.py``); the walk did
+    not. Nearly all source in this repo lives below the sampled depth, so this is
+    the common case.
 
-  * ``scripts/worktree_lifecycle.py`` skips a locked worktree outright.
-  * ``git worktree remove`` refuses a locked worktree unless given ``--force``.
+WHY A ``git worktree lock`` AND NOT A CLAIM FILE. Two enforcement points already
+honour it with no code to add to either: the reaper classifies a locked worktree
+as protected, and ``git worktree remove`` refuses one. MEASURED with the control
+moving in both directions.
 
-Both were MEASURED rather than read (same install, same date), with the control
-moving in both directions -- the same merged, backdated worktree reported
-"WOULD TRASH" unlocked and was skipped once locked, and ``git worktree remove``
-exited 128 locked and 0 unlocked.
+WHAT THIS DELIBERATELY DOES NOT RECORD. Dirtiness. The reaper can compute that
+itself, at the instant it decides, and does. Recording it here would mean
+sampling it in one process and acting on it in another, and everything that
+followed from that arrangement in an earlier design — a return code so one step
+could tell the next, a re-check because the value went stale, a reconciliation
+with a third tool — was a seam that generated its own defects. **A lock records
+what cannot be derived; everything derivable is derived at the point of use.**
+Only the claiming session knows its own pid, so that is the only thing here.
 
 THE REASON LEADS WITH A SENTENCE, AND THAT IS NOT COSMETIC. git echoes the lock
-reason verbatim when it refuses a removal, so the reason string is read by a
-human or an agent at exactly the moment they are blocked. A bare JSON blob there
-explains nothing. The machine-readable half follows the sentence and is parsed
-from the first ``{``.
+reason verbatim when it refuses a removal, so the reason is read by a human or an
+agent at exactly the moment they are blocked. A bare JSON blob there explains
+nothing. The machine-readable half follows and is parsed from the first ``{``.
 
-Two rules, each with a decidable release condition -- a lock with no release
-condition is why blanket-locking every worktree was rejected:
-
-    claim   a session took this worktree      released when its process is gone,
-                                              or the worktree has gone idle
-    dirty   it holds uncommitted tracked work released when it becomes clean
-
-THERE IS DELIBERATELY NO `archon` RULE, and the reason is measured rather than
-assumed. Archon creates worktrees registered against THIS repository (verified
-on a live install: an Archon worktree's ``.git`` points into this repo's
-``.git/worktrees/``), so the obvious move is a third rule holding them while
-Archon calls the environment active. That rule was built, run end to end, and
-removed, because it DEADLOCKS:
-
-  1. Archon's ``complete`` runs ``git worktree remove``, which the lock refuses;
-  2. so the environment never leaves ``status='active'``;
-  3. so the release condition -- "Archon stopped reporting it active" -- can
-     never fire, and the lock is permanent.
-
-Measured, not predicted: ``archon complete`` reported "0 completed, 1 failed"
-against exactly this lock, and only a manual unlock recovered it.
-
-It was also redundant. A CLEAN Archon worktree has nothing for the reaper to
-destroy, and the reaper's own freshness and merged checks already keep a running
-one; a DIRTY one is caught by the `dirty` rule like any other worktree, and
-``git worktree remove`` refuses a dirty worktree anyway -- so on the only case
-that mattered, our lock was not what stopped Archon. ``archon_active_paths``
-below survives as a read-only seam and reports how many environments are active,
-which is observability, not a lock.
-
-A lock whose reason is NOT our JSON is FOREIGN -- a human's
-``git worktree lock --reason "do not touch"``. It is never parsed for meaning and
-never auto-released. Refusing to interpret someone else's lock is the whole point
-of distinguishing them.
+A lock whose reason is NOT our namespaced JSON is FOREIGN — a human's
+``git worktree lock --reason "do not touch"``, or another tool's. Never parsed
+for meaning, never auto-released. Refusing to interpret someone else's lock is
+the whole point of distinguishing them.
 
 Stdlib only, and deliberately so: this is imported by a PreToolUse hook on the
-latency path and by a batch sweeper that may run under the system interpreter
-when the venv is absent. ``yaml`` is imported lazily and only for the config
-read, which falls back to defaults when it is unavailable.
+latency path and read by a reaper that may run under the system interpreter when
+the venv is absent. ``yaml`` is imported lazily and only for the config read,
+which falls back to defaults when it is unavailable.
 """
 
 from __future__ import annotations
@@ -86,15 +71,18 @@ from pathlib import Path
 PAYLOAD_VERSION = 1
 
 # The namespace that makes a payload OURS. Without it, any lock reason ending in
-# generic JSON -- `manual hold {"v":1,"rule":"dirty"}` -- parses as ours and
+# generic JSON -- `manual hold {"v":1,"rule":"claim"}` -- parses as ours and
 # becomes eligible for auto-release, which breaks the one invariant this module
 # is built on: a lock we did not write is never touched. `v` and `rule` are
 # common enough words to be written by accident; this is not.
 PAYLOAD_NAMESPACE = "genesis.worktree-ownership"
 
+# One rule, because one fact needs recording. `rule` survives as a field so a
+# future kind of ownership can be added without every existing lock becoming
+# unreadable -- and so an unrecognised rule reads as FOREIGN rather than as
+# something to act on.
 RULE_CLAIM = "claim"
-RULE_DIRTY = "dirty"
-RULES = (RULE_CLAIM, RULE_DIRTY)
+RULES = (RULE_CLAIM,)
 
 # A session process: argv[0]'s basename is exactly `claude`. MEASURED: the
 # wrapper that launches it (`bash -c cd ... && claude ...`) also contains the
@@ -104,8 +92,8 @@ _SESSION_EXE = "claude"
 
 _GIT_TIMEOUT = 30
 
-# Session ids are UUIDs. Anything else is not one, and is refused rather than
-# escaped -- the id is echoed into a lock reason a human reads.
+# Session ids are UUID-shaped. Anything else is not one, and is refused rather
+# than escaped -- the id is echoed into a lock reason a human reads.
 _SID_RE = re.compile(r"[0-9a-fA-F-]{1,64}\Z")
 
 # Locks written by something else that we can nonetheless NAME. Claude Code's own
@@ -118,11 +106,7 @@ _SID_RE = re.compile(r"[0-9a-fA-F-]{1,64}\Z")
 # Recognising it buys a useful report and nothing else -- these stay FOREIGN and
 # are never auto-released. MEASURED 2026-09-10: of 6 agent worktrees on a live
 # install, only the one with a running agent was still locked, so the harness
-# does clean up after itself and there is no leak to chase. A CRASHED agent would
-# leak one, and a leaked lock pins a worktree away from the reaper permanently --
-# so the sweeper reports an idle foreign lock loudly instead of acting on it.
-# Releasing another tool's lock by parsing a format we do not control is exactly
-# the mistake the foreign category exists to prevent.
+# does clean up after itself and there is no leak to chase.
 _THIRD_PARTY = ((re.compile(r"^claude agent\b"), "claude agent"),)
 
 
@@ -363,19 +347,17 @@ def _parse_payload(raw: str) -> dict | None:
         return None
     if payload.get("v") != PAYLOAD_VERSION:
         return None
-    rule = payload.get("rule")
-    if rule not in RULES:
+    if payload.get("rule") not in RULES:
         return None
-    # Validate the WHOLE payload, not just the discriminators. A `claim` missing
+    # Validate the WHOLE payload, not just the discriminators. A claim missing
     # its pid, or carrying a non-integer one, has no usable release condition --
     # `pid_is_live_session` would read it as dead and release immediately, which
     # is the opposite of what a malformed claim should do.
-    if rule == RULE_CLAIM:
-        if not isinstance(payload.get("pid"), int) or payload["pid"] <= 1:
-            return None
-        start_time = payload.get("start")
-        if start_time is not None and not isinstance(start_time, int):
-            return None
+    if not isinstance(payload.get("pid"), int) or payload["pid"] <= 1:
+        return None
+    start_time = payload.get("start")
+    if start_time is not None and not isinstance(start_time, int):
+        return None
     return payload
 
 
@@ -395,49 +377,45 @@ def read_lock(root: Path) -> Lock | None:
 def format_reason(payload: dict) -> str:
     """A lock reason: a sentence a blocked reader can act on, then the JSON.
 
-    git prints this verbatim in "cannot remove a locked working tree" , so the
+    git prints this verbatim in "cannot remove a locked working tree", so the
     sentence has to say who holds it and what would make it safe to release.
     """
-    rule = payload.get("rule")
-    if rule == RULE_CLAIM:
-        pid = payload.get("pid")
-        lead = (
-            f"Claimed by a live Claude Code session (pid {pid}). "
-            "If that process is gone this lock is stale and safe to release."
-        )
-    elif rule == RULE_DIRTY:
-        lead = (
-            "Holds uncommitted tracked changes. "
-            "Commit or discard them and this lock releases on the next sweep."
-        )
-    else:  # pragma: no cover - RULES is closed, guarded by callers
-        lead = "Held by the worktree ownership sweeper."
+    pid = payload.get("pid")
+    lead = (
+        f"Claimed by a live Claude Code session (pid {pid}). "
+        "If that process is gone this lock is stale and safe to release."
+    )
     return f"{lead} {json.dumps(payload, separators=(',', ':'), sort_keys=True)}"
 
 
-def build_payload(rule: str, *, sid: str | None = None, pid: int | None = None) -> dict | None:
-    """The JSON half of a lock reason, or None when the rule cannot be satisfied.
+def build_payload(
+    rule: str = RULE_CLAIM, *, sid: str | None = None, pid: int | None = None
+) -> dict | None:
+    """The JSON half of a lock reason, or None when the claim cannot be satisfied.
 
-    A `claim` without a resolvable session pid returns None rather than a lock
-    with no release condition. That is the whole reason blanket-locking was
-    rejected: a lock nothing can decide to remove is indistinguishable from a
-    leak, and 200 of them would stop the reaper permanently.
+    A claim without a resolvable session pid returns None rather than a lock with
+    no release condition. That is the whole reason blanket-locking was rejected:
+    a lock nothing can decide to remove is indistinguishable from a leak, and 200
+    of them would stop the reaper permanently.
     """
     if rule not in RULES:
         return None
-    payload: dict = {"ns": PAYLOAD_NAMESPACE, "v": PAYLOAD_VERSION, "rule": rule}
-    if rule == RULE_CLAIM:
-        if pid is None:
-            pid = session_pid_from_ancestry()
-        if pid is None:
-            return None
-        start = proc_starttime(pid)
-        if start is None:
-            return None
-        payload["pid"] = pid
-        payload["start"] = start
-        if sid and _SID_RE.match(sid):
-            payload["sid"] = sid
+    if pid is None:
+        pid = session_pid_from_ancestry()
+    if pid is None:
+        return None
+    start = proc_starttime(pid)
+    if start is None:
+        return None
+    payload = {
+        "ns": PAYLOAD_NAMESPACE,
+        "v": PAYLOAD_VERSION,
+        "rule": rule,
+        "pid": pid,
+        "start": start,
+    }
+    if sid and _SID_RE.match(sid):
+        payload["sid"] = sid
     return payload
 
 
@@ -458,7 +436,9 @@ def lock_worktree(root: Path, payload: dict) -> bool:
 
     Never overwrites an existing lock. An existing lock is another rule's or
     another session's statement of ownership, and replacing it would discard the
-    release condition that makes it removable.
+    release condition that makes it removable. git refuses a second lock anyway;
+    checking first is what keeps the answer deterministic and off the /proc walk
+    that ``build_payload`` would otherwise perform.
     """
     if read_lock(root) is not None:
         return False
@@ -477,108 +457,33 @@ def unlock_worktree(root: Path) -> bool:
     return bool(result and result.returncode == 0)
 
 
-# --------------------------------------------------------------------------
-# Rule predicates
-# --------------------------------------------------------------------------
-
-
-def has_tracked_changes(root: Path) -> bool:
-    """True when ``root`` holds uncommitted changes to TRACKED files.
-
-    Untracked files are excluded deliberately. A worktree accumulates untracked
-    build output, caches and editor droppings that nobody would call work; if
-    those counted, every worktree would be permanently dirty and the `dirty`
-    rule would degenerate into the blanket lock this design rejected.
-
-    Fails CLOSED -- an unreadable worktree reports dirty, so a git failure keeps
-    the lock rather than dropping protection.
-    """
-    result = _git(root, "status", "--porcelain", "--untracked-files=no")
-    if result is None or result.returncode != 0:
-        return True
-    return bool(result.stdout.strip())
-
-
-def archon_active_paths(db_path: Path | None = None) -> list[str]:
-    """Worktree paths Archon still calls active. Empty list when Archon is absent.
-
-    OBSERVABILITY, NOT A LOCK. Nothing here decides ownership from this answer --
-    see the module docstring for the deadlock that removed the rule which did.
-    The sweep reports the count so an operator can see how much of the worktree
-    population belongs to Archon, and the read stays because the fact is cheap,
-    measured, and the thing a future Archon-aware rule would need.
-
-    This is the only place the design touches Archon at all, and it must stay
-    optional: an install without Archon has to behave identically, so every
-    failure -- no file, no table, a corrupt database, a schema that moved --
-    returns an empty list instead of raising. Verified end to end by moving the
-    Archon state directory aside on a live install: absent and corrupt both
-    return [] and the sweep is otherwise unchanged.
-
-    Read-only, and safe against a live writer: Archon holds this database open in
-    WAL mode while its UI runs. The URI is built with ``pathname2url`` because a
-    raw f-string silently opens a DIFFERENT (empty) database when the path
-    contains ``?`` or ``#`` -- the query string starts early and SQLite reads
-    whatever the truncated path names.
-    """
-    if db_path is None:
-        db_path = Path.home() / ".archon" / "archon.db"
-    if not db_path.exists():
-        return []
-    try:
-        import sqlite3
-        from urllib.request import pathname2url
-
-        uri = f"file:{pathname2url(str(db_path))}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=5) as conn:
-            rows = conn.execute(
-                "SELECT working_path FROM remote_agent_isolation_environments "
-                "WHERE status = 'active'"
-            ).fetchall()
-    except Exception:
-        return []
-    return [r[0] for r in rows if r and r[0]]
-
-
-def is_releasable(
-    lock: Lock,
-    root: Path,
-    *,
-    idle_seconds: float | None = None,
-    stale_seconds: float | None = None,
-) -> tuple[bool, str]:
+def is_releasable(lock: Lock) -> tuple[bool, str]:
     """Whether ``lock`` may be released now, and why.
 
-    Returns ``(releasable, reason)``; the reason is logged either way, so a lock
-    that stays explains itself as loudly as one that goes.
+    Returns ``(releasable, reason)``; the reason is reported either way, so a
+    lock that stays explains itself as loudly as one that goes.
 
-    A FOREIGN lock is never releasable. Neither is a lock whose rule we do not
-    recognise -- both mean "someone else's statement", and the correct action for
-    someone else's statement is to leave it alone. An unrecognised rule is the
-    shape a lock written by a FUTURE version of this module would have, and
-    leaving it alone is the right answer for that too.
+    ONE condition, deliberately. An earlier design also released a live
+    session's claim once the worktree looked idle, to stop a long-running session
+    pinning a worktree for its whole life. That was built on the mtime staleness
+    signal, which is MEASURED unsound for any file deeper than two directory
+    levels — so it would have released claims on worktrees being actively edited.
+    It is gone. A claim ends when its process ends, and a claim held by a live
+    session is correct: that session may well come back to it, and the only cost
+    is a merged worktree not being reclaimed while its owner is still running.
+
+    A FOREIGN lock is never releasable, and neither is a lock whose rule we do not
+    recognise — both mean "someone else's statement", including a statement from a
+    future version of this module.
     """
     if lock.foreign or lock.payload is None:
         return False, f"{describe_foreign(lock.raw)} lock (not ours) — left untouched"
-
-    rule = lock.rule
-
-    if rule == RULE_CLAIM:
-        pid = lock.payload.get("pid")
-        start = lock.payload.get("start")
-        if not pid_is_live_session(pid, start):
-            return True, f"claiming session (pid {pid}) is gone"
-        if idle_seconds is not None and stale_seconds is not None and idle_seconds >= stale_seconds:
-            days = idle_seconds / 86400
-            return True, f"claim held by a live session but the worktree is idle {days:.0f}d"
-        return False, f"claimed by live session pid {pid}"
-
-    if rule == RULE_DIRTY:
-        if has_tracked_changes(root):
-            return False, "still holds uncommitted tracked changes"
-        return True, "no uncommitted tracked changes remain"
-
-    return False, f"unrecognised rule {rule!r} — left untouched"
+    if lock.rule != RULE_CLAIM:
+        return False, f"unrecognised rule {lock.rule!r} — left untouched"
+    pid = lock.payload.get("pid")
+    if not pid_is_live_session(pid, lock.payload.get("start")):
+        return True, f"claiming session (pid {pid}) is gone"
+    return False, f"claimed by live session pid {pid}"
 
 
 # --------------------------------------------------------------------------
@@ -607,7 +512,7 @@ def _overlay_path() -> Path:
     user config never lands in a PR), while an earlier version of this loader
     looked only at the repository's ``config/`` directory. The result was that
     ``settings_update("worktree_ownership", {"enabled": false})`` would report
-    success, ``settings_get`` would display the override, and the sweeper would
+    success, ``settings_get`` would display the override, and the mechanism would
     go on using the default -- a lever that appears to work and does nothing.
 
     Mirrors ``genesis._config_overlay._resolve_overlay_path``, which cannot be
@@ -629,10 +534,9 @@ def load_config() -> dict:
     Mirrors ``genesis.observability.mcp_staleness_guard_config`` in shape, but
     reads the file directly instead of importing it: this module is imported by a
     hook that may run under an interpreter with no ``genesis`` package on its
-    path, and by a sweeper that may run under the system interpreter when the
-    venv is missing. A missing ``yaml`` degrades to defaults rather than failing,
-    which keeps the mechanism working in exactly the degraded environments where
-    a silent import error would otherwise disable it invisibly.
+    path. A missing ``yaml`` degrades to defaults rather than failing, which keeps
+    the mechanism working in exactly the degraded environments where a silent
+    import error would otherwise disable it invisibly.
     """
     merged = dict(DEFAULTS)
     try:
@@ -654,10 +558,10 @@ def load_config() -> dict:
 def effective_mode() -> str:
     """The mode this mechanism runs under, read live.
 
-    Degrades an invalid value to ``advisory`` rather than ``off``. Both this
-    mechanism's surfaces are non-blocking -- a lock the reaper already honours,
-    and a hook that writes to stderr and exits 0 -- so the safest failure is to
-    keep protecting, not to stop.
+    Degrades an invalid value to ``advisory`` rather than ``off``. Every surface
+    here is non-blocking -- a lock the reaper already honours, and a hook that
+    writes to stderr and exits 0 -- so the safest failure is to keep protecting,
+    not to stop.
     """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
