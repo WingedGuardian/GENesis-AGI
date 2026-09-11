@@ -9,8 +9,8 @@ both halves -- the leak happens, and nothing sweeps that directory
 (`disk_hygiene.sh` roots every find at a named SUBdirectory; `tmp_watchgod.sh`
 covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
 
-WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
-branch into main: 60 atomic-write sites across 52 files, 30 of them dirty.
+WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-11 against this branch
+containing main: 61 atomic-write sites across 53 files, 30 of them dirty.
 That denominator moved THREE times, in both directions, and every move is worth
 recording because each was invisible in a different way:
   * +1 site (58 -> 59). The temp-name test was anchored to the END of a string
