@@ -677,7 +677,10 @@ def _build_profile_addendum(profile: str) -> str:
 def _resolve_skills(request: DirectSessionRequest) -> list[str]:
     """Determine which skills to inject: explicit > profile + auto-detect."""
     if request.skills is not None:
-        return request.skills
+        skills = list(request.skills)
+        if request.profile == "research" and "web-research" not in skills:
+            skills.append("web-research")
+        return skills
 
     # Start with profile-bound skills
     skills = list(_PROFILE_SKILLS.get(request.profile, []))
@@ -1499,7 +1502,16 @@ class DirectSessionRunner:
             from genesis.learning.skills.wiring import load_skill
 
             for name in skill_names:
-                content = load_skill(name)
+                try:
+                    content = load_skill(name)
+                except (OSError, UnicodeError) as exc:
+                    if request.profile == "research" and name == "web-research":
+                        raise RuntimeError(
+                            "research profile requires the web-research skill"
+                        ) from exc
+                    raise
+                if request.profile == "research" and name == "web-research" and not content:
+                    raise RuntimeError("research profile requires the web-research skill")
                 if content:
                     system_prompt += f"\n\n## Skill: {name}\n{content}"
 
@@ -1534,6 +1546,12 @@ class DirectSessionRunner:
         # observe/research get health + memory only.
         mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")
         mcp_config = self._config_builder.build_mcp_config(profile=mcp_profile)
+        if request.profile == "research":
+            if mcp_config is None:
+                raise RuntimeError("research profile requires its MCP configuration")
+            # Derive this from the live recon registry after tool exceptions so
+            # neither an exception nor a future recon tool can widen the pair.
+            disallowed += self._config_builder.build_research_recon_disallowed()
         # Secure-by-default: strict_mcp_config (CCInvocation default True) makes the
         # generated --mcp-config authoritative, dropping the user-scoped ~/.claude.json
         # servers. Honor an EXPLICIT mcp_profile="full" (a deliberate, trusted

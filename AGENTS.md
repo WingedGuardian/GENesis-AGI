@@ -272,7 +272,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `recon_config` — View or modify recon configuration.
 - `recon_findings` — Query stored recon findings.
 - `recon_github_read` — Inspect GitHub repository metadata, a recursive tree, or one file.
-- `recon_github_search` — Search GitHub repositories, code, or issues without shell access.
+- `recon_github_search` — Search public GitHub.com repositories or issues without shell access.
 - `recon_run_github_discovery` — Discover GitHub repos for a topic, ranked by momentum/activity/maturity.
 - `recon_run_github_discovery_job` — Run the curated GitHub Discovery JOB on-demand (files new repos → triage).
 - `recon_run_model_intelligence` — Run model intelligence scan — check for new models, pricing changes, stale profiles.

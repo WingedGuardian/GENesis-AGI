@@ -67,8 +67,11 @@ Most profiles block: Bash, Edit, task_submit, settings_update,
 direct_session_run, module_call. Use `interact` for workflows that operate
 external platforms (publishing, form filling) and need to communicate with the
 user. Use `research` for investigation that writes observations/follow-ups;
-it also reaches the `genesis-recon` tools, including read-only GitHub search and
-source inspection. Its shared `web-research` skill is injected automatically.
+it also reaches the `genesis-recon` tools, including read-only GitHub.com search and
+source inspection of public repositories through a fixed unauthenticated API endpoint.
+File reads are limited to 8 MiB. Its shared `web-research` skill and
+research MCP configuration are required; dispatch fails clearly if either cannot
+be loaded. Every other recon tool is derived from the live registry and denied.
 Use `observe` for read-only investigation.
 
 **MCP scoping is secure-by-default.** `CCInvocation.strict_mcp_config` defaults to

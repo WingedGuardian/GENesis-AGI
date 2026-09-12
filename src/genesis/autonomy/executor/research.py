@@ -124,11 +124,29 @@ class DeepResearcherImpl:
         # Build MCP config so the research session has access to Genesis
         # MCP servers (memory recall, web search tools).
         mcp_config = self._build_mcp_config()
+        if mcp_config is None:
+            logger.error("Research session blocked: research MCP config unavailable")
+            return ResearchResult(
+                found=False,
+                clues="Research session could not start because its MCP configuration is unavailable",
+                concrete_blockers=["Research infrastructure configuration failure"],
+            )
 
         from genesis.cc.session_config import SessionConfigBuilder
         from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 
-        research_method = load_skill("web-research") or ""
+        try:
+            research_method = load_skill("web-research")
+        except (OSError, UnicodeError):
+            logger.exception("Research session blocked: web-research skill unreadable")
+            research_method = None
+        if not research_method:
+            logger.error("Research session blocked: web-research skill unavailable")
+            return ResearchResult(
+                found=False,
+                clues="Research session could not start because the required research method is unavailable",
+                concrete_blockers=["Research method configuration failure"],
+            )
         recon_disallowed = SessionConfigBuilder().build_research_recon_disallowed()
         invocation = CCInvocation(
             prompt=prompt,
@@ -184,7 +202,7 @@ class DeepResearcherImpl:
             builder = SessionConfigBuilder()
             return builder.build_mcp_config(profile="research")
         except Exception:
-            logger.debug("Could not build MCP config, session will use project defaults")
+            logger.exception("Could not build required research MCP config")
             return None
 
     # ─── Private Helpers ───────────────────────────────────────��────────────

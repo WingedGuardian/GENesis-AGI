@@ -166,6 +166,59 @@ class TestResearchSession:
         )
         assert result is None
 
+    async def test_missing_research_mcp_config_fails_without_invoking(self) -> None:
+        invoker = AsyncMock()
+        researcher = DeepResearcherImpl(db=AsyncMock(), invoker=invoker)
+
+        with patch.object(researcher, "_build_mcp_config", return_value=None):
+            result = await researcher.research(
+                {"idx": 1, "description": "Fix bug"}, "Error", [],
+            )
+
+        assert result is not None
+        assert result.found is False
+        assert "MCP configuration" in result.clues
+        invoker.run.assert_not_awaited()
+
+    async def test_missing_research_method_fails_without_invoking(self) -> None:
+        invoker = AsyncMock()
+        researcher = DeepResearcherImpl(db=AsyncMock(), invoker=invoker)
+
+        with (
+            patch.object(researcher, "_build_mcp_config", return_value="/tmp/research.json"),
+            patch("genesis.autonomy.executor.research.load_skill", return_value=None),
+        ):
+            result = await researcher.research(
+                {"idx": 1, "description": "Fix bug"}, "Error", [],
+            )
+
+        assert result is not None
+        assert result.found is False
+        assert "required research method" in result.clues
+        invoker.run.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "load_error", [OSError("unreadable"), UnicodeError("invalid UTF-8")],
+    )
+    async def test_unreadable_research_method_fails_without_invoking(
+        self, load_error: Exception,
+    ) -> None:
+        invoker = AsyncMock()
+        researcher = DeepResearcherImpl(db=AsyncMock(), invoker=invoker)
+
+        with (
+            patch.object(researcher, "_build_mcp_config", return_value="/tmp/research.json"),
+            patch("genesis.autonomy.executor.research.load_skill", side_effect=load_error),
+        ):
+            result = await researcher.research(
+                {"idx": 1, "description": "Fix bug"}, "Error", [],
+            )
+
+        assert result is not None
+        assert result.found is False
+        assert "required research method" in result.clues
+        invoker.run.assert_not_awaited()
+
     async def test_session_finds_approach(self) -> None:
         output = FakeCCOutput(
             text='Some analysis...\n```json\n{"found": true, "approach": "Use library X version 2.0 which fixes this bug", "sources": ["https://github.com/lib/issues/123"], "clues": null, "concrete_blockers": []}\n```',

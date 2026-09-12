@@ -8,11 +8,12 @@ permanently blocked.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
+from genesis.autonomy.executor.resources import RequiredSkillUnavailableError
 from genesis.autonomy.executor.step_dispatcher import StepDispatcher
 
 # ---------------------------------------------------------------------------
@@ -252,6 +253,25 @@ class TestNoAutonomousDispatcher:
 
         assert result.status == "failed"
         assert "session crashed" in result.result
+
+    async def test_required_delegated_skill_failure_blocks_dispatch(self) -> None:
+        invoker = AsyncMock()
+        sd = StepDispatcher(db=AsyncMock(), invoker=invoker)
+        step = _make_step(step_type="research") | {"skills": ["research"]}
+
+        with patch(
+            "genesis.autonomy.executor.step_dispatcher.load_step_resources",
+            side_effect=RequiredSkillUnavailableError(
+                "required delegated skill unavailable: web-research"
+            ),
+        ):
+            result = await sd.dispatch_step("t-1", step, [])
+
+        assert result.status == "failed"
+        assert result.blocker_description == (
+            "required delegated skill unavailable: web-research"
+        )
+        invoker.run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
