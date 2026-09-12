@@ -1426,9 +1426,10 @@ actually rely on:
 - `GET /repos/{owner}/{repo}/branches/main/protection` → **404, not protected**.
   The protection the claim rested on did not exist. A *ruleset* did — a different
   API, invisible to the branch-protection endpoint.
-- That ruleset required **one status check** (`test`), not the ten other CI jobs
-  that blocked AT THE TIME (the suite is 15 jobs / 13 blocking today — see the CI
-  paragraph below; this whole bullet is a dated measurement, not current state). Lint, leak-detector and the rest were never server-side required.
+- That ruleset required **one status check** (`test`), not the other CI jobs that
+  blocked AT THE TIME. This whole bullet is a dated measurement, not current
+  state; see the CI paragraph below. Lint, leak-detector and the rest were never
+  server-side required.
 - It carried `bypass_actors: [{actor_type: RepositoryRole, actor_id: 5 (admin),
   bypass_mode: always}]`. **A bypass entry voids the rule for that actor.** The
   sole author is the repo admin, and the merge command this skill mandates
@@ -2288,8 +2289,9 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   `sync-hooks.sh` copies only the five GIT hooks (`commit-msg`, `post-commit`,
   `pre-commit`, `prepare-commit-msg`, `pre-push`) plus one helper into
   `.git/hooks/`. `.claude/hooks/genesis-hook` launches entry-point hook scripts
-  such as `git_push_guard.py`; that guard imports the shared `shell_parse.py` and
-  `hook_output.py` modules. The launcher resolves `HOOK_ROOT` to the **MAIN
+  such as `git_push_guard.py`; that guard imports the shared `shell_parse.py`
+  module. `hook_output.py` is instead imported by other hook entry points. The
+  launcher resolves `HOOK_ROOT` to the **MAIN
   worktree**, not the tree you are sitting in
   (`HOOK_ROOT="$MAIN_ROOT"` unless `GENESIS_HOOK_DEV_LOCAL=1`). That is
   deliberate — it stops per-branch hook drift, measured 2026-08 at 60 of 70
@@ -2314,13 +2316,16 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   Rule 2.5 demands nothing. An earlier version said both "always reach the depth
   gate", which over-states the workflow half.
 
-**CI is not one check.** `ci.yml` defines **15** jobs, of which **13 block** and
-**2 are `Advisory BY DESIGN` (exit 0 always)** — `review-depth-check` and
-`cc-pin-receipts`. (An earlier version said "ten of eleven … only
-`review-depth-check`", wrong on both halves; count the `jobs:` keys rather than
-trusting any prose figure, including this one.) Note that only THREE of the 13 —
-`test`, `leak-detector`, `lint` — are server-side REQUIRED status checks, so a
-red job outside that trio blocks the local gate but not GitHub. Several are
+**CI is not one check.** `ci.yml` defines **15** jobs. `review-depth-check` and
+`cc-pin-receipts` are **Advisory BY DESIGN** (they always exit 0); a red result
+from another job blocks the local gate. `dependency-audit` has a narrower
+exception: the audit command reports vulnerability findings without making the
+job red, while setup or installation failures can still fail the job. (An
+earlier version said "ten of eleven … only `review-depth-check`", wrong on both
+halves; count the `jobs:` keys and inspect the steps rather than trusting any
+prose figure, including this one.) Only THREE checks — `test`, `leak-detector`,
+and `lint` — are server-side REQUIRED, so a red local-gate job outside that trio
+does not block GitHub. Several are
 reproducible locally BEFORE pushing, which is far cheaper than a red PR:
 
 ```bash
