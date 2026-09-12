@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
 import secret_scrub as s  # noqa: E402
 
@@ -213,3 +215,740 @@ class TestReviewFixes:
         # The secret-key-name gate still applies: a quoted value under a benign
         # key (no KEY/SECRET/TOKEN/… in the name) must NOT be redacted.
         assert s.scrub("MESSAGE='hello world foo'") == "MESSAGE='hello world foo'"
+
+
+# ── scrub: bare-value credential shapes (the captured-output case) ────────
+
+
+class TestScrubRedactsBareProviderTokens:
+    """Credential shapes that arrive with NO label.
+
+    Captured terminal output is the motivating case: a token printed by a CLI
+    lands in the capture as a naked value, so only its SHAPE can save it. The
+    labeled/assignment patterns never see it. Values here are synthetic.
+    """
+
+    def test_anthropic_setup_token(self):
+        # ``sk-`` keys carry interior hyphens; an [A-Za-z0-9]-only class stops
+        # at the first one, far short of any length floor, and passes it through.
+        assert R in s.scrub("sk-ant-oat01-" + "A" * 40)
+
+    def test_openrouter_key(self):
+        assert R in s.scrub("sk-or-v1-" + "b" * 48)
+
+    def test_openai_project_key(self):
+        assert R in s.scrub("sk-proj-" + "c" * 40)
+
+    def test_groq_key(self):
+        assert R in s.scrub("gsk_" + "d" * 40)
+
+    def test_nvidia_nim_key(self):
+        assert R in s.scrub("nvapi-" + "e" * 40)
+
+    def test_tavily_key(self):
+        assert R in s.scrub("tvly-" + "f" * 32)
+
+    def test_github_fine_grained_pat(self):
+        assert R in s.scrub("github_pat_" + "g" * 40)
+
+    def test_jwt(self):
+        assert R in s.scrub("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0." + "h" * 40)
+
+    def test_jwt_with_empty_claims_payload(self):
+        # `{}` encodes to `e30` — a valid signed JWT whose second segment does
+        # not begin `eyJ`. Requiring that prefix on the payload missed the
+        # whole bearer token.
+        assert R in s.scrub("Bearer eyJhbGciOiJIUzI1NiJ9.e30." + "h" * 43)
+
+    def test_jwt_with_whitespace_prefixed_payload(self):
+        # A JSON payload with leading whitespace base64-encodes to a segment
+        # starting `IH`/`ICJ` — still a valid JWT the payload-prefix assumption
+        # let through.
+        assert R in s.scrub("eyJhbGciOiJIUzI1NiJ9.IHsiYSI6MX0." + "h" * 43)
+
+    def test_bare_token_alone_on_its_own_line(self):
+        # The captured-output shape: no label, no assignment, just the value
+        # surrounded by prose the tool printed around it.
+        out = s.scrub("Your token (valid for 1 year):\n\nsk-ant-oat01-" + "Z" * 40 + "\n")
+        assert R in out
+        assert "Z" * 40 not in out
+
+
+class TestScrubRedactsStructuredCredentials:
+    """Credentials identified by STRUCTURE rather than a vendor prefix."""
+
+    def test_discord_webhook_url(self):
+        out = s.scrub("https://discord.com/api/webhooks/123456789012345678/" + "A" * 60)
+        assert R in out
+        assert "A" * 60 not in out
+
+    def test_discord_webhook_url_alt_host(self):
+        out = s.scrub("https://discordapp.com/api/webhooks/987654321098765432/" + "B" * 60)
+        assert R in out
+
+    def test_telegram_bot_token_bare(self):
+        out = s.scrub("1234567890:AA" + "C" * 33)
+        assert R in out
+        assert "C" * 33 not in out
+
+    def test_telegram_bot_token_in_api_url(self):
+        # The form Genesis itself constructs (guardian alert, backup.sh,
+        # install.sh) and therefore the form most likely to reach a pane tail.
+        # A left anchor that rejects any preceding word character kills this,
+        # because the id is preceded by the literal "bot".
+        url = "https://api.telegram.org/bot7891234567:AAG1a2b3c4d5" + "e" * 24 + "/sendMessage"
+        out = s.scrub(url)
+        assert R in out, "token unredacted in the vendor's own URL form"
+        assert "AAG1a2b3c4d5" not in out
+
+    def test_telegram_bot_token_at_vendor_documented_length(self):
+        # Telegram's public Bot API example carries a 34-char secret half. A
+        # floor derived from one locally-observed token has no margin and
+        # silently passes anything shorter.
+        doc_shape = "110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+        assert len(doc_shape.split(":")[1]) == 34
+        assert R in s.scrub(doc_shape)
+
+
+class TestScrubKeepsHyphenatedLookalikes:
+    """The widened classes must not eat ordinary hyphenated text."""
+
+    def test_short_sk_fragment(self):
+        assert R not in s.scrub("sk-1")
+
+    def test_hyphenated_prose(self):
+        text = "a well-documented self-healing check-and-repair reconciliation pass"
+        assert R not in s.scrub(text)
+
+    def test_branch_name(self):
+        assert R not in s.scrub("fix/scrub-capture-hygiene-and-more-words-here")
+
+    def test_timestamps_and_ports_are_not_telegram_tokens(self):
+        # Discriminating negatives for the digits:secret shape — these carry the
+        # colon-separated form and must still survive.
+        for benign in (
+            "elapsed 18:13",
+            "2026-09-01T12:34:56Z",
+            "port 8080:8080 mapped",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ):
+            assert R not in s.scrub(benign), benign
+
+    def test_uuid_is_not_a_provider_token(self):
+        assert R not in s.scrub("bed2f4dd-4224-4fe3-94b2-e18c9f99e0e3")
+
+    def test_git_sha_is_not_a_token(self):
+        assert R not in s.scrub("0400c706186786ccc92e8a8d7904773e7ed5f8b1")
+
+    def test_timestamp_pair_is_not_a_telegram_token(self):
+        assert R not in s.scrub("elapsed 18:13")
+
+    def test_plain_discord_url_without_token(self):
+        assert R not in s.scrub("https://discord.com/channels/123/456")
+
+
+# ── scrub: bounded work on hostile input ─────────────────────────────────
+
+
+class TestScrubDoesNotBacktrackCatastrophically:
+    """``scrub`` runs inside a PostToolUse hook and on captured terminal tails,
+    so its input is arbitrary machine output — long unbroken alphanumeric runs
+    (base64 blobs, minified bundles, hex dumps) are ordinary, not adversarial.
+
+    Greedy unbounded quantifiers followed by a required literal backtrack
+    quadratically on exactly that shape. The threshold is deliberately loose:
+    the unfixed patterns take ~30s on this input, so a multi-second ceiling
+    separates linear from quadratic without being sensitive to machine speed.
+    """
+
+    def test_long_alphanumeric_run_completes_promptly(self):
+        import time
+
+        blob = "eyJ" + "A" * 40000
+        start = time.perf_counter()
+        s.scrub(blob)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 5.0, f"scrub took {elapsed:.1f}s — quadratic backtracking"
+
+    def test_long_value_still_redacted_after_bounding(self):
+        # Guard the fix did not over-correct into a fail-open: bounding the KEY
+        # must not stop a long VALUE from being redacted.
+        assert R in s.scrub("API_SECRET=" + "y" * 9000)
+
+    def test_long_url_password_still_redacted_after_bounding(self):
+        assert R in s.scrub("https://user:" + "p" * 900 + "@host.example/path")
+
+
+class TestBoundingNeverFailsOpen:
+    """Bounding a repeat to stop quadratic backtracking must not stop a real
+    secret being redacted — the failure mode is silent, so each bound needs a
+    control on the side it does NOT protect.
+
+    The first attempt bounded the env-assignment KEY at 64. That did not merely
+    miss long keys: it slid the match FORWARD past the name's secret-ish prefix,
+    so `_SECRET_KEY_HINT` no longer saw `SECRET_`/`TOKEN_` and redaction stopped
+    entirely. And it bounded a URL span labelled "hostname" that is in fact the
+    USERINFO, capping usernames for no perf benefit at all.
+    """
+
+    # A value with no vendor prefix and no label: only the arm under test can
+    # match it, so a pass cannot be borrowed from another pattern.
+    UNLABELLED = "9f8e7d6c5b4a39281706abcdef0123456789"
+
+    def test_the_isolation_control_holds(self):
+        assert R not in s.scrub(self.UNLABELLED), (
+            "the bare value is caught by some other arm — the tests below would "
+            "pass without proving anything about the arm under test"
+        )
+
+    def test_long_env_key_is_still_redacted(self):
+        for n in (10, 64, 65, 120, 400):
+            line = f"SECRET_{'A' * n}={self.UNLABELLED}"
+            assert R in s.scrub(line), f"env key of {n + 7} chars silently unredacted"
+
+    def test_long_url_userinfo_is_still_redacted(self):
+        for n in (5, 253, 254, 600):
+            url = f"https://{'u' * n}:{'p' * 40}@host.example/path"
+            assert R in s.scrub(url), f"userinfo of {n} chars silently unredacted"
+
+    def test_long_url_scheme_is_still_redacted(self):
+        # The SECOND bound tried on this pattern, and the same failure as the
+        # first: RFC 3986 puts no ceiling on a scheme, so a 32-char cap simply
+        # stopped redacting past it. Both bounds are gone — the pattern no
+        # longer matches the scheme at all — so no length may reintroduce this.
+        for n in (3, 32, 33, 40, 300):
+            scheme = "a" + "1" * n
+            url = f"{scheme}://user:{self.UNLABELLED}@host.example/path"
+            assert R in s.scrub(url), f"scheme of {n + 1} chars silently unredacted"
+
+    def test_url_password_with_empty_username_is_redacted(self):
+        # `redis://:pw@host` is the form a generated DSN emits. Nothing else in
+        # this module recognises an unlabelled password, so requiring at least
+        # one username character wrote it to the log in plaintext.
+        for url in (
+            f"https://:{self.UNLABELLED}@host.example/path",
+            f"redis://:{self.UNLABELLED}@192.0.2.10:6379/0",
+        ):
+            assert R in s.scrub(url), f"empty-username password unredacted: {url}"
+
+    def test_dropping_the_scheme_did_not_widen_the_match(self):
+        # The control on the other side: `://` is no longer preceded by a
+        # scheme in the pattern, so these must still be left alone.
+        for text in (
+            "http://example.com/a:b@c",  # colon and @ in the PATH
+            "https://host.example:8080/path",  # host:port, no @
+            "see foo:bar@baz for details",  # no `://` at all
+            "https://github.com/WingedGuardian/GENesis-AGI",
+        ):
+            assert R not in s.scrub(text), f"over-redacted: {text}"
+
+    def test_long_secret_value_is_still_redacted(self):
+        # The side the original bounding DID protect — kept as a guard so a
+        # future fix cannot trade one direction for the other.
+        assert R in s.scrub("API_SECRET=" + "y" * 9000)
+
+
+class TestStructuredCredentialsAreCaseInsensitive:
+    """Hosts and schemes are case-insensitive per RFC 3986, and real logs carry
+    both forms."""
+
+    def test_discord_webhook_uppercase_host(self):
+        assert R in s.scrub("https://DISCORD.COM/api/webhooks/123456789012345678/" + "A" * 60)
+
+    def test_discord_webhook_uppercase_scheme(self):
+        assert R in s.scrub("HTTPS://discord.com/api/webhooks/123456789012345678/" + "A" * 60)
+
+    def test_discord_webhook_mixed_case_app_host(self):
+        assert R in s.scrub("https://DiscordApp.com/api/webhooks/123456789012345678/" + "A" * 60)
+
+    def test_lowercase_still_works(self):
+        assert R in s.scrub("https://discord.com/api/webhooks/123456789012345678/" + "A" * 60)
+
+
+class TestEnvAssignmentAnchorKeepsBaselineRecall:
+    """The anchor that removes the quadratic behaviour must not cost recall the
+    shipping version already had."""
+
+    V = "9f8e7d6c5b4a39281706abcdef0123456789"
+
+    def test_underscore_prefixed_secret_name_still_redacted(self):
+        assert R in s.scrub(f"_MY_SECRET={self.V}")
+
+    def test_plain_secret_name_still_redacted(self):
+        assert R in s.scrub(f"SECRET_KEY={self.V}")
+
+    def test_empty_quoted_value_is_not_a_secret(self):
+        # The dominant historical false positive: an ordinary code constant
+        # whose NAME contains a secret word and whose value is empty.
+        # MEASURED (PR #1580 body): all 16 assignments the value floor stopped
+        # matching over 779,899 tracked lines were EMPTY — so the floor's whole
+        # measured precision gain lives at length zero, and the exclusion stops
+        # there.
+        assert R not in s.scrub('_OAUTH_SRC=""')
+
+    def test_short_quoted_value_is_still_redacted(self):
+        # A quoted value under a secret-hint name is redacted at ANY non-zero
+        # length: the parent redacted `API_KEY="abc"` and a length floor above
+        # 1 quietly traded that recall for a precision gain the corpus
+        # measurement attributes entirely to empty values. Real short secrets
+        # exist (a 4-digit PIN, a test token); over-redacting a short config
+        # word is this module's cheap direction.
+        assert R in s.scrub('API_KEY="abc"')
+        assert R in s.scrub("AUTH_TOKEN='12'")
+
+    def test_short_quoted_value_with_spaces_is_redacted(self):
+        assert R in s.scrub("API_KEY='a b'")
+
+    def test_short_unquoted_value_is_left_alone(self):
+        # The unquoted floor stays at 6: with no closing delimiter a short
+        # unquoted word (`API_MODE=on`) is far likelier config than credential.
+        assert R not in s.scrub("API_MODE=on")
+
+
+class TestScrubIsLinearAcrossInputShapes:
+    """A perf claim measured on one input shape is not a perf claim.
+
+    The first regression here passed its benchmark because the benchmark was
+    drawn from the exact character class the anchor excluded — the test
+    validated the fix's own assumption. This matrix spans the classes that
+    drive the env-assignment arm differently, so a pattern edit cannot go
+    quadratic on one shape while the suite stays green on another.
+
+    The 5s ceiling is deliberately loose (machine-speed tolerant): the broken
+    shapes measured 13-16 SECONDS, healthy ones under 100ms.
+    """
+
+    SHAPES = {
+        "all_alnum": "eyJ" + "A" * 40000,
+        "underscore_pairs": "A_" * 20000,
+        "screaming_snake": "_".join("ABCDEFGH" for _ in range(5000)),
+        "sparse_underscores": ("A" * 199 + "_") * 200,
+        "quoted_wall": '"' + "x" * 40000,
+        "url_wall": "https://u:" + "p" * 40000,
+        # PEM armour is the one arm that must reason ACROSS lines, so it is the
+        # one that can go quadratic on repeated markers. Both directions of the
+        # half-visible case belong in the matrix too: each drives the adjacent
+        # key-material walk rather than the matched-pair path.
+        "repeated_pem_headers": "-----BEGIN RSA PRIVATE KEY-----\n" * 8192,
+        "repeated_pem_footers": "-----END RSA PRIVATE KEY-----\n" * 8192,
+        "pem_header_then_body": (
+            "-----BEGIN RSA PRIVATE KEY-----\n" + ("QUFB" * 16 + "\n") * 4000
+        ),
+        # Decoration recognition inspects the TAIL of every line, so the two
+        # shapes that exercise it belong here: a wall of decorated body lines,
+        # and prose whose lines end in a long token (the near-miss that must
+        # stay cheap as well as stay OUT of the key-material class).
+        "decorated_body_wall": ("2026-09-02 12:00:00 " + "QUFB" * 16 + "\n") * 4000,
+        # Many FAILED candidates, not one successful token: an unbounded
+        # segment repeat rescans the remaining suffix from every start, which
+        # is quadratic on exactly the input that never matches. MEASURED
+        # before bounding: 48/96/192KB = 350/1587/5319ms, so a full 256KB
+        # capture crossed the scrub timeout and the whole diagnostic was
+        # discarded.
+        "failed_jwt_candidates": ("-eyJ" + "A" * 8) * 21845,
+        "long_tail_prose": (
+            "crash at 0400c706186786ccc92e8a8d7904773e7ed5f8b1abc\n" * 6000
+        ),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(SHAPES))
+    def test_shape_completes_promptly(self, shape):
+        import time
+
+        start = time.perf_counter()
+        s.scrub(self.SHAPES[shape])
+        elapsed = time.perf_counter() - start
+        assert elapsed < 5.0, f"{shape}: {elapsed:.1f}s — quadratic behaviour"
+
+
+class TestEnvKeyCeilingResidual:
+    """The {2,512}+ ceiling has ONE residual, accepted deliberately and pinned
+    here so it is a stated behaviour, not a surprise.
+
+    The lookbehind admits a match start after `_` (that is what keeps
+    `2FA_TOKEN=` catchable), so a key LONGER than 512 chars with interior
+    underscores can match a late suffix that no longer contains the secret-ish
+    hint — and the value is then not redacted by THIS arm. Exposure is zero
+    measured (the longest real key on this install is 31 chars); this test
+    firing in anger is the trigger to revisit the ceiling.
+    """
+
+    V = "9f8e7d6c5b4a39281706abcdef0123456789"
+
+    def test_keys_up_to_the_ceiling_redact(self):
+        for n in (31, 120, 400, 505):
+            assert R in s.scrub(f"SECRET_{'A' * n}={self.V}"), f"key len {n + 7}"
+
+    def test_the_documented_residual_at_600_chars(self):
+        # No interior underscore after SECRET_ -> lookbehind blocks every
+        # restart, so an over-ceiling key is a CLEAN MISS (better than the old
+        # fail-open, which broke redaction at 65 chars).
+        out = s.scrub(f"SECRET{'A' * 600}={self.V}")
+        assert R not in out  # documented: clean miss past the ceiling
+
+
+class TestDiffLineTokensAreRedacted:
+    """A token on a git-diff removed line arrives as `-<token>` with no
+    separator. The version on main redacts these; an anchor that excludes `-`
+    from the start position regressed them to raw. Pane tails routinely hold
+    `git diff` / `git log -p` output, so this is an ordinary shape."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "-ghp_" + "a" * 36,
+            "-AKIAIOSFODNN7EXAMPLE",
+            "-AIza" + "c" * 35,
+            "-sk-ant-oat01-" + "T" * 40,
+            "+ghp_" + "a" * 36,  # added lines too
+        ],
+    )
+    def test_diff_prefixed_token_redacts(self, line):
+        assert R in s.scrub(line), line[:30]
+
+    def test_hyphenated_prose_still_survives(self):
+        # The negatives that justified the old exclusion must keep passing.
+        assert R not in s.scrub(
+            "a well-documented self-healing check-and-repair reconciliation pass"
+        )
+
+
+class TestPemPrivateKeysAreRedacted:
+    """`cat ~/.ssh/id_ed25519` in the last 200 lines of a pane is an ordinary
+    accident and the highest-value secret on the box. No shape pattern can
+    catch a base64 body; the BEGIN/END armour can."""
+
+    def _pem(self, kind="OPENSSH"):
+        body = "\n".join("QUFB" * 16 for _ in range(6))
+        # kind="" is the real PKCS#8 form `BEGIN PRIVATE KEY` — single space,
+        # not the double space naive interpolation produces.
+        label = f"{kind} PRIVATE KEY" if kind else "PRIVATE KEY"
+        return f"-----BEGIN {label}-----\n{body}\n-----END {label}-----"
+
+    @pytest.mark.parametrize("kind", ["OPENSSH", "RSA", "EC", ""])
+    def test_pem_block_is_redacted(self, kind):
+        text = f"here is the file:\n{self._pem(kind)}\nafter"
+        out = s.scrub(text)
+        assert "QUFB" not in out, f"{kind or 'generic'} PEM body survived"
+        assert "here is the file" in out and "after" in out
+
+    def test_unterminated_header_redacts_the_key_run(self):
+        """A HALF-VISIBLE key must still be redacted.
+
+        This assertion used to read `"QUFB" in out` — it pinned a live leak.
+        The capture window (`-S -200`) and the 256KB input cap both cut at
+        arbitrary positions, so a key whose END marker was clipped away reached
+        the log with its body intact. Requiring BOTH delimiters means the
+        clipped case is exactly the case that leaks.
+        """
+        import time
+
+        blob = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(
+            "QUFB" * 16 for _ in range(400)
+        )
+        start = time.perf_counter()
+        out = s.scrub(blob)
+        assert time.perf_counter() - start < 5.0
+        assert "QUFB" not in out, "clipped-END key body survived"
+
+    def test_orphan_end_marker_redacts_everything_above_it(self):
+        """The mirror case: the BEGIN scrolled off the top of the window.
+
+        Everything above a delimiter nothing opened is the key's, so it all
+        goes. That DOES discard any diagnostic printed before the key — the
+        deliberate price of never inspecting the body to guess where the key
+        starts, which is the question that produced a fresh defect every review
+        round.
+        """
+        body = "\n".join("QUFB" * 16 for _ in range(6))
+        text = f"earlier diagnostic\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+        out = s.scrub(text)
+        assert "QUFB" not in out, "clipped-BEGIN key body survived"
+        assert "after" in out, "output below the key was discarded too"
+
+    def test_a_marker_that_does_not_end_its_line_is_a_mention(self):
+        """A delimiter that ENDS its line is armour; one that does not is a
+        mention, and a mention costs nothing.
+
+        This is the whole distinction the scanner rests on, so both directions
+        are pinned. A grep hit closes a quote, source closes a string, prose
+        runs on — none of them end with the delimiter, so the surrounding
+        diagnostic survives intact.
+        """
+        text = (
+            "line one of the crash\n"
+            "tests/a.py:12:  key = '-----BEGIN RSA PRIVATE KEY-----'\n"
+            "see -----BEGIN RSA PRIVATE KEY----- for the format\n"
+            "line four of the crash\n"
+        )
+        out = s.scrub(text)
+        for keep in ("line one of the crash", "see -----BEGIN", "line four"):
+            assert keep in out, f"{keep!r} was blanked by a mention:\n{out}"
+
+    def test_an_unpaired_armour_line_redacts_to_that_end_of_the_capture(self):
+        """The stated cost of the design, pinned so it stays a decision.
+
+        A delimiter ENDING its line with no partner is treated as a key whose
+        other delimiter the window cut off, and redaction runs to that end of
+        the input. A bare delimiter echoed into a log therefore takes the rest
+        of the capture with it. Accepted: in a crash tail a line that ends in
+        exactly this text is overwhelmingly a real key, and the alternative —
+        inspecting the body to decide — is the generator this design removes.
+        """
+        text = "before the key\n-----BEGIN RSA PRIVATE KEY-----\nafter the key\n"
+        out = s.scrub(text)
+        assert "before the key" in out, "output ABOVE an unpaired BEGIN is not the key's"
+        assert "after the key" not in out, (
+            "an unpaired BEGIN must be treated as a key running to the bottom"
+        )
+
+    def test_repeated_unmatched_headers_stay_linear(self):
+        """The measured quadratic: the old both-delimiter regex retried its
+        cross-line body scan at EVERY header, 25.5s on a 256KB input of
+        repeated headers (ratio 4.0 at 2x input) — past the exit-capture
+        timeout, so the whole diagnostic was discarded."""
+        import time
+
+        hdr = "-----BEGIN RSA PRIVATE KEY-----\n"
+        blob = hdr * (262144 // len(hdr))
+        start = time.perf_counter()
+        s.scrub(blob)
+        assert time.perf_counter() - start < 5.0
+
+    def test_mismatched_armour_labels_still_redact(self):
+        body = "\n".join("QUFB" * 16 for _ in range(4))
+        text = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+        assert "QUFB" not in s.scrub(text)
+
+    def test_crlf_line_endings_are_handled(self):
+        body = "\r\n".join("QUFB" * 16 for _ in range(4))
+        text = f"-----BEGIN RSA PRIVATE KEY-----\r\n{body}\r\n-----END RSA PRIVATE KEY-----"
+        assert "QUFB" not in s.scrub(text)
+
+    def test_legacy_encrypted_armour_puts_headers_before_the_body(self):
+        """RFC 1421 / OpenSSL legacy-encrypted armour — what
+        `openssl genrsa -aes128 -traditional` and `ssh-keygen -m PEM -N` emit —
+        carries `Proc-Type:`/`DEK-Info:` and a BLANK LINE between the marker and
+        the base64.
+
+        VERIFIED against a real openssl artifact when the scanner still looked
+        at the body: 14 of 14 visible body lines reached the log, because the
+        walk expected material on the very next line. Nothing inspects the body
+        now, so the shape cannot matter — this stays as the regression pin.
+        """
+        body = "\n".join("QUFB" * 16 for _ in range(6))
+        text = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "Proc-Type: 4,ENCRYPTED\n"
+            "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5\n"
+            "\n"
+            f"{body}\n"
+        )  # END deliberately absent: the capture window cut it off
+        assert "QUFB" not in s.scrub(text), "encrypted-armour body survived"
+
+    def test_encrypted_pkcs8_armour_is_redacted(self):
+        body = "\n".join("QUFB" * 16 for _ in range(4))
+        text = f"-----BEGIN ENCRYPTED PRIVATE KEY-----\n{body}\n-----END ENCRYPTED PRIVATE KEY-----"
+        assert "QUFB" not in s.scrub(text)
+
+    def test_pgp_secret_key_block_is_redacted(self):
+        """`gpg --export-secret-keys -a` armour says PRIVATE KEY BLOCK."""
+        body = "\n".join("lQVYBGhA" * 8 for _ in range(4))
+        text = f"-----BEGIN PGP PRIVATE KEY BLOCK-----\n{body}\n-----END PGP PRIVATE KEY BLOCK-----"
+        assert "lQVYBGhA" not in s.scrub(text)
+
+    def test_the_short_final_body_line_is_redacted_too(self):
+        """A base64 body's LAST line is short by construction (a 2048-bit RSA
+        key ends in a 24-character line), and under decoration it satisfied
+        neither a long-run floor nor a whole-line base64 test — so it survived
+        while the rest of the key was covered. Nothing measures the body now.
+        """
+        body = "\n".join("QUFB" * 16 for _ in range(3))
+        text = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\nQUFBQUFB\n"
+        out = s.scrub(text)
+        assert "QUFBQUFB" not in out, f"key tail survived:\n{out}"
+
+    def test_two_unrelated_markers_do_not_swallow_the_span(self):
+        """The classic shape: one `grep` hit names a BEGIN, another names an
+        END, and everything between them is ordinary diagnostic output. Pairing
+        them destroys the crash context the log exists for.
+
+        VERIFIED before the interior check existed: 7 diagnostic lines in, 1
+        out.
+        """
+        text = "\n".join(
+            ["tests/a.py:12:  key = '-----BEGIN RSA PRIVATE KEY-----'"]
+            + [f"crash line {i} KEEPME" for i in range(1, 7)]
+            + ["tests/b.py:99:  end = '-----END RSA PRIVATE KEY-----'"]
+            + ["crash line 7 KEEPME"]
+        )
+        out = s.scrub(text)
+        kept = sum(1 for ln in out.splitlines() if "KEEPME" in ln)
+        assert kept == 7, f"only {kept}/7 diagnostic lines survived:\n{out}"
+
+    def test_a_real_block_is_still_redacted_whole(self):
+        """Guard for the check above: the interior test must not stop a genuine
+        block — whose interior IS key material — from being redacted."""
+        body = "\n".join("QUFB" * 16 for _ in range(20))
+        text = f"before\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+        out = s.scrub(text)
+        assert "QUFB" not in out
+        assert "before" in out and "after" in out
+
+    # ── captured output is frequently DECORATED ────────────────────────────
+    # A column-0 test for "is this line key material" is an assumption about
+    # the CAPTURE, not about the key. Enumerated as a class rather than as the
+    # one shape a reviewer happened to name: MEASURED across 7 decorations x 3
+    # clipping states, 4 decorations wrote the whole body out before this was
+    # handled, while plain / indented / diff-`+` did not — and those three pass
+    # only because `+` is a base64 character and `.strip()` covers indentation.
+    # Passing by accident of the alphabet is not coverage.
+    _DECORATIONS = {
+        "log_timestamp": lambda ln: f"2026-09-02 12:00:00 {ln}",
+        "journalctl": lambda ln: f"host genesis[123]: {ln}",
+        "diff_removed": lambda ln: f"-{ln}",
+        "diff_added": lambda ln: f"+{ln}",
+        "indented": lambda ln: f"    {ln}",
+        "pipe_gutter": lambda ln: f"  | {ln}",
+    }
+
+    def _armoured(self, kind="RSA"):
+        """Real RFC 1421 shape: metadata headers, a blank line, then body."""
+        body = [("QUFB" * 16) for _ in range(6)]
+        return (
+            [f"-----BEGIN {kind} PRIVATE KEY-----",
+             "Proc-Type: 4,ENCRYPTED",
+             "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5",
+             ""]
+            + body
+            + [f"-----END {kind} PRIVATE KEY-----"]
+        )
+
+    @pytest.mark.parametrize("decoration", sorted(_DECORATIONS))
+    @pytest.mark.parametrize("clip", ["paired", "end_clipped", "begin_clipped"])
+    def test_decorated_key_material_is_redacted(self, decoration, clip):
+        lines = self._armoured()
+        if clip == "end_clipped":
+            lines = lines[:-1]
+        elif clip == "begin_clipped":
+            lines = lines[1:]
+        decorate = self._DECORATIONS[decoration]
+        out = s.scrub("\n".join(decorate(ln) for ln in lines))
+        assert "QUFB" not in out, f"{decoration}/{clip} body survived:\n{out}"
+
+    def test_a_decorated_mention_is_still_only_a_mention(self):
+        """Decoration must not turn a mention into armour: the test is what
+        ENDS the line, and a decorated grep hit still closes its quote."""
+        text = "\n".join(
+            [f"2026-09-02 12:00:0{i} crash line {i} KEEPME" for i in range(1, 4)]
+            + ["2026-09-02 12:00:04 a.py:1: k = '-----BEGIN RSA PRIVATE KEY-----'"]
+            + [f"2026-09-02 12:00:0{i} crash line {i} KEEPME" for i in range(5, 8)]
+        )
+        out = s.scrub(text)
+        kept = sum(1 for ln in out.splitlines() if "KEEPME" in ln)
+        assert kept == 6, f"only {kept}/6 decorated diagnostic lines survived:\n{out}"
+
+    def test_a_serialized_block_on_one_line_is_redacted(self):
+        """A PEM block serialized onto ONE line — a JSON log field, an escaped
+        env value — carries BOTH markers in that line, and neither ends it.
+
+        Both-markers-in-one-line is a closed test no mention can satisfy by
+        accident in the shapes the mention pins cover (a grep hit names one
+        marker per line), so redacting the whole line is safe and line-granular
+        — the documented safe direction for a one-line block.
+        """
+        text = (
+            "before\n"
+            '{"key":"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg\\n'
+            '-----END PRIVATE KEY-----"}\n'
+            "after"
+        )
+        out = s.scrub(text)
+        assert "MIIEvQIBADANBg" not in out, f"one-line key body survived:\n{out}"
+        assert "before" in out and "after" in out
+
+    def test_a_one_line_mention_of_both_markers_is_the_accepted_cost(self):
+        """Pinned as a DECISION: a single line naming both markers (a grep -e
+        pair, a doc sentence) is redacted. One diagnostic line lost is the
+        cheap direction; a serialized real key persisted is not."""
+        out = s.scrub(
+            "grep -e '-----BEGIN RSA PRIVATE KEY-----'"
+            " -e '-----END RSA PRIVATE KEY-----' dump.log"
+        )
+        assert out == R
+
+    def test_a_certificate_is_not_a_private_key(self):
+        """Only PRIVATE KEY armour redacts. A certificate is public material,
+        and treating it as a key would blank ordinary TLS diagnostics."""
+        body = "\n".join("Q0VSVA" * 8 for _ in range(4))
+        text = f"-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----"
+        out = s.scrub(text)
+        assert "Q0VSVA" in out, "a public certificate was redacted as a key"
+
+
+class TestAdditionalVendorPrefixes:
+    @pytest.mark.parametrize(
+        "tok",
+        [
+            "sk_live_" + "a" * 24,          # Stripe secret
+            "rk_live_" + "b" * 24,          # Stripe restricted
+            "ASIA" + "QRSTUVWXYZ12345A",    # AWS STS temporary
+            "npm_" + "c" * 36,
+            "pypi-" + "d" * 60,
+            "csk-" + "e" * 48,  # Cerebras — a miss the left-anchor exposed
+        ],
+    )
+    def test_prefix_redacts(self, tok):
+        assert R in s.scrub("value: " + tok), tok[:16]
+
+    def test_asia_the_word_is_not_a_credential(self):
+        assert R not in s.scrub("shipping to ASIA next week")
+
+    def test_stripe_lookalike_prose_survives(self):
+        assert R not in s.scrub("the sk_live_migration plan doc")
+
+
+class TestPatternsStayPortable:
+    """The scrubber runs under whatever bare `python3` the install has —
+    `scripts/cc_exit_capture.sh` invokes it by name, deliberately NOT the venv
+    interpreter, so a broken venv cannot break the dying-pane capture.
+
+    Possessive quantifiers (`*+`, `{m,n}+`) are Python 3.11+ ONLY (bpo-433030).
+    An install whose system `python3` is older — Ubuntu 22.04 ships 3.10, and
+    `scripts/install.sh` installs `python3.12` as a SEPARATE binary rather than
+    replacing it — would raise `re.error` at import, and every captured tail
+    would be withheld forever. Plain bounded repeats give the same linearity
+    (MEASURED: whole-blob scrubbing stays linear, 39KB/78KB/156KB =
+    349/705/1441ms) and the same matches (MEASURED: 0 differing outputs over
+    20,270 strings).
+    """
+
+    def test_no_possessive_quantifiers_in_any_compiled_pattern(self):
+        """Checks the COMPILED patterns, not the file text — prose may name the
+        construct (this module's own comments do); only a pattern can break the
+        import."""
+        import re as _re
+
+        # `\+\+` covers the possessive one-or-more (`x++`), which the original
+        # detector missed: `[A-Z0-9_]++` would have passed this guard and then
+        # raised `re.error` at import on Python < 3.11, withholding every tail.
+        possessive = _re.compile(r"(?:\*\+|\?\+|\+\+|\{\d+(?:,\d*)?\}\+)")
+        offenders = {
+            name: possessive.findall(obj.pattern)
+            for name, obj in vars(s).items()
+            if isinstance(obj, _re.Pattern) and possessive.search(obj.pattern)
+        }
+        assert not offenders, (
+            f"possessive quantifier(s) in {offenders} require Python 3.11+; "
+            "the hook must import under the install's bare python3"
+        )
+
+    def test_the_portability_guard_can_actually_fail(self):
+        """Guard-the-guard: the check above reads `.pattern` off module-level
+        compiled regexes, so it is worth proving it SEES one."""
+        import re as _re
+
+        possessive = _re.compile(r"(?:\*\+|\?\+|\+\+|\{\d+(?:,\d*)?\}\+)")
+        assert possessive.search(r"(?P<key>_*+[A-Z]{2,512}+)")
+        assert possessive.search(r"(?P<key>[A-Z0-9_]++)")  # possessive one-or-more
+        assert not possessive.search(r"(?P<key>_{0,4}[A-Z]{2,512})")

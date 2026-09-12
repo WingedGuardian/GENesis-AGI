@@ -105,6 +105,28 @@ class TestRejectsProseFalsePositives:
         assert classify_as_reference(ext) is None
 
 
+class TestHyphenatedSlugsAreNotCredentials:
+    """Regression guard for the capture/redaction split.
+
+    The redaction-side prefix class admits ``-``/``_`` so that namespaced keys
+    match. Sharing that class with this module made ordinary hyphenated slugs
+    clear the length floor and land in the reference store as credentials.
+    These are the measured false captures from that attempt.
+    """
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "We should use sk-learn-pipeline-preprocessing for the feature step",
+            "Renamed the branch to sk-refactor-memory-graph-phase2 yesterday",
+            "The kube namespace glpat-staging-eu-west1 is the one we scaled",
+            "The CSS class fc-timegrid0123456789abcdef0 broke the calendar",
+        ],
+    )
+    def test_slug_is_not_captured_as_a_credential(self, prose):
+        assert classify_as_reference(_ext(prose, entities=["x"]), user_text=prose) is None
+
+
 # ─── Must STILL classify (guards the fix didn't over-correct) ─────────────────
 
 
@@ -129,6 +151,18 @@ class TestStillClassifiesGenuine:
         assert ref is not None
         assert ref["kind"] == "credentials"
         assert "verysecretword" in ref["value"]
+
+    def test_labelled_modern_key_still_captured(self):
+        # Unlabelled modern keys are deliberately NOT matched here (see the
+        # divergence note on _KNOWN_KEY_PREFIX_PATTERN); the labelled phrasing
+        # is the one that actually occurs in conversation, and it must work.
+        ext = _ext(
+            "The OpenRouter API key is sk-or-v1-" + "a" * 48 + " for the router",
+            entities=["OpenRouter"],
+        )
+        ref = classify_as_reference(ext)
+        assert ref is not None
+        assert ref["kind"] == "credentials"
 
     def test_ip_with_adjacent_context_still_network(self):
         ext = _ext(
