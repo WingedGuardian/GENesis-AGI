@@ -37,6 +37,37 @@ _MAX_PROCEDURES = 10
 _MAX_OBSERVATIONS = 5
 _MAX_CHARS_PER_RESULT = 300
 _MAX_SKILL_CONTENT_CHARS = 2000
+_MAX_DELEGATED_SKILL_CONTENT_CHARS = 6000
+_LEGACY_STEP_SKILL_DELEGATES = {"research": "web-research"}
+
+
+class RequiredSkillUnavailableError(RuntimeError):
+    """A declared skill delegation could not be loaded for dispatch."""
+
+
+def _bounded_skill_content(content: str, limit: int, source_file: Path) -> str:
+    """Bound injected skill text and identify the complete local source."""
+    if len(content) <= limit:
+        return content
+    return (
+        content[:limit]
+        + f"\n\n[TRUNCATED — complete skill source: {source_file}]"
+    )
+
+
+def _load_required_step_skill(name: str) -> tuple[Path, str]:
+    """Load a required compatibility delegate through the canonical skill loader."""
+    from genesis.learning.skills.wiring import get_skill_path
+
+    try:
+        skill_file = get_skill_path(name)
+        if skill_file is None:
+            raise FileNotFoundError(name)
+        return skill_file, skill_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RequiredSkillUnavailableError(
+            f"required delegated skill unavailable: {name}"
+        ) from exc
 
 
 def _extract_keywords(text: str, max_keywords: int = 15) -> list[str]:
@@ -324,21 +355,27 @@ async def load_step_resources(
             if md_file.exists():
                 try:
                     content = md_file.read_text(encoding="utf-8", errors="replace")
-                    # Include the ABSOLUTE skill dir: a dispatched step runs
-                    # outside the project, so the `Skill` tool can't load this
-                    # skill — but it CAN Read these files by absolute path. The
-                    # injected copy is truncated; the full skill + its
-                    # references/ live at skill_path.
-                    if len(content) > _MAX_SKILL_CONTENT_CHARS:
-                        content = (
-                            content[:_MAX_SKILL_CONTENT_CHARS]
-                            + f"\n\n[TRUNCATED — read the COMPLETE skill (SKILL.md "
-                            f"and its references/) from: {skill_path}]"
-                        )
+                    injected = _bounded_skill_content(
+                        content, _MAX_SKILL_CONTENT_CHARS, md_file,
+                    )
                     parts.append(
                         f"### Skill: {skill_name} (full skill dir: {skill_path})\n\n"
-                        f"{content}"
+                        f"{injected}"
                     )
+                    delegated_name = _LEGACY_STEP_SKILL_DELEGATES.get(skill_name.lower())
+                    if delegated_name:
+                        delegated_file, delegated_content = _load_required_step_skill(
+                            delegated_name
+                        )
+                        delegated_injected = _bounded_skill_content(
+                            delegated_content,
+                            _MAX_DELEGATED_SKILL_CONTENT_CHARS,
+                            delegated_file,
+                        )
+                        parts.append(
+                            f"### Delegated method: {delegated_name}\n\n"
+                            f"{delegated_injected}"
+                        )
                 except OSError:
                     logger.debug("Failed to read skill file %s", md_file)
                 break

@@ -6,12 +6,19 @@ Schedules and dynamic sources use YAML config files.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
+import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import aiosqlite
+import httpx
 import yaml
 from fastmcp import FastMCP
 
@@ -35,6 +42,172 @@ _router: object | None = None
 _surplus_queue: object | None = None
 _pipeline: object | None = None
 _memory_store: object | None = None
+
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_VISIBILITY_QUALIFIER_RE = re.compile(
+    r"(?<!\S)(?:is|visibility):(public|private|internal)(?!\S)", re.IGNORECASE,
+)
+_GITHUB_ISSUE_TYPE_QUALIFIER_RE = re.compile(
+    r"(?<!\S)(?:is|type):(issue|pr)(?!\S)", re.IGNORECASE,
+)
+_GITHUB_BOOLEAN_OR_RE = re.compile(r"(?<!\S)OR(?!\S)")
+_GITHUB_TREE_ENTRY_LIMIT = 2_000
+_GITHUB_CONTENTS_MAX_BYTES = 8 * 1024 * 1024
+_GITHUB_API_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
+_GITHUB_BLOB_RESPONSE_MAX_BYTES = 12 * 1024 * 1024
+_GITHUB_CONTENTS_MAX_BASE64_CHARS = 4 * ((_GITHUB_CONTENTS_MAX_BYTES + 2) // 3)
+
+
+@dataclass(frozen=True)
+class _GitHubAPIFailure:
+    kind: str
+    status_code: int | None = None
+
+
+def _github_failure_message(action: str, failure: object) -> str:
+    """Turn a bounded transport failure into useful recovery guidance."""
+    if not isinstance(failure, _GitHubAPIFailure):
+        return f"GitHub {action} failed"
+    if failure.kind == "rate_limited":
+        return f"GitHub {action} was rate limited; retry after the public API reset"
+    if failure.kind == "forbidden_or_rate_limited":
+        return (
+            f"GitHub {action} returned HTTP 403 without decisive rate-limit headers; "
+            "wait at least one minute before one retry, then treat recurrence as forbidden"
+        )
+    if failure.kind == "not_found":
+        return f"GitHub {action} was not found"
+    if failure.kind == "invalid_request":
+        return f"GitHub {action} rejected the request; revise the query, path, or ref"
+    if failure.kind == "response_too_large":
+        return f"GitHub {action} response exceeded Genesis's bounded limit"
+    if failure.kind == "invalid_response":
+        return f"GitHub {action} returned an invalid response"
+    if failure.kind == "timeout":
+        return f"GitHub {action} timed out"
+    if failure.kind == "network":
+        return f"GitHub {action} failed because of a network error"
+    return f"GitHub {action} failed with HTTP {failure.status_code}"
+
+
+async def _github_public_api(
+    endpoint: str,
+    *,
+    params: dict[str, str] | None = None,
+    timeout: int | float = 15,
+    max_bytes: int = _GITHUB_API_RESPONSE_MAX_BYTES,
+) -> tuple[bool, str | _GitHubAPIFailure]:
+    """Fetch a bounded GitHub.com REST response without operator credentials."""
+    url = f"https://api.github.com/{endpoint.lstrip('/')}"
+    try:
+        async with (
+            httpx.AsyncClient(
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "Genesis-public-research",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                follow_redirects=False,
+                timeout=timeout,
+            ) as client,
+            client.stream("GET", url, params=params) as response,
+        ):
+            if response.status_code != 200:
+                logger.warning(
+                    "Public GitHub API request failed (%s): %s",
+                    response.status_code,
+                    endpoint,
+                )
+                rate_limit_headers = (
+                    response.headers.get("x-ratelimit-remaining") == "0"
+                    or "retry-after" in response.headers
+                )
+                if response.status_code == 429 or (
+                    response.status_code == 403 and rate_limit_headers
+                ):
+                    kind = "rate_limited"
+                elif response.status_code == 403:
+                    kind = "forbidden_or_rate_limited"
+                elif response.status_code == 404:
+                    kind = "not_found"
+                elif response.status_code == 422:
+                    kind = "invalid_request"
+                else:
+                    kind = "http_error"
+                return False, _GitHubAPIFailure(kind, response.status_code)
+            body = bytearray()
+            async for chunk in response.aiter_raw(chunk_size=64 * 1024):
+                if len(chunk) > max_bytes - len(body):
+                    logger.warning("Public GitHub API response exceeded cap: %s", endpoint)
+                    return False, _GitHubAPIFailure("response_too_large")
+                body.extend(chunk)
+        return True, body.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning("Public GitHub API returned invalid UTF-8: %s", endpoint)
+        return False, _GitHubAPIFailure("invalid_response")
+    except httpx.TimeoutException:
+        logger.warning("Public GitHub API request timed out: %s", endpoint)
+        return False, _GitHubAPIFailure("timeout")
+    except (httpx.HTTPError, OSError, ValueError):
+        logger.warning("Public GitHub API request failed: %s", endpoint, exc_info=True)
+        return False, _GitHubAPIFailure("network")
+
+
+async def _verify_public_repository(
+    repository: str,
+) -> tuple[bool, dict | None, _GitHubAPIFailure | None]:
+    """Return verification state, public metadata, and any transport failure."""
+    ok, raw = await _github_public_api(f"repos/{repository}")
+    if not ok:
+        if isinstance(raw, _GitHubAPIFailure) and raw.kind == "not_found":
+            return True, None, None
+        return False, None, raw if isinstance(raw, _GitHubAPIFailure) else None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return False, None, _GitHubAPIFailure("invalid_response")
+    classification = _repository_visibility(payload)
+    if classification is True:
+        return True, payload, None
+    if classification is False:
+        return True, None, None
+    return False, None, _GitHubAPIFailure("invalid_response")
+
+
+def _repository_visibility(repository: object) -> bool | None:
+    """Classify repository evidence as public, nonpublic, or invalid."""
+    if not isinstance(repository, dict) or not isinstance(repository.get("private"), bool):
+        return None
+    private = repository["private"]
+    visibility = repository.get("visibility")
+    if visibility == "public" and private is False:
+        return True
+    if visibility in {"private", "internal"}:
+        return False
+    return None
+
+
+def _issue_repository(item: object) -> str | None:
+    """Extract owner/name from a GitHub issue-search repository URL."""
+    if not isinstance(item, dict):
+        return None
+    url = item.get("repository_url")
+    if not isinstance(url, str):
+        return None
+    prefix = "https://api.github.com/repos/"
+    if not url.startswith(prefix):
+        return None
+    repository = url[len(prefix):]
+    return repository if _GITHUB_REPO_RE.fullmatch(repository) else None
+
+
+def _bounded_file_metadata(payload: object) -> dict:
+    """Select small, non-content fields from an untrusted Contents response."""
+    if not isinstance(payload, dict):
+        return {"response_type": type(payload).__name__}
+    fields = ("name", "path", "sha", "size", "type", "encoding", "html_url", "download_url")
+    return {name: payload.get(name) for name in fields if name in payload}
 
 
 def init_recon_mcp(
@@ -407,6 +580,305 @@ async def recon_run_github_discovery(query: str, limit: int = 10) -> dict:
     if not repos:
         result["note"] = "no results — if unexpected, check gh auth / rate-limit (30/min) in logs"
     return result
+
+
+@mcp.tool()
+async def recon_github_search(
+    kind: str,
+    query: str,
+    page: int = 1,
+    per_page: int = 30,
+) -> dict:
+    """Search public GitHub.com repositories or issues without shell access.
+
+    This is a read-only, fixed-endpoint wrapper around GitHub's search API.
+    It reports transport/API failure separately from a successful empty result.
+    Pagination is explicit: page >= 1 and per_page is limited to 1..100.
+    """
+    if kind not in {"repositories", "issues"}:
+        return {"ok": False, "error": "kind must be repositories or issues"}
+    if not query.strip():
+        return {"ok": False, "error": "query must not be empty"}
+    if "\x00" in query:
+        return {"ok": False, "error": "query must not contain NUL bytes"}
+    if page < 1 or not 1 <= per_page <= 100:
+        return {"ok": False, "error": "page must be >= 1 and per_page must be 1..100"}
+
+    # Remove caller-supplied visibility terms before adding the authoritative
+    # public constraint. Local response checks below provide a second boundary.
+    public_query = _GITHUB_VISIBILITY_QUALIFIER_RE.sub("", query).strip()
+    if kind == "issues":
+        # GitHub's search/issues endpoint combines issues and pull requests.
+        # Its legacy REST grammar does not reliably preserve a trailing type
+        # qualifier across Boolean OR branches, so callers must split those into
+        # separate searches. Remove other caller-supplied type qualifiers and
+        # add the authoritative issue-only constraint.
+        if _GITHUB_BOOLEAN_OR_RE.search(public_query):
+            return {
+                "ok": False,
+                "error": "issues query must not contain Boolean OR; run separate searches",
+            }
+        public_query = _GITHUB_ISSUE_TYPE_QUALIFIER_RE.sub("", public_query).strip()
+        if not public_query:
+            return {
+                "ok": False,
+                "error": "query must include terms beyond visibility/type qualifiers",
+            }
+        public_query = f"{public_query} is:issue is:public"
+    else:
+        public_query = f"{public_query} is:public".strip()
+    ok, raw = await _github_public_api(
+        f"search/{kind}",
+        params={"q": public_query, "page": str(page), "per_page": str(per_page)},
+    )
+    if not ok:
+        return {"ok": False, "error": _github_failure_message("search", raw)}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "GitHub search returned invalid JSON"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "GitHub search returned an invalid payload"}
+
+    if "items" not in payload or "total_count" not in payload:
+        return {"ok": False, "error": "GitHub search response omitted required fields"}
+    raw_items = payload["items"]
+    if not isinstance(raw_items, list):
+        return {"ok": False, "error": "GitHub search returned an invalid items payload"}
+
+    if kind == "issues":
+        if any("pull_request" in item for item in raw_items if isinstance(item, dict)):
+            return {
+                "ok": False,
+                "error": "GitHub issues search unexpectedly returned a pull request",
+            }
+        if any(_issue_repository(item) is None for item in raw_items):
+            return {
+                "ok": False,
+                "error": "GitHub issues search returned an invalid repository identity",
+            }
+        # This fixed, unauthenticated api.github.com transport cannot see private
+        # repositories. Exact repository URLs above prevent ambiguous identities.
+        items = raw_items
+    else:
+        classifications = [_repository_visibility(item) for item in raw_items]
+        if any(classification is None for classification in classifications):
+            return {
+                "ok": False,
+                "error": "GitHub repository search could not verify repository visibility",
+            }
+        items = [
+            item for item, classification in zip(raw_items, classifications, strict=True)
+            if classification is True
+        ]
+
+    api_total = payload["total_count"]
+    if isinstance(api_total, bool) or not isinstance(api_total, int) or api_total < 0:
+        return {"ok": False, "error": "GitHub search returned an invalid total_count"}
+    # The transport never sends operator credentials, so this count and its
+    # pagination signal contain public GitHub.com results only.
+    total = api_total
+    accessible = min(api_total, 1000)
+    has_more = page * per_page < accessible
+    return {
+        "ok": True,
+        "kind": kind,
+        "query": query,
+        "total_count": total,
+        "accessible_count": accessible,
+        "incomplete_results": bool(payload.get("incomplete_results", False)),
+        "items": items,
+        "visibility_filter_applied": True,
+        "page": page,
+        "per_page": per_page,
+        "has_more": has_more,
+    }
+
+
+@mcp.tool()
+async def recon_github_read(
+    repository: str,
+    operation: str = "repository",
+    path: str = "",
+    ref: str = "",
+    max_chars: int = 50000,
+) -> dict:
+    """Inspect GitHub repository metadata, a recursive tree, or one file.
+
+    Read-only operations: ``repository``, ``tree``, and ``file``. File content
+    is decoded as UTF-8 and capped at max_chars (1..100000); the response says
+    when it was truncated and provides the exact total plus GitHub URLs.
+    """
+    if not _GITHUB_REPO_RE.fullmatch(repository):
+        return {"ok": False, "error": "repository must be owner/name"}
+    if operation not in {"repository", "tree", "file"}:
+        return {"ok": False, "error": "operation must be repository, tree, or file"}
+    if not 1 <= max_chars <= 100000:
+        return {"ok": False, "error": "max_chars must be 1..100000"}
+    if operation == "file" and not path.strip("/"):
+        return {"ok": False, "error": "path is required for file reads"}
+    if "\x00" in ref or "\x00" in path:
+        return {"ok": False, "error": "path and ref must not contain NUL bytes"}
+
+    visibility_verified, repository_metadata, visibility_failure = (
+        await _verify_public_repository(repository)
+    )
+    if not visibility_verified:
+        return {
+            "ok": False,
+            "error": _github_failure_message("repository visibility check", visibility_failure),
+        }
+    if repository_metadata is None:
+        return {"ok": False, "error": "repository must exist and be public"}
+
+    if operation == "repository":
+        return {
+            "ok": True,
+            "operation": "repository",
+            "repository": repository,
+            "result": repository_metadata,
+        }
+    if operation == "tree":
+        endpoint = f"repos/{repository}/git/trees/{quote(ref or 'HEAD', safe='')}"
+        params = {"recursive": "1"}
+    else:
+        # Rejecting '..' keeps the endpoint constrained to the requested
+        # repository's contents route.
+        parts = [part for part in path.strip("/").split("/") if part]
+        if any(part in {".", ".."} for part in parts):
+            return {"ok": False, "error": "path may not contain . or .. segments"}
+        encoded_path = "/".join(quote(part, safe="") for part in parts)
+        endpoint = f"repos/{repository}/contents/{encoded_path}"
+        params = {"ref": ref} if ref else None
+
+    ok, raw = await _github_public_api(endpoint, params=params)
+    if not ok:
+        return {"ok": False, "error": _github_failure_message(f"{operation} read", raw)}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"GitHub {operation} read returned invalid JSON"}
+
+    if operation == "tree":
+        if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+            return {"ok": False, "error": "GitHub tree read returned an invalid payload"}
+        tree = payload["tree"]
+        upstream_truncated = bool(payload.get("truncated", False))
+        local_truncated = len(tree) > _GITHUB_TREE_ENTRY_LIMIT
+        result = dict(payload)
+        result["tree"] = tree[:_GITHUB_TREE_ENTRY_LIMIT]
+        result["truncated"] = upstream_truncated or local_truncated
+        result["upstream_truncated"] = upstream_truncated
+        result["local_truncated"] = local_truncated
+        result["returned_entries"] = len(result["tree"])
+        result["received_entries"] = len(tree)
+        return {"ok": True, "operation": "tree", "repository": repository, "result": result}
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "error": "requested path is not a file",
+            "metadata": _bounded_file_metadata(payload),
+        }
+    if payload.get("type") != "file":
+        return {
+            "ok": False,
+            "error": "GitHub contents response was not a file",
+            "metadata": _bounded_file_metadata(payload),
+        }
+    file_size = payload.get("size")
+    if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size < 0:
+        return {
+            "ok": False,
+            "error": "GitHub file response had invalid size metadata",
+            "metadata": _bounded_file_metadata(payload),
+        }
+    if file_size > _GITHUB_CONTENTS_MAX_BYTES:
+        return {
+            "ok": False,
+            "error": "GitHub file exceeds the supported 8 MiB limit",
+            "metadata": _bounded_file_metadata(payload),
+        }
+    content_payload = payload
+    if payload.get("encoding") == "none":
+        sha = payload.get("sha")
+        if not isinstance(sha, str):
+            return {
+                "ok": False,
+                "error": "GitHub large-file response had invalid metadata",
+                "metadata": _bounded_file_metadata(payload),
+            }
+        blob_ok, blob_raw = await _github_public_api(
+            f"repos/{repository}/git/blobs/{quote(sha, safe='')}",
+            timeout=60,
+            max_bytes=_GITHUB_BLOB_RESPONSE_MAX_BYTES,
+        )
+        if not blob_ok:
+            return {
+                "ok": False,
+                "error": _github_failure_message("large-file read", blob_raw),
+                "metadata": _bounded_file_metadata(payload),
+            }
+        try:
+            content_payload = json.loads(blob_raw)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "GitHub large-file read returned invalid JSON"}
+        if not isinstance(content_payload, dict):
+            return {"ok": False, "error": "GitHub large-file read returned an invalid payload"}
+        blob_size = content_payload.get("size")
+        if (
+            isinstance(blob_size, bool)
+            or not isinstance(blob_size, int)
+            or blob_size != file_size
+        ):
+            return {
+                "ok": False,
+                "error": "GitHub large-file response had inconsistent size metadata",
+                "metadata": _bounded_file_metadata(payload),
+            }
+    if content_payload.get("encoding") != "base64":
+        return {"ok": False, "error": "GitHub file response was not base64 encoded", "metadata": _bounded_file_metadata(payload)}
+    encoded_content = content_payload.get("content")
+    if not isinstance(encoded_content, str):
+        return {"ok": False, "error": "GitHub file response had invalid content", "metadata": _bounded_file_metadata(payload)}
+    try:
+        encoded_chars = sum(not char.isspace() for char in encoded_content)
+        if encoded_chars > _GITHUB_CONTENTS_MAX_BASE64_CHARS:
+            return {
+                "ok": False,
+                "error": "GitHub file exceeds the supported 8 MiB limit",
+                "metadata": _bounded_file_metadata(payload),
+            }
+        compact_content = "".join(encoded_content.split())
+        decoded_bytes = base64.b64decode(compact_content, validate=True)
+        if len(decoded_bytes) > _GITHUB_CONTENTS_MAX_BYTES:
+            return {
+                "ok": False,
+                "error": "GitHub file exceeds the supported 8 MiB limit",
+                "metadata": _bounded_file_metadata(payload),
+            }
+        if len(decoded_bytes) != file_size:
+            return {
+                "ok": False,
+                "error": "GitHub file response had inconsistent size metadata",
+                "metadata": _bounded_file_metadata(payload),
+            }
+        decoded = decoded_bytes.decode("utf-8")
+    except (binascii.Error, TypeError, ValueError, UnicodeDecodeError):
+        return {"ok": False, "error": "file is not UTF-8 text", "metadata": _bounded_file_metadata(payload)}
+    return {
+        "ok": True,
+        "operation": "file",
+        "repository": repository,
+        "path": path,
+        "ref": ref or None,
+        "sha": payload.get("sha"),
+        "size": payload.get("size"),
+        "html_url": payload.get("html_url"),
+        "download_url": payload.get("download_url"),
+        "content": decoded[:max_chars],
+        "truncated": len(decoded) > max_chars,
+        "total_chars": len(decoded),
+    }
 
 
 @mcp.tool()

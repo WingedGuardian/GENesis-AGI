@@ -341,7 +341,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51f9a358 2026-09-05
+verified: d0627c854 2026-09-11
 ```
 
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
@@ -367,6 +367,16 @@ verified: 51f9a358 2026-09-05
   closed: per-field REPAIR of a foreign document (seven findings), and inferring
   whether credential discovery had succeeded from a config loader that degrades
   silently by design (two P1s).
+- **Research-profile direct sessions require the canonical `web-research` skill.**
+  Foreground research subagents preload the same skill through agent frontmatter;
+  autonomous blocker research injects it directly and requires the research MCP
+  profile. Ordinary autonomous steps assigned the legacy `research` skill use a
+  narrow compatibility adapter and receive the canonical method in their prompt,
+  including when an API provider has no filesystem tools. Both background research
+  paths derive the same recon boundary from the live tool registry: only
+  public-repository GitHub.com search and bounded source inspection remain. These
+  operations use a fixed unauthenticated API endpoint, never operator credentials;
+  UTF-8 file reads are limited to 8 MiB.
 - **Failover records availability only when a peer DEMONSTRABLY served** — a
   usable output, or answer text already streamed to the user. The degenerate
   empty non-error output (a silent cap) keeps its long-standing behaviour and is
@@ -909,7 +919,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 788dd9a9 2026-09-06
+verified: d0627c854 2026-09-11
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -951,6 +961,12 @@ verified: 788dd9a9 2026-09-06
   than a drop, since dropping asserts absence. Pings immediately in `live`.
   `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
+- **Research sessions can search and inspect public GitHub.com data through
+  read-only recon MCP operations.** The transport uses a fixed unauthenticated API
+  endpoint so operator-private repositories and viewer-specific fields are outside
+  its authority. Empty results remain distinct from API failure; tree and UTF-8
+  source reads are bounded, with file reads limited to 8 MiB and output truncation
+  reported explicitly.
 - **recon/career_outreach.py** (`CareerOutreachMonitor`) — the recon entry that
   not only pushes but ACTS: a daily surplus-cron ACTUATOR driving a configured
   external career-agent module (SSH CC dispatch, declared in the install's
@@ -1042,7 +1058,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 50b79ffb 2026-09-01
+verified: d0627c854 2026-09-11
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -2455,6 +2471,10 @@ verified: 50b79ffb 2026-09-01
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
   `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  `web-research` is the shared method for foreground sessions, the
+  `genesis-researcher` subagent, and research-profile background sessions;
+  task risk and breadth select its depth. Tier-2 `research` resources resolve and
+  inject that delegated method before tool-less autonomous API dispatch.
 - **contribution/**: `python -m genesis contribute <sha>` — sanitize-then-PR
   upstream, pseudonymous. `sanitize.scan_diff()` is FAIL-CLOSED (8 scanners;
   any finding stops). Its forbidden-globs floor duplicates

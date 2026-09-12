@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from genesis.autonomy.executor.resources import (
+    RequiredSkillUnavailableError,
     _extract_keywords,
     _load_skill_catalog,
     gather_resource_inventory,
@@ -197,6 +198,103 @@ class TestLoadStepResources:
             assert "Research Skill" in result
             assert "Do research" in result
 
+    async def test_truncated_fallback_reports_selected_source_file(
+        self, tmp_path: Path,
+    ) -> None:
+        skill_dir = tmp_path / "fallback"
+        skill_dir.mkdir()
+        readme = skill_dir / "README.md"
+        readme.write_text("x" * 2001, encoding="utf-8")
+
+        with patch(
+            "genesis.autonomy.executor.resources._find_skill_path",
+            return_value=skill_dir,
+        ):
+            result = await load_step_resources(None, {"skills": ["fallback"]})
+
+        assert result is not None
+        assert f"complete skill source: {readme}" in result
+
+    async def test_delegated_skill_method_is_injected_for_toolless_dispatch(
+        self, tmp_path: Path,
+    ) -> None:
+        research_dir = tmp_path / "research"
+        research_dir.mkdir()
+        (research_dir / "SKILL.md").write_text(
+            "---\nname: research\n---\n# Research\nPreserve the structured output.",
+            encoding="utf-8",
+        )
+        web_dir = tmp_path / "web-research"
+        web_dir.mkdir()
+        (web_dir / "SKILL.md").write_text(
+            "# Web Research\nEvidence standard\nDeliver with citations.",
+            encoding="utf-8",
+        )
+
+        with (
+            patch(
+                "genesis.autonomy.executor.resources._find_skill_path",
+                return_value=research_dir,
+            ),
+            patch(
+                "genesis.learning.skills.wiring.get_skill_path",
+                return_value=web_dir / "SKILL.md",
+            ),
+        ):
+            result = await load_step_resources(None, {"skills": ["research"]})
+
+        assert result is not None
+        assert "Preserve the structured output" in result
+        assert "### Delegated method: web-research" in result
+        assert "Evidence standard" in result
+        assert "Deliver with citations" in result
+
+    async def test_missing_delegated_skill_is_explicit(self, tmp_path: Path) -> None:
+        research_dir = tmp_path / "research"
+        research_dir.mkdir()
+        (research_dir / "SKILL.md").write_text(
+            "---\nname: research\n---\n# Research",
+            encoding="utf-8",
+        )
+
+        with (
+            patch(
+                "genesis.autonomy.executor.resources._find_skill_path",
+                return_value=research_dir,
+            ),
+            patch(
+                "genesis.learning.skills.wiring.get_skill_path",
+                return_value=None,
+            ),
+            pytest.raises(
+                RequiredSkillUnavailableError, match="unavailable: web-research",
+            ),
+        ):
+            await load_step_resources(None, {"skills": ["research"]})
+
+    async def test_delegated_skill_lookup_error_is_explicit(self, tmp_path: Path) -> None:
+        research_dir = tmp_path / "research"
+        research_dir.mkdir()
+        (research_dir / "SKILL.md").write_text(
+            "---\nname: research\n---\n# Research",
+            encoding="utf-8",
+        )
+
+        with (
+            patch(
+                "genesis.learning.skills.wiring.get_skill_path",
+                side_effect=OSError("unreadable catalog"),
+            ),
+            patch(
+                "genesis.autonomy.executor.resources._find_skill_path",
+                return_value=research_dir,
+            ),
+            pytest.raises(
+                RequiredSkillUnavailableError, match="unavailable: web-research",
+            ),
+        ):
+            await load_step_resources(None, {"skills": ["research"]})
+
     async def test_missing_skill_skipped(self) -> None:
         """Missing skills are skipped gracefully."""
         with patch(
@@ -208,9 +306,7 @@ class TestLoadStepResources:
             assert result is None
 
     async def test_injection_includes_absolute_skill_dir(self, tmp_path: Path) -> None:
-        """The injected resource carries the absolute skill dir, so a dispatched
-        step (which can't load the skill via the Skill tool from outside the
-        project) can Read the full skill + references by absolute path."""
+        """The injected resource identifies its source for tool-capable CLI dispatch."""
         skill_dir = tmp_path / "deliverable-builder"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("# Deliverable Builder\nbody", encoding="utf-8")

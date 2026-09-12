@@ -8,6 +8,10 @@ skill_type: workflow
 
 # Research
 
+This legacy Tier-2 entry delegates the research method to
+`.claude/skills/web-research/SKILL.md`. Load and follow that skill. Preserve the
+structured output below when a caller requires it.
+
 ## Purpose
 
 Conduct thorough research on a topic, producing a structured summary with
@@ -19,18 +23,6 @@ sources and actionable takeaways for Genesis.
 - A blocker requires understanding an unfamiliar domain.
 - Surplus compute is available and a research task is queued.
 - An evaluation identified a WATCH or ADOPT item needing deeper analysis.
-
-## Workflow
-
-1. **Scope** — Define the research question clearly. What specifically do we
-   need to know? What decisions does this inform?
-2. **Gather** — Search web, documentation, code repositories. Collect primary
-   sources. Prefer official docs over blog posts.
-3. **Synthesize** — Organize findings into a coherent narrative. Identify
-   consensus vs. conflicting information.
-4. **Assess reliability** — Note source quality, recency, potential bias.
-5. **Extract actionables** — What should Genesis do with this information?
-6. **Write output** — Structured research report.
 
 ## Output Format
 

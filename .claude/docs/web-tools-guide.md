@@ -33,10 +33,9 @@ Browser for interaction. ATS APIs for job listings.
 | **Perplexity** (API) | Both | Synthesized answers with citations | None (paid only) |
 | **Brave** (API) | Genesis runtime | Auto-fallback when SearXNG fails | ~1,000/month |
 
-**CC sessions default:** CC `WebSearch` for general lookups. SearXNG via
-Bash for structured JSON / `site:` filtering. Tavily for AI-optimized
-agent search (free tier). Exa for semantic/conceptual discovery. Perplexity
-when synthesis from multiple sources justifies the cost.
+**Default:** use the Genesis `web_search` MCP interface. Select a backend only
+when the task needs it; the tool's automatic chain handles ordinary fallback.
+Foreground-only CC tools remain useful for a quick lookup or AI-processed fetch.
 
 ## GitHub Search — "I need to find repos, code, or libraries"
 
@@ -45,17 +44,21 @@ libraries on GitHub, use these INSTEAD of generic web search:
 
 | Tool | Context | Use when... |
 |------|---------|-------------|
-| **`gh search repos "query"`** | Both (via Bash) | Find repos by topic, description, language |
-| **`gh search code "query"`** | Both (via Bash) | Search code across all public repos |
+| **`recon_github_search`** | Genesis research sessions | Find public GitHub.com repositories or issues through an unauthenticated fixed endpoint |
+| **`recon_github_read`** | Genesis research sessions | Inspect public GitHub.com repository metadata, bounded trees, or UTF-8 source files up to Genesis's 8 MiB file limit |
+| **`gh search repos/code`** | Foreground with Bash | Direct CLI fallback |
 | **grep.app** | Both | `web_fetch("https://grep.app/search?q=QUERY")` — semantic code search, better than GitHub native |
-| **`gh api search/repositories?q=QUERY`** | Both | Structured JSON results with star counts, dates |
+| **`gh api search/repositories?q=QUERY`** | Foreground with Bash | Structured CLI fallback |
 | **Exa** with GitHub filter | Both | `web_search(query, backend="exa")` with `include_domains: ["github.com"]` |
 
 **When to use:** Any task involving "search GitHub," "find a library,"
 "how do other projects handle X," or "what open-source tools exist for Y."
 Generic web search returns blog posts ABOUT GitHub projects; these tools
 search GitHub directly. grep.app is especially valuable for finding
-implementation patterns across repos.
+implementation patterns across repos. GitHub's code-search API requires
+credentials, so the public-only recon tool discovers candidate repositories and
+then inspects their trees/files; foreground sessions can use authenticated CLI
+search when operator-private visibility is appropriate.
 
 ---
 
@@ -69,8 +72,8 @@ implementation patterns across repos.
 | **CC WebFetch** | CC sessions | Quick fetch + AI summarization |
 | **Firecrawl** (API) | CC sessions | Complex pages, paywall bypass (costs credits) |
 
-**CC sessions default:** Crawl4AI first (free, local, JS-capable).
-CC `WebFetch` for AI-processed summaries. Firecrawl as last resort.
+**Default:** `web_fetch` uses the maintained automatic fetch chain. Select a
+specific backend only for a demonstrated need. Firecrawl is paid and explicit.
 
 ## Browser — "I need to interact with a page"
 

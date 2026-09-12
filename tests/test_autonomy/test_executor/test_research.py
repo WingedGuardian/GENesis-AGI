@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -165,6 +166,59 @@ class TestResearchSession:
         )
         assert result is None
 
+    async def test_missing_research_mcp_config_fails_without_invoking(self) -> None:
+        invoker = AsyncMock()
+        researcher = DeepResearcherImpl(db=AsyncMock(), invoker=invoker)
+
+        with patch.object(researcher, "_build_mcp_config", return_value=None):
+            result = await researcher.research(
+                {"idx": 1, "description": "Fix bug"}, "Error", [],
+            )
+
+        assert result is not None
+        assert result.found is False
+        assert "MCP configuration" in result.clues
+        invoker.run.assert_not_awaited()
+
+    async def test_missing_research_method_fails_without_invoking(self) -> None:
+        invoker = AsyncMock()
+        researcher = DeepResearcherImpl(db=AsyncMock(), invoker=invoker)
+
+        with (
+            patch.object(researcher, "_build_mcp_config", return_value="/tmp/research.json"),
+            patch("genesis.autonomy.executor.research.load_skill", return_value=None),
+        ):
+            result = await researcher.research(
+                {"idx": 1, "description": "Fix bug"}, "Error", [],
+            )
+
+        assert result is not None
+        assert result.found is False
+        assert "required research method" in result.clues
+        invoker.run.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "load_error", [OSError("unreadable"), UnicodeError("invalid UTF-8")],
+    )
+    async def test_unreadable_research_method_fails_without_invoking(
+        self, load_error: Exception,
+    ) -> None:
+        invoker = AsyncMock()
+        researcher = DeepResearcherImpl(db=AsyncMock(), invoker=invoker)
+
+        with (
+            patch.object(researcher, "_build_mcp_config", return_value="/tmp/research.json"),
+            patch("genesis.autonomy.executor.research.load_skill", side_effect=load_error),
+        ):
+            result = await researcher.research(
+                {"idx": 1, "description": "Fix bug"}, "Error", [],
+            )
+
+        assert result is not None
+        assert result.found is False
+        assert "required research method" in result.clues
+        invoker.run.assert_not_awaited()
+
     async def test_session_finds_approach(self) -> None:
         output = FakeCCOutput(
             text='Some analysis...\n```json\n{"found": true, "approach": "Use library X version 2.0 which fixes this bug", "sources": ["https://github.com/lib/issues/123"], "clues": null, "concrete_blockers": []}\n```',
@@ -185,6 +239,12 @@ class TestResearchSession:
         assert result.found is True
         assert "library X" in result.approach
         assert result.session_id == "ses-research-001"
+
+        invocation = invoker.run.await_args.args[0]
+        assert "Evidence standard" in (invocation.system_prompt or "")
+        assert '"genesis-recon"' in Path(invocation.mcp_config).read_text()
+        assert "mcp__genesis-recon__recon_store_finding" in invocation.disallowed_tools
+        assert "mcp__genesis-recon__recon_github_search" not in invocation.disallowed_tools
 
     async def test_session_finds_nothing_with_blockers(self) -> None:
         output = FakeCCOutput(

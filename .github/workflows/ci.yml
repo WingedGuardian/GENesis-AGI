@@ -705,7 +705,10 @@ jobs:
           # one, the checker must find nothing rather than yesterday's.
           rm -f junit.xml
           # Ignore preserved AZ-era test files that import removed modules
-          pytest -v \
+          # Quiet progress keeps the failure traceback and final summary inside the
+          # Actions log cap. With 25k+ cases, verbose node ids truncated both before
+          # the real failure and made two consecutive red runs undiagnosable.
+          pytest -q \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
