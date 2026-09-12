@@ -165,8 +165,10 @@ source — there is no `requirements.txt`). Known-CVE scanning runs automaticall
 
 - **CI** — the `dependency-audit` job in `.github/workflows/ci.yml` runs
   `pip-audit` against the resolved runtime tree on every PR/push and weekly,
-  failing on any new (untriaged) advisory. Already-triaged, not-reachable
-  advisories are listed with rationale in that job.
+  reporting advisories outside its retained ignore baseline in the job log.
+  Audit findings are advisory: step-level `continue-on-error` prevents them
+  from failing the job. Dependency installation failures still fail the job.
+  Existing ignored advisories are listed with rationale in that job.
 - **Dependabot** — GitHub's dependency-graph security alerts are enabled for
   the repo, and `.github/dependabot.yml` keeps the GitHub Actions current.
 
