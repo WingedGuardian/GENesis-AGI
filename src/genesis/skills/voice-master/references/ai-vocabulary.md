@@ -170,11 +170,11 @@ Vague upbeat endings.
 - "poised for growth"
 - "watch this space"
 
-## Significance & structure inflation
+## Tier 1: significance & structure inflation
 
-High-signal words and phrases that inflate importance or fake structure. Treat
-these like the Significance and Promotional lists above (added alongside the
-document-level structural tells in `anti-slop.md`).
+High-signal words and phrases that inflate importance or fake structure. They
+are Tier 1 vocabulary: reject them in the mandatory audit alongside the
+document-level structural tells in `anti-slop.md`.
 
 - "stands as" / "stands as a testament": inflated copula; prefer "is".
 - "at the forefront of" / "on the cutting edge of": press-release framing.
