@@ -1389,7 +1389,7 @@ surface** — and that last set is WIDER than it used to say here: read
 `review_enforcement_commit._PROMPT_SURFACE_PREFIXES` + `_is_prompt_surface` rather
 than a copied list. It covers `.claude/agents|commands|skills/*`,
 `src/genesis/skills/*`, **`src/genesis/identity/`**, and **any**
-`src/genesis/**/prompts/` path — so editing `identity/CODE_AUDITOR.md` or an
+`src/genesis/**/prompts/` path — so editing `src/genesis/identity/CODE_AUDITOR.md` or an
 executor prompt forces `substantial` even at one line, which the old list denied.
 So the "Prompt / LLM behavior → both + extra scrutiny" row above is machine-enforced (a
 trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
@@ -2287,9 +2287,10 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**
   `sync-hooks.sh` copies only the five GIT hooks (`commit-msg`, `post-commit`,
   `pre-commit`, `prepare-commit-msg`, `pre-push`) plus one helper into
-  `.git/hooks/`. Everything else — `git_push_guard.py`, `shell_parse.py`,
-  `hook_output.py` — is launched by `.claude/hooks/genesis-hook`, which resolves
-  `HOOK_ROOT` to the **MAIN worktree**, not the tree you are sitting in
+  `.git/hooks/`. `.claude/hooks/genesis-hook` launches entry-point hook scripts
+  such as `git_push_guard.py`; that guard imports the shared `shell_parse.py` and
+  `hook_output.py` modules. The launcher resolves `HOOK_ROOT` to the **MAIN
+  worktree**, not the tree you are sitting in
   (`HOOK_ROOT="$MAIN_ROOT"` unless `GENESIS_HOOK_DEV_LOCAL=1`). That is
   deliberate — it stops per-branch hook drift, measured 2026-08 at 60 of 70
   worktrees running a stale `full_suite_guard`. Three consequences:
@@ -2943,7 +2944,8 @@ The review-findings gate specifically:
    the reason for the absence (quota, never triggered, still running). The only
    things that clear it are a review at head, a clean re-review comment naming
    head, a provably review-trivial delta since a stale review, or a conscious
-   `# stale-review-override`.
+   `# stale-review-override` — except on a hook-surface PR, where that sigil also
+   requires the exact base-and-head fallback-review evidence described above.
    ⚠ This item previously read "no review comments at all (quota exhausted) →
    merge allowed on CI alone", which is FALSE and contradicted the Pre-Merge Gate
    section above ("an ABSENT review always blocks") four hundred lines earlier.
