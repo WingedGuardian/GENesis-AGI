@@ -285,3 +285,67 @@ async def test_run_failover_peer_offline_propagates_without_fresh_retry(loop, in
             on_event=None,
         )
     assert invoker.run.call_count == 1  # no fresh retry
+
+
+# ── Resumed-turn fragments must SURVIVE failover/contingency rebuilds ────────
+# A resumed turn's system_prompt is not empty on Telegram: it carries the
+# per-turn fragments assembled by the caller (topic context with the live
+# proposal board, the session-control block, the research-routing nudge). Both
+# degraded paths re-assemble the identity for a fresh/tool-less session — that
+# part is right — but they must COMPOSE it with those fragments, not replace
+# them: "approve this proposal" needs the board, and "the older ones" needs the
+# thread context, on the peer exactly as much as on the home model.
+
+
+@pytest.mark.asyncio
+async def test_failover_preserves_resume_fragments_beside_identity(loop, invoker, monkeypatch):
+    captured: dict = {}
+
+    def _spy(home, base, *a, **k):
+        captured["system_prompt"] = base.system_prompt
+        return [("glm-5.2", _PEER_INV)]
+
+    inv = CCInvocation(
+        prompt="approve this proposal", resume_session_id="cc-1",
+        system_prompt="## Pending proposals\n- P1: adopt-first demo",
+    )
+    monkeypatch.setattr(roster, "failover_invocations", _spy)
+    invoker.run = AsyncMock(return_value=_output(text="peer reply", session_id="glm-1"))
+
+    out = await loop._try_roster_failover(
+        inv, session={"id": "cc-live"}, channel=ChannelType.TELEGRAM,
+        model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+        prompt_text="approve this proposal",
+    )
+
+    assert out and "peer reply" in out
+    # Identity re-assembled for the fresh peer session…
+    assert "You are Genesis." in captured["system_prompt"]
+    # …AND the turn's own context preserved, not discarded by the rebuild.
+    assert "P1: adopt-first demo" in captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_contingency_preserves_resume_fragments_beside_identity(loop):
+    # The tool-less contingency dispatcher gets referents for "this one"/"the
+    # older ones" the same way: assembled identity + the turn's fragments.
+    captured: dict = {}
+
+    class _Dispatch:
+        async def dispatch_conversation(self, messages, system_prompt):
+            captured["system_prompt"] = system_prompt
+            result = MagicMock()
+            result.success, result.content, result.model = True, "ok", "router-x"
+            return result
+
+    loop._contingency = _Dispatch()
+
+    out = await loop._try_contingency(
+        "approve this proposal",
+        "## Pending proposals\n- P1: adopt-first demo",
+        ChannelType.TELEGRAM, session_id="cc-live", was_resume=True,
+    )
+
+    assert "ok" in out  # reply text (contingency preamble is prefixed by the caller)
+    assert "You are Genesis." in captured["system_prompt"]
+    assert "P1: adopt-first demo" in captured["system_prompt"]

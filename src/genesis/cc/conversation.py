@@ -1202,15 +1202,27 @@ class ConversationLoop:
             # appended to a resumed turn's prompt (the research-routing nudge
             # already does this on Telegram), leaving the peer with only that
             # fragment as its whole identity.
+            # The re-assembled identity COMPOSES with whatever fragments the
+            # turn already assembled (topic context with the live proposal
+            # board, session-control block, research-routing nudge) — it never
+            # replaces them. Those fragments are the only place that per-turn
+            # context exists on a resume; dropping them made "approve this
+            # proposal" arrive at the peer with no referent.
             if base_inv.resume_session_id is not None:
-                system_prompt = await self._assembler.assemble(
+                identity = await self._assembler.assemble(
                     db=self._db, model=str(model), effort=str(effort),
                     session_id=session["id"],
                 )
-                system_prompt = await self._enrich_with_context(
-                    system_prompt, prompt_text,
+                identity = await self._enrich_with_context(
+                    identity, prompt_text,
                 )
-                base_inv = replace(base_inv, system_prompt=system_prompt)
+                fragments = base_inv.system_prompt
+                base_inv = replace(
+                    base_inv,
+                    system_prompt=(
+                        f"{identity}\n\n{fragments}" if fragments else identity
+                    ),
+                )
             peers = roster.failover_invocations(home, base_inv)
             if not peers:
                 return None
@@ -1670,15 +1682,22 @@ class ConversationLoop:
         # FACT: a resumed turn's prompt may be a non-empty fragment (an appended
         # nudge) rather than None, and shipping that fragment alone to a raw
         # router LLM would answer as Genesis with no Genesis identity at all.
+        # The rebuilt identity COMPOSES with the incoming fragments (same rule
+        # as _try_roster_failover): the tool-less router has no other referent
+        # for "this one" / "the older ones" than the topic context the turn
+        # already assembled — replacing it strips exactly that.
         if was_resume or system_prompt is None:
             try:
-                system_prompt = await self._assembler.assemble(
+                identity = await self._assembler.assemble(
                     db=self._db, model="sonnet", effort="medium",
                     session_id=session_id,
                 )
             except Exception:
                 logger.error("Failed to assemble system prompt for contingency", exc_info=True)
                 return None
+            system_prompt = (
+                f"{identity}\n\n{system_prompt}" if system_prompt else identity
+            )
 
         messages = [{"role": "user", "content": prompt_text}]
 
