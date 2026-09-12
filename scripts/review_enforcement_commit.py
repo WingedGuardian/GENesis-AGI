@@ -595,6 +595,128 @@ def _worktree_root(cwd: str) -> str:
     return os.path.realpath(cwd)
 
 
+# ── Enumerated remedies: the option set as DATA ───────────────────────────────
+#
+# Both caps below present the session with a CHOICE to relay to the user. That is
+# the one thing in this file a session cannot be trusted to carry accurately, and
+# it is measured rather than suspected: on 2026-08-31 the escalation cap printed
+# three remedies and the relay to the user dropped the first, invented a fourth,
+# and added "ship as-is" — the outcome the cap exists to prevent. A prose list
+# inside a message is unfalsifiable; a declared set can be checked at the ask, at
+# the ack, and by anyone reading the state afterwards.
+#
+# These constants are the single source for all three: the message renders from
+# them, the ack validates against them, and they are written to state for the
+# ask-time gate. Keeping them here rather than only in state is deliberate — a
+# best-effort state write can fail, and the ack must still have a vocabulary to
+# validate against, so a bookkeeping failure never downgrades to accepting a bare
+# ack.
+_ESCALATION_REMEDIES = (
+    {
+        "key": "redesign",
+        "label": "robust-by-construction redesign",
+        "detail": "rebuild so the defect class cannot recur, rather than patching "
+        "the instances a reviewer named",
+    },
+    {
+        "key": "narrow",
+        "label": "narrow the scope",
+        "detail": "cut the change down to the part that is converging and take the "
+        "rest separately",
+    },
+    {
+        "key": "shelve",
+        "label": "shelve the change",
+        "detail": "stop here and come back to it with a different approach",
+    },
+)
+
+_FINAL_ROUND_REMEDIES = (
+    {
+        "key": "accept",
+        "label": "accept the outstanding findings and merge",
+        "detail": "document each one and why it is acceptable in the PR body. "
+        "Clears ONE commit; the block returns on the next",
+    },
+    {
+        "key": "abandon",
+        "label": "abandon the branch",
+        "detail": "restart from a design that does not need this many rounds",
+    },
+)
+
+
+def _render_remedies(remedies: tuple[dict, ...], sigil: str) -> str:
+    """The remedy set as a numbered list, each with its runnable ack form.
+
+    Numbered rather than the inline `(a / b / c)` prose this used to be: every
+    other enumerating gate in this file uses a numbered list, and the inline form
+    is the shape that was measurably corrupted in relay. Printing the exact
+    command per remedy also means the ack vocabulary is always visible, which is
+    what lets validation stay strict when the state write has failed.
+    """
+    lines = []
+    for i, r in enumerate(remedies, 1):
+        lines.append(f"  {i}. {r['label']} — {r['detail']}")
+        lines.append(f'        git commit -m "your message"  # {sigil}:{r["key"]}')
+    return "\n".join(lines)
+
+
+def _declare_remedies(
+    remedies: tuple[dict, ...],
+    *,
+    gate: str,
+    required_action: str,
+    cwd: str | None,
+    session_id: str | None = None,
+) -> None:
+    """Write the remedy set to state so later layers can check against it.
+
+    Best-effort by contract (``write_gate_demand`` never raises): a gate must
+    block whether or not its bookkeeping succeeded.
+    """
+    try:
+        from review_state import write_gate_demand
+
+        write_gate_demand(
+            gate=gate,
+            remedies=[{"key": r["key"], "label": r["label"]} for r in remedies],
+            required_action=required_action,
+            cwd=cwd,
+            session_id=session_id,
+        )
+    except Exception:  # noqa: BLE001 — bookkeeping must never break the block
+        pass
+
+
+def _acked_remedy(
+    segs: list, remedies: tuple[dict, ...], sigil: str
+) -> tuple[bool, set]:
+    """(the sigil is present on every commit segment, the set of args it carries).
+
+    Returns the SET rather than a single choice so the caller can tell three
+    cases apart, each of which needs a different message: nothing named (a bare
+    ack, which attests to no particular decision), one thing named (the normal
+    path), and two DIFFERENT things named across a compound — which is not a
+    decision either, but reporting it as "bare" is wrong on its face when the
+    session plainly wrote two named acks.
+    """
+    if not segs or not all(has_trailing_override(s.raw, sigil=sigil) for s in segs):
+        return False, set()
+    # Imported HERE, not at module scope, and the reason is a fail direction.
+    # This file's `from shell_parse import (...)` block runs at import time, where
+    # a failure exits 1 — which CC treats as NON-blocking, so the entire review
+    # gate silently disappears (the standing import-time fail-open, tracked
+    # separately). Adding a symbol there widens that surface to include version
+    # skew between a worktree's copy of this file and the main tree's shell_parse,
+    # which is a real configuration on this box. A call-time import instead raises
+    # inside main(), where run_guard converts it to a hard BLOCK. Same dependency,
+    # opposite failure.
+    from shell_parse import trailing_override_arg
+
+    return True, {trailing_override_arg(s.raw, sigil) for s in segs}
+
+
 def _merge_note(cwd: str | None) -> str:
     """A hint appended to a cap/mode-switch denial when a merge is mid-flight.
 
@@ -785,6 +907,7 @@ def main() -> None:
             is_review_current,
             marker_content_current,
             reset_review_round,
+            satisfy_gate_demand,
         )
     except Exception:  # noqa: BLE001 — ANY load failure, not just absence.
         # If review_state cannot be loaded, fail open — don't block.
@@ -1043,7 +1166,26 @@ def main() -> None:
             # required — the escalation cap below is still live once this one clears.
             # Printing only one would send a session round a loop of alternating
             # blocks, so name the co-required form when it applies.
-            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
+            escalation_hint = (
+                " escalation-ack:<remedy>" if round_n >= ESCALATION_ROUND_CAP else ""
+            )
+            # Declared for the ask-time gate even though this sigil needs no
+            # argument. The two caps differ structurally: `escalation-ack` attests
+            # to a CHOICE among three remedies, so a bare token names nothing,
+            # whereas `final-round-accept` IS the choice — the other option here is
+            # to stop committing, which has no sigil because it produces no commit.
+            # So there is no ambiguity for an argument to resolve. What both share
+            # is the relay risk, and that is what the declaration covers.
+            _declare_remedies(
+                _FINAL_ROUND_REMEDIES,
+                gate="final-round-cap",
+                required_action=(
+                    "Take this to the user before choosing, relaying BOTH options "
+                    "as written; neither is yours to make alone."
+                ),
+                cwd=cwd,
+                session_id=payload.get("session_id"),
+            )
             _deny(
                 f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
                 f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
@@ -1063,6 +1205,13 @@ def main() -> None:
                 "alone." + _merge_note(cwd)
             )
             return
+        # The demand this gate declared is answered the moment the sigil is
+        # honoured — `final-round-accept` IS the choice, so there is no argument
+        # for it to carry. Without this the demand never retires and every later
+        # question on the branch must offer the accept/abandon menu, including
+        # questions about something else entirely: a permanent false block on an
+        # unrelated tool, long after the decision was made.
+        satisfy_gate_demand("accept", cwd=cwd, gate="final-round-cap")
         # Acked = the accept decision was made. Deliberately NO reset: the counter
         # stays at/above the terminal so the next commit blocks again. The spend is
         # DEFERRED to the allow (see `_allow` above) — the later rules can still
@@ -1070,24 +1219,67 @@ def main() -> None:
         spend_final_accept = True
 
     if round_n >= ESCALATION_ROUND_CAP:
-        acked = bool(commit_segs) and all(
-            has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
+        acked, args = _acked_remedy(
+            commit_segs, _ESCALATION_REMEDIES, "escalation-ack"
         )
-        if not acked:
+        valid_keys = {r["key"] for r in _ESCALATION_REMEDIES}
+        choice = next(iter(args)) if len(args) == 1 else None
+        named = sorted(a for a in args if a)
+        conflicting = named if len(args) > 1 and None not in args else []
+        partly_bare = named if len(args) > 1 and None in args else []
+        if not acked or choice not in valid_keys:
+            required = (
+                "STOP and get a FRESH user decision on how to proceed, relaying the "
+                "remedies below AS WRITTEN, then acknowledge that decision BY NAME."
+            )
+            _declare_remedies(
+                _ESCALATION_REMEDIES,
+                gate="escalation-cap",
+                required_action=required,
+                cwd=cwd,
+                session_id=payload.get("session_id"),
+            )
+            # An ack naming something outside the set is the measured failure mode
+            # ("ship as-is"), not a typo — say which token was rejected, or the
+            # session cannot tell an invented remedy from a misspelled one.
+            rejected = (
+                "\n\nOnly some segments named a remedy ("
+                + ", ".join(f"'{c}'" for c in partly_bare)
+                + "); the rest carried a bare ack. Every commit segment must "
+                "name the SAME remedy.\n"
+                if partly_bare
+                else "\n\nThe ack named " + " and ".join(f"'{c}'" for c in conflicting)
+                + " on different segments of one command. That is not a decision "
+                "either — name ONE remedy, identically, on every commit segment.\n"
+                if conflicting
+                else f"\n\nThe ack named '{choice}', which is not one of them. There is "
+                "deliberately no 'proceed as-is' among them: accepting the findings "
+                "as they stand is what the TERMINAL offers, several rounds from "
+                "here, and importing that answer into this gate is the decision "
+                "this cap exists to withhold.\n"
+                if acked and choice
+                else "\n\nA BARE '# escalation-ack' is not enough: it attests to no "
+                "particular decision, so a session that relayed a corrupted menu is "
+                "indistinguishable from one that relayed this one.\n"
+                if acked
+                else "\n"
+            )
             _deny(
                 f"BLOCKED: review escalation cap reached — {round_n} consecutive "
                 f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
                 f"{ESCALATION_ROUND_CAP}; internal same-model self/subagent audits are "
                 "not counted). The cross-model review→fix loop has run long — the "
                 "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
-                "the problem statement is likely wrong, not just this fix. STOP and get "
-                "a FRESH user decision on how to proceed (robust-by-construction "
-                "redesign / narrow scope / shelve), then "
-                "acknowledge that decision with a trailing shell comment (outside any "
-                "quotes):\n"
-                '  git commit -m "your message"  # escalation-ack' + _merge_note(cwd)
+                "the problem statement is likely wrong, not just this fix.\n\n"
+                f"{required}{rejected}\n"
+                + _render_remedies(_ESCALATION_REMEDIES, "escalation-ack")
+                + "\n\nRelay ALL of them. Do not add an option this gate does not "
+                "list — 'ship as-is' is the outcome this cap exists to prevent, and "
+                "presenting it is the corruption, not a shortcut around it."
+                + _merge_note(cwd)
             )
             return
+        satisfy_gate_demand(choice, cwd=cwd, gate="escalation-cap")
         # Acked = a fresh decision to continue → reset the round budget so the next
         # stop is a fresh cap away, not per-commit friction for the branch's whole
         # life. Reset stands even if a later rule blocks THIS commit: the

@@ -2327,6 +2327,67 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   gate change, ask whether the mechanism is broken or you simply did not do the
   work it assumed you would.
 
+### A gate's enumerated remedies are the option set — and they are now enforced
+
+When a gate blocks with a list of ways forward, that list is the option set. Do
+not substitute your own menu, drop an entry, or add one the gate did not name.
+
+This is not advice about diligence; it is a measured failure with a mechanism
+built around it. On 2026-08-31 the review escalation cap blocked with three
+remedies — redesign / narrow / shelve — and the relay to the user dropped the
+first, invented "split the PR", and added "ship as-is", which is the outcome that
+cap exists to prevent. The gate's text was ONE message back, so the cause was not
+memory: a strong prior ("split or ship") beat the text in front of it. That
+matters, because re-showing the text is exactly the intervention that does not
+work against a template override.
+
+Three layers now make the set mechanical, and each will simply refuse you:
+
+1. **The gate declares its remedies as data** (`review_state.write_gate_demand`),
+   so what it asked for outlives the message.
+2. **`AskUserQuestion` is BLOCKED** while a demand is unacknowledged unless one
+   question's options carry every declared remedy
+   (`scripts/hooks/ask_question_gate.py`). Other questions ride along freely —
+   the standing convention already asks for at least two per call, so nothing has
+   to be dropped to make room. **The remedy for this refusal is to ADD the
+   missing options, never to skip the ask.**
+3. **The acknowledgment must NAME the choice** — `# escalation-ack:redesign`,
+   not a bare `# escalation-ack`. The block message prints the exact runnable
+   form for each remedy, so the vocabulary is always in front of you.
+
+**There is no "proceed as-is" argument, and that is the design.** Accepting the
+findings as they stand is what the TERMINAL offers, several rounds further on
+(`# final-round-accept`). Withholding that answer at this cap is what the cap IS.
+An escape here would also be cheaper to satisfy than any real remedy, which makes
+it the default path rather than a hatch. If you genuinely believe the cap is
+wrong for this change, that is a conversation about which remedies it should
+OFFER — not a side door around the ones it does.
+
+**The shape the covering question must have**, because getting it wrong costs a
+round-trip: ONE option per remedy, each remedy recognisable by name in the
+option's LABEL, and no other options in that question. It is a bijection — that
+question's options ARE the remedy set.
+
+Both halves bite. A missing remedy is refused, and so is an EXTRA option: a menu
+carrying a choice the gate never offered is not the gate's menu, whatever else it
+also contains. That half is the one that matters most, because adding an option
+is exactly how the measured corruption happened — the relay kept some real
+remedies and added "ship as-is" beside them.
+
+Descriptions do not count, only labels. A description is prose about an option;
+the label is what the user picks, and matching prose let `"Ship as-is / neither
+shelve nor rework"` register as offering `shelve`.
+
+If you need a further choice, put it in a SECOND question. Other questions ride
+along freely — the convention already asks for at least two — and there it is
+plainly your question rather than something the gate appears to have sanctioned.
+
+The transferable rule, beyond this one gate: **where a mechanism depends on a
+call site REMEMBERING something at the moment attention is elsewhere, a note is
+not a fix.** Move the obligation into a chokepoint and let it refuse. Writing
+oneself a memory about the escalation cap was the first attempt here, and it is
+the same class of thing as the failure it was meant to prevent.
+
 ## The Gate Machinery — the sequence, and why it bites
 
 Ten enforcement layers sit between a change and `main`. Learning them by hitting

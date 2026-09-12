@@ -567,21 +567,25 @@ def _token_is_sigil(tok: str, sigil: str) -> bool:
     return bool(re.match(re.escape(sigil) + r"(?![-\w])", tok))
 
 
-def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
-    """Whether the segment carries a genuine ``# <sigil>`` comment.
+def _leading_run_sigil_token(seg: str, sigil: str) -> str | None:
+    """The raw token for ``sigil`` in the segment's trailing comment, else None.
+
+    The ONE walk both sigil readers share. Extracted so that "is the sigil
+    present?" and "what argument does it carry?" can never disagree: a copied
+    loop can satisfy today's cases and drift apart on the next edit, and the
+    guarantee that matters here is structural, not incidental.
 
     The ``#`` must open a real comment (outside quotes, preceded by whitespace),
-    so a token buried in a quoted message word does not count. ``sigil`` selects
-    which override token to detect (``review-override`` by default; the CI-status
-    merge gate passes ``ci-override``).
+    so a token buried in a quoted message word does not count. The sigil must
+    appear in the LEADING contiguous run of recognized ack/override tokens:
+    ``# review-override: accepted P2s`` (sigil first, prose follows) and
+    ``# audit-ack depth-ack`` (a run of two sigils) both count, but
+    ``# not a review-override`` / ``# see review-override docs`` do NOT — a prose
+    token ahead of the sigil ends the run. This keeps independent acks able to
+    coexist without letting an incidental or negated prose mention waive a gate.
 
-    The sigil must appear in the LEADING contiguous run of recognized ack/override
-    tokens: `# review-override: accepted P2s` (sigil first, prose follows) and
-    `# audit-ack depth-ack` (a run of two sigils — each satisfies its own check)
-    both count, but `# not a review-override` / `# see review-override docs` do NOT
-    — a prose token ahead of the sigil ends the run. This keeps independent acks
-    able to coexist without letting an incidental or negated prose mention waive
-    the gate.
+    Returns the token AS WRITTEN (``escalation-ack:redesign``), not the sigil, so
+    a caller can read whatever is bound to it.
     """
     quote: str | None = None
     prev_ws = True
@@ -605,19 +609,66 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
         if c == "#" and prev_ws:
             for tok in seg[i + 1 :].split():
                 if _token_is_sigil(tok, sigil):
-                    return True  # the queried sigil, reached within the leading run
+                    return tok  # the queried sigil, reached within the leading run
                 if not any(_token_is_sigil(tok, s) for s in _KNOWN_SIGILS):
-                    return False  # a prose token ends the leading run of sigils
+                    return None  # a prose token ends the leading run of sigils
                 # else: a DIFFERENT recognized sigil — still in the run, keep scanning
-            return False
+            return None
         prev_ws = c.isspace()
         i += 1
-    return False
+    return None
+
+
+def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
+    """Whether the segment carries a genuine ``# <sigil>`` comment.
+
+    The ``#`` must open a real comment (outside quotes, preceded by whitespace),
+    so a token buried in a quoted message word does not count. ``sigil`` selects
+    which override token to detect (``review-override`` by default; the CI-status
+    merge gate passes ``ci-override``).
+
+    The sigil must appear in the LEADING contiguous run of recognized ack/override
+    tokens: `# review-override: accepted P2s` (sigil first, prose follows) and
+    `# audit-ack depth-ack` (a run of two sigils — each satisfies its own check)
+    both count, but `# not a review-override` / `# see review-override docs` do NOT
+    — a prose token ahead of the sigil ends the run. This keeps independent acks
+    able to coexist without letting an incidental or negated prose mention waive
+    the gate.
+    """
+    return _leading_run_sigil_token(seg, sigil) is not None
 
 
 def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     """Public alias of :func:`_has_trailing_override` for sibling hooks."""
     return _has_trailing_override(seg, sigil)
+
+
+def trailing_override_arg(seg: str, sigil: str) -> str | None:
+    """The argument bound to a sigil as ``# <sigil>:<arg>``, else None.
+
+    Lets a gate demand that an acknowledgment NAME the thing being acknowledged
+    instead of accepting a bare token that could stand for anything. Where a gate
+    enumerates remedies and asks the session to relay them to the user, a bare ack
+    makes a session that relayed a corrupted menu indistinguishable from one that
+    relayed the real one; an ack carrying the chosen remedy does not.
+
+    Returns None when the sigil is absent OR carries no ``:arg``. The CALLER
+    decides whether a bare sigil is acceptable, because for some it is (an
+    ``audit-ack`` attests to a single action) and for others it is not (an
+    ``escalation-ack`` attests to a CHOICE among enumerated remedies).
+
+    Recognition delegates to :func:`_leading_run_sigil_token`, the same scanner
+    :func:`_has_trailing_override` uses — so a sigil cannot be recognised by one
+    and missed by the other. That is a structural guarantee rather than a claim
+    about two loops that happen to match, and a test pins it.
+    """
+    tok = _leading_run_sigil_token(seg, sigil)
+    if tok is None:
+        return None
+    _, sep, arg = tok.partition(":")
+    if not sep:
+        return None
+    return arg.strip() or None
 
 
 def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:

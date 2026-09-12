@@ -762,9 +762,32 @@ def _write_round(state: dict, cwd: str | None = None) -> None:
     try:
         rf = _round_file(cwd)
         rf.parent.mkdir(parents=True, exist_ok=True)
-        rf.write_text(json.dumps(state, indent=2))
+        # Write-then-rename rather than write_text: the latter TRUNCATES first, so
+        # a concurrent reader can catch a partial file, fail to parse it, and get
+        # {} back — which reads as "no counter, no demand" and fails the whole
+        # gate OPEN. os.replace is atomic within a filesystem, so a reader sees
+        # either the old file or the new one, never half of one.
+        tmp = rf.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, rf)
     except OSError:
         pass
+
+
+_CARRIED_FIELDS = ("gate_demand",)
+
+
+def _carry(prev: dict | None, branch: str) -> dict:
+    """Fields that survive a counter rewrite, when they belong to this branch.
+
+    Kept as a named set rather than inline so the next field added to this file
+    has ONE place to be declared instead of every writer to remember. It applies
+    at the two rewrite sites that keep the SAME branch; the new-branch site does
+    not call it, because a branch change is exactly when nothing carries.
+    """
+    if not prev or prev.get("branch") != branch:
+        return {}
+    return {k: prev[k] for k in _CARRIED_FIELDS if k in prev}
 
 
 def bump_review_round(
@@ -825,6 +848,11 @@ def bump_review_round(
         # converging occasionally.
         _write_round(
             {
+                # Carry the whole prior state for this branch, then overwrite what
+                # this write actually changes. Enumerating survivors one by one is
+                # what dropped `gate_demand` here while `reset_review_round` kept
+                # it — two writers of one file disagreeing about its shape.
+                **_carry(_prev, branch),
                 "branch": branch,
                 "round": 0,
                 "lifetime": lifetime,
@@ -843,6 +871,11 @@ def bump_review_round(
         return get_review_round(cwd=cwd)
     state = _prev
     if not state or state.get("branch") != branch:
+        # No _carry here, deliberately: this branch runs precisely when the prior
+        # state belongs to a DIFFERENT branch, which is the condition under which
+        # _carry returns {} anyway. Calling it would read as coverage where there
+        # is none. Dropping a demand on a branch change is intended — the demand
+        # is branch-scoped state.
         state = {
             "branch": branch,
             "round": 1,
@@ -858,6 +891,7 @@ def bump_review_round(
         # _coerce_finite_int also absorbs the `1e999`→inf→OverflowError value class.
         prev = _coerce_finite_int(state.get("round", 0))
         state = {
+            **_carry(state, branch),
             "branch": branch,
             "round": prev + 1,
             "lifetime": lifetime + 1,
@@ -972,9 +1006,127 @@ def reset_review_round(cwd: str | None = None) -> None:
             # Carried for the same reason as `lifetime`: an escalation-ack resets
             # the streak, and must not also refund a spent final acceptance.
             "final_accept_consumed": bool(state.get("final_accept_consumed")),
+            # Carried because this function rebuilds the dict from scratch and the
+            # ack's own last act is to call it. A satisfied demand records WHICH
+            # remedy the user chose; dropping it here would erase the decision at
+            # the exact moment it was made, which is the audit trail's only reader.
+            **(
+                {"gate_demand": state["gate_demand"]}
+                if isinstance(state.get("gate_demand"), dict)
+                else {}
+            ),
         },
         cwd,
     )
+
+
+def write_gate_demand(
+    *,
+    gate: str,
+    remedies: list[dict],
+    required_action: str,
+    cwd: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Record a blocking gate's enumerated remedy set as DATA. Never raises.
+
+    A gate that enumerates remedies in prose is trusting the session to relay
+    them faithfully to the user. MEASURED 2026-08-31, this cap printed three and
+    the relay dropped the first, invented a fourth, and added "ship as-is" — the
+    outcome the cap exists to prevent. Prose cannot be checked; a written set can.
+
+    ``remedies`` is a list of ``{"key": <slug>, "label": <human text>}``. The slug
+    is what an acknowledgment names (``# escalation-ack:redesign``) and what the
+    ask-time gate looks for among a question's options; the label is what a human
+    reads. Stored on the existing per-worktree round-counter file rather than in a
+    new store — the demand IS cap state, and its lifetime is the cap's.
+
+    Best-effort like every other write here: a gate must still block when its
+    bookkeeping fails, so callers validate against their own remedy constant and
+    treat missing state as "no relaxation", never as "no requirement".
+    """
+    state = _load_round(cwd)
+    state["gate_demand"] = {
+        "gate": gate,
+        "session_id": session_id or None,
+        "declared_at": time.time(),
+        "remedies": [
+            {"key": str(r.get("key", "")), "label": str(r.get("label", ""))}
+            for r in remedies
+            if isinstance(r, dict) and r.get("key")
+        ],
+        "required_action": required_action,
+        "satisfied_with": None,
+    }
+    state.setdefault("branch", get_current_branch(cwd=cwd))
+    _write_round(state, cwd)
+
+
+def read_gate_demand(
+    cwd: str | None = None, *, session_id: str | None = None
+) -> dict | None:
+    """The LIVE gate demand for this worktree's current branch, else None.
+
+    Live means: present, well-shaped, carrying at least one remedy, belonging to
+    the current branch, and not yet satisfied. A satisfied demand stays on disk as
+    the audit trail but stops gating — otherwise the ack that answers it would
+    leave every later question blocked behind a decision already made.
+
+    Branch scoping rather than an age cutoff, deliberately: the demand should live
+    exactly as long as the block that created it, and the block is branch-scoped
+    counter state. An invented staleness window would either expire a demand while
+    its cap is still firing, or wedge a worktree on a demand nothing can clear.
+
+    Never raises — ``_load_round`` already normalizes shape and value, and a
+    non-object ``gate_demand`` from a hand edit is rejected here.
+    """
+    state = _load_round(cwd)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+        return None
+    demand = state.get("gate_demand")
+    if not isinstance(demand, dict) or demand.get("satisfied_with") is not None:
+        return None
+    if session_id is not None and demand.get("session_id") not in (None, session_id):
+        # Someone else's obligation. An earlier revision scanned every round file
+        # on the box to work around the writer and reader keying on different
+        # directories; MEASURED, that let an unrelated worktree's session be
+        # refused a question about something else entirely. The demand carries
+        # the session that owes it instead.
+        return None
+    remedies = [
+        r for r in demand.get("remedies", []) if isinstance(r, dict) and r.get("key")
+    ]
+    if not remedies:
+        return None
+    return {**demand, "remedies": remedies}
+
+
+def satisfy_gate_demand(
+    choice: str, cwd: str | None = None, *, gate: str | None = None
+) -> None:
+    """Retire the live demand, recording WHICH remedy was chosen. Never raises.
+
+    ``gate`` names the gate the caller is answering. When given, a demand
+    belonging to a DIFFERENT gate is left alone: an escalation-cap ack must not
+    stamp its choice onto a leftover terminal demand, which would corrupt the
+    audit trail this function exists to preserve and silently retire a block
+    nobody answered.
+
+    Deliberately a rewrite rather than a delete, for the same reason
+    :func:`reset_review_round` is: the value of demanding a named choice is that
+    a later reader can see what was chosen, and a record its own acknowledgment
+    erases is not a record.
+    """
+    state = _load_round(cwd)
+    demand = state.get("gate_demand")
+    if not isinstance(demand, dict):
+        return
+    if gate is not None and demand.get("gate") != gate:
+        return
+    demand["satisfied_with"] = choice
+    demand["satisfied_at"] = time.time()
+    state["gate_demand"] = demand
+    _write_round(state, cwd)
 
 
 def get_current_branch(cwd: str | None = None) -> str:

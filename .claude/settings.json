@@ -351,6 +351,16 @@
                 ]
             },
             {
+                "matcher": "AskUserQuestion",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/ask_question_gate.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
                 "matcher": "ExitWorktree",
                 "hooks": [
                     {

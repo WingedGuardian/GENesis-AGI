@@ -841,3 +841,98 @@ class TestSigilRunRegression:
         # token into _KNOWN_SIGILS left all 146 tests in this file passing.
         unqueried = sorted(set(sp._KNOWN_SIGILS) - set(queried))
         assert not unqueried, f"declared in _KNOWN_SIGILS but no guard queries it: {unqueried}"
+
+
+# --- trailing_override_arg: an ack that NAMES what it acknowledges -----------
+#
+# A bare sigil attests to nothing in particular. Where a gate enumerates a set of
+# remedies and asks the session to relay them, the acknowledgment has to say WHICH
+# one was chosen, or a session that relayed a corrupted menu is indistinguishable
+# from one that relayed the real one.
+
+
+class TestTrailingOverrideArg:
+    """`# <sigil>:<arg>` — reading the argument bound to an ack sigil."""
+
+    def test_reads_the_argument_after_the_colon(self):
+        seg = 'git commit -m "x"  # escalation-ack:redesign'
+        assert sp.trailing_override_arg(seg, "escalation-ack") == "redesign"
+
+    def test_bare_sigil_has_no_argument(self):
+        seg = 'git commit -m "x"  # escalation-ack'
+        assert sp.trailing_override_arg(seg, "escalation-ack") is None
+
+    def test_absent_sigil_has_no_argument(self):
+        seg = 'git commit -m "x"  # review-override'
+        assert sp.trailing_override_arg(seg, "escalation-ack") is None
+
+    def test_argument_inside_a_quoted_message_does_not_count(self):
+        # The whole point of the shared walk: a '#' inside quotes is not a comment.
+        seg = 'git commit -m "see # escalation-ack:redesign in the docs"'
+        assert sp.trailing_override_arg(seg, "escalation-ack") is None
+        assert not sp.has_trailing_override(seg, sigil="escalation-ack")
+
+    def test_prose_ahead_of_the_sigil_ends_the_run(self):
+        seg = 'git commit -m "x"  # not an escalation-ack:redesign'
+        assert sp.trailing_override_arg(seg, "escalation-ack") is None
+        assert not sp.has_trailing_override(seg, sigil="escalation-ack")
+
+    def test_a_sigil_riding_alongside_another_still_yields_its_argument(self):
+        seg = 'git commit -m "x"  # audit-ack escalation-ack:shelve'
+        assert sp.trailing_override_arg(seg, "escalation-ack") == "shelve"
+        assert sp.has_trailing_override(seg, sigil="audit-ack")
+
+    def test_empty_argument_reads_as_no_argument(self):
+        seg = 'git commit -m "x"  # escalation-ack:'
+        assert sp.trailing_override_arg(seg, "escalation-ack") is None
+
+    def test_argument_is_not_confused_with_a_longer_sigil_name(self):
+        seg = 'git commit -m "x"  # escalation-ack-extra:redesign'
+        assert sp.trailing_override_arg(seg, "escalation-ack") is None
+
+    @pytest.mark.parametrize(
+        "seg",
+        [
+            'git commit -m "x"  # escalation-ack:redesign',
+            'git commit -m "x"  # escalation-ack:narrow trailing prose here',
+            "git commit -m 'x'  # audit-ack escalation-ack:shelve",
+        ],
+    )
+    def test_detection_agrees_with_has_trailing_override(self, seg):
+        """The two must never disagree about whether the sigil is present.
+
+        This is the property the shared walk exists to guarantee: an argument can
+        only be read from a sigil the boolean check also recognises. A copied walk
+        could satisfy these cases today and drift apart on the next edit; the
+        structural guarantee is tested separately below.
+        """
+        assert sp.has_trailing_override(seg, sigil="escalation-ack")
+        assert sp.trailing_override_arg(seg, "escalation-ack") is not None
+
+    def test_both_readers_share_one_walk(self):
+        """Structural lock: neither reader may carry its own quote-walking loop.
+
+        A previous draft of `trailing_override_arg` COPIED the loop out of
+        `_has_trailing_override` and claimed in its docstring that they were "the
+        same walk, so a sigil cannot be recognised by one and missed by the
+        other" — a guarantee a copy cannot make. Both must delegate to the shared
+        scanner, so the claim is true by construction rather than by inspection.
+        """
+        tree = ast.parse(inspect.getsource(sp))
+        scanner = "_leading_run_sigil_token"
+        for name in ("_has_trailing_override", "trailing_override_arg"):
+            fn = next(
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == name
+            )
+            called = {
+                n.func.id
+                for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            }
+            assert scanner in called, f"{name} does not delegate to {scanner}"
+            # No `while` loop of its own — that is what a copied walk looks like.
+            assert not [n for n in ast.walk(fn) if isinstance(n, ast.While)], (
+                f"{name} carries its own scanning loop instead of sharing one"
+            )
