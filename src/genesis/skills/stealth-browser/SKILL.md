@@ -159,6 +159,15 @@ This section documents the mechanism for debugging only. The VNC
 protocol injects real input events, bypassing detection of synthetic
 events (XTest, CDP, Playwright mouse).
 
+**Coordinate correctness is NOT this skill's subject, and the rules live in
+one place.** This path is the only one in the codebase that mixes coordinate
+spaces — DOM coordinates in CSS pixels against a window origin in physical
+screen pixels — and it got that wrong until 2026-09-06 by measuring
+`devicePixelRatio` and never applying it. Anti-detection and hitting the right
+pixel are orthogonal concerns; see **Coordinate Safety** in the
+`browser-automation` skill rather than re-deriving it here, so the two cannot
+drift apart.
+
 ### Why It Works
 
 x11vnc injects input through the VNC protocol, adding network-realistic
