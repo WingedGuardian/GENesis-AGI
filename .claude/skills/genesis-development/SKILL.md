@@ -216,6 +216,37 @@ string ends in `\n`). The acceptance replay is what exposed it. A matcher that
 finds nothing is indistinguishable from a matcher that looks at nothing —
 only replaying a known-positive tells them apart.
 
+**A null result is a LEAD, never a clearance — and it travels with its blind
+spot attached or it does not travel.** The paragraph above is about an
+instrument that looked at nothing. This is the harder case: the instrument
+worked, the reading was clean, and the reading was still wrong. Three null
+results from one session were wrong the same way, and every one was overturned
+by CONSTRUCTION rather than by more sampling:
+
+- *"An expansion in verb position always emits ≥2 words, so it self-corrupts any
+  command it appears in."* Generalised from a handful of samples of ONE of the
+  construct's spellings. Another spelling admits a degenerate case that emits
+  exactly one word — so argv survives intact, and the parse resolves a verb bash
+  never runs. Stated abstractly on purpose; see the note under the
+  resource-defect bullet in Test-First Discipline.
+- *"Zero over-block flips across 129,179 real commands."* The regression was
+  CONSTRUCTIBLE, and a later worker constructed it: a `BLOCK → ALLOW` flip on
+  an `rm -rf` of the production database's parent directory.
+- *"Zero regressions, verified three ways."* All three ways were the same axis —
+  see the resource-defect bullet under Test-First Discipline.
+
+A corpus measures what has been TYPED. It says nothing about what is TYPEABLE.
+For a SAFETY property the question is therefore never "did I observe a failure"
+but "can one be CONSTRUCTED", and only the second question has an answer that
+clears anything. **So when a null result is handed to anyone — a subagent, a
+peer session, a PR body, the user — state the DENOMINATOR and the METHOD'S BLIND
+SPOT in the same breath as the number, and say in words that it is not proof.**
+Then name the recipient's job: the person best placed to construct the
+counterexample is whoever is about to rely on the null result, and they will not
+go looking unless you tell them the search is still open. A null passed on bare
+is read as a clearance by everyone downstream, which is how one unproven
+sentence becomes the premise of three later decisions.
+
 ### Select, don't amputate — truncation is the absence of a decision
 
 **Scope first, because bounding is often correct.** What makes something an
@@ -778,6 +809,69 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   canonical parser, which fails on shapes nobody enumerated. Skip a cell only
   with an explicit reason recorded in the skip, since a silent skip and a hole
   look identical.
+
+  **Generate the cells from the GRAMMAR of what the rule flags, not from
+  history.** The axes above are the shape; this is where they come from. MEASURED
+  2026-09-09, after three corpus-based measurements had each missed a real
+  regression: enumerating {program} × {option form} × {construct} × {position} —
+  the axes the rule itself keys on — and running EVERY cell through real `bash`
+  via an argv-printing shim AND through the real guard subprocesses on BOTH trees
+  produced 746 cells and, more to the point, a control that MOVED: `main` 744
+  ALLOW / 2 BLOCK, PR head 339 / 407, after the fix 534 / 212. That surfaced 206
+  over-blocks which a 129,179-command corpus had shown none of. A second sweep
+  built 384 cells over the same four axes. Run the matrix against main as well as
+  against your branch, and compare it PER CELL, keyed by input — never by the
+  aggregate counts. Two cells can swap ALLOW and BLOCK while the totals sit
+  identical, and a resource-only fix legitimately preserves every verdict (the
+  next bullet is exactly that case), so a matching distribution proves nothing in
+  either direction. Establish liveness separately: use a deliberately mutated
+  control or another known outcome that the harness must distinguish. A correct
+  resource-only fix can preserve every production verdict, so it need not make
+  the two production trees differ.
+  **Instrument the probe before you trust 746 of anything.** These guards emit
+  ASK as JSON on stdout with EXIT CODE 0, so a probe reading only the return code
+  cannot tell ASK from ALLOW — and ASK is precisely the state a newly added flag
+  usually produces, so the sweep reports "no change" while the new flag fires on
+  every cell. Combine exit status with the JSON payload when status is zero:
+  BLOCK is the non-zero gate result, while ALLOW and ASK are distinguished by
+  the payload. Prove the harness can distinguish each outcome on known inputs
+  before believing any aggregate it prints.
+- **A correctness test cannot see a RESOURCE defect — and on a path the harness
+  can SIGKILL, that defect is a bypass.** Verifying a change three ways is ONE
+  verification when all three ask the same question. MEASURED 2026-09-09 on an
+  in-flight fix that added a new scan to the shell parser the hook stack shares:
+  it was checked at the parser level, at the guard level, and against the
+  specific exploit it existed for — three passes, all CORRECTNESS, all green —
+  while the scan itself was quadratic in the length of a SINGLE token, the
+  ordinary accidental-O(n²) shape of a nested scan with no early exit. On the
+  linear form it held flat at 0.004s (4ms) at every length; on the pathological one
+  it ran to SECONDS, then minutes, at input sizes a caller can simply type. A
+  PreToolUse hook that overruns its wall-clock is SIGKILLed, and a killed hook
+  fails OPEN — the guard code says as much in its own comments — so a scan that
+  can be made slow enough disarms the gate rather than tripping it, and because
+  the parser is shared it does not stop at the one guard being edited. A FOURTH
+  correctness check would have passed too.
+  So, for any code the harness can kill: ask the three questions the correctness
+  suite never asks — what is its complexity, what input maximises it, and what
+  does the system do when it does not finish. Where "does not finish" means
+  PERMIT, a super-linear scan over attacker-influenced input IS the defect,
+  however correct its output. Measure its worst-case runtime in a controlled
+  performance probe, and keep a deterministic regression test for the bounded
+  algorithm in CI; a wall-clock assertion in an install-agnostic test is not
+  reliable. Record the measured margin against the smallest timeout on its path.
+  (The Generalizability
+  Gate's "retention machinery does not belong on a hook path" is the same
+  mechanism met from the other end: work that scales with the input, on a path
+  whose deadline is a security boundary.)
+  **This bullet is deliberately imprecise, and that is the second rule in it: a
+  lesson about a vulnerability does not need the vulnerability's parameters.**
+  The shape teaches — super-linear on attacker-chosen input, measured at seconds
+  where the linear form completes in milliseconds, on a path that fails open. The exact
+  input sizes, the timeout tier they defeat, the count of guards behind the
+  shared parser and the quoted fail-open line teach nothing further; they only
+  compose into a working recipe, and one that keeps working for every install
+  still on the pre-fix code. Nor does "the fix has landed" license the specifics
+  — check whether it landed on `main`, not whether a PR for it exists.
 - **Anti-patterns (binding):** never assert on a mock's behavior when the real
   code path can run; never add test-only methods/branches to production
   classes; fakes implement the real contract (real method names, real return
@@ -1571,6 +1665,25 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   re-review comment naming head), but a trivial NON-hook delta may still merge on a stale
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
+
+  **And the verdict is a function of the TREE YOU RAN IT FROM.** `--check-pr` is
+  (remote PR state × LOCAL gate code) — it executes the `git_push_guard.py` sitting
+  in your working copy, not the one on `main`. Run from a worktree carrying an
+  unmerged change to the gate, it reports what WOULD be true once that change lands:
+  a correct verification OF THE FIX, and a false statement about the PR. MEASURED
+  2026-09-09: a session reported a peer's PR as one blocker from green on exactly
+  that confusion. So say which tree produced any verdict you pass on, and for a
+  claim about a PR's CURRENT state, run it from a tree at `origin/main`. To bound
+  a verdict you already took, compare the CHECKER ITSELF and its effective policy
+  inputs across the two trees, not main's history: `git diff origin/main --
+  scripts/hooks/git_push_guard.py` (add whichever modules the checker imports),
+  then identify any local configuration that can alter required reviews or CI.
+  Hash the relevant blobs when the effective policy is identical. Reaching for
+  `git log origin/main -- <checker>` instead is the trap — it inspects only what
+  landed on main, so it comes back EMPTY in the exact case that bites you, a
+  worktree carrying an unmerged change to the gate. Empty history is not identical
+  logic. The same reasoning applies to any local checker whose answer is about a
+  remote object.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
   A PR touching the enforcement-hook surface (the guard code itself) gets almost no
   stale-review leniency: the merge gate (1) never classifies a post-review delta that
@@ -2137,6 +2250,24 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   approval gate) is a STOP-and-discuss, never an auto-fix. Chasing a reviewer's
   green checkmark with a change you believe is wrong is a discipline failure.
   No performative agreement — state the verified fix, or the reasoned pushback.
+- **Refuting a finding is itself a CLAIM, and it meets the same evidence bar you
+  just held the finding to.** The bullet above is about pushing back when the
+  reviewer is wrong; this is the cost of pushing back when YOU are. MEASURED
+  2026-09-09: a reviewer session refuted a cross-model reviewer's severity
+  assessment with a structural argument — "an expansion in verb position always
+  corrupts argv, so the exploit cannot exist" — which covered a few sampled
+  instances of one spelling rather than
+  the construct's grammar; a builder session then refuted the refutation with a
+  working construction, and the original severity was right all along. The tell
+  was sitting in the refutation's own text: it said *"I have NOT proven no clean
+  construction exists"* and stated the conclusion in the next sentence.
+  **An acknowledged gap in a proof is the reason NOT to state the conclusion —
+  never a hedge that licenses stating it.** So: a structural refutation must cover
+  the CONSTRUCT'S GRAMMAR — every form the syntax admits — not a sample of its
+  instances. Where it cannot, the finding STANDS and gets fixed or escalated on
+  its own merits; "I could not construct one" is a null result and clears nothing
+  (see the acceptance-bar section). Downgrading a severity is a refutation too,
+  and costs exactly the same evidence as dismissing the finding outright.
 - **Waiving the review GATE is not waiving the FINDINGS.** When the user says
   "skip the review" for a trivial change, that waives the blocking *ceremony*
   (the gate and its `*-override` sigils — note `# review-override` is the one
@@ -2609,6 +2740,35 @@ closing-shaped work (answering, merging green PRs, the handoff row). What
 this rule removes is only the WATCHING — unprompted gate-polling and
 review-soliciting between a push and the next external event. When you do
 merge, the Pre-Merge Gate below governs unchanged.
+
+### Which one first — prefer a `fix`, because it is usually SMALLER (standing user rule, 2026-09-10)
+
+The section above says WHEN driving is justified. When several PRs qualify at
+once, the owner's stated preference is the tiebreak: **a fix restores existing
+functionality that is broken; new functionality can wait.** This is ONE axis in
+a larger calculus — a gated PR, a live hazard, a user's named request all still
+outrank it — not a hard ordering.
+
+MEASURED across the 65 open `fix`/`feat` PRs on this repo, 2026-09-10:
+
+| kind | n | mean added lines | ≥1000 lines | findings-blocked | mean findings score |
+|---|---|---|---|---|---|
+| `feat` | 30 | 2,024 | 67% | 77% | 3.00 |
+| `fix` | 35 | 804 | 29% | 66% | 2.77 |
+
+Chained to the round data: **86% of PRs over 1,000 lines reach 3+ Codex rounds,
+against 6% under 200.** So the mechanism is `feat` → bigger → more rounds → more
+of the maintainer's conscious decisions consumed, because past the escalation cap
+every additional round costs a fresh human sign-off.
+
+**The honest limit, which changes how to apply this.** The findings-score gap is
+modest (3.00 vs 2.77; 77% vs 66% blocked), so *"feats attract more findings per
+se"* is WEAKLY supported. *"Feats are bigger, and size drives rounds"* is
+STRONGLY supported. The rule is therefore the SIZE axis wearing a `feat:` prefix
+— which means **a small feat is not deprioritised, and a 2,000-line fix does not
+get a pass.** Read the diffstat, not the prefix; a rule keyed on the prefix
+rather than on the property would be wrong on exactly the cases where the
+tiebreak matters.
 
 ### Never RETIRE a PR you are not the one reviving (standing user rule, 2026-09-08)
 
