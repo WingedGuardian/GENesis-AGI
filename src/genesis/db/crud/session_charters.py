@@ -16,10 +16,57 @@ writers' uncommitted work).
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 
 import aiosqlite
+
+# What a truncated session id may contain before it is allowed to become a
+# SQLite `LIKE` pattern. CC session ids are UUIDs, so hex plus the hyphen is the
+# whole alphabet — and `%` and `_`, the two LIKE wildcards, are outside it by
+# construction rather than by an escape rule someone has to remember to apply.
+_SESSION_PREFIX_RE = re.compile(r"[0-9a-fA-F-]+")
+
+# The COMPLETE shape of a CC session id: a canonical UUID, 8-4-4-4-12 hex.
+#
+# Length was the old test at every write boundary (`len(sid) >= 32`), and length
+# is not a shape. A 36-character UUID with one non-hex typo, and a 32-character
+# fragment of something else, are both "long enough" — and both were accepted
+# and written as durable provenance, which the documented contract says should
+# have been NULL (Codex P2, PR #1622). Refusing an id that is not an id is a
+# validity judgement, not a size cap: the value is not truncated to fit, it is
+# declined, and the caller records the honest absence instead.
+#
+# MEASURED 2026-09-08 on a live install: 1,939 of 1,939 distinct ids across
+# session_charters (52), cc_sessions (1,883) and session_heartbeats (4) match
+# this pattern — so nothing real is refused by it.
+#
+# LOWERCASE ONLY, deliberately. An earlier draft accepted either case, on the
+# reasoning that the length check it replaces did — but that is the wrong test,
+# because nothing downstream is case-insensitive: `resolve_session_id` only
+# strips, `upsert_stub` stores the string verbatim, and SQLite `=` on TEXT is
+# case-sensitive. An uppercase id would therefore PASS the guard and create a
+# stub under a key the hook's lowercase id can never match — the exact orphan
+# the guard exists to prevent, admitted by the leniency meant to be safe.
+# Measured across all four id columns: 0 uppercase values, so refusing them
+# regresses nothing and closes a way in.
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def is_full_session_id(value: str) -> bool:
+    """True when `value` is a COMPLETE CC session id, not a prefix or a typo.
+
+    The single test every WRITE boundary should use before storing a session id
+    as durable provenance. `resolve_session_id` cannot make this call itself:
+    its contract is to return the input unchanged when it cannot resolve, so
+    "unresolved prefix" and "malformed full-length value" leave it looking
+    identical by design. Deciding which of those a caller will accept is the
+    caller's job — this is the shared predicate for making that decision the
+    same way twice.
+    """
+    return bool(_SESSION_ID_RE.fullmatch((value or "").strip()))
+
 
 VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "dropped"})
 # "ambient" means a DISPATCHED Claude Code session (see _default_added_by);
@@ -145,32 +192,62 @@ async def get(db: aiosqlite.Connection, session_id: str) -> dict | None:
 async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
     """Resolve a truncated session id to the full one by unique prefix match.
 
-    Full-length ids (>= 32 chars) pass through unchanged. Prefixes are
-    matched against session_charters first, then against
-    cc_sessions.cc_session_id — the latter covers sessions that have not
-    chartered yet (pre-first-compaction), so a stub is never created under a
-    truncated id that later diverges from the hook's full id (Codex P2,
-    PR #1053). Ambiguous or unmatched prefixes return the input unchanged;
-    WRITE callers must refuse to create rows for unresolved short ids.
+    Full-length ids (>= 32 chars) pass through unchanged. Ambiguous or unmatched
+    prefixes return the INPUT unchanged; WRITE callers must refuse to create rows
+    for an unresolved short id.
+
+    THREE STORES, ONE QUERY, AND THE UNION IS THE POINT (Codex P2 x3, PR #1622).
+    A session's full id can live in any of them, and which one depends only on
+    how far through its life it is:
+
+      session_charters   — chartered sessions (post-first-compaction)
+      cc_sessions        — dispatched/recorded sessions, chartered or not
+      session_heartbeats — written by the UserPromptSubmit hook BEFORE the model
+                           runs, so for a newly started foreground session it is
+                           the ONLY store holding the id at all
+
+    Asking them in SEQUENCE was wrong in both directions. It MISSED the third
+    store entirely, which is the one covering exactly the window where a session
+    creates provenance about itself — so the common case stored NULL. And it
+    ACCEPTED the first store's single hit as unique without looking further, so
+    a prefix matching one chartered session AND a different unchartered one
+    returned the charter's id and attributed the work to the wrong session,
+    permanently. "Unique" is a property of the union; it cannot be decided one
+    store at a time.
+
+    `UNION` (not `UNION ALL`) deduplicates, so a session present in two stores
+    is still one answer; `LIMIT 2` is all the ambiguity check needs.
+
+    THE PREFIX IS VALIDATED BEFORE IT BECOMES A PATTERN. It is interpolated into
+    a `LIKE`, where `%` and `_` are WILDCARDS — a malformed prefix could match a
+    single unrelated row and be written as durable provenance. Session ids are
+    UUIDs, so anything outside hex-and-hyphen is not a prefix of one and is
+    refused rather than escaped: refusing keeps a non-id out of the query
+    entirely, where escaping would still ask the question.
     """
     sid = (session_id or "").strip()
     if len(sid) >= 32 or not sid:
         return sid
+    if not _SESSION_PREFIX_RE.fullmatch(sid):
+        return sid
+    # Bound POSITIONALLY, once per branch, not as a repeated `?1`. sqlite3
+    # accepts a numbered placeholder with a sequence today but warns that it is
+    # a NAMED parameter supplied with qmark-style binding, and raises
+    # ProgrammingError from Python 3.14 — so the one-value spelling would have
+    # turned this resolver into a hard failure at an interpreter bump, silently
+    # until then. Same value, three slots.
+    pattern = sid + "%"
     cursor = await db.execute(
-        "SELECT session_id FROM session_charters WHERE session_id LIKE ? LIMIT 2",
-        (sid + "%",),
+        "SELECT session_id AS sid FROM session_charters WHERE session_id LIKE ?"
+        " UNION SELECT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ?"
+        " UNION SELECT cc_session_id FROM session_heartbeats"
+        " WHERE cc_session_id LIKE ?"
+        " LIMIT 2",
+        (pattern, pattern, pattern),
     )
     rows = await cursor.fetchall()
     if len(rows) == 1:
         return rows[0][0]
-    if not rows:
-        cursor = await db.execute(
-            "SELECT DISTINCT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ? LIMIT 2",
-            (sid + "%",),
-        )
-        rows = await cursor.fetchall()
-        if len(rows) == 1:
-            return rows[0][0]
     return sid
 
 

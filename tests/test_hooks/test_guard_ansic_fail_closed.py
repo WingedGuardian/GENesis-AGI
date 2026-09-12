@@ -351,6 +351,101 @@ class TestUntokenizable:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# ANSI-C DECODE — escape-free $'...' resolves to what bash runs, so a verb or
+# flag hidden in one is seen by the ordinary gate (not just the fail-closed net)
+# ══════════════════════════════════════════════════════════════════════════
+class TestAnsiCDecode:
+    """shlex leaves the ``$`` on ``$'push'`` (token ``$push``), one char off from
+    what bash runs. ``_decode_escape_free_ansi_c`` rewrites the escape-free span
+    so the resolved subcommand/flag matches bash. Each assertion here fails if
+    the decode is reverted (verify-RED confirmed against the pre-fix module)."""
+
+    def test_ansic_verb_resolves_to_the_real_subcommand(self):
+        # $'push' hid the verb: git_subcommand read $push and no gate saw a push.
+        segs = sp.analyze(f"{GIT} $'{PUSH}' origin main {FORCE}")
+        assert any(s.exe == "git" and sp.git_subcommand(s.argv) == PUSH for s in segs)
+
+    def test_ansic_gh_pr_token_resolves(self):
+        segs = sp.analyze("gh $'pr' merge 5 " + ADMIN)
+        assert any(s.exe == "gh" and sp.gh_pr_subcommand(s.argv) == "merge" for s in segs)
+
+    def test_ansic_gh_merge_subcommand_resolves(self):
+        segs = sp.analyze("gh pr $'merge' 5 " + ADMIN)
+        assert any(s.exe == "gh" and sp.gh_pr_subcommand(s.argv) == "merge" for s in segs)
+
+    def test_ansic_flag_on_visible_verb_resolves(self):
+        # verb visible, --no-verify hidden as --$'no-verify': the flag must show.
+        segs = sp.analyze(f"{GIT} {COMMIT} --$'no-''verify' -m x")
+        assert any(s.exe == "git" and sp.commit_skips_hooks(s.argv) for s in segs)
+
+    def test_escape_bearing_span_is_NOT_decoded(self):
+        # hex-encoded verb: a partial escape decoder is a blind spot, so the
+        # decode leaves it — this is the documented residual (follow-up), and the
+        # test PINS that we did not silently half-decode it into a false gate.
+        segs = sp.analyze(r"git $'\x70\x75\x73\x68' origin main")
+        assert not any(s.exe == "git" and sp.git_subcommand(s.argv) == PUSH for s in segs)
+
+    def test_ansic_inside_double_quotes_is_not_decoded(self):
+        # bash does not treat $'...' as ANSI-C inside "..." — decoding there
+        # would corrupt an ordinary argument. The verb stays echo, no push.
+        segs = sp.analyze(f'echo "$\'{PUSH}\'"')
+        assert all(sp.git_subcommand(s.argv) != PUSH for s in segs)
+
+    def test_unterminated_ansic_span_is_not_decoded(self):
+        """An unterminated ``$'...`` is INVALID bash — there is no verb bash
+        runs, so the decode must not manufacture one. Recording the remainder
+        as a span turned ``--$'no-verify`` into a real ``--no-verify`` token,
+        which hands a hard policy verdict to a command that never executes;
+        the command must stay untokenizable and route to the ask/blind-spot
+        net instead. RED without the ``j >= n`` guard in ``_ansi_c_spans``."""
+        # the flag form, with the closing apostrophe absent.
+        cmd = f"{GIT} {COMMIT} --$'{NV[2:]}"
+        assert sp._ansi_c_spans(cmd) == []
+        assert sp._decode_escape_free_ansi_c(cmd) == cmd
+        # the flag must NOT resolve — the command is unparseable, not permitted
+        assert not any(sp.commit_skips_hooks(seg.argv) for seg in sp.analyze(cmd))
+        assert sp.untokenizable(cmd) is True
+
+    def test_unterminated_ansic_verb_is_not_decoded(self):
+        """Same for a verb: ``git $'push`` is invalid bash, so no push segment
+        may be synthesised out of it."""
+        cmd = f"{GIT} $'{PUSH}"
+        assert sp._ansi_c_spans(cmd) == []
+        assert not any(sp.git_subcommand(seg.argv) == PUSH for seg in sp.analyze(cmd))
+        assert sp.untokenizable(cmd) is True
+
+    def test_terminated_span_before_an_unterminated_one_still_scans(self):
+        """The ``break`` on an unterminated opener must not discard spans found
+        BEFORE it — a regression guard on the scan's early exit."""
+        cmd = f"{GIT} $'{PUSH}' && {GIT} {COMMIT} --$'{NV[2:]}"
+        spans = sp._ansi_c_spans(cmd)
+        assert len(spans) == 1 and spans[0][2] == PUSH
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# git_push_guard — decoded ANSI-C reaches the ORDINARY gate verdict (BLOCK),
+# and the escaped/heredoc cases still route to the fail-closed net
+# ══════════════════════════════════════════════════════════════════════════
+class TestAnsiCDecodeGuard:
+    def test_ansic_verb_force_push_blocks(self, tmp_path):
+        # git $'push' --force → decodes to a force push → the plain-form verdict.
+        r = _run(_PUSH_GUARD, f"{GIT} $'{PUSH}' origin main {FORCE}", cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_ansic_gh_merge_verb_blocks(self, tmp_path):
+        r = _run(_PUSH_GUARD, f"gh $'pr' merge 5 {ADMIN}", cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_ansic_flag_no_verify_blocks(self, tmp_path):
+        r = _run(_PUSH_GUARD, f"{GIT} {COMMIT} --$'no-''verify' -m x", cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_benign_ansic_echo_not_blocked(self, tmp_path):
+        r = _run(_PUSH_GUARD, "echo $'hello world'", cwd=str(tmp_path))
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # git_push_guard — the net flips the unparseable cases to BLOCK (verify-RED)
 # ══════════════════════════════════════════════════════════════════════════
 class TestPushGuardNet:
@@ -645,22 +740,10 @@ class TestCommitGuardNet:
 
 
 class TestCommitGuardProbeFailure:
-    """The net's own `except` branch — the probe itself blowing up.
+    """A failed checked parse is loud and fail-closed via run_guard.
 
-    `untokenizable()` is wrapped in a try/except so a defect in the probe cannot
-    crash the gate into a silent allow. That branch used to ASK ("Approve only
-    if you are sure"), and the 2026-09-08 ruling moved it to a DENY along with
-    the rest of the net: it is reached precisely when the guard knows nothing
-    about the command, which is the worst possible moment to prompt someone.
-
-    Nothing covered this branch before — it was reachable only by breaking the
-    probe, which no test did — so it is added here rather than adapted.
-
-    The message must be distinguishable from `run_guard`'s generic fail-closed
-    text, or this test would pass against a guard with no except branch at all:
-    an escaping exception also exits 2, via the wrapper. So the assertion pins
-    the branch's OWN wording (the parseable-rewrite instruction), not just the
-    exit code.
+    Main replaced the separate parseability probe with analyze_checked. Inject
+    the real choke point, keeping every other parser operation genuine.
     """
 
     def _guard_tree_with_raising_probe(self, tmp_path: Path, command: str):
@@ -668,7 +751,7 @@ class TestCommitGuardProbeFailure:
 
         The gate does `sys.path.insert(0, dirname(__file__)/"hooks")` before
         importing, which beats PYTHONPATH — so the shim has to be a sibling of
-        the copied module. Every name except `untokenizable` delegates to the
+        the copied module. Every name except `analyze_checked` delegates to the
         genuine parser, so exactly one variable changes.
         """
         scripts = tmp_path / "scripts"
@@ -689,11 +772,8 @@ class TestCommitGuardProbeFailure:
             "sys.modules['_real_sp'] = _real\n"
             "_s.loader.exec_module(_real)\n"
             "def __getattr__(name):\n    return getattr(_real, name)\n"
-            # The raise text deliberately avoids the words the assertions match
-            # on. `run_guard` echoes the exception message, so an exception
-            # saying "probe" would let a MISSING except branch satisfy a test
-            # that only looks for "probe" in stderr.
-            "def untokenizable(*a, **k):\n"
+            # Pin the actual exception in run_guard's fail-closed diagnostic.
+            "def analyze_checked(*a, **k):\n"
             "    raise RuntimeError('induced failure')\n"
         )
         return subprocess.run(
@@ -724,14 +804,10 @@ class TestCommitGuardProbeFailure:
             f"allow.\n{r.stdout}{r.stderr}"
         )
 
-    def test_probe_failure_names_the_rewrite(self, tmp_path):
+    def test_parser_failure_reports_the_actual_error(self, tmp_path):
         r = self._guard_tree_with_raising_probe(tmp_path, self._MENTION)
-        guidance = r.stderr.lower()
-        assert "probe" in guidance and "directly-parseable" in guidance, (
-            "the refusal must come from the gate's OWN except branch and tell "
-            "the session to rewrite the command parseably — a bare run_guard "
-            f"fail-closed would satisfy the exit code alone.\n{r.stderr}"
-        )
+        assert "GUARD ERROR" in r.stderr and "RuntimeError: induced failure" in r.stderr
+        assert "ANSI-C" not in r.stderr
 
     def test_probe_failure_control_allows_when_the_probe_works(self, tmp_path):
         """CONTROL — without it the two tests above pass against a broken tree.
@@ -745,31 +821,14 @@ class TestCommitGuardProbeFailure:
 
 
 class TestPushGuardProbeFailure:
-    """The push guard's own `except` branch — the sibling of the class above.
+    """Single-parser failure and deferred-denial exception coverage.
 
-    The push guard wraps `untokenizable()` for the same reason the commit gate
-    does, and nothing covered its branch either. Two properties are pinned:
-
-    1. A crashed probe still REFUSES a command whose text names a gated op.
-    2. It does NOT refuse a command that names nothing gated.
-
-    (2) is the half that is easy to get wrong, and the first cut of this branch
-    did: it set `untok = True` AND short-circuited the gated-mention conjunct,
-    so one probe defect would have denied every command in the session, `ls -la`
-    included. That is a self-inflicted outage rather than fail-closed — the
-    commit gate's equivalent branch sits behind `_COMMIT_PATTERN`, so a crash
-    there can only ever deny a command already naming a commit. The probe now
-    stands in for UNTOKENIZABLE only, and the mention conjunct still applies,
-    which concedes no coverage: the normal path is bounded by that same mention.
-
-    The two cells are each other's control. The deny cell proves the shim is
-    actually live (a tree that failed to import would allow both), and the allow
-    cell proves the scoping is real (a guard that denied on any probe crash
-    would refuse both).
+    A primary parse failure is fail-closed even for unrelated commands, matching
+    main's run_guard contract; there is no independently recoverable probe now.
     """
 
     # Default override: the probe itself blows up.
-    _RAISING_PROBE = "def untokenizable(*a, **k):\n    raise RuntimeError('induced failure')\n"
+    _RAISING_PROBE = "def analyze_checked(*a, **k):\n    raise RuntimeError('induced failure')\n"
     # Probe stays REAL (so the net ARMS normally); a helper called AFTER the net
     # and BEFORE the deferred deny raises one of the two exceptions the tail's
     # fail-open catches. `commit_skips_hooks` is exactly such a call site — the
@@ -809,7 +868,7 @@ class TestPushGuardProbeFailure:
             "sys.modules['_real_sp'] = _real\n"
             "_s.loader.exec_module(_real)\n"
             # Module __getattr__ ALONE is sufficient, including for the guard's
-            # `from shell_parse import (analyze, ...)` — PEP 562 consults it for
+            # `from shell_parse import (analyze_checked, ...)` — PEP 562 consults it for
             # `from X import Y` too. An earlier revision here also re-exported
             # four names explicitly with a comment claiming __getattr__ did not
             # cover them; that was false, and the list was missing two of the
@@ -818,8 +877,7 @@ class TestPushGuardProbeFailure:
             # __getattr__ that was doing all the work. The commit-gate twin
             # above has always relied on __getattr__ alone and passes.
             "def __getattr__(name):\n    return getattr(_real, name)\n"
-            # Raise text avoids every word the assertions match on, so a MISSING
-            # except branch (whose message run_guard echoes) cannot pass.
+            # Override only the checked parser or the named late helper.
             + (override or self._RAISING_PROBE)
         )
         return subprocess.run(
@@ -841,7 +899,7 @@ class TestPushGuardProbeFailure:
     # Mentions a gated op but resolves to no gated segment — the exact path on
     # which the probe is consulted.
     _MENTION = 'echo "please ' + PUSH + ' later"'
-    # Names nothing gated. Must survive a broken probe.
+    # Names nothing gated; a primary parser crash still fails closed.
     _UNRELATED = "ls -la"
     # Genuinely UN-tokenizable (ANSI-C escaped quote) AND names a gated op, so
     # the net arms on its own terms with the REAL probe in place. `_MENTION`
@@ -856,29 +914,14 @@ class TestPushGuardProbeFailure:
             f"op, not prompt and not allow.\n{r.stdout}{r.stderr}"
         )
 
-    def test_probe_failure_names_the_probe_and_the_rewrite(self, tmp_path):
+    def test_parser_failure_reports_the_actual_error(self, tmp_path):
         r = self._guard_tree_with_raising_probe(tmp_path, self._MENTION)
-        guidance = r.stderr.lower()
-        assert "probe" in guidance and "directly-parseable" in guidance, (
-            "the refusal must come from the guard's OWN except branch and say "
-            "the probe failed — a bare run_guard fail-closed also exits 2, and "
-            f"the net's generic quoting text would be a false diagnosis.\n{r.stderr}"
-        )
-        assert "ANSI-C" not in r.stderr, (
-            "the probe-failure message must NOT claim the command has ANSI-C "
-            "quoting — nothing established that; the probe crashed before it "
-            f"could look.\n{r.stderr}"
-        )
+        assert "GUARD ERROR" in r.stderr and "RuntimeError: induced failure" in r.stderr
+        assert "ANSI-C" not in r.stderr
 
-    def test_probe_failure_does_not_deny_an_unrelated_command(self, tmp_path):
-        """The scoping cell. Paired with the deny cell above, which proves the
-        shim is live — otherwise this would pass against an inert tree."""
+    def test_primary_parser_failure_denies_an_unrelated_command(self, tmp_path):
         r = self._guard_tree_with_raising_probe(tmp_path, self._UNRELATED)
-        assert _decision(r) != "block", (
-            "a probe defect must not deny every command in the session. The "
-            "gated-mention conjunct still applies when the probe crashes.\n"
-            f"{r.stdout}{r.stderr}"
-        )
+        assert _decision(r) == "block", r.stdout + r.stderr
 
     def test_probe_failure_control_allows_when_the_probe_works(self, tmp_path):
         """CONTROL — without it the deny cells pass against a broken tree.
@@ -889,25 +932,13 @@ class TestPushGuardProbeFailure:
         r = _run(_PUSH_GUARD, self._MENTION, cwd=str(tmp_path))
         assert _decision(r) == "allow", r.stdout + r.stderr
 
-    def test_probe_failure_is_never_silent(self, tmp_path):
-        """A crashed probe must still SAY so on the path where it allows.
-
-        Catching the exception here replaces `run_guard`'s own loud
-        "GUARD ERROR (…): failing CLOSED — <type>: <msg>" line. Without a
-        replacement, a probe defect is completely invisible for every command
-        that does not name a gated op: correct verdict, zero signal, and the
-        deny message's own advice ("if this persists … flag it") is unreachable
-        by exactly the commands that would reveal it. "Never hide broken things"
-        applies to the guard's own machinery, not only to the code it guards.
-        """
+    def test_primary_parser_failure_is_never_silent(self, tmp_path):
         r = self._guard_tree_with_raising_probe(tmp_path, self._UNRELATED)
-        assert _decision(r) != "block", r.stdout + r.stderr
-        assert "probe raised" in r.stderr and "RuntimeError" in r.stderr, (
-            "an allowed command whose probe CRASHED must still report the "
-            f"crash, with the exception type.\n{r.stderr!r}"
-        )
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert "GUARD ERROR" in r.stderr and "RuntimeError: induced failure" in r.stderr
 
-    def test_armed_net_survives_the_tail_payload_fail_open(self, tmp_path):
+    @pytest.mark.parametrize("exception", ["KeyError", "JSONDecodeError"])
+    def test_armed_net_survives_the_tail_payload_fail_open(self, tmp_path, exception):
         """The window that DEFERRING the net's verdict opened.
 
         The net decides its deny early and hands it to the tail. Between those
@@ -920,8 +951,14 @@ class TestPushGuardProbeFailure:
         The probe stays real (so the net arms on its own terms) and a helper
         called after it raises KeyError.
         """
+        override = self._KEYERROR_AFTER_NET
+        if exception == "JSONDecodeError":
+            override = (
+                "import json\ndef commit_skips_hooks(*a, **k):\n"
+                "    raise json.JSONDecodeError('induced failure', '', 0)\n"
+            )
         r = self._guard_tree_with_raising_probe(
-            tmp_path, self._UNTOK_MENTION, override=self._KEYERROR_AFTER_NET
+            tmp_path, self._UNTOK_MENTION, override=override
         )
         assert _decision(r) == "block", (
             "an ARMED blind-spot deny was swallowed by the tail's payload "

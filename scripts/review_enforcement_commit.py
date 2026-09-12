@@ -25,12 +25,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
 from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
-    analyze,
+    analyze_checked,
     commit_skips_hooks,
     git_subcommand,
     has_trailing_override,
     split_segments,
-    untokenizable,
 )
 
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
@@ -647,73 +646,29 @@ def main() -> None:
     # Parse the command into the segments it actually executes (through
     # wrappers, bash -c, command substitutions). Reused for Rule 0, the
     # add-chain detection, and the override binding.
-    segs = analyze(command)
+    #
+    # `blind` is the same parse telling us whether it could read ALL of the command
+    # — an empty result means "found no commit" only when it is not also "stopped
+    # looking". One call answers both, so the two can never disagree.
+    segs, blind = analyze_checked(command)
 
     # The cheap _COMMIT_PATTERN early-out can match "git commit" mentioned in a
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
-        # ── Blind-spot net: unverifiable → DENY ─────────────────────────────
-        # "No commit segment" is a trustworthy verdict only when the command was
-        # PARSEABLE. The parser can mis-segment a command and DROP the real
-        # commit segment, so this very early-out is what lets a commit-to-main
-        # / --no-verify / unreviewed commit through. Reproduced against a
-        # shimmed binary, so the proof was execution rather than a parse
-        # reading. When the word "commit" appears (guaranteed past the
-        # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
-        # empty parse is not evidence of absence.
-        #
-        # The outcome is a REFUSAL with the way out spelled in the message —
-        # for every session type. User ruling 2026-09-08: hooks are for the
-        # agent; no gate prompts the user except the deliberate push/PR-create
-        # egress ask. The earlier interactive-ask design priced a false
-        # positive in USER clicks; the deny prices it in an AGENT rewrite the
-        # message names (Write tool for prose; `git commit -F <file>` for real
-        # commits). Keep the predicate broad — narrowing conjuncts starve the
-        # trigger (measured) — and never downgrade this to an advisory: that
-        # would fail-open on exactly the parse failure the net exists for.
-        #
-        # The probe reads the command RAW — the normalizer that used to
-        # pre-process it is deleted, so an ordinary contraction inside quoted
-        # multi-line input DOES reach this branch. It still does not prompt, but
-        # for a different reason than this comment used to give: analyze()
-        # resolves the segment, and the net only fires where it found none.
-        try:
-            if untokenizable(command):
-                # One deny for every session type — interactive and dispatched
-                # alike (the old split asked the human when present; retired by
-                # the 2026-09-08 ruling above). The way OUT is in the message:
-                # a refusal the session cannot act on is a wall; with the
-                # rewrite named it is a cost.
-                _deny(
-                    "BLOCKED: this command cannot be parsed safely (e.g. "
-                    "ANSI-C $'...' quoting) and mentions a commit, so review "
-                    "enforcement cannot verify what it would actually run.\n"
-                    "To proceed: if you are WRITING TEXT (a commit message, "
-                    "a plan, review notes) whose content merely mentions a "
-                    "commit, use the Write tool instead of a here-doc — an "
-                    "apostrophe in ordinary prose is what makes this "
-                    "unparseable, and re-quoting the here-doc cannot fix "
-                    "that. If you are RUNNING a git command, rewrite it in "
-                    "a directly-parseable form (plain quotes, or "
-                    "`git commit -F <file>`)."
-                )
-        except Exception as exc:  # noqa: BLE001 — never crash into a silent allow
-            # (_deny's SystemExit is a BaseException — it passes through this.)
-            # Name the exception: catching here replaces run_guard's own
-            # "GUARD ERROR (…) — <type>: <msg>" line, so without this the
-            # operator is told the probe failed but never what failed. Less
-            # severe than the push guard's twin (this branch sits behind
-            # _COMMIT_PATTERN and always denies, so something is always
-            # printed), but a probe bug still reads as a mysterious recurring
-            # block unless the type and message travel with it.
+        # A missing segment is not proof of absence when the same checked
+        # parse reports blindness. Refuse in every session type: user ruling
+        # 2026-09-08 prices a false positive in an agent rewrite, not a human
+        # approval. Keep main's bounds refusal and its cause-specific remedy.
+        if blind is not None:
             _deny(
-                "BLOCKED: the commit-guard parseability probe failed "
-                f"({type(exc).__name__}: {exc}), so this command could not be "
-                "verified. Rewrite the command in a directly-parseable form "
-                "(plain quotes, or `git commit -F <file>`); if this persists "
-                "on ordinary commands, the probe itself is broken — flag it "
-                "instead of retrying."
+                f"BLOCKED: this command {blind.cause} and mentions a commit, so "
+                "review enforcement cannot verify what it would actually run.\n"
+                f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                "message, a plan, review notes) whose content merely mentions "
+                "a commit, use the Write tool instead of a here-doc. If you are "
+                "RUNNING a git command, rewrite it in a directly-parseable "
+                "form (plain quotes, or `git commit -F <file>`)."
             )
         sys.exit(0)
 

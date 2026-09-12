@@ -43,6 +43,20 @@ from typing import Any
 #: The measured harness threshold. Output STRICTLY ABOVE this is persisted.
 HOOK_STDOUT_CAP = 10_000
 
+#: The events whose BARE STDOUT the model reads, per the module docstring above.
+#: Lives here, next to the cap, because this module is the single home of the
+#: contract and the gate that enforces it must DERIVE the set rather than restate
+#: it -- an allowlist whose whole guarantee is "a newly wired model-facing hook
+#: fails by construction" cannot be built on a hand-maintained copy of the list.
+#:
+#: ``PostModelSwitch`` is deliberately ABSENT. The published hooks reference names
+#: it alongside these three; the bundle read that produced this list does not, and
+#: nothing in .claude/settings.json is wired to it. It is excluded on the weaker
+#: evidence rather than included on the stronger, because a wrong entry here makes
+#: the gate demand exemptions for hooks that cannot reach the model. If a hook is
+#: ever wired to it, add it here and the gate picks it up with no other change.
+BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit", "UserPromptExpansion")
+
 #: What a section divider costs: the emitters write "\n\n---\n\n" (7) and
 #: ``print`` adds its newline. Under-counting here makes ``fits()`` slightly
 #: optimistic, which the chokepoint then has to correct with a cut.
