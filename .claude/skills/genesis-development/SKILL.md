@@ -824,16 +824,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   aggregate counts. Two cells can swap ALLOW and BLOCK while the totals sit
   identical, and a resource-only fix legitimately preserves every verdict (the
   next bullet is exactly that case), so a matching distribution proves nothing in
-  either direction. What establishes a live harness is a known differentiating
-  control: an input whose verdict you can predict and which the two trees are
-  known to answer differently.
+  either direction. Establish liveness separately: use a deliberately mutated
+  control or another known outcome that the harness must distinguish. A correct
+  resource-only fix can preserve every production verdict, so it need not make
+  the two production trees differ.
   **Instrument the probe before you trust 746 of anything.** These guards emit
   ASK as JSON on stdout with EXIT CODE 0, so a probe reading only the return code
   cannot tell ASK from ALLOW — and ASK is precisely the state a newly added flag
   usually produces, so the sweep reports "no change" while the new flag fires on
-  every cell. Read the verdict out of the payload, and prove the harness can
-  DISTINGUISH all three outcomes on known inputs before believing any aggregate
-  it prints.
+  every cell. Combine exit status with the JSON payload when status is zero:
+  BLOCK is the non-zero gate result, while ALLOW and ASK are distinguished by
+  the payload. Prove the harness can distinguish each outcome on known inputs
+  before believing any aggregate it prints.
 - **A correctness test cannot see a RESOURCE defect — and on a path the harness
   can SIGKILL, that defect is a bypass.** Verifying a change three ways is ONE
   verification when all three ask the same question. MEASURED 2026-09-09 on an
@@ -853,16 +855,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   suite never asks — what is its complexity, what input maximises it, and what
   does the system do when it does not finish. Where "does not finish" means
   PERMIT, a super-linear scan over attacker-influenced input IS the defect,
-  however correct its output. Pin it with a TIMING test — a worst-case input
-  asserted to complete well inside the SMALLEST timeout on its path — because no
-  correctness test in the suite can go red on this class. (The Generalizability
+  however correct its output. Measure its worst-case runtime in a controlled
+  performance probe, and keep a deterministic regression test for the bounded
+  algorithm in CI; a wall-clock assertion in an install-agnostic test is not
+  reliable. Record the measured margin against the smallest timeout on its path.
+  (The Generalizability
   Gate's "retention machinery does not belong on a hook path" is the same
   mechanism met from the other end: work that scales with the input, on a path
   whose deadline is a security boundary.)
   **This bullet is deliberately imprecise, and that is the second rule in it: a
   lesson about a vulnerability does not need the vulnerability's parameters.**
   The shape teaches — super-linear on attacker-chosen input, measured at seconds
-  where the linear form is sub-millisecond, on a path that fails open. The exact
+  where the linear form completes in milliseconds, on a path that fails open. The exact
   input sizes, the timeout tier they defeat, the count of guards behind the
   shared parser and the quoted fail-open line teach nothing further; they only
   compose into a working recipe, and one that keeps working for every install
@@ -1670,9 +1674,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   2026-09-09: a session reported a peer's PR as one blocker from green on exactly
   that confusion. So say which tree produced any verdict you pass on, and for a
   claim about a PR's CURRENT state, run it from a tree at `origin/main`. To bound
-  a verdict you already took, compare the CHECKER ITSELF across the two trees, not
-  main's history: `git diff origin/main -- scripts/hooks/git_push_guard.py` (add
-  whichever modules the checker imports), or hash the blobs. Reaching for
+  a verdict you already took, compare the CHECKER ITSELF and its effective policy
+  inputs across the two trees, not main's history: `git diff origin/main --
+  scripts/hooks/git_push_guard.py` (add whichever modules the checker imports),
+  then identify any local configuration that can alter required reviews or CI.
+  Hash the relevant blobs when the effective policy is identical. Reaching for
   `git log origin/main -- <checker>` instead is the trap — it inspects only what
   landed on main, so it comes back EMPTY in the exact case that bites you, a
   worktree carrying an unmerged change to the gate. Empty history is not identical
