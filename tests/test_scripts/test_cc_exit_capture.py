@@ -458,5 +458,3 @@ def test_scrub_filter_decodes_bytes_leniently():
     out = r.stdout.decode()
     assert "KEEPME" in out, "surrounding diagnostic text was lost"
     assert secret not in out, "credential survived the lenient decode path"
-
-
