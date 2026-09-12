@@ -79,10 +79,10 @@ _COLLECTION_MAP = {
 class SupersedeUnresolved(Exception):
     """``supersedes`` named no memory, or named several.
 
-    Raised BEFORE ``_mark_superseded`` writes anything, and — on the ``store()``
-    path — AFTER the new memory is durably stored, so it describes a partial
-    outcome rather than a failed write: the content is safe, the deprecation did
-    not happen.
+    Raised BEFORE ``_mark_superseded`` writes anything. When propagated to
+    the caller by ``store()``, it reports a target-resolution preflight failure,
+    before generating the new memory ID or writing the new memory. Neither
+    the new content nor a deprecation has been stored by that call.
 
     Never guess an ambiguous handle: two memories sharing a prefix are two
     different corrections, and deprecating the wrong one is unrecoverable
