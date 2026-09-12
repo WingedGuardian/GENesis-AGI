@@ -124,6 +124,43 @@ class TestConfigLoading:
         # Custom timeout loaded
         assert c.get_timeout("outreach") == 7200
 
+    def test_an_unusable_timeout_falls_back_rather_than_misbehaving(self, tmp_path) -> None:
+        """FOUR guards, matching `_coerce_pid` and `_positive_int`.
+
+        This site had only OverflowError while a diff claimed the coercion class
+        was enumerated — and it is the WIDEST of the three: the classifier is
+        shared with the email gate and is the default timeout source for EVERY
+        approval type.
+
+        The one that matters: `autonomous_cli_fallback: true` is a plausible
+        config accident (bool is an int subclass), and `int(True)` is 1 — a
+        ONE-SECOND window on the owner's autonomous-CLI approval, expired by the
+        60s poller before any channel renders it. A rejected value falls back to
+        the default of None, i.e. wait indefinitely, which is the safe
+        direction for an approval."""
+        for label, literal in [
+            ("bool", "true"),            # int(True) == 1
+            ("negative", "-5"),          # a deadline already in the past
+            ("zero", "0"),
+            ("fractional", "30.9"),      # int() TRUNCATES rather than refusing
+            ("infinity", ".inf"),        # valid YAML; int() raises OverflowError
+        ]:
+            cfg = tmp_path / f"autonomy_{label}.yaml"
+            cfg.write_text(f"approval_timeouts:\n  autonomous_cli_fallback: {literal}\n")
+            c = ActionClassifier(config_path=cfg, rules_path=tmp_path / "no_rules.yaml")
+            assert c.get_timeout("autonomous_cli_fallback") is None, label
+
+        # CONTROLS — usable values must still load, or the guards are a denial
+        # of service rather than a guard.
+        for label, literal, expected in [
+            ("int", "1800", 1800),
+            ("integral float", "60.0", 60),
+        ]:
+            cfg = tmp_path / f"autonomy_ok_{label.replace(' ', '_')}.yaml"
+            cfg.write_text(f"approval_timeouts:\n  autonomous_cli_fallback: {literal}\n")
+            c = ActionClassifier(config_path=cfg, rules_path=tmp_path / "no_rules.yaml")
+            assert c.get_timeout("autonomous_cli_fallback") == expected, label
+
     def test_missing_config_uses_defaults(self, tmp_path) -> None:
         missing = tmp_path / "does_not_exist.yaml"
         c = ActionClassifier(config_path=missing, rules_path=tmp_path / "no_rules.yaml")
