@@ -428,6 +428,34 @@ def test_a_truncated_scan_does_not_claim_an_exact_session_count(tmp_path, monkey
     assert "-filing cap" in remedy, remedy
 
 
+def test_unreadable_filing_does_not_claim_an_exact_restart_inventory(tmp_path):
+    """A failed fresh-filing read can hide another affected session."""
+    _file(
+        tmp_path,
+        session="ctx-session",
+        body=b"[genesis-ctx:charter] payload\n" + b"x" * 200,
+    )
+    h = _collect(tmp_path)
+    h.errors.append("could not read another fresh filing")
+
+    remedy = next(f for f in ci.derive_findings(h) if "RESTART the affected sessions" in f)
+    assert "at least 1" in remedy
+    assert "could not be read" in remedy
+
+
+def test_restart_remedy_precedes_filing_inventory_for_critical_preview(tmp_path):
+    """The 200-character critical preview must retain the restart instruction."""
+    _file(
+        tmp_path,
+        session="ctx-session",
+        body=b"[genesis-ctx:charter] payload\n" + b"x" * 200,
+    )
+    findings = ci.derive_findings(_collect(tmp_path))
+    remedy_index = next(i for i, finding in enumerate(findings) if "RESTART the affected" in finding)
+    filed_index = next(i for i, finding in enumerate(findings) if "the harness FILED" in finding)
+    assert remedy_index < filed_index
+
+
 def test_filing_session_ids_are_escaped(tmp_path):
     """A session directory name is CC-authored filesystem metadata — POSIX
     permits a newline in it — and it now reaches a first_party observation, so

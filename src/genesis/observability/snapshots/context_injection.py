@@ -1024,7 +1024,7 @@ def derive_findings(health: InjectionHealth, *, max_listed: int = 5) -> list[str
         by_producer[d["producer"]] = by_producer.get(d["producer"], 0) + 1
     listed = ", ".join(_render_filing(d) for d in health.fresh_filings[:max_listed])
     more = f" …and {total - max_listed} more" if total > max_listed else ""
-    findings.append(
+    filed_finding = (
         f"the harness FILED {total} hook output(s) across {health.filing_sessions} "
         f"session(s) — those windows ran WITHOUT the filed content: {listed}{more}."
     )
@@ -1044,12 +1044,18 @@ def derive_findings(health: InjectionHealth, *, max_listed: int = 5) -> list[str
         # that built these ids saw only the newest _MAX_FRESH — so this count is
         # a LOWER BOUND, not exact, and saying "exact" would be the false
         # completeness claim the whole watcher exists to avoid.
-        total_desc = (
-            f"at least {len(ids)}; the scan hit its {_MAX_FRESH}-filing cap, so more "
-            "may be affected"
-            if health.scan_truncated
-            else f"{len(ids)} total"
-        )
+        if health.scan_truncated:
+            total_desc = (
+                f"at least {len(ids)}; the scan hit its {_MAX_FRESH}-filing cap, so "
+                "more may be affected"
+            )
+        elif health.errors:
+            total_desc = (
+                f"at least {len(ids)}; some fresh filings could not be read, so more "
+                "may be affected"
+            )
+        else:
+            total_desc = f"{len(ids)} total"
         overflow = (
             f" …and {len(ids) - _MAX_SESSIONS_NAMED} more not listed"
             if len(ids) > _MAX_SESSIONS_NAMED
@@ -1063,6 +1069,10 @@ def derive_findings(health: InjectionHealth, *, max_listed: int = 5) -> list[str
             "re-measure it with the probe seam in scripts/genesis_session_context.py "
             "and re-fit the part budgets."
         )
+    # Critical-observation delivery keeps only the first 200 characters. The
+    # restart instruction is the actionable remedy, so put it before the filing
+    # inventory rather than letting a long summary erase it in the alert preview.
+    findings.append(filed_finding)
     if any(not p.startswith(("session-context", "cap-measurement")) for p in by_producer):
         findings.append(
             "filings from other hooks mean THAT hook's contribution was withheld from "
