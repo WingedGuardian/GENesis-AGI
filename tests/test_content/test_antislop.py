@@ -124,6 +124,11 @@ class TestDetect:
     def test_detect_empty_for_clean_text(self):
         assert detect("A simple, honest sentence.") == {}
 
+    def test_first_person_opening_is_allowed(self):
+        findings = detect("I keep coming back to this because it matters.")
+        assert "opens_with_I" not in findings
+        assert not any("opens_with_I" in flag for flag in scrub("I keep coming back to this because it matters.").flags)
+
     def test_detect_reports_categories(self):
         text = f"We delve into the landscape {EM} a testament to synergy."
         f = detect(text)
