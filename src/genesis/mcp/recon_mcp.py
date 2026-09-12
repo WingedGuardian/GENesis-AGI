@@ -6,16 +6,21 @@ Schedules and dynamic sources use YAML config files.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import aiosqlite
 import yaml
 from fastmcp import FastMCP
 
 from genesis.db.crud import observations as obs_crud
+from genesis.recon.gh_cli import run_gh_checked
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,8 @@ _router: object | None = None
 _surplus_queue: object | None = None
 _pipeline: object | None = None
 _memory_store: object | None = None
+
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def init_recon_mcp(
@@ -407,6 +414,128 @@ async def recon_run_github_discovery(query: str, limit: int = 10) -> dict:
     if not repos:
         result["note"] = "no results — if unexpected, check gh auth / rate-limit (30/min) in logs"
     return result
+
+
+@mcp.tool()
+async def recon_github_search(
+    kind: str,
+    query: str,
+    page: int = 1,
+    per_page: int = 30,
+) -> dict:
+    """Search GitHub repositories, code, or issues without shell access.
+
+    This is a read-only, fixed-endpoint wrapper around GitHub's search API.
+    It reports transport/API failure separately from a successful empty result.
+    Pagination is explicit: page >= 1 and per_page is limited to 1..100.
+    """
+    if kind not in {"repositories", "code", "issues"}:
+        return {"ok": False, "error": "kind must be repositories, code, or issues"}
+    if not query.strip():
+        return {"ok": False, "error": "query must not be empty"}
+    if page < 1 or not 1 <= per_page <= 100:
+        return {"ok": False, "error": "page must be >= 1 and per_page must be 1..100"}
+
+    ok, raw = await run_gh_checked(
+        "gh", "api", "-X", "GET", f"search/{kind}",
+        "-f", f"q={query}", "-f", f"page={page}", "-f", f"per_page={per_page}",
+    )
+    if not ok:
+        return {"ok": False, "error": "GitHub search failed; check gh auth, network, and rate limit"}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "GitHub search returned invalid JSON"}
+
+    total = int(payload.get("total_count", 0))
+    accessible = min(total, 1000)  # GitHub Search API exposes only the first 1,000 results.
+    return {
+        "ok": True,
+        "kind": kind,
+        "query": query,
+        "total_count": total,
+        "accessible_count": accessible,
+        "incomplete_results": bool(payload.get("incomplete_results", False)),
+        "items": payload.get("items", []),
+        "page": page,
+        "per_page": per_page,
+        "has_more": page * per_page < accessible,
+    }
+
+
+@mcp.tool()
+async def recon_github_read(
+    repository: str,
+    operation: str = "repository",
+    path: str = "",
+    ref: str = "",
+    max_chars: int = 50000,
+) -> dict:
+    """Inspect GitHub repository metadata, a recursive tree, or one file.
+
+    Read-only operations: ``repository``, ``tree``, and ``file``. File content
+    is decoded as UTF-8 and capped at max_chars (1..100000); the response says
+    when it was truncated and provides the exact total plus GitHub URLs.
+    """
+    if not _GITHUB_REPO_RE.fullmatch(repository):
+        return {"ok": False, "error": "repository must be owner/name"}
+    if operation not in {"repository", "tree", "file"}:
+        return {"ok": False, "error": "operation must be repository, tree, or file"}
+    if not 1 <= max_chars <= 100000:
+        return {"ok": False, "error": "max_chars must be 1..100000"}
+    if operation == "file" and not path.strip("/"):
+        return {"ok": False, "error": "path is required for file reads"}
+
+    if operation == "repository":
+        endpoint = f"repos/{repository}"
+        args = ["gh", "api", "-X", "GET", endpoint]
+    elif operation == "tree":
+        endpoint = f"repos/{repository}/git/trees/{quote(ref or 'HEAD', safe='')}"
+        args = ["gh", "api", "-X", "GET", endpoint, "-f", "recursive=1"]
+    else:
+        # gh passes this as one argv item; rejecting '..' keeps the endpoint
+        # constrained to the requested repository's contents route.
+        parts = [part for part in path.strip("/").split("/") if part]
+        if any(part in {".", ".."} for part in parts):
+            return {"ok": False, "error": "path may not contain . or .. segments"}
+        encoded_path = "/".join(quote(part, safe="") for part in parts)
+        endpoint = f"repos/{repository}/contents/{encoded_path}"
+        args = ["gh", "api", "-X", "GET", endpoint]
+        if ref:
+            args += ["-f", f"ref={ref}"]
+
+    ok, raw = await run_gh_checked(*args)
+    if not ok:
+        return {"ok": False, "error": f"GitHub {operation} read failed; check repository, ref, auth, network, and rate limit"}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"GitHub {operation} read returned invalid JSON"}
+
+    if operation != "file":
+        return {"ok": True, "operation": operation, "repository": repository, "result": payload}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "requested path is not a file", "metadata": payload}
+    if payload.get("type") != "file" or payload.get("encoding") != "base64":
+        return {"ok": False, "error": "GitHub contents response was not a base64 file", "metadata": payload}
+    try:
+        decoded = base64.b64decode(payload.get("content", ""), validate=False).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return {"ok": False, "error": "file is not UTF-8 text", "metadata": payload}
+    return {
+        "ok": True,
+        "operation": "file",
+        "repository": repository,
+        "path": path,
+        "ref": ref or None,
+        "sha": payload.get("sha"),
+        "size": payload.get("size"),
+        "html_url": payload.get("html_url"),
+        "download_url": payload.get("download_url"),
+        "content": decoded[:max_chars],
+        "truncated": len(decoded) > max_chars,
+        "total_chars": len(decoded),
+    }
 
 
 @mcp.tool()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -185,6 +186,12 @@ class TestResearchSession:
         assert result.found is True
         assert "library X" in result.approach
         assert result.session_id == "ses-research-001"
+
+        invocation = invoker.run.await_args.args[0]
+        assert "Evidence standard" in (invocation.system_prompt or "")
+        assert '"genesis-recon"' in Path(invocation.mcp_config).read_text()
+        assert "mcp__genesis-recon__recon_store_finding" in invocation.disallowed_tools
+        assert "mcp__genesis-recon__recon_github_search" not in invocation.disallowed_tools
 
     async def test_session_finds_nothing_with_blockers(self) -> None:
         output = FakeCCOutput(

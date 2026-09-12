@@ -35,8 +35,89 @@ async def test_all_tools_registered(tools):
         "recon_findings",
         "recon_triage",
         "recon_store_finding",
+        "recon_github_search",
+        "recon_github_read",
     ]:
         assert name in tools, f"Missing tool: {name}"
+
+
+async def test_github_search_distinguishes_empty_results_from_failure(tools, monkeypatch):
+    async def empty(*args, **kwargs):
+        return True, '{"total_count":0,"incomplete_results":false,"items":[]}'
+
+    monkeypatch.setattr("genesis.mcp.recon_mcp.run_gh_checked", empty)
+    result = await tools["recon_github_search"].fn(kind="repositories", query="unlikely")
+    assert result == {
+        "ok": True,
+        "kind": "repositories",
+        "query": "unlikely",
+        "total_count": 0,
+        "accessible_count": 0,
+        "incomplete_results": False,
+        "items": [],
+        "page": 1,
+        "per_page": 30,
+        "has_more": False,
+    }
+
+    async def failed(*args, **kwargs):
+        return False, ""
+
+    monkeypatch.setattr("genesis.mcp.recon_mcp.run_gh_checked", failed)
+    failed_result = await tools["recon_github_search"].fn(
+        kind="repositories", query="unlikely"
+    )
+    assert failed_result["ok"] is False
+    assert "failed" in failed_result["error"].lower()
+
+
+async def test_github_read_file_reports_truncation(tools, monkeypatch):
+    async def fake(*args, **kwargs):
+        import base64
+        import json
+
+        return True, json.dumps({
+            "type": "file",
+            "size": 12,
+            "sha": "abc",
+            "html_url": "https://github.com/o/r/blob/main/a.txt",
+            "download_url": "https://raw.example/a.txt",
+            "encoding": "base64",
+            "content": base64.b64encode(b"abcdefghijkl").decode(),
+        })
+
+    monkeypatch.setattr("genesis.mcp.recon_mcp.run_gh_checked", fake)
+    result = await tools["recon_github_read"].fn(
+        repository="o/r", operation="file", path="a.txt", max_chars=5
+    )
+    assert result["ok"] is True
+    assert result["content"] == "abcde"
+    assert result["truncated"] is True
+    assert result["total_chars"] == 12
+
+
+async def test_github_file_read_rejects_directory_response_without_crashing(tools, monkeypatch):
+    async def directory(*args, **kwargs):
+        return True, '[{"type":"file","name":"child.txt"}]'
+
+    monkeypatch.setattr("genesis.mcp.recon_mcp.run_gh_checked", directory)
+    result = await tools["recon_github_read"].fn(
+        repository="o/r", operation="file", path="directory"
+    )
+    assert result["ok"] is False
+    assert "not a file" in result["error"]
+
+
+async def test_github_search_has_more_respects_api_1000_result_cap(tools, monkeypatch):
+    async def many(*args, **kwargs):
+        return True, '{"total_count":5000,"incomplete_results":false,"items":[]}'
+
+    monkeypatch.setattr("genesis.mcp.recon_mcp.run_gh_checked", many)
+    result = await tools["recon_github_search"].fn(
+        kind="repositories", query="popular", page=10, per_page=100
+    )
+    assert result["has_more"] is False
+    assert result["accessible_count"] == 1000
 
 
 def test_load_watchlist():

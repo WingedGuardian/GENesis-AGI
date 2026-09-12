@@ -63,12 +63,12 @@ lands elsewhere.
 | `interact` | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `steward` | ✗ | ✓ | ✓ | ✓ | ✓ |
 
-Most profiles block: Bash, Edit, Write, task_submit, settings_update,
+Most profiles block: Bash, Edit, task_submit, settings_update,
 direct_session_run, module_call. Use `interact` for workflows that operate
 external platforms (publishing, form filling) and need to communicate with the
 user. Use `research` for investigation that writes observations/follow-ups;
-it also reaches the `genesis-recon` discovery tools (GitHub/model-intel/skill
-scanning, findings storage) — the only profile that does.
+it also reaches the `genesis-recon` tools, including read-only GitHub search and
+source inspection. Its shared `web-research` skill is injected automatically.
 Use `observe` for read-only investigation.
 
 **MCP scoping is secure-by-default.** `CCInvocation.strict_mcp_config` defaults to
@@ -139,21 +139,13 @@ Background sessions have strict memory isolation:
 - **`model` / `effort`** — default Sonnet/High. Haiku for cheap bulk tasks.
 - **`profile`** — see table above. Choose the minimum profile that covers the task.
 
-## Always Write Progress Incrementally
+## Preserve Partial Progress
 
-**Rule: instruct every background session to write findings to memory as it
-discovers them, not as a final batch at the end.**
-
-Why: Background sessions are fragile and cannot be resumed. The timeout clock
-runs continuously — including during rate limit waits. Any write committed
-before a failure is preserved; any uncommitted work is lost permanently.
-
-**Pattern to use in every prompt:**
-> "Write each [finding/target/result] to memory as you find it, not all at the end."
-
-Design your prompt around this constraint. A session that writes 15 of 20 targets
-and then times out has delivered value. A session that batches and times out
-delivers nothing.
+The session's terminal output is the research deliverable. For work likely to
+exceed one run, ask it to write a bounded artifact under its background-session
+directory as it progresses; do not instruct it to use blocked vector-memory
+tools. Structured observation/reference writes remain available when the task
+specifically calls for those durable records.
 
 ## Rate Limits Are Shared
 
@@ -171,30 +163,13 @@ work. Schedule long research sessions for idle periods.
 ## Failure Recovery
 
 There is no resume path for failed background sessions. If a session fails:
-1. Check memory for partial results (writes before failure are preserved)
-2. Relaunch with a prompt that says: "Check memory for existing progress first,
-   then continue from where it left off."
+1. Check the session output and any artifact path it reported.
+2. Relaunch with the partial output or artifact path and ask it to continue.
 
 Failure modes:
-- **Timeout** → Telegram notification + any committed memory writes preserved
+- **Timeout** → Telegram notification + any written artifact preserved
 - **Rate limit during wait** → countdown expires → same as timeout
 - **Crash** → Telegram notification, same recovery path
-
-## Memory Storage for Research Sessions
-
-The core philosophy: **internal → episodic, external → knowledge base.**
-
-**External research** (web sources, online data, third-party information):
-- `memory_type`: `"knowledge"` (routes to `knowledge_base` collection)
-- `confidence`: `0.5` (default — not vetted yet)
-- After human review, promote via `knowledge_ingest` (0.85 confidence boost + dedup)
-
-**Internal research** (about Genesis itself, codebase analysis, architecture):
-- `memory_type`: `"episodic"` (routes to `episodic_memory` collection)
-- This is Genesis reflecting on itself — internal context, not external facts
-
-For both types, include a descriptive `source` tag (e.g. `"research_session"`,
-`"podcast_research"`) and topic `tags` for recall.
 
 ## MCP Tool
 

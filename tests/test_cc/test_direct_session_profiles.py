@@ -666,6 +666,15 @@ def test_non_steward_invocation_has_empty_bash_allowlist():
     assert inv.bash_allowlist == ()
 
 
+def test_research_profile_injects_shared_web_research_skill():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="compare available libraries", profile="research")
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert "Evidence standard" in (inv.system_prompt or "")
+
+
 # --- Profile overlay mechanism (generic; install-local profiles) ---
 # Install-specific profiles live in an optional, gitignored
 # genesis.cc.profile_overlay module — these tests exercise the loader + the

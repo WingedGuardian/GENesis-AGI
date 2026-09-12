@@ -21,6 +21,7 @@ from typing import Any
 
 from genesis.autonomy.executor.types import ResearchResult
 from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, background_session_dir
+from genesis.learning.skills.wiring import load_skill
 from genesis.memory.provenance import is_external, wrap_external_recall
 from genesis.security import immunity_shadow
 
@@ -124,14 +125,17 @@ class DeepResearcherImpl:
         # MCP servers (memory recall, web search tools).
         mcp_config = self._build_mcp_config()
 
+        from genesis.cc.session_config import SessionConfigBuilder
         from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 
+        research_method = load_skill("web-research") or ""
+        recon_disallowed = SessionConfigBuilder().build_research_recon_disallowed()
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (research needs output)
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
-            system_prompt=None,  # Uses default SOUL.md identity
+            system_prompt=research_method,
             append_system_prompt=True,
             mcp_config=mcp_config,
             timeout_s=1800,  # 30 min max for research
@@ -151,7 +155,7 @@ class DeepResearcherImpl:
                 "mcp__genesis-outreach__outreach_send",
                 "mcp__genesis-outreach__outreach_send_and_wait",
                 "mcp__genesis-health__module_call",
-            ],
+            ] + recon_disallowed,
         )
 
         logger.info(
@@ -173,12 +177,12 @@ class DeepResearcherImpl:
         return self._parse_research_output(output)
 
     def _build_mcp_config(self) -> str | None:
-        """Build MCP config for research sessions (reflection profile)."""
+        """Build MCP config for research sessions, including read-only recon tools."""
         try:
             from genesis.cc.session_config import SessionConfigBuilder
 
             builder = SessionConfigBuilder()
-            return builder.build_mcp_config(profile="reflection")
+            return builder.build_mcp_config(profile="research")
         except Exception:
             logger.debug("Could not build MCP config, session will use project defaults")
             return None
