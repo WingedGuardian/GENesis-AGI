@@ -110,6 +110,36 @@ def test_emit_final_lands_WHOLE_not_merely_present(sink):
     assert sink.getvalue().endswith(line + "\n"), sink.getvalue()[-90:]
 
 
+def test_emit_final_prefers_a_pointer_fallback_over_clipping_the_tail(sink):
+    """When the full closing line will not fit, a caller-supplied fallback that
+    fits is emitted WHOLE — the raw clip (which drops the line's tail, and the
+    tail is the mirror pointer) is the last resort, not the first.
+
+    Reproduces F1: `emit_final` used to `clip_to_cost` from the right, so an
+    audit line whose counters or session id pushed it past the room lost its
+    trailing `— full text: <mirror>]_` — the one part the reader needs. The
+    fallback drops the volatile counters and keeps part + pointer.
+    """
+    full = (
+        "_[ctx knowledge: 123456789012 intended / 9800 emitted — CUT 123456779212 chars at 'ek' — full text: /home/u/.genesis/sessions/"
+        + "s" * 60
+        + "/context-knowledge.md]_"
+    )
+    fallback = (
+        "_[ctx knowledge: audit counts omitted for size — full text: /home/u/.genesis/sessions/"
+        + "s" * 60
+        + "/context-knowledge.md]_"
+    )
+    # Room fits the fallback but not the full line.
+    reserve = _ho.emit_cost(fallback)
+    out = _writer(sink, budget=500, reserve=reserve)
+    out.emit("x" * (500 - reserve), block="knowledge")
+    out.emit_final(full, fallback=fallback)
+    got = sink.getvalue()
+    assert got.rstrip("\n").endswith("context-knowledge.md]_"), got[-90:]
+    assert "audit counts omitted" in got, "fell back to a raw clip instead of the pointer form"
+
+
 def test_reserve_is_held_back_from_emit(sink):
     """A block may not spend the headroom kept for the closing line."""
     out = _writer(sink, budget=200, reserve=100)

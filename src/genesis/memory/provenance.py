@@ -481,8 +481,10 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # Context-injection watcher (awareness/loop.py _check_context_injection_health)
         # — Genesis observing its OWN runtime: whether the harness filed a
         # SessionStart hook's output instead of delivering it. The evidence is
-        # file sizes, mtimes and PATHS of the harness's own persisted files
-        # under ~/.claude/projects — filesystem metadata Genesis observed. No
+        # file sizes, mtimes, PATHS, and the SESSION-DIR names of the harness's
+        # own persisted files under ~/.claude/projects — all filesystem metadata
+        # Genesis observed (the session id is the grandparent dir name, escaped
+        # at ingestion like the path; see context_injection.note_filing). No
         # byte of a filed hook's CONTENT reaches the observation: the collector
         # attributes each filing from a closed set of labels it authors itself
         # (context_injection._attribute). That is what makes first_party true
