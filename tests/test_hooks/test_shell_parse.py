@@ -128,6 +128,22 @@ class TestNesting:
     def test_bash_ec_bundle_still_works(self):
         assert any(s.exe == "echo" for s in sp.analyze("bash -ec 'echo hello'"))
 
+    @pytest.mark.parametrize("interpreter", ["dash", "sh"])
+    @pytest.mark.parametrize("options", ["cC", "Cc", "cE", "Ec", "cI", "Ic", "cV", "Vc"])
+    def test_dash_valid_uppercase_c_bundles_recurse(self, interpreter, options):
+        assert any(s.exe == "echo" for s in sp.analyze(f"{interpreter} -{options} 'echo hello'"))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -- -ce 'echo hidden'",
+            "bash - -ce 'echo hidden'",
+            "bash -cz 'echo hidden'",
+        ],
+    )
+    def test_interpreter_non_options_and_invalid_bundles_do_not_recurse(self, command):
+        assert not any(s.exe == "echo" for s in sp.analyze(command))
+
     def test_command_substitution(self):
         assert _push_blocked('echo "$(git push origin main)"')
 
@@ -339,6 +355,13 @@ class TestCommandPositionStrip:
 
     def test_coproc_command(self):
         assert self._detects("coproc echo hello", "echo")
+
+    def test_named_coproc_compound_body_command(self):
+        assert self._detects("coproc worker { rm -rf /tmp/scratch; }", "rm")
+
+    @pytest.mark.parametrize("opener, closer", [("(", ")"), ("if true; then", "fi"), ("while false; do", "done")])
+    def test_named_coproc_other_compound_body_command(self, opener, closer):
+        assert self._detects(f"coproc worker {opener} rm -rf /tmp/scratch; {closer}", "rm")
 
     def test_glued_rm(self):
         assert self._detects("(rm -rf ~)", "rm")

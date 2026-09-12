@@ -1293,7 +1293,36 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     return result
 
 _FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
-_INTERPRETER_C_BUNDLE = re.compile(r"^-[A-Za-z]*c[A-Za-z]+$")
+
+# Invocation-option letters that may share a short bundle with ``-c``.  These
+# are deliberately per interpreter: treating an unsupported letter as a script
+# carrier makes the parser recurse into an argument the shell rejects or treats
+# as a filename. The bash set comes from ``bash --help``; the dash/sh set was
+# verified against the installed dash implementation, which also provides
+# ``sh`` on the supported Linux hosts.
+_C_BUNDLE_OPTIONS = {
+    "bash": frozenset("abcefhiklmnprstuvxBCEHPTD"),
+    "sh": frozenset("abcefhilmnprstuvxCEIV"),
+    "dash": frozenset("abcefhilmnprstuvxCEIV"),
+    "ash": frozenset("abcefhilmnprstuvx"),
+    "ksh": frozenset("abcefhilmnprstuvx"),
+    "zsh": frozenset("abcefhilmnprstuvx"),
+}
+
+
+def _coproc_body(argv: list[str]) -> list[str]:
+    """The command run by ``coproc``, dropping its optional compound name."""
+    body = argv[1:]
+    # ``coproc NAME COMPOUND-COMMAND`` gives NAME to the coprocess.  For
+    # ``coproc NAME command`` NAME is the command itself, so only strip it when
+    # the following token can open Bash's compound-command grammar.
+    if (
+        len(body) > 1
+        and body[1] in {"{", "(", "if", "while", "until", "for", "case", "select", "function"}
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", body[0])
+    ):
+        body = body[1:]
+    return body
 
 
 def _embedded_commands(argv: list[str]) -> list[str]:
@@ -1321,7 +1350,7 @@ def _embedded_commands(argv: list[str]) -> list[str]:
         return [shlex.join(argv[2:])]
 
     if argv[0] == "coproc" and len(argv) > 1:
-        return [shlex.join(argv[1:])]
+        return [shlex.join(_coproc_body(argv))]
 
     return []
 
@@ -1398,7 +1427,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         )
         nested = []
         if exe in _NESTED:
-            script = _nested_script(argv)
+            script = _nested_script(argv, exe)
             if script:
                 nested.append(script)
 
@@ -1514,27 +1543,24 @@ def _substitutions(text: str) -> list[str]:
     return subs
 
 
-def _nested_script(argv: list[str]) -> str:
+def _nested_script(argv: list[str], interpreter: str) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Handles a bare ``-c`` (script is the next token), a combined short bundle
-    where ``c`` is last (``-lc 'script'`` → next token), an option bundle where
-    ``c`` is not last (``-ce 'script'`` → next token), and an inline value
-    (``-c'script'`` → the rest of the token after ``c``).
+    Stops at ``--`` and a lone ``-``, which end option processing.  A combined
+    option is accepted only when every letter is valid for this interpreter;
+    ``bash -cz`` is rejected by Bash and does not run a script.
     """
+    allowed = _C_BUNDLE_OPTIONS[interpreter]
     for i, tok in enumerate(argv[1:], 1):
-        if not tok.startswith("-") or tok.startswith("--"):
+        if tok in {"-", "--"}:
+            break
+        if not tok.startswith("-"):
             continue
-        if "c" not in tok[1:]:
+        options = tok[1:]
+        if "c" not in options or not set(options) <= allowed:
             continue
-
-        pos = tok.find("c")
-
-        if _INTERPRETER_C_BUNDLE.match(tok) or pos == len(tok) - 1:
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        else:
-            return tok[pos + 1 :]
+        if i + 1 < len(argv):
+            return argv[i + 1]
 
     return ""
 
