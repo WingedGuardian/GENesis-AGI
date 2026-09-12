@@ -13,7 +13,8 @@ skill_type: workflow
 Evaluate content through the lens of what Genesis knows about the user. The
 differentiator vs generic AI summary is the user model — Genesis's accumulated
 understanding of who this person is, what they care about, and what they're
-working on. Assume everything matters; find HOW it matters.
+working on. Treat the user's placement of an item as a request for analysis,
+not as proof that the item is a strong personal fit or should be adopted.
 
 ## When to Use
 
@@ -27,8 +28,10 @@ working on. Assume everything matters; find HOW it matters.
 1. **Assemble user context** — Read USER.md, query `memory_recall` MCP for
    topics related to the content, check user_model_cache and recent observations.
    USER.md is the floor; the memory system is the ceiling.
-2. **Fetch content** — If URLs, fetch and read actual content. Never evaluate
-   based on URL text alone. Exhaust all access methods before reporting failure.
+2. **Fetch content** — If the request supplies URLs, fetch every supplied URL
+   and individually address each source; do not stop because the first source
+   seems sufficient. Never evaluate based on URL text alone. Exhaust all access
+   methods before reporting failure.
 3. **Apply four lenses** — Evaluate through all four, do not skip or collapse:
    - **What This Is** — content-native analysis (argument, evidence, contribution)
    - **How This Could Help You** — user-model-informed value extraction
@@ -38,6 +41,37 @@ working on. Assume everything matters; find HOW it matters.
    Relevance (Direct/Tangential/Background). These are recommendations, NOT
    binding metadata.
 5. **Write output** — Structured evaluation in the format below.
+
+## Personal-Relevance Evidence Protocol
+
+Find possible value without manufacturing personal fit. For every material
+claim about relevance, distinguish:
+
+- **Explicit** — supported by a specific user statement, current goal, active
+  project, known practice, or constraint in USER.md, memory, or observations.
+- **Inferred** — a plausible connection derived from named evidence. Label it as
+  an inference and say what would confirm or falsify it.
+- **Unknown** — no user-specific evidence is available. Give the content-native
+  value and the question it raises; do not backfill a personal story.
+- **Constraint-conflicted** — a stated user boundary (privacy, employer policy,
+  budget, time, platform, or explicit preference) materially limits the value.
+
+The act of saving an item is evidence of attention, not evidence of agreement,
+priority, relevance strength, or adoption intent. Likewise, absence from the
+user model is not evidence of irrelevance. Keep these two directions separate.
+
+Use `Direct` only when at least one specific, current user fact supports the
+connection. Generic usefulness, popularity, or broad career value does not make
+an item Direct. Recommendation strength, confidence, timeline, and next step
+must match the evidence status. When the connection is uncertain, prefer a
+bounded experiment or a concrete question over a fabricated confident action.
+
+For external tools, separate the valuable mechanism from its packaging. Before
+suggesting that Genesis or the user build an equivalent, consider direct use,
+configuration, API/MCP/CLI integration, a sidecar or container, and reuse of a
+separable upstream component. Treat implementation language as integration cost,
+not an automatic veto, and compare those options with the full cost of building,
+testing, battle-hardening, and maintaining another implementation.
 
 ## Output Format
 
@@ -123,7 +157,8 @@ same space. Keep it to 2-4 rows.}
 
 ## Key Rules
 
-- **Assume it matters.** The user put it here for a reason. Find the value.
+- **Assume the request matters, not that the conclusion is positive.** Find
+  possible value, then calibrate personal-fit claims to user-specific evidence.
 - **Never dismiss** content because the user model doesn't mention this topic.
 - **Never over-filter** based on the user's known profile. They may be exploring
   new interests.
