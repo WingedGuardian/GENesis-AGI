@@ -11,9 +11,12 @@ to avoid circular imports from any config loader.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def _user_config_dir() -> Path:
@@ -41,6 +44,30 @@ def _resolve_overlay_path(base_path: Path) -> Path:
     return base_path.with_suffix(".local.yaml")
 
 
+#: Last-warned mtime per overlay path. A broken overlay MUST warn — but several
+#: loaders re-read on every call (the immunity gate reloads per check), so an
+#: undeduped warning turns one YAML typo into a multiline traceback on every
+#: memory or approval operation, flooding the journal until an operator notices.
+#: Warn once per bad file VERSION: any mtime CHANGE warns again, so a failed
+#: repair stays visible — including a backwards move, which an mtime-preserving
+#: restore produces. Keyed by path (not path+mtime) so the map is bounded by the
+#: number of overlay files rather than growing once per edit forever.
+_WARNED_OVERLAYS: dict[str, float] = {}
+
+
+def _warn_overlay_once(local_path: Path, msg: str, *args, exc_info: bool = False) -> None:
+    """Log an overlay problem once per (path, mtime). Never raises."""
+    path_key = str(local_path)
+    try:
+        mtime = local_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if _WARNED_OVERLAYS.get(path_key) == mtime:
+        return
+    _WARNED_OVERLAYS[path_key] = mtime
+    logger.warning(msg, *args, exc_info=exc_info)
+
+
 def merge_local_overlay(base: dict, base_path: Path) -> dict:
     """Deep-merge a ``.local.yaml`` overlay into *base* if it exists.
 
@@ -49,14 +76,54 @@ def merge_local_overlay(base: dict, base_path: Path) -> dict:
     (``~/.genesis/config/{stem}.local.yaml``), falling back to the repo-relative
     sibling.
 
-    Returns *base* unchanged when no overlay file exists.
+    Returns *base* unchanged when no overlay file exists, is unparseable, or is
+    valid YAML of the wrong SHAPE.
     """
     local_path = _resolve_overlay_path(base_path)
     if not local_path.exists():
         return base
     try:
-        local = yaml.safe_load(local_path.read_text()) or {}
+        local = yaml.safe_load(local_path.read_text())
+        if local is None:
+            # Empty file or an explicit `null` — legitimately nothing to merge,
+            # and NOT a malformed overlay. Distinguished from the falsy
+            # non-mappings below, which an `or {}` default used to swallow
+            # without a word: `[]`, `false`, `0` and `""` all became "no
+            # overrides" silently, and an empty-list root is precisely the shape
+            # this guard advertises catching.
+            return base
+        if not isinstance(local, dict):
+            # Valid YAML, wrong ROOT SHAPE — a list or a bare scalar. This is the
+            # one malformed case the except below does NOT catch: parsing
+            # succeeds, and the AttributeError from `.items()` would be raised by
+            # _deep_merge OUTSIDE this function, propagating to every caller of
+            # the config loader instead of degrading to base. Validate here so a
+            # wrong-shape overlay fails the same safe way an unparseable one does.
+            _warn_overlay_once(
+                local_path,
+                "Config overlay %s has a %s at its root, not a mapping — "
+                "IGNORING it; every setting in this file is NOT in effect. "
+                "Fix the YAML and reload.",
+                local_path,
+                type(local).__name__,
+            )
+            return base
     except Exception:
+        # NEVER silent. Returning `base` is the right FALLBACK, but an unlogged
+        # one is indistinguishable from a clean load — the caller sees a valid
+        # config and cannot tell that every override in this file was dropped.
+        # That is load-bearing for configs whose overlay is the SOLE home of a
+        # setting (cc_roster peers, for one): a single YAML typo silently
+        # yields "no peers configured", and the discovery moment is the
+        # subscription cap. The base-file loader in genesis.cc.roster already
+        # warns on the same failure; this is the matching half.
+        _warn_overlay_once(
+            local_path,
+            "Failed to parse config overlay %s — IGNORING it; every setting in "
+            "this file is NOT in effect. Fix the YAML and reload.",
+            local_path,
+            exc_info=True,
+        )
         return base
     return _deep_merge(base, local)
 
@@ -68,6 +135,42 @@ def local_overlay_mtime(base_path: Path) -> float:
         return local_path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def local_overlay_key(base_path: Path) -> tuple[int, int, int]:
+    """``(mtime_ns, size, inode)`` of the ``.local.yaml`` overlay, or zeros.
+
+    A finer cache key than :func:`local_overlay_mtime`, and purely additive —
+    that function is unchanged, so no existing caller moves.
+
+    The float mtime it returns carries the filesystem's own resolution, so a
+    rewrite landing inside one tick is invisible to a cache keyed on it: a
+    coarse filesystem, a fast `settings_update`, or an editor or restore that
+    preserves timestamps all leave the key unchanged while the file's CONTENT
+    changed. A config cache guarded that way serves the old value indefinitely,
+    which defeats the point of re-reading config live. `st_mtime_ns` is an
+    integer at nanosecond resolution, and `st_size` moves on almost any real
+    edit; both come from one `stat()`.
+
+    The INODE is the third part, and it is what covers the case the first two
+    cannot: a writer that preserves the timestamp AND lands the same byte count.
+    Every atomic write in this repo goes through a temp file and a rename
+    (`mcp/health/settings.py::_atomic_yaml_write`), and a restore from backup
+    writes a new file too — both change the inode even when nothing else moves.
+
+    Still not a content hash — hashing means reading the file, which is the work
+    such a cache exists to avoid. The one shape this cannot see is an IN-PLACE
+    rewrite that keeps both the size and the timestamp, which no writer here
+    performs; `reset_config_cache()` is the deterministic escape if one ever
+    does. This narrows the window; it does not close it, and saying otherwise
+    would be the kind of claim this repo keeps having to retract.
+    """
+    local_path = _resolve_overlay_path(base_path)
+    try:
+        st = local_path.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return (0, 0, 0)
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:

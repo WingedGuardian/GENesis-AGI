@@ -1577,7 +1577,7 @@ Output JSON (no markdown fences, just raw JSON):
   "tags": ["<merged relevant tags — deduplicated>"],
   "confidence": <float 0-1, max of inputs as baseline>,
   "memory_class": "<fact|reference|procedure|insight>",
-  "wing": "<wing>",
+  "wing": "<one of: {wing_choices}>",
   "room": "<room>",
   "synthesis_notes": "<why these were merged, what was dropped>"
 }}
@@ -1606,12 +1606,33 @@ def _build_synthesis_prompt(
             f"--- Memory {i} (confidence {confidence}, source {source}, "
             f"created {created}) ---\n{content}"
         )
+    from genesis.memory.taxonomy import WINGS
+
     return _SYNTHESIS_PROMPT.format(
         wing=wing,
         room=room,
         n=len(cluster),
+        # Enumerate the controlled vocabulary rather than asking for free text.
+        # The write-path guard is a backstop; the prompt is the root cause, and
+        # a schema that says "<wing>" invites a plausible invention.
+        wing_choices="|".join(sorted(WINGS)),
         memories="\n\n".join(memory_blocks),
     )
+
+
+def _valid_wing_or(candidate: object, fallback: str) -> str:
+    """The candidate wing if it is in the controlled vocabulary, else fallback.
+
+    `dict.get(key, default)` only falls back on a MISSING key, so a model that
+    emits an invalid wing beats the caller's known-good default. Here the
+    fallback is the cluster's own wing — derived from the memories being
+    merged — which is better information than re-classifying from content.
+    """
+    from genesis.memory.taxonomy import WINGS
+
+    if isinstance(candidate, str) and candidate.strip() in WINGS:
+        return candidate.strip()
+    return fallback
 
 
 def _parse_synthesis_response(
@@ -1643,7 +1664,12 @@ def _parse_synthesis_response(
             "tags": data.get("tags", []),
             "confidence": data.get("confidence", 0.8),
             "memory_class": data.get("memory_class", "fact"),
-            "wing": data.get("wing", default_wing),
+            # Fall back on an INVALID wing too, not only a missing one. The
+            # cluster's own wing is known-valid and derived from the very
+            # memories being merged — strictly better than letting store()
+            # discard a bad value and re-guess from content, whose terminal
+            # fallback is general/uncategorized.
+            "wing": _valid_wing_or(data.get("wing"), default_wing),
             "room": data.get("room", default_room),
             "synthesis_notes": data.get("synthesis_notes", ""),
         }

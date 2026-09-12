@@ -162,12 +162,12 @@ def test_healthy_cycle_push_not_age_gated(tmp_path):
 
 
 def test_healthy_listing_cleans_user_deleted_file(tmp_path):
-    """Intent lock, with the live corpus's filename shapes (spaces/&/'):
-    a file absent from a HEALTHY listing and older than grace is a user
-    deletion → cleaned; a still-listed file stays."""
+    """Intent lock, with the filename shapes a real vault produces
+    (spaces / & / apostrophe): a file absent from a HEALTHY listing and older
+    than grace is a user deletion → cleaned; a still-listed file stays."""
     env, inbox, log, _ = _setup(tmp_path)
     gone = _old_response_file(inbox, "My todos & musings-1.genesis.md")
-    stays = _old_response_file(inbox, "Jay's Notes-2.genesis.md")
+    stays = _old_response_file(inbox, "Someone's Notes-2.genesis.md")
     _set_listing(env, [stays.name])  # user deleted the first in Obsidian
 
     r = _run(env)

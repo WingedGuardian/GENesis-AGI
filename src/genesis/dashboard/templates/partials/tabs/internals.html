@@ -137,15 +137,17 @@
             <template x-for="(prov, provName) in ($store.genesisDashboard.routingConfig.providers || {})" :key="provName">
               <div style="display:flex; align-items:center; gap:0.35rem; padding:0.25rem 0.5rem; border-radius:5px; background:rgba(255,255,255,0.04); border:1px solid var(--color-border); font-size:0.72rem;">
                 <span class="status-dot"
-                      :style="`background: ${($store.genesisDashboard.routingConfig.cb_states || {})[provName] === 'OPEN' ? '#d9534f' : '#4caf50'}`"></span>
+                      :title="$store.genesisDashboard.breakerTooltip(provName)"
+                      :style="`background: ${({failing:'#d9534f', unverified:'transparent', healthy:'#4caf50'})[$store.genesisDashboard.breakerVerdict(provName)]};
+                               box-shadow: ${$store.genesisDashboard.breakerVerdict(provName) === 'unverified' ? 'inset 0 0 0 2px #facc15' : 'none'}`"></span>
                 <span style="font-weight:500; color:#e0e0e0;" x-text="provName"></span>
                 <span style="color:#666; font-size:0.65rem;" x-text="prov.model"></span>
                 <button @click.stop="$store.genesisDashboard.toggleProvider(provName)"
                         style="font-size:0.62rem; padding:1px 6px; border-radius:3px; cursor:pointer; border:1px solid; font-weight:500; margin-left:0.25rem;"
-                        :style="($store.genesisDashboard.routingConfig.cb_states || {})[provName] !== 'OPEN'
+                        :style="!$store.genesisDashboard.breakerIsOpen(provName)
                           ? 'background:transparent; color:#ef9a9a; border-color:#ef9a9a;'
                           : 'background:transparent; color:#81c784; border-color:#81c784;'"
-                        x-text="($store.genesisDashboard.routingConfig.cb_states || {})[provName] !== 'OPEN' ? 'disable' : 'enable'"></button>
+                        x-text="!$store.genesisDashboard.breakerIsOpen(provName) ? 'disable' : 'enable'"></button>
               </div>
             </template>
           </div>
@@ -484,15 +486,22 @@
                   <template x-for="(pt, i) in data.series" :key="i">
                     <div :style="(() => {
                       const color = data.trend_good === true ? 'rgba(76,175,80,0.5)' : data.trend_good === false ? 'rgba(217,83,79,0.5)' : 'rgba(136,136,136,0.4)';
-                      if (pt.value === null) return `flex:1; background:${color}; border-radius:1px; height:2px;`;
+                      // First point on a REDEFINED metric: the bars either side
+                      // of this edge are not the same measurement.
+                      const brk = pt.period_end && pt.period_end === data.series_break_at ? ' border-left:2px dashed #d9a441;' : '';
+                      if (pt.value === null) return `flex:1; background:${color}; border-radius:1px; height:2px;${brk}`;
                       const vals = data.series.filter(p => p.value !== null).map(p => p.value);
                       const mn = Math.min(...vals), mx = Math.max(...vals);
                       const pct = mx > mn ? ((pt.value - mn) / (mx - mn)) * 90 + 10 : 50;
-                      return `flex:1; background:${color}; border-radius:1px; height:${pct}%;`;
+                      return `flex:1; background:${color}; border-radius:1px; height:${pct}%;${brk}`;
                     })()"></div>
                   </template>
                 </div>
-                <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.2rem;" x-text="data.weeks_of_data + ' weeks'"></div>
+                <!-- Name the break in words too: the arrow above is computed
+                     inside the newest definition only (trend_basis_weeks), so
+                     the footer must say what it covers. -->
+                <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.2rem;"
+                     x-text="data.series_break_at ? (data.weeks_of_data + ' weeks \u00b7 redefined ' + data.series_break_at + ' \u00b7 trend over ' + data.trend_basis_weeks) : (data.weeks_of_data + ' weeks')"></div>
               </div>
             </template>
           </div>

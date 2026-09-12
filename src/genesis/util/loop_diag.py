@@ -26,7 +26,7 @@ import asyncio
 def default_executor_pending() -> dict[str, int] | None:
     """Return the running loop's default-executor pressure, or ``None``.
 
-    ``{"pending": <queued calls>, "workers": <live threads>,
+    ``{"pending": <queued calls>, "workers": <threads EVER CREATED, not busy>,
     "max_workers": <cap>}``. ``pending`` is the count of submitted calls not yet
     picked up by a worker — a sustained non-zero value means every worker is
     busy and ``to_thread`` work is backing up (the saturation signal). Returns

@@ -44,8 +44,6 @@ class OutreachScheduler:
         config: OutreachConfig,
         db: aiosqlite.Connection,
         *,
-        reconciler: object | None = None,
-        curve_computer: object | None = None,
         event_bus: object | None = None,
     ) -> None:
         self._pipeline = pipeline
@@ -53,8 +51,6 @@ class OutreachScheduler:
         self._engagement = engagement
         self._config = config
         self._db = db
-        self._reconciler = reconciler
-        self._curve_computer = curve_computer
         self._event_bus = event_bus
         self._scheduler: AsyncIOScheduler | None = None
         # In-memory alert dedup — DB-independent fallback.
@@ -106,20 +102,6 @@ class OutreachScheduler:
             "interval",
             minutes=self._config.engagement_poll_minutes,
             id="outreach_engagement_poll",
-            replace_existing=True,
-        )
-        # Daily calibration — reconcile predictions + recompute curves
-        # Wrap minute to avoid APScheduler crash if morning_report_time >= XX:55
-        cal_raw = int(minute) + 5
-        cal_hour = int(hour) + (cal_raw // 60)
-        cal_minute = cal_raw % 60
-        self._scheduler.add_job(
-            self._calibration_job,
-            "cron",
-            hour=cal_hour,
-            minute=cal_minute,
-            timezone=tz,
-            id="outreach_calibration",
             replace_existing=True,
         )
         # Health check — surfaces critical infrastructure problems to user
@@ -643,23 +625,6 @@ class OutreachScheduler:
             )
         return "(check the bridge: journalctl --user -u ambient-bridge)"
 
-    async def _calibration_job(self) -> None:
-        """Reconcile predictions and recompute calibration curves."""
-        if self._is_paused():
-            return
-        try:
-            if self._reconciler:
-                results = await self._reconciler.reconcile_all()
-                logger.info("Calibration reconciliation: %s", results)
-            if self._curve_computer:
-                for domain in ("outreach", "triage", "procedure", "routing"):
-                    await self._curve_computer.compute_and_save(domain)
-                logger.info("Calibration curves recomputed")
-            await self._record_job_result("calibration")
-        except Exception as exc:
-            logger.exception("Calibration job failed")
-            await self._record_job_result("calibration", error=str(exc), exc=exc)
-
     async def _mark_row_delivered(self, row: dict, delivered_at: str) -> None:
         """Mark a drained row delivered, keying on ``id`` or falling back to
         ``rowid`` when ``id`` is NULL.
@@ -739,6 +704,29 @@ class OutreachScheduler:
                                 age.total_seconds() / 3600,
                             )
                             continue
+
+                    # Re-read the cancel state immediately before committing to a
+                    # send. `drain` took a snapshot up to 20 rows ago, and each
+                    # row ahead of this one can cost an LLM draft plus an adapter
+                    # round-trip — so the snapshot is stale by seconds to minutes,
+                    # and that is precisely the window in which someone cancels
+                    # (they cancel because the message is about to go out). Without
+                    # this, `pending_outreach.cancel` returns "cancelled" and the
+                    # message ships anyway, leaving a row recorded as both
+                    # cancelled and delivered. A narrow race remains between this
+                    # read and the send itself; that one is inherent without row
+                    # locking, and it is microseconds rather than minutes.
+                    _cancel_cursor = await self._db.execute(
+                        "SELECT cancelled_at FROM pending_outreach WHERE rowid = ?",
+                        (row["rowid"],),
+                    )
+                    _cancel_row = await _cancel_cursor.fetchone()
+                    if _cancel_row is not None and _cancel_row[0] is not None:
+                        logger.info(
+                            "Pending outreach %s cancelled after drain — not sending",
+                            row.get("id") or f"rowid:{row.get('rowid')}",
+                        )
+                        continue
 
                     # Validate category — map known non-enum values, fall
                     # back to DIGEST (not ALERT) for truly unknown ones.

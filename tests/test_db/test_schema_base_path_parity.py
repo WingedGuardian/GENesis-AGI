@@ -41,6 +41,7 @@ import textwrap
 from pathlib import Path
 
 from genesis.db import migrations as _migrations_pkg
+from genesis.db.migrations import runner as _migrations_runner
 from genesis.db.schema import INDEXES, TABLES
 from genesis.db.schema import _migrations as _schema_migrations
 
@@ -152,8 +153,14 @@ def _migration_added() -> set[tuple[str, str]]:
     """(table, column) pairs any numbered migration adds via ALTER ... ADD COLUMN."""
     mig_dir = Path(_migrations_pkg.__file__).parent
     pairs: set[tuple[str, str]] = set()
-    for path in sorted(mig_dir.glob("[0-9][0-9][0-9][0-9]_*.py")):
-        pairs |= _alter_pairs_in_source(path.read_text())
+    # Match on the RUNNER's own pattern, not a hand-written glob. The previous
+    # `[0-9][0-9][0-9][0-9]_*.py` glob silently excluded timestamp-id
+    # migrations, so this guard would have stopped seeing every NEW migration
+    # while still reporting green — a fail-open on the bootstrap-crash class
+    # (#1123/#1127) it exists to catch.
+    for path in sorted(mig_dir.iterdir()):
+        if _migrations_runner._MIGRATION_PATTERN.match(path.name):
+            pairs |= _alter_pairs_in_source(path.read_text())
     return pairs
 
 

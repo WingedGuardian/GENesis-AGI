@@ -129,6 +129,16 @@ def _bg_session_sandbox(session_id: str) -> str:
 # cannot see or call them. Validated empirically: the init event's tools
 # list shrinks by the disallowed count.
 
+# The HUMAN half of the entity-merge approval gate. Denied universally AND
+# protected from re-enablement via `tool_exceptions` (see _NO_TOOL_EXCEPTIONS):
+# an autonomous session that could call approve+apply would self-approve the
+# gate, and reject carries the same human-review authority.
+_NO_ENTITY_ADJUDICATION_WRITE = [
+    "mcp__genesis-memory__entity_adjudication_approve",
+    "mcp__genesis-memory__entity_adjudication_apply",
+    "mcp__genesis-memory__entity_adjudication_reject",
+]
+
 _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
@@ -152,6 +162,17 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
     "mcp__genesis-memory__knowledge_ingest_source",
+    # ── Entity-merge human-approval gate ──────────────────────────
+    # entity_adjudication_approve/_apply/_reject are the HUMAN half of the
+    # entity-merge gate: a proposed_merge is applied ONLY after a person
+    # approves it, and applying tombstones one entity into another
+    # irreversibly. An autonomous session that could call approve+apply would
+    # self-approve the gate — defeating its entire purpose — and reject is the
+    # same human-review authority (it could bury legitimate proposals). Denied
+    # UNIVERSALLY (every profile, present and future), not just the read-leaning
+    # ones, so no background profile can usurp the human decision. The read-only
+    # `entity_adjudication_list` stays reachable (surfacing proposals is safe).
+    *_NO_ENTITY_ADJUDICATION_WRITE,
     # ── User-scoped MCP servers (defense-in-depth) ────────────────
     # strict_mcp_config (CCInvocation default True) already drops these by making
     # --mcp-config authoritative; deny them by name too so a site that opts out of
@@ -217,21 +238,73 @@ _NO_WEB_TOOLS = [
 ]
 
 # Perimeter sessions: block outreach tools beyond basic send.
+#
+# NOTE ON POLARITY — this is a DENY list, so a tool nobody enumerates is
+# ALLOWED. The `mail` profile's comment claims "only outreach_send is
+# available"; that is a description of the intended result, not something the
+# mechanism enforces. Every new genesis-outreach tool is reachable from the
+# untrusted-inbound perimeter until it is named here. Add new tools to this list
+# as part of adding them, not afterwards.
 _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-outreach__outreach_poll",
     "mcp__genesis-outreach__outreach_digest",
 ]
 
-# Cold-marketing actuator. marketing_send resolves its recipient in-code from the
-# owner-curated marketing_prospects store and enqueues a BULK cold send — it must be
-# reachable ONLY from the `campaign` profile (the intended autonomous marketing
-# caller). Deny it in every other profile: mandatorily for the untrusted-inbound
-# perimeter profiles (mail, community-responder), where an injected inbound message
-# could otherwise reach the actuator, and belt-and-suspenders on profiles that don't
-# mount genesis-outreach today (guards an MCP-config fallback-to-full).
+# The pending-queue controls: read what the owner has scheduled, or retract it.
+#
+# Denied on EVERY background profile, which is broader than the perimeter groups
+# above and deliberately so. PROFILES governs background sessions only — the
+# owner's own interactive session does not go through it — and no background
+# session has business reading or cancelling the owner's queued messages. So the
+# allowed set here is EMPTY, which makes the rule trivial to state and to test,
+# and costs nothing: both tools are new in this change, so nothing depends on
+# them.
+#
+# Scoped this way after review found `steward` still reachable: it ingests
+# external GitHub PR content and can publish `gh` comments, so an injected PR
+# body could read queued-message previews out through a comment or silently
+# cancel the owner's alerts. `interact` (arbitrary browser page content) and
+# `campaign` (external platform replies) carry the same shape. Enumerating the
+# perimeter profile-by-profile is what let steward slip; denying everywhere and
+# testing for it removes the judgement call entirely.
+_NO_OUTREACH_QUEUE_CONTROL = [
+    "mcp__genesis-outreach__outreach_pending",
+    "mcp__genesis-outreach__outreach_cancel",
+]
+
+# Host-capacity actuators. They live on the genesis-outreach server (it owns the
+# owner-approval channel they use), so a profile that mounts that server for its
+# reply tool gets these too unless they are named here — which is how they were
+# reachable from the untrusted-inbound perimeter until the allowlist-polarity test
+# in tests/test_cc/test_direct_session_profiles.py surfaced them.
+#
+# Both are approval-gated (an APPROVE/DENY request goes to the owner's channel and
+# nothing mutates without it), so this is not a silent-compromise path. It is still
+# wrong: injected inbound content should not be able to raise plausible-looking
+# infrastructure approval prompts in the owner's channel, and the gate is defence
+# in depth rather than a reason to leave the actuator reachable. Denied on the
+# perimeter only — an autonomous working session asking the owner to grow a disk is
+# the intended use.
+_NO_PROVISIONING = [
+    "mcp__genesis-outreach__provision_grow",
+    "mcp__genesis-outreach__provision_vzdump",
+]
+
+# Cold-marketing tools. marketing_send resolves its recipient in-code from the
+# owner-curated marketing_prospects store and enqueues a BULK cold send;
+# marketing_prospects_list ENUMERATES that same private store (names + addresses).
+# Both must be reachable ONLY from the `campaign` profile (the intended autonomous
+# marketing caller). Deny them in every other profile: mandatorily for the
+# untrusted-inbound perimeter profiles (mail, community-responder), where an injected
+# inbound message could otherwise reach the actuator OR exfiltrate the prospect list
+# by echoing it back through the profile's reply tool, and belt-and-suspenders on
+# profiles that don't mount genesis-outreach today (guards an MCP-config
+# fallback-to-full). NOTE: the tool code-gates on effective_mode()==off (returns
+# empty), so this denial is what protects the store once marketing mode is ARMED.
 _NO_MARKETING_SEND = [
     "mcp__genesis-outreach__marketing_send",
+    "mcp__genesis-outreach__marketing_prospects_list",
 ]
 
 # The venv Python interpreter running genesis-server. Exposed to profile
@@ -251,16 +324,19 @@ PROFILES: dict[str, list[str]] = {
         + _NO_OUTREACH_ENGAGEMENT
         + _NO_RECON_WRITES
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     "research": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
-    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
+    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
     # grants Bash (so it can run `gh`) — every other profile blocks Bash.
@@ -273,18 +349,32 @@ PROFILES: dict[str, list[str]] = {
         + _NO_BROWSER_INTERACTION
         + _NO_FILE_WRITE
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
+    # Also a perimeter profile — it reads external Discord messages (see
+    # _PROFILE_ORIGIN below, which classifies it as external-ingesting). It mounts
+    # genesis-outreach (session_config.py) but carried NEITHER outreach deny group,
+    # so the whole outreach surface beyond send — digest, queue, poll,
+    # send_and_wait, engagement, preferences — plus both host-capacity actuators
+    # were reachable from attacker-controlled Discord content. `mail` had the same
+    # shape and was covered; this profile was simply never given the same groups.
+    # Surfaced by the allowlist-polarity test, which is the point of stating the
+    # boundary as an allowlist: an `in`-based test cannot fail for an omission.
     "community-responder": (
         _UNIVERSAL_DISALLOW
         + _NO_BROWSER_INTERACTION
         + _NO_MEMORY_WRITES
         + _NO_FOLLOW_UPS
+        + _NO_OUTREACH_ENGAGEMENT
+        + _NO_OUTREACH_EXTRAS
+        + _NO_PROVISIONING
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -302,7 +392,9 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_WEB_TOOLS
         + _NO_OUTREACH_EXTRAS
+        + _NO_PROVISIONING
         + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
     ),
 }
 
@@ -630,9 +722,10 @@ class DirectSessionRequest:
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
-    # Intentional per-dispatch model SELECTION (not failover): a roster name
-    # (e.g. "glm-5.2") to run this background session on instead of the global
-    # default. None → the chokepoint applies the active default as usual.
+    # Intentional per-dispatch model SELECTION (not failover): a roster name —
+    # a peer from the cc_roster overlay — to run this background session on
+    # instead of the global default. None → the chokepoint applies the active
+    # default as usual.
     roster_model: str | None = None
     # Delivery of the terminal outcome. None → derived from the legacy
     # notify/notify_on_failure_only bools in __post_init__ (SILENT/FAILURE_ONLY),
@@ -676,7 +769,7 @@ class DirectSessionResult:
     duration_s: float = 0.0
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
-    roster_model: str = ""  # roster NAME the chokepoint selected ("glm-5.2"/"claude")
+    roster_model: str = ""  # roster NAME the chokepoint selected (peer name or "claude")
 
 
 # ---------------------------------------------------------------------------
@@ -1428,6 +1521,11 @@ class DirectSessionRunner:
             # profile disallow lists are the belt; this keeps the exception
             # mechanism from becoming a hole in them, regardless of caller.
             exceptions -= set(_NO_MARKETING_SEND)
+            # Same protection for the entity-merge human-approval gate: a
+            # tool_exception must never re-grant approve/apply/reject to a
+            # background session (that would let it self-approve the gate,
+            # defeating the whole point of the universal deny above).
+            exceptions -= set(_NO_ENTITY_ADJUDICATION_WRITE)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile

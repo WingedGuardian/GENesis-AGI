@@ -67,6 +67,43 @@ def test_no_file_not_active(tmp_path: Path) -> None:
     assert _gateway_pause_active(_cfg(tmp_path), now=NOW) is False
 
 
+def test_gateway_paused_verb_reports_active_expired_and_absent(tmp_path: Path) -> None:
+    """The read-only `paused` verb reports whether an UNEXPIRED gateway pause is
+    active (mirrors _gateway_pause_active) so update.sh can avoid clobbering a pause
+    it did not create (P2 #1). Fail-safe: expired or absent → paused: false."""
+    home = tmp_path
+    sd = home / ".local" / "state" / "genesis-guardian"
+    sd.mkdir(parents=True)
+    pf = sd / "paused.json"
+
+    def paused_out() -> str:
+        r = _run_gateway("paused", home)
+        return r.stdout + r.stderr
+
+    def zt(delta_s: int) -> str:  # Z-suffixed UTC iso, now + delta
+        return (datetime.now(UTC) + timedelta(seconds=delta_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # unexpired, within max_ahead → true
+    pf.write_text(json.dumps({"paused": True, "reason": "deploy", "expires_at": zt(1800)}))
+    assert '"paused": true' in paused_out()
+    # far-future (> now + 3600 max_ahead) → false (ignored, mirrors check.py)
+    pf.write_text(json.dumps({"paused": True, "reason": "deploy", "expires_at": zt(999999)}))
+    assert '"paused": false' in paused_out()
+    # expired → false (fail-safe toward monitoring)
+    pf.write_text(json.dumps({"paused": True, "reason": "deploy", "expires_at": zt(-100)}))
+    assert '"paused": false' in paused_out()
+    # naive timestamp (no Z) coerced to UTC, unexpired → true (must not raise → false)
+    naive = (datetime.now(UTC) + timedelta(seconds=1800)).strftime("%Y-%m-%dT%H:%M:%S")
+    pf.write_text(json.dumps({"paused": True, "expires_at": naive}))
+    assert '"paused": true' in paused_out()
+    # paused is not literal true → false
+    pf.write_text(json.dumps({"paused": "true", "expires_at": zt(1800)}))
+    assert '"paused": false' in paused_out()
+    # absent → false
+    pf.unlink()
+    assert '"paused": false' in paused_out()
+
+
 def test_fresh_unexpired_is_active(tmp_path: Path) -> None:
     _write_pause(tmp_path, expires_at=(NOW + timedelta(minutes=10)).isoformat())
     assert _gateway_pause_active(_cfg(tmp_path), now=NOW) is True

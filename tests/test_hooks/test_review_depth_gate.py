@@ -71,7 +71,11 @@ def _stage_inline(repo: Path) -> None:
 
 
 def _mark(repo: Path, home: Path, evidence: str) -> subprocess.CompletedProcess:
-    """Write review evidence then run `review_state.py mark` (computes level/adversarial)."""
+    """Write review evidence then run `review_state.py mark` (computes level/adversarial).
+
+    ``mark`` now requires an outcome flag; these depth tests pass ``--defects`` (the
+    escalation streak is irrelevant here).
+    """
     (home / ".genesis" / "last_code_review.txt").write_text(evidence)
     env = {**os.environ, "HOME": str(home)}
     return subprocess.run(
@@ -81,6 +85,7 @@ def _mark(repo: Path, home: Path, evidence: str) -> subprocess.CompletedProcess:
             "mark",
             "--agent-output",
             str(home / ".genesis" / "last_code_review.txt"),
+            "--defects",
         ],
         cwd=str(repo),
         env=env,

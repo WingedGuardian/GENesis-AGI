@@ -219,12 +219,28 @@ AUTONOMY_GATE_SITES: dict[str, tuple[str, str]] = {
     ),
     "autonomy/email_gate_watcher.py::drain_pending_email_sends": (
         "gated-via",
-        "owner approve -> record_success / owner reject -> record_correction; "
-        "threads origin_class='owner' (owner decisions are the evidence)",
+        "owner reject/cancel -> record_correction; threads origin_class='owner' "
+        "(owner decisions are the evidence). The owner-approve record_success path "
+        "moved to _terminalize_delivered_hold (identical origin_class threading)",
+    ),
+    "autonomy/email_gate_watcher.py::_terminalize_delivered_hold": (
+        "gated-via",
+        "owner approve -> record_success, gated on the pes.mark_sent single-flip "
+        "claim (at-most-once); threads origin_class='owner' (owner decisions are the "
+        "evidence). Shared by the DELIVERED + consumed-approval reconcile branches",
     ),
     "dashboard/routes/autonomy.py::autonomy_flag_send": (
         "gated-via",
         "owner flags an autonomous send from the dashboard; threads origin_class='owner'",
+    ),
+    "autonomy/desktop_gate.py::_classify_cell": (
+        "gated-via",
+        "CLASSIFY apply_event making the desktop cell visible in the matrix; "
+        "threads origin_class='first_party' (Genesis's own deterministic "
+        "classifier) into the crud choke emit. Records no success/correction "
+        "evidence: desktop is absent from PROMOTABLE_DOMAINS, so the cell can "
+        "never be promoted and banking evidence on it would be decoration with "
+        "a mutation surface attached",
     ),
     "ego/cell_promotion.py::handle_cell_promotion_resolution": (
         "gated-via",

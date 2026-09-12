@@ -95,7 +95,13 @@ async def memory_recall(
         compact: If True, return lightweight previews only (memory_id, preview,
             score, wing, room, memory_class, source). Use memory_expand to
             fetch full content for specific IDs. Saves tokens and ~500ms.
-        wing: Filter results to this structural domain (e.g., "infrastructure").
+        wing: Filter results to this structural domain. Controlled vocabulary —
+            one of: autonomy, career, channels, dev_workflow, employment,
+            general, infrastructure, integrations, learning, memory, research,
+            routing. Enumerated here, as `life_domain` below is, because this
+            docstring IS the schema the caller sees: an unlisted value is
+            refused, and a caller that can be told the valid set should not
+            have to learn it by failing a call.
         room: Filter results to this topic within a wing.
         life_domain: Filter by life domain: "personal", "employment", or "genesis".
         include_graph: If False, skip graph traversal (saves ~500ms per call).
@@ -138,6 +144,34 @@ async def memory_recall(
             return [
                 {"error": f"life_domain must be one of {sorted(LIFE_DOMAINS)}, got {life_domain!r}"}
             ]
+
+    # Same treatment for `wing`, the sibling filter parameter. Both Qdrant
+    # (`collections.py` applies wing as a hard `must` condition) and the FTS5
+    # post-filter drop every row on an out-of-vocabulary value, so a typo
+    # returns an empty list that reads as "no such memories exist" rather than
+    # "no such wing". Validity comes from `_validate_wing` so there is ONE
+    # definition of the vocabulary; only the failure SHAPE differs by
+    # direction — the write path raises, this read path reports.
+    if wing is not None:
+        try:
+            _validate_wing(wing)
+        except ValueError as exc:
+            note = ""
+            if mode == "drift":
+                # Drift mode discovers clusters dynamically and ignores
+                # wing/room entirely, so this call would have succeeded before
+                # the guard. Erroring is still right — the caller asked for a
+                # filter that does not exist — but say why it was ignorable.
+                note = " (note: drift mode ignores wing/room filters)"
+            return [{"error": f"{exc}{note}"}]
+        # Use the value we CHECKED, not the one we were handed. `_validate_wing`
+        # tests `wing.strip()`, but every downstream consumer compares the raw
+        # string verbatim — Qdrant as a `MatchValue` FieldCondition and the FTS5
+        # path as a post-filter. Forwarding the unstripped value would let
+        # `wing=" memory "` pass validation and still match zero rows, which is
+        # precisely the silent-empty-result this guard exists to eliminate.
+        # A blank/whitespace-only wing means "no filter", not "filter on empty".
+        wing = wing.strip() or None
 
     _t0 = _time.monotonic()
     memory_mod = _memory_mod()
@@ -732,6 +766,52 @@ async def memory_expand(
     return results
 
 
+def _validate_wing(wing: str | None) -> None:
+    """Reject an out-of-vocabulary wing at the AGENT-FACING boundary.
+
+    Every MCP tool that accepts a `wing` must call this — all three of
+    `memory_recall`, `memory_store` and `memory_synthesize` do. A caller that
+    can be told the valid set should be told it: a silent coercion here teaches
+    nothing, and this parameter has been reported as "not exposed" by an agent
+    that never tried it. `MemoryStore.store()` coerces instead — see the
+    comment there for why the two tiers differ.
+
+    One definition of validity, two failure SHAPES, chosen by direction. The
+    WRITE tools let this ValueError propagate: a rejected write must not look
+    like a completed one. The READ tool (`memory_recall`) catches it and
+    returns `[{"error": ...}]`, matching how its sibling `life_domain` filter
+    already reports a bad value in the same function. Raising there would be
+    the louder choice but not the better one — recall returns a list, and an
+    exception is a harsher failure mode than the empty-looking list it exists
+    to explain.
+
+    Guarding one tool and not its sibling just moves the door: all three
+    agent-facing tools write or filter on the same `memory_metadata.wing`
+    column, and `classify_life_domain()` returns "personal" for an unknown
+    wing, so one bad value corrupts a DERIVED field too. That holds regardless
+    of how many bad rows exist at any moment.
+
+    An earlier revision justified this with a row count ("18 of ~81k rows …,
+    17 of those 18 have `dream_cycle_run_id IS NULL`, so they came through
+    THIS boundary"). Retracted, not merely restated: re-measured 2026-09-03,
+    no wing-bearing table holds ANY out-of-vocabulary row, no store is ~81k,
+    and `dream_cycle_run_id` is NULL for every row in `memory_metadata` — so
+    that column discriminates nothing and the provenance inference never
+    followed from it, whatever the counts had been. The mechanism argument
+    above needs no corpus, which is why it replaces rather than supplements
+    the number.
+    """
+    if wing is None or not wing.strip():
+        return
+    from genesis.memory.taxonomy import WINGS
+
+    if wing.strip() not in WINGS:
+        raise ValueError(
+            f"invalid wing {wing!r}; expected one of {sorted(WINGS)}. "
+            "Omit `wing` to let it be classified automatically."
+        )
+
+
 @mcp.tool()
 async def memory_store(
     content: str,
@@ -761,6 +841,7 @@ async def memory_store(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
+    _validate_wing(wing)
     # WS-3: dispatched sessions carry a session-level origin via env
     # (GENESIS_SESSION_ORIGIN, stamped by CCInvoker). Forward it so an
     # external-influenced session's writes stop landing first_party via the
@@ -1379,6 +1460,7 @@ async def memory_synthesize(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
+    _validate_wing(wing)
 
     resolved_tags = list(tags or [])
     if "synthesis" not in resolved_tags:

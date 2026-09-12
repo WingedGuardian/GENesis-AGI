@@ -26,8 +26,22 @@ async def init(rt: GenesisRuntime) -> None:
         return
 
     try:
+        from genesis.campaigns.name_heal import heal_campaign_names
         from genesis.campaigns.runner import CampaignRunner
         from genesis.mcp.health.campaign_tools import init_campaign_tools
+
+        # Heal pre-write-boundary names BEFORE the runner registers any job.
+        # runner.start() derives each APScheduler job id from the stored name
+        # (``campaign_{name}``), so normalizing afterwards — which is what the
+        # reverted d0012 data migration did, running at _core.py ~:558, well
+        # after this step at ~:472 — would orphan the live job. Doing it here
+        # means the scheduler only ever sees clean names. Fail-open.
+        try:
+            healed = await heal_campaign_names(rt._db)
+            if healed:
+                logger.info("Campaign names normalized: %d", healed)
+        except Exception:
+            logger.exception("Campaign name heal failed — continuing")
 
         runner = CampaignRunner(
             db=rt._db,

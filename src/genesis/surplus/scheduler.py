@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -40,6 +39,30 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+
+def _pump_surplus_heartbeat(where: str) -> None:
+    """Refresh the surplus job-health heartbeat; LOG (never swallow) on failure.
+
+    The 900s zombie-scheduler watchdog reads ``job_health['surplus_dispatch'].last_run``
+    (via status.json). This is the ONLY producer of that timestamp. A silently-failing
+    ``record_job_success`` would starve the watchdog while the loop runs fine — a
+    candidate cause of the 2026-09-01 no-task-running restarts. Logging the failure
+    makes that (previously invisible) mode diagnosable.
+    """
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        GenesisRuntime.instance().record_job_success("surplus_dispatch")
+    except Exception as exc:
+        # No exc_info: record_job_success does a DB persist, so a sustained outage
+        # would emit up to ~4 tracebacks/loop. The exception repr names the cause
+        # (e.g. 'database is locked') without flooding the log during that incident.
+        logger.warning(
+            "surplus heartbeat write failed (%s): %r — the 900s zombie watchdog may see a false stall",
+            where,
+            exc,
+        )
 
 
 def _restart_safe_hourly(hours: int, *, minute: int = 0):
@@ -828,23 +851,19 @@ class SurplusScheduler:
         try:
             # Refresh job_health at loop entry (and before each dispatch, below) so the
             # 900s zombie-scheduler watchdog sees liveness across a SEQUENCE of moderate
-            # dispatches. KNOWN GAP: this does NOT refresh DURING one dispatch_once that
-            # itself blocks 15-30 min — last_run then gaps, and unless heavy_workload is set
-            # (only the dream jobs set it) the watchdog could restart a healthy-but-slow
-            # surplus. Latent — no such restart observed to date; tracked as a follow-up.
-            try:
-                from genesis.runtime import GenesisRuntime
-
-                GenesisRuntime.instance().record_job_success("surplus_dispatch")
-            except Exception:
-                pass
+            # dispatches. The single-long-dispatch gap (a dispatch_once that itself blocks
+            # 15-30 min — INCLUDING a setup-phase stall with NO task running, the
+            # 2026-09-01 incident) is now covered by the heavy_workload flag set at
+            # dispatch_once ENTRY (see dispatch.py). This heartbeat write is the OTHER
+            # liveness signal; its failures are LOGGED (not swallowed) because a silent
+            # failure here would starve the watchdog while the loop runs fine.
+            _pump_surplus_heartbeat("loop-entry")
 
             for _ in range(3):
                 # Refresh before each dispatch so a SEQUENCE of slow/failing tasks
-                # doesn't trip the 900s watchdog (does NOT cover the single-long-dispatch
-                # gap noted at loop entry).
-                with contextlib.suppress(Exception):
-                    GenesisRuntime.instance().record_job_success("surplus_dispatch")
+                # doesn't trip the 900s watchdog (the single-long-dispatch gap is covered
+                # by dispatch_once's entry-set heavy_workload flag).
+                _pump_surplus_heartbeat("pre-dispatch")
                 if not await self.dispatch_once():
                     break
 

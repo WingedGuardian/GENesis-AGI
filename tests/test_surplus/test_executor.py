@@ -615,3 +615,54 @@ async def test_gather_context_excludes_infrastructure_alerts():
     typed_calls = [c for c in q.call_args_list if "type" in c.kwargs]
     for c in typed_calls:
         assert "exclude_types" not in c.kwargs
+
+
+# --- The WING_AUDIT prompt teaches a vocabulary the system will not honour ---
+# It asks a model to propose wing reclassifications, and it shipped a
+# hand-copied list naming `architecture` and `identity`, neither of which is in
+# `taxonomy.WINGS`. That is a defect on the mechanism alone: the agent-facing
+# MCP doors reject an out-of-vocabulary wing and `MemoryStore.store()` coerces
+# it away, so any name here that is not a wing can only produce work the system
+# discards.
+#
+# Deliberately NOT claimed: that this prompt caused specific corrupt rows.
+# `executor.py` states 11 lines above the prompt that wing-audit findings are
+# observational-only (posted for review, not auto-applied), and the traced path
+# — intake -> _route_to_knowledge -> MemoryStore.store() — passes no explicit
+# wing at all. It is a plausible contributor (it teaches an agent a word the
+# agent may later hand to `memory_store`), not a demonstrated cause. Row counts
+# quoted from an earlier revision of this branch did not reproduce against a
+# live store — re-measured, no wing-bearing table held any out-of-vocabulary
+# row — so they are omitted rather than restated. The mechanism argument above
+# needs no corpus, and a public repo is no place to state the size of an
+# install's private memory store.
+
+
+def test_wing_audit_prompt_offers_only_real_wings():
+    """Every wing the prompt names must be one the write path will accept."""
+    import re
+
+    from genesis.memory.taxonomy import WINGS
+    from genesis.surplus.executor import _TASK_PROMPTS
+
+    prompt = _TASK_PROMPTS[TaskType.WING_AUDIT]
+    line = next(ln for ln in prompt.split("\n") if "existing wings" in ln)
+    offered = {w.strip() for w in line.split(":", 1)[1].split(",")}
+
+    assert offered, "the prompt names no wings at all"
+    assert not (offered - WINGS), f"prompt offers non-wings: {sorted(offered - WINGS)}"
+    # The two the hand-copied list actually shipped, named so a regression reads
+    # as the specific defect rather than a generic set mismatch.
+    assert "architecture" not in offered and "identity" not in offered
+
+    # The template is `.format(context=...)`-ed at dispatch (executor.py), so a
+    # wing name carrying a format brace would raise inside _build_prompt and
+    # kill the surplus task. Guarded here rather than at import — see the note
+    # beside _WING_VOCABULARY.
+    assert "{" not in line and "}" not in line, line
+
+    # Derived, not restated: the prompt must carry the WHOLE vocabulary, or the
+    # next wing added to WINGS is one this audit can never propose. `general`
+    # is the sole exclusion — this task exists to move memories OUT of it.
+    assert offered == WINGS - {"general"}
+    assert not re.search(r"\bgeneral\b", line)
