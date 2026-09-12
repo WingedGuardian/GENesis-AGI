@@ -750,6 +750,7 @@ class OutreachPipeline:
                     self._db,
                     outreach_id=outreach_id,
                     category=request.category.value,
+                    channel=channel,
                     stated_confidence=request.stated_confidence,
                 )
             except Exception:  # noqa: BLE001 — ledger is best-effort; never break the send

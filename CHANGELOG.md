@@ -9,6 +9,82 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **SECURITY.md described a posture the code left behind two months ago.** The
+  security policy told operators to treat the dashboard API as
+  "unauthenticated administrative access" and said the dashboard password
+  "protects the web UI, not the programmatic API". Neither has been true since
+  the API mutation gate landed: with a password set, state-changing `/api`
+  requests require a bearer token or an authenticated same-origin cookie with a
+  CSRF check, and `/v1` enforces its own bearer. The doc now says so -- along
+  with the limits that decide whether you still need network isolation, because
+  you do: the gate covers mutations only, reads stay open, it is inert when no
+  password is set, and it has a documented kill switch.
+
+  Corrected in the same pass: the autonomy ladder was described as seven levels
+  (`L0`-`L6`) when four ship (`L1`-`L4`, the rest deferred), the per-category
+  permissions were described as six categories when there are four, and the
+  process-group-kill example was attributed to a PreToolUse hook when it is
+  runtime library hardening -- a different guarantee, since a hook cannot be
+  bypassed by the agent and a helper only protects its own call sites. The
+  guard section also named one linter as the enforcement mechanism for shell
+  and URL policy; that linter only ever sees file edits, and the shell and web
+  guards are separate programs chosen by tool matcher.
+
+  Newly documented rather than corrected: provenance stamping and the two
+  privileged-write paths gated on it, the approval requirement and journal now
+  standing in front of irreversible entity merges, session-id validation before
+  filesystem use, and an External Egress section that says plainly which
+  outbound channel actually enforces a gate today and which are only observed.
+
+
+### Changed
+
+- **A capability can no longer earn standing autonomy just by existing.**
+  Genesis's per-capability trust cells can be promoted from "ask me every time"
+  to a standing grant once a capability accumulates approved successes. That
+  promotion path was scoped by evidence but not by capability: any future
+  capability whose cells recorded five approved successes would have been
+  offered to you for promotion, and approving it would have converted
+  per-action approval into standing authority. The same was true of anything
+  money-related: Genesis's own definition calls financial actions
+  "never trust-unlockable", but nothing actually stopped a financial capability
+  being promoted -- it was held back only by the order of two statements in the
+  email path. Promotion now requires passing two fixed bars: the capability must
+  be on a short allowlist (email only today) and must not be financial, checked
+  both where candidates are proposed and at the state change itself. Everything
+  else stays at ask-me-every-time for its whole life -- still learning, still
+  tracking evidence, but never converting that into a standing grant without a
+  deliberate code change. No behaviour change for ordinary email sends.
+
+- **The session charter now lists every open ledger item, not just the oldest
+  six.** The ledger is a curated list of one-line to-dos, and the old window
+  meant a session with more than six open items never saw a newly added one in
+  its own prompt — it existed only in the aggregate count. The list is now
+  effectively unbounded (a 200-row ceiling with an explicit "more than 200 —
+  the rest are not listed" note), and an oversized charter block degrades by
+  dropping whole sections with a marker rather than cutting mid-bullet, with
+  the open/closed count preserved.
+
+- **A review comment on documentation no longer blocks a merge.** The pre-merge
+  check already declined to count findings on prose, but its idea of prose was
+  narrow: markdown counted only underneath `docs/`, so a comment on a top-level
+  guide, or on one of the instruction files that shape how the assistant works,
+  was treated as a finding on code and held the merge. Any markdown, reStructured-
+  Text or AsciiDoc file now counts as documentation wherever it lives.
+
+  The narrowness was deliberate, and it is being relaxed on one specific ground:
+  a separate check, at the moment work is committed rather than merged, classifies
+  those instruction files independently and still requires a proper review before
+  they can change. So what moves is only whether a reviewer's comment on prose can
+  hold up a merge — not whether prose gets reviewed.
+
+  Reversible without another change: `merge_gate.doc_findings` accepts `skip`
+  (the default, prose never blocks), `p1_only` (only the highest severity blocks
+  on prose), or `score` (prose is treated exactly like code, the previous
+  behaviour). Findings are listed in the pre-merge report under every setting —
+  the lever decides whether they count, never whether anyone sees them.
 ## [v3.0b18] - 2026-09-07
 
 ### Added

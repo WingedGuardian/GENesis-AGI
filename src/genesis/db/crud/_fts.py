@@ -12,7 +12,34 @@ when the AND query returned zero — it never changes a query that already hit.
 
 from __future__ import annotations
 
+import re
+
 import aiosqlite
+
+
+def fts5_term(value: object) -> str | None:
+    """One FTS5-safe bare term, or ``None`` if nothing survives sanitising.
+
+    Callers that COMPOSE a boolean expression must sanitise each term BEFORE
+    joining it, not after. ``_prepare_fts5(boolean=True)`` strips unsafe
+    characters from the finished expression, which turns a punctuation-only term
+    into whitespace and leaves a dangling operator — ``(fusion OR  )`` — that is
+    still parenthesis-BALANCED and so passes that function's only structural
+    check, then fails in FTS5 with ``syntax error near ")"``.
+
+    Returning ``None`` for "nothing left" is the point: it lets a composer DROP
+    the term instead of emitting an operator with no operand. Word characters
+    and single interior spaces survive (a hyphenated tag becomes two terms, the
+    same result ``_prepare_fts5`` already produced for it); everything else goes.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^\w\s]", " ", str(value), flags=re.UNICODE)
+    # Collapse runs so a joined expression can never contain a bare double space
+    # that reads as an empty operand to a later reviewer.
+    cleaned = " ".join(cleaned.split())
+    return cleaned or None
+
 
 # Ultra-common English stopwords dropped from the OR retry so a verbose query
 # like "where is the nonexistent service" falls back to "nonexistent OR service"

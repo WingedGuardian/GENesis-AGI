@@ -28,6 +28,16 @@ async def graph_db(tmp_path):
             PRIMARY KEY (source_id, target_id)
         )
     """)
+    await db.execute("""
+        -- The graph loader applies recall's visibility predicate, so every
+        -- fixture that builds a projection needs this table. Empty here:
+        -- no invalid rows, so these tests' expectations are unchanged.
+        CREATE TABLE memory_metadata (
+            memory_id  TEXT PRIMARY KEY,
+            invalid_at TEXT,
+            deprecated INTEGER
+        )
+    """)
     await db.execute(
         "CREATE INDEX idx_ml_source ON memory_links(source_id)"
     )

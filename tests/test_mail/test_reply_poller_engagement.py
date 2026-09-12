@@ -331,8 +331,8 @@ async def test_e2e_reply_prediction_resolves_after_bridge(db):
         delivery_id="<sent-def@mx.google.com>",
     )
     # Mirror pipeline._deliver: write reply_received/positive_engagement predictions.
-    await ledger_writers.on_outreach_delivered(db, outreach_id=OUTREACH_ID, category="content")
-    await ledger_writers.on_outreach_delivered(db, outreach_id=other_id, category="content")
+    await ledger_writers.on_outreach_delivered(db, outreach_id=OUTREACH_ID, category="content", channel="email")
+    await ledger_writers.on_outreach_delivered(db, outreach_id=other_id, category="content", channel="email")
 
     # Bridge the reply on send A → engagement 'useful' / signal 'user_reply'.
     tracker = ThreadTracker(db)
