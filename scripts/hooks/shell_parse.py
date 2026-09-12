@@ -550,6 +550,11 @@ _KNOWN_SIGILS = (
     # missing declaration nor an unwarranted one can ship unnoticed.
     "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
     "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
+    # FOURTH occurrence of the class, caught the same way — by the test, not by
+    # review. The push-without-PR gate shipped its query without this line, and
+    # the branch was red on a suite the author did not run (the push-guard suites
+    # passed; the guard against exactly this mistake lives here).
+    "no-pr-ack",  # git_push_guard: re-push of a public branch with no open PR
     # THIRD occurrence of the class the comment above describes, caught by that
     # test rather than in review: the round-7 terminal shipped its sigil query
     # without this line, and the terminal's own block message printed the losing

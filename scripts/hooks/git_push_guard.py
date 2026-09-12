@@ -111,6 +111,7 @@ import shlex
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -7611,6 +7612,156 @@ def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str 
     return None
 
 
+def _push_is_dry_run(argv: list[str]) -> bool:
+    """Whether this push is a dry run, which publishes nothing.
+
+    ``--dry-run`` and its short form ``-n``, including inside a bundled short
+    cluster (``-nv``). A dry run cannot create the no-CI gap this gate exists to
+    prevent, and refusing it would block the command people reach for precisely
+    when a push is being refused.
+    """
+    for tok in argv[1:]:
+        if tok == "--":
+            break
+        if tok == "--dry-run":
+            return True
+        if tok.startswith("-") and not tok.startswith("--") and "n" in tok[1:]:
+            return True
+    return False
+
+
+def _remote_url_slug(url: str) -> str | None:
+    """Casefolded ``owner/repo`` for a github.com remote url, else None.
+
+    Parsed with the CANONICAL stdlib ``urlsplit`` rather than a hand-rolled split
+    of an unbounded grammar — the same rule ``push_allowlist._sanitize_url``
+    already follows, and for the same reason. A hand-split version of this
+    function misclassified SIX families, every one silently (the gate simply
+    never fired): a port (``ssh://git@github.com:22/o/r``,
+    ``https://github.com:443/o/r``), an uppercase HOST in either the URL or the
+    scp-like form — RFC 3986 makes the host case-insensitive — an uppercase
+    OWNER/REPO which GitHub itself treats case-insensitively, a trailing slash
+    after ``.git``, a ``#fragment`` or ``?query``, and a scp-like form with no
+    user (``github.com:o/r.git``).
+
+    (The uppercase-host examples are deliberately described rather than spelled
+    out: CI's email scan excludes ``@github.com`` CASE-SENSITIVELY, so the literal
+    uppercase form reads to it as a personal address. The test file carries the
+    real spellings — it is excluded from that scan — so coverage is unaffected.)
+
+    Both halves are casefolded because both are case-insensitive in practice, so
+    the caller compares like with like.
+    """
+    if not url or not url.strip():
+        return None
+    v = url.strip()
+
+    if "://" in v:
+        try:
+            parts = urlsplit(v)
+        except ValueError:
+            return None
+        # `hostname` is already lowercased and userinfo-stripped; `path` excludes
+        # query and fragment. Port is deliberately ignored: github.com:443 and
+        # github.com are the same host for identity purposes.
+        host, path = parts.hostname, parts.path
+    else:
+        # git's OWN rule for scp-like vs local path: a ":" with NO "/" before it.
+        colon = v.find(":")
+        slash = v.find("/")
+        if colon == -1 or (slash != -1 and slash < colon):
+            return None  # a local path, not a remote url
+        authority, path = v[:colon], v[colon + 1 :]
+        host = authority.rsplit("@", 1)[-1].lower()  # drop optional [user@]
+
+    if not host or host != "github.com":
+        return None
+    segments = [s for s in (path or "").split("/") if s]
+    if len(segments) != 2:
+        return None
+    owner, repo = segments
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}".lower()
+
+
+def _urls_target_public_repo(urls: set[str]) -> bool:
+    """Whether ANY of these push urls points at the canonical public repo.
+
+    Fail-SAFE for this gate's purposes means returning False when the public repo
+    cannot be determined or no url resolves: the caller then leaves the push
+    alone. Refusing to publish because we could not identify the destination
+    would stop work on private remotes for a condition we never established.
+    """
+    # Test seam, mirroring the existing `_TEST_*` ones. It exists because a test
+    # CANNOT fake a public remote by pointing a github-looking url at a local bare
+    # repo: `git remote get-url --push` expands `insteadOf`, so the guard sees the
+    # local path and this function correctly returns False — which silently
+    # satisfies the gate by the WRONG conjunct and makes any assertion about the
+    # other conjuncts vacuous. That is not hypothetical: it is exactly how the
+    # first version of the first-push test passed while testing nothing.
+    if os.environ.get("_TEST_FORCE_PUBLIC_REMOTE") == "1":
+        return True
+    canonical = _canonical_public_repo()
+    if not canonical or not urls:
+        return False
+    # Casefolded on both sides: GitHub owner/repo are case-insensitive, so
+    # `WingedGuardian/GENesis-AGI` and `wingedguardian/genesis-agi` are one repo.
+    target = canonical.lower()
+    return any((_remote_url_slug(u) or "") == target for u in urls)
+
+
+def _branch_has_open_pr(branch: str, repo: str | None = None) -> bool | None:
+    """True/False if ``branch`` heads an OPEN PR; None when undeterminable.
+
+    The three-valued return is the whole point. A boolean would collapse "there
+    is no PR" into "gh could not tell us", and this gate BLOCKS on the former —
+    so a network blip would halt every push on the box. Callers must treat None
+    as "do not block".
+
+    Tests inject via ``_TEST_GH_OPEN_PR``: ``"1"``/``"0"`` force a definite
+    answer, and an empty value forces the undeterminable branch.
+    """
+    raw = os.environ.get("_TEST_GH_OPEN_PR")
+    if raw is not None:
+        s = raw.strip()
+        if not s:
+            return None
+        return s not in ("0", "false", "no")
+    if not branch:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "list",
+                "--head", branch,
+                "--state", "open",
+                *_repo_args(repo),
+                "--limit", "1",
+                "--json", "number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    if not out:
+        return None  # rc=0 with empty stdout is silence, not "there is no PR"
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list):
+        return None  # `null` or an object is outside gh's documented contract
+    return bool(data)
+
+
 def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None = None) -> bool:
     """Whether this push targets a branch ALREADY on ``remote`` (a re-push).
 
@@ -8094,12 +8245,84 @@ def _run_merge_and_push_gates() -> int:
                     else:
                         ask_reason = (
                             f"git push needs your approval before publishing externally "
-                            f"(target: {branch or 'default'})."
+                            f"(target: {branch or 'default'}). After it lands, open the "
+                            f"PR IMMEDIATELY — a branch on the remote with no PR gets no "
+                            f"CI at all, so the leak scan never runs on it."
                         )
+
+                    # A re-push to an ALREADY-PUBLISHED branch with no OPEN PR.
+                    #
+                    # This sits on the re-push arm, never the first push, and that
+                    # placement is the design. Blocking a FIRST push for "no PR"
+                    # would deadlock publishing outright: a PR cannot be opened for
+                    # a branch that is not on the remote yet, and `gh pr create`
+                    # does not push for you (MEASURED, gh 2.98.0: it aborts
+                    # non-interactively because its implicit push needs a prompt).
+                    # So the first push is approved by the dialog as before, and
+                    # every push AFTER it requires the PR to exist — which bounds a
+                    # branch's PR-less window to one push instead of forever.
+                    #
+                    # Fail OPEN on anything uncertain. A miss costs one branch
+                    # briefly lacking a PR; a false block stops every session on
+                    # the box from pushing, and this runs on the hot path.
+                    # `and` short-circuits left to right, so the gh call is never
+                    # made for a private remote or a first push.
+                    if (
+                        push_allow_reason is not None
+                        # SF9: a dry run publishes nothing, so it cannot create a
+                        # CI gap — and it is exactly what someone reaches for when
+                        # a push is being refused.
+                        and not _push_is_dry_run(push_segs[0].argv)
+                        # SF8: `gh pr create && git push` is the remedy this block
+                        # prints. A PreToolUse block discards the WHOLE compound,
+                        # so catching it would throw the fix away with the push.
+                        and not create_segs
+                        and _urls_target_public_repo(urls)
+                        # SF5: scope the PR query to the SAME repo the conjunct
+                        # above just proved we are pushing to. With repo=None, gh
+                        # resolves from the hook's own cwd, so the two facts could
+                        # come from different repositories and be compared as one.
+                        and _branch_has_open_pr(cur, _canonical_public_repo()) is False
+                        # B2: per-SEGMENT, never against the whole command. Every
+                        # sibling call site in this repo passes `seg.raw`, and the
+                        # whole-cmd form is measurably bypassable — an unrelated
+                        # segment, a later segment, or a HEREDOC BODY that merely
+                        # mentions the sigil all waived the gate.
+                        and not any(
+                            has_trailing_override(s.raw, "no-pr-ack") for s in push_segs
+                        )
+                        # B3: the allowlist arm above is OFFLINE and trusts a
+                        # 90-day-old record even when the remote branch is gone
+                        # (push_allowlist's documented TRUST WINDOW). That was a
+                        # conscious acceptance for SKIPPING A PROMPT; it is not
+                        # acceptable as the premise of a hard block, because a
+                        # branch name re-created inside that window would be
+                        # refused with a remedy it cannot run (`gh pr create`
+                        # needs the branch ON the remote). Confirm live before
+                        # refusing — last conjunct, so the common allow path
+                        # never pays for it.
+                        and _push_is_republish(push_remote, cur, pcwd)
+                    ):
+                        print(
+                            f"BLOCKED: '{cur}' is already on the public remote with no "
+                            f"open PR. A pushed branch with no PR gets NO CI at all "
+                            f"(ci.yml fires on push:[main] / pull_request:[main] and "
+                            f"matches neither), so nothing scans it for leaks.\n"
+                            f"Open it FIRST, as its own command — chaining it to the "
+                            f"push means this block discards both:\n"
+                            f"    gh pr create --title ... --body-file ...\n"
+                            f"Then re-run the push.\n"
+                            f"(Deliberately keeping this branch PR-less? Append "
+                            f"'  # no-pr-ack' to the push command.)",
+                            file=sys.stderr,
+                        )
+                        return 2
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
-                        f"(target: {branch or 'default'})."
+                        f"(target: {branch or 'default'}). After it lands, open the PR "
+                        f"IMMEDIATELY — a branch on the remote with no PR gets no CI at "
+                        f"all, so the leak scan never runs on it."
                     )
 
         # ── git merge into main ─────────────────────────────────────
