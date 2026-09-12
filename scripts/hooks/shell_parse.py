@@ -1530,10 +1530,7 @@ def _nested_script(argv: list[str]) -> str:
 
         pos = tok.find("c")
 
-        if _INTERPRETER_C_BUNDLE.match(tok):
-            if i + 1 < len(argv):
-                return argv[i + 1]
-        elif pos == len(tok) - 1:
+        if _INTERPRETER_C_BUNDLE.match(tok) or pos == len(tok) - 1:
             if i + 1 < len(argv):
                 return argv[i + 1]
         else:
