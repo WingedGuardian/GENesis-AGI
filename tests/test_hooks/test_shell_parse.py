@@ -119,6 +119,31 @@ class TestNesting:
     def test_bash_lc_bundle(self):
         assert _commit_nv("bash -lc 'git commit -n -m wip'")
 
+    def test_bash_ce_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ce 'echo hello'"))
+
+    def test_bash_cl_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -cl 'echo hello'"))
+
+    def test_bash_ec_bundle_still_works(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -ec 'echo hello'"))
+
+    @pytest.mark.parametrize("interpreter", ["dash", "sh"])
+    @pytest.mark.parametrize("options", ["cC", "Cc", "cE", "Ec", "cI", "Ic", "cV", "Vc"])
+    def test_dash_valid_uppercase_c_bundles_recurse(self, interpreter, options):
+        assert any(s.exe == "echo" for s in sp.analyze(f"{interpreter} -{options} 'echo hello'"))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -- -ce 'echo hidden'",
+            "bash - -ce 'echo hidden'",
+            "bash -cz 'echo hidden'",
+        ],
+    )
+    def test_interpreter_non_options_and_invalid_bundles_do_not_recurse(self, command):
+        assert not any(s.exe == "echo" for s in sp.analyze(command))
+
     def test_command_substitution(self):
         assert _push_blocked('echo "$(git push origin main)"')
 
@@ -312,6 +337,31 @@ class TestCommandPositionStrip:
 
     def test_while_do_done(self):
         assert self._detects("while :; do git push --force origin main; done", "git", "push")
+
+    def test_case_pattern_command(self):
+        assert self._detects("case x in y) echo hello ;; esac", "echo")
+
+    def test_case_multiple_pattern_commands(self):
+        command = "case x in a) echo first ;; b) echo second ;; esac"
+        segments = sp.analyze(command)
+
+        assert sum(s.exe == "echo" for s in segments) == 2
+
+    def test_function_body_command(self):
+        assert self._detects("f() { echo hello; }", "echo")
+
+    def test_function_keyword_body_command(self):
+        assert self._detects("function f { echo hello; }", "echo")
+
+    def test_coproc_command(self):
+        assert self._detects("coproc echo hello", "echo")
+
+    def test_named_coproc_compound_body_command(self):
+        assert self._detects("coproc worker { rm -rf /tmp/scratch; }", "rm")
+
+    @pytest.mark.parametrize("opener, closer", [("(", ")"), ("if true; then", "fi"), ("while false; do", "done")])
+    def test_named_coproc_other_compound_body_command(self, opener, closer):
+        assert self._detects(f"coproc worker {opener} rm -rf /tmp/scratch; {closer}", "rm")
 
     def test_glued_rm(self):
         assert self._detects("(rm -rf ~)", "rm")
