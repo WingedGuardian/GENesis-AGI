@@ -44,13 +44,6 @@ _pipeline: object | None = None
 _memory_store: object | None = None
 
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_GITHUB_VISIBILITY_QUALIFIER_RE = re.compile(
-    r"(?<!\S)(?:is|visibility):(public|private|internal)(?!\S)", re.IGNORECASE,
-)
-_GITHUB_ISSUE_TYPE_QUALIFIER_RE = re.compile(
-    r"(?<!\S)(?:is|type):(issue|pr)(?!\S)", re.IGNORECASE,
-)
-_GITHUB_BOOLEAN_OR_RE = re.compile(r"(?<!\S)OR(?!\S)")
 _GITHUB_TREE_ENTRY_LIMIT = 2_000
 _GITHUB_CONTENTS_MAX_BYTES = 8 * 1024 * 1024
 _GITHUB_API_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
@@ -62,6 +55,39 @@ _GITHUB_CONTENTS_MAX_BASE64_CHARS = 4 * ((_GITHUB_CONTENTS_MAX_BYTES + 2) // 3)
 class _GitHubAPIFailure:
     kind: str
     status_code: int | None = None
+
+
+def _github_issue_query(
+    text: str,
+    repository: str,
+    state: str,
+    labels: list[str],
+) -> tuple[str | None, str | None]:
+    """Build an issue-only public query from validated, structured fields."""
+    if repository and _GITHUB_REPO_RE.fullmatch(repository) is None:
+        return None, "repository must be in owner/name form"
+    if state not in {"", "open", "closed"}:
+        return None, "state must be open, closed, or empty"
+
+    values = [text, *labels]
+    if any(any(ord(char) < 32 or ord(char) == 127 for char in value) for value in values):
+        return None, "issue text and labels must not contain control characters"
+    if any('"' in value or "\\" in value for value in values):
+        return None, "issue text and labels must not contain quotes or backslashes"
+    if any(not label.strip() for label in labels):
+        return None, "labels must not contain empty values"
+
+    parts = ["is:issue", "is:public"]
+    if text.strip():
+        parts.append(f'"{text.strip()}"')
+    if repository:
+        parts.append(f"repo:{repository}")
+    if state:
+        parts.append(f"state:{state}")
+    parts.extend(f'label:"{label.strip()}"' for label in labels)
+    if len(parts) == 2:
+        return None, "issue search requires text or at least one structured filter"
+    return " ".join(parts), None
 
 
 def _github_failure_message(action: str, failure: object) -> str:
@@ -181,6 +207,8 @@ def _repository_visibility(repository: object) -> bool | None:
         return None
     private = repository["private"]
     visibility = repository.get("visibility")
+    if not isinstance(visibility, str):
+        return None
     if visibility == "public" and private is False:
         return True
     if visibility in {"private", "internal"}:
@@ -585,48 +613,44 @@ async def recon_run_github_discovery(query: str, limit: int = 10) -> dict:
 @mcp.tool()
 async def recon_github_search(
     kind: str,
-    query: str,
+    query: str = "",
+    repository: str = "",
+    state: str = "",
+    labels: list[str] | None = None,
     page: int = 1,
     per_page: int = 30,
 ) -> dict:
     """Search public GitHub.com repositories or issues without shell access.
 
-    This is a read-only, fixed-endpoint wrapper around GitHub's search API.
+    Repository ``query`` accepts GitHub's repository-search syntax. For issue
+    search, ``query`` is literal text; use the structured ``repository``,
+    ``state``, and ``labels`` fields for filters. Issue searches always enforce
+    ``is:issue is:public``. This is a read-only, fixed-endpoint API wrapper.
     It reports transport/API failure separately from a successful empty result.
     Pagination is explicit: page >= 1 and per_page is limited to 1..100.
     """
     if kind not in {"repositories", "issues"}:
         return {"ok": False, "error": "kind must be repositories or issues"}
-    if not query.strip():
+    if kind == "repositories" and not query.strip():
         return {"ok": False, "error": "query must not be empty"}
+    if kind == "repositories" and any(
+        (repository, state, labels)
+    ):
+        return {"ok": False, "error": "issue filters require kind=issues"}
     if "\x00" in query:
         return {"ok": False, "error": "query must not contain NUL bytes"}
     if page < 1 or not 1 <= per_page <= 100:
         return {"ok": False, "error": "page must be >= 1 and per_page must be 1..100"}
 
-    # Remove caller-supplied visibility terms before adding the authoritative
-    # public constraint. Local response checks below provide a second boundary.
-    public_query = _GITHUB_VISIBILITY_QUALIFIER_RE.sub("", query).strip()
+    public_query = query
     if kind == "issues":
-        # GitHub's search/issues endpoint combines issues and pull requests.
-        # Its legacy REST grammar does not reliably preserve a trailing type
-        # qualifier across Boolean OR branches, so callers must split those into
-        # separate searches. Remove other caller-supplied type qualifiers and
-        # add the authoritative issue-only constraint.
-        if _GITHUB_BOOLEAN_OR_RE.search(public_query):
-            return {
-                "ok": False,
-                "error": "issues query must not contain Boolean OR; run separate searches",
-            }
-        public_query = _GITHUB_ISSUE_TYPE_QUALIFIER_RE.sub("", public_query).strip()
-        if not public_query:
-            return {
-                "ok": False,
-                "error": "query must include terms beyond visibility/type qualifiers",
-            }
-        public_query = f"{public_query} is:issue is:public"
-    else:
-        public_query = f"{public_query} is:public".strip()
+        public_query, query_error = _github_issue_query(
+            query, repository, state, labels or [],
+        )
+        if query_error is not None:
+            return {"ok": False, "error": query_error}
+        if public_query is None:
+            return {"ok": False, "error": "GitHub issue query construction failed"}
     ok, raw = await _github_public_api(
         f"search/{kind}",
         params={"q": public_query, "page": str(page), "per_page": str(per_page)},

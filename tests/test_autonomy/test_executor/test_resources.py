@@ -176,13 +176,13 @@ class TestLoadStepResources:
 
     async def test_skill_loaded(self, tmp_path: Path) -> None:
         """Skills are loaded from SKILL.md when assigned."""
-        skill_dir = tmp_path / "research"
+        skill_dir = tmp_path / "dev"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("# Research Skill\nDo research.")
 
         catalog = {
             "tier1": [],
-            "tier2": [{"name": "research", "description": "Research", "tier": 2, "path": ""}],
+            "tier2": [{"name": "dev", "description": "Development", "tier": 2, "path": ""}],
         }
 
         with patch(
@@ -192,7 +192,7 @@ class TestLoadStepResources:
             "genesis.autonomy.executor.resources._skill_catalog_cache",
             catalog,
         ):
-            step = {"idx": 0, "skills": ["research"]}
+            step = {"idx": 0, "skills": ["dev"]}
             result = await load_step_resources(None, step)
             assert result is not None
             assert "Research Skill" in result
@@ -233,12 +233,11 @@ class TestLoadStepResources:
 
         with (
             patch(
-                "genesis.autonomy.executor.resources._find_skill_path",
-                return_value=research_dir,
-            ),
-            patch(
-                "genesis.learning.skills.wiring.get_skill_path",
-                return_value=web_dir / "SKILL.md",
+                "genesis.autonomy.executor.resources._REQUIRED_STEP_SKILL_FILES",
+                {
+                    "research": research_dir / "SKILL.md",
+                    "web-research": web_dir / "SKILL.md",
+                },
             ),
         ):
             result = await load_step_resources(None, {"skills": ["research"]})
@@ -259,12 +258,11 @@ class TestLoadStepResources:
 
         with (
             patch(
-                "genesis.autonomy.executor.resources._find_skill_path",
-                return_value=research_dir,
-            ),
-            patch(
-                "genesis.learning.skills.wiring.get_skill_path",
-                return_value=None,
+                "genesis.autonomy.executor.resources._REQUIRED_STEP_SKILL_FILES",
+                {
+                    "research": research_dir / "SKILL.md",
+                    "web-research": tmp_path / "missing.md",
+                },
             ),
             pytest.raises(
                 RequiredSkillUnavailableError, match="unavailable: web-research",
@@ -272,28 +270,20 @@ class TestLoadStepResources:
         ):
             await load_step_resources(None, {"skills": ["research"]})
 
-    async def test_delegated_skill_lookup_error_is_explicit(self, tmp_path: Path) -> None:
-        research_dir = tmp_path / "research"
-        research_dir.mkdir()
-        (research_dir / "SKILL.md").write_text(
-            "---\nname: research\n---\n# Research",
-            encoding="utf-8",
-        )
-
-        with (
-            patch(
-                "genesis.learning.skills.wiring.get_skill_path",
-                side_effect=OSError("unreadable catalog"),
-            ),
-            patch(
-                "genesis.autonomy.executor.resources._find_skill_path",
-                return_value=research_dir,
-            ),
-            pytest.raises(
-                RequiredSkillUnavailableError, match="unavailable: web-research",
-            ),
+    async def test_delegated_skill_ignores_missing_catalog(self) -> None:
+        with patch(
+            "genesis.autonomy.executor.resources._find_skill_path",
+            side_effect=AssertionError("required skills must not consult the catalog"),
+        ), patch(
+            "genesis.autonomy.executor.resources._CATALOG_PATH",
+            Path("/nonexistent/catalog.json"),
         ):
-            await load_step_resources(None, {"skills": ["research"]})
+            result = await load_step_resources(None, {"skills": ["research"]})
+
+        assert result is not None
+        assert "structured output below" in result
+        assert "### Delegated method: web-research" in result
+        assert "Evidence standard" in result
 
     async def test_missing_skill_skipped(self) -> None:
         """Missing skills are skipped gracefully."""

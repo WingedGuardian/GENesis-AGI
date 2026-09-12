@@ -339,7 +339,7 @@ async def test_github_search_rejects_malformed_payloads(tools, monkeypatch, payl
     assert result["ok"] is False
 
 
-async def test_github_search_forces_public_visibility_and_filters_private_items(tools, monkeypatch):
+async def test_github_repository_search_filters_private_items(tools, monkeypatch):
     calls = []
 
     async def fake(endpoint, **kwargs):
@@ -352,7 +352,7 @@ async def test_github_search_forces_public_visibility_and_filters_private_items(
     )
 
     assert calls[0][0] == "search/repositories"
-    assert calls[0][1]["params"]["q"] == "topic is:public"
+    assert calls[0][1]["params"]["q"] == "topic is:private"
     assert [item["full_name"] for item in result["items"]] == ["o/public"]
     assert result["visibility_filter_applied"] is True
 
@@ -362,6 +362,8 @@ async def test_github_search_forces_public_visibility_and_filters_private_items(
     [
         {"full_name": "o/r", "private": False},
         {"full_name": "o/r", "private": False, "visibility": None},
+        {"full_name": "o/r", "private": False, "visibility": []},
+        {"full_name": "o/r", "private": False, "visibility": {}},
         {"full_name": "o/r", "private": False, "visibility": "unknown"},
         {"full_name": "o/r", "private": True, "visibility": "public"},
     ],
@@ -410,57 +412,53 @@ async def test_github_issue_search_forces_public_visibility(tools, monkeypatch):
 
     monkeypatch.setattr("genesis.mcp.recon_mcp._github_public_api", fake_search)
     result = await tools["recon_github_search"].fn(
-        kind="issues", query="bug is:private",
+        kind="issues", query="memory leak", repository="o/r",
+        state="open", labels=["help wanted", "bug"],
     )
 
     assert result["ok"] is True
     assert calls[0][0] == "search/issues"
-    assert calls[0][1]["params"]["q"] == "bug is:issue is:public"
-
-
-async def test_github_issue_search_replaces_type_qualifiers(
-    tools, monkeypatch,
-):
-    calls = []
-
-    async def fake_search(endpoint, **kwargs):
-        calls.append((endpoint, kwargs))
-        return True, '{"total_count":0,"items":[]}'
-
-    monkeypatch.setattr("genesis.mcp.recon_mcp._github_public_api", fake_search)
-    result = await tools["recon_github_search"].fn(
-        kind="issues", query="label:bug is:pr type:pr",
+    assert calls[0][1]["params"]["q"] == (
+        'is:issue is:public "memory leak" repo:o/r state:open '
+        'label:"help wanted" label:"bug"'
     )
 
-    assert result["ok"] is True
-    assert calls[0][1]["params"]["q"] == "label:bug is:issue is:public"
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"query": ""}, "issue search requires text or at least one structured filter"),
+        ({"repository": "invalid"}, "repository must be in owner/name form"),
+        ({"state": "all"}, "state must be open, closed, or empty"),
+        ({"query": 'bug" OR is:pr'}, "issue text and labels must not contain quotes"),
+        ({"labels": ["bug", ""]}, "labels must not contain empty values"),
+    ],
+)
+async def test_github_issue_search_rejects_invalid_structured_fields(
+    tools, monkeypatch, kwargs, error,
+):
+    async def unexpected(*_args, **_kwargs):
+        raise AssertionError("invalid issue query must not reach transport")
+
+    monkeypatch.setattr("genesis.mcp.recon_mcp._github_public_api", unexpected)
+    result = await tools["recon_github_search"].fn(kind="issues", **kwargs)
+    assert result["ok"] is False
+    assert error in result["error"]
 
 
-async def test_github_issue_search_rejects_boolean_or_before_transport(
+async def test_github_repository_search_rejects_issue_filters(
     tools, monkeypatch,
 ):
     async def unexpected(*_args, **_kwargs):
-        raise AssertionError("Boolean OR issue query must not reach transport")
+        raise AssertionError("ambiguous Boolean qualifier query must not reach transport")
 
     monkeypatch.setattr("genesis.mcp.recon_mcp._github_public_api", unexpected)
     result = await tools["recon_github_search"].fn(
-        kind="issues", query="label:bug OR label:docs",
+        kind="repositories", query="topic", state="open",
     )
     assert result == {
         "ok": False,
-        "error": "issues query must not contain Boolean OR; run separate searches",
-    }
-
-
-async def test_github_issue_search_rejects_type_only_query(tools, monkeypatch):
-    async def unexpected(*_args, **_kwargs):
-        raise AssertionError("type-only issue query must not reach transport")
-
-    monkeypatch.setattr("genesis.mcp.recon_mcp._github_public_api", unexpected)
-    result = await tools["recon_github_search"].fn(kind="issues", query="is:pr")
-    assert result == {
-        "ok": False,
-        "error": "query must include terms beyond visibility/type qualifiers",
+        "error": "issue filters require kind=issues",
     }
 
 

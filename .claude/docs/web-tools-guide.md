@@ -44,7 +44,7 @@ libraries on GitHub, use these INSTEAD of generic web search:
 
 | Tool | Context | Use when... |
 |------|---------|-------------|
-| **`recon_github_search`** | Genesis research sessions | Find public GitHub.com repositories or issues through an unauthenticated fixed endpoint |
+| **`recon_github_search`** | Genesis research sessions | Find public GitHub.com repositories, or issues through literal text plus structured repository/state/label filters, using an unauthenticated fixed endpoint |
 | **`recon_github_read`** | Genesis research sessions | Inspect public GitHub.com repository metadata, bounded trees, or UTF-8 source files up to Genesis's 8 MiB file limit |
 | **`gh search repos/code`** | Foreground with Bash | Direct CLI fallback |
 | **grep.app** | Both | `web_fetch("https://grep.app/search?q=QUERY")` — semantic code search, better than GitHub native |

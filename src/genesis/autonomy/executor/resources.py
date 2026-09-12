@@ -39,6 +39,10 @@ _MAX_CHARS_PER_RESULT = 300
 _MAX_SKILL_CONTENT_CHARS = 2000
 _MAX_DELEGATED_SKILL_CONTENT_CHARS = 6000
 _LEGACY_STEP_SKILL_DELEGATES = {"research": "web-research"}
+_REQUIRED_STEP_SKILL_FILES = {
+    "research": _REPO_ROOT / "src" / "genesis" / "skills" / "research" / "SKILL.md",
+    "web-research": _REPO_ROOT / ".claude" / "skills" / "web-research" / "SKILL.md",
+}
 
 
 class RequiredSkillUnavailableError(RuntimeError):
@@ -56,11 +60,9 @@ def _bounded_skill_content(content: str, limit: int, source_file: Path) -> str:
 
 
 def _load_required_step_skill(name: str) -> tuple[Path, str]:
-    """Load a required compatibility delegate through the canonical skill loader."""
-    from genesis.learning.skills.wiring import get_skill_path
-
+    """Load a repo-tracked compatibility skill without the optional catalog."""
+    skill_file = _REQUIRED_STEP_SKILL_FILES.get(name)
     try:
-        skill_file = get_skill_path(name)
         if skill_file is None:
             raise FileNotFoundError(name)
         return skill_file, skill_file.read_text(encoding="utf-8")
@@ -346,6 +348,27 @@ async def load_step_resources(
     for skill_name in step.get("skills", []):
         if not isinstance(skill_name, str):
             continue
+        delegated_name = _LEGACY_STEP_SKILL_DELEGATES.get(skill_name.lower())
+        if delegated_name:
+            skill_file, content = _load_required_step_skill(skill_name.lower())
+            injected = _bounded_skill_content(
+                content, _MAX_SKILL_CONTENT_CHARS, skill_file,
+            )
+            parts.append(
+                f"### Skill: {skill_name} (full skill dir: {skill_file.parent})\n\n"
+                f"{injected}"
+            )
+            delegated_file, delegated_content = _load_required_step_skill(delegated_name)
+            delegated_injected = _bounded_skill_content(
+                delegated_content,
+                _MAX_DELEGATED_SKILL_CONTENT_CHARS,
+                delegated_file,
+            )
+            parts.append(
+                f"### Delegated method: {delegated_name}\n\n"
+                f"{delegated_injected}"
+            )
+            continue
         skill_path = _find_skill_path(skill_name)
         if skill_path is None:
             logger.debug("Skill '%s' not found in catalog", skill_name)
@@ -362,20 +385,6 @@ async def load_step_resources(
                         f"### Skill: {skill_name} (full skill dir: {skill_path})\n\n"
                         f"{injected}"
                     )
-                    delegated_name = _LEGACY_STEP_SKILL_DELEGATES.get(skill_name.lower())
-                    if delegated_name:
-                        delegated_file, delegated_content = _load_required_step_skill(
-                            delegated_name
-                        )
-                        delegated_injected = _bounded_skill_content(
-                            delegated_content,
-                            _MAX_DELEGATED_SKILL_CONTENT_CHARS,
-                            delegated_file,
-                        )
-                        parts.append(
-                            f"### Delegated method: {delegated_name}\n\n"
-                            f"{delegated_injected}"
-                        )
                 except OSError:
                     logger.debug("Failed to read skill file %s", md_file)
                 break
