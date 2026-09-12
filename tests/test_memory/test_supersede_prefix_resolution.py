@@ -25,11 +25,14 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 
+from genesis.db.schema._tables import FTS5_DDL
 from genesis.memory.store import MemoryStore
 
 OLD = "abcd1234-0000-4000-8000-000000000001"
 NEW = "efab5678-0000-4000-8000-000000000002"
+DEAD = "beef9999-0000-4000-8000-000000000003"
 PREFIX = OLD[:8]
+DUPE = "the fact a session is trying to correct"
 
 
 @pytest.fixture()
@@ -75,15 +78,36 @@ async def db():
                PRIMARY KEY (source_id, target_id, link_type)
            )"""
     )
+    # Production FTS5 DDL, imported rather than retyped — find_exact_duplicate
+    # queries this table, and the successor-validation defects below only
+    # reproduce end-to-end through the dedup short-circuit it feeds.
+    await conn.execute(FTS5_DDL)
     for mid in (OLD, NEW):
         await conn.execute(
             "INSERT INTO memory_metadata (memory_id, created_at, embedding_status) "
             "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only')",
             (mid,),
         )
+    # A memory that is already deprecated, holding the SAME content as DUPE.
+    await conn.execute(
+        "INSERT INTO memory_metadata "
+        "(memory_id, created_at, embedding_status, deprecated) "
+        "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only', 1)",
+        (DEAD,),
+    )
     await conn.commit()
     yield conn
     await conn.close()
+
+
+async def _index(db, mid: str, content: str) -> None:
+    """Put a memory's content in the FTS table find_exact_duplicate reads."""
+    await db.execute(
+        "INSERT INTO memory_fts (memory_id, content, source_type, tags, collection) "
+        "VALUES (?, ?, 'conversation', '', 'episodic_memory')",
+        (mid, content),
+    )
+    await db.commit()
 
 
 @pytest.fixture()
@@ -256,3 +280,87 @@ async def test_a_saturated_candidate_list_is_flagged_as_truncated(store, db):
     assert exc.value.reason == "ambiguous"
     assert exc.value.truncated is True
     assert "possibly more" in str(exc.value)
+
+
+# ─── SUCCESSOR validation ────────────────────────────────────────────────────
+#
+# Everything above validates the supersede TARGET. Nothing validated the
+# SUCCESSOR, and the dedup short-circuit added by this change supplies one the
+# caller never chose: whatever `find_exact_duplicate` matched. That query
+# (crud/memory.py) selects on content length + 200-char prefix only — it
+# consults neither the target id nor the `deprecated` column.
+#
+# MEASURED with the guards removed, end to end through store():
+#   same content + supersedes=<prefix of itself>  -> deprecated=1,
+#     superseded_by pointing at itself, a self-referential succeeded_by edge.
+#   same content as a DEPRECATED memory            -> target deprecated, the
+#     correction landing on a row recall filters out. Both halves invisible.
+
+
+@pytest.mark.asyncio()
+@pytest.mark.asyncio()
+async def test_dedup_short_circuit_cannot_self_supersede(store, db):
+    """The REAL path: identical content + a handle for the memory holding it.
+
+    This is not a contrived call — it is what happens when a session re-sends
+    content it has not actually changed, which is the shape a retried
+    correction takes.
+
+    The pair is validated BEFORE any write, so the rejection is a no-op and
+    simply raises: there is no stored content whose fate the caller would have
+    to reconcile against the error. The exception names the memory that already
+    holds this content, so nothing is lost by failing.
+    """
+    from genesis.memory.store import SupersedeUnresolved
+
+    await _index(db, OLD, DUPE)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.store(DUPE, "conversation", supersedes=PREFIX)
+
+    assert exc.value.reason == "self_supersede"
+    assert exc.value.successor_id == OLD, "the caller needs the surviving id"
+    assert (await _row(db, OLD))["deprecated"] == 0
+    assert await _links(db) == []
+
+
+@pytest.mark.asyncio()
+async def test_a_deprecated_dedup_candidate_cannot_carry_the_correction(store, db):
+    """Superseding ONTO a deprecated memory loses both halves.
+
+    The target goes deprecated and the successor was already filtered out of
+    recall, so the correction is unreachable. Rejected before any write.
+    """
+    from genesis.memory.store import SupersedeUnresolved
+
+    await _index(db, DEAD, DUPE)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.store(DUPE, "conversation", supersedes=OLD)
+
+    assert exc.value.reason == "successor_deprecated"
+    assert (await _row(db, OLD))["deprecated"] == 0, (
+        "deprecated the target toward a successor recall cannot see"
+    )
+    assert await _links(db) == []
+
+
+@pytest.mark.asyncio()
+async def test_the_normal_path_does_not_validate_the_pair(store, db):
+    """Cost lock: ONLY the dedup path validates the pair.
+
+    The ordinary supersede's successor is a uuid4 minted moments earlier, so
+    checking it would be a query per supersede to prove something structurally
+    guaranteed.
+
+    Asserted by behaviour rather than by call counting: NEW is deprecated here,
+    and `_mark_superseded` supersedes onto it anyway because nothing on that
+    path looks.
+    """
+    await db.execute("UPDATE memory_metadata SET deprecated = 1 WHERE memory_id = ?", (NEW,))
+    await db.commit()
+
+    await store._mark_superseded(OLD, NEW, "2026-09-06T19:53:21+00:00")
+
+    assert (await _row(db, OLD))["deprecated"] == 1
+    assert (OLD, NEW, "succeeded_by") in await _links(db)

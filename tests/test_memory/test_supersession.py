@@ -556,3 +556,93 @@ async def test_failed_supersede_link_does_not_invalidate(store, db):
         await store.store("new fact", "conversation", supersedes=old_id)
 
     assert not calls, "a failed link create must not dirty the cache"
+
+
+@pytest.mark.asyncio()
+async def test_dedup_short_circuit_still_supersedes(store, db):
+    """The dedup early-return skipped the supersede entirely.
+
+    ``store()`` returns at the dedup check ~300 lines above the supersede
+    block, so a correction whose content already existed deprecated nothing
+    while the caller was told the store succeeded. It is also the LIKELIEST
+    path, because retrying a failed supersede re-sends the same content.
+    """
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links, \
+         patch.object(MemoryStore, "_mark_superseded", new=AsyncMock()) as ms, \
+         patch.object(
+             MemoryStore, "_validate_supersede_pair", new=AsyncMock()
+         ) as validate:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.resolve_id = AsyncMock(
+            side_effect=lambda _db, mid: ([mid], "passthrough")
+        )
+        # The pre-flight confirms a PASSTHROUGH handle names a real row.
+        mock_mem.get_metadata = AsyncMock(return_value={
+            "memory_id": "old-memory-id", "collection": "episodic_memory",
+            "embedding_status": "fts5_only", "deprecated": 0,
+            "superseded_by": None, "superseded_at": None,
+        })
+        # The content is already stored — the dedup short-circuit fires.
+        mock_mem.find_exact_duplicate = AsyncMock(return_value="pre-existing-id")
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        out = await store.store(
+            "a correction", "conversation", supersedes="old-memory-id",
+        )
+
+    assert out == "pre-existing-id"
+    ms.assert_awaited_once()
+    # and it must supersede TOWARD the memory that actually exists
+    assert ms.await_args[0][1] == "pre-existing-id"
+    # ...having validated the pair first, because THIS successor was chosen by
+    # find_exact_duplicate rather than minted by this call. Same validator
+    # memory_supersede uses.
+    validate.assert_awaited_once_with("old-memory-id", "pre-existing-id")
+
+
+@pytest.mark.asyncio()
+async def test_an_unresolvable_target_never_reaches_the_dedup_lookup(store, db):
+    """The duplication this closes, and the ordering that makes it impossible.
+
+    Found in review of PR #1831: the supersede call added to the dedup path sat
+    INSIDE the lookup's ``try``, whose handler is a bare ``except Exception``.
+    A supersede failure was caught there, logged as "Dedup check failed"
+    (misattributing the cause to a lookup that had just succeeded), and fell
+    through into the full store pipeline — writing a SECOND copy of content the
+    lookup had proved already existed.
+
+    Handler placement was the patch. The fix is ORDER: the target is resolved
+    before the lookup runs at all, so an unresolvable handle cannot reach the
+    handler, cannot reach the pipeline, and cannot duplicate anything. Asserted
+    as the lookup never happening, plus `create_metadata` — the duplication
+    itself, not a proxy for it.
+    """
+    from genesis.memory.store import SupersedeUnresolved
+
+    with patch("genesis.memory.store.upsert_point"), \
+         patch("genesis.memory.store.update_payload"), \
+         patch("genesis.memory.store.memory_crud") as mock_mem, \
+         patch("genesis.memory.store.memory_links_crud") as mock_links:
+        mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        # Content that WOULD dedup, so a fall-through would be a duplicate.
+        mock_mem.find_exact_duplicate = AsyncMock(return_value="pre-existing-id")
+        # ...and a handle that names no memory: the resolver's NOT_FOUND.
+        mock_mem.resolve_id = AsyncMock(return_value=([], "not_found"))
+        mock_mem.mark_superseded = AsyncMock(return_value=True)
+        mock_links.create = AsyncMock(return_value=("old", "new"))
+
+        with pytest.raises(SupersedeUnresolved):
+            await store.store(
+                "a correction", "conversation", supersedes="deadbeef",
+            )
+
+    mock_mem.create_metadata.assert_not_awaited()
+    mock_mem.find_exact_duplicate.assert_not_awaited(), (
+        "resolution must precede the lookup, or the old fall-through is still "
+        "reachable by a different route"
+    )
+    mock_mem.mark_superseded.assert_not_awaited()

@@ -222,17 +222,67 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
+        # Resolve the supersede target BEFORE anything is written, and before
+        # the duplicate lookup below — because that lookup can RETURN, and a
+        # request to deprecate a memory that does not exist should not quietly
+        # succeed just because the content happened to be a duplicate.
+        # Resolving first also has to happen before ``create_metadata``:
+        # resolving afterwards let a short prefix match the row this call had
+        # just written, deprecating the new memory as its own successor.
+        resolved_supersedes = (
+            await self._resolve_supersede_target(supersedes) if supersedes else None
+        )
+
+        # Dedup: skip if exact content already stored (any collection).
+        # The LOOKUP is what is best-effort, and only the lookup is inside this
+        # guard. The supersede below deliberately sits OUTSIDE it: a handler
+        # wrapped around both would catch a supersede failure, mislabel it
+        # "Dedup check failed", and fall through into the full store pipeline —
+        # writing a SECOND copy of content the lookup had just proved already
+        # exists. That is on the exact path a caller retries a correction on.
+        existing: str | None = None
         try:
             existing = await memory_crud.find_exact_duplicate(
                 self._db, content=content,
             )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                return existing
         except Exception:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+            existing = None
+
+        if existing:
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            if resolved_supersedes:
+                # The supersede still has to happen. This early return sits
+                # ~300 lines above the supersede block, so a correction whose
+                # content already exists deprecated NOTHING while the caller
+                # was told the store succeeded. And it is the LIKELIEST path:
+                # retrying a failed supersede re-sends the same content with a
+                # corrected id, which lands exactly here.
+                #
+                # Only THIS path validates the pair. Here the successor is not a
+                # memory we just wrote — it is whatever find_exact_duplicate
+                # matched, and that query consults neither the supersede target
+                # nor the deprecated column, so it can hand back the target
+                # itself or an already-deprecated row. The normal path below
+                # needs no such check: its successor is a uuid4 minted moments
+                # earlier. Same validator memory_supersede uses; nothing is
+                # written if it rejects.
+                await self._validate_supersede_pair(resolved_supersedes, existing)
+                try:
+                    await self._mark_superseded(
+                        resolved_supersedes, existing, datetime.now(UTC).isoformat(),
+                    )
+                except Exception:
+                    # Mirrors the normal supersede path below: a failure once
+                    # the pair is validated is infrastructure, and it must not
+                    # turn a durable store into a raised error — that reads as
+                    # "the store failed" and invites a duplicating retry.
+                    logger.warning(
+                        "Failed to mark memory %s as superseded by %s",
+                        resolved_supersedes, existing, exc_info=True,
+                    )
+            return existing
 
         # Surface form normalization: expand known aliases before embedding
         try:
@@ -265,16 +315,6 @@ class MemoryStore:
         is_subsystem_write = source_subsystem is not None
         if is_subsystem_write:
             force_fts5_only = True
-
-        # Resolve the supersede target BEFORE anything is written. An
-        # unresolvable target then costs nothing and leaves nothing behind, and
-        # the raise reaches the caller with no half-done operation attached.
-        # It also has to be before ``create_metadata``: resolving afterwards let
-        # a short prefix match the row this call had just written, deprecating
-        # the new memory as its own successor.
-        resolved_supersedes = (
-            await self._resolve_supersede_target(supersedes) if supersedes else None
-        )
 
         memory_id = str(uuid.uuid4())
         now_iso = datetime.now(UTC).isoformat()

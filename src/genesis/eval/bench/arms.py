@@ -72,6 +72,7 @@ BENCH_MEMORY_WRITE_DISALLOWED: frozenset[str] = frozenset({
     "knowledge_ingest_source",
     "memory_extract",
     "memory_store",
+    "memory_supersede",
     "memory_synthesize",
     "observation_resolve",
     "observation_write",
