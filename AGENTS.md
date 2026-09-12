@@ -46,6 +46,26 @@ not to confirm:
   verdict ("remaining items are out-of-threat-model residue, not blocking") instead of
   continuing to enumerate: over-hardening code whose functionality doesn't warrant it is
   itself a review failure.
+- **"The approach itself is wrong" is a legitimate review verdict — say it when the
+  evidence supports it.** Rounds accumulate for two different reasons and the round
+  count cannot tell them apart: a sound solution carrying defects converges, while a
+  WRONG-SHAPED solution does not — each fix creates the surface for the next finding,
+  so the loop reads like whack-a-mole while it is really a design error accruing
+  interest. You are the only reviewer positioned to notice, because the author has
+  three rounds of sunk cost and the read-model that produced the design.
+  Three signals, none of which requires you to judge intent — all are visible in the
+  diff and the review history:
+  * findings CONCENTRATE in one file or one function rather than scattering;
+  * a finding lands on a line THIS pull request itself added in an earlier round
+    (the fix is generating its own bug supply);
+  * the diff GROWS across rounds instead of shrinking.
+  When two or more hold, say so plainly and name the alternative shape — delete the
+  mechanism, move it one layer up, make the problem impossible rather than detected.
+  A denylist defeated by a caller does not become correct by enumerating callers.
+  Scope it honestly, because the opposite error is just as expensive: findings that
+  SCATTER across a diff, each with a local fix, are ordinary defects in a sound
+  design, and telling that author their architecture is wrong sends them hunting a
+  problem that is not there. Absent the signals, review the code.
 - **End with a verdict:** `Ready to merge: Yes | No | With fixes` + a one-line reason.
 
 ### Documentation is out of scope for review
