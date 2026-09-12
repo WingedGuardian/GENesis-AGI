@@ -595,17 +595,24 @@ def _worktree_root(cwd: str) -> str:
     return os.path.realpath(cwd)
 
 
-def _merge_note(cwd: str | None) -> str:
-    """A hint appended to a cap/mode-switch denial when a merge is mid-flight.
+def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
+    """A hint appended to a denial when a merge is mid-flight.
 
-    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict or the round
-    counter: those sentinels are unauthenticated files that any actor with shell
-    access can create (``echo x > .git/MERGE_HEAD``), and `git merge --no-commit`
-    leaves one indefinitely without any forgery at all. Keying an EXEMPTION off
-    them would let the actor this gate exists to constrain silence it
-    permanently with one write — measured: a forged sentinel froze the counter
-    across three further distinct defect rounds. Telling the author what the
-    gate can see is safe; letting that state decide the verdict is not.
+    ``gate`` selects the consequence clause, because the two gates are misled by
+    a merge in DIFFERENT ways and a reader needs the one that applies: the round
+    counter sees another round, the depth gate sees a large authored change.
+    Sharing one wording would describe the wrong problem half the time.
+
+    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict, the round
+    counter, or the depth classification: those sentinels are unauthenticated
+    files that any actor with shell access can create (``echo x >
+    .git/MERGE_HEAD``), and `git merge --no-commit` leaves one indefinitely
+    without any forgery at all. Keying an EXEMPTION off them would let the actor
+    this gate exists to constrain silence it permanently with one write —
+    measured: a forged sentinel froze the counter across three further distinct
+    defect rounds. Telling the author what the gate can see is safe; letting that
+    state decide the verdict is not. Adding a second caller does not weaken that:
+    this still only ever returns TEXT.
     """
     try:
         out = subprocess.run(
@@ -628,6 +635,29 @@ def _merge_note(cwd: str | None) -> str:
         return ""
     if not merging:
         return ""
+    if gate == "depth":
+        return (
+            "\n\nNOTE: a git sequencer sentinel is present — a merge, rebase, "
+            "cherry-pick or revert is in progress. Content that operation brought "
+            "in counts toward substantiality exactly like code you wrote (via the "
+            "staged diff on a normal commit, via the recorded marker level on an "
+            "-a/pathspec one), which is why a commit that is only the operation "
+            "can land here.\n"
+            "That is NOT an exemption, and this hook cannot tell the two apart: "
+            "only content that arrived already reviewed on its own PR is somebody "
+            "else's audited work. A cherry-pick, a revert, and every conflict "
+            "resolution are YOURS and still need the audit — ack only once you "
+            "have checked there is no local delta in the staged set.\n"
+            "The ack clears THIS gate only. If the operation also left the review "
+            "marker no longer binding the staged diff — usual for a merge, but NOT "
+            "if you re-marked afterwards — the review-current gate blocks next and "
+            "the full ack is:  # depth-ack review-override\n"
+            "Add that second sigil ONLY once that gate actually fires: it records "
+            "findings as accepted, which is a false statement when there were none. "
+            "And sigils bind PER COMMIT SEGMENT, so a chained command needs the run "
+            "repeated on each segment — one comment at the very end binds only the "
+            "last one."
+        )
     return (
         "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "
         "keys on the staged diff, so pulling upstream in to resolve a conflict "
@@ -1231,6 +1261,7 @@ def main() -> None:
                 "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
+                + _merge_note(cwd, gate="depth")
             )
             return
 
