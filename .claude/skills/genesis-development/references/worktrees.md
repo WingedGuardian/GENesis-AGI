@@ -51,6 +51,34 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   file in the diff belongs to your work. If you see files you didn't modify,
   STOP and investigate.
 
+## Who owns a worktree
+
+Ownership is RECORDED, not inferred. A worktree being worked in carries a
+`git worktree lock` whose reason names the holder — a session's process, or
+"holds uncommitted tracked changes" — and both the reaper and `git worktree
+remove` already honour that lock, so recording it is the whole protection.
+
+You do not have to do anything for this. A claim is taken automatically on your
+first Edit or Write into a worktree, and released when your process exits or the
+worktree goes idle past the reaper's staleness window. The daily sweep
+(`scripts/worktree_claim_sweep.py`, disk-hygiene step 0) locks worktrees holding
+uncommitted tracked work and releases everything whose condition has come true.
+
+What you WILL see: a stderr note when you edit inside a worktree another live
+session claims. It never blocks — check with that session, or work in your own
+worktree. Inspect ownership yourself with
+`python3 scripts/worktree_claim_sweep.py --list`.
+
+**Do not infer ownership from `/proc/*/cwd`.** Two guards were built on that
+signal and it does not exist here: sessions `cd` per command, so a session's
+process CWD never leaves the main checkout. MEASURED 2026-09-10 — 0 of 200
+worktrees had any process CWD inside them while 7 session processes ran.
+
+**Never release a lock you did not take.** A lock reason that is not Genesis's
+own JSON belongs to someone else — a person, or Claude Code's own
+worktree-isolated subagents, which lock what they create. The sweep reports
+those and leaves them alone.
+
 ## Testing code in a worktree
 
 `tests/conftest.py` pins `sys.path[0]` to the worktree's own `src`, so `pytest`
