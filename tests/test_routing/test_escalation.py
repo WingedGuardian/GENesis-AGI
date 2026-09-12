@@ -413,6 +413,21 @@ class TestDeadProviderNotification:
         assert rows[0]["priority"] == "critical"
         assert "prov-y" in rows[0]["content"]
 
+    async def test_capped_span_uses_recorded_recovery_wording(self, escalation, empty_db):
+        """The cap path is grammatical and does not imply continuous failure."""
+        from genesis.routing.escalation import _EVIDENCE_SPAN_CAP_S
+
+        await self._seed_failure_obs(
+            escalation, empty_db, "prov-capped", "pf-capped",
+            age_s=int(_EVIDENCE_SPAN_CAP_S) + 1,
+        )
+        await escalation._maybe_notify("prov-capped")
+        rows = await self._criticals(empty_db, "prov-capped", escalation)
+        assert len(rows) == 1
+        message = json.loads(rows[0]["content"])["message"]
+        assert "has no recorded recovery for more than 14 days." in message
+        assert "every call" not in message
+
     async def test_repeated_trips_do_not_re_notify(self, escalation, empty_db):
         """The whole point of 'then quiet'."""
         await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
@@ -857,6 +872,11 @@ class TestSilenceIsNotRecovery:
         for _ in range(_TRIP_THRESHOLD):
             await esc._on_event(_make_event("prov-sparse"))
             t["now"] += timedelta(days=7)  # once a week, never recovering
+        await asyncio.gather(
+            *(task for task in asyncio.all_tasks()
+              if task.get_name() == "escalation-obs-prov-sparse"),
+            return_exceptions=True,
+        )
         assert esc._state["prov-sparse"]["trip_count"] == _TRIP_THRESHOLD, (
             "weekly trips must accumulate — zeroing them on elapsed time is what "
             "made a genuinely dead low-traffic provider invisible"
@@ -886,6 +906,11 @@ class TestSilenceIsNotRecovery:
             t["now"] += timedelta(days=2)
         assert esc._state["prov-rec"]["trip_count"] == 3
         esc.record_recovery("prov-rec")
+        await asyncio.gather(
+            *(task for task in asyncio.all_tasks()
+              if task.get_name() == "escalation-resolve-prov-rec"),
+            return_exceptions=True,
+        )
         assert "prov-rec" not in esc._state, "recovery must clear the incident"
 
 

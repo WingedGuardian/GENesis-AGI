@@ -10,31 +10,38 @@ not evidence of absence.
 
 The fix nets around the blind spot in the CALLERS (shell_parse's own ANSI-C fix
 is a separate follow-up): when a command is not cleanly parseable AND mentions a
-gated op AND the parse surfaced no matching segment, the guard ASKS the human
-instead of deciding. Asking (not blocking) is the load-bearing choice: a hard
-block must be surgically precise about which unparseable commands are real, and
-precision is exactly what an unreliable parse cannot deliver -- every narrowing
-conjunct became a new way to starve the trigger, while over-blocking broke benign
-shapes. With an ask, a false positive costs one confirmation and a miss is the
-pre-existing status quo, so the trigger can be broad.
+gated op AND the parse surfaced no matching segment, the guard REFUSES the
+command -- exit 2, for every session type, interactive included.
 
-The invariants below are therefore: a bypass shape must NEVER be a silent allow,
-and a benign shape must never be REFUSED WHERE SOMEONE CAN APPROVE IT.
+The refusal is the whole design, not a fallback for unattended sessions. USER
+RULING 2026-09-08: hooks are for the AGENT, not the user; the only prompt a
+human ever sees from these guards is the deliberate push / PR-create egress
+approval, which is unchanged and out of scope here. The earlier design asked
+interactively and priced a false positive in one USER confirmation; this one
+prices it in an AGENT rewrite that the refusal message spells out (the Write
+tool for prose, ``-F <file>`` for a real git command). Same broad predicate,
+no prompt.
 
-That second one used to read "a benign shape must NEVER be a hard block", full
-stop, and that is false — it was written from the interactive path and quietly
-assumed a human. An unattended session has nobody to answer an ask, so the only
-choices there are refuse or allow-unverified; a security gate does not pick the
-second, and the cost argument that buys a broad trigger ("a false positive costs
-one confirmation") does not survive the move. Narrowing the predicate until the
-old invariant held was attempted for three rounds and does not converge: on the
-blind path the parser cannot distinguish an executed gated verb from a quoted or
-commented one, and that inability IS the premise of the net.
+The predicate stays broad on purpose. A hard block that had to be surgically
+precise about which unparseable commands are real could not exist -- precision
+is exactly what an unreliable parse cannot deliver, and three rounds of
+narrowing conjuncts each became a new way to starve the trigger. What makes a
+broad trigger affordable is no longer "somebody clicks approve" but "the
+message names a rewrite the session can perform unaided".
 
-So unattended refusals of benign shapes are accepted, with a condition that is
-asserted rather than assumed — the refusal must be RECOVERABLE on its own,
-naming both the cause and the rewrite that avoids it, so a session with no human
-can act on it unaided.
+The invariants below are therefore:
+
+* a bypass shape must NEVER be a silent allow;
+* an inert mention inside an unparseable command IS refused -- in every session
+  type, with no mode axis left -- and the refusal must be ACTIONABLE, naming
+  both the cause and a rewrite that applies, so the session can proceed without
+  a human. That is what makes it a cost rather than a wall, and it is asserted,
+  never assumed.
+
+The second invariant used to read "a benign shape must NEVER be a hard block".
+That was written from the interactive path and is now retired outright: nothing
+distinguishes the modes any more, so there is no path on which a benign
+unparseable mention is merely asked about.
 
 Trigger literals are assembled from fragments so this file's own text does not
 carry them (matches the convention in test_shell_parse.py).
@@ -163,6 +170,13 @@ def _names_a_usable_escape(guidance: str) -> bool:
     of re-quoting a here-doc fixes the second; the route out is to write the
     file with a tool instead. A message that only covers the first is a wall for
     the more common case, so require both.
+
+    This is what buys the broad predicate now that NOBODY is prompted. The cost
+    of a false positive is one agent rewrite — but only if the message names a
+    rewrite that applies to the command in hand. Match on stable substrings
+    ("use the Write tool" / "instead of a here-doc", "-F <file>" / "plain
+    quotes") rather than the full wording, so re-phrasing the message does not
+    fail the suite while gutting it does.
     """
     covers_command = "-f <file>" in guidance or "plain quotes" in guidance
     covers_prose = "write tool" in guidance or "instead of a here-doc" in guidance
@@ -287,8 +301,16 @@ def _run(
     interactive ask direction failed because production correctly hard-denies in
     dispatched mode (measured: 21 failures). CI happens to run non-dispatched,
     so this would never have surfaced there — the suite would just have been
-    quietly mode-dependent. Dispatch state is now an explicit argument, so each
-    test states the mode it means to exercise.
+    quietly mode-dependent.
+
+    The blind-spot net itself no longer reads that marker at all (2026-09-08:
+    one deny for every session type), so the mode axis is kept here as a LOCK
+    rather than a live variable: the cells below assert that the verdict is
+    identical whatever the marker says. The marker is still load-bearing
+    elsewhere in the push guard — the push / PR-create egress legs deny a
+    dispatched session where they would prompt a human — so stripping it by
+    default still matters, and those legs are covered in
+    ``test_push_create_override.py``.
     """
     payload: dict = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     if cwd is not None:
@@ -505,11 +527,21 @@ class TestGhPrCreateIsCovered:
         r = _run(_PUSH_GUARD, "gh pr create --title x --body y", cwd=cwd)
         assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
-    def test_hidden_create_reaches_a_human(self, tmp_path, monkeypatch):
-        """VERIFY-RED: allowed before the fix (mention set lacked any create term)."""
+    def test_hidden_create_is_refused_actionably(self, tmp_path, monkeypatch):
+        """VERIFY-RED: allowed before the net existed (the mention set had no create term).
+
+        Renamed from ``…_reaches_a_human``, which described the retired
+        interactive-ask design. Nobody is reached now: the net refuses this in
+        every session type, so the test pins the exact verdict (``block``, not
+        "ask-or-block") plus the property that makes a refusal affordable — the
+        message names a rewrite the session can perform on its own.
+        """
         cwd = _unpushed_repo(tmp_path, monkeypatch)
         r = _run(_PUSH_GUARD, f"{ANSIC}gh pr create --title x --body y", cwd=cwd)
-        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert _names_a_usable_escape(r.stderr.lower()), (
+            "the hidden-create refusal must name a way out that applies.\n" + r.stderr
+        )
 
     def test_create_alone_does_not_trip_the_net(self, tmp_path):
         """The mention test is `gh` AND `create`, not the word `create`.
@@ -530,76 +562,93 @@ class TestGhPrCreateIsCovered:
         assert _decision(r) == "allow", r.stdout + r.stderr
 
 
-class TestDispatchMarkerIsExact:
-    """The dispatch marker is the exact string "1" — never truthiness.
+class TestBlindSpotDenyIsModeIndependent:
+    """The blind-spot refusal has NO session-type axis left. That is the contract.
 
-    `cc/invoker.py` stamps "1"; every other consumer compares exactly
-    (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
-    outcome_verification_hook). A truthiness test reads GENESIS_CC_SESSION=0 —
-    an operator explicitly turning it OFF — as dispatched, and hard-BLOCKS a
-    benign unparseable command that the interactive path should merely ask
-    about. Over-blocking is the failure direction this design exists to avoid.
+    This class used to be `TestDispatchMarkerIsExact`, pinning the commit gate's
+    exact `GENESIS_CC_SESSION == "1"` compare: a truthiness test would have read
+    an operator's explicit `=0` as dispatched and hard-blocked a benign
+    unparseable command that the interactive path merely asked about. The
+    2026-09-08 ruling deleted BOTH sides of that split — the gate no longer
+    reads the marker at all, and every session type gets the same refusal — so
+    the old invariant has nothing left to protect and asserting it would just
+    re-fail.
+
+    What replaces it is the stronger, simpler property the ruling created:
+    whatever the marker says (unset, `0`, `false`, `no`, `off`, `2`, `1`), the
+    verdict and its guidance are IDENTICAL. Every value the old class carried is
+    still a cell, plus the two it lacked, so a re-introduced mode split — in
+    either direction — fails here.
+
+    The exact-compare invariant itself is not lost, only relocated: the push
+    guard's `_is_dispatched()` still gates the push / PR-create egress legs (the
+    one surviving human prompt), covered by `test_push_create_override.py`.
     """
 
     # Un-tokenizable, and merely MENTIONS the word — no `git commit` adjacency.
-    # The interactive path asks about this; the dispatched path must NOT refuse
-    # it, because refusing is unappealable where nobody can confirm.
+    # Nothing gated executes here, and it is refused anyway: the parser cannot
+    # tell this from the real thing, which is the premise of the net existing.
+    # The refusal's ACTIONABILITY is what makes that affordable, so it is
+    # asserted on every cell rather than taken on faith.
     _BENIGN = "echo $'don\\'t " + COMMIT + " this'"
-    # Un-tokenizable AND carries a real `git commit`. This is what the dispatched
-    # deny leg exists for, and what it must still catch after the narrowing.
+    # Un-tokenizable AND carries a real `git commit`. The true positive the net
+    # exists for; it must never stop being caught while the benign cells are
+    # being reasoned about.
     _GATED = "echo $'a\\'b)c' && " + GIT + " " + COMMIT + " " + NV + " -m x"
 
-    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "2"])
-    def test_non_one_values_are_not_dispatched(self, tmp_path, value):
-        """VERIFY-RED: every one of these hard-blocked before the exact compare."""
-        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path), dispatched=value)
-        assert _decision(r) != "block", f"{value}: {r.stdout + r.stderr}"
+    @pytest.mark.parametrize(
+        "marker",
+        [None, "0", "false", "no", "off", "2", "1"],
+        ids=["unset", "0", "false", "no", "off", "2", "1"],
+    )
+    def test_marker_value_never_changes_the_blind_spot_verdict(self, tmp_path, marker):
+        """One deny, every session type — and the same actionable message on each.
 
-    def test_exact_one_is_dispatched(self, tmp_path):
-        """CONTROL — the deny leg must still fire for the real marker AND a real op.
+        `None` is the real interactive default (the helper strips the marker),
+        `"1"` is a genuinely dispatched session, and the middle values are the
+        shapes an operator produces by turning the marker OFF. All seven must
+        agree, or a mode split has crept back in.
+        """
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path), dispatched=marker)
+        assert _decision(r) == "block", f"marker={marker!r}: {r.stdout + r.stderr}"
+        guidance = r.stderr.lower()
+        assert "parse" in guidance, (
+            f"marker={marker!r}: refused without naming the CAUSE.\n{r.stderr}"
+        )
+        assert _names_a_usable_escape(guidance), (
+            f"marker={marker!r}: refused without a way out that applies. A "
+            f"refusal a session cannot act on is a wall, not a cost.\n{r.stderr}"
+        )
 
-        Without this the tests above are satisfied by a guard that never denies
-        at all, which is the same shape as a predicate that measures zero false
-        positives by never firing.
+    def test_real_gated_op_is_still_refused(self, tmp_path):
+        """CONTROL — the net must still catch the case it was built for.
 
-        Uses the GATED input deliberately. An earlier version of this control
-        used the benign one and passed only because the deny leg was
-        over-broad — so it would have gone green while the guard refused
-        `c.commit()` in a here-doc. A control has to demand the behaviour for a
-        case that genuinely warrants it, or it just re-measures the bug.
+        Without this, the cells above are satisfied by a guard that refuses
+        everything, which is the same shape as a predicate measuring zero false
+        negatives by never allowing anything. Uses the GATED input deliberately:
+        an earlier version of this control used the benign one and would have
+        gone green while the guard refused `c.commit()` in a here-doc.
         """
         r = _run(_COMMIT_GUARD, self._GATED, cwd=str(tmp_path), dispatched="1")
         assert _decision(r) == "block", r.stdout + r.stderr
 
-    def test_benign_mention_when_dispatched_is_refused_RECOVERABLY(self, tmp_path):
-        """The cost of the unattended deny leg, pinned rather than wished away.
+    def test_the_refusal_is_never_a_prompt(self, tmp_path):
+        """The ruling's headline: this net does not reach a human, in any mode.
 
-        This test used to assert `!= "block"` and was described as the lock that
-        justified narrowing the deny predicate. Narrowing was abandoned: it does
-        not converge, because on the blind path the parser cannot tell an
-        executed gated verb from one inside quoted data, which is the premise of
-        the net. So this shape IS refused when unattended, deliberately.
-
-        What is asserted instead is that the refusal can be acted on without a
-        human — cause and rewrite both named. That is the whole difference
-        between an accepted cost and a wedged session, and asserting it is what
-        caught the commit gate naming the rewrite only on its interactive `ask`,
-        i.e. giving the guidance exclusively to the session that could have
-        asked for it.
+        Asserted separately from the verdict because `_decision` collapses an
+        `ask` into its own bucket — a regression that restored the interactive
+        prompt would flip these cells from `block` to `ask` and this is the
+        assertion that names why that is wrong, rather than reporting a bare
+        verdict mismatch. The one surviving prompt in these guards is the
+        push / PR-create egress approval, which this command never reaches.
         """
-        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path), dispatched="1")
-        if _decision(r) != "block":
-            return  # parseable after all — nothing to recover from
-        guidance = r.stderr.lower()
-        assert "parse" in guidance and _names_a_usable_escape(guidance), (
-            "an unattended refusal must name both the cause and the way out — "
-            f"there is no one to ask.\n{r.stderr}"
-        )
-
-    def test_unset_is_not_dispatched(self, tmp_path):
-        """Absent marker — the helper strips it, so this is the real default."""
-        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
-        assert _decision(r) != "block", r.stdout + r.stderr
+        for marker in (None, "1"):
+            r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path), dispatched=marker)
+            assert _decision(r) != "ask", (
+                f"marker={marker!r}: the blind-spot net prompted a human. Hooks "
+                f"are for the agent — the egress ask is the only exception.\n"
+                f"{r.stdout}{r.stderr}"
+            )
 
     @pytest.mark.parametrize(
         "key,value",
@@ -623,11 +672,37 @@ class TestDispatchMarkerIsExact:
         made the harness describe a world that was not the one under test, and
         both were fixed one key at a time. This locks the CLASS: the child sees
         an allowlist, so an ambient value cannot reach a guard by default.
+
+        The OBSERVABLE moved, and had to. This used to run the benign command
+        and assert the verdict did not become `block`, which worked only while
+        that command sat in the ask lane where a leak could push it over. With
+        the whole lane now refusing, MEASURED: all four keys produce the same
+        `block` with and without the leak — the probe had gone vacuous, and
+        `GENESIS_CC_SESSION` cannot be made to bite again at all, because the
+        gate no longer reads it. So assert the harness property DIRECTLY, on the
+        child's own environment, the way the sandbox-HOME test above does: a
+        leak is then detectable regardless of what any verdict happens to be.
         """
         monkeypatch.setenv(key, value)
-        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
-        assert _decision(r) != "block", (
-            f"ambient {key} leaked into the guard subprocess: " + r.stdout + r.stderr
+        probe = "import json,os;print(json.dumps(dict(os.environ)))"
+        r = subprocess.run(
+            [_PY, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_child_env(str(tmp_path)),
+            cwd=str(tmp_path),
+        )
+        assert r.returncode == 0, r.stdout + r.stderr
+        child = json.loads(r.stdout)
+        assert os.environ.get(key) == value, (
+            f"CONTROL: {key} is not set in the PARENT, so its absence in the "
+            "child proves nothing."
+        )
+        assert key not in child, (
+            f"ambient {key}={value!r} leaked into the guard subprocess "
+            f"environment; the allowlist is not holding.\nchild env: "
+            f"{sorted(child)}"
         )
 
 
@@ -664,6 +739,234 @@ class TestCommitGuardNet:
         assert _decision(r) != "block", r.stdout + r.stderr
 
 
+class TestCommitGuardProbeFailure:
+    """A failed checked parse is loud and fail-closed via run_guard.
+
+    Main replaced the separate parseability probe with analyze_checked. Inject
+    the real choke point, keeping every other parser operation genuine.
+    """
+
+    def _guard_tree_with_raising_probe(self, tmp_path: Path, command: str):
+        """Copy the real gate into a tree whose sibling probe raises.
+
+        The gate does `sys.path.insert(0, dirname(__file__)/"hooks")` before
+        importing, which beats PYTHONPATH — so the shim has to be a sibling of
+        the copied module. Every name except `analyze_checked` delegates to the
+        genuine parser, so exactly one variable changes.
+        """
+        scripts = tmp_path / "scripts"
+        hooks = scripts / "hooks"
+        hooks.mkdir(parents=True)
+        (scripts / _COMMIT_GUARD.name).write_text(_COMMIT_GUARD.read_text())
+        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
+        (hooks / "shell_parse.py").write_text(
+            "import importlib.util, sys\n"
+            "_s = importlib.util.spec_from_file_location(\n"
+            f"    '_real_sp', {str(_HOOKS_DIR / 'shell_parse.py')!r}\n"
+            ")\n"
+            "_real = importlib.util.module_from_spec(_s)\n"
+            # Registered BEFORE exec_module: @dataclass resolves
+            # sys.modules[cls.__module__] while building the class, and a module
+            # missing from it raises at IMPORT time — which exits 1 and would
+            # wear the costume of a verdict.
+            "sys.modules['_real_sp'] = _real\n"
+            "_s.loader.exec_module(_real)\n"
+            "def __getattr__(name):\n    return getattr(_real, name)\n"
+            # Pin the actual exception in run_guard's fail-closed diagnostic.
+            "def analyze_checked(*a, **k):\n"
+            "    raise RuntimeError('induced failure')\n"
+        )
+        return subprocess.run(
+            [_PY, str(scripts / _COMMIT_GUARD.name)],
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                    "cwd": str(tmp_path),
+                }
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_child_env(str(tmp_path)),
+            cwd=str(tmp_path),
+        )
+
+    # A command that MENTIONS a commit (so `_COMMIT_PATTERN` lets it past the
+    # cheap early-out) but resolves to no commit segment — which is exactly the
+    # path on which the probe is consulted.
+    _MENTION = 'echo "please ' + COMMIT + ' later"'
+
+    def test_probe_failure_denies(self, tmp_path):
+        r = self._guard_tree_with_raising_probe(tmp_path, self._MENTION)
+        assert _decision(r) == "block", (
+            "a failed parseability probe must refuse, not prompt and not "
+            f"allow.\n{r.stdout}{r.stderr}"
+        )
+
+    def test_parser_failure_reports_the_actual_error(self, tmp_path):
+        r = self._guard_tree_with_raising_probe(tmp_path, self._MENTION)
+        assert "GUARD ERROR" in r.stderr and "RuntimeError: induced failure" in r.stderr
+        assert "ANSI-C" not in r.stderr
+
+    def test_probe_failure_control_allows_when_the_probe_works(self, tmp_path):
+        """CONTROL — without it the two tests above pass against a broken tree.
+
+        A copied gate that cannot import, or a command that never reaches the
+        probe, would also produce an exit-2/exit-1 that looks like a verdict.
+        The same command through the REAL gate must be an ordinary allow.
+        """
+        r = _run(_COMMIT_GUARD, self._MENTION, cwd=str(tmp_path))
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+
+class TestPushGuardProbeFailure:
+    """Single-parser failure and deferred-denial exception coverage.
+
+    A primary parse failure is fail-closed even for unrelated commands, matching
+    main's run_guard contract; there is no independently recoverable probe now.
+    """
+
+    # Default override: the probe itself blows up.
+    _RAISING_PROBE = "def analyze_checked(*a, **k):\n    raise RuntimeError('induced failure')\n"
+    # Probe stays REAL (so the net ARMS normally); a helper called AFTER the net
+    # and BEFORE the deferred deny raises one of the two exceptions the tail's
+    # fail-open catches. `commit_skips_hooks` is exactly such a call site — the
+    # --no-verify check sits between them.
+    _KEYERROR_AFTER_NET = (
+        "def commit_skips_hooks(*a, **k):\n    raise KeyError('induced mid-main failure')\n"
+    )
+
+    def _guard_tree_with_raising_probe(
+        self, tmp_path: Path, command: str, override: str | None = None
+    ):
+        """Copy the real guard into a tree whose sibling probe raises.
+
+        The guard inserts its own dir at sys.path[0] and its parent at [1], so
+        the shim must be a sibling of the COPIED module. The whole hooks dir is
+        copied (plus `scripts/review_state.py`) so every other sibling import
+        resolves to the genuine article and exactly one variable changes —
+        `review_state` and `push_allowlist` are soft imports, but copying them
+        keeps the tree faithful rather than exercising their degraded paths.
+        """
+        scripts = tmp_path / "scripts"
+        hooks = scripts / "hooks"
+        hooks.mkdir(parents=True)
+        for src in _HOOKS_DIR.glob("*.py"):
+            (hooks / src.name).write_text(src.read_text())
+        rs = _WORKTREE / "scripts" / "review_state.py"
+        if rs.exists():
+            (scripts / "review_state.py").write_text(rs.read_text())
+        # Overwrite the sibling probe AFTER the faithful copy.
+        (hooks / "shell_parse.py").write_text(
+            "import importlib.util, sys\n"
+            "_s = importlib.util.spec_from_file_location(\n"
+            f"    '_real_sp', {str(_HOOKS_DIR / 'shell_parse.py')!r}\n"
+            ")\n"
+            "_real = importlib.util.module_from_spec(_s)\n"
+            # Registered BEFORE exec_module — see the commit-gate twin above.
+            "sys.modules['_real_sp'] = _real\n"
+            "_s.loader.exec_module(_real)\n"
+            # Module __getattr__ ALONE is sufficient, including for the guard's
+            # `from shell_parse import (analyze_checked, ...)` — PEP 562 consults it for
+            # `from X import Y` too. An earlier revision here also re-exported
+            # four names explicitly with a comment claiming __getattr__ did not
+            # cover them; that was false, and the list was missing two of the
+            # guard's six imports, so believing the comment would have meant
+            # either adding names forever or "simplifying" by deleting the
+            # __getattr__ that was doing all the work. The commit-gate twin
+            # above has always relied on __getattr__ alone and passes.
+            "def __getattr__(name):\n    return getattr(_real, name)\n"
+            # Override only the checked parser or the named late helper.
+            + (override or self._RAISING_PROBE)
+        )
+        return subprocess.run(
+            [_PY, str(hooks / _PUSH_GUARD.name)],
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                    "cwd": str(tmp_path),
+                }
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_child_env(str(tmp_path)),
+            cwd=str(tmp_path),
+        )
+
+    # Mentions a gated op but resolves to no gated segment — the exact path on
+    # which the probe is consulted.
+    _MENTION = 'echo "please ' + PUSH + ' later"'
+    # Names nothing gated; a primary parser crash still fails closed.
+    _UNRELATED = "ls -la"
+    # Genuinely UN-tokenizable (ANSI-C escaped quote) AND names a gated op, so
+    # the net arms on its own terms with the REAL probe in place. `_MENTION`
+    # cannot do this job: it is ordinary prose that tokenizes cleanly, so the
+    # net never arms and there is no deny for the fail-open to swallow.
+    _UNTOK_MENTION = "echo $'don\\'t " + PUSH + " yet' > /dev/null"
+
+    def test_probe_failure_denies_a_gated_mention(self, tmp_path):
+        r = self._guard_tree_with_raising_probe(tmp_path, self._MENTION)
+        assert _decision(r) == "block", (
+            "a failed parseability probe must refuse a command naming a gated "
+            f"op, not prompt and not allow.\n{r.stdout}{r.stderr}"
+        )
+
+    def test_parser_failure_reports_the_actual_error(self, tmp_path):
+        r = self._guard_tree_with_raising_probe(tmp_path, self._MENTION)
+        assert "GUARD ERROR" in r.stderr and "RuntimeError: induced failure" in r.stderr
+        assert "ANSI-C" not in r.stderr
+
+    def test_primary_parser_failure_denies_an_unrelated_command(self, tmp_path):
+        r = self._guard_tree_with_raising_probe(tmp_path, self._UNRELATED)
+        assert _decision(r) == "block", r.stdout + r.stderr
+
+    def test_probe_failure_control_allows_when_the_probe_works(self, tmp_path):
+        """CONTROL — without it the deny cells pass against a broken tree.
+
+        A copied guard that cannot import would also exit nonzero and look like
+        a verdict. The same command through the REAL guard must be an allow.
+        """
+        r = _run(_PUSH_GUARD, self._MENTION, cwd=str(tmp_path))
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+    def test_primary_parser_failure_is_never_silent(self, tmp_path):
+        r = self._guard_tree_with_raising_probe(tmp_path, self._UNRELATED)
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert "GUARD ERROR" in r.stderr and "RuntimeError: induced failure" in r.stderr
+
+    @pytest.mark.parametrize("exception", ["KeyError", "JSONDecodeError"])
+    def test_armed_net_survives_the_tail_payload_fail_open(self, tmp_path, exception):
+        """The window that DEFERRING the net's verdict opened.
+
+        The net decides its deny early and hands it to the tail. Between those
+        points sits `except (JSONDecodeError, KeyError): return 0` — a
+        deliberate fail-open for malformed payloads. An armed deny must outrank
+        it: the net fired because the command was UNVERIFIABLE, and a later
+        parse hiccup is not evidence it became safe. The old inline `return 2`
+        had no such window, so this is a property the deferral had to buy back.
+
+        The probe stays real (so the net arms on its own terms) and a helper
+        called after it raises KeyError.
+        """
+        override = self._KEYERROR_AFTER_NET
+        if exception == "JSONDecodeError":
+            override = (
+                "import json\ndef commit_skips_hooks(*a, **k):\n"
+                "    raise json.JSONDecodeError('induced failure', '', 0)\n"
+            )
+        r = self._guard_tree_with_raising_probe(
+            tmp_path, self._UNTOK_MENTION, override=override
+        )
+        assert _decision(r) == "block", (
+            "an ARMED blind-spot deny was swallowed by the tail's payload "
+            f"fail-open — the deferral lost a verdict the inline return had.\n"
+            f"{r.stdout}{r.stderr}"
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Acceptance corpus — bash-verified shapes retained from the superseded
 # parser-side attempt (PR #1513, closed unmerged: "the bash-verified corpus of
@@ -671,9 +974,19 @@ class TestCommitGuardNet:
 # These caught two real false positives in the first cut of this net.
 # ══════════════════════════════════════════════════════════════════════════
 class TestAcceptanceCorpus:
-    """The net must fire on the un-parseable shapes and stay silent on the
-    accident-plausible LEGIT ones (an apostrophe in a trailing comment, an
-    ANSI-C commit message) — bash runs the latter exactly as written."""
+    """What the net owes the accident-plausible LEGIT shapes, which is no longer
+    one answer for all of them.
+
+    Where analyze() still RESOLVES the real segment (an apostrophe in a trailing
+    comment after a parseable commit, an ANSI-C commit message), the net stands
+    down and the ordinary rules own the verdict — unchanged, and still the daily
+    friction case.
+
+    Where the parse went blind (`git status  # don't <verb> yet` — a real
+    command whose only gated word is in a comment), the command is now REFUSED
+    rather than asked about. That is the false-positive cost the 2026-09-08
+    ruling accepted, moved from a user click onto an agent rewrite, and it is
+    pinned here with the rewrite asserted rather than hoped for."""
 
     def test_apostrophe_in_trailing_comment_not_net_blocked(self, tmp_path):
         # `# don't` makes shlex raise, but bash never executes a comment and
@@ -682,10 +995,22 @@ class TestAcceptanceCorpus:
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) != "block", r.stdout + r.stderr
 
-    def test_apostrophe_in_comment_not_net_blocked_push_guard(self, tmp_path):
+    def test_apostrophe_in_comment_push_guard_is_refused_actionably(self, tmp_path):
+        """Renamed from `…_not_net_blocked`: this shape IS blocked now.
+
+        MEASURED: interactive verdict moved ask -> block with the ruling. There
+        is no gated segment for analyze() to resolve here — `git status` is the
+        only real command — so unlike its commit-guard sibling above the net
+        does fire, and the parser cannot tell this comment from an executed
+        push. The refusal is only affordable because the message names the
+        rewrite, so that is asserted, not assumed.
+        """
         cmd = f"{GIT} status  # don't {PUSH} yet"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", r.stdout + r.stderr
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert _names_a_usable_escape(r.stderr.lower()), (
+            "a benign shape refused without a usable rewrite is a wall.\n" + r.stderr
+        )
 
     def test_legit_ansic_commit_message_not_net_blocked(self, tmp_path):
         # An ANSI-C message is the canonical way to embed an apostrophe. The
@@ -718,6 +1043,11 @@ class TestAcceptanceCorpus:
         against parsed segment spans: more argv-to-effect modelling, which is the
         non-convergent tail this design deliberately avoids. Same accepted bucket
         as eval / dynamic construction (2026-08-12 decision).
+
+        The human it reaches is the push/PR-create EGRESS approval, which the
+        2026-09-08 ruling left untouched — not the blind-spot prompt, which is
+        retired. The net never fires here: analyze() does resolve a push
+        segment, so the ordinary push gate owns this verdict.
 
         The mechanism is deliberately NOT written out here. This repository is
         public and the shape is not closed, so an explanation of why the guard
@@ -841,9 +1171,17 @@ class TestCommitGuardFailsClosedOnCrash:
 # of the axes that actually drive the decision, so an untested cell fails loudly
 # instead of silently.
 #
-# Invariants (not exact verdicts — the point is the direction of failure):
-#   * a cell that really executes a gated op is NEVER a silent allow;
-#   * a cell that executes nothing gated is NEVER a hard block.
+# Invariants:
+#   * a cell that really executes a gated op is NEVER a silent allow (direction
+#     of failure only — which mechanism refuses it is not pinned);
+#   * a cell that executes nothing gated is refused ANYWAY where the parse went
+#     blind, identically in every session type, with an actionable message —
+#     and left strictly alone where the parse is trustworthy.
+#
+# The second invariant read "is NEVER a hard block" until the 2026-09-08 ruling
+# retired the interactive prompt. It is not a loosening: the old form permitted
+# an `ask`, which is now forbidden outright, and the cost it used to wave
+# through is now an asserted property of the refusal message.
 # ══════════════════════════════════════════════════════════════════════════
 _DESYNC = "x=$'a\\'b'\n"  # ANSI-C desync: makes the parser drop what follows
 
@@ -903,10 +1241,18 @@ def test_matrix_hidden_gated_op_is_never_silently_allowed(
 ):
     """A gated op the PARSER CANNOT SEE must never be silently allowed.
 
-    Run in BOTH modes. The two legs reach the same conclusion by different
-    predicates — interactive asks on a broad mention, dispatched refuses only on
-    a `git <verb>` adjacency — so a change to either can regress independently.
-    Before this axis existed, only the interactive leg was ever exercised.
+    Run in BOTH modes. The mode axis predates the 2026-09-08 ruling, when the
+    two legs reached this conclusion by DIFFERENT predicates (interactive asked
+    on a broad mention; dispatched refused only on a `git <verb>` adjacency) and
+    could therefore regress independently — before the axis existed only the
+    interactive leg was ever exercised. One deny now serves both, so the axis is
+    a LOCK on that unification rather than two distinct behaviours: if a mode
+    split returns, these cells are where it has to survive.
+
+    The verdict stays `in ("ask", "block")` rather than `== "block"` on purpose.
+    Some cells are hidden from the net but not from the ordinary gates, which
+    may legitimately answer with the egress approval; what this matrix owns is
+    the DIRECTION of failure, never which mechanism produced it.
     """
     cmd = wrap(op)
     if _parser_sees_gated_op(cmd):
@@ -921,75 +1267,93 @@ def test_matrix_hidden_gated_op_is_never_silently_allowed(
 @pytest.mark.parametrize("op_name,op", _GATED_OPS, ids=[n for n, _ in _GATED_OPS])
 @pytest.mark.parametrize("ctx_name,wrap", _INERT, ids=[n for n, _ in _INERT])
 @pytest.mark.parametrize("dispatched", [None, "1"], ids=["interactive", "dispatched"])
-def test_matrix_inert_mention_is_never_hard_blocked(
+def test_matrix_inert_mention_is_refused_actionably_never_prompted(
     op_name, op, ctx_name, wrap, dispatched, tmp_path
 ):
-    """Nothing gated EXECUTES in these cells. What that entitles them to differs
-    by mode, and an earlier version of this test got that wrong.
+    """Nothing gated EXECUTES in these cells, and the unparseable ones are
+    refused anyway — identically in every session type, with a way out named.
 
-    Two axes were missing and their absence hid a real regression. The verdict
-    was asserted as `!= "block"`, which `ask` satisfies — so when 18 of these 24
-    cells moved allow -> ask, the matrix stayed green while the false-positive
-    cost it exists to bound tripled unseen. And dispatch mode was not a
-    parameter at all, so the cell where those asks became REFUSALS did not exist
-    in the grid; it took an external audit to find it.
+    The INVARIANT changed here; the coverage did not. Every context, op and mode
+    the grid carried is still a cell. What each cell asserts is now:
 
-    With both axes present the dispatched half went red, and the honest reading
-    is that the invariant was wrong, not the guard. "A benign shape is never
-    hard blocked" cannot hold unattended: there is no one to answer a prompt, so
-    the only two options there are refuse or allow-unverified, and a security
-    gate does not pick the second. Three rounds of narrowing the predicate were
-    spent trying to make the old invariant true before that was accepted — the
-    blind path cannot tell an executed verb from a quoted one, which is the
-    premise of the net existing, so no predicate over the same degraded parse
-    separates these cells from the real thing.
+      (a) never a SILENT allow where the parse went blind;
+      (b) a REFUSAL (exit 2) in that case — the same one for every session type,
+          so a mode split cannot return without failing here;
+      (c) a refusal whose stderr is ACTIONABLE: it names the cause, and it names
+          a rewrite that applies (the Write tool for prose, `-F <file>` for a
+          real git command).
 
-    So the invariant is SCOPED rather than deleted. Interactively a benign shape
-    is never refused — an `ask` here is the accepted cost, one confirmation. In
-    an unattended session it may be refused, but the refusal must be RECOVERABLE
-    on its own: the message has to name the cause and the way out, so a session
-    with no human can rewrite the command and proceed. That is what makes this a
-    cost rather than a wall, and it is asserted, not assumed.
+    History, because each revision of this test hid a defect the next one found.
+    The verdict was once asserted as `!= "block"`, which `ask` satisfies — so
+    when 18 of these 24 cells moved allow -> ask, the matrix stayed green while
+    the false-positive cost it exists to bound tripled unseen. Dispatch mode was
+    then not a parameter at all, so the cell where those asks became REFUSALS
+    did not exist in the grid; an external audit found it. Adding the axis
+    turned the dispatched half red and the honest reading was that the invariant
+    was wrong, not the guard: three rounds of narrowing the predicate could not
+    make "a benign shape is never hard blocked" true, because the blind path
+    cannot tell an executed verb from a quoted one — which is the premise of the
+    net existing.
 
-    The verdict stays `!= "block"` on the interactive side rather than
-    `== "allow"` on purpose: the ask RATE is a separate measured quantity (see
-    the corpus figures in git_push_guard._GATED_MENTION) and pinning it per-cell
-    would freeze a cost decision inside a regression test.
+    The 2026-09-08 user ruling settles it for both halves rather than only the
+    unattended one: hooks are for the agent and do not prompt, so the interactive
+    `ask` is retired and these cells refuse too. The false positive is now priced
+    in an agent rewrite instead of a user click — which is exactly why (c) is a
+    hard assertion and not a comment. A refusal with no usable rewrite would make
+    this a wall for every session, not just the unattended ones.
+
+    The cells split on the PARSE, not on the mode: where the command tokenizes
+    (or analyze() resolved the op anyway) the net stands down and the ordinary
+    rules allow, which is correct — nothing gated executes. MEASURED across the
+    24 combinations: the three untokenizable contexts refuse in both modes, and
+    `in_double_quotes` allows in both.
     """
-    r = _run(_guard_for(op), wrap(op), cwd=str(tmp_path), dispatched=dispatched)
+    cmd = wrap(op)
+    r = _run(_guard_for(op), cmd, cwd=str(tmp_path), dispatched=dispatched)
     decision = _decision(r)
-    if dispatched != "1":
-        assert decision != "block", (
-            f"{ctx_name}/{op_name} (interactive) was HARD BLOCKED — nothing "
-            f"gated executes in this cell, and a human is present to answer an "
-            f"ask.\n{r.stdout}{r.stderr}"
+    cell = f"{ctx_name}/{op_name} (dispatched={dispatched})"
+
+    # No cell in this grid may reach a human. The blind-spot net does not prompt
+    # any more, and nothing gated executes here, so the surviving push/PR-create
+    # egress ask is unreachable too. Asserted first and separately: a restored
+    # interactive prompt would otherwise surface as a bare verdict mismatch
+    # without naming what it broke.
+    assert decision != "ask", (
+        f"{cell} PROMPTED a human. Hooks are for the agent — the only ask left "
+        f"is the push/PR-create egress approval, which this cell never "
+        f"reaches.\n{r.stdout}{r.stderr}"
+    )
+
+    if not (sp.untokenizable(cmd) and not _parser_sees_gated_op(cmd)):
+        # The net's precondition does not hold, so it must stand down entirely.
+        assert decision == "allow", (
+            f"{cell} was refused although the parse was TRUSTWORTHY — the "
+            f"blind-spot net has no business firing here.\n{r.stdout}{r.stderr}"
         )
         return
-    # Unattended. A refusal is PERMITTED here — not required. Many of these
-    # cells tokenize cleanly, so the net never fires and they are simply
-    # allowed, which is correct: nothing gated executes in them. What this half
-    # of the matrix pins is the shape of the refusal WHEN one happens. (The
-    # "never a silent allow" direction is the bypass matrix's job, not this
-    # one's — asserting it here too would duplicate that guarantee and make
-    # this test fail for the opposite reason.)
-    if decision != "block":
-        return
+
+    # Blind parse. The refusal is required, not merely permitted: leaving it
+    # optional is what let the interactive half drift for a whole revision.
+    assert decision == "block", (
+        f"{cell} was ALLOWED on a blind parse. The parser cannot tell this "
+        f"from a real gated op, which is the premise of the net.\n"
+        f"{r.stdout}{r.stderr}"
+    )
     guidance = r.stderr.lower()
     assert "cannot be parsed" in guidance or "parse" in guidance, (
-        f"{ctx_name}/{op_name} (dispatched) refused without naming the CAUSE. "
-        f"An unattended session cannot ask why.\n{r.stderr}"
+        f"{cell} refused without naming the CAUSE. The session has no one to "
+        f"ask why.\n{r.stderr}"
     )
     # APPLICABILITY, not a keyword. `"rewrite" in guidance` passes on a message
     # saying "do not rewrite", and — measured — it passed on a message whose only
     # suggestion did not apply to the command at hand: the dominant real shape
     # reaching this leg is prose being written to a FILE, where re-quoting a
     # here-doc cannot help because the apostrophe is in the prose itself. The
-    # refusal has to cover BOTH cases, or an unattended session hits a wall on
-    # the common one.
+    # refusal has to cover BOTH cases, or the session hits a wall on the common
+    # one.
     assert _names_a_usable_escape(guidance), (
-        f"{ctx_name}/{op_name} (dispatched) refused without a way out that "
-        f"applies. A refusal a session cannot act on is a wall, not a cost.\n"
-        f"{r.stderr}"
+        f"{cell} refused without a way out that applies. A refusal a session "
+        f"cannot act on is a wall, not a cost.\n{r.stderr}"
     )
 
 
@@ -1001,7 +1365,26 @@ def test_matrix_inert_mention_is_never_hard_blocked(
 # hook-skip). Returning an `ask` from inside the net pre-empted those rules and
 # turned a policy block into a dialog — measured, and invisible to invariants
 # that only assert "not silently allowed". These pin the verdict exactly.
+#
+# Under the 2026-09-08 ruling the net's verdict is a DENY rather than an ask, so
+# a downgrade to a dialog is no longer possible at all. But the net still sets
+# `blind_spot_deny` and DEFERS it to the tail rather than returning inline, and
+# that deferral is the whole reason the REASON stays correct: every specific
+# hard block above it returns first and prints its own sharper cause.
+#
+# So there are two independent properties here, and the second one used to be
+# only a comment. Both are asserted below:
+#   1. the VERDICT is still `block` (what these tests always covered), and
+#   2. the MESSAGE is the specific rule's, not the net's generic
+#      "cannot be parsed safely" text.
+#
+# (2) is what an inline `return 2` inside the net would silently break — same
+# block, worse reason — and nothing else in this file would have gone red.
+# The apostrophe_comment cells are the ones that matter: they make the command
+# untokenizable AND mention a gated op, so the net genuinely arms and the two
+# candidate messages actually race.
 # ══════════════════════════════════════════════════════════════════════════
+_NET_GENERIC = "cannot be parsed safely"
 _SQLITE = "sql" + "ite3"
 _DML = "INS" + "ERT INTO t VALUES(1)"
 _REPO = str(_WORKTREE)
@@ -1018,6 +1401,13 @@ class TestNetDoesNotDowngradeHardBlocks:
         cmd = f'{_SQLITE} /tmp/x.db "{_DML}"{suffix}'
         r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
         assert _decision(r) == "block", r.stdout + r.stderr
+        assert "sqlite3 are not allowed" in r.stderr, (
+            "the specific sqlite rule must own the message; the net's deferral "
+            f"is what preserves that.\n{r.stderr}"
+        )
+        assert _NET_GENERIC not in r.stderr, (
+            f"the net pre-empted a more specific hard block.\n{r.stderr}"
+        )
 
     @pytest.mark.parametrize(
         "suffix", ["", "  # don't forget"], ids=["plain", "apostrophe_comment"]
@@ -1026,3 +1416,21 @@ class TestNetDoesNotDowngradeHardBlocks:
         cmd = f'{GIT} {COMMIT} {NV} -m "x"{suffix}'
         r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
         assert _decision(r) == "block", r.stdout + r.stderr
+        assert "bypasses review enforcement hooks" in r.stderr, (
+            "the specific --no-verify rule must own the message.\n" + r.stderr
+        )
+        assert _NET_GENERIC not in r.stderr, (
+            f"the net pre-empted a more specific hard block.\n{r.stderr}"
+        )
+
+    def test_the_net_still_owns_the_message_when_no_specific_rule_applies(self):
+        # The control for the two cells above: with no more specific rule to
+        # win, the net's own generic text IS the right message. Without this,
+        # the two `_NET_GENERIC not in` assertions would also pass against a
+        # guard whose net had been deleted outright.
+        cmd = f"echo $'don\\'t {PUSH} yet' > /dev/null"
+        r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert _NET_GENERIC in r.stderr, (
+            f"the net must still speak when nothing sharper does.\n{r.stderr}"
+        )

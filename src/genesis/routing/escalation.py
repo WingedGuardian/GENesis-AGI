@@ -27,12 +27,10 @@ logger = logging.getLogger(__name__)
 # 5 trips ≈ 10 minutes of cycling (120s open duration × 5 cycles).
 _TRIP_THRESHOLD = 5
 
-# Consecutive trips further apart than this belong to SEPARATE incidents.
-# Genuine same-outage trip gaps are bounded by the breaker backoff (30 min
-# cap, 4h for quota) plus idle-traffic stretches — the widest gap measured on
-# a real multi-day outage was ~12h (sparse overnight traffic on a HALF_OPEN
-# breaker). 24h clears that with margin, while bounding a stale in-memory
-# anchor to a day instead of weeks.
+# A gap wider than this is logged as sparse evidence. It is NOT an incident
+# boundary: elapsed silence is not recovery evidence, so only record_recovery()
+# clears the state. Keeping this threshold makes unexpectedly sparse failure
+# patterns observable without discarding trips that still need escalation.
 _TRIP_WINDOW_S = 24 * 3600
 
 # How long a provider must have been continuously failing before the user is
@@ -92,8 +90,8 @@ class ProviderEscalation:
         # provider that never fully recovers — and the escalation used to render
         # that as a weeks-long outage that never happened.
         #
-        # The fix for that lives in `_describe_evidence`, not here. Trips are
-        # DISCRETE events and recovery is a DISCRETE event; between two of them
+        # The fix for that lives in the message text of `_create_observation` and
+        # `notify_provider_if_due`, not here. Trips are DISCRETE events and recovery is a DISCRETE event; between two of them
         # this class has no signal about the provider's state at all, so it must
         # not infer one in either direction. Zeroing the count inferred a
         # recovery from silence (and blinded the threshold to sparse outages);
@@ -126,8 +124,9 @@ class ProviderEscalation:
                 #
                 # The symptom that motivated the reset was real, but it lives in
                 # the REPORTING: the messages inferred a continuous outage from
-                # sparse trip evidence. That is fixed where it happens, in
-                # `_describe_evidence`, so the state can stay true.
+                # sparse trip evidence. That is fixed where it happens, in the message text
+                # of `_create_observation` and `notify_provider_if_due`, so the
+                # state can stay true.
                 logger.info(
                     "Provider '%s': %.0fh since its last trip — the incident "
                     "continues (no recovery observed); evidence now reaches "
@@ -242,18 +241,11 @@ class ProviderEscalation:
                 content=content,
                 priority="high",
                 category="system_health",
-                # KNOWN GAP, deliberately not fixed here: this stamps the row
-                # when the 5th trip lands, so the duration every consumer reads
-                # is short by the escalation ramp (~15-30 min, more under
-                # backoff). `first_trip_at` — the true start — is carried in the
-                # content JSON below but read by nothing. Backdating this column
-                # to it was tried and REVERTED: the anchor is written once per
-                # state entry (:72) and cleared only by `record_recovery`, so a
-                # flapping provider (success_threshold=2 means one clean call
-                # does not clear a trip) keeps a weeks-old anchor and the row is
-                # then born already past the 1h notification floor — a critical
-                # page with a fabricated multi-day duration. Fixing this needs
-                # the anchor bounded first; see the follow-up.
+                # The durable outage clock starts when threshold evidence is
+                # written, not at the first in-memory trip. `first_trip_at` is
+                # retained in content as evidence for the escalation row, while
+                # notification timing intentionally uses this durable timestamp.
+                # A gap without recorded recovery may not move either value.
                 created_at=self._clock().isoformat(),
                 content_hash=content_hash,
                 skip_if_duplicate=True,
@@ -601,8 +593,8 @@ async def notify_provider_if_due(
                     # inference the evidence never supported. What IS known is
                     # that no recovery has been recorded since the row opened.
                     "message": (
-                        f"Provider '{provider}' has not recovered since {human} ago — "
-                        f"no successful recovery has been recorded in that time. Calls "
+                        f"Provider '{provider}' has no recorded recovery for {human}. "
+                        f"Calls "
                         f"are falling back to other providers in each chain. If this "
                         f"provider is a paid or entitlement-gated model, the account "
                         f"may need attention."

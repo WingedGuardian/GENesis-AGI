@@ -176,6 +176,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **user_evaluate** — Evaluate content for personal relevance to the user using the user model
 - **video-processing** — Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
 - **voice-master** — Foundational voice authority and AI humanizer — writes content in the user's authentic voice with built-in AI detection, and supports stealth / anti- attribution writing (forum personas, anonymous posts, "write as not-me"). Use when asked to write/draft/generate content, invoke /voice, /write-as-me, or /humanize, run voice calibration, check "does this sound like me?", "make this sound human" / "de-AI this", "write a forum post as [persona]", or run AI detection ("does this sound like AI?", "check for AI patterns", "anti-slop check"). Do NOT use this skill for code, technical docs, or any output the user has not asked to be written in their voice — code styling defers to the separate code-voice skill.
+- **web-research** — Evidence-driven web and open-source research for questions that require multiple sources, factual verification, comparisons, or an adopt/adapt/build decision. Use for substantial research in foreground sessions, the genesis-researcher subagent, and research-profile background sessions. Skip for a single stable fact or a known URL that only needs fetching.
 - **youtube-fetch** — Fetches YouTube video metadata and transcripts using yt-dlp. Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
 
 ### MCP Tools
@@ -270,6 +271,8 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `recon_cc_update_check` — Analyze a Claude Code version change for impact on Genesis.
 - `recon_config` — View or modify recon configuration.
 - `recon_findings` — Query stored recon findings.
+- `recon_github_read` — Inspect GitHub repository metadata, a recursive tree, or one file.
+- `recon_github_search` — Search public GitHub.com repositories or issues without shell access.
 - `recon_run_github_discovery` — Discover GitHub repos for a topic, ranked by momentum/activity/maturity.
 - `recon_run_github_discovery_job` — Run the curated GitHub Discovery JOB on-demand (files new repos → triage).
 - `recon_run_model_intelligence` — Run model intelligence scan — check for new models, pricing changes, stale profiles.
