@@ -33,7 +33,7 @@ if str(SRC_DIR) not in sys.path:
 BATCH = 2000
 
 
-async def anchor_pass(db, apply: bool) -> dict:
+async def anchor_pass(db, apply: bool, *, db_path: str) -> dict:
     from genesis.memory.entity_anchors import extract_anchors, record_anchors
 
     scanned = mentions = memories_with = 0
@@ -56,8 +56,17 @@ async def anchor_pass(db, apply: bool) -> dict:
                 continue
             memories_with += 1
             if apply:
+                # `db` READS the corpus; record_anchors WRITES on its own
+                # connection under BEGIN IMMEDIATE, so it takes the target as a
+                # PATH rather than this connection. Passing db_path explicitly
+                # is what keeps --db honoured: without it the writes would go to
+                # the default database while this loop reads the one the
+                # operator named.
                 mentions += await record_anchors(
-                    db, memory_id, content, source="backfill_mechanical",
+                    memory_id,
+                    content,
+                    source="backfill_mechanical",
+                    db_path=db_path,
                 )
             else:
                 mentions += len(anchors)
@@ -127,7 +136,7 @@ async def main() -> None:
     try:
         mode = "APPLY" if args.apply else "DRY-RUN"
         print(f"[{mode}] entity backfill against {db_path}")
-        anchor = await anchor_pass(db, args.apply)
+        anchor = await anchor_pass(db, args.apply, db_path=db_path)
         print(f"anchor pass: {anchor}")
         seed = await seed_fts_pass(db, args.apply)
         print(f"seed-FTS pass: {seed['seed_mentions']} mentions")
