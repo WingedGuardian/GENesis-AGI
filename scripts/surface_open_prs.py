@@ -11,8 +11,11 @@ FRESH ``now``, and surfaces the age-stale ones passively inline as one line:
 Worker = fetch-only; this hook owns ALL display logic + the seen-map, so the
 surface is always computed against the current clock (never a stale snapshot's).
 Its stdout becomes context visible to Claude at session start (same contract as
-scripts/surface_pr_updates.py). The whole body is fail-open: any error, missing
-cache, stale cache, or disabled config -> print nothing, never block session start.
+scripts/surface_pr_updates.py). Fail-open: a missing cache, a stale cache, an
+unparseable one, or disabled config -> print nothing and never block session
+start. An UNEXPECTED error (in practice a genesis/src import skew) prints ONE
+fixed-format line first, so a broken surface is not read as "no open PRs", then
+returns. It still never blocks session start.
 It NEVER prints CI/review state or "ready to merge" — a visibility nudge only.
 """
 
@@ -21,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
 from datetime import UTC, datetime
 
 # The cache is only ever as fresh as the worker's last successful run. A snapshot
@@ -78,7 +82,17 @@ def main() -> None:
 
         stale_days = pulse_cfg.knob_int(cfg, "open_pr_stale_days")
         resurface = pulse_cfg.knob_int(cfg, "open_pr_resurface_days")
-        max_surface = pulse_cfg.knob_int(cfg, "open_pr_max_surface")
+        # Clamped in CODE — see the fuller note in surface_pr_updates.py; knob_int
+        # has no upper bound and a .local.yaml overlay can raise the configured
+        # value. OPEN_PR_MAX_SURFACE_CAP is the SHARED constant, so this clamp and
+        # the settings validator cannot drift apart. It is NOT a promise that an
+        # over-cap value never arrives: the validator guards settings_update, and
+        # a hand-edited overlay reaches load_config unvalidated, where this line
+        # silently reduces it. MEASURED at 5000 -> 20.
+        max_surface = min(
+            pulse_cfg.knob_int(cfg, "open_pr_max_surface"),
+            pulse_cfg.OPEN_PR_MAX_SURFACE_CAP,
+        )
 
         # Namespace the seen-map by the cache's live repo slug so a PR number from a
         # DIFFERENT repo (a re-pointed remote / fork) can't collide with an aged-out
@@ -113,8 +127,21 @@ def main() -> None:
         if text:
             print(text)
             sys.stdout.flush()
-    except Exception:
-        return  # Never block session start.
+    except Exception as exc:
+        # Fail open, and say so IN BAND -- see the full note in
+        # surface_pr_updates.py. The short version: stderr is not model-facing,
+        # which is why writing the diagnostic there costs nothing AND achieves
+        # nothing. Claude Code discards an exit-0 hook's stderr, so a version
+        # skew still read as "nothing to report". ONE fixed-format line, the only
+        # variable part an exception class name, sliced -- it cannot approach the
+        # hook-output cap. The traceback still goes to stderr for the debug log.
+        print(
+            f"[PRs] open-PR surfacing FAILED ({type(exc).__name__[:40]}) -- read "
+            "'no open PRs' as UNKNOWN this session, not as none. "
+            "Trace in the hook debug log."
+        )
+        traceback.print_exc(file=sys.stderr)
+        return
 
 
 if __name__ == "__main__":

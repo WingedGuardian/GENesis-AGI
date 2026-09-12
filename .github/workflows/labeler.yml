@@ -1,0 +1,42 @@
+# Applies .github/labeler.yml — path-glob → label — on pull-request open and
+# push. The labels are ANNOTATIONS; nothing gates on them (see labeler.yml).
+name: Labeler
+
+on:
+  # `pull_request_target` runs the workflow from the BASE branch with a token
+  # that can write labels, which `pull_request` cannot do for a fork PR. That
+  # makes it privileged, so the job below checks out NOTHING and runs no code
+  # from the pull request — the action reads the changed-file list through the
+  # API. Never add a checkout of `github.event.pull_request.head.sha` here, and
+  # never run a build step: that is the documented path by which this trigger
+  # leaks a write token to untrusted code.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit sha, not a tag: a tag is mutable, and this job holds
+      # a token that can write to pull requests.
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          configuration-path: .github/labeler.yml
+          # An unlabelled pull request is a missing annotation, not a broken
+          # build: this workflow is deliberately NOT among the required checks,
+          # and a failure here must never be able to block a merge.
+          #
+          # ADD-ONLY. `sync-labels: true` also REMOVES a managed label when its
+          # globs stop matching, and the labels this file manages are ordinary
+          # names a person may apply by hand — `documentation` most obviously.
+          # Stripping a human's label to keep a machine's annotation tidy is a
+          # side effect nobody asked for, and this file's whole premise is that
+          # the labels decide nothing. A stale label is cosmetic; a deleted one
+          # destroys intent. (Measured 2026-09-09: no open PR carries any label
+          # this config manages, so nothing is stripped TODAY — the setting is
+          # about the first time someone does.)
+          sync-labels: false

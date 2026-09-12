@@ -537,3 +537,50 @@ async def test_generic_outreach_send_forwards_labeled_surplus(tmp_path):
     finally:
         mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
         await conn.close()
+
+
+async def test_outreach_pending_pages_with_a_denominator(tmp_path):
+    """The listing must report a TOTAL and a truncation flag, not a bare list.
+
+    A bare list capped at 50 is indistinguishable from a complete one. With 60
+    queued messages a caller would have concluded it had seen them all — and since
+    every id worth cancelling comes from this tool, the invisible rows were also
+    the uncancellable ones. Paging with `total` + `truncated` is the house shape
+    for a bounded read: whole elements, plus a denominator.
+    """
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach
+
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    async with aiosqlite.connect(str(tmp_path / "p.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await pending_outreach.ensure_table(conn)
+        for i in range(60):
+            await pending_outreach.enqueue(
+                conn, message=f"queued {i}", category="notification",
+                deliver_after=f"2030-01-{(i % 28) + 1:02d}T00:00:00+00:00",
+            )
+        try:
+            mcp_mod._pipeline = None
+            mcp_mod._db = conn
+            tools = await mcp.get_tools()
+
+            first = await tools["outreach_pending"].fn()
+            assert first["total"] == 60, first
+            assert len(first["items"]) == 50
+            assert first["truncated"] is True, "60 rows behind a 50 cap must say so"
+
+            # The tail is REACHABLE, which is the point of paging.
+            rest = await tools["outreach_pending"].fn(offset=50)
+            assert len(rest["items"]) == 10
+            assert rest["truncated"] is False
+            ids = {r["id"] for r in first["items"]} | {r["id"] for r in rest["items"]}
+            assert len(ids) == 60, "paging lost or duplicated rows"
+
+            # A cancelled row leaves the listing AND the denominator.
+            await pending_outreach.cancel(conn, first["items"][0]["id"])
+            after = await tools["outreach_pending"].fn()
+            assert after["total"] == 59
+        finally:
+            mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db

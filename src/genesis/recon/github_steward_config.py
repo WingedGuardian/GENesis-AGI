@@ -64,6 +64,13 @@ DEFAULTS: dict[str, Any] = {
     "automation_denylist": [],
     # Loud-truncation cap: activity events processed per tick.
     "max_events_per_tick": 100,
+    # Separate, much smaller cap for the account-level NOTIFICATIONS lane. It is
+    # not sized like the deep-poll because it does not cost like the deep-poll:
+    # resolving one notification reads up to four comment/action surfaces plus
+    # the thread object, so reusing the 100 above would mean ~400 serial `gh`
+    # invocations in a single tick. Sized so a busy tick stays well inside the
+    # 2h cadence with room to spare.
+    "max_notifications_per_tick": 25,
     # Account-level notifications lane — surfaces activity BEYOND the flagship
     # deep-poll: @mentions of the owner anywhere, and responses on issues/PRs the
     # owner authored on OTHER people's repos (their outbound contributions). The
@@ -83,7 +90,12 @@ DEFAULTS: dict[str, Any] = {
 OWNED_ONLY_NOTIFICATION_REASONS = frozenset({"author", "subscribed"})
 
 # Public: the settings-domain validator imports these to check knobs.
-INT_KNOBS = ("auto_select_cap", "auto_select_days", "max_events_per_tick")
+INT_KNOBS = (
+    "auto_select_cap",
+    "auto_select_days",
+    "max_events_per_tick",
+    "max_notifications_per_tick",
+)
 
 
 def _base_path() -> Path:
