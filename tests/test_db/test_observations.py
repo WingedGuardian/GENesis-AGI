@@ -566,3 +566,50 @@ async def test_dedup_is_scoped_by_origin(db):
     # A THIRD identical owner request IS a duplicate (same origin) → skipped.
     r3 = await observations.create(db, id="dup_owner2", origin_class="owner", **common)
     assert r3 is None
+
+
+class TestUnresolvedByHash:
+    """Hash-scoped oldest-first read — the outage-clock primitive."""
+
+    async def _seed(self, db, id, hash_, created, resolved=0):
+        from genesis.db.crud import observations
+        await observations.create(
+            db, id=id, person_id=None, type="provider_failure",
+            content=f"row {id}", source="routing", priority="high",
+            content_hash=hash_, created_at=created,
+        )
+        if resolved:
+            await db.execute(
+                "UPDATE observations SET resolved = 1 WHERE id = ?", (id,)
+            )
+            await db.commit()
+
+    async def test_oldest_first_and_hash_scoped(self, db):
+        from genesis.db.crud import observations
+        await self._seed(db, "new", "hash-a", "2026-09-02T00:00:00+00:00")
+        await self._seed(db, "old", "hash-a", "2026-08-28T00:00:00+00:00")
+        await self._seed(db, "other", "hash-b", "2026-08-01T00:00:00+00:00")
+        rows = await observations.unresolved_by_hash(
+            db, source="routing", content_hash="hash-a",
+        )
+        assert [r["id"] for r in rows] == ["old", "new"], (
+            "oldest first — a truncated read must keep the EARLIEST rows"
+        )
+
+    async def test_resolved_rows_are_excluded(self, db):
+        from genesis.db.crud import observations
+        await self._seed(db, "gone", "hash-c", "2026-08-28T00:00:00+00:00", resolved=1)
+        await self._seed(db, "live", "hash-c", "2026-09-01T00:00:00+00:00")
+        rows = await observations.unresolved_by_hash(
+            db, source="routing", content_hash="hash-c",
+        )
+        assert [r["id"] for r in rows] == ["live"]
+
+    async def test_limit_bounds_the_read(self, db):
+        from genesis.db.crud import observations
+        for i in range(4):
+            await self._seed(db, f"r{i}", "hash-d", f"2026-08-2{i+1}T00:00:00+00:00")
+        rows = await observations.unresolved_by_hash(
+            db, source="routing", content_hash="hash-d", limit=2,
+        )
+        assert [r["id"] for r in rows] == ["r0", "r1"]

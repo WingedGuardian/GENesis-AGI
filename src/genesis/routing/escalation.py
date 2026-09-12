@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 # 5 trips ≈ 10 minutes of cycling (120s open duration × 5 cycles).
 _TRIP_THRESHOLD = 5
 
+# Consecutive trips further apart than this belong to SEPARATE incidents.
+# Genuine same-outage trip gaps are bounded by the breaker backoff (30 min
+# cap, 4h for quota) plus idle-traffic stretches — the widest gap measured on
+# a real multi-day outage was ~12h (sparse overnight traffic on a HALF_OPEN
+# breaker). 24h clears that with margin, while bounding a stale in-memory
+# anchor to a day instead of weeks.
+_TRIP_WINDOW_S = 24 * 3600
+
 # How long a provider must have been continuously failing before the user is
 # told. The escalation observation above fires at ~10 minutes, which is the
 # right threshold for a DASHBOARD row and far too eager for a notification —
@@ -36,6 +44,15 @@ _TRIP_THRESHOLD = 5
 # symbol exists anywhere in the repo, so the hour stands on the reasoning above
 # rather than on a borrowed threshold.
 _NOTIFY_AFTER_S = 3600.0
+
+# Ceiling on the SPAN a message may quote. Derived, not chosen: it is the
+# observations TTL (`db.crud.observations._DEFAULT_TTL`, 14 days), so past this
+# the row the span is measured from has expired and nothing a reader can look up
+# corroborates the number. Beyond it the wording degrades to "more than N days"
+# rather than quoting a precise total no record supports. Kept as a literal
+# rather than imported so this module does not take a CRUD dependency for a
+# constant; the tie is asserted in the tests.
+_EVIDENCE_SPAN_CAP_S = 14 * 24 * 3600
 
 
 class ProviderEscalation:
@@ -66,8 +83,59 @@ class ProviderEscalation:
                 "trip_count": 0,
                 "first_trip_at": None,
                 "escalated": False,
+                "last_trip_at": None,
             },
         )
+
+        # A wide gap is NOTED, not acted on. The state entry survives until
+        # `record_recovery` clears it, so `first_trip_at` can be weeks old on a
+        # provider that never fully recovers — and the escalation used to render
+        # that as a weeks-long outage that never happened.
+        #
+        # The fix for that lives in `_describe_evidence`, not here. Trips are
+        # DISCRETE events and recovery is a DISCRETE event; between two of them
+        # this class has no signal about the provider's state at all, so it must
+        # not infer one in either direction. Zeroing the count inferred a
+        # recovery from silence (and blinded the threshold to sparse outages);
+        # rendering "failing every call for N days" inferred a continuous outage
+        # from the same silence. Both were the same mistake, and only the second
+        # one is a real defect.
+        now = self._clock()
+        last_trip = state.get("last_trip_at")
+        if last_trip is not None:
+            try:
+                gap_s = (now - datetime.fromisoformat(last_trip)).total_seconds()
+            except ValueError:
+                gap_s = None
+            if gap_s is not None and gap_s > _TRIP_WINDOW_S:
+                # OBSERVED ONLY — nothing is discarded here any more.
+                #
+                # This used to zero `trip_count` and clear the anchor, on the
+                # theory that a long gap meant the old incident was stale. That
+                # was the wrong diagnosis of the right symptom, and it cost more
+                # than it bought. MEASURED: a provider failing once a week and
+                # never recovering sat at trip_count=1 for 8 consecutive weeks —
+                # it could never reach `_TRIP_THRESHOLD`, so no observation was
+                # ever written and the user was never told it was dead
+                # (Codex P1, #1632).
+                #
+                # Elapsed silence is not recovery evidence. The breaker can sit
+                # OPEN through an idle stretch, and only `record_recovery` —
+                # which requires actual successful calls — clears an incident.
+                # Resetting on the clock asserted a recovery nothing witnessed.
+                #
+                # The symptom that motivated the reset was real, but it lives in
+                # the REPORTING: the messages inferred a continuous outage from
+                # sparse trip evidence. That is fixed where it happens, in
+                # `_describe_evidence`, so the state can stay true.
+                logger.info(
+                    "Provider '%s': %.0fh since its last trip — the incident "
+                    "continues (no recovery observed); evidence now reaches "
+                    "back to %s",
+                    provider, gap_s / 3600, state.get("first_trip_at"),
+                )
+        state["last_trip_at"] = now.isoformat()
+
         state["trip_count"] += 1
         if state["first_trip_at"] is None:
             state["first_trip_at"] = self._clock().isoformat()
@@ -146,10 +214,18 @@ class ProviderEscalation:
                 "provider": provider,
                 "trip_count": state["trip_count"],
                 "first_trip_at": state["first_trip_at"],
+                # Says what the trip record SHOWS. "N times since <date>" read as
+                # a continuous N-day outage on a provider that had merely tripped
+                # sparsely over that span — the claim the re-anchor was added to
+                # suppress by discarding state. Naming both ends of the evidence
+                # and saying "observed" makes the same row honest for a burst and
+                # for a once-a-week failure, so the state does not have to lie.
+                "last_trip_at": state["last_trip_at"],
                 "message": (
-                    f"Provider '{provider}' has tripped its circuit breaker "
-                    f"{state['trip_count']} times since {state['first_trip_at']} "
-                    f"without recovery. All calls are falling back to other providers."
+                    f"Provider '{provider}' tripped its circuit breaker "
+                    f"{state['trip_count']} times between {state['first_trip_at']} "
+                    f"and {state['last_trip_at']}; no recovery has been observed in "
+                    f"between. Calls are falling back to other providers."
                 ),
             }
         )
@@ -336,12 +412,17 @@ async def notify_provider_if_due(
     clock = clock or (lambda: datetime.now(UTC))
     failure_hash = ProviderEscalation._provider_content_hash(provider)
     try:
-        rows = await observations.query(
+        # Hash-scoped read, NOT `query(resolved=False, limit=N)` + a Python
+        # filter: that shape silently starves this provider once the TOTAL
+        # unresolved routing population exceeds the fetch window — its clock
+        # then reads as absent, indistinguishable from "provider is fine".
+        # `unresolved_by_hash` is index-covered (idx_observations_content_hash)
+        # and returns oldest-first, so even its own (per-hash) bound keeps
+        # the earliest rows — the direction the outage clock needs.
+        rows = await observations.unresolved_by_hash(
             db,
             source="routing",
-            type="provider_failure",
-            resolved=False,
-            limit=100,
+            content_hash=failure_hash,
         )
     except Exception:
         logger.error(
@@ -355,12 +436,14 @@ async def notify_provider_if_due(
     # written through a different origin_class — or present before this
     # provider was first seen by THIS process — does not suppress a second.
     # Taking the newest would reset the outage clock on every duplicate,
-    # which is the exact failure this whole change exists to remove.
+    # which is the exact failure this whole change exists to remove. The
+    # min() stays in Python (not LIMIT 1 in SQL) deliberately: the oldest
+    # row's content can be unparseable, and the clock should then fall to
+    # the next parseable row rather than to silence.
     starts = [
         s
         for r in rows
-        if r.get("content_hash") == failure_hash
-        and (s := ProviderEscalation._outage_started_at(r)) is not None
+        if (s := ProviderEscalation._outage_started_at(r)) is not None
     ]
     if not starts:
         # No unresolved failure record → nothing to measure an outage from.
@@ -491,7 +574,15 @@ async def notify_provider_if_due(
         )
 
     hours = elapsed / 3600.0
-    human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
+    # Bounded so the reported span cannot grow without limit. The cap is the
+    # observations TTL (`_DEFAULT_TTL`, 14 days) rather than a chosen number:
+    # past it the row this span is measured from has itself expired, so nothing
+    # a reader can look up corroborates the figure. Beyond the cap the message
+    # says "more than N days" instead of quoting a precise, uncheckable total.
+    if elapsed > _EVIDENCE_SPAN_CAP_S:
+        human = f"more than {_EVIDENCE_SPAN_CAP_S / 86400:.0f} days"
+    else:
+        human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
     try:
         obs_id = await observations.create(
             db,
@@ -502,11 +593,19 @@ async def notify_provider_if_due(
                 {
                     "provider": provider,
                     "outage_started_at": started.isoformat(),
+                    # "has been failing EVERY CALL for N days" was the false
+                    # claim at the centre of this PR. Between two trips a week
+                    # apart nothing here observed the provider at all — success
+                    # only clears state after two consecutive wins, and that
+                    # clears everything — so continuous total failure was an
+                    # inference the evidence never supported. What IS known is
+                    # that no recovery has been recorded since the row opened.
                     "message": (
-                        f"Provider '{provider}' has been failing every call for "
-                        f"{human} and has not recovered. Calls are falling back to "
-                        f"other providers in each chain. If this provider is a paid "
-                        f"or entitlement-gated model, the account may need attention."
+                        f"Provider '{provider}' has not recovered since {human} ago — "
+                        f"no successful recovery has been recorded in that time. Calls "
+                        f"are falling back to other providers in each chain. If this "
+                        f"provider is a paid or entitlement-gated model, the account "
+                        f"may need attention."
                     ),
                 }
             ),
