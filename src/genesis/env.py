@@ -7,6 +7,10 @@ Configuration precedence (highest to lowest):
   1. Environment variable (e.g. OLLAMA_URL)
   2. ~/.genesis/config/genesis.yaml  (local install config)
   3. Hardcoded default (safe for a fresh clone)
+
+Exception: ``user_timezone()`` deliberately inverts this to FILE-first
+(genesis.yaml -> USER_TIMEZONE env fallback -> UTC) because timezone is the one
+setting with a live, dashboard-owned mutation surface; see its docstring.
 """
 
 from __future__ import annotations
@@ -48,7 +52,10 @@ def _local_config() -> dict:
     """
     global _LOCAL_CONFIG, _LOCAL_CONFIG_LOADED
     if _LOCAL_CONFIG_LOADED:
-        return _LOCAL_CONFIG or {}
+        # Normalized on the CACHED path too, not just after a load: this function
+        # has two returns, and guarding only the loader would leave the one that
+        # serves every call after the first unprotected.
+        return _LOCAL_CONFIG if isinstance(_LOCAL_CONFIG, dict) else {}
     _LOCAL_CONFIG_LOADED = True
     cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
     if not cfg_path.is_file():
@@ -58,11 +65,103 @@ def _local_config() -> dict:
         import yaml  # noqa: PLC0415 — lazy import, yaml is always available
 
         with cfg_path.open() as fh:
-            _LOCAL_CONFIG = yaml.safe_load(fh) or {}
+            loaded = yaml.safe_load(fh)
+        # `or {}` alone covers a null/empty file but KEEPS a truthy non-mapping
+        # root (a yaml list, or a bare scalar from a stray edit), and every caller
+        # below then calls `.get` on it. Hand-edited file, documented graceful
+        # contract: anything that is not a mapping is treated as absent.
+        #
+        # AND IT SAYS SO. Discarding the whole file silently is the same defect the
+        # section guard was fixed for, one level up: an accidental top-level list
+        # still CONTAINS the operator's settings, so `{}` throws away a declared
+        # policy — including the opt-out that stops recall using the paid lane —
+        # and `_local_section` never gets the chance to warn, because there is no
+        # section left to be malformed. Before this normalization the resulting
+        # exception at least surfaced a memory-bootstrap degradation; a quiet
+        # fallback is worse than the crash it replaced unless it is announced.
+        if loaded is not None and not isinstance(loaded, dict):
+            logger.warning(
+                "genesis.yaml root is %s, not a mapping — the ENTIRE file is being "
+                "ignored and every setting falls back to its default. Nothing in it "
+                "is in force. Fix the file (its top level must be a mapping) to "
+                "restore your declared policy. Path: %s",
+                type(loaded).__name__,
+                cfg_path,
+            )
+        _LOCAL_CONFIG = loaded if isinstance(loaded, dict) else {}
     except Exception:
         logger.warning("Failed to load local config from %s", cfg_path, exc_info=True)
         _LOCAL_CONFIG = {}
     return _LOCAL_CONFIG
+
+
+#: The spellings every env-var branch in this module already treats as FALSE.
+#: Kept as one set so the yaml branch cannot drift from the environment branch.
+_FALSEY_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _yaml_bool(value: object) -> bool:
+    """Interpret a yaml scalar as a boolean the SAME way the env branch does.
+
+    ``bool()`` alone is wrong here and the failure is silent: PyYAML returns a
+    plain string for a QUOTED scalar, so ``embed_priority_tier: "false"`` is a
+    non-empty string and ``bool()`` reads it as TRUE — the opposite of what the
+    operator wrote, and in that particular case it keeps the PAID lane running.
+    The same yaml written unquoted parses to a real ``False``, so the meaning of
+    an identical setting would depend on quoting alone; written in secrets.env
+    instead, the env branch already reads it correctly. Three spellings of one
+    intention must not disagree.
+
+    Strings are matched case-insensitively against the same token set the env
+    branches use; every other type falls back to ``bool()`` (a real yaml
+    ``false``, ``0``, an empty list — all already correct under it).
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        # EMPTY IS FALSE, and this branch has to say so explicitly. The token set
+        # below answers "is this one of the words meaning no", and an empty string
+        # is in none of them — so without this line `ollama_enabled: ""` would read
+        # as TRUE, where the `bool()` it replaced correctly read it as False. That
+        # is a regression this helper would have introduced while fixing its
+        # sibling: `embed_priority_tier: ""` would silently select the PAID lane.
+        # An empty value is an absent value, not an affirmation.
+        if not stripped:
+            return False
+        return stripped.lower() not in _FALSEY_TOKENS
+    return bool(value)
+
+
+def _local_section(name: str) -> dict:
+    """Return the named local-config section, or ``{}`` if it is not a mapping.
+
+    Every accessor that reads a nested key MUST go through this rather than
+    ``_local_config().get(name, {})``. That spelling supplies its default only
+    for a MISSING key, so both shapes a hand-edited yaml actually produces —
+    ``memory:`` with the child commented out (loads as ``None``) and
+    ``memory: enabled`` (loads as ``str``) — survive it and raise AttributeError
+    on the next ``.get``.
+
+    That raise is not contained. ``runtime/init/memory.py`` catches ``Exception``
+    around the memory bootstrap and records an init degradation, so a one-line
+    typo in the user-editable config silently runs the whole install with no
+    vector memory — while ``_local_config``'s docstring promises callers fall
+    through to their defaults gracefully.
+    """
+    section = _local_config().get(name)
+    if section is not None and not isinstance(section, dict):
+        # Never discard a declared policy SILENTLY. Two of the settings under here
+        # fail toward spending money (the paid embedding lane) and toward running an
+        # autonomous job the operator switched off, so "your config was ignored" has
+        # to be visible. Matches the existing precedent for an unreadable-but-present
+        # setting elsewhere in the tree: enforce the default, and say so.
+        logger.warning(
+            "genesis.yaml section %r is %s, not a mapping — ignoring it and using the "
+            "default for every setting under it. Fix the config to restore your "
+            "declared policy.",
+            name,
+            type(section).__name__,
+        )
+    return section if isinstance(section, dict) else {}
 
 
 def repo_root() -> Path:
@@ -100,6 +199,59 @@ def genesis_home() -> Path:
     """Resolve the Genesis runtime home (~/.genesis): output, sessions, config."""
     value = os.environ.get("GENESIS_HOME")
     return Path(value).expanduser() if value else Path.home() / ".genesis"
+
+
+def falkordb_socket_path() -> Path:
+    """Unix socket the graph engine listens on (``~/.genesis/falkordb/falkordb.sock``).
+
+    Composed from ``genesis_home()`` so it honors ``GENESIS_HOME``, which is what
+    lets a test point it at a tmp dir instead of the live engine. The path is a
+    convention shared with the systemd unit template, which renders the same
+    location — the unit is the writer, this is the reader, and they must agree.
+
+    Socket-only by design: the engine runs with ``--port 0``, so there is no TCP
+    URL accessor to pair with this one.
+    """
+    return genesis_home() / "falkordb" / "falkordb.sock"
+
+
+def alert_queue_root() -> Path:
+    """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
+
+    Resolved via ``genesis_home()`` so it honors the ``GENESIS_HOME`` override.
+    That lets the test suite isolate it to a tmp dir (see the
+    ``_isolate_alert_queue`` conftest fixture) instead of writing real alerts the
+    live server would drain to the owner's Telegram. The HOST guardian uses
+    ``config.state_path/"alerts"/"queue"`` (a different, non-home path) and is
+    unaffected by this resolver.
+    """
+    return genesis_home() / "alerts" / "queue"
+
+
+def internal_api_token_path() -> Path:
+    """Path to the persistent internal API token (generated once at server boot).
+
+    Trusted loopback/host callers read this to authenticate to ``/api`` mutation
+    endpoints when a dashboard password is set (see the dashboard auth gate).
+    Distinct from the optional ``GENESIS_MCP_HTTP_TOKEN`` (voice API) — this one
+    always exists once the server has booted, so callers need no configuration.
+    Written by the dashboard auth layer with mode 0600.
+    """
+    return genesis_home() / "internal_api_token"
+
+
+def read_internal_api_token() -> str | None:
+    """Return the internal API token, or ``None`` if absent / unreadable.
+
+    Pure read — never generates (only the server does, at boot). A ``None`` here
+    is correct on a fresh box where no dashboard password is set and the ``/api``
+    mutation gate is inactive: callers simply send no bearer.
+    """
+    try:
+        tok = internal_api_token_path().read_text().strip()
+        return tok or None
+    except OSError:
+        return None
 
 
 def memory_writebacks_off() -> bool:
@@ -177,6 +329,109 @@ def recall_read_pool_size() -> int:
         return int(raw)
     except ValueError:
         return DEFAULT_READ_POOL_SIZE
+
+
+def session_read_pool_size() -> int:
+    """Size of the read pool in a PER-SESSION MCP child (not the server's).
+
+    Deliberately a separate reader from :func:`recall_read_pool_size`, because the
+    two callers differ in CARDINALITY, not just in taste: the server is one per
+    box and fields every session's per-prompt recall, while an MCP child exists
+    once PER CC SESSION and serves only that session's explicit ``memory_recall``
+    calls. One host-derived number applied to both is multiplied by the number of
+    live sessions — MEASURED with 6 children on an 8-core box, that is 56 pooled
+    connections instead of 28.
+
+    Tunable via ``GENESIS_SESSION_READ_POOL_SIZE``; the pool floors it at 1, and a
+    missing or non-integer value falls back to the default. Set it explicitly on
+    an install that genuinely runs concurrent tool calls within one session.
+    """
+    from genesis.db.connection import DEFAULT_SESSION_READ_POOL_SIZE
+
+    # Precedence: the new per-session knob, then the LEGACY one, then the default.
+    #
+    # The legacy fallback is a compatibility obligation, not politeness. Before
+    # the role split this process honoured GENESIS_RECALL_READ_POOL_SIZE, so an
+    # install that set it to CONSTRAIN per-session resource use — say 1 — would
+    # otherwise be silently RAISED to the new default on upgrade, in every live
+    # MCP child at once. That is the opposite of what such an operator asked for,
+    # and nothing would report it.
+    for var in ("GENESIS_SESSION_READ_POOL_SIZE", "GENESIS_RECALL_READ_POOL_SIZE"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            # A malformed value in the PREFERRED variable must not silently fall
+            # through to the legacy one — that would let a typo change which knob
+            # is in effect. Take the default, as the server-side reader does.
+            return DEFAULT_SESSION_READ_POOL_SIZE
+    return DEFAULT_SESSION_READ_POOL_SIZE
+
+
+# SQLite busy_timeout default (ms). Defined HERE, not in db/connection.py: it is
+# an env-tunable default (see db_busy_timeout_ms below), and env.py must sit
+# below the db layer in the import graph — connection.py re-exports it for its
+# historical importers (structural review on WS-1 PR-1).
+BUSY_TIMEOUT_MS = 5000
+
+
+def db_busy_timeout_ms() -> int:
+    """SQLite ``busy_timeout`` (ms) for Genesis connections (default
+    ``BUSY_TIMEOUT_MS``, 5000).
+
+    How long SQLite itself waits for the WAL writer slot before surfacing
+    "database is locked". Overridable via ``GENESIS_DB_BUSY_TIMEOUT_MS`` per
+    PROCESS — the MCP child entrypoint raises it to 15s for itself (N MCP writer
+    processes race ONE writer slot with no queue fairness; 5s loses to any
+    server-side batch), while the server keeps the default. Floored at 100ms so
+    a typo can't turn every contended write into an instant failure; missing or
+    non-integer values fall back to the default. It lengthens how long a write
+    WAITS — it never shortens or skips work.
+    """
+    raw = os.environ.get("GENESIS_DB_BUSY_TIMEOUT_MS", "").strip()
+    if not raw:
+        return BUSY_TIMEOUT_MS
+    try:
+        return max(100, int(raw))
+    except ValueError:
+        return BUSY_TIMEOUT_MS
+
+
+def recall_rerank_gate_off() -> bool:
+    """True when the recall rerank rate-gate + circuit-breaker must NOT be built
+    (kill switch).
+
+    Recall's Voyage rerank normally runs behind a shared rate gate (skip to the
+    RRF+graph floor instead of burning a 429 when over Voyage's RPM) and a
+    timeout-only circuit breaker (skip during a Voyage hang) — follow-up
+    ac27b693, PR-3. This env kill makes the runtime skip building them, so the
+    rerank call is unguarded exactly as before the change — no code change.
+    Default off: the gate+breaker are built.
+    """
+    return os.environ.get("GENESIS_RECALL_RERANK_GATE_OFF", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def recall_rerank_rpm() -> int:
+    """Requests-per-minute the recall rerank rate gate paces Voyage to.
+
+    Voyage's free tier (no payment method) is 3 RPM; paid usage tiers are higher,
+    so this is tunable per install via ``GENESIS_RECALL_RERANK_RPM`` rather than
+    hardcoded (generalizability). Floored at 1; a missing/non-integer value falls
+    back to the free-tier default of 3.
+    """
+    raw = os.environ.get("GENESIS_RECALL_RERANK_RPM", "").strip()
+    if not raw:
+        return 3
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
 
 
 def skill_gate_off() -> bool:
@@ -350,7 +605,7 @@ def ollama_url() -> str:
     env_val = os.environ.get("OLLAMA_URL")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("network", {}).get("ollama_url")
+    local_val = _local_section("network").get("ollama_url")
     if local_val:
         return str(local_val).strip()
     return _DEFAULT_OLLAMA_URL
@@ -368,7 +623,7 @@ def lm_studio_url() -> str:
     env_val = os.environ.get("LM_STUDIO_URL")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("network", {}).get("lm_studio_url")
+    local_val = _local_section("network").get("lm_studio_url")
     if local_val:
         return str(local_val).strip()
     return _DEFAULT_LM_STUDIO_URL
@@ -387,10 +642,48 @@ def ollama_enabled() -> bool:
     env_val = os.environ.get("GENESIS_ENABLE_OLLAMA")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    local_val = _local_config().get("network", {}).get("ollama_enabled")
+    local_val = _local_section("network").get("ollama_enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return False
+
+
+def embed_priority_tier() -> bool:
+    """Whether RECALL embeddings request DeepInfra's paid priority tier.
+
+    Defaults to TRUE, and that default is a deliberate cost/quality call worth
+    stating rather than burying.
+
+    DeepInfra queues default-tier requests when a model is under load (their
+    Priority Service Tier announcement, 2026-06-29). MEASURED 2026-09-04 on
+    Qwen3-Embedding-0.6B: default 8.6-13.3s, priority ~650ms flat across input
+    sizes. The proactive-recall route has a 4.5s deadline, so on the default
+    tier recall failed 100% of the time — 20 of 20 through the live endpoint.
+
+    The premium is 1.5x: $0.010 -> $0.015 per 1M tokens. MEASURED volume on this
+    install is 217 recall requests in 24h at ~120 tokens each, so the difference
+    is roughly HALF A CENT PER MONTH. Defaulting to False would ship a feature
+    that does not work, to save an amount too small to measure — which the
+    project's stated "quality over cost, always" principle rules out.
+
+    Only the deadline-bound RECALL chain uses this. Storage embedding is a
+    background write with no deadline and stays on the normal rate.
+
+    Set GENESIS_EMBED_PRIORITY_TIER=false in secrets.env, or
+    memory.embed_priority_tier: false in ~/.genesis/config/genesis.yaml, to opt
+    out — recall then degrades to the keyword-only path whenever the queue runs
+    deeper than the deadline.
+    """
+    env_val = os.environ.get("GENESIS_EMBED_PRIORITY_TIER")
+    if env_val is not None:
+        return env_val.strip().lower() not in {"0", "false", "no", "off"}
+    # Via `_local_section`, which tolerates every shape a hand-edited yaml can
+    # produce: the documented opt-out must not be able to break the thing it opts
+    # out of. See that helper for what an unguarded read costs here specifically.
+    local_val = _local_section("memory").get("embed_priority_tier")
+    if local_val is not None:
+        return _yaml_bool(local_val)
+    return True
 
 
 def build_lane_enabled() -> bool:
@@ -407,24 +700,88 @@ def build_lane_enabled() -> bool:
     env_val = os.environ.get("GENESIS_BUILD_LANE_ENABLED")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    local_val = _local_config().get("build_lane", {}).get("enabled")
+    local_val = _local_section("build_lane").get("enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return False
+
+
+def models_md_synthesis_enabled() -> bool:
+    """Whether the weekly models.md synthesis job may run. Default ON.
+
+    The job dispatches a CC session that refreshes the LOCAL models.md overlay
+    (``~/.genesis/output/models.md``) from recent model-intelligence findings —
+    it no longer commits to the tracked reference doc. This is the operator
+    off-switch for that autonomous behavior (a CC-cost or catalog-noise
+    concern), distinct from the global ``runtime.paused`` gate. Set
+    ``GENESIS_MODELS_MD_SYNTHESIS_OFF=1`` in secrets.env or
+    ``models_md_synthesis.enabled: false`` in ``~/.genesis/config/genesis.yaml``.
+    The runner evaluates this per weekly tick, but a change takes effect only
+    after a genesis-server restart: a running process's env is static and
+    ``_local_config()`` caches the YAML parse for the process lifetime (same
+    restart requirement as ``build_lane_enabled``). The weekly cadence leaves
+    ample time to restart before the next run. Fails toward ON (env read can't
+    raise, local config swallows).
+    """
+    env_val = os.environ.get("GENESIS_MODELS_MD_SYNTHESIS_OFF")
+    if env_val is not None:
+        # The env var names the OFF state: a truthy value DISABLES the job.
+        return env_val.strip().lower() not in {"1", "true", "yes", "on"}
+    local_val = _local_section("models_md_synthesis").get("enabled")
+    if local_val is not None:
+        return _yaml_bool(local_val)
+    return True
+
+
+def _valid_zone(name: str) -> bool:
+    """True iff ``name`` resolves as an IANA zone (guards against typos)."""
+    try:
+        from zoneinfo import (  # noqa: PLC0415 — lazy; zoneinfo is stdlib
+            ZoneInfo,
+            ZoneInfoNotFoundError,
+        )
+
+        ZoneInfo(name)
+        return True
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return False
 
 
 def user_timezone() -> str:
     """User's local timezone (IANA format).
 
-    Precedence: USER_TIMEZONE env var → local config timezone → UTC.
+    Precedence: genesis.yaml ``timezone`` → USER_TIMEZONE env var → UTC.
     Used by tz.py and any subsystem that formats timestamps for display.
+
+    genesis.yaml is authoritative because timezone is the one setting with a
+    live, dashboard-owned mutation surface: the Configuration-tab dropdown
+    writes the file and ``tz.reload()`` picks it up without a restart. The
+    ``USER_TIMEZONE`` env var is a DEPRECATED fallback, consulted only when the
+    file has no ``timezone`` key (e.g. a standard install that never ran
+    setup-local-config). This deliberately diverges from the env-first house
+    convention (``github_user`` etc.) for that reason; a one-time seed migration
+    (``db/migrations/0086``) copies a real env value into the file before this
+    precedence took effect, so the flip preserves behavior on existing installs.
     """
-    env_val = os.environ.get("USER_TIMEZONE")
-    if env_val:
-        return env_val.strip()
+    # A valid IANA zone is always a non-empty string that ``ZoneInfo`` accepts.
+    # Accept ONLY that at each layer — a blank string, a non-string YAML scalar
+    # (``timezone: no`` → False, ``0`` → int), or a TYPO (e.g. ``Amrica/Chicago``
+    # written by a setup-local-config free-form prompt) is treated as unset and
+    # falls through, rather than being returned and crashing the CronTrigger /
+    # ZoneInfo consumers that trust this function's output.
     local_val = _local_config().get("timezone")
-    if local_val:
-        return str(local_val).strip()
+    if isinstance(local_val, str) and local_val.strip():
+        candidate = local_val.strip()
+        if _valid_zone(candidate):
+            return candidate
+        logger.warning(
+            "genesis.yaml timezone %r is not a valid IANA zone — falling back; "
+            "set a valid zone via the dashboard Timezone control.",
+            candidate,
+        )
+    env_val = (os.environ.get("USER_TIMEZONE") or "").strip()
+    if env_val and _valid_zone(env_val):
+        return env_val
     return "UTC"
 
 
@@ -436,7 +793,7 @@ def github_user() -> str:
     env_val = os.environ.get("GENESIS_GITHUB_USER")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("github", {}).get("user")
+    local_val = _local_section("github").get("user")
     if local_val:
         return str(local_val).strip()
     return ""
@@ -450,7 +807,7 @@ def github_public_repo() -> str:
     env_val = os.environ.get("GENESIS_GITHUB_PUBLIC_REPO")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("github", {}).get("public_repo")
+    local_val = _local_section("github").get("public_repo")
     if local_val:
         return str(local_val).strip()
     return "GENesis-AGI"

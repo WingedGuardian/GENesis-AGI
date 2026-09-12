@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     from genesis.memory.store import MemoryStore
     from genesis.observability.events import GenesisEventBus
+    from genesis.recon.account_activity import AccountActivityMonitor
     from genesis.recon.gatherer import ReconGatherer
     from genesis.routing.router import Router
     from genesis.surplus.brainstorm import BrainstormRunner
@@ -39,6 +40,7 @@ class SchedulerContext(Protocol):
     _maintenance_hours: int
     _analytical_hours: int
     _recon_gatherer: ReconGatherer | None
+    _account_activity_monitor: AccountActivityMonitor | None
     _model_intelligence_job: Any
     _models_md_synthesis_job: Any
     _skill_security_scan_job: Any

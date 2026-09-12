@@ -65,14 +65,15 @@ def test_model_for_depth(bridge):
 
 
 def test_effort_for_context(bridge):
-    # LIGHT→LOW, DEEP→HIGH (fixed), STRATEGIC→MAX
+    # Config-driven defaults (reflection_models domain): LIGHT→LOW, DEEP→XHIGH,
+    # STRATEGIC→XHIGH (Haiku ignores effort at dispatch; LOW is a harmless no-op).
     assert bridge._effort_for_context(Depth.LIGHT) == EffortLevel.LOW
-    assert bridge._effort_for_context(Depth.DEEP) == EffortLevel.HIGH
-    assert bridge._effort_for_context(Depth.STRATEGIC) == EffortLevel.MAX
-    # Deep is fixed HIGH regardless of escalation source or signal load
-    # (escalation_source is logged but doesn't change effort — that's V4 executor)
-    assert bridge._effort_for_context(Depth.DEEP, escalation_source="critical_bypass") == EffortLevel.HIGH
-    assert bridge._effort_for_context(Depth.DEEP, escalation_source="light_escalation") == EffortLevel.HIGH
+    assert bridge._effort_for_context(Depth.DEEP) == EffortLevel.XHIGH
+    assert bridge._effort_for_context(Depth.STRATEGIC) == EffortLevel.XHIGH
+    # Deep effort is unchanged by escalation source — it's logged, not acted on
+    # (escalation-driven effort is a V4 executor concern).
+    assert bridge._effort_for_context(Depth.DEEP, escalation_source="critical_bypass") == EffortLevel.XHIGH
+    assert bridge._effort_for_context(Depth.DEEP, escalation_source="light_escalation") == EffortLevel.XHIGH
 
 
 async def test_reflect_deep(db, bridge, tick, mock_invoker):

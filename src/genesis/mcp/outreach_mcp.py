@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -14,6 +15,16 @@ from fastmcp import FastMCP
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-outreach")
+
+# Pragmatic RFC-shape email check (matches the codebase's contribution.sanitize
+# pattern). Full RFC 5322 is not needed and no validator lib ships; this rejects
+# the common invalids (blank, no @, no TLD, whitespace) that must never reach an
+# adapter. Anchored + length-bounded; consecutive dots rejected.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _is_valid_email(addr: str) -> bool:
+    return bool(_EMAIL_RE.match(addr)) and ".." not in addr and len(addr) <= 254
 
 _pipeline = None
 _engagement = None
@@ -118,6 +129,7 @@ async def outreach_send(
                 deliver_after=preferred_timing,
                 thread_id=thread_id,
                 validated_recipient=validated_recipient,
+                labeled_surplus=labeled_surplus,
             )
             return json.dumps({
                 "status": "queued",
@@ -176,6 +188,156 @@ async def outreach_send(
         "status": result.status.value,
         "channel": result.channel,
         "error": result.error,
+    })
+
+
+@mcp.tool()
+async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
+    """Stage a COLD marketing email to a curated prospect. Returns a neutral
+    queued/refused JSON status.
+
+    Safety contract (why there is NO recipient parameter):
+      - The recipient is resolved IN CODE from ``marketing_prospects`` by
+        ``prospect_id`` — the LLM never supplies or influences the address.
+      - The tool refuses unless the ``marketing_outreach`` lever is enabled, the
+        prospect exists, is not opted out, and its address is RFC-shaped.
+      - A staged send is enqueued with ``labeled_surplus=True`` so it classifies
+        BULK at the WS-8 email autonomy gate — which ships at ASK and HOLDS every
+        cold send for owner approval. This tool never sends directly.
+    """
+    # (a) Outer lever: refuse entirely when off (env kill / disabled / invalid).
+    from genesis.outreach.marketing_config import effective_mode
+
+    if effective_mode() == "off":
+        return json.dumps({"status": "refused", "reason": "marketing_outreach_disabled"})
+
+    if _db is None:
+        return json.dumps({"status": "refused", "reason": "no_database"})
+
+    # (b) Resolve the recipient IN CODE — never from the caller.
+    from genesis.db.crud import marketing_prospects as mp
+
+    prospect = await mp.get_by_id(_db, prospect_id)
+    if prospect is None:
+        return json.dumps({"status": "refused", "reason": "prospect_not_found"})
+    if prospect.get("opted_out"):
+        return json.dumps({"status": "refused", "reason": "prospect_opted_out"})
+    recipient = (prospect.get("email") or "").strip()
+    if not recipient or not _is_valid_email(recipient):
+        return json.dumps({"status": "refused", "reason": "invalid_recipient"})
+
+    # (c) Compose + stage. category=NOTIFICATION (external informational outreach,
+    # no category-level approval gate — the email autonomy gate is the authority);
+    # labeled_surplus=True → BULK classification at the gate.
+    from genesis.outreach.types import OutreachCategory
+
+    subject = (subject or "").strip()
+    body = body or ""
+    message = f"{subject}\n\n{body}" if subject else body
+
+    if not _pipeline:
+        # Subprocess (standalone MCP) path — enqueue for the genesis-server drain,
+        # which rebuilds the request with labeled_surplus preserved (mirrors
+        # outreach_send's enqueue). The BULK flag survives via pending_outreach.
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent safety net
+        pending_id = await pending_outreach.enqueue(
+            _db,
+            message=message,
+            category=OutreachCategory.NOTIFICATION.value,
+            channel="email",
+            validated_recipient=recipient,
+            labeled_surplus=True,
+        )
+        return json.dumps({"status": "queued", "pending_id": pending_id})
+
+    # In-process pipeline path (server-hosted). Same neutral outcome contract as
+    # outreach_send: a HELD gate decision is reported as a terminal non-action.
+    from genesis.outreach.types import OutreachRequest, OutreachStatus
+
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic=subject[:100] if subject else message[:100],
+        context=message,
+        salience_score=0.5,
+        signal_type="marketing_cold",
+        channel="email",
+        labeled_surplus=True,
+        validated_recipient=recipient,
+        verbatim=True,
+    )
+    result = await _pipeline.submit(req)
+    if result.status == OutreachStatus.HELD:
+        return json.dumps({
+            "status": "not_performed",
+            "reason": "owner_authorization",
+            "message": (
+                "This marketing send is governed by Genesis owner authorization and "
+                "was not performed. This is expected, routine behavior, not an error."
+            ),
+        })
+    return json.dumps({
+        "outreach_id": result.outreach_id,
+        "status": result.status.value,
+        "channel": result.channel,
+        "error": result.error,
+    })
+
+
+@mcp.tool()
+async def marketing_prospects_list(limit: int = 100) -> str:
+    """List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets
+    the campaign may pitch — so it can enumerate → personalise a pitch → call
+    ``marketing_send(prospect_id, subject, body)``.
+
+    READ-ONLY (never sends). Returns ``id``/``email``/``name``/``company`` per row.
+    Excludes any prospect that is opted-out OR already ``contacted``/``replied``
+    (``list_active`` semantics), so a target that has been delivered a pitch never
+    reappears here — this is what stops the campaign re-pitching the same person.
+    Also returns the live ``mode`` of the ``marketing_outreach`` lever so the campaign
+    can do nothing when it is ``off``. On a fresh clone the store is empty and this
+    returns an empty list.
+
+    Args:
+        limit: max prospects to return (default 100). ``truncated`` flags a longer store.
+    """
+    from genesis.outreach.marketing_config import effective_mode
+
+    mode = effective_mode()
+    if _db is None:
+        return json.dumps({"status": "error", "reason": "no_database", "mode": mode, "prospects": []})
+    if mode == "off":
+        # Mirror marketing_send's OUTER off-switch: when the marketing lever is off the
+        # cold-send substrate surfaces NOTHING — don't hand the target inventory to a
+        # campaign session that shouldn't be running. Code-gated (not LLM-trusted to
+        # read the `mode` field), so the off posture holds even for a misbehaving caller.
+        return json.dumps({
+            "status": "ok", "mode": mode, "count": 0, "total": 0, "truncated": False,
+            "prospects": [],
+        })
+
+    from genesis.db.crud import marketing_prospects as mp
+
+    n = limit if isinstance(limit, int) and limit > 0 else 100
+    rows = await mp.list_active(_db)
+    truncated = len(rows) > n
+    prospects = [
+        {
+            "id": r["id"],
+            "email": r["email"],
+            "name": r.get("name"),
+            "company": r.get("company"),
+        }
+        for r in rows[:n]
+    ]
+    return json.dumps({
+        "status": "ok",
+        "mode": mode,
+        "count": len(prospects),
+        "total": len(rows),  # denominator for `truncated` (no silent cap)
+        "truncated": truncated,
+        "prospects": prospects,
     })
 
 
@@ -338,6 +500,111 @@ async def outreach_queue(
         return [{"error": f"Query failed: {exc}"}]
 
 
+@mcp.tool()
+async def outreach_pending(limit: int = 50, offset: int = 0) -> dict:
+    """List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
+
+    Deliberately a separate tool from ``outreach_queue``, which reads
+    ``outreach_history`` (messages already DELIVERED) and therefore never shows a
+    scheduled message at all. That gap is why this exists: without it, a queued
+    message is only addressable by the id its ``outreach_send`` call returned, so
+    once that id is out of view the message cannot be found, inspected, or
+    cancelled — it simply arrives.
+
+    Returns each row's id, when it is due (``deliver_after``), and a short message
+    preview, soonest-due first. A NULL ``deliver_after`` means "goes out on the
+    next drain tick", so it sorts FIRST — ordering on ``deliver_after`` directly
+    would push the imminent messages behind everything scheduled for next month,
+    and the LIMIT would then drop exactly the ones worth cancelling.
+
+    PAGED, with a denominator. Returns
+    ``{items, total, offset, limit, truncated}`` — never a bare list. A bare list
+    capped at 50 is indistinguishable from a complete one, so a caller with 60
+    queued messages would have concluded it had seen them all and that the missing
+    ten did not exist; and since every id worth cancelling comes from this tool,
+    the invisible ones were also the uncancellable ones. ``total`` is the real
+    count and ``truncated`` says outright whether more remain; page with ``offset``.
+    """
+    if not _db:
+        return {"error": "not initialized"}
+    try:
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    try:
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        where = "WHERE delivered = 0 AND cancelled_at IS NULL"
+        count_cursor = await _db.execute(
+            f"SELECT COUNT(*) FROM pending_outreach {where}"  # noqa: S608 — literal
+        )
+        total = int((await count_cursor.fetchone())[0])
+        cursor = await _db.execute(
+            f"""SELECT id, category, channel, urgency, deliver_after, created_at,
+                      substr(message, 1, 160) AS message_preview
+                 FROM pending_outreach
+                {where}
+                ORDER BY COALESCE(deliver_after, created_at) ASC, created_at ASC
+                LIMIT ? OFFSET ?""",  # noqa: S608 — `where` is a literal above
+            (limit, offset),
+        )
+        columns = [d[0] for d in cursor.description]
+        items = [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(items) < total,
+        }
+    except Exception as exc:
+        return {"error": f"Query failed: {exc}"}
+
+
+@mcp.tool()
+async def outreach_cancel(pending_id: str) -> str:
+    """Cancel a queued, not-yet-sent message by its pending id.
+
+    Use this to retract or reschedule a queued message: cancel, then re-send with
+    the new timing. Before this existed the only options were to send a duplicate
+    or to mark the original DELIVERED — and that second one writes a false record
+    into a table that gets read back, so a later session concludes the recipient
+    was told something they were not.
+
+    Returns a status naming what actually happened, because "cancelled" and "there
+    was nothing to cancel" must not look alike:
+      cancelled         — this call cancelled a live queued message
+      already_cancelled — a previous cancel already took effect
+      already_dequeued  — the message has left the queue. It was sent, OR it is
+                          HELD at the autonomy gate awaiting the owner's approval
+                          (in which case it has NOT been sent and still will be),
+                          OR it aged out after 24h. The queue writes the same flag
+                          for all three, so this tool does not claim delivery it
+                          cannot verify.
+      unknown_id        — no such pending message
+
+    Get ids from ``outreach_pending`` (paged: check its ``truncated`` flag).
+    """
+    if not _db:
+        return json.dumps({"error": "not initialized"})
+    try:
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent; init is fire-and-forget
+        did, reason = await pending_outreach.cancel(_db, pending_id)
+    except Exception as exc:
+        return json.dumps({"error": f"Cancel failed: {exc}"})
+    payload = {"status": reason, "cancelled": did, "pending_id": pending_id}
+    if reason == "already_dequeued":
+        payload["note"] = (
+            "left the queue — sent, awaiting approval at the autonomy gate, or aged "
+            "out. Not necessarily delivered."
+        )
+    return json.dumps(payload)
+
+
 async def _server_rpc(path: str, payload: dict, *, read_timeout_s: float) -> dict:
     """Bridge a synchronous outreach op to genesis-server, which owns the live
     pipeline this subprocess lacks. POSTs to the in-process dashboard route and
@@ -350,9 +617,20 @@ async def _server_rpc(path: str, payload: dict, *, read_timeout_s: float) -> dic
     host = os.environ.get("GENESIS_DASHBOARD_HOST", "127.0.0.1")
     port = os.environ.get("GENESIS_DASHBOARD_PORT", "5000")
     url = f"http://{host}:{port}{path}"
+    # Internal bearer so the POST passes the server's /api mutation gate when a
+    # dashboard password is set. Absent token → no header (gate inactive).
+    headers: dict[str, str] = {}
+    try:
+        from genesis.env import read_internal_api_token
+
+        _tok = read_internal_api_token()
+        if _tok:
+            headers["Authorization"] = f"Bearer {_tok}"
+    except Exception:
+        pass
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout_s, connect=5.0)) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             return resp.json()
     except httpx.HTTPStatusError as exc:

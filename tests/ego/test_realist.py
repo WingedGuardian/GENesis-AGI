@@ -285,11 +285,15 @@ class TestCapabilityMapFix:
             lambda *a, **k: EgoConfig(outcome_bus_capability_feed=False),
         )
 
-        # Create proposals: 1 approved, 1 rejected, 3 withdrawn
-        await ego_crud.create_proposal(
-            db, id="cap1", action_type="maintenance", content="Approved"
-        )
-        await ego_crud.resolve_proposal(db, "cap1", status="approved")
+        # Create proposals: 2 approved, 1 rejected, 3 withdrawn.
+        # Three TERMINAL proposals, not two, so the domain clears the
+        # aggregator's minimum-sample floor — at n=2 it would not be emitted at
+        # all and this test would pass vacuously while checking nothing.
+        for _pid in ("cap1", "cap1b"):
+            await ego_crud.create_proposal(
+                db, id=_pid, action_type="maintenance", content="Approved"
+            )
+            await ego_crud.resolve_proposal(db, _pid, status="approved")
 
         await ego_crud.create_proposal(
             db, id="cap2", action_type="maintenance", content="Rejected"
@@ -305,11 +309,13 @@ class TestCapabilityMapFix:
         results = await compute_capability_map(db)
         maint = [r for r in results if r["domain"] == "maintenance"]
 
-        # Without fix: 1/5 = 20%. With fix: 1/2 = 50%.
-        if maint:
-            assert maint[0]["confidence"] >= 0.4, (
-                f"Expected >= 0.4 (withdrawn excluded), got {maint[0]['confidence']}"
-            )
+        # Without fix: 2/6 = 33%. With fix: 2/3 = 67%.
+        # Asserted unconditionally — a `if maint:` guard would let the whole
+        # check evaporate the moment the domain stopped being emitted.
+        assert maint, "maintenance domain must be emitted for this test to mean anything"
+        assert maint[0]["confidence"] >= 0.4, (
+            f"Expected >= 0.4 (withdrawn excluded), got {maint[0]['confidence']}"
+        )
 
 
 # -- Realist filter integration tests --
@@ -592,3 +598,129 @@ class TestGenesisEgoRealist:
             ego_source="genesis_ego_cycle",
         )
         assert "Domain boundary" in prompt
+
+
+# -- PR-5 unit E: realist history widen (Codex P1) --
+
+
+class TestBuildRealistPromptWiden:
+    """The ``widened`` kwarg switches the history header so the prompt honestly
+    describes its own contents (Rule #6 tells the realist it only knows the
+    table above)."""
+
+    def test_widened_header(self):
+        prompt = _build_realist_prompt(
+            [{"action_type": "dispatch", "content": "x", "confidence": 0.5}],
+            [],
+            widened=True,
+        )
+        assert "Full Pending Board + Recently Resolved (7d)" in prompt
+        assert "Recent Proposal History (48h)" not in prompt
+
+    def test_legacy_header_by_default(self):
+        prompt = _build_realist_prompt(
+            [{"action_type": "dispatch", "content": "x", "confidence": 0.5}],
+            [],
+        )
+        assert "Recent Proposal History (48h)" in prompt
+        assert "Full Pending Board" not in prompt
+
+
+class TestRealistWidenIntegration:
+    """When blind drafting is active (reconcile mode != off) the realist history
+    widens to the FULL ego-scoped board, so a >2-day-old pending proposal stays
+    visible to Rule #2 dedup (Codex P1). In off mode the legacy 2-day/LIMIT-20
+    GLOBAL window is preserved exactly."""
+
+    async def _capture_prompt(self, db, monkeypatch, *, mode):
+        from types import SimpleNamespace
+
+        from genesis.ego.session import EgoSession
+
+        monkeypatch.setattr(
+            "genesis.ego.reconcile_config.effective_mode", lambda: mode
+        )
+
+        captured = {}
+
+        async def fake_run(invocation):
+            captured["prompt"] = invocation.prompt
+            return SimpleNamespace(
+                cost_usd=0.0,
+                is_error=False,
+                text=json.dumps([{"index": 0, "verdict": "pass", "reasoning": "ok"}]),
+                error_message=None,
+            )
+
+        session = object.__new__(EgoSession)
+        session._db = db
+        session._source_tag = "genesis_ego_cycle"
+        session._last_realist_cost_usd = 0.0
+        session._invoker = SimpleNamespace(run=fake_run)
+
+        await session._filter_proposals(
+            [
+                {
+                    "action_type": "dispatch",
+                    "content": "brand new draft",
+                    "confidence": 0.8,
+                }
+            ]
+        )
+        return captured["prompt"]
+
+    async def _seed_pending(self, db, *, id, content, ego_source, days_old):
+        from datetime import UTC, datetime, timedelta
+
+        ts = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
+        await ego_crud.create_proposal(
+            db,
+            id=id,
+            action_type="dispatch",
+            content=content,
+            rationale="r",
+            confidence=0.7,
+            status="pending",
+            ego_source=ego_source,
+            created_at=ts,
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_old_pending_visible_when_blind(self, db, monkeypatch):
+        await self._seed_pending(
+            db,
+            id="old-pending-1",
+            content="OLD PENDING install-test automation",
+            ego_source="genesis_ego_cycle",
+            days_old=5,
+        )
+        prompt = await self._capture_prompt(db, monkeypatch, mode="shadow")
+        assert "OLD PENDING install-test automation" in prompt
+        assert "Full Pending Board + Recently Resolved (7d)" in prompt
+
+    @pytest.mark.asyncio
+    async def test_old_pending_hidden_in_off_mode(self, db, monkeypatch):
+        await self._seed_pending(
+            db,
+            id="old-pending-2",
+            content="OLD PENDING install-test automation",
+            ego_source="genesis_ego_cycle",
+            days_old=5,
+        )
+        prompt = await self._capture_prompt(db, monkeypatch, mode="off")
+        assert "OLD PENDING install-test automation" not in prompt
+        assert "Recent Proposal History (48h)" in prompt
+
+    @pytest.mark.asyncio
+    async def test_widen_is_ego_scoped(self, db, monkeypatch):
+        """Widen pulls only THIS ego's board — another ego's pending is excluded."""
+        await self._seed_pending(
+            db,
+            id="user-ego-pending",
+            content="USER EGO private board item",
+            ego_source="user_ego_cycle",
+            days_old=5,
+        )
+        prompt = await self._capture_prompt(db, monkeypatch, mode="shadow")
+        assert "USER EGO private board item" not in prompt

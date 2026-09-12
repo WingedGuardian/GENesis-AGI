@@ -7,27 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
+from genesis.db.schema import TABLES
 from genesis.memory.store import MemoryStore
 
 
 async def _build_db(path: str) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(path)
-    await conn.execute("""
-        CREATE TABLE memory_metadata (
-            memory_id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            collection TEXT NOT NULL DEFAULT 'episodic_memory',
-            confidence REAL,
-            embedding_status TEXT NOT NULL DEFAULT 'embedded',
-            memory_class TEXT DEFAULT 'fact',
-            wing TEXT,
-            room TEXT,
-            valid_at TEXT,
-            invalid_at TEXT,
-            source_subsystem TEXT,
-            origin_class TEXT
-        )
-    """)
+    # Canonical DDL — never drifts when memory_metadata columns are added
+    # (e.g. the MW-1 judgment axes).
+    await conn.execute(TABLES["memory_metadata"])
     await conn.execute("""
         CREATE VIRTUAL TABLE memory_fts USING fts5(
             memory_id, content, source_type, tags, collection

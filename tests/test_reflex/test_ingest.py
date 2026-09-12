@@ -74,6 +74,28 @@ class TestHandler:
         await ing.handle_event(_event())
         assert ing.stats["queued"] == 1
 
+    async def test_enqueues_job_failed(self, db):
+        # PR-2b: the background-job funnel (job.failed) feeds the same pipeline.
+        ing = _ingestor(db)
+        await ing.handle_event(_event(event_type="job.failed"))
+        assert ing.stats["queued"] == 1
+
+    async def test_skips_reason_only_failure_no_error_type(self, db):
+        # A semantic/reason-only failure carries error_reason and NO error_type
+        # (job_health's non-exception path) — not a reflex-arc bug. Skipped for
+        # BOTH sources so widening intake to job.failed can't manufacture a
+        # bogus "UnknownError" signal.
+        ing = _ingestor(db)
+        for etype in ("job.failed", "task.failed"):
+            await ing.handle_event(
+                SimpleNamespace(
+                    event_type=etype,
+                    subsystem="health",
+                    details={"task_name": "weekly_assessment", "error_reason": "no data"},
+                )
+            )
+        assert ing.stats["queued"] == 0
+
     async def test_ignores_other_event_types(self, db):
         ing = _ingestor(db)
         await ing.handle_event(_event(event_type="breaker.tripped"))

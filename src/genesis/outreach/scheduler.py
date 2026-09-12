@@ -44,8 +44,6 @@ class OutreachScheduler:
         config: OutreachConfig,
         db: aiosqlite.Connection,
         *,
-        reconciler: object | None = None,
-        curve_computer: object | None = None,
         event_bus: object | None = None,
     ) -> None:
         self._pipeline = pipeline
@@ -53,8 +51,6 @@ class OutreachScheduler:
         self._engagement = engagement
         self._config = config
         self._db = db
-        self._reconciler = reconciler
-        self._curve_computer = curve_computer
         self._event_bus = event_bus
         self._scheduler: AsyncIOScheduler | None = None
         # In-memory alert dedup — DB-independent fallback.
@@ -108,20 +104,6 @@ class OutreachScheduler:
             id="outreach_engagement_poll",
             replace_existing=True,
         )
-        # Daily calibration — reconcile predictions + recompute curves
-        # Wrap minute to avoid APScheduler crash if morning_report_time >= XX:55
-        cal_raw = int(minute) + 5
-        cal_hour = int(hour) + (cal_raw // 60)
-        cal_minute = cal_raw % 60
-        self._scheduler.add_job(
-            self._calibration_job,
-            "cron",
-            hour=cal_hour,
-            minute=cal_minute,
-            timezone=tz,
-            id="outreach_calibration",
-            replace_existing=True,
-        )
         # Health check — surfaces critical infrastructure problems to user
         self._scheduler.add_job(
             self._health_check_job,
@@ -169,13 +151,31 @@ class OutreachScheduler:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
 
-    async def _record_job_result(self, name: str, *, error: str | None = None) -> None:
-        """Record success/failure in runtime + emit event."""
+    async def _record_job_result(
+        self, name: str, *, error: str | None = None, exc: BaseException | None = None
+    ) -> None:
+        """Record success/failure in runtime + emit event.
+
+        Pass *exc* whenever an exception caused the failure — it is what makes
+        the event diagnosable (``error_type`` + frames). A failure reported only
+        as a semantic *error* string carries no ``error_type``, which is how
+        consumers tell an internal defect from an external blocker.
+        """
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
-        if error:
-            rt.record_job_failure(name, error)
+        if error or exc is not None:
+            from genesis.observability.failure_details import error_summary, failure_details
+
+            # One detail string for both sinks, so job_health.last_error and the
+            # event message agree — and so passing only *exc* (no *error*) can
+            # never render the message as "failed: None".
+            detail = error_summary(exc, error) or "unknown"
+            rt.record_job_failure(
+                name,
+                detail,
+                error_type=type(exc).__name__ if exc is not None else None,
+            )
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
 
@@ -183,7 +183,8 @@ class OutreachScheduler:
                     Subsystem.OUTREACH,
                     Severity.ERROR,
                     f"{name}.failed",
-                    f"Scheduled job {name} failed: {error}",
+                    f"Scheduled job {name} failed: {detail}",
+                    **failure_details(exc=exc, reason=None if exc is not None else error),
                 )
         else:
             rt.record_job_success(name)
@@ -243,7 +244,7 @@ class OutreachScheduler:
             await self._record_job_result("morning_report")
         except Exception as exc:
             logger.exception("Morning report job failed")
-            await self._record_job_result("morning_report", error=str(exc))
+            await self._record_job_result("morning_report", error=str(exc), exc=exc)
 
     async def _surplus_outreach_job(self) -> None:
         if self._is_paused():
@@ -277,7 +278,7 @@ class OutreachScheduler:
             await self._record_job_result("surplus_outreach")
         except Exception as exc:
             logger.exception("Surplus outreach job failed")
-            await self._record_job_result("surplus_outreach", error=str(exc))
+            await self._record_job_result("surplus_outreach", error=str(exc), exc=exc)
 
     async def _engagement_poll_job(self) -> None:
         if self._is_paused():
@@ -291,7 +292,7 @@ class OutreachScheduler:
             await self._record_job_result("engagement_poll")
         except Exception as exc:
             logger.exception("Engagement poll failed")
-            await self._record_job_result("engagement_poll", error=str(exc))
+            await self._record_job_result("engagement_poll", error=str(exc), exc=exc)
 
     async def _health_check_job(self) -> None:
         """Check health alerts and send outreach for critical issues.
@@ -383,7 +384,7 @@ class OutreachScheduler:
             await self._record_job_result("health_check")
         except Exception as exc:
             logger.exception("Health check outreach job failed")
-            await self._record_job_result("health_check", error=str(exc))
+            await self._record_job_result("health_check", error=str(exc), exc=exc)
 
     async def _critical_observations_job(self) -> None:
         """Alert user via Telegram when critical observations are created.
@@ -511,7 +512,7 @@ class OutreachScheduler:
             await self._record_job_result("critical_observations")
         except Exception as exc:
             logger.exception("Critical observations outreach job failed")
-            await self._record_job_result("critical_observations", error=str(exc))
+            await self._record_job_result("critical_observations", error=str(exc), exc=exc)
 
     async def _ambient_health_job(self) -> None:
         """Alert when the edge ambient-capture bridge goes dark or regresses.
@@ -597,17 +598,24 @@ class OutreachScheduler:
             await self._record_job_result("ambient_health")
         except Exception as exc:
             logger.exception("Ambient health monitor job failed")
-            await self._record_job_result("ambient_health", error=str(exc))
+            await self._record_job_result("ambient_health", error=str(exc), exc=exc)
 
     @staticmethod
     def _ambient_remedy_hint(causes: tuple[str, ...]) -> str:
         """Cause-aware remediation line for the ambient alert (worst cause wins).
 
-        "degraded" is a multi-cause bucket (dead diar worker, RSS regression) —
-        a fixed "process down/hung" suffix misdiagnoses a live-but-leaking bridge.
+        "degraded" is a multi-cause bucket (dead diar worker, RSS regression,
+        auto-recovery exhausted) — a fixed "process down/hung" suffix misdiagnoses a
+        live-but-leaking bridge. Precedence: bridge-dead > recovery-failing > diar >
+        rss (most-specific/actionable wins).
         """
         if "bridge-dead" in causes:
             return "(ambient bridge process down/hung — check/restart ambient-bridge.service)"
+        if "recovery-failing" in causes:
+            return (
+                "(auto-recovery exhausted — the device is dark and reboot attempts failed; "
+                "check the device's power/network or the ESPHome API on the Voice PE)"
+            )
         if "diar-worker" in causes:
             return "(diarization worker crashed — a bridge restart respawns it: systemctl --user restart ambient-bridge)"
         if "rss-total" in causes or "rss-diar-child" in causes:
@@ -616,23 +624,6 @@ class OutreachScheduler:
                 "restart reclaims memory, but investigate before the VM feels it)"
             )
         return "(check the bridge: journalctl --user -u ambient-bridge)"
-
-    async def _calibration_job(self) -> None:
-        """Reconcile predictions and recompute calibration curves."""
-        if self._is_paused():
-            return
-        try:
-            if self._reconciler:
-                results = await self._reconciler.reconcile_all()
-                logger.info("Calibration reconciliation: %s", results)
-            if self._curve_computer:
-                for domain in ("outreach", "triage", "procedure", "routing"):
-                    await self._curve_computer.compute_and_save(domain)
-                logger.info("Calibration curves recomputed")
-            await self._record_job_result("calibration")
-        except Exception as exc:
-            logger.exception("Calibration job failed")
-            await self._record_job_result("calibration", error=str(exc))
 
     async def _mark_row_delivered(self, row: dict, delivered_at: str) -> None:
         """Mark a drained row delivered, keying on ``id`` or falling back to
@@ -687,6 +678,21 @@ class OutreachScheduler:
                                 # cap (subtracting naive from aware raises) — treat
                                 # it as UTC, which is how created_at is written.
                                 parsed = parsed.replace(tzinfo=UTC)
+                            # Age the retry cap from when the row became DUE, not
+                            # when it was created — a reminder scheduled far ahead
+                            # (deliver_after) is not "stuck" until its delivery
+                            # time passes, so the cap must not drop it before it
+                            # is ever attempted.
+                            deliver_after_ts = row.get("deliver_after")
+                            if deliver_after_ts:
+                                try:
+                                    _da = datetime.fromisoformat(deliver_after_ts)
+                                    if _da.tzinfo is None:
+                                        _da = _da.replace(tzinfo=UTC)
+                                    if _da > parsed:
+                                        parsed = _da
+                                except (ValueError, TypeError):
+                                    pass
                             age = datetime.now(UTC) - parsed
                         except (ValueError, TypeError):
                             age = None
@@ -698,6 +704,29 @@ class OutreachScheduler:
                                 age.total_seconds() / 3600,
                             )
                             continue
+
+                    # Re-read the cancel state immediately before committing to a
+                    # send. `drain` took a snapshot up to 20 rows ago, and each
+                    # row ahead of this one can cost an LLM draft plus an adapter
+                    # round-trip — so the snapshot is stale by seconds to minutes,
+                    # and that is precisely the window in which someone cancels
+                    # (they cancel because the message is about to go out). Without
+                    # this, `pending_outreach.cancel` returns "cancelled" and the
+                    # message ships anyway, leaving a row recorded as both
+                    # cancelled and delivered. A narrow race remains between this
+                    # read and the send itself; that one is inherent without row
+                    # locking, and it is microseconds rather than minutes.
+                    _cancel_cursor = await self._db.execute(
+                        "SELECT cancelled_at FROM pending_outreach WHERE rowid = ?",
+                        (row["rowid"],),
+                    )
+                    _cancel_row = await _cancel_cursor.fetchone()
+                    if _cancel_row is not None and _cancel_row[0] is not None:
+                        logger.info(
+                            "Pending outreach %s cancelled after drain — not sending",
+                            row.get("id") or f"rowid:{row.get('rowid')}",
+                        )
+                        continue
 
                     # Validate category — map known non-enum values, fall
                     # back to DIGEST (not ALERT) for truly unknown ones.
@@ -732,6 +761,10 @@ class OutreachScheduler:
                         channel=channel,
                         thread_id=row.get("thread_id"),
                         validated_recipient=row.get("validated_recipient"),
+                        # Preserve the BULK/campaign flag through the queue so a
+                        # QUEUED cold-marketing send classifies BULK at the
+                        # autonomy gate (a legacy row lacking the column → False).
+                        labeled_surplus=bool(row.get("labeled_surplus")),
                         # The queue stores already-final agent messages
                         # (outreach_send bridge path). Deliver them EXACTLY —
                         # the LLM drafter must never re-word a stored message.
@@ -778,7 +811,7 @@ class OutreachScheduler:
             await self._record_job_result("drain_pending")
         except Exception as exc:
             logger.exception("Drain pending outreach job failed")
-            await self._record_job_result("drain_pending", error=str(exc))
+            await self._record_job_result("drain_pending", error=str(exc), exc=exc)
 
     async def _pick_best_insight(self) -> dict | None:
         cursor = await self._db.execute(

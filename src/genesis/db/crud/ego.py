@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import aiosqlite
 
@@ -334,10 +335,17 @@ async def has_pending_cli_approval(
     wording change to the approval message can never silently break the gate.
     """
     cursor = await db.execute(
+        # json_valid guard: a bare json_extract raises OperationalError on a
+        # malformed `context`, and a bare AND-chain does not promise to
+        # short-circuit past it — SQLite's evaluation order is plan-dependent.
+        # The class here is the COLUMN (approval_requests.context), not the
+        # file: the two queries in approval_requests.py were guarded first and
+        # this third member was missed by scoping the enumeration to that file.
         "SELECT 1 FROM approval_requests "
         "WHERE status = 'pending' "
         "AND action_type = 'autonomous_cli_fallback' "
-        "AND json_extract(context, '$.policy_id') = ? LIMIT 1",
+        "AND (CASE WHEN json_valid(context) "
+        "          THEN json_extract(context, '$.policy_id') END) = ? LIMIT 1",
         (source_tag,),
     )
     return await cursor.fetchone() is not None
@@ -401,13 +409,22 @@ async def set_mode(db: aiosqlite.Connection, mode: str, ego_key: str = "ego_mode
 async def has_pending_proposal_with_hash(
     db: aiosqlite.Connection,
     content_hash: str,
+    *,
+    statuses: tuple[str, ...] = ("pending", "approved"),
 ) -> bool:
-    """Check if a pending or approved proposal with this content hash exists."""
+    """Check if a proposal with this content hash exists in *statuses*.
+
+    Default statuses preserve the original pending/approved dedup semantics.
+    The develop-gate passes ``("pending", "approved", "tabled")`` so a
+    persistent dev-artifact idea the gate already tabled is not re-created
+    (and re-tabled, and re-journaled) every ego cycle.
+    """
+    placeholders = ",".join("?" for _ in statuses)
     cursor = await db.execute(
         "SELECT 1 FROM ego_proposals "
-        "WHERE content_hash = ? AND status IN ('pending', 'approved') "
+        f"WHERE content_hash = ? AND status IN ({placeholders}) "
         "LIMIT 1",
-        (content_hash,),
+        (content_hash, *statuses),
     )
     return await cursor.fetchone() is not None
 
@@ -440,6 +457,10 @@ async def create_proposal(
     content_size: int | None = None,
     original_content: str | None = None,
     expected_outputs: str | None = None,
+    revalidate_at: str | None = None,
+    last_validated_at: str | None = None,
+    scope: str | None = None,
+    scope_revision: int | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -451,9 +472,10 @@ async def create_proposal(
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
             ego_source, goal_id, content_hash, content_size,
-            original_content, expected_outputs)
+            original_content, expected_outputs, revalidate_at, last_validated_at,
+            scope, scope_revision)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?)""",
+                   ?, ?, ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -480,6 +502,10 @@ async def create_proposal(
             content_size,
             original_content,
             expected_outputs,
+            revalidate_at,
+            last_validated_at,
+            scope,
+            scope_revision,
         ),
     )
     await db.commit()
@@ -568,17 +594,223 @@ async def resolve_proposal(
     status: str,
     user_response: str | None = None,
     resolved_at: str | None = None,
+    expected_revision: int | None = None,
 ) -> bool:
-    """Update a proposal's status. Returns True if a row was updated."""
+    """Update a proposal's status. Returns True if a row was updated.
+
+    ``expected_revision`` (PR-4 dark plumbing — no live caller until PR-6): when
+    provided, the update applies only if the proposal's ``revision_num`` still
+    matches, an optimistic-concurrency guard against a revise/resolve race. The
+    MCP resolve path runs over a SEPARATE non-serialized connection, so this
+    atomic WHERE clause is the only defense against resolving a stale revision.
+    Absent (the default) the behavior is unchanged.
+    """
     if resolved_at is None:
         resolved_at = datetime.now(UTC).isoformat()
-    cursor = await db.execute(
+    sql = (
         "UPDATE ego_proposals SET status = ?, user_response = ?, resolved_at = ? "
+        "WHERE id = ? AND status = 'pending'"
+    )
+    params: list = [status, user_response, resolved_at, id]
+    if expected_revision is not None:
+        sql += " AND revision_num = ?"
+        params.append(expected_revision)
+    cursor = await db.execute(sql, params)
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def reaffirm_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    revalidate_at: str | None = None,
+) -> bool:
+    """Mark a pending proposal validated-as-of-now (reconcile reaffirm verdict).
+
+    Touches ``last_validated_at`` and — when the caller provides the next
+    cadence stamp — advances ``revalidate_at``, so a just-reaffirmed item does
+    not stay perpetually ⚠due. Status/rank/content are unchanged. Returns True
+    if a pending row was updated.
+    """
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET last_validated_at = ?, "
+        "revalidate_at = COALESCE(?, revalidate_at) "
         "WHERE id = ? AND status = 'pending'",
-        (status, user_response, resolved_at, id),
+        (datetime.now(UTC).isoformat(), revalidate_at, id),
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def insert_proposal_revision(
+    db: aiosqlite.Connection,
+    *,
+    proposal_id: str,
+    revision_num: int,
+    content: str | None,
+    rationale: str | None,
+    confidence: float | None,
+    execution_plan: str | None,
+    expected_outputs: str | None,
+    revised_by: str | None,
+    reason: str | None,
+    scope: str | None = None,
+) -> None:
+    """Append a prior-values snapshot to ego_proposal_revisions.
+
+    Does NOT commit — ``revise_proposal`` commits the audit row and the proposal
+    UPDATE in a single transaction so the guard's rowcount decision and the audit
+    write land together.
+    """
+    await db.execute(
+        """INSERT INTO ego_proposal_revisions
+           (id, proposal_id, revision_num, content, rationale, confidence,
+            execution_plan, expected_outputs, revised_at, revised_by, reason,
+            scope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            uuid4().hex,
+            proposal_id,
+            revision_num,
+            content,
+            rationale,
+            confidence,
+            execution_plan,
+            expected_outputs,
+            datetime.now(UTC).isoformat(),
+            revised_by,
+            reason,
+            scope,
+        ),
+    )
+
+
+async def revise_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    expected_revision: int,
+    content: str,
+    rationale: str | None = None,
+    confidence: float | None = None,
+    execution_plan: str | None = None,
+    expected_outputs: str | None = None,
+    revised_by: str | None = None,
+    reason: str | None = None,
+    revalidate_at: str | None = None,
+    scope: str | None = None,
+    scope_revision: int | None = None,
+) -> int | None:
+    """Version-revise a PENDING proposal in place (reconcile revise verdict).
+
+    Guard-first, single transaction. The shared SerializedConnection cannot be
+    rolled back, so we never write the audit row before the guard decides:
+
+      1. SELECT the current row (prior values, live revision_num/status).
+      2. Guarded UPDATE ... WHERE id=? AND status='pending' AND revision_num=?
+         — the rowcount is the atomic decision. Bumps revision_num, rewrites the
+         mutable fields, and recomputes content_hash/content_size so the dispatch
+         integrity check stays truthful on the new content.
+      3. Only if rowcount == 1, append the PRIOR values to ego_proposal_revisions
+         (recorded under the superseded revision_num).
+      4. One commit.
+
+    ``action_type`` is immutable (calibration cells + decision_prefix key on it),
+    so it is never in the update set. Returns the new revision_num on success, or
+    None if the guard failed (row concurrently revised/resolved, no longer
+    pending, or absent).
+    """
+    from genesis.ego.integrity import content_hash as _content_hash
+    from genesis.ego.integrity import content_size as _content_size
+
+    cursor = await db.execute(
+        "SELECT content, rationale, confidence, execution_plan, expected_outputs, "
+        "revision_num, status, scope FROM ego_proposals WHERE id = ?",
+        (id,),
+    )
+    prior = await cursor.fetchone()
+    if prior is None:
+        return None
+
+    new_hash = _content_hash(content) if content else None
+    new_size = _content_size(content) if content else 0
+    new_revision = expected_revision + 1
+
+    update = await db.execute(
+        "UPDATE ego_proposals SET content = ?, "
+        "rationale = COALESCE(?, rationale), confidence = COALESCE(?, confidence), "
+        "execution_plan = COALESCE(?, execution_plan), "
+        "expected_outputs = COALESCE(?, expected_outputs), revision_num = ?, "
+        "content_hash = ?, content_size = ?, last_validated_at = ?, "
+        "revalidate_at = COALESCE(?, revalidate_at), "
+        "scope = COALESCE(?, scope), "
+        "scope_revision = CASE WHEN ? IS NOT NULL THEN ? ELSE scope_revision END "
+        "WHERE id = ? AND status = 'pending' AND revision_num = ?",
+        (
+            content,
+            rationale,
+            confidence,
+            execution_plan,
+            expected_outputs,
+            new_revision,
+            new_hash,
+            new_size,
+            datetime.now(UTC).isoformat(),
+            revalidate_at,
+            scope,
+            scope_revision,
+            scope_revision,
+            id,
+            expected_revision,
+        ),
+    )
+    if update.rowcount != 1:
+        await db.commit()
+        return None
+
+    await insert_proposal_revision(
+        db,
+        proposal_id=id,
+        revision_num=expected_revision,
+        content=prior["content"],
+        rationale=prior["rationale"],
+        confidence=prior["confidence"],
+        execution_plan=prior["execution_plan"],
+        expected_outputs=prior["expected_outputs"],
+        revised_by=revised_by,
+        reason=reason,
+        scope=prior["scope"],
+    )
+    await db.commit()
+    return new_revision
+
+
+async def prune_proposal_revisions(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 45,
+    now: str,
+) -> int:
+    """Delete ego_proposal_revisions audit rows older than *older_than_days*
+    relative to ISO ``now``. Retention for the unbounded revision audit table
+    (the reconcile stage is its first writer, PR-5), wired into disk_hygiene.sh.
+    ``now`` is injected (never wall-clock here) so the cutover is deterministic
+    and testable. No-ops if the table is absent; never creates it. Returns rows
+    deleted.
+    """
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='ego_proposal_revisions'"
+    )
+    if await cursor.fetchone() is None:
+        return 0
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM ego_proposal_revisions WHERE revised_at < ?", (cutoff,)
+    )
+    await db.commit()
+    return cursor.rowcount or 0
 
 
 async def execute_proposal(
@@ -607,6 +839,8 @@ async def execute_proposal(
 async def claim_proposal_for_dispatch(
     db: aiosqlite.Connection,
     id: str,
+    *,
+    allow_develop: bool = True,
 ) -> bool:
     """Atomically claim an approved proposal for dispatch.
 
@@ -615,16 +849,28 @@ async def claim_proposal_for_dispatch(
     double-dispatch when multiple callers (cadence, Telegram, dashboard)
     race to claim the same proposal.
 
+    Scope enforcement (last line): when ``allow_develop`` is False (Genesis
+    self-development disabled), a ``scope='develop'`` row is UNCLAIMABLE — the
+    guard refuses it here, atomically, regardless of which dispatch path
+    (execution-brief or approved-sweep) races to claim it. Rows with a NULL
+    scope are NOT blocked by this guard: only genesis-ego proposals are ever
+    scoped, and an unscoped approved row is either a user-ego proposal (out of
+    this boundary) or a grandfathered/legacy row; the create/revise chokepoints
+    are where an unjudged *genesis-ego* draft is stopped, so blocking NULL here
+    would wrongly strand every user-ego dispatch. Callers pass
+    ``allow_develop=genesis_self_development_enabled``.
+
     Unlike execute_proposal(), this does NOT set resolved_at — the
     original resolved_at timestamp must be preserved for the 48h
     staleness guard.
 
-    Returns True if claimed, False if already claimed by another path.
+    Returns True if claimed, False if already claimed OR blocked by scope.
     """
+    scope_guard = "" if allow_develop else "AND (scope IS NULL OR scope != 'develop') "
     cursor = await db.execute(
         "UPDATE ego_proposals SET status = 'executed', "
         "user_response = 'dispatching' "
-        "WHERE id = ? AND status = 'approved'",
+        f"WHERE id = ? AND status = 'approved' {scope_guard}",
         (id,),
     )
     await db.commit()
@@ -728,12 +974,22 @@ async def table_proposal(
 async def withdraw_proposal(
     db: aiosqlite.Connection,
     id: str,
+    *,
+    user_response: str | None = None,
 ) -> bool:
-    """Move a pending proposal to 'withdrawn' status. Returns True if updated."""
+    """Move a pending proposal to 'withdrawn' status. Returns True if updated.
+
+    ``user_response`` carries withdrawal evidence (e.g. the reconcile stage's
+    premise-invalidation note) and is stored alongside the status change so the
+    board and intervention journal record WHY the proposal was retired. It is
+    applied via COALESCE so an omitted note never clobbers an existing one;
+    existing callers that omit it are unchanged.
+    """
     cursor = await db.execute(
         "UPDATE ego_proposals SET status = 'withdrawn', rank = NULL, "
-        "resolved_at = ? WHERE id = ? AND status = 'pending'",
-        (datetime.now(UTC).isoformat(), id),
+        "resolved_at = ?, user_response = COALESCE(?, user_response) "
+        "WHERE id = ? AND status = 'pending'",
+        (datetime.now(UTC).isoformat(), user_response, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -787,83 +1043,90 @@ async def get_pending_queue(
 
 async def auto_table_stale_proposals(
     db: aiosqlite.Connection,
-    max_age_days: int = 14,
+    ttl_hours: dict | None = None,
+    *,
+    unranked_cap_hours: int = 336,
 ) -> int:
-    """Auto-table pending proposals older than *max_age_days*.
+    """Auto-table pending proposals older than their per-urgency staleness
+    window, moving them to the recoverable 'tabled' cold lane.
 
-    Also updates corresponding intervention_journal entries to keep
-    them in sync (same pattern as :func:`expire_stale_proposals`).
+    Urgency-based window (config ``auto_table_ttl_hours``). A BACKSTOP behind the
+    reconcile cycle (which withdraws stale/invalid proposals each pass), NOT the
+    primary staleness mechanism — windows sit generously above observed user
+    decision-latency (median ~1-2d, tail to ~12d; 2026-08-06 review) so only
+    truly-abandoned proposals are swept, never the normal-cadence tail.
+    'tabled' is NOT deletion — the ego can un-table, and a still-relevant
+    proposal is re-derived fresh next cycle. Unranked proposals (never put on
+    the board → lower priority) age out faster, capped at
+    ``unranked_cap_hours`` (default 14d — a shorter floor than the ranked
+    windows). Keeps intervention_journal in sync (same pattern as
+    :func:`expire_stale_proposals`).
 
     Returns count of auto-tabled proposals.
     """
-    now = datetime.now(UTC).isoformat()
-    threshold = f"-{max_age_days} days"
+    if ttl_hours is None:
+        try:
+            from genesis.ego.config import load_ego_config
 
-    # Get IDs first so we can update journal too
+            ttl_hours = load_ego_config().auto_table_ttl_hours
+        except Exception:  # config unreadable — fall back to safe defaults
+            ttl_hours = {"critical": 240, "high": 336, "normal": 504, "low": 720}
+
+    now_dt = datetime.now(UTC)
     cursor = await db.execute(
-        "SELECT id FROM ego_proposals WHERE status = 'pending' AND created_at < datetime('now', ?)",
-        (threshold,),
+        "SELECT id, urgency, rank, created_at FROM ego_proposals "
+        "WHERE status = 'pending'"
     )
     rows = await cursor.fetchall()
-    if not rows:
+
+    stale_ids: list[str] = []
+    for r in rows:
+        _id, _urgency, _rank, _created_at = r[0], r[1], r[2], r[3]
+        window_h = ttl_hours.get(_urgency or "normal", ttl_hours.get("normal", 120))
+        # Unranked (never boarded) proposals are lower-priority — cap their
+        # window so they clean up faster (only ever shortens, never extends).
+        if _rank is None:
+            window_h = min(window_h, unranked_cap_hours)
+        try:
+            created = datetime.fromisoformat(_created_at)
+            age_s = (now_dt - created).total_seconds()
+        except (TypeError, ValueError):
+            # Unparseable or tz-naive created_at → skip this row, never abort
+            # the whole sweep.
+            continue
+        if age_s >= window_h * 3600:
+            stale_ids.append(_id)
+
+    if not stale_ids:
         return 0
 
-    ids = [r[0] for r in rows]
-    # Table proposals
-    await db.execute(
-        "UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
-        "resolved_at = ? "
-        "WHERE status = 'pending' AND created_at < datetime('now', ?)",
-        (now, threshold),
+    now = now_dt.isoformat()
+    placeholders = ",".join("?" * len(stale_ids))
+    # Re-check status = 'pending' at write time (TOCTOU guard): a proposal
+    # concurrently approved/executed/withdrawn between the SELECT above and this
+    # UPDATE must NOT be clobbered back to 'tabled'. Mirrors the guard in every
+    # sibling mutator (table_proposal, expire_stale_proposals, ...).
+    result = await db.execute(
+        f"UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
+        f"resolved_at = ? WHERE status = 'pending' AND id IN ({placeholders})",
+        (now, *stale_ids),
     )
-    # Update matching journal entries
-    placeholders = ",".join("?" * len(ids))
+    tabled_count = result.rowcount
+    # Journal sync scoped to proposals ACTUALLY tabled by this call (status +
+    # exact resolved_at), NOT the pre-guard candidate list: a proposal
+    # concurrently resolved between the SELECT and the guarded UPDATE is
+    # excluded above, and must not get its journal flipped to 'tabled' — that
+    # would permanently diverge journal outcome from the true proposal status.
     await db.execute(
         f"UPDATE intervention_journal SET outcome_status = 'tabled', "
-        f"resolved_at = ? WHERE proposal_id IN ({placeholders}) "
-        f"AND outcome_status = 'pending'",
-        (now, *ids),
+        f"resolved_at = ? WHERE outcome_status = 'pending' AND proposal_id IN ("
+        f"SELECT id FROM ego_proposals WHERE status = 'tabled' "
+        f"AND resolved_at = ? AND id IN ({placeholders}))",
+        (now, now, *stale_ids),
     )
     await db.commit()
-    logger.info("Auto-tabled %d stale proposal(s) (>%dd)", len(ids), max_age_days)
-
-    # Shorter threshold for unranked proposals — proposals that were never
-    # put on the board are lower-priority and should be cleaned up faster.
-    unranked_days = min(max_age_days, 5)
-    unranked_threshold = f"-{unranked_days} days"
-    cursor2 = await db.execute(
-        "SELECT id FROM ego_proposals "
-        "WHERE status = 'pending' AND rank IS NULL "
-        "AND created_at < datetime('now', ?)",
-        (unranked_threshold,),
-    )
-    unranked_rows = await cursor2.fetchall()
-    unranked_count = 0
-    if unranked_rows:
-        unranked_ids = [r[0] for r in unranked_rows]
-        await db.execute(
-            "UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
-            "resolved_at = ? "
-            "WHERE status = 'pending' AND rank IS NULL "
-            "AND created_at < datetime('now', ?)",
-            (now, unranked_threshold),
-        )
-        placeholders2 = ",".join("?" * len(unranked_ids))
-        await db.execute(
-            f"UPDATE intervention_journal SET outcome_status = 'tabled', "
-            f"resolved_at = ? WHERE proposal_id IN ({placeholders2}) "
-            f"AND outcome_status = 'pending'",
-            (now, *unranked_ids),
-        )
-        await db.commit()
-        unranked_count = len(unranked_ids)
-        logger.info(
-            "Auto-tabled %d unranked proposal(s) (>%dd)",
-            unranked_count,
-            unranked_days,
-        )
-
-    return len(ids) + unranked_count
+    logger.info("Auto-tabled %d urgency-stale proposal(s)", tabled_count)
+    return tabled_count
 
 
 async def get_board(
@@ -949,24 +1212,29 @@ async def expire_stale_proposals(db: aiosqlite.Connection) -> int:
         return 0
 
     ids = [r[0] for r in rows]
-    # Expire proposals
-    await db.execute(
+    # Expire proposals (status guard re-checked at write time).
+    result = await db.execute(
         "UPDATE ego_proposals SET status = 'expired', resolved_at = ? "
         "WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?",
         (now, now),
     )
-    # Expire matching journal entries
+    expired_count = result.rowcount
+    # Journal sync scoped to proposals ACTUALLY expired by this call (status +
+    # exact resolved_at), NOT the pre-UPDATE candidate list — so a proposal
+    # concurrently resolved between the SELECT and the UPDATE does not get its
+    # journal wrongly flipped to 'expired' (journal/proposal divergence).
     placeholders = ",".join("?" * len(ids))
     await db.execute(
         f"UPDATE intervention_journal SET outcome_status = 'expired', "
-        f"resolved_at = ? WHERE proposal_id IN ({placeholders}) "
-        f"AND outcome_status = 'pending'",
-        (now, *ids),
+        f"resolved_at = ? WHERE outcome_status = 'pending' AND proposal_id IN ("
+        f"SELECT id FROM ego_proposals WHERE status = 'expired' "
+        f"AND resolved_at = ? AND id IN ({placeholders}))",
+        (now, now, *ids),
     )
     await db.commit()
-    if ids:
-        logger.info("Expired %d stale proposal(s)", len(ids))
-    return len(ids)
+    if expired_count:
+        logger.info("Expired %d stale proposal(s)", expired_count)
+    return expired_count
 
 
 async def get_batch_for_delivery(
@@ -1105,13 +1373,9 @@ async def list_active_directives(
     ``kind`` defaults to plain directives so pre-decision callers are
     unchanged; decision rows have their own accessors below.
     """
-    cursor = await db.execute(
-        "SELECT * FROM ego_directives "
-        "WHERE status = 'active' AND ego_target = ? AND kind = ? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (ego_target, kind, limit),
+    return await list_directives(
+        db, ego_target=ego_target, statuses=("active",), kind=kind, limit=limit
     )
-    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def resolve_directive(
@@ -1135,6 +1399,43 @@ async def resolve_directive(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def list_directives(
+    db: aiosqlite.Connection,
+    *,
+    ego_target: str | None = None,
+    statuses: tuple[str, ...] = ("active",),
+    kind: str = "directive",
+    limit: int = 20,
+) -> list[dict]:
+    """Directives filtered by status (and optionally ego_target).
+
+    Generalizes :func:`list_active_directives` for the dashboard, which needs a
+    cross-target active view plus recently-resolved history. Ordered by
+    ``COALESCE(resolved_at, created_at) DESC`` so a homogeneous call sorts
+    correctly either way — active rows (resolved_at NULL) by creation, resolved
+    rows by resolution time. ``kind`` defaults to plain directives; decision
+    rows are excluded (they have their own accessors).
+    """
+    if not statuses:
+        return []
+    placeholders = ",".join("?" for _ in statuses)
+    params: list[object] = [kind, *statuses]
+    target_clause = ""
+    if ego_target is not None:
+        target_clause = "AND ego_target = ? "
+        params.append(ego_target)
+    params.append(limit)
+    cursor = await db.execute(
+        f"""SELECT * FROM ego_directives
+           WHERE kind = ? AND status IN ({placeholders})
+           {target_clause}
+           ORDER BY COALESCE(resolved_at, created_at) DESC
+           LIMIT ?""",  # noqa: S608 — placeholders count-derived, all values bound
+        params,
+    )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 # ── Decision rows (kind='decision') — durable user rulings ──────────────

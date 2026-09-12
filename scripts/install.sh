@@ -71,13 +71,38 @@ set_secret() {
 
 # ── HOME guard ───────────────────────────────────────────────
 # Ensure HOME is set (may be empty in container sessions without login shell)
-# and persisted in /etc/environment so all future sessions inherit it.
+# and persisted in /etc/environment so all future sessions inherit it. Resolve
+# from passwd by uid (robust when the name lookup is missing) and fail closed
+# rather than proceed with HOME="" (which `set -u` would not catch).
 if [ -z "${HOME:-}" ]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
-    echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+    # /etc/environment is root-owned. Persist HOME best-effort: write directly
+    # if it is writable (root installs), else via passwordless sudo. If neither
+    # works, skip silently -- HOME is already exported above, so persistence
+    # here is not required. A plain `>> /etc/environment` as a non-root user
+    # leaks a shell redirection error ("Permission denied") that 2>/dev/null
+    # cannot suppress, because the shell opens the redirect target before
+    # applying redirections.
+    # A missing /etc/environment in a writable /etc is directly creatable — plain
+    # `-w` is false for a nonexistent path, which would otherwise skip creation and
+    # lose the persisted HOME on a minimal/container root image (where the previous
+    # `>>` created the file). Before appending, ensure the file ends in a newline so
+    # an unterminated final assignment isn't concatenated onto (`FOO=barHOME=...`).
+    if [ -w /etc/environment ] || { [ ! -e /etc/environment ] && [ -w /etc ]; }; then
+        if [ -s /etc/environment ] && [ -n "$(tail -c1 /etc/environment 2>/dev/null)" ]; then
+            printf '\n' >> /etc/environment 2>/dev/null || true
+        fi
+        echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1; then
+        if [ -s /etc/environment ] && [ -n "$(sudo -n tail -c1 /etc/environment 2>/dev/null)" ]; then
+            printf '\n' | sudo -n tee -a /etc/environment >/dev/null 2>&1 || true
+        fi
+        echo "HOME=$HOME" | sudo -n tee -a /etc/environment >/dev/null 2>&1 || true
+    fi
 fi
 
 # ── TMPDIR guard ─────────────────────────────────────────────
@@ -678,7 +703,7 @@ fi
 
 # Identity seed files (runtime-generated, gitignored) — mirror bootstrap.sh so
 # install.sh-only setups don't triage/act with empty calibration until first regen.
-for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md; do
+for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md USER.md; do
     if [ ! -f "$REPO_DIR/src/genesis/identity/$f" ] && [ -f "$REPO_DIR/src/genesis/identity/$f.example" ]; then
         cp "$REPO_DIR/src/genesis/identity/$f.example" "$REPO_DIR/src/genesis/identity/$f"
         echo "    + Seeded $f from template"
@@ -830,10 +855,22 @@ if [ -f "$_cc_env" ]; then
     # shellcheck source=/dev/null
     source "$_cc_env"
     echo "  Installing Claude Code (v${CC_VERSION}) before service generation..."
+    unset CC_SUPPRESSION_STATE
     if ! cc_ensure_local; then
         echo "    (will finalize at step 12; manual: npm install -g @anthropic-ai/claude-code@${CC_VERSION})"
         SETUP_WARNINGS=1
     fi
+    # cc_ensure_local's return code carries only the VERSION outcome; suppression
+    # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
+    # warning suffices at this step — step 12 makes the authoritative call and
+    # sets SETUP_WARNINGS if it still cannot verify.
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|repaired) : ;;
+        *)
+            echo "    WARNING: CC auto-updater suppression not verified yet" \
+                 "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
+            ;;
+    esac
 fi
 
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
@@ -899,22 +936,11 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [9/$TOTAL_STEPS] Setting up Claude Code hooks..."
 
-TEMPLATE="$REPO_DIR/config/claude-settings.json.template"
-TARGET="$REPO_DIR/.claude/settings.json"
 VENV_PYTHON="$VENV_PATH/bin/python"
 
-if [ -f "$TEMPLATE" ]; then
-    mkdir -p "$REPO_DIR/.claude"
-    if [ -f "$TARGET" ]; then
-        echo "    . .claude/settings.json already exists (not overwriting)"
-    else
-        sed "s|{{VENV_PYTHON}}|$VENV_PYTHON|g; s|{{GENESIS_ROOT}}|$REPO_DIR|g" \
-            "$TEMPLATE" > "$TARGET"
-        echo "    + Claude Code hooks configured"
-    fi
-else
-    echo "    - Hook template not found (skipping)"
-fi
+# .claude/settings.json ships tracked in the repo — hooks are pre-configured on
+# every clone, so there is no template to render here. (VENV_PYTHON stays defined:
+# the .mcp.json render below still substitutes it.)
 
 # .mcp.json — MCP server configuration for Claude Code
 MCP_TEMPLATE="$REPO_DIR/config/mcp.json.template"
@@ -1073,7 +1099,15 @@ RestartSec=5
 # 25% of container RAM (scales with the box); live qdrant RSS is ~0.3G.
 MemoryMax=25%
 LimitNOFILE=65536
-OOMScoreAdjust=-500
+# 100, not -500: a systemd USER manager cannot apply a negative oom_score_adj
+# (lowering below the inherited oom_score_adj_min of 0 needs CAP_SYS_RESOURCE),
+# and the write fails SILENTLY — the value reads back correct from
+# \`systemctl show\` while the kernel ignores it. Qdrant is a HARD dependency of
+# genesis-server, so a kill order that does not match what every configuration
+# surface claims is worth getting right. 100 matches genesis-server: both are
+# core, both restartable, both below unset units (systemd's 200) and above the
+# CC session (0). See genesis-server.service.template for the full note.
+OOMScoreAdjust=100
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes
@@ -1087,11 +1121,28 @@ QDSERVICE
 elif [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
     # Migrate the legacy hardcoded cap to the portable percentage in place.
     # Only the exact old default is touched, so a custom value is never clobbered.
+    _qd_migrated=0
     if grep -q '^MemoryMax=4G$' "$SYSTEMD_USER_DIR/qdrant.service"; then
         sed -i 's/^MemoryMax=4G$/MemoryMax=25%/' "$SYSTEMD_USER_DIR/qdrant.service"
+        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
+        _qd_migrated=1
+    fi
+    # Same in-place shape for the dead OOM score. Qdrant is NOT a template, so
+    # bootstrap.sh's template-sync cannot heal it the way it heals genesis-server
+    # and agent-zero — without this, every existing install keeps a declaration
+    # the user manager silently refuses. Only the exact old default is touched,
+    # so a custom value is never clobbered.
+    if grep -q '^OOMScoreAdjust=-500$' "$SYSTEMD_USER_DIR/qdrant.service"; then
+        sed -i 's/^OOMScoreAdjust=-500$/OOMScoreAdjust=100/' "$SYSTEMD_USER_DIR/qdrant.service"
+        echo "    ~ qdrant.service OOMScoreAdjust -500 -> 100 (the -500 never applied)"
+        _qd_migrated=1
+    fi
+    if [ "$_qd_migrated" = "1" ]; then
+        # OOMScoreAdjust is an EXEC-time property: daemon-reload alone does NOT
+        # re-apply it to the running process, so the restart is what makes the
+        # new value take effect.
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user try-restart qdrant.service 2>/dev/null || true
-        echo "    ~ qdrant.service MemoryMax 4G -> 25% (portable)"
     else
         echo "    . qdrant.service already exists"
     fi
@@ -1173,6 +1224,16 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     done
 fi
 
+# Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+# timer — the loop above only enables timers). Enable-only (not --now): it is
+# meant to fire in the CC-quiet cold-start window before genesis-server, so
+# arming it for the next boot is correct; the paired timer handles periodic
+# attempts. Without this the cold-start leg would render but never activate.
+if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+    systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+        echo "    + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+fi
+
 # Enable AND start tmp watchgod (OS-level temp protection)
 WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
 if [ -f "$WATCHGOD_SRC" ]; then
@@ -1191,6 +1252,33 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
             echo "    + genesis-server started" || \
             echo "    WARNING: could not start genesis-server"
     fi
+fi
+
+# --- Memory resilience (systemd-oomd pressure-kill + swap invariant + PID ceiling) ---
+# Fresh-install parity with bootstrap.sh/update.sh: without this block a fresh
+# container install sat unprotected against the OOM-thrash / fork-exhaustion
+# wedge, with NO automatic trigger to run update.sh. Guarded so a tree missing
+# the lib degrades (warns) rather than aborting under `set -euo pipefail` — the
+# lib's own never-abort contract. Uses install.sh's own `_install_pkg` idiom
+# (bootstrap's `install_pkg` is undefined here). See scripts/lib/memory_resilience.sh.
+if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
+    # systemd-oomd is a SEPARATE apt/dnf package; memory_resilience_apply
+    # silently skips pressure-kill setup when it's absent, so provision it
+    # BEFORE sourcing/applying the lib (install → apply order). _install_pkg is
+    # idempotent and degrades to a warning; the lib still guards on PSI/systemd
+    # independently. (dnf: oomd ships inside systemd; the subpackage is
+    # systemd-oomd-defaults.)
+    _install_pkg systemd-oomd systemd-oomd-defaults || echo "  WARNING: Could not install systemd-oomd — if the next step reports 'systemd-oomd not available', pressure-kill protection is off."
+    # shellcheck source=lib/memory_resilience.sh
+    source "$SCRIPT_DIR/lib/memory_resilience.sh"
+    memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot). Same lib, same never-abort
+    # contract; surfaces via the posture check (pid_ceiling_effective_ok) when
+    # sudo/etc is unavailable.
+    pid_budget_apply
+else
+    echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi
 
 # Infrastructure report
@@ -1239,6 +1327,7 @@ echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 # Install OR align to the pin — cc_ensure_local (scripts/lib/cc_version.sh, sourced
 # above) installs when absent AND upgrades/downgrades a drifted-but-present CC to
 # the pin (the prior "already installed → skip" check never re-aligned drift).
+unset CC_SUPPRESSION_STATE
 if ! cc_ensure_local; then
     echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
     SETUP_WARNINGS=1
@@ -1263,56 +1352,45 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
     echo "    + Suppressed CC native installer prompt (npm-only)"
 fi
 
-# Suppress CC auto-updater via user-level ~/.claude/settings.json.
-# Repo-level .claude/settings.json is NOT sufficient — it only applies when
-# CC is launched from the project directory. The auto-updater runs in
-# contexts where repo settings don't apply, so we set it at the user level.
-# See docs/reference/cc-compatibility.md for the discovery.
+# Seed user-level ~/.claude/settings.json with two CC defaults: (1) suppress the
+# auto-updater, and (2) Genesis's subagent-nesting depth. CC 2.1.217+ made nested
+# subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
+# (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
+# Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
+# launched from the project directory, and the auto-updater runs in contexts where
+# repo settings don't apply, so we set these at the user level. (The host VM's own
+# recovery `claude -p` is single-brain and never nests, so host-setup.sh deliberately
+# does NOT set the nesting default.) See docs/reference/cc-compatibility.md.
 _settings_file="$HOME/.claude/settings.json"
-mkdir -p "$HOME/.claude"
-if [ ! -f "$_settings_file" ]; then
-    cat > "$_settings_file" <<'CCSETTINGS'
-{
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_UPDATES": "1"
-  }
-}
-CCSETTINGS
-    echo "    + Created $_settings_file with auto-updater suppression"
+# Both concerns land in ONE call, and therefore in ONE atomic write:
+#   * the two auto-updater keys are ENFORCED to "1" (cc_ensure_updater_suppressed,
+#     scripts/lib/cc_version.sh — the SAME function the align path and the
+#     genesis-cc-settings-align timer re-run, so setup and steady state cannot
+#     drift apart);
+#   * the container-only subagent-nesting default is SET IF ABSENT, so a
+#     deliberate operator override (0 to disable, or higher) is preserved.
+# One call so BOTH policies share a single write contract (mode/xattr carry-over,
+# compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
+# it. Note what this does NOT claim: on a fresh install the file is still touched
+# twice overall, because cc_ensure_local (earlier in this script) already creates
+# it with the suppression keys before this line adds the nesting default. Those
+# two writes are sequential within one process, so they do not race each other —
+# the lost-update hazard the CAS addresses is a CONCURRENT writer (CC itself
+# rewrites settings.json), not this ordering.
+# (The host VM's recovery `claude -p` is single-brain and never nests, so
+# host-setup.sh deliberately passes no nesting default.)
+if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
+    # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
+    # "verified" is finally true here. The nesting default is deliberately not
+    # claimed on this line: on the python3-less create path it is NOT applied
+    # (the function says so loudly on stderr), and a summary line that
+    # overclaims for a corner case teaches the reader to distrust the summary.
+    echo "    + CC auto-updater suppression verified in $_settings_file"
 else
-    # Merge — preserves any existing env vars and other top-level keys.
-    if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(2)
-if not isinstance(data, dict):
-    sys.exit(2)
-env = data.setdefault("env", {})
-if not isinstance(env, dict):
-    sys.exit(2)
-changed = False
-for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
-    if env.get(key) != "1":
-        env[key] = "1"
-        changed = True
-if changed:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    print("merged")
-else:
-    print("unchanged")
-PYEOF
-    then
-        echo "    + Auto-updater suppression set in $_settings_file"
-    else
-        echo "    WARNING: Could not merge auto-updater settings into $_settings_file"
-        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
-    fi
+    echo "    WARNING: Could not write CC settings in $_settings_file"
+    echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    SETUP_WARNINGS=1
 fi
 
 # Login guidance (interactive only)

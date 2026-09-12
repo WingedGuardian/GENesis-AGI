@@ -33,10 +33,70 @@ settings.json hook command
      "timeout": 2000
    }
    ```
-3. Test manually: `.claude/hooks/genesis-hook my_hook.py`
+3. Test manually: `echo '<payload>' | .claude/hooks/genesis-hook my_hook.py`
+   (payload on **stdin** — see the input contract below).
+
+## Hook Input Contract — read stdin, never the `CLAUDE_TOOL_INPUT` env var
+
+Claude Code delivers each hook's payload as **JSON on stdin**, e.g.
+`{"tool_name": "Bash", "tool_input": {"command": "..."}, "tool_response": {...},
+"session_id": "..."}`. Tool arguments are nested under `tool_input`.
+
+A hook must read its input through the shared helper, **never** from
+`os.environ["CLAUDE_TOOL_INPUT"]` (or `CLAUDE_TOOL_USE_RESULT` / `CLAUDE_SESSION_ID`).
+Those env vars are a dead legacy contract — current CC does not set them, so a
+hook that reads them fails open silently (this is exactly how a dozen guards went
+inert; see `docs/reference/cc-compatibility.md`).
+
+```python
+from hook_input import read_payload, field, tool_response, session_id  # scripts/hooks/
+
+payload = read_payload()                 # full payload dict ({} on failure)
+cmd = field(payload, "command")          # tool_input.command (also handles Write's file_path, etc.)
+result = tool_response(payload)          # PostToolUse result
+sid = session_id(payload)                # session id, validated as a path component
+```
+
+**Building a path from the session id?** Use `session_path()` — never join the
+id yourself. Several hooks `mkdir(parents=True)` under
+`~/.genesis/sessions/<id>/`, so a `/` or `..` in the id CREATES directories
+outside the session tree:
+
+```python
+from hook_input import session_path
+
+p = session_path(_GENESIS_DIR / "sessions", sid, "messages.jsonl")
+if p is not None and p.exists():
+    ...                                  # skip ONLY the file operation
+```
+
+**Skip exactly the filesystem operation, nothing else.** The id is dangerous
+only as a path component — never as a bound SQL parameter, a JSON value or a
+dict key. A hook that treats a rejected id as "return early" disables unrelated
+work: DB-backed charter lookups, payload-only checks, and canonical writes all
+keep working for an id that merely fails the path rule.
+
+`is_safe_session_id()` exists for the rare non-path case, but prefer
+`session_path()`: returning the path (or `None`) removes the "what do I skip?"
+decision that a bare bool invites.
+
+Scope note: these helpers cover hooks under `scripts/`. Code in `src/genesis/`
+cannot import them today and carries its own checks — do not assume a session id
+reaching `src/` has been validated.
+
+Scripts in `scripts/` (not `scripts/hooks/`) reach the helper with a one-line
+bootstrap: `sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))`.
+
+A settings.json command must NOT wrap the hook in `echo "$CLAUDE_TOOL_INPUT" | …`
+— that clobbers CC's real stdin with an empty value. Invoke the hook directly and
+let CC's stdin flow through.
+
+`tests/test_scripts/test_hook_input_contract.py` enforces this: it feeds each
+safety-critical guard a real payload and fails if any hook reads a dead env var.
 
 ## Inline Bash Hooks
 
 Some safety guards (pip-editable blocker, YouTube URL blocker) are inline bash
 in settings.json. These don't use the launcher — they're self-contained bash
-one-liners with no Python dependencies.
+one-liners with no Python dependencies. They read the payload from stdin too:
+`IN=$(cat); CMD=$(printf %s "$IN" | jq -r .tool_input.command)`.

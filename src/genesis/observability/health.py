@@ -6,6 +6,8 @@ Follows the aiohttp pattern from surplus/compute_availability.py.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -150,6 +152,7 @@ async def probe_qdrant(
             latency_ms=round(latency, 2),
             message=str(exc),
             checked_at=_clock().isoformat(),
+            timed_out=isinstance(exc, TimeoutError),
         )
 
 
@@ -206,6 +209,7 @@ async def probe_ollama(
             latency_ms=round(latency, 2),
             message=str(exc),
             checked_at=_clock().isoformat(),
+            timed_out=isinstance(exc, TimeoutError),
         )
 
 
@@ -299,6 +303,35 @@ async def probe_scheduler_heartbeats(
         )
     except Exception as exc:
         latency = (time.monotonic() - start) * 1000
+        # Surface the eval failure LOUDLY as a WARNING event (which persists to the
+        # events table and shows on the Errors tab) — but keep the ProbeResult
+        # HEALTHY. This probe's status is consumed ONLY by the remediation engine,
+        # which treats any non-HEALTHY status identically to DOWN (remediation.py
+        # _evaluate) and would fire the hourly scheduler_heartbeat_alert *outreach*
+        # on this "can't evaluate" branch. Emitting the event gives honest signal
+        # without that pager storm; flipping the status would only add noise (this
+        # probe feeds no dashboard tile).
+        # Not cooldown-gated: a persistent "can't evaluate" fault re-emits once per
+        # awareness tick, but repeats collapse under the Errors-tab event grouping
+        # and ride normal event pruning. Add a last-emitted gate only if that volume
+        # ever proves excessive (it hasn't — this branch fires only when job_health
+        # itself is unreadable, a rare hard fault).
+        try:
+            from genesis.observability.types import Severity, Subsystem
+            from genesis.runtime import GenesisRuntime
+
+            rt = GenesisRuntime.peek()
+            if rt is not None and rt.event_bus is not None:
+                await rt.event_bus.emit(
+                    Subsystem.HEALTH,
+                    Severity.WARNING,
+                    "scheduler_heartbeat_probe_error",
+                    f"scheduler-heartbeat probe could not evaluate: {exc}",
+                )
+        except Exception:
+            logger.debug(
+                "scheduler-heartbeat probe error-event emit failed", exc_info=True
+            )
         return ProbeResult(
             name="scheduler_heartbeats",
             status=ProbeStatus.HEALTHY,  # can't evaluate ≠ schedulers dead
@@ -489,6 +522,21 @@ async def probe_guardian(
         staleness_s = (now - heartbeat_time).total_seconds()
 
         if staleness_s < degraded_threshold_s:
+            # A fresh heartbeat that carries a stand-down marker is an intentional,
+            # alive-but-not-watching Guardian (deploy pause / maintenance). The
+            # heartbeat is written each tick so the watchdog stays quiet, but the
+            # check cycle is skipped — so report DEGRADED, not HEALTHY, or health
+            # surfaces would claim full monitoring for the whole stand-down window.
+            standdown = data.get("standdown")
+            if standdown:
+                return ProbeResult(
+                    name="guardian",
+                    status=ProbeStatus.DEGRADED,
+                    latency_ms=round(latency, 2),
+                    message=f"Guardian standing down ({standdown}) — not monitoring",
+                    checked_at=now.isoformat(),
+                    details={"staleness_s": round(staleness_s, 1), "standdown": standdown},
+                )
             return ProbeResult(
                 name="guardian",
                 status=ProbeStatus.HEALTHY,
@@ -604,7 +652,7 @@ async def collect_probe_results(
 
     async def _safe(name: str, coro) -> None:
         try:
-            results[name] = await asyncio.wait_for(coro, timeout=10.0)
+            result = await asyncio.wait_for(coro, timeout=10.0)
         except Exception as exc:
             results[name] = ProbeResult(
                 name=name,
@@ -613,6 +661,12 @@ async def collect_probe_results(
                 message=f"Probe error: {exc}",
                 checked_at=datetime.now(UTC).isoformat(),
             )
+            return
+        if result is not None:
+            # An OPTIONAL probe answers None for "not applicable on this install".
+            # Recording that would put a None into a dict this function declares as
+            # `dict[str, ProbeResult]`, which every consumer is entitled to believe.
+            results[name] = result
 
     from genesis.env import ollama_enabled
 
@@ -622,6 +676,9 @@ async def collect_probe_results(
         _safe("disk", probe_disk()),
         _safe("guardian", probe_guardian(guardian_remote=guardian_remote)),
         _safe("browser_processes", probe_browser_processes()),
+        # Answers None while the engine is not yet armed on this install, which
+        # `_safe` drops rather than recording as a probe result.
+        _safe("falkordb", probe_falkordb()),
         _safe("scheduler_heartbeats", probe_scheduler_heartbeats()),
     ]
     if db is not None:
@@ -698,6 +755,125 @@ _AMBIENT_VERDICT_TO_PROBE = {
     "down": ProbeStatus.DOWN,
     "unknown": ProbeStatus.DEGRADED,
 }
+
+
+async def probe_falkordb(
+    socket_path: str | None = None,
+    *,
+    timeout_s: int = 3,
+    clock=None,
+) -> ProbeResult | None:
+    """Probe the FalkorDB graph engine over its unix socket.
+
+    Returns ``None`` when the engine is not armed — no socket present. Read that
+    as NOT-YET-ARMED, not as optional: the graph engine is part of the memory
+    architecture, and `config/graphstore.yaml` defaulting to networkx is a staged
+    cutover, not a statement that the engine is a nice-to-have. During that
+    cutover an unarmed engine is the expected state on an install that has not
+    provisioned it yet, so it is reported as "not applicable" rather than as a
+    fault, and the caller omits the key entirely.
+
+    NOT in the CriticalFailureCollector's probe list *yet*, and that is a
+    transition decision with an expiry rather than a permanent classification:
+    that list is for services whose absence is a real failure, and until the
+    cutover completes an unarmed engine is not one — including it now would pin
+    every not-yet-provisioned install at critical_failure=1.0. It BELONGS there
+    once provisioning is default-on and the lever has moved (F4); moving it is
+    part of that change, not a follow-up to remember.
+
+    Speaks redis PING rather than issuing a graph query — this answers "is the
+    engine reachable", and a reachable engine with an empty projection is a
+    healthy engine, not a degraded one.
+    """
+    from genesis.env import falkordb_socket_path
+
+    _clock = clock or (lambda: datetime.now(UTC))
+    resolved = socket_path or str(falkordb_socket_path())
+    if not Path(resolved).exists():
+        # "Not armed" and "armed, then it vanished" are DIFFERENT states, and
+        # returning None for both concealed the one that matters. Once the lever
+        # SELECTS falkordb, an absent socket is not a not-yet-provisioned
+        # install — it is the live backend gone, with every traversal falling
+        # back and logging an error while this probe and the infrastructure
+        # snapshot omitted the engine entirely. Health that goes quiet exactly
+        # when the thing it watches breaks is worse than no probe.
+        #
+        # So the mode decides which answer this is. Read fresh (the lever is
+        # re-read per call by design) and fail toward NOT-APPLICABLE: if the
+        # mode cannot be determined, this is the pre-cutover state and the
+        # engine is not yet anyone's dependency.
+        try:
+            from genesis.memory.graphstore_config import effective_mode
+
+            selected = effective_mode() == "falkordb"
+        except Exception:  # pragma: no cover - config unreadable degrades to n/a
+            selected = False
+        if not selected:
+            return None
+        return ProbeResult(
+            name="falkordb",
+            status=ProbeStatus.DOWN,
+            # No attempt was made — there is nothing to connect to — so this is
+            # 0.0 rather than a fabricated duration.
+            latency_ms=0.0,
+            message=(
+                f"graphstore mode is 'falkordb' but no engine socket exists at "
+                f"{resolved} — every memory-graph read is falling back to NetworkX"
+            ),
+            checked_at=_clock().isoformat(),
+        )
+
+    start = time.monotonic()
+    try:
+        import redis.asyncio as _redis
+
+        client = _redis.Redis(unix_socket_path=resolved, socket_timeout=timeout_s)
+        try:
+            await asyncio.wait_for(client.ping(), timeout=timeout_s)
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+        return ProbeResult(
+            name="falkordb",
+            status=ProbeStatus.HEALTHY,
+            latency_ms=round((time.monotonic() - start) * 1000, 2),
+            checked_at=_clock().isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure to reach an ARMED engine is DOWN
+        # The socket EXISTS but will not answer: that is a real fault, unlike
+        # its absence. A missing client library lands here too — the engine
+        # was armed and we still cannot reach it, which is what a reader of
+        # this probe needs to know.
+        return ProbeResult(
+            name="falkordb",
+            status=ProbeStatus.DOWN,
+            latency_ms=round((time.monotonic() - start) * 1000, 2),
+            # `str(exc)` alone is EMPTY for an argument-less exception, and the
+            # most likely failure here raises exactly that: a socket timeout
+            # surfaces as a bare `redis.exceptions.TimeoutError()`. That left an
+            # operator reading "falkordb DOWN" with no reason at all. Found by
+            # the test below, which is why the DOWN branch needed one.
+            message=str(exc) or type(exc).__name__,
+            checked_at=_clock().isoformat(),
+            timed_out=_is_timeout(exc),
+        )
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """Was this a timeout, from either of the two unrelated TimeoutError types?
+
+    `redis.exceptions.TimeoutError` does NOT subclass the builtin — MEASURED, its
+    MRO is (TimeoutError, RedisError, Exception, BaseException) — so a bare
+    `isinstance(exc, TimeoutError)` is False for a client socket_timeout, which
+    is the most likely timeout on this path. Same name, unrelated types.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        from redis.exceptions import TimeoutError as _RedisTimeout
+    except ImportError:
+        return False
+    return isinstance(exc, _RedisTimeout)
 
 
 async def probe_ambient_health(clock=None) -> ProbeResult | None:

@@ -9,8 +9,9 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.env import cc_project_dir, user_timezone
+from genesis.env import cc_project_dir, genesis_home, user_timezone
 from genesis.runtime.init.process_reaper import _wire_process_reaper
+from genesis.runtime.init.rate_limit_resume import _wire_rate_limit_resume
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -41,7 +42,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("execution_traces prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("execution_traces_prune", str(exc))
+            rt.record_job_failure("execution_traces_prune", exc=exc)
             logger.exception("execution_traces prune failed")
 
     scheduler.add_job(
@@ -63,7 +64,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("cost_events prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("cost_events_prune", str(exc))
+            rt.record_job_failure("cost_events_prune", exc=exc)
             logger.exception("cost_events prune failed")
 
     scheduler.add_job(
@@ -85,7 +86,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("file_modifications prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("file_modifications_prune", str(exc))
+            rt.record_job_failure("file_modifications_prune", exc=exc)
             logger.exception("file_modifications prune failed")
 
     scheduler.add_job(
@@ -107,7 +108,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("job_run_events prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("job_run_events_prune", str(exc))
+            rt.record_job_failure("job_run_events_prune", exc=exc)
             logger.exception("job_run_events prune failed")
 
     scheduler.add_job(
@@ -129,7 +130,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("alert_events prune: removed %d resolved rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("alert_events_prune", str(exc))
+            rt.record_job_failure("alert_events_prune", exc=exc)
             logger.exception("alert_events prune failed")
 
     scheduler.add_job(
@@ -154,7 +155,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("deferred_work prune: removed %d terminal rows (>45d)", removed)
         except Exception as exc:
-            rt.record_job_failure("deferred_work_prune", str(exc))
+            rt.record_job_failure("deferred_work_prune", exc=exc)
             logger.exception("deferred_work prune failed")
 
     scheduler.add_job(
@@ -179,13 +180,47 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
                     removed,
                 )
         except Exception as exc:
-            rt.record_job_failure("graduation_events_prune", str(exc))
+            rt.record_job_failure("graduation_events_prune", exc=exc)
             logger.exception("graduation_events prune failed")
 
     scheduler.add_job(
         _prune_graduation_events,
         CronTrigger(hour=5, minute=40, timezone=user_timezone()),
         id="graduation_events_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    async def _prune_events() -> None:
+        # The observability event bus is the ONLY high-volume table with no
+        # retention (45k+ rows / ~108d, growing ~12x month-over-month). Unlike
+        # the sibling prunes, crud.events.prune takes an ISO cutoff, not days=;
+        # every events.timestamp is stored as UTC isoformat (…+00:00), so the
+        # DELETE's lexical `timestamp < cutoff` is a correct chronological
+        # comparison. Consumers only ever read recent rows (ORDER BY timestamp
+        # DESC LIMIT), so a 90-day window breaks nothing.
+        if rt._db is None:
+            return
+        try:
+            from datetime import timedelta
+
+            from genesis.db.crud import events as _ev
+
+            cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat()
+            removed = await _ev.prune(rt._db, older_than=cutoff)
+            rt.record_job_success("events_prune")
+            if removed:
+                logger.info("events prune: removed %d rows (>90d)", removed)
+        except Exception as exc:
+            rt.record_job_failure("events_prune", exc=exc)
+            logger.exception("events prune failed")
+
+    scheduler.add_job(
+        _prune_events,
+        # 06:00 — the drip slots 05:00–05:50 are taken (…graduation 05:40,
+        # voice_hygiene 05:50); a fresh slot avoids two DB-writing jobs at once.
+        CronTrigger(hour=6, minute=0, timezone=user_timezone()),
+        id="events_prune",
         max_instances=1,
         misfire_grace_time=3600,
     )
@@ -224,7 +259,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
                     healed,
                 )
         except Exception as exc:
-            rt.record_job_failure("voice_hygiene", str(exc))
+            rt.record_job_failure("voice_hygiene", exc=exc)
             logger.exception("voice hygiene failed")
 
     scheduler.add_job(
@@ -234,6 +269,125 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         max_instances=1,
         misfire_grace_time=3600,
     )
+
+
+def build_learning_collectors(rt: GenesisRuntime) -> list:
+    """Build the steady-state signal-collector set installed after learning init.
+
+    This is the AUTHORITATIVE steady-state collector list — swapped in via
+    ``AwarenessLoop.replace_collectors`` (a FULL replacement of the bootstrap set
+    from ``runtime/init/awareness.py::build_bootstrap_collectors``). Any collector
+    that must keep being measured post-bootstrap MUST appear here, or its signal
+    stops being collected. The parity guard in
+    ``tests/test_learning/test_extension_wiring.py`` enforces that every bootstrap
+    signal (minus ``BOOTSTRAP_ONLY_SIGNALS``) is covered here, and pins the emitted
+    name set to ``genesis.awareness.types.STEADY_STATE_SIGNALS``.
+
+    Imports are kept function-local (lazy) to preserve init-order/cycle safety —
+    the outreach/memory getters resolve dependencies that may not be ready when
+    the learning subsystem is constructed.
+    """
+    from genesis.awareness.signals import (
+        ContainerMemoryCollector,
+        JobHealthCollector,
+        ProcessHealthCollector,
+        SchedulerLivenessCollector,
+        StrategicTimerCollector,
+    )
+    from genesis.env import ollama_enabled
+    from genesis.learning.signals.autonomy_activity import (
+        AutonomyActivityCollector,
+    )
+    from genesis.learning.signals.budget import BudgetCollector
+    from genesis.learning.signals.conversation import ConversationCollector
+    from genesis.learning.signals.critical_failure import (
+        CriticalFailureCollector,
+    )
+    from genesis.learning.signals.error_spike import ErrorSpikeCollector
+    from genesis.learning.signals.guardian_activity import (
+        GuardianActivityCollector,
+    )
+    from genesis.learning.signals.light_cascade import LightCascadeCollector
+    from genesis.learning.signals.micro_cascade import MicroCascadeCollector
+    from genesis.learning.signals.outreach_engagement import (
+        OutreachEngagementCollector,
+    )
+    from genesis.learning.signals.pending_items import (
+        PendingItemCollector,
+    )
+    from genesis.learning.signals.recon_findings import (
+        ReconFindingsCollector,
+    )
+    from genesis.learning.signals.sentinel_activity import (
+        SentinelActivityCollector,
+    )
+    from genesis.learning.signals.surplus_activity import (
+        SurplusActivityCollector,
+    )
+    from genesis.learning.signals.task_quality import TaskQualityCollector
+    from genesis.learning.signals.user_goal_staleness import (
+        UserGoalStalenessCollector,
+    )
+    from genesis.learning.signals.user_session_pattern import (
+        UserSessionPatternCollector,
+    )
+    from genesis.observability.health import (
+        probe_db,
+        probe_ollama,
+        probe_qdrant,
+    )
+
+    # DB and Qdrant are non-optional — Genesis cannot function
+    # without them, so their absence is a critical_failure. Ollama
+    # is opt-in (cloud-primary architecture): only treat its
+    # absence as critical when the install configures it as
+    # enabled. Without this gate, every cloud-only install would
+    # fire critical_failure=1.0 forever on a service that was
+    # never required, polluting reflections and observation
+    # writes with phantom emergencies.
+    probes = [
+        partial(probe_db, rt._db),
+        probe_qdrant,
+    ]
+    if ollama_enabled():
+        probes.append(probe_ollama)
+
+    from genesis.learning.signals.cc_version import CCVersionCollector
+    from genesis.learning.signals.genesis_version import GenesisVersionCollector
+
+    return [
+        ConversationCollector(rt._db),
+        TaskQualityCollector(rt._db),
+        OutreachEngagementCollector(rt._db),
+        ReconFindingsCollector(rt._db),
+        BudgetCollector(rt._db),
+        ErrorSpikeCollector(rt._db),
+        CriticalFailureCollector(probes),
+        StrategicTimerCollector(rt._db),
+        ContainerMemoryCollector(),
+        # Restored to the steady-state swap (were bootstrap-only → dropped
+        # post-bootstrap). event_loop_latency is intentionally NOT restored here
+        # (deferred — see BOOTSTRAP_ONLY_SIGNALS).
+        JobHealthCollector(runtime=rt),
+        SchedulerLivenessCollector(runtime=rt),
+        PendingItemCollector(rt._db),
+        MicroCascadeCollector(rt._db),
+        LightCascadeCollector(rt._db),
+        SentinelActivityCollector(),
+        GuardianActivityCollector(),
+        SurplusActivityCollector(rt._db),
+        AutonomyActivityCollector(rt._db),
+        GenesisVersionCollector(
+            rt._db,
+            pipeline_getter=lambda: rt._outreach_pipeline,
+        ),
+        # Detect-and-record only — no router/pipeline/memory_store: this
+        # collector deliberately runs no impact analysis (see its docstring).
+        CCVersionCollector(rt._db),
+        ProcessHealthCollector(),
+        UserGoalStalenessCollector(rt._db),
+        UserSessionPatternCollector(rt._db),
+    ]
 
 
 async def init(rt: GenesisRuntime) -> None:
@@ -248,103 +402,7 @@ async def init(rt: GenesisRuntime) -> None:
 
     try:
         if rt._awareness_loop is not None:
-            from genesis.awareness.signals import (
-                ContainerMemoryCollector,
-                ProcessHealthCollector,
-                StrategicTimerCollector,
-            )
-            from genesis.env import ollama_enabled
-            from genesis.learning.signals.autonomy_activity import (
-                AutonomyActivityCollector,
-            )
-            from genesis.learning.signals.budget import BudgetCollector
-            from genesis.learning.signals.conversation import ConversationCollector
-            from genesis.learning.signals.critical_failure import (
-                CriticalFailureCollector,
-            )
-            from genesis.learning.signals.error_spike import ErrorSpikeCollector
-            from genesis.learning.signals.guardian_activity import (
-                GuardianActivityCollector,
-            )
-            from genesis.learning.signals.light_cascade import LightCascadeCollector
-            from genesis.learning.signals.micro_cascade import MicroCascadeCollector
-            from genesis.learning.signals.outreach_engagement import (
-                OutreachEngagementCollector,
-            )
-            from genesis.learning.signals.pending_items import (
-                PendingItemCollector,
-            )
-            from genesis.learning.signals.recon_findings import (
-                ReconFindingsCollector,
-            )
-            from genesis.learning.signals.sentinel_activity import (
-                SentinelActivityCollector,
-            )
-            from genesis.learning.signals.surplus_activity import (
-                SurplusActivityCollector,
-            )
-            from genesis.learning.signals.task_quality import TaskQualityCollector
-            from genesis.learning.signals.user_goal_staleness import (
-                UserGoalStalenessCollector,
-            )
-            from genesis.learning.signals.user_session_pattern import (
-                UserSessionPatternCollector,
-            )
-            from genesis.observability.health import (
-                probe_db,
-                probe_ollama,
-                probe_qdrant,
-            )
-
-            # DB and Qdrant are non-optional — Genesis cannot function
-            # without them, so their absence is a critical_failure. Ollama
-            # is opt-in (cloud-primary architecture): only treat its
-            # absence as critical when the install configures it as
-            # enabled. Without this gate, every cloud-only install would
-            # fire critical_failure=1.0 forever on a service that was
-            # never required, polluting reflections and observation
-            # writes with phantom emergencies.
-            probes = [
-                partial(probe_db, rt._db),
-                probe_qdrant,
-            ]
-            if ollama_enabled():
-                probes.append(probe_ollama)
-
-            from genesis.learning.signals.cc_version import CCVersionCollector
-            from genesis.learning.signals.genesis_version import GenesisVersionCollector
-
-            collectors = [
-                ConversationCollector(rt._db),
-                TaskQualityCollector(rt._db),
-                OutreachEngagementCollector(rt._db),
-                ReconFindingsCollector(rt._db),
-                BudgetCollector(rt._db),
-                ErrorSpikeCollector(rt._db),
-                CriticalFailureCollector(probes),
-                StrategicTimerCollector(rt._db),
-                ContainerMemoryCollector(),
-                PendingItemCollector(rt._db),
-                MicroCascadeCollector(rt._db),
-                LightCascadeCollector(rt._db),
-                SentinelActivityCollector(),
-                GuardianActivityCollector(),
-                SurplusActivityCollector(rt._db),
-                AutonomyActivityCollector(rt._db),
-                GenesisVersionCollector(
-                    rt._db,
-                    pipeline_getter=lambda: rt._outreach_pipeline,
-                ),
-                CCVersionCollector(
-                    rt._db,
-                    router=rt._router,
-                    pipeline_getter=lambda: rt._outreach_pipeline,
-                    memory_store_getter=lambda: rt._memory_store,
-                ),
-                ProcessHealthCollector(),
-                UserGoalStalenessCollector(rt._db),
-                UserSessionPatternCollector(rt._db),
-            ]
+            collectors = build_learning_collectors(rt)
             rt._awareness_loop.replace_collectors(collectors)
             logger.info("Installed %d signal collectors", len(collectors))
 
@@ -407,7 +465,7 @@ async def init(rt: GenesisRuntime) -> None:
                 else:
                     rt.record_job_success("triage_calibration_daily")
             except Exception as exc:
-                rt.record_job_failure("triage_calibration_daily", str(exc))
+                rt.record_job_failure("triage_calibration_daily", exc=exc)
                 raise
 
         rt._learning_scheduler.add_job(
@@ -440,13 +498,49 @@ async def init(rt: GenesisRuntime) -> None:
                 if n:
                     logger.info("Email gate drain resolved %d held send(s)", n)
             except Exception as exc:
-                rt.record_job_failure("email_gate_drain", str(exc))
+                rt.record_job_failure("email_gate_drain", exc=exc)
                 raise
 
         rt._learning_scheduler.add_job(
             _email_gate_drain,
             CronTrigger(minute="*/5", timezone=user_timezone()),
             id="email_gate_drain",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
+        # Contributor Work-Log poster — the resolution watcher for held public
+        # GitHub-issue drafts. Drains pending_issue_posts: approved + live → post
+        # via `gh issue create`; approved + propose_only → dry-run terminal;
+        # rejected/expired/orphaned → close out. Mode read live each tick; `off`
+        # short-circuits. max_instances=1 ⇒ no in-drain races.
+        from genesis.autonomy.contributor_issue_watcher import (
+            drain_pending_issue_posts,
+        )
+
+        async def _contributor_issue_drain() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping contributor issue drain",
+                    exc_info=True,
+                )
+                return
+            try:
+                n = await drain_pending_issue_posts(rt)
+                rt.record_job_success("contributor_issue_drain")
+                if n:
+                    logger.info("Contributor issue drain resolved %d held draft(s)", n)
+            except Exception as exc:
+                rt.record_job_failure("contributor_issue_drain", exc=exc)
+                raise
+
+        rt._learning_scheduler.add_job(
+            _contributor_issue_drain,
+            CronTrigger(minute="*/5", timezone=user_timezone()),
+            id="contributor_issue_drain",
             max_instances=1,
             misfire_grace_time=300,
         )
@@ -479,7 +573,7 @@ async def init(rt: GenesisRuntime) -> None:
                         ", ".join(decayed),
                     )
             except Exception as exc:
-                rt.record_job_failure("capability_decay_sweep", str(exc))
+                rt.record_job_failure("capability_decay_sweep", exc=exc)
                 raise
 
         rt._learning_scheduler.add_job(
@@ -546,7 +640,7 @@ async def init(rt: GenesisRuntime) -> None:
                     )
                 rt.record_job_success("auto_memory_harvest")
             except Exception as exc:
-                rt.record_job_failure("auto_memory_harvest", str(exc))
+                rt.record_job_failure("auto_memory_harvest", exc=exc)
                 logger.exception("Auto-memory harvest failed")
 
         rt._learning_scheduler.add_job(
@@ -569,7 +663,7 @@ async def init(rt: GenesisRuntime) -> None:
                         stale,
                     )
             except Exception as exc:
-                rt.record_job_failure("observation_expiry_sweep", str(exc))
+                rt.record_job_failure("observation_expiry_sweep", exc=exc)
                 logger.exception("Observation expiry sweep failed")
 
         rt._learning_scheduler.add_job(
@@ -592,7 +686,7 @@ async def init(rt: GenesisRuntime) -> None:
                         count,
                     )
             except Exception as exc:
-                rt.record_job_failure("follow_up_retention_sweep", str(exc))
+                rt.record_job_failure("follow_up_retention_sweep", exc=exc)
                 logger.exception("Follow-up retention sweep failed")
 
         rt._learning_scheduler.add_job(
@@ -628,7 +722,7 @@ async def init(rt: GenesisRuntime) -> None:
                         decayed,
                     )
             except Exception as exc:
-                rt.record_job_failure("inbox_marker_decay", str(exc))
+                rt.record_job_failure("inbox_marker_decay", exc=exc)
                 logger.exception("Inbox marker decay sweep failed")
 
         rt._learning_scheduler.add_job(
@@ -637,6 +731,107 @@ async def init(rt: GenesisRuntime) -> None:
             id="inbox_marker_decay",
             max_instances=1,
             misfire_grace_time=3600,
+        )
+
+        async def _idea_lane_decay_sweep() -> None:
+            # Soft-age-out un-triaged ideas in the surplus-ideation review lane
+            # (source='surplus_ideation', kind='idea'): status→completed after
+            # 45d, then reaped by the retention sweep. Mechanical TTL, like the
+            # inbox marker decay above — the review lane must not grow unbounded.
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping idea lane decay",
+                    exc_info=True,
+                )
+                return
+            try:
+                from genesis.db.crud import follow_ups
+
+                decayed = await follow_ups.decay_stale_ideas(rt._db)
+                rt.record_job_success("idea_lane_decay")
+                if decayed:
+                    logger.info(
+                        "Idea lane decay: aged out %d un-triaged idea(s)",
+                        decayed,
+                    )
+            except Exception as exc:
+                rt.record_job_failure("idea_lane_decay", exc=exc)
+                logger.exception("Idea lane decay sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _idea_lane_decay_sweep,
+            CronTrigger(hour=4, minute=45, timezone=user_timezone()),
+            id="idea_lane_decay",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
+        async def _ledger_escalation_sweep() -> None:
+            # Escalate a session_ledger row nobody can dispose of any more (row
+            # untouched >= stale_days AND its session quiet >= quiet_days) into a
+            # user_input_needed follow-up, and complete escalations whose row has
+            # since been disposed. Lives here (learning scheduler) rather than in
+            # the awareness loop because it MUTATES — it creates follow-ups — and
+            # the awareness _check_* family is documented read-and-alert only.
+            # Hourly, so the reverse sync closes a follow-up within the hour of
+            # its row being disposed.
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping ledger escalation",
+                    exc_info=True,
+                )
+                return
+            if rt._db is None:
+                return
+            try:
+                from genesis.session_awareness.ledger_escalation import run_sweep
+                from genesis.session_awareness.ledger_escalation_config import (
+                    is_enabled,
+                )
+
+                if not is_enabled():
+                    rt.record_job_success("ledger_escalation")
+                    return
+                result = await run_sweep(
+                    rt._db,
+                    now=datetime.now(UTC),
+                    sessions_dir=genesis_home() / "sessions",
+                )
+                if result["reconcile_failed"]:
+                    # The forward pass ran but the reverse sync did not. Half a
+                    # run is not a successful run: recording success here would
+                    # let a permanently dead reverse sync — escalations stuck
+                    # pending for rows disposed weeks ago — sit behind a green
+                    # job-health tile indefinitely.
+                    rt.record_job_failure(
+                        "ledger_escalation",
+                        "reverse sync could not read the ledger",
+                    )
+                else:
+                    rt.record_job_success("ledger_escalation")
+                if result["created"] or result["reconciled"]:
+                    logger.info(
+                        "Ledger escalation: created %d, reconciled %d, deferred %d",
+                        result["created"],
+                        result["reconciled"],
+                        result["deferred"],
+                    )
+            except Exception as exc:
+                rt.record_job_failure("ledger_escalation", exc=exc)
+                logger.exception("Ledger escalation sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _ledger_escalation_sweep,
+            CronTrigger(minute=17, timezone=user_timezone()),
+            id="ledger_escalation",
+            max_instances=1,
+            misfire_grace_time=1800,
         )
 
         async def _run_recovery() -> None:
@@ -651,8 +846,8 @@ async def init(rt: GenesisRuntime) -> None:
                             report.embeddings_recovered,
                             report.items_pending,
                         )
-                except Exception:
-                    rt.record_job_failure("recovery_orchestrator", "recovery failed")
+                except Exception as exc:
+                    rt.record_job_failure("recovery_orchestrator", "recovery failed", exc=exc)
                     logger.exception("Recovery orchestrator failed")
 
         rt._learning_scheduler.add_job(
@@ -668,8 +863,8 @@ async def init(rt: GenesisRuntime) -> None:
                 try:
                     await rt._health_data.validate_api_keys()
                     rt.record_job_success("api_key_validation")
-                except Exception:
-                    rt.record_job_failure("api_key_validation", "validation failed")
+                except Exception as exc:
+                    rt.record_job_failure("api_key_validation", "validation failed", exc=exc)
                     logger.exception("API key validation failed")
 
         rt._learning_scheduler.add_job(
@@ -695,8 +890,8 @@ async def init(rt: GenesisRuntime) -> None:
                     rt.record_job_success("dead_letter_expiry")
                     if expired:
                         logger.info("Expired %d dead letter items (>72h)", expired)
-                except Exception:
-                    rt.record_job_failure("dead_letter_expiry", "expiry failed")
+                except Exception as exc:
+                    rt.record_job_failure("dead_letter_expiry", "expiry failed", exc=exc)
                     logger.exception("Dead letter expiry failed")
 
         rt._learning_scheduler.add_job(
@@ -721,7 +916,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if expired:
                     logger.info("Expired %d stale message queue items (>7d)", expired)
             except Exception as exc:
-                rt.record_job_failure("message_queue_expiry", str(exc))
+                rt.record_job_failure("message_queue_expiry", exc=exc)
                 logger.exception("Message queue expiry failed")
 
         rt._learning_scheduler.add_job(
@@ -754,10 +949,11 @@ async def init(rt: GenesisRuntime) -> None:
                             ok,
                             fail,
                         )
-                except Exception:
+                except Exception as exc:
                     rt.record_job_failure(
                         "dead_letter_redispatch",
                         "redispatch failed",
+                        exc=exc,
                     )
                     logger.exception("Dead letter redispatch failed")
 
@@ -810,7 +1006,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if counts.get("judged") or counts.get("merged") or counts.get("proposed"):
                     logger.info("entity_adjudication drain (mode=%s): %s", mode, counts)
             except Exception as exc:
-                rt.record_job_failure("entity_adjudication_drain", str(exc))
+                rt.record_job_failure("entity_adjudication_drain", exc=exc)
                 logger.exception("entity_adjudication drain failed")
 
         # CronTrigger (not IntervalTrigger — resets on restart). :25 is a clean
@@ -832,7 +1028,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if any(v > 0 for v in result.values()):
                     logger.info("Procedure promotion: %s", result)
             except Exception as exc:
-                rt.record_job_failure("procedure_promotion", str(exc))
+                rt.record_job_failure("procedure_promotion", exc=exc)
                 logger.exception("Procedure promotion failed")
             # Self-healing embedding backfill — independent of promotion so a
             # backfill failure never fails the promotion job. Repairs procedures
@@ -1002,7 +1198,7 @@ async def init(rt: GenesisRuntime) -> None:
                             logger.exception("Failed to synthesize USER_KNOWLEDGE.md")
                 rt.record_job_success("user_model_evolution")
             except Exception as exc:
-                rt.record_job_failure("user_model_evolution", str(exc))
+                rt.record_job_failure("user_model_evolution", exc=exc)
                 logger.exception("User model evolution failed")
 
         rt._learning_scheduler.add_job(
@@ -1035,13 +1231,36 @@ async def init(rt: GenesisRuntime) -> None:
                         max_idle_minutes=360,
                     )
                 cleaned = await cleanup_stale_heartbeats(rt._db)
+
+                # D3 — foreground-session liveness reaper. Isolated in its OWN
+                # try/except so a notify/observation failure can NEVER abort the
+                # stale-session / heartbeat cleanup above (which is the job's
+                # primary contract).
+                try:
+                    from genesis.cc.foreground_reaper import reap_dark_foreground
+
+                    fg = await reap_dark_foreground(rt)
+                    if fg.get("reaped"):
+                        logger.info(
+                            "Session reaper: checkpointed %d dark foreground "
+                            "session(s) (notified=%d, shadow=%d)",
+                            fg["reaped"],
+                            fg.get("notified", 0),
+                            fg.get("shadow", 0),
+                        )
+                except Exception:
+                    logger.warning(
+                        "Foreground liveness reaper failed (stale-session cleanup unaffected)",
+                        exc_info=True,
+                    )
+
                 rt.record_job_success("session_reaper")
                 if reaped:
                     logger.info("Session reaper: expired %d stale sessions", reaped)
                 if cleaned:
                     logger.info("Session reaper: cleaned %d stale heartbeats", cleaned)
             except Exception as exc:
-                rt.record_job_failure("session_reaper", str(exc))
+                rt.record_job_failure("session_reaper", exc=exc)
                 logger.exception("Session reaper failed")
 
         rt._learning_scheduler.add_job(
@@ -1068,7 +1287,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if count:
                     logger.info("Capability map refreshed: %d domains", count)
             except Exception as exc:
-                rt.record_job_failure("capability_map_refresh", str(exc))
+                rt.record_job_failure("capability_map_refresh", exc=exc)
                 logger.exception("Capability map refresh failed")
 
         rt._learning_scheduler.add_job(
@@ -1101,7 +1320,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if any(incremental.values()):
                     logger.info("Outcome harvest: %s", incremental)
             except Exception as exc:
-                rt.record_job_failure("outcome_harvest", str(exc))
+                rt.record_job_failure("outcome_harvest", exc=exc)
                 logger.exception("Outcome harvest failed")
 
         rt._learning_scheduler.add_job(
@@ -1140,7 +1359,7 @@ async def init(rt: GenesisRuntime) -> None:
                         " (low-confidence)" if snap["low_confidence"] else "",
                     )
             except Exception as exc:
-                rt.record_job_failure("ego_calibration", str(exc))
+                rt.record_job_failure("ego_calibration", exc=exc)
                 logger.exception("Ego calibration failed")
 
         rt._learning_scheduler.add_job(
@@ -1176,7 +1395,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if report.scanned:
                     logger.info("Ledger grader: %s", report.summary())
             except Exception as exc:
-                rt.record_job_failure("ledger_grader", str(exc))
+                rt.record_job_failure("ledger_grader", exc=exc)
                 logger.exception("Ledger grader failed")
 
         rt._learning_scheduler.add_job(
@@ -1209,7 +1428,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if reaped:
                     logger.info("Activity log reaper: deleted %d old records", reaped)
             except Exception as exc:
-                rt.record_job_failure("activity_log_reaper", str(exc))
+                rt.record_job_failure("activity_log_reaper", exc=exc)
                 logger.exception("Activity log reaper failed")
 
         rt._learning_scheduler.add_job(
@@ -1232,7 +1451,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if n:
                     logger.debug("CC span ingest: %d spans", n)
             except Exception as exc:
-                rt.record_job_failure("cc_span_ingest", str(exc))
+                rt.record_job_failure("cc_span_ingest", exc=exc)
                 logger.exception("CC span ingest failed")
 
         # Frequent (every 2 min) so dispatched-session tool spans land in the
@@ -1259,7 +1478,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if removed:
                     logger.info("otel_spans prune: removed %d old spans", removed)
             except Exception as exc:
-                rt.record_job_failure("otel_span_prune", str(exc))
+                rt.record_job_failure("otel_span_prune", exc=exc)
                 logger.exception("otel_spans prune failed")
 
         rt._learning_scheduler.add_job(
@@ -1274,6 +1493,12 @@ async def init(rt: GenesisRuntime) -> None:
         # testable seam so the registration is covered, not just the crud prunes).
         _wire_drip_retention_jobs(rt._learning_scheduler, rt)
 
+        # Memory integrity Phase 0 — read-only consistency check + recall-health
+        # probe (off-peak CronTrigger; mode-gated, self-persisting).
+        from genesis.runtime.init.memory_integrity import _wire_memory_integrity_jobs
+
+        _wire_memory_integrity_jobs(rt._learning_scheduler, rt)
+
         # NOTE: the daily deep `git fsck --full` (F.1) is NOT wired here. It runs
         # from the awareness loop (`_check_git_health_deep`) on a ~daily guard so
         # it survives a router-degraded startup that skips this learning init.
@@ -1282,6 +1507,10 @@ async def init(rt: GenesisRuntime) -> None:
         # policy — activity markers + live-terminal gate, dry-run→auto-arm).
         # Extracted to a testable seam; see process_reaper.py.
         _wire_process_reaper(rt._learning_scheduler, rt)
+
+        # Rate-limit resume engine (re-dispatch parked CC work at reset; gated
+        # per-tick by cc_rate_limit_resume mode). Testable seam; CronTrigger */10.
+        _wire_rate_limit_resume(rt._learning_scheduler, rt)
 
         # ── Skill evolution pipeline (weekly backup trigger) ────────────────
         async def _run_skill_evolution() -> None:
@@ -1303,7 +1532,7 @@ async def init(rt: GenesisRuntime) -> None:
                     logger.info("Skill evolution completed: %s", result)
                 rt.record_job_success("skill_evolution")
             except Exception as exc:
-                rt.record_job_failure("skill_evolution", str(exc))
+                rt.record_job_failure("skill_evolution", exc=exc)
                 logger.exception("Skill evolution pipeline failed")
 
         rt._learning_scheduler.add_job(
@@ -1346,7 +1575,7 @@ async def init(rt: GenesisRuntime) -> None:
                     logger.warning("J9 regression check failed", exc_info=True)
                 rt.record_job_success("j9_eval_aggregation")
             except Exception as exc:
-                rt.record_job_failure("j9_eval_aggregation", str(exc))
+                rt.record_job_failure("j9_eval_aggregation", exc=exc)
                 logger.exception("J9 weekly aggregation failed")
 
         rt._learning_scheduler.add_job(
@@ -1382,7 +1611,7 @@ async def init(rt: GenesisRuntime) -> None:
                 )
                 rt.record_job_success("pr_review_harvest")
             except Exception as exc:
-                rt.record_job_failure("pr_review_harvest", str(exc))
+                rt.record_job_failure("pr_review_harvest", exc=exc)
                 logger.exception("PR review harvest failed")
 
         rt._learning_scheduler.add_job(
@@ -1452,7 +1681,7 @@ async def init(rt: GenesisRuntime) -> None:
                 logger.info("Model gauntlet: ran %d/%d roster model(s)", ran, len(models))
                 rt.record_job_success("model_gauntlet")
             except Exception as exc:
-                rt.record_job_failure("model_gauntlet", str(exc))
+                rt.record_job_failure("model_gauntlet", exc=exc)
                 logger.exception("Model gauntlet job failed")
 
         rt._learning_scheduler.add_job(

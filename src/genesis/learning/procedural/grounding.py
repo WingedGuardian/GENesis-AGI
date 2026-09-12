@@ -25,7 +25,7 @@ import re
 
 # Placeholders are normalized away before matching so a templated step
 # (e.g. ``gh api repos/<owner>/<repo>``) still grounds against the concrete
-# command Genesis ran (``gh api repos/WingedGuardian/Genesis``).
+# command Genesis ran (``gh api repos/example-org/example-repo``).
 _PLACEHOLDER = re.compile(
     r"<[^>]+>|\$\{?\w+\}?|\bYYYY[-/]?MM[-/]?DD\b|\bv?\d+\.\dbXX\b|\bXX+\b"
 )

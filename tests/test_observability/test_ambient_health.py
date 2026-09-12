@@ -4,6 +4,7 @@ Covers the alert-decision logic (the testable core) and ``bridge_snapshot``'s
 composition/contract; the SSH read + scheduler wiring are verified on-device
 (they need the edge + a running scheduler).
 """
+
 import asyncio
 from datetime import UTC, datetime, timedelta
 
@@ -61,7 +62,8 @@ def test_device_offline_does_not_mask_software_failure():
     # A real software failure (dead diar worker) still fires even if the device
     # happens to be offline at the same time.
     verdict = evaluate_ambient_health(
-        _snapshot(active_connections=0, diar_worker_alive=False), now=NOW,
+        _snapshot(active_connections=0, diar_worker_alive=False),
+        now=NOW,
     )
     assert verdict.status == "degraded"
 
@@ -256,7 +258,8 @@ def test_rss_breach_does_not_mask_down():
     # the RSS reason is still appended for the operator.
     stale = (NOW - timedelta(minutes=10)).isoformat()
     verdict = evaluate_ambient_health(
-        _snapshot(ts=stale, rss_total_mb=1200.0), now=NOW,
+        _snapshot(ts=stale, rss_total_mb=1200.0),
+        now=NOW,
     )
     assert verdict.status == "down"
     assert any("RSS" in r for r in verdict.reasons)
@@ -271,10 +274,12 @@ def test_causes_are_stable_machine_keys():
     stale = (NOW - timedelta(minutes=10)).isoformat()
     assert evaluate_ambient_health(_snapshot(ts=stale), now=NOW).causes == ("bridge-dead",)
     assert evaluate_ambient_health(
-        _snapshot(diar_worker_alive=False), now=NOW,
+        _snapshot(diar_worker_alive=False),
+        now=NOW,
     ).causes == ("diar-worker",)
     verdict = evaluate_ambient_health(
-        _snapshot(rss_total_mb=1200.0, rss_diar_child_mb=600.0), now=NOW,
+        _snapshot(rss_total_mb=1200.0, rss_diar_child_mb=600.0),
+        now=NOW,
     )
     assert verdict.causes == ("rss-total", "rss-diar-child")
 
@@ -289,3 +294,80 @@ def test_bridge_snapshot_carries_causes(monkeypatch):
     monkeypatch.setattr(ambient_health, "read_edge_health", _data)
     out = asyncio.run(ambient_health.bridge_snapshot(now=NOW))
     assert out["causes"] == ["rss-total"]
+
+
+# --- recovery_failing: the ONE darkness signal we act on (armed auto-recovery could
+# not restore the device). Fires ONLY when the edge emits recovery_failing=True, which
+# only happens on a recovery-armed install — so an unarmed/off device stays silent. ---
+
+
+def test_recovery_failing_is_degraded_with_cause():
+    verdict = evaluate_ambient_health(
+        _snapshot(
+            active_connections=0,
+            recovery_failing=True,
+            failed_reboot_count=3,
+            device_dark_since="2026-06-18T06:00:00+00:00",
+            last_reboot_error="TimeoutError",
+        ),
+        now=NOW,
+    )
+    assert verdict.status == "degraded"
+    assert verdict.causes == ("recovery-failing",)
+    reason = " ".join(verdict.reasons)
+    assert "auto-recovery exhausted" in reason
+    assert "3 reboot attempt" in reason
+    assert "2026-06-18T06:00:00+00:00" in reason
+    assert "TimeoutError" in reason
+
+
+def test_recovery_failing_false_is_ok():
+    # Recovery armed but not failing (device present, or dark but within the recovery
+    # window) must NOT alert — same as today.
+    assert evaluate_ambient_health(_snapshot(recovery_failing=False), now=NOW).status == "ok"
+
+
+def test_recovery_failing_absent_is_ok():
+    # An edge build without recovery armed never emits the field → unchanged (the
+    # "never alert on an absent device" invariant holds by default).
+    assert evaluate_ambient_health(_snapshot(active_connections=0), now=NOW).status == "ok"
+
+
+def test_recovery_failing_with_missing_detail_fields_still_degrades():
+    # recovery_failing=True with no count/since/error still degrades with a bare reason
+    # (defensive: an older/partial edge payload must not crash the evaluator).
+    verdict = evaluate_ambient_health(_snapshot(recovery_failing=True), now=NOW)
+    assert verdict.status == "degraded"
+    assert verdict.causes == ("recovery-failing",)
+    assert any("auto-recovery exhausted" in r for r in verdict.reasons)
+
+
+def test_recovery_failing_does_not_mask_dead_bridge():
+    # A dead bridge (stale heartbeat) stays "down" even when recovery is also failing;
+    # the recovery reason is still appended for the operator.
+    stale = (NOW - timedelta(minutes=10)).isoformat()
+    verdict = evaluate_ambient_health(
+        _snapshot(ts=stale, recovery_failing=True, failed_reboot_count=1),
+        now=NOW,
+    )
+    assert verdict.status == "down"
+    assert "bridge-dead" in verdict.causes
+    assert "recovery-failing" in verdict.causes
+    assert any("auto-recovery exhausted" in r for r in verdict.reasons)
+
+
+def test_recovery_failing_coexists_with_diar_worker():
+    # Two independent degraded causes both surface (the scheduler re-alerts on a NEW
+    # cause via the value-free cause keys).
+    verdict = evaluate_ambient_health(
+        _snapshot(active_connections=0, diar_worker_alive=False, recovery_failing=True),
+        now=NOW,
+    )
+    assert verdict.status == "degraded"
+    assert set(verdict.causes) == {"diar-worker", "recovery-failing"}
+
+
+def test_recovery_failing_truthy_non_true_does_not_fire():
+    # Strict `is True` gate: a truthy-but-not-True value (e.g. 1) must NOT trip it,
+    # matching the diar/RSS guards' explicitness.
+    assert evaluate_ambient_health(_snapshot(recovery_failing=1), now=NOW).status == "ok"

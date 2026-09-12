@@ -654,12 +654,16 @@ async def test_grade_ego_with_data(db):
                 "0.8-1.0": {"count": 16, "success_rate": 0.13},
             },
             "total_proposals": 29,
+            # 25 of the 29 were actually judged (9 + 16 in the calibration
+            # buckets); the rest never got an answer. The grade is gated on
+            # THIS number, not on total_proposals — see _grade_ego.
+            "total_resolved": 25,
         },
     }
     result = await _grade_ego(db, "2026-05-01", "2026-05-08", dimension_results)
     assert result["grade"] is not None
     assert result["score"] is not None
-    assert result["sample_count"] == 29
+    assert result["sample_count"] == 25
     # Calibration + execution dominate; approval demoted to 20%
     assert result["score"] < 70  # C or below
 
@@ -694,33 +698,14 @@ async def test_grade_procedural_null_success_rate(db):
     assert "success_rate" in result.get("reason", "")
 
 
-async def test_zero_fill_single_null_penalizes(db):
-    """A single null factor is treated as 0.0, not skipped."""
-    from genesis.eval.j9_aggregator import _score_with_zero_fill
-
-    # All present: (0.8 * 0.4 + 0.6 * 0.3 + 0.7 * 0.3) * 100 ≈ 71.0
-    all_present = [(0.8, 0.4), (0.6, 0.3), (0.7, 0.3)]
-    assert abs(_score_with_zero_fill(all_present, max_nulls=1) - 71.0) < 0.01
-
-    # One null: (0.8 * 0.4 + 0.0 * 0.3 + 0.7 * 0.3) * 100 ≈ 53.0
-    one_null = [(0.8, 0.4), (None, 0.3), (0.7, 0.3)]
-    assert abs(_score_with_zero_fill(one_null, max_nulls=1) - 53.0) < 0.01
-
-
-async def test_zero_fill_multiple_nulls_returns_none(db):
-    """More than max_nulls null factors → no grade."""
-    from genesis.eval.j9_aggregator import _score_with_zero_fill
-
-    two_nulls = [(0.8, 0.4), (None, 0.3), (None, 0.3)]
-    assert _score_with_zero_fill(two_nulls, max_nulls=1) is None
-
-
 async def test_grade_awareness_from_ticks(db):
     """Awareness grade uses tick_regularity + signal_completeness."""
     import json as _json
 
-    # Build realistic signals_json with 20 distinct signal names
-    signals = [{"name": f"signal_{i}", "value": 0.5} for i in range(20)]
+    from genesis.awareness.types import STEADY_STATE_SIGNALS
+
+    # All steady-state signals present (value 0.0 when idle) → completeness 1.0.
+    signals = [{"name": n, "value": 0.0} for n in sorted(STEADY_STATE_SIGNALS)]
     signals_json = _json.dumps(signals)
 
     for i in range(25):
@@ -737,9 +722,39 @@ async def test_grade_awareness_from_ticks(db):
     assert result["score"] is not None
     assert result["sample_count"] == 25
     assert result["factors"]["classified_count"] == 20
-    # Signal completeness: 20 unique signals vs 18 expected → 1.0 (capped)
+    # All steady-state collectors producing output → completeness 1.0.
     assert result["factors"]["signal_completeness"] == 1.0
-    assert result["factors"]["unique_signals"] == 20
+    assert result["factors"]["unique_signals"] == len(STEADY_STATE_SIGNALS)
+
+
+async def test_grade_awareness_completeness_detects_dropped_collector(db):
+    """A steady-state collector missing from ticks drops completeness below 1.0.
+
+    Regression guard for the collector-drop bug: the old magic-denominator metric
+    (distinct_names / 18) saturated at 1.0 and never detected a dropped collector.
+    Scoring against the canonical STEADY_STATE_SIGNALS set makes a drop visible.
+    """
+    import json as _json
+
+    from genesis.awareness.types import STEADY_STATE_SIGNALS
+
+    # One steady-state signal absent from every tick (collector dropped).
+    present = sorted(STEADY_STATE_SIGNALS - {"scheduled_job_health"})
+    signals_json = _json.dumps([{"name": n, "value": 0.0} for n in present])
+
+    for i in range(25):
+        await db.execute(
+            "INSERT INTO awareness_ticks (id, created_at, source, classified_depth, "
+            "signals_json, scores_json) VALUES (?, ?, 'scheduled', NULL, ?, '[]')",
+            (f"tick-{i}", "2026-05-05T12:00:00Z", signals_json),
+        )
+    await db.commit()
+
+    result = await _grade_awareness(db, "2026-05-01", "2026-05-08", {})
+    n = len(STEADY_STATE_SIGNALS)
+    # factors["signal_completeness"] is round(_, 4) in the aggregator.
+    assert result["factors"]["signal_completeness"] == round((n - 1) / n, 4)
+    assert result["factors"]["signal_completeness"] < 1.0
 
 
 async def test_grade_awareness_empty_signals(db):
@@ -1501,3 +1516,388 @@ async def test_compute_goal_completion_excludes_ego_goals(db):
         "abandoned": 0,
     }
     assert metrics["achieved_count"] == 1
+
+
+# ── No-data scoring: a factor without a denominator must not score as 0 ──────
+#
+# Acceptance bar for the 2026-09-06 ego "F" (score 4.0). That week had 12
+# proposals: 11 still pending, and ONE tabled 60ms after creation by the
+# develop-scope roadmap gate (a recoverable bookkeeping record of a proposal
+# self-development being disabled declined to pursue). The tabled row became
+# the entire resolved population, so approval_rate was 0/1, its 0.85 confidence
+# scored against a 0.0 outcome gave calibration 0.1, and a null
+# execution_success_rate was zero-filled at 40% weight. No human judged
+# anything, yet the ego was graded F on it.
+
+
+async def _seed_window_proposals(db, rows):
+    """Seed ego_proposals. rows = [(status, confidence, resolved)]."""
+    for i, (status, conf, resolved) in enumerate(rows):
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, confidence, created_at, resolved_at) "
+            "VALUES (?,'maintenance','c',?,?,?,?)",
+            (f"np{i}", status, conf, "2026-09-02T00:00:00+00:00",
+             "2026-09-02T00:00:00+00:00" if resolved else None),
+        )
+    await db.commit()
+
+
+async def test_ego_grade_withheld_when_only_resolution_is_a_self_tabling(db):
+    """The real 2026-09-06 defect: 11 pending + 1 auto-tabled must NOT grade F.
+
+    Nobody judged any of these proposals, so there is nothing to grade. The
+    correct outcome is a WITHHELD grade, not the worst possible one.
+    """
+    from genesis.eval.j9_aggregator import _compute_ego_quality, _grade_ego
+
+    await _seed_window_proposals(
+        db,
+        [("pending", 0.75, False)] * 11 + [("tabled", 0.85, True)],
+    )
+    since, until = "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00"
+    metrics, _ = await _compute_ego_quality(db, since, until)
+    result = await _grade_ego(db, since, until, {"ego": metrics})
+
+    assert result["grade"] != "F", (
+        "an ego whose proposals nobody answered was graded F on one "
+        f"self-tabled bookkeeping row: {result}"
+    )
+    assert result["grade"] is None, result
+
+
+async def test_tabled_and_withdrawn_are_not_rejections(db):
+    """Non-judgments must stay out of the approval denominator.
+
+    Both statuses are reachable with no human involved — `auto_table_stale_
+    proposals` and the ego's own reconcile withdrawal — so scoring them as
+    rejections penalises the ego for its own cleanup.
+    """
+    from genesis.eval.j9_aggregator import _compute_ego_quality
+
+    await _seed_window_proposals(
+        db,
+        [("approved", 0.8, True), ("rejected", 0.8, True),
+         ("tabled", 0.8, True), ("withdrawn", 0.8, True)],
+    )
+    metrics, _ = await _compute_ego_quality(
+        db, "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+    )
+    # 1 approved of (1 approved + 1 rejected) — tabled/withdrawn excluded.
+    assert metrics["approval_rate"] == 0.5, metrics
+    assert metrics["total_resolved"] == 2, metrics
+
+
+async def test_ego_min_samples_counts_the_scored_population(db):
+    """The sufficiency gate must read the population the factors came from.
+
+    Pending proposals contribute to no factor, so they must not be what
+    satisfies _MIN_SAMPLES — otherwise a grade issues off n=1 while
+    reporting a sample of 12.
+    """
+    from genesis.eval.j9_aggregator import _compute_ego_quality, _grade_ego
+
+    await _seed_window_proposals(
+        db, [("pending", 0.75, False)] * 20 + [("approved", 0.9, True)],
+    )
+    since, until = "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00"
+    metrics, _ = await _compute_ego_quality(db, since, until)
+    result = await _grade_ego(db, since, until, {"ego": metrics})
+
+    assert result["grade"] is None, (
+        f"graded on 1 resolved proposal padded by 20 pending ones: {result}"
+    )
+    assert result["sample_count"] == 1, result
+
+
+async def test_absent_factor_is_excluded_not_scored_as_zero(db):
+    """A factor with no denominator is dropped and the rest renormalised."""
+    from genesis.eval.j9_aggregator import _score_available_factors
+
+    all_present = [(0.8, 0.4), (0.6, 0.3), (0.7, 0.3)]
+    assert abs(_score_available_factors(all_present, max_absent=1) - 71.0) < 0.01
+
+    # Absent middle factor: (0.8*0.4 + 0.7*0.3) / (0.4+0.3) * 100 ≈ 75.71
+    one_absent = [(0.8, 0.4), (None, 0.3), (0.7, 0.3)]
+    assert abs(_score_available_factors(one_absent, max_absent=1) - 75.71) < 0.01
+
+    # Too little left to judge on.
+    two_absent = [(0.8, 0.4), (None, 0.3), (None, 0.3)]
+    assert _score_available_factors(two_absent, max_absent=1) is None
+
+
+async def test_absent_factor_never_drags_a_grade_downward(db):
+    """Regression guard: absence must never be cheaper than presence.
+
+    Zero-filling made 'no data' indistinguishable from 'scored 0.0', which is
+    the mechanism behind both recorded ego F grades.
+    """
+    from genesis.eval.j9_aggregator import _score_available_factors
+
+    absent = _score_available_factors([(0.8, 0.4), (None, 0.6)], max_absent=1)
+    scored_zero = _score_available_factors([(0.8, 0.4), (0.0, 0.6)], max_absent=1)
+    assert absent > scored_zero, (absent, scored_zero)
+
+
+async def test_procedural_grade_gated_on_the_outcome_population(db):
+    """The gate must read outcomes, not invocations.
+
+    success_rate is 50% of the procedural score and is computed over
+    procedure_outcome events, while the sufficiency gate read
+    invocation_count — a different, independently-sized population. A week
+    with plenty of invocations and one outcome graded on that one outcome.
+    """
+    dimension_results = {
+        "procedure": {
+            "success_rate": 0.0,
+            "mean_confidence": 0.7,
+            "invocation_count": 435,   # clears the old gate easily
+            "outcome_count": 1,        # ...on a single measured outcome
+            "total_procedures": 2334,
+        },
+    }
+    result = await _grade_procedural(db, "2026-05-01", "2026-05-08", dimension_results)
+    assert result["grade"] is None, result
+    assert "outcomes" in result.get("reason", ""), result
+    # sample_count must describe the population the grade rests on. Reporting
+    # invocations here is how "graded on 1 outcome" came back as n=435.
+    assert result["sample_count"] == 1, result
+    assert result["factors"]["invocation_count"] == 435   # still legible
+
+
+async def test_procedural_sample_count_is_one_population_on_every_path(db):
+    """Withheld and graded rows must not report different populations.
+
+    sample_count lands in one column and one sparkline; if the withheld path
+    counts outcomes and the graded path counts invocations, the series changes
+    meaning between adjacent weeks. _grade_ego reports its judged population on
+    every path — procedural now matches.
+    """
+    base = {"success_rate": 0.8, "mean_confidence": 0.7,
+            "invocation_count": 435, "outcome_count": 40,
+            "total_procedures": 2334}
+    graded = await _grade_procedural(
+        db, "2026-05-01", "2026-05-08", {"procedure": base})
+    assert graded["grade"] is not None, graded
+    assert graded["sample_count"] == 40, graded
+
+    # Withheld on the invocation gate, and withheld on the missing primary
+    # factor — both report the same population as the graded path.
+    few = await _grade_procedural(
+        db, "2026-05-01", "2026-05-08",
+        {"procedure": {**base, "invocation_count": 2, "outcome_count": 1}})
+    assert few["grade"] is None and few["sample_count"] == 1, few
+    no_primary = await _grade_procedural(
+        db, "2026-05-01", "2026-05-08",
+        {"procedure": {**base, "success_rate": None}})
+    assert no_primary["grade"] is None and no_primary["sample_count"] == 40, no_primary
+
+
+async def test_awareness_and_reflection_scoring_is_unchanged(db):
+    """These two graders never produce an absent factor, so the helper change
+    must be a no-op for them.
+
+    Their factors are ratios that default to 0.0 rather than None once the
+    gate passes, so renormalising over 'present' factors is the identity. This
+    pins that the blast radius of the scoring change stops here.
+    """
+    from genesis.eval.j9_aggregator import _score_available_factors
+
+    # Real weight vectors: awareness (.6/.4) and reflection (.25/.5/.25).
+    # An earlier revision of this test used memory's (.4/.3/.3) by mistake and
+    # claimed to cover reflection.
+    for weights in ([(0.9, 0.6), (0.8, 0.4)],
+                    [(1.0, 0.25), (0.55, 0.5), (0.6, 0.25)]):
+        renormalised = _score_available_factors(weights, max_absent=0)
+        legacy = sum(v * w for v, w in weights) * 100
+        assert abs(renormalised - legacy) < 1e-9, (weights, renormalised, legacy)
+
+
+async def test_calibration_buckets_cover_every_confidence_exactly_once(db):
+    """Bucket edges must not be accumulated in floating point.
+
+    `bucket_low + 0.2` gives 0.4 + 0.2 == 0.6000000000000001, which put a
+    confidence of exactly 0.6 in TWO buckets and one of exactly 1.0 in NONE.
+    Calibration is 40% of the ego grade, and `j9_regression` proposals are
+    created at confidence 1.0 — so every auto-filed regression proposal was
+    invisible to the heaviest factor in its own subsystem's grade.
+    """
+    from genesis.eval.j9_aggregator import _CALIBRATION_BUCKETS, _compute_ego_quality
+
+    for lo, hi in _CALIBRATION_BUCKETS:
+        assert round(hi - lo, 10) == 0.2, (lo, hi)
+
+    # NOTE: a total-slot count is NOT a valid assertion here — under the bug
+    # the double-counted 0.6 and the dropped 1.0 cancel out exactly, so the
+    # total is conserved. Assert each edge case's PLACEMENT instead.
+    await _seed_window_proposals(db, [("approved", 0.6, True)])
+    metrics, _ = await _compute_ego_quality(
+        db, "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+    )
+    cal = metrics["confidence_calibration"]
+    assert sum(b["count"] for b in cal.values()) == 1, (
+        f"one proposal at confidence 0.6 occupies {len(cal)} buckets: {cal}"
+    )
+    assert list(cal) == ["0.6-0.8"], cal
+
+
+async def test_calibration_counts_a_confidence_of_exactly_one(db):
+    """confidence == 1.0 fell outside every half-open bucket.
+
+    j9_regression proposals are created at confidence 1.0
+    (regression_alert.py), so the ego's own auto-filed regressions never
+    reached the factor worth 40% of its grade.
+    """
+    from genesis.eval.j9_aggregator import _compute_ego_quality
+
+    await _seed_window_proposals(db, [("approved", 1.0, True)])
+    metrics, _ = await _compute_ego_quality(
+        db, "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+    )
+    cal = metrics["confidence_calibration"]
+    assert cal.get("0.8-1.0", {}).get("count") == 1, (
+        f"a confidence of exactly 1.0 was counted nowhere: {cal}"
+    )
+
+
+async def test_ego_metrics_carry_the_approval_rate_definition_marker(db):
+    """approval_rate is the ego headline series — its definition must travel.
+
+    It drives the dashboard sparkline and _extract_trend_values -> ego_slope
+    -> go_ready. Excluding tabled/withdrawn shrinks the denominator and raises
+    the rate, so an unmarked change would read as improvement.
+    """
+    from genesis.eval.j9_aggregator import (
+        _EGO_APPROVAL_RATE_DEFN,
+        _compute_ego_quality,
+        _extract_trend_values,
+    )
+
+    await _seed_window_proposals(db, [("approved", 0.8, True)])
+    metrics, _ = await _compute_ego_quality(
+        db, "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+    )
+    assert metrics["approval_rate_defn"] == _EGO_APPROVAL_RATE_DEFN
+
+    # A pre-marker snapshot must not be averaged into the slope.
+    mixed = [{"metrics": {"approval_rate": 0.1}},                       # v1
+             {"metrics": {"approval_rate": 0.9,
+                          "approval_rate_defn": _EGO_APPROVAL_RATE_DEFN}}]
+    assert _extract_trend_values("ego", mixed) == [0.9]
+    # Other dimensions are unaffected by the guard.
+    assert _extract_trend_values(
+        "memory", [{"metrics": {"precision_at_5": 0.5}}]) == [0.5]
+
+
+async def test_withheld_grade_reason_reaches_the_dashboard_key(db):
+    """`reason` must land in factors, which is where the dashboard reads it.
+
+    insert_subsystem_grade has no `reason` column and
+    dashboard/routes/eval.py reads factors["reason"], so every grader's
+    explanation was silently dropped. This fix makes the withheld path — now
+    the common path for ego — legible instead of blank.
+
+    It calls the production fold (`factors_with_reason`, the named chokepoint
+    run_weekly_aggregation uses) rather than a copy of it, so deleting the fold
+    fails this test instead of leaving it green.
+    """
+    from genesis.eval.j9_aggregator import (
+        _compute_ego_quality,
+        _grade_ego,
+        factors_with_reason,
+    )
+
+    await _seed_window_proposals(db, [("pending", 0.7, False)] * 6)
+    since, until = "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00"
+    metrics, _ = await _compute_ego_quality(db, since, until)
+    info = await _grade_ego(db, since, until, {"ego": metrics})
+
+    assert info["grade"] is None
+    grade_factors = factors_with_reason(info)             # the persist chokepoint
+    assert "judged" in grade_factors["reason"], grade_factors["reason"]
+    # A grader that already carries its own `reason` in factors keeps it.
+    assert factors_with_reason(
+        {"factors": {"reason": "mine"}, "reason": "outer"})["reason"] == "mine"
+    # No reason at all leaves factors untouched (graded path).
+    assert factors_with_reason({"factors": {"a": 1}}) == {"a": 1}
+
+
+async def test_withheld_reason_survives_the_persist_call(db):
+    """The fold must be WIRED, not merely available.
+
+    Asserting the helper alone would stay green if run_weekly_aggregation
+    stopped calling it, so this reads the row the dashboard reads: every
+    withheld grade persisted by a full aggregation must carry its reason in
+    factors_json.
+    """
+    from genesis.db.crud import j9_eval as j9_crud
+    from genesis.eval.j9_aggregator import run_weekly_aggregation
+
+    await run_weekly_aggregation(db)          # empty window -> all withheld
+
+    rows = await j9_crud.get_latest_subsystem_grades(db)
+    assert rows, "aggregation persisted no subsystem grades"
+    withheld = [r for r in rows if r["grade"] is None]
+    assert withheld, [r["subsystem"] for r in rows]
+    for row in withheld:
+        assert row["factors"].get("reason"), row["subsystem"]
+    ego = [r for r in rows if r["subsystem"] == "ego"]
+    assert ego and "judged" in ego[0]["factors"]["reason"], ego
+
+
+async def test_a_failed_execution_still_counts_as_an_approval(db):
+    """`failed` is post-approval, so it belongs in the approval numerator.
+
+    ego_crud.execute_proposal only transitions rows that are already
+    'approved', and mark_proposal_verification_failed only transitions rows
+    that are already 'executed'. So a failed proposal is by definition one the
+    user approved; scoring it as an approval failure conflates execution with
+    approval — the same conflation the rest of this change removes. Its
+    failure is measured separately by execution_success_rate.
+    """
+    from genesis.eval.j9_aggregator import _compute_ego_quality
+
+    await _seed_window_proposals(
+        db,
+        [("approved", 0.8, True), ("executed", 0.8, True),
+         ("failed", 0.8, True), ("rejected", 0.8, True)],
+    )
+    metrics, _ = await _compute_ego_quality(
+        db, "2026-09-01T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+    )
+    # 3 of 4 judged proposals were approved; only the rejection was not.
+    assert metrics["approval_rate"] == 0.75, metrics
+    # The failure is still counted, in the metric that measures execution.
+    assert metrics["execution_success_rate"] == 0.5, metrics
+
+
+async def test_a_quiet_week_is_not_a_definition_break(db):
+    """A week with no proposals must still carry the definition marker.
+
+    The marker is what detect_series_break / latest_definition_segment read.
+    An empty week that omits it looks like a REDEFINITION sitting between two
+    v2 weeks: the trend segment is cut to the single newest point and the
+    dashboard reports `insufficient_data` on a series whose definition never
+    changed. The week WAS computed under v2 rules, so it must say so.
+    """
+    from genesis.dashboard.routes.eval import latest_definition_segment
+    from genesis.eval.j9_aggregator import (
+        _EGO_APPROVAL_RATE_DEFN,
+        _compute_ego_quality,
+    )
+
+    metrics, sample = await _compute_ego_quality(
+        db,
+        "2026-09-01T00:00:00+00:00",
+        "2026-09-08T00:00:00+00:00",
+    )
+    assert sample == 0 and metrics["total_proposals"] == 0, metrics
+    assert metrics.get("approval_rate_defn") == _EGO_APPROVAL_RATE_DEFN, metrics
+
+    # v2 -> quiet week -> v2 is ONE segment: the trend keeps both real points.
+    series = [
+        {"definition": _EGO_APPROVAL_RATE_DEFN, "value": 0.5},
+        {"definition": metrics.get("approval_rate_defn"), "value": None},
+        {"definition": _EGO_APPROVAL_RATE_DEFN, "value": 0.9},
+    ]
+    assert len(latest_definition_segment(series)) == 3, series

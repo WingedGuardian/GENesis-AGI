@@ -188,6 +188,38 @@ class StepDispatcher:
             else CCModel.SONNET
         )
 
+        # Secure-by-default MCP scoping. strict_mcp_config defaults to True, so
+        # --mcp-config is authoritative. CODE steps run in the worktree cwd (where
+        # project-scoped genesis + serena servers would otherwise load); VERIFICATION
+        # runs in background_session_dir. Pin both to the genesis-only "reflection"
+        # profile so strict drops the user-scoped serena/gitnexus/codebase-memory
+        # servers. build_mcp_config loads servers WHOLESALE, so also pass the MCP
+        # portion of the reflection denylist: this DENIES the write/admin genesis
+        # tools (settings_update — which could disable the autonomous approval gate —
+        # ego_directive, campaign_*, module_call, direct_session_run, task_submit,
+        # memory_store, knowledge_ingest, …) while KEEPING genesis READ tools and the
+        # built-ins (Bash/Write/Edit) that code steps need. Built-ins are unaffected by
+        # strict; code edits still flow through the audited Edit/Write PreToolUse hooks.
+        # Mirrors research.py/DirectSession (never mcp_config without a denylist).
+        # Non-code steps get no MCP: strict with no config → zero servers (probe-verified).
+        step_mcp_config: str | None = None
+        step_disallowed: list[str] | None = None
+        if is_code_or_verify:
+            try:
+                from genesis.cc.session_config import SessionConfigBuilder
+
+                _scb = SessionConfigBuilder()
+                step_mcp_config = _scb.build_mcp_config("reflection")
+                step_disallowed = [
+                    t for t in _scb.build_reflection_disallowed() if t.startswith("mcp__")
+                ]
+            except Exception:
+                logger.debug(
+                    "step MCP config build failed; running with no MCP", exc_info=True
+                )
+                step_mcp_config = None
+                step_disallowed = None
+
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (step needs a result)
@@ -195,6 +227,8 @@ class StepDispatcher:
             effort=effort,
             timeout_s=step_type.default_timeout_s,
             skip_permissions=True,
+            mcp_config=step_mcp_config,
+            disallowed_tools=step_disallowed,
             working_dir=working_dir,
         )
 

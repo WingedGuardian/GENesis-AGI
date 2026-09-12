@@ -60,6 +60,160 @@ def _safe_killpg(pgid: int, sig: int) -> None:
 os.killpg = _safe_killpg  # type: ignore[assignment]
 
 
+# ── Redirect pytest's temp tree OFF the watchgod-policed cc-tmp ───────────
+# A CC session's TMPDIR is ``~/.genesis/cc-tmp`` (set by scripts/cc-slot.sh),
+# and pytest's ``tmp_path``/basetemp default under ``$TMPDIR``. Left alone, a
+# broad suite dumps hundreds of MB of ``pytest-of-<user>/`` into that
+# budget-policed dir and trips ``genesis-tmp-watchgod`` (stuck-ORANGE churn).
+# This steers pytest's own basetemp to ``~/tmp`` (``big_tmp_dir``) instead —
+# WITHOUT touching the process ``TMPDIR`` (which would desync CC's
+# TMPDIR/CLAUDE_CODE_TMPDIR). Runs at config time, before any ``tmp_path``
+# fixture resolves. No-op on CI (TMPDIR unset) and when ``--basetemp`` is
+# passed explicitly. See ``genesis.util.tmp.should_redirect_pytest_basetemp``.
+def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
+    """Remove per-PID basetemp dirs left by runs that exited abnormally (SIGKILL/
+    host crash — ``pytest_unconfigure`` never ran). A leaf is stale iff its name
+    is an integer PID that is no longer alive; LIVE PIDs (concurrent runs) are
+    spared, so this never touches another in-flight suite. Best-effort — this is
+    the safety net that makes cleanup survive abnormal exits (``pytest_unconfigure``
+    handles the normal path)."""
+    import shutil
+
+    try:
+        names = os.listdir(pytest_base)
+    except OSError:
+        return
+    for name in names:
+        # isdecimal (NOT isdigit): isdigit is True for superscripts like '²' whose
+        # int() raises ValueError — this loop must never raise out of
+        # pytest_configure (that would break collection for the WHOLE suite,
+        # strictly worse than the leak it prevents).
+        if not name.isdecimal():
+            continue
+        pid = int(name)
+        if pid <= 1:
+            continue  # our leaf is always our own PID (>1); never signal 0/1
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            shutil.rmtree(os.path.join(pytest_base, name), ignore_errors=True)  # dead → reap
+        except (OSError, OverflowError):
+            # alive-but-not-ours (PermissionError), transient, or an out-of-PID-range
+            # name (os.kill(10**30,0) → OverflowError, which is NOT an OSError) → spare.
+            pass
+
+
+def _is_introspection_only(config) -> bool:
+    """Modes that print and exit without running tests (--help/--fixtures/--markers).
+
+    Kept as a predicate rather than inlined so the exemption set is one
+    reviewable list; see the caller for why these must not be blocked.
+
+    ``version`` is deliberately NOT in that list, which is not obvious. MEASURED
+    across two pytest versions, because the project pins only ``pytest>=8.0`` and
+    the behaviour differs between them:
+
+    * ``--version`` — ``Config.main()`` short-circuits it (it matches the literal
+      token at count 1) before the infrastructure starts, so we never run.
+      Same on 9.0.3 and 9.1.1.
+    * ``--version --version`` / ``-VV`` — ``helpconfig.pytest_cmdline_main``
+      returns at ``version > 1``, before ``_do_configure()``. Again never run.
+    * ``-V`` — VERSION-DEPENDENT, and that is the whole reason this note exists.
+      On 9.0.3 neither branch fires (``Config.main`` matches the *string*
+      ``--version``, and ``version == 1`` is not ``> 1``), so it falls through to
+      ``wrap_session`` and runs the WHOLE SUITE. On 9.1.1 pytest answers it early
+      and this hook never loads.
+
+    Removing ``version`` is right under EITHER behaviour: where ``-V`` never
+    reaches us the entry is simply dead, and where it does reach us it is a full
+    unserialized suite that exempting would wave straight past the lock — the
+    opposite of the point. It reads like a harmless entry, which is why the
+    measurement is written down rather than left to the next reader's intuition,
+    and why the test guarding it asserts the safety PROPERTY (``-V`` never runs a
+    session past a held lock) rather than either version's mechanism. An earlier
+    version of that test encoded 9.0.3's behaviour and failed on CI's 9.1.1.
+    """
+    opt = config.option
+    return any(
+        getattr(opt, name, False)
+        for name in ("help", "showfixtures", "show_fixtures_per_test", "markers")
+    )
+
+
+def pytest_configure(config):
+    # ── Box-wide serialization ─────────────────────────────────────────────
+    # Acquire BEFORE anything else, and before the basetemp early-return
+    # below, so every exit path from this function is already governed.
+    #
+    # This is the choke point every run of THIS repo's suite shares, whatever
+    # launched it and from whichever worktree — nothing else sits on the path of
+    # a cron job, a plain SSH shell or a background session. (The gauntlet
+    # scores FOREIGN fixture projects with their own rootdir, so this conftest
+    # never loads for it — it acquires the same lock itself.) Non-blocking and
+    # fail-open by contract, so a fault here can never stop the suite from
+    # running — see genesis.util.pytest_lock.
+    from genesis.util import pytest_lock
+    from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
+
+    lock = pytest_lock.acquire()
+    config._genesis_pytest_lock = lock
+    if lock.blocked and not _is_introspection_only(config):
+        pytest.exit(lock.message, returncode=pytest_lock.EXIT_LOCK_HELD)
+    elif lock.blocked:
+        # Introspection modes run _do_configure() OUTSIDE wrap_session, so an
+        # Exit raised here escapes as a pluggy traceback (MEASURED: --help and
+        # --markers exit 1 with a traceback; --fixtures discards the status and
+        # exits 0, so a blocked call looks like it SUCCEEDED and listed
+        # nothing). They also collect nothing and run no tests, so there is no
+        # resource to govern — let them through.
+        lock.release()
+
+    # Decide FIRST (pure, no I/O) — only touch the filesystem when we actually
+    # redirect, so the no-op / CI / explicit-`--basetemp` path never creates
+    # `~/tmp` (which would break a read-only-home or CI run during config).
+    if not should_redirect_pytest_basetemp(
+        current_basetemp=config.option.basetemp,
+        tmpdir_env=os.environ.get("TMPDIR"),
+        home=os.path.expanduser("~"),
+    ):
+        return
+    # Scope the leaf per-process. pytest CLEARS an explicit basetemp at session
+    # start and roots tmp_path directly under it (no pytest-of-<user> numbered
+    # rotation), so two concurrent runs sharing one path would rmtree each other's
+    # live temp. The box lock now serializes runs that load this conftest, but a
+    # deliberate override (GENESIS_PYTEST_LOCK=0) or a foreign-rootdir run can
+    # still overlap, so the per-pid leaf remains what keeps their temp isolated.
+    pytest_base = os.path.join(big_tmp_dir(), "pytest")
+    # Reap dead-PID leaves from prior abnormal exits BEFORE creating ours, so the
+    # ~/tmp/pytest dir can't accumulate (the daily hygiene job only prunes direct
+    # children of ~/tmp, whose mtime every run refreshes — so it never ages out).
+    _reap_stale_pytest_basetemps(pytest_base)
+    target = os.path.join(pytest_base, str(os.getpid()))
+    Path(target).mkdir(parents=True, exist_ok=True)
+    config.option.basetemp = target
+    config._genesis_basetemp_cleanup = target
+
+
+def pytest_unconfigure(config):
+    """Remove the per-process basetemp tree this session created. pytest wipes an
+    explicit basetemp at session START but never at exit, and each run gets a new
+    PID, so without this the ``~/tmp/pytest/<pid>`` dirs would accumulate (the
+    daily hygiene job only prunes direct children of ``~/tmp``, whose mtime every
+    new run refreshes — so it never ages out). Best-effort."""
+    import shutil
+
+    target = getattr(config, "_genesis_basetemp_cleanup", None)
+    if target:
+        shutil.rmtree(target, ignore_errors=True)
+
+    # Release the box-wide lock LAST, so it spans the whole session including
+    # this cleanup. (flock also drops on process death, so a crash cannot wedge
+    # the box — this is the orderly path, not the only one.)
+    lock = getattr(config, "_genesis_pytest_lock", None)
+    if lock is not None:
+        lock.release()
+
+
 # ── Safety: prevent tests from polluting production circuit breaker state ──
 @pytest.fixture(autouse=True)
 def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
@@ -67,6 +221,179 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     import genesis.routing.circuit_breaker as cb_mod
 
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
+
+
+# ── Safety: prevent tests from writing REAL durable alerts ──────────────────
+@pytest.fixture(autouse=True)
+def _isolate_alert_queue(tmp_path):
+    """Redirect the durable alert-queue root to tmp for ALL tests.
+
+    ``_alert_flap`` / ``_alert_starved`` (watchdog) and the alert-drain init
+    resolve their queue root via ``env.alert_queue_root()``; patching that one
+    resolver keeps any test reaching an alert path from writing a REAL
+    ``~/.genesis/alerts/queue`` entry that the live server drains to the owner's
+    Telegram (this happened — test-sized 'flap-damping' backoff values were
+    delivered as real incidents). Surgical: only the alert-queue root, NOT
+    ``GENESIS_HOME`` globally, so config/state reads are untouched. The HOST
+    guardian queue (``config.state_path``) is a separate path, unaffected.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real queue — mirrors
+    ``_isolate_user_config_dir``.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "genesis.env.alert_queue_root",
+        lambda: tmp_path / "alerts" / "queue",
+    )
+    yield
+    mp.undo()
+
+
+# ── Safety: prevent tests from writing REAL merge-override audit rows ───────
+@pytest.fixture(autouse=True)
+def _isolate_override_log(tmp_path):
+    """Redirect the merge gate's override STORE to tmp for ALL tests.
+
+    Any test that drives ``git_push_guard`` with an override sigil in the command
+    now produces a durable audit row, and the default path is the live log the
+    operator reads. MEASURED before this existed: four rows describing a PR that
+    does not exist — one blocked command retried during development — reached the
+    real store and had to be removed by hand. A store nobody isolated records
+    fiction before it records anything true.
+
+    Repo-wide rather than under ``tests/test_hooks/``: ``tests/test_scripts/``
+    also drives these hooks (some as subprocesses), and a bare local
+    ``git merge x  # merge-to-main-override`` is enough to write a row — no PR,
+    no network. Set on the environment so subprocess-launched hooks inherit it.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real log — mirrors
+    ``_isolate_alert_queue``.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GENESIS_MERGE_OVERRIDE_DIR", str(tmp_path / "merge_overrides"))
+    # The discard guard's recovery store, for the SAME reason and by the same
+    # argument: tests/test_scripts/ drives that hook too, some as subprocesses, and
+    # its live default is ~/.genesis/git_discard_snapshots. Today only
+    # test_git_discard_guard.py sets it locally, so nothing leaks — this is here so
+    # the NEXT test that drives that guard cannot write to the operator's real
+    # recovery store. Isolating one of two sibling stores was the gap.
+    mp.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(tmp_path / "git_discard_snapshots"))
+    # And the SUPERSEDED knob, which is config the operator may still carry. It no
+    # longer steers the store, but setting it now makes the guard print a migration
+    # notice — so leaving it inherited means the suite's stderr depends on the
+    # developer's environment. Same gap as the sibling store above, one level up:
+    # isolating the store but not the config that talks about it.
+    mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
+    yield
+    mp.undo()
+
+
+# ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
+@pytest.fixture(autouse=True)
+def _isolate_genesis_db_path(tmp_path):
+    """Redirect ``env.genesis_db_path()`` to tmp for ALL tests.
+
+    Same class as ``_isolate_alert_queue``: code paths that resolve the DB
+    lazily (e.g. the settings gate-disable critical-observation write via
+    ``get_raw_db(genesis_db_path())``) would otherwise write REAL rows the
+    live server pages to the owner's Telegram when tests run from the main
+    tree (from a worktree they silently mint a stray ``data/genesis.db``
+    instead — measured 2026-08-19). Tests that need a DB construct their own
+    in-memory connection; none legitimately resolve the install DB.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "genesis.env.genesis_db_path",
+        lambda: tmp_path / "isolated-genesis.db",
+    )
+    yield
+    mp.undo()
+
+
+# ── Safety: isolate tests from the install's config overlays ──
+@pytest.fixture(autouse=True)
+def _isolate_user_config_dir(tmp_path):
+    """Neutralize BOTH overlay vectors so tests never read install-local state.
+
+    ``config/*.local.yaml`` overlays are install-local (e.g. a voice-live
+    install arms ``voice_act.local.yaml`` ``mode: live``). Every loader that
+    calls ``merge_local_overlay`` resolves them from two locations, and BOTH
+    leak into tests unpatched — green on CI (no overlays), red or falsely green
+    on a live install:
+
+    1. **User dir** (``~/.genesis/config/*.local.yaml``) — absolute, so it leaks
+       in the main tree AND in a sibling worktree. Patched by redirecting
+       ``_user_config_dir`` to an empty per-test dir.
+    2. **Repo-relative sibling** (``<repo>/config/*.local.yaml``) — gitignored,
+       present only in the main tree, so a worktree test run structurally can't
+       catch it. When a loader is called with a real repo config path (e.g.
+       ``load_ego_config()`` with no args → ``repo_root()/config/ego.yaml``),
+       ``_resolve_overlay_path`` falls back to the real sibling. We wrap the
+       resolver so any overlay that resolves INSIDE the real repo config dir is
+       redirected to the empty dir. tmp-rooted overlays (the overlay tests'
+       own fixtures, and ``test_config_save``-style tests) are never touched.
+
+    ``security/immunity.py`` binds ``_user_config_dir`` at module level (its own
+    reference), so it is patched separately. The guards in
+    tests/test_config_overlay.py keep this list complete and catch any NEW
+    hand-rolled ``.local.yaml`` resolver that bypasses ``merge_local_overlay``.
+    Independent resolvers (routing, recon, mcp settings) hold their own logic
+    and are tracked for consolidation (follow-up); the MCP ``_USER_CONFIG_DIR``
+    constants are excluded as too import-heavy for an every-test fixture — their
+    tests self-isolate.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` rather than the shared ``monkeypatch``
+    fixture: a test that calls ``monkeypatch.undo()`` mid-body (e.g.
+    ``test_learned_knobs``) would otherwise also revert THIS suite-isolation
+    patch — and a subsequent config read in that test would hit the real overlay.
+    An independent instance we undo in teardown is immune to that.
+    """
+    from genesis import _config_overlay
+    from genesis.env import repo_root
+    from genesis.security import immunity
+
+    mp = pytest.MonkeyPatch()
+    user_dir = tmp_path / "user-config-isolated"
+    mp.setattr(_config_overlay, "_user_config_dir", lambda: user_dir)
+    mp.setattr(immunity, "_user_config_dir", lambda: user_dir)
+
+    # Vector 2: neutralize the repo-relative sibling fallback.
+    _orig_resolve = _config_overlay._resolve_overlay_path
+
+    def _sandboxed_resolve(base_path):
+        result = _orig_resolve(base_path)
+        try:
+            resolved = result.resolve()
+        except OSError:  # pragma: no cover - defensive (symlink loops)
+            return result
+        # Resolve the real config dir LAZILY (repo_root() reads GENESIS_REPO_ROOT
+        # per call), so a test that re-points GENESIS_REPO_ROOT after fixture
+        # setup is still honored — and the deterministic regression test can aim
+        # a synthetic overlay at it.
+        real_config_dir = (repo_root() / "config").resolve()
+        if resolved.is_relative_to(real_config_dir):
+            # A real install-local overlay — redirect to the guaranteed-absent
+            # isolated dir so the loader falls through to shipped defaults.
+            return user_dir / result.name
+        return result
+
+    mp.setattr(_config_overlay, "_resolve_overlay_path", _sandboxed_resolve)
+    # immunity.py binds `_resolve_overlay_path` at MODULE level (a by-name
+    # import), so its own reference must be patched too — patching only
+    # _config_overlay's attribute does not reach it (record_demotion() would
+    # otherwise still fall back to the real config/ws3_immunity.local.yaml
+    # sibling). Lazy importers (memory/graph_expansion, ledger/learned_knobs)
+    # re-resolve against the patched _config_overlay each call, so they need no
+    # separate patch. The guard test tracks module-level importers of both names.
+    mp.setattr(immunity, "_resolve_overlay_path", _sandboxed_resolve)
+    try:
+        yield
+    finally:
+        mp.undo()
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +480,42 @@ def _guard_db_crud_not_mocked():
             "or `with patch(...)` so the patch is restored, or set the mock on a "
             "local mock object — never assign to the real module attribute."
         )
+
+
+def require_access_denied(path) -> None:
+    """Skip unless THIS process is actually stopped by ``path``'s mode bits.
+
+    Probes the path that was chmod'd, not some writable neighbour of it — a
+    probe aimed at the wrong path reports "denied" from a directory nobody
+    restricted, which skips every run and pins nothing. Directories are probed
+    by listing, files by opening, because those are the operations the callers
+    rely on being refused.
+
+    Any test that chmods a directory or file and then asserts on the failure is
+    resting on a premise the environment can void: root and anything holding
+    CAP_DAC_OVERRIDE write straight through mode bits, and CI containers
+    routinely run as root. There the operation SUCCEEDS, and the test either
+    fails for an unrelated reason or — worse — passes vacuously, having
+    asserted that nothing went wrong in a run where nothing was ever blocked.
+
+    Shared rather than repeated: the same premise underpins several chmod-based
+    tests across the suite, and a lesson applied only where it was learned
+    leaves the rest of the population exactly as it was.
+
+    Restores nothing and mutates nothing — call it AFTER chmod, before the
+    assertions, and let the caller's own ``finally`` restore the mode.
+    """
+    import pathlib
+
+    p = pathlib.Path(path)
+    try:
+        if p.is_dir():
+            list(p.iterdir())
+        else:
+            p.open("rb").close()
+    except OSError:
+        return  # genuinely denied — the premise holds
+    pytest.skip(f"this process reads through mode bits on {p} (root / CAP_DAC_OVERRIDE)")
 
 
 @pytest.fixture

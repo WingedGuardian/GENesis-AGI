@@ -26,6 +26,14 @@ async def db():
     await conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _no_boot_settle_delay(monkeypatch):
+    """Disable the data-migration boot-settle delay by default so tests that call
+    run_data_migrations() don't wait the real 120s. The delay's own tests override
+    this and patch asyncio.sleep."""
+    monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", "0")
+
+
 async def test_migration_0060_idempotent_after_create_all_tables():
     """The REAL boot path: init_db runs create_all_tables (which creates
     data_migrations from _tables.py) BEFORE the migration runner. Migration
@@ -122,7 +130,14 @@ def _patch_migrations(monkeypatch, mods: dict):
     """Wire discovery + import to a dict of {stem: fake module}."""
     from pathlib import Path
 
-    available = [(stem[:5], stem, Path(f"/fake/{stem}.py")) for stem in mods]
+    # Derive the id with the RUNNER's pattern rather than a fixed slice:
+    # `stem[:5]` silently yields "d2026" for a timestamp-shaped fake, so a
+    # future timestamp fixture would test a nonsense id and still pass.
+    available = []
+    for stem in mods:
+        m = runner_mod._DATA_MIGRATION_PATTERN.match(f"{stem}.py")
+        assert m, f"fake migration stem {stem!r} does not match the runner pattern"
+        available.append((m.group(1), stem, Path(f"/fake/{stem}.py")))
     monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: available)
     monkeypatch.setattr(
         runner_mod.importlib, "import_module", lambda name: mods[name.rsplit(".", 1)[-1]]
@@ -218,6 +233,140 @@ async def test_runner_rejects_duplicate_prefix(db, monkeypatch):
         await DataMigrationRunner(db).run_pending()
     # run_data_migrations swallows it (never aborts boot) but logs.
     assert await runner_mod.run_data_migrations(db) == []
+
+
+def test_no_duplicate_migration_prefixes_in_tree():
+    """Static guard: the REAL migration directories carry no duplicate prefixes.
+
+    Two concurrently-merged PRs each took `d0009` (2026-08-01: #1274 + #1276) —
+    the runner's runtime guard then made run_data_migrations a boot-time no-op
+    on EVERY install (error swallowed, all data migrations skipped) until one
+    was renamed. The runtime guard fires at deploy time on every install; this
+    test fires at CI time on the offending PR's merge ref, where the collision
+    is cheap to fix.
+    """
+    from collections import Counter
+
+    from genesis.db._migration_discovery import discover_numbered_modules
+    from genesis.db._migration_ids import DATA, SCHEMA
+
+    # The NAMESPACE, not a pattern: discovery resolves the pattern from the
+    # contract itself, so this test cannot bind to a regex that disagrees with
+    # the directory it is scanning. (A copied regex here silently stopped
+    # covering timestamp-id migrations the moment the runner's pattern widened.)
+    surfaces = [
+        (runner_mod._DATA_MIGRATIONS_DIR, DATA, "data migration"),
+        (runner_mod._DATA_MIGRATIONS_DIR.parent / "migrations", SCHEMA, "schema migration"),
+    ]
+    for directory, namespace, label in surfaces:
+        ids = [mid for mid, _, _ in discover_numbered_modules(directory, namespace)]
+        dupes = {mid: n for mid, n in Counter(ids).items() if n > 1}
+        assert not dupes, (
+            f"duplicate {label} prefix(es) {dupes} in {directory} — "
+            "rename the newer file to a fresh UTC timestamp id "
+            "(`date -u +%Y%m%d%H%M%S`; data migrations prefix a 'd')"
+        )
+
+
+async def test_runner_dependency_unavailable_warns_not_errors(db, monkeypatch, caplog):
+    # A cold-boot transient (embedder/Qdrant not warm) raises the sentinel: the
+    # runner defers it (marked failed -> replays next boot) and logs at WARNING
+    # with NO traceback — not the scary ERROR+traceback reserved for real bugs.
+    import logging
+
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    def cold():
+        raise MigrationDependencyUnavailable("embedder unavailable after 3 attempts")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(cold, lambda: True)})
+    with caplog.at_level(logging.DEBUG, logger="genesis.db.data_migrations.runner"):
+        outcomes = await DataMigrationRunner(db).run_pending()
+
+    assert outcomes[0]["success"] is False
+    assert outcomes[0].get("deferred") is True
+    assert await crud.get_status(db, "d0001") == "failed"  # retryable -> replays next boot
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.WARNING and "deferred" in r.getMessage() for r in recs)
+    assert not any(r.levelno >= logging.ERROR for r in recs)  # no ERROR
+    assert not any(r.exc_info for r in recs)  # no traceback attached
+
+
+async def test_runner_verify_dependency_unavailable_warns_not_errors(db, monkeypatch, caplog):
+    # End-to-end (Codex #1296 P2): migrate() succeeds but verify() raises the
+    # sentinel (embedder went cold in between) → runner WARN-and-defers rather than
+    # taking the verify-failed ERROR path, so no spurious boot ERROR.
+    import logging
+
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    def verify():
+        raise MigrationDependencyUnavailable("cold during verify")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(lambda: {"ok": 1}, verify)})
+    with caplog.at_level(logging.DEBUG, logger="genesis.db.data_migrations.runner"):
+        outcomes = await DataMigrationRunner(db).run_pending()
+
+    assert outcomes[0].get("deferred") is True
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.WARNING and "deferred" in r.getMessage() for r in recs)
+    assert not any(r.levelno >= logging.ERROR for r in recs)  # no verify-failed ERROR
+    assert await crud.get_status(db, "d0001") == "failed"  # idempotent replay next boot
+
+
+async def test_runner_genuine_exception_still_logs_error_with_traceback(db, monkeypatch, caplog):
+    # A NON-sentinel exception (a real migration bug) must still hit ERROR+traceback —
+    # the WARN demotion is scoped to the dependency-unavailable sentinel only.
+    import logging
+
+    def boom():
+        raise RuntimeError("a real migration bug")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(boom, lambda: True)})
+    with caplog.at_level(logging.WARNING, logger="genesis.db.data_migrations.runner"):
+        await DataMigrationRunner(db).run_pending()
+
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.ERROR and r.exc_info for r in recs)
+    assert await crud.get_status(db, "d0001") == "failed"
+
+
+async def test_run_data_migrations_waits_boot_settle_delay(db, monkeypatch):
+    # The entry point sleeps the configured boot-settle delay before running.
+    slept = {"secs": None}
+
+    async def fake_sleep(secs):
+        slept["secs"] = secs
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", "7")  # overrides autouse 0
+    monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: [])
+    await runner_mod.run_data_migrations(db)
+    assert slept["secs"] == 7.0
+
+
+def test_boot_delay_rejects_non_finite_and_garbage(monkeypatch):
+    # inf would make asyncio.sleep(inf) hang migrations forever; nan / garbage are
+    # also nonsense — all fall back to the default rather than a hang or crash.
+    for bad in ("inf", "-inf", "nan", "not-a-number", ""):
+        monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", bad)
+        assert runner_mod._boot_settle_delay_s() == runner_mod._DEFAULT_BOOT_SETTLE_DELAY_S
+    # A negative finite value clamps to 0 (disabled), not the default.
+    monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", "-5")
+    assert runner_mod._boot_settle_delay_s() == 0.0
+
+
+async def test_run_data_migrations_no_delay_when_zero(db, monkeypatch):
+    slept = {"called": False}
+
+    async def fake_sleep(secs):
+        slept["called"] = True
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", fake_sleep)
+    # autouse fixture already set the env to "0"
+    monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: [])
+    await runner_mod.run_data_migrations(db)
+    assert slept["called"] is False
 
 
 async def test_runner_redispatches_orphaned_running(db, monkeypatch):

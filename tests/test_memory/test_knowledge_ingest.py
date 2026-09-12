@@ -76,6 +76,57 @@ async def test_ingest_unit_scan_failure_is_fail_open():
     assert unit_id == "unit-1"
 
 
+# ─── Deferred stale-point cleanup (vector store down) ───────────────────────
+
+
+async def _run_replace(delete_result):
+    """Upsert-replace an existing unit (old point qid-old → new point qid-new)
+    with store.delete returning *delete_result*; return (unit_id, store)."""
+    store = _mock_store()
+    store.store = AsyncMock(return_value="qid-new")
+    store.delete = AsyncMock(return_value=delete_result)
+    with patch(
+        "genesis.memory.knowledge_ingest.knowledge_crud.find_by_unique_key",
+        new_callable=AsyncMock, return_value={"id": "unit-1", "qdrant_id": "qid-old"},
+    ), patch(
+        "genesis.memory.knowledge_ingest.knowledge_crud.upsert",
+        new_callable=AsyncMock, return_value=("unit-1", False),
+    ):
+        unit_id = await ingest_knowledge_unit(
+            store=store,
+            db=MagicMock(),
+            content="replacement body",
+            project="proj",
+            domain="dom",
+        )
+    return unit_id, store
+
+
+async def test_replace_with_deferred_delete_logs_stale_pair(caplog):
+    """Upsert-replace while the vector store is down: store.delete() DEFERS
+    (touches nothing), leaving the replaced memory fully alive alongside its
+    successor. Nothing retries that delete, so the helper must log the stale
+    pair LOUDLY — while the ingest itself still completes."""
+    with caplog.at_level(logging.ERROR):
+        unit_id, store = await _run_replace(
+            {"deferred": True, "metadata": False, "fts5": False}
+        )
+
+    assert unit_id == "unit-1"  # ingest completed
+    store.delete.assert_awaited_once_with("qid-old")
+    assert any("Stale-point cleanup deferred" in r.message for r in caplog.records)
+
+
+async def test_replace_with_clean_delete_no_stale_log(caplog):
+    """A successful replacement delete (no 'deferred' key) logs nothing."""
+    with caplog.at_level(logging.ERROR):
+        unit_id, store = await _run_replace({"metadata": 1, "fts5": 1})
+
+    assert unit_id == "unit-1"
+    store.delete.assert_awaited_once_with("qid-old")
+    assert not any("Stale-point cleanup deferred" in r.message for r in caplog.records)
+
+
 # ─── WS-3 origin_class: one derivation, both stores ─────────────────────────
 
 

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import partition_informational
+from genesis.ego.verification import parse_expected_outputs
 from genesis.util.approval_words import (
     APPROVE_PHRASES as _SHARED_BARE_APPROVE,
 )
@@ -53,6 +54,42 @@ def _serialize_expected_outputs(raw: dict | str | None) -> str | None:
     if isinstance(raw, str):
         return raw  # already serialized
     return None
+
+
+def ensure_deliverable_spec(
+    raw: dict | str | None,
+    *,
+    proposal_id: str,
+    action_type: str,
+    ego_source: str | None,
+) -> str | None:
+    """Serialize expected_outputs, injecting the deliverable floor when needed.
+
+    A genesis-ego dispatch/investigate proposal must carry a VERIFIABLE
+    deliverable so post-dispatch verification always applies. Injects a default
+    (``~/.genesis/output/ego-reports/<id>.md``) when there is no USABLE spec —
+    keyed on ``parse_expected_outputs(...) is None`` so an ego-supplied ``{}``
+    (serializes non-None, parses as absent) is caught, not just an absent field.
+    Shared by both proposal writers (``create_batch`` and the reconcile revise
+    path) so a live-revise cannot strip a valid spec down to an unverifiable one.
+    """
+    serialized = _serialize_expected_outputs(raw)
+    if (
+        ego_source == "genesis_ego_cycle"
+        and action_type in ("dispatch", "investigate")
+        and parse_expected_outputs(serialized) is None
+    ):
+        serialized = json.dumps(
+            {
+                "files": [f"~/.genesis/output/ego-reports/{proposal_id}.md"],
+                "min_size_bytes": 500,
+            }
+        )
+        logger.info(
+            "Proposal %s: injected default expected_outputs (deliverable floor)",
+            proposal_id,
+        )
+    return serialized
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +188,16 @@ def _format_digest(
         # Confidence badge
         confidence = p.get("confidence", 0.0)
         lines.append(f"\n[{confidence:.2f} confidence]")
+
+        # PR-6a: revision + revalidation surfacing. Dark until reconcile
+        # revise/reaffirm ships — revision_num stays 1 and last_validated_at
+        # equals created_at today, so neither line renders yet.
+        revision = p.get("revision_num", 1)
+        if revision and revision > 1:
+            lines.append(f"[rev {revision}]")
+        last_validated = p.get("last_validated_at")
+        if last_validated and last_validated != p.get("created_at"):
+            lines.append(f"<i>verified as of {_ESC(str(last_validated)[:16])}</i>")
 
         # WS-2 P4 arbitration annotations (annotate-only; never suppresses).
         badge = p.get("_calibration_badge")
@@ -312,6 +359,27 @@ class ProposalWorkflow:
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
 
+        # Revalidation cadence (PR-6a): stamp revalidate_at per urgency so the
+        # reconcile stage can flag proposals whose premises are due for a
+        # re-check. NEVER a kill path — overdue only queues verification
+        # (locked decision #2). Config-derived; degrades to EgoConfig defaults.
+        from genesis.ego.config import load_ego_config, next_revalidate_at
+
+        _created_dt = datetime.fromisoformat(created_at)
+
+        # Self-development flag (roadmap gate), read once per batch. On a config
+        # read failure, fail toward LESS autonomy (treat as disabled → develop
+        # proposals get tabled, never auto-shipped).
+        try:
+            _self_dev_enabled = load_ego_config().genesis_self_development_enabled
+        except Exception:
+            logger.warning(
+                "self-development flag read failed — treating as disabled",
+                exc_info=True,
+            )
+            _self_dev_enabled = False
+        _is_genesis = ego_source == "genesis_ego_cycle"
+
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
         # hallucinated goal_ids from persisting).
         valid_goal_ids: set[str] | None = None
@@ -366,14 +434,44 @@ class ProposalWorkflow:
             proposal_content = p.get("content", "")
             hash_val = _content_hash(proposal_content) if proposal_content else None
 
+            # Scope chokepoint (genesis-ego only). The realist stamps
+            # _realist_scope on every genesis-ego draft; enforce it structurally
+            # here — the single create-time gate no phrasing or future writer
+            # can bypass:
+            #   - unstamped (realist errored / omitted / invalid) → DROP,
+            #     fail-closed. The ego re-derives next cycle (blind-drafting
+            #     re-proposes anything real), so nothing is permanently lost and
+            #     nothing UNJUDGED ever reaches the board.
+            #   - develop + self-development disabled → created-then-TABLED
+            #     below (recoverable record, never digested/dispatched).
+            #   - develop + enabled, or operate → created normally, scope persisted.
+            _scope = p.get("_realist_scope") if _is_genesis else None
+            if _is_genesis and _scope not in ("operate", "develop"):
+                logger.warning(
+                    "Genesis-ego proposal DROPPED — scope unjudged (realist "
+                    "unavailable or contract violation); re-derived next cycle: %s",
+                    proposal_content[:80],
+                )
+                continue
+            _will_table = _is_genesis and _scope == "develop" and not _self_dev_enabled
+
             # Dedup: skip if identical content already pending/approved.
             # Skip check for empty content to avoid false collisions on
             # the fixed SHA-256 of the empty string.
+            # Develop drafts that will be tabled also dedup against TABLED rows,
+            # else a persistent dev idea would be re-created + re-tabled every
+            # cycle.
             if hash_val:
+                _dedup_statuses = (
+                    ("pending", "approved", "tabled")
+                    if _will_table
+                    else ("pending", "approved")
+                )
                 try:
                     if await ego_crud.has_pending_proposal_with_hash(
                         self._db,
                         hash_val,
+                        statuses=_dedup_statuses,
                     ):
                         logger.info(
                             "Proposal dedup: skipping exact duplicate (hash=%s)",
@@ -382,6 +480,19 @@ class ProposalWorkflow:
                         continue
                 except Exception:
                     logger.warning("Proposal dedup check failed, proceeding", exc_info=True)
+
+            _revalidate_at = next_revalidate_at(
+                p.get("urgency", "normal"), from_dt=_created_dt,
+            )
+
+            # Deliverable floor (genesis/operations ego only) — shared with the
+            # reconcile revise path so both proposal writers enforce it.
+            _eo_serialized = ensure_deliverable_spec(
+                p.get("expected_outputs"),
+                proposal_id=pid,
+                action_type=p.get("action_type", "unknown"),
+                ego_source=ego_source,
+            )
 
             await ego_crud.create_proposal(
                 self._db,
@@ -407,10 +518,17 @@ class ProposalWorkflow:
                 content_hash=hash_val,
                 content_size=_content_size(proposal_content),
                 original_content=p.get("_original_content"),
-                expected_outputs=_serialize_expected_outputs(
-                    p.get("expected_outputs"),
-                ),
+                expected_outputs=_eo_serialized,
+                revalidate_at=_revalidate_at,
+                last_validated_at=created_at,
+                scope=_scope,
+                scope_revision=1 if _scope else None,
             )
+            # Signal the tabling loop in _process_proposals (session.py): a
+            # develop proposal created while self-development is disabled is
+            # tabled right after creation — recoverable, never digested.
+            if _will_table:
+                p["_table_after_create"] = True
             ids.append(pid)
             created_proposals.append(p)
 
@@ -526,6 +644,17 @@ class ProposalWorkflow:
                     pass  # Malformed timestamp — proceed with delivery
 
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
+        # Digest ships only still-pending rows: proposals tabled between
+        # creation and delivery (develop-scope gate, queue cap) are recoverable
+        # records on the tabled lane, not approval requests.
+        _non_pending = sum(1 for p in proposals if p.get("status") != "pending")
+        if _non_pending:
+            logger.info(
+                "Digest for batch %s excludes %d non-pending proposal(s)",
+                batch_id,
+                _non_pending,
+            )
+            proposals = [p for p in proposals if p.get("status") == "pending"]
         if not proposals:
             logger.warning("No proposals found for batch %s", batch_id)
             return None
@@ -599,6 +728,38 @@ class ProposalWorkflow:
             value=delivery_id,
         )
 
+        # PR-6a resolve-side guard: snapshot the revision each proposal was
+        # RENDERED at, so a reply resolving this digest pins the revision the
+        # user actually saw. A concurrent revise (PR-6b) bumps revision_num;
+        # resolve_proposals passes this as expected_revision so a stale resolve
+        # refuses instead of clobbering the newer version. Keyed by DELIVERY id
+        # (each digest message pins its own snapshot — re-delivering a batch
+        # after a revise must not retarget replies to the older digest onto the
+        # newer snapshot). The batch-keyed copy is the fallback for resolves
+        # with no delivery context (bare "approve all" / bulk paths, which act
+        # on the LATEST digest by construction) and for digests sent before
+        # delivery-keying shipped. Written only after a successful delivery.
+        # Every row is revision_num=1 until PR-6b introduces revise, so today
+        # this is a no-op match.
+        try:
+            snapshot_json = json.dumps(
+                {p["id"]: p.get("revision_num", 1) for p in proposals}
+            )
+            await ego_crud.set_state(
+                self._db,
+                key=f"revision_snapshot:{delivery_id}",
+                value=snapshot_json,
+            )
+            await ego_crud.set_state(
+                self._db,
+                key=f"revision_snapshot:{batch_id}",
+                value=snapshot_json,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to write revision snapshot for %s", batch_id, exc_info=True
+            )
+
         # GROUNDWORK(digest-rate-limit): record delivery timestamp for
         # rate limiting. Written even when gate is disabled so the
         # timestamp is ready when the gate is flipped on.
@@ -628,10 +789,15 @@ class ProposalWorkflow:
         self,
         batch_id: str,
         decisions: dict[int, tuple[str, str | None]],
+        *,
+        delivery_id: str | None = None,
     ) -> dict[str, str]:
         """Apply parsed decisions to proposals in the batch.
 
         ``decisions`` maps 1-based index → (status, optional reason).
+        ``delivery_id`` identifies the digest message the user replied to,
+        when known — it selects the revision snapshot for THAT digest so a
+        reply to an older delivery cannot resolve against a newer snapshot.
         Returns ``{proposal_id: final_status}``.
 
         On rejection with a reason, automatically stores a correction
@@ -639,6 +805,31 @@ class ProposalWorkflow:
         """
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
         results: dict[str, str] = {}
+
+        # PR-6a resolve-side guard: pin each resolve to the revision the user saw
+        # in the digest (snapshotted at send_digest). The delivery-keyed snapshot
+        # is authoritative (per-digest); the batch-keyed one is the fallback for
+        # resolves with no delivery context and for digests sent before
+        # delivery-keying shipped. Missing snapshot → None → unguarded (behaves
+        # as today); NEVER default to 1, or pre-existing digests and bulk
+        # "approve all pending" would refuse legitimate resolves.
+        rev_snapshot: dict[str, int] = {}
+        try:
+            snap_raw = None
+            if delivery_id:
+                snap_raw = await ego_crud.get_state(
+                    self._db, f"revision_snapshot:{delivery_id}"
+                )
+            if not snap_raw:
+                snap_raw = await ego_crud.get_state(
+                    self._db, f"revision_snapshot:{batch_id}"
+                )
+            if snap_raw:
+                rev_snapshot = json.loads(snap_raw)
+        except Exception:
+            logger.debug(
+                "Failed to load revision snapshot for %s", batch_id, exc_info=True
+            )
 
         for idx, (status, reason) in decisions.items():
             if idx < 1 or idx > len(proposals):
@@ -649,6 +840,7 @@ class ProposalWorkflow:
                 prop["id"],
                 status=status,
                 user_response=reason,
+                expected_revision=rev_snapshot.get(prop["id"]),
             )
             if updated:
                 results[prop["id"]] = status

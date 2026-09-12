@@ -31,11 +31,15 @@ Fetch all sources simultaneously. Never serialize independent lookups.
 When a source is inaccessible, exhaust all autonomous options before involving
 the user:
 
-1. Try the primary tool (WebFetch, scrape, direct access)
-2. Try alternative tools in the toolkit (Firecrawl, other MCP tools)
+1. Try the primary tool (`web_fetch` MCP — its auto chain already escalates
+   TinyFish → Scrapling → Ladder → Crawl4AI → httpx)
+2. Try alternative backends: `web_fetch(url, backend="firecrawl")` (paid
+   escalation — cloud scraping API, reachable from Bash-less background
+   sessions; NOT in the auto chain because it burns credits), or in
+   foreground sessions the `firecrawl` CLI (a Bash plugin, not an MCP server)
 3. Route to a different model/service that CAN access the content type:
    - YouTube video → Gemini API (**MUST use file_data approach** — see below)
-   - Paywalled article → Firecrawl (JS rendering, paywall bypass)
+   - Paywalled article → Firecrawl backend (JS rendering, paywall bypass)
    - Authenticated service → check for specialized MCP tools
 4. Try creative workarounds (transcript APIs, metadata services, cached versions)
 5. Only then ask the user — with specific options, not "what was it about?"

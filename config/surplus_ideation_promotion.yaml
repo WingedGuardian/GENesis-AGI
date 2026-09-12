@@ -1,0 +1,15 @@
+# Surplus ideation → follow_ups 'idea' review-lane promotion pass (WS-M PR-2).
+#
+# After PR-2's intake split, brainstorm ideas are staged in surplus_insights; a
+# capped, FIFO promotion pass in the surplus maintenance GC graduates the pending
+# ones into the follow_ups 'idea' review lane (browse/triage in the cockpit).
+#
+# enabled     — master switch. false (or env GENESIS_SURPLUS_IDEATION_PROMOTION_DISABLED=1)
+#               stops promotion; staged ideas then just TTL-decay (pre-PR-2 behaviour).
+# cap_per_run — max ideas promoted per GC pass (protects the lane; overflow waits
+#               for the next pass or decays).
+#
+# Read live each GC pass — takes effect without a restart. Overlay in
+# surplus_ideation_promotion.local.yaml to customize per install.
+enabled: true
+cap_per_run: 20

@@ -21,6 +21,7 @@ rewriting here.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 
 import aiosqlite
@@ -32,6 +33,12 @@ MECHANICAL_TYPES = frozenset({"code_file", "code_symbol", "pr", "commit"})
 
 # Named types that may share identity across type labels (the LLM may
 # call OMI a "product" in one extraction and a "device" in another).
+# NOTE (MW-3): host/install/project are deliberately NOT in this cluster. Blind
+# cross-type folding by NAME cannot tell "the concept being typed" from a
+# coincidental same-name collision (a machine, an install, and a codebase all
+# named "genesis" are distinct things). The concept→typed transition is designed
+# as an EVIDENCE-BASED step in MW-3 PR-3/PR-4 (the adjudicator/backfill decides
+# same-vs-coincidental from mention evidence), not a name-fold here.
 _CONCEPT_CLUSTER = frozenset({"product", "device", "concept", "subsystem", "repo"})
 
 FUZZY_THRESHOLD = 0.85
@@ -97,7 +104,13 @@ async def resolve_entity(
         else [entity_type]
     )
     candidates = await entities_crud.list_norm_names(db, entity_types=cluster)
-    near = _closest(norm_name, candidates)
+    # _closest runs synchronous O(n*m) difflib fuzzy-matching over every
+    # same-cluster candidate. As the entity registry grew past the "small enough
+    # to scan in-process" assumption this blocked the event loop ~1s+ (measured
+    # via the loop-stall sampler, PR #1398). Offload to a thread so the loop keeps
+    # scheduling — _closest is a pure function over an already-materialized list,
+    # so it is safe to run off-loop.
+    near = await asyncio.to_thread(_closest, norm_name, candidates)
     entity_id = await entities_crud.create_entity(
         db, name=name, norm_name=norm_name, entity_type=entity_type,
         source=source, _commit=False,

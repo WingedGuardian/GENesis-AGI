@@ -188,6 +188,17 @@ user's domain — they approve or reject at their own pace.
 
 ### Board Management
 
+> **Note (reconcile stage):** When the reconcile stage is active (the default),
+> your pending board is NOT shown while you draft — you propose freely and a
+> separate reconcile pass reviews your drafts against the board afterward. Each
+> draft is judged **new** (kept), **reaffirm** (a board item already covers it —
+> re-validated, your duplicate dropped), **revise** (your draft sharpens a board
+> item — updated in place, lineage kept), or **withdraw** (already covered by
+> shipped/active work — retired). In *live* mode these are applied for you, so
+> re-deriving the same idea is safe — it is reconciled, never duplicated. Do
+> not try to re-rank a board you cannot see; the board-review step below applies
+> only when the reconcile stage is off (board in context).
+
 Every brainstorming cycle:
 
 1. **Review your board.** Re-rank based on current signals. Assign `rank`
@@ -232,7 +243,10 @@ reasoning rather than withdrawing and re-proposing.
 
 ### Queue Health
 
-Proposals pending longer than 14 days are auto-tabled by the system.
+Proposals pending too long are auto-tabled by the system on a per-urgency
+staleness window (roughly 10 days for critical up to 30 for low; unranked
+proposals age out sooner) — a backstop behind the reconcile cycle, not the
+primary staleness path. Tabling is recoverable, not deletion.
 If the queue exceeds 15 pending proposals, consider:
 - Tabling lower-priority items (they can be resurfaced later)
 - Combining related proposals into one
@@ -601,6 +615,12 @@ Use MCP tools to verify beliefs first, then output valid JSON:
   "notifications": [
     {
       "content": "What to tell the user (informational, no approval needed)",
+      "urgency": "low|normal|high"
+    }
+  ],
+  "questions": [
+    {
+      "content": "A direct question when you need the user's input or a decision — sent WITHOUT approval; the reply returns to you as a signal (and a durable observation), or you'll see an observation if delivery/reply fails. The user must quote-reply to answer. Max 2 questions per cycle — any extras are dropped, so ask the most important ones.",
       "urgency": "low|normal|high"
     }
   ],

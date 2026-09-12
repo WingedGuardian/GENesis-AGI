@@ -10,7 +10,7 @@ enforces this restriction, not our code.
 
 Gateway allowlist: restart-timer, pause, resume, status, reset-state, version,
 update, sync-gateway, redeploy, update-cc, update-node, test-approval,
-disk-status, host-profile, reharden-key, ping, provision-status,
+disk-status, host-profile, cc-tmp-apply, reharden-key, ping, provision-status,
 provision-grow-disk, provision-grow-memory, provision-vzdump,
 provision-vzdump-status, storage-expand, grow-root,
 set-container-limits.

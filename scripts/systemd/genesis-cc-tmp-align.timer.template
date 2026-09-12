@@ -1,0 +1,18 @@
+[Unit]
+Description=Genesis cc-tmp isolation — periodic opportunistic apply
+
+[Timer]
+# An early post-boot attempt (covers a cold-start run that found the host not yet
+# reachable), then ~every 2h. Each fire is a cheap probe: the host-side apply
+# no-ops unless CC is quiet, so a busy install just keeps trying cheaply until a
+# lull while a quiet install converges on the first fire. The 2h cadence honors
+# the project's 7200s timeout floor as a polling interval. Persistent catches a
+# missed run after downtime; RandomizedDelaySec de-correlates from other timers.
+OnBootSec=15min
+OnUnitInactiveSec=7200
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

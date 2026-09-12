@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -14,6 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.env import user_timezone
 from genesis.observability.events import GenesisEventBus
+from genesis.observability.failure_details import error_summary, failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus import dispatch as dispatch_engine
 from genesis.surplus.brainstorm import BrainstormRunner
@@ -34,10 +34,35 @@ from genesis.surplus.types import SurplusExecutor, TaskType
 
 if TYPE_CHECKING:
     from genesis.memory.store import MemoryStore
+    from genesis.recon.account_activity import AccountActivityMonitor
     from genesis.recon.gatherer import ReconGatherer
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+
+def _pump_surplus_heartbeat(where: str) -> None:
+    """Refresh the surplus job-health heartbeat; LOG (never swallow) on failure.
+
+    The 900s zombie-scheduler watchdog reads ``job_health['surplus_dispatch'].last_run``
+    (via status.json). This is the ONLY producer of that timestamp. A silently-failing
+    ``record_job_success`` would starve the watchdog while the loop runs fine — a
+    candidate cause of the 2026-09-01 no-task-running restarts. Logging the failure
+    makes that (previously invisible) mode diagnosable.
+    """
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        GenesisRuntime.instance().record_job_success("surplus_dispatch")
+    except Exception as exc:
+        # No exc_info: record_job_success does a DB persist, so a sustained outage
+        # would emit up to ~4 tracebacks/loop. The exception repr names the cause
+        # (e.g. 'database is locked') without flooding the log during that incident.
+        logger.warning(
+            "surplus heartbeat write failed (%s): %r — the 900s zombie watchdog may see a false stall",
+            where,
+            exc,
+        )
 
 
 def _restart_safe_hourly(hours: int, *, minute: int = 0):
@@ -95,7 +120,10 @@ class SurplusScheduler:
         self._compute = compute_availability
         self._executor = executor or StubExecutor()
         self._brainstorm_runner = brainstorm_runner or BrainstormRunner(
-            db, queue, executor=self._executor, clock=clock,
+            db,
+            queue,
+            executor=self._executor,
+            clock=clock,
         )
         self._dispatch_interval = dispatch_interval_minutes
         self._brainstorm_interval = brainstorm_check_hours
@@ -114,6 +142,8 @@ class SurplusScheduler:
         # self._executor for any type without a registered entry.
         self._executors: dict[TaskType, SurplusExecutor] = {}
         self._recon_gatherer: ReconGatherer | None = None
+        self._account_activity_monitor: AccountActivityMonitor | None = None
+        self._career_outreach_monitor = None  # Set via set_career_outreach_monitor()
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
         self._skill_security_scan_job = None  # Set via set_skill_security_scan_job()
@@ -169,6 +199,7 @@ class SurplusScheduler:
         # Late-registration: if scheduler already started, add the job now
         if self._scheduler.running and not self._scheduler.get_job("schedule_fresh_session_test"):
             from apscheduler.triggers.cron import CronTrigger
+
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
                 CronTrigger(day_of_week="sat", hour=9, timezone=user_timezone()),
@@ -202,6 +233,14 @@ class SurplusScheduler:
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
         self._recon_gatherer = gatherer
+
+    def set_account_activity_monitor(self, monitor: AccountActivityMonitor) -> None:
+        """Set the GitHub account-activity monitor (2h external-activity poll)."""
+        self._account_activity_monitor = monitor
+
+    def set_career_outreach_monitor(self, monitor) -> None:
+        """Set the career-outreach monitor (daily draft-staging driver + nudge)."""
+        self._career_outreach_monitor = monitor
 
     def set_model_intelligence_job(self, job) -> None:
         """Set the ModelIntelligenceJob for scheduled model landscape scanning."""
@@ -262,6 +301,7 @@ class SurplusScheduler:
         # restart.  Config param brainstorm_check_hours is unused since this
         # conversion; the fixed schedule replaces the interval cadence.
         from apscheduler.triggers.cron import CronTrigger
+
         self._scheduler.add_job(
             self.brainstorm_check,
             CronTrigger(hour="1,13", minute=0, timezone=user_timezone()),
@@ -295,6 +335,28 @@ class SurplusScheduler:
             self.run_recon_gather,
             CronTrigger(day_of_week="tue,fri", hour=1, minute=45, timezone=user_timezone()),
             id="recon_gather",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        # GitHub account-activity monitor: every 2h local. Deterministic (no
+        # LLM) external-activity watch. CronTrigger, never IntervalTrigger
+        # (which resets on restart).
+        self._scheduler.add_job(
+            self.run_account_activity_monitor,
+            CronTrigger(hour="*/2", timezone=user_timezone()),
+            id="account_activity_monitor",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        # Career-outreach monitor: daily at 08:00 local. ACTUATOR — drives the
+        # external career-agent engine to stage first-touch outreach drafts, then
+        # nudges the owner. ONE job (max_instances=1 is per-job; a second job would
+        # race on the single remote engine). Ships OFF (career_outreach_config).
+        # CronTrigger, never IntervalTrigger (which resets on restart).
+        self._scheduler.add_job(
+            self.run_career_outreach_monitor,
+            CronTrigger(hour=8, timezone=user_timezone()),
+            id="career_outreach_monitor",
             max_instances=1,
             misfire_grace_time=3600,
         )
@@ -350,6 +412,7 @@ class SurplusScheduler:
             )
         # Dream cycle: weekly Sunday 4am — clustering + worklist persist
         from apscheduler.triggers.cron import CronTrigger
+
         self._scheduler.add_job(
             self.run_dream_cycle,
             CronTrigger(day_of_week="sun", hour=4, timezone=user_timezone()),
@@ -449,6 +512,7 @@ class SurplusScheduler:
             # restarts more frequently.  Fixed hour ensures the batch runs
             # daily regardless of restart cadence.
             from apscheduler.triggers.cron import CronTrigger
+
             self._scheduler.add_job(
                 self.schedule_j9_eval_batch,
                 CronTrigger(hour=3, timezone=user_timezone()),  # 3 AM local daily
@@ -492,6 +556,7 @@ class SurplusScheduler:
         # pattern (see genesis.awareness.loop._on_scheduler_job_event).
         try:
             from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+
             self._job_event_loop = asyncio.get_running_loop()
             self._scheduler.add_listener(
                 self._on_scheduler_job_event,
@@ -506,6 +571,7 @@ class SurplusScheduler:
         # timestamps from the previous process and trigger a restart.
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             rt.record_job_success("surplus_dispatch")
             logger.info("Surplus scheduler: initial heartbeat emitted")
@@ -516,6 +582,7 @@ class SurplusScheduler:
         try:
             from genesis.memory.dream_cycle import check_incomplete_runs
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             if rt.db is not None:
                 await check_incomplete_runs(rt.db)
@@ -528,7 +595,8 @@ class SurplusScheduler:
         # and don't count the restart toward the task's retry budget.
         try:
             requeued, _ = await self._queue.recover_stuck(
-                older_than_hours=0, bump_attempt=False,
+                older_than_hours=0,
+                bump_attempt=False,
             )
             if requeued:
                 logger.info("Boot sweep: reclaimed %d orphaned running task(s)", requeued)
@@ -552,7 +620,8 @@ class SurplusScheduler:
         await self.run_gitnexus_strip()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
-            self._dispatch_interval, self._brainstorm_interval,
+            self._dispatch_interval,
+            self._brainstorm_interval,
         )
 
     async def stop(self) -> None:
@@ -580,7 +649,8 @@ class SurplusScheduler:
             )
         except Exception:
             logger.warning(
-                "Failed to hand off scheduler event for %s", job_id,
+                "Failed to hand off scheduler event for %s",
+                job_id,
                 exc_info=True,
             )
 
@@ -588,8 +658,16 @@ class SurplusScheduler:
         """Emit observability event for a failed or missed scheduled job."""
         exception = getattr(event, "exception", None)
         is_error = exception is not None
+        # error_summary prefixes the exception TYPE — APScheduler exceptions here
+        # routinely render as an empty str(), which is exactly when the type
+        # carries all the signal (live: last_error was recorded as "" for
+        # months). Build the message from the SAME summary that goes to
+        # job_health so the message-only surfaces — health_errors output and the
+        # grouped-error UI, which key on the event MESSAGE not its details —
+        # are diagnosable too, not just the job_health row.
+        detail = error_summary(exception, "missed") or "missed"
         msg = (
-            f"Scheduled job '{job_id}' failed: {exception}"
+            f"Scheduled job '{job_id}' failed: {detail}"
             if is_error
             else f"Scheduled job '{job_id}' missed (past misfire grace time)"
         )
@@ -598,17 +676,23 @@ class SurplusScheduler:
         else:
             logger.warning(msg)
 
-        # Record failure in job health tracking
+        # Record failure in job health tracking.
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
-            rt.record_job_failure(job_id, str(exception or "missed")[:500])
+            rt.record_job_failure(
+                job_id,
+                detail,
+                error_type=type(exception).__name__ if exception is not None else None,
+            )
         except Exception:
             logger.warning("Failed to record job failure for %s", job_id, exc_info=True)
 
         # Emit to event bus for dashboard / alerting
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             if rt.event_bus:
                 await rt.event_bus.emit(
@@ -617,6 +701,7 @@ class SurplusScheduler:
                     "scheduler.job_failed" if is_error else "scheduler.job_missed",
                     msg,
                     job_id=job_id,
+                    **failure_details(exc=exception),
                 )
         except Exception:
             logger.warning("Failed to emit scheduler error event", exc_info=True)
@@ -633,7 +718,9 @@ class SurplusScheduler:
         await gate_jobs.brainstorm_check(self)
 
     async def _recently_completed(
-        self, task_type, cooldown_hours: int | float,
+        self,
+        task_type,
+        cooldown_hours: int | float,
     ) -> bool:
         """Return ``True`` if *task_type* completed within *cooldown_hours*."""
         return await gate_jobs.recently_completed(self, task_type, cooldown_hours)
@@ -689,6 +776,14 @@ class SurplusScheduler:
     async def run_recon_gather(self) -> None:
         """Check watchlist projects for new GitHub releases and star counts."""
         await runner_jobs.run_recon_gather(self)
+
+    async def run_account_activity_monitor(self) -> None:
+        """Poll owner repos for external GitHub activity (every 2h)."""
+        await runner_jobs.run_account_activity_monitor(self)
+
+    async def run_career_outreach_monitor(self) -> None:
+        """Drive the career-agent engine to stage outreach drafts (daily)."""
+        await runner_jobs.run_career_outreach_monitor(self)
 
     async def run_model_intelligence(self) -> None:
         """Run model intelligence scan (weekly)."""
@@ -747,45 +842,53 @@ class SurplusScheduler:
         """Scheduled dispatch callback."""
         try:
             from genesis.runtime import GenesisRuntime
+
             if GenesisRuntime.instance().paused:
                 logger.debug("Surplus dispatch skipped (Genesis paused)")
                 return
         except Exception:
             pass
         try:
-            # Record heartbeat at loop entry so the watchdog sees liveness
-            # even when a single dispatch_once() blocks for 15-30 minutes
-            # (sequential task execution + intake pipeline overhead).
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("surplus_dispatch")
-            except Exception:
-                pass
+            # Refresh job_health at loop entry (and before each dispatch, below) so the
+            # 900s zombie-scheduler watchdog sees liveness across a SEQUENCE of moderate
+            # dispatches. The single-long-dispatch gap (a dispatch_once that itself blocks
+            # 15-30 min — INCLUDING a setup-phase stall with NO task running, the
+            # 2026-09-01 incident) is now covered by the heavy_workload flag set at
+            # dispatch_once ENTRY (see dispatch.py). This heartbeat write is the OTHER
+            # liveness signal; its failures are LOGGED (not swallowed) because a silent
+            # failure here would starve the watchdog while the loop runs fine.
+            _pump_surplus_heartbeat("loop-entry")
 
             for _ in range(3):
-                # Refresh heartbeat before each dispatch so slow or
-                # failing tasks don't trip the 900s watchdog threshold.
-                with contextlib.suppress(Exception):
-                    GenesisRuntime.instance().record_job_success("surplus_dispatch")
+                # Refresh before each dispatch so a SEQUENCE of slow/failing tasks
+                # doesn't trip the 900s watchdog (the single-long-dispatch gap is covered
+                # by dispatch_once's entry-set heavy_workload flag).
+                _pump_surplus_heartbeat("pre-dispatch")
                 if not await self.dispatch_once():
                     break
 
             if self._event_bus:
                 await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.DEBUG,
-                    "heartbeat", "surplus_scheduler dispatch completed",
+                    Subsystem.SURPLUS,
+                    Severity.DEBUG,
+                    "heartbeat",
+                    "surplus_scheduler dispatch completed",
                 )
         except Exception as exc:
             logger.exception("Surplus dispatch loop failed")
             if self._event_bus:
                 await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.ERROR,
+                    Subsystem.SURPLUS,
+                    Severity.ERROR,
                     "dispatch.failed",
                     "Surplus dispatch loop failed with exception",
+                    **failure_details(exc=exc),
                 )
             try:
                 from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("surplus_dispatch", str(exc))
+
+                GenesisRuntime.instance().record_job_failure(
+                    "surplus_dispatch", exc=exc, emit_event=False
+                )
             except Exception:
                 pass
-

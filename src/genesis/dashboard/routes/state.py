@@ -13,6 +13,17 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
 
+# IANA timezone names for the dashboard timezone dropdown, computed ONCE at import
+# (``available_timezones()`` scans the tz database on disk — ~600 entries — so it
+# must not run per request). Sorted for stable rendering; validation of a chosen
+# value still happens via ``ZoneInfo(...)`` in the POST handler.
+try:
+    from zoneinfo import available_timezones as _available_timezones
+
+    _TIMEZONE_OPTIONS: list[str] = sorted(_available_timezones())
+except Exception:  # pragma: no cover — zoneinfo/tzdata always present on our stack
+    _TIMEZONE_OPTIONS = []
+
 
 def _parse_approval_rows(rows: list[dict]) -> list[dict]:
     now = datetime.now(UTC)
@@ -62,7 +73,20 @@ async def pending_approvals():
     if not rt.is_bootstrapped or rt._db is None:
         return jsonify([])
 
+    from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
+
     pending = await approval_requests.list_pending(rt._db)
+    # Desktop-takeover rows are withheld from this queue on purpose. The cards
+    # it renders are CLI-fallback cards: the template fills Fallback / Reason /
+    # API Route from context keys a desktop row does not have, so the helpers
+    # fall through to their hardcoded defaults and the row is presented as
+    # "claude -p" / "CLI fallback requires manual approval". An owner tapping
+    # Approve on that would believe they cleared a stuck dispatch while
+    # actually handing over their keyboard and mouse. Desktop consent belongs
+    # to the purpose-built surface that names the target window back to them.
+    pending = [
+        r for r in pending if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE
+    ]
     return jsonify(_parse_approval_rows(pending))
 
 
@@ -284,21 +308,25 @@ def essential_knowledge_endpoint():
 @blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
 @_async_route
 async def settings_timezone():
-    """Get or set the user's display timezone.
+    """Get or set the user's display + schedule timezone.
 
-    GET: returns {"timezone": <IANA tz name>} — whatever the user configured
-         (defaults to "UTC" if unset).
+    genesis.yaml ``timezone`` is the authoritative source (``user_timezone()``
+    reads it first; ``USER_TIMEZONE`` env is only a deprecated fallback), so this
+    write actually takes effect.
+
+    GET: returns {"timezone": <current IANA tz>, "options": [<IANA tz>, ...]} —
+         the current value plus the full zone list for the dropdown.
     POST: {"timezone": <IANA tz name>} → validates, writes to genesis.yaml,
-          invalidates caches. Takes effect immediately for display;
-          scheduler CronTrigger timezone updates on next restart.
+          invalidates caches + reloads. Takes effect immediately for display;
+          scheduler CronTrigger timezones re-bind on the next restart.
     """
     from genesis.env import user_timezone
 
     if request.method == "GET":
-        return jsonify({"timezone": user_timezone()})
+        return jsonify({"timezone": user_timezone(), "options": _TIMEZONE_OPTIONS})
 
     payload = request.get_json(silent=True) or {}
-    new_tz = payload.get("timezone", "").strip()
+    new_tz = (payload.get("timezone") or "").strip()  # tolerate {"timezone": null}
     if not new_tz:
         return jsonify({"error": "timezone is required"}), 400
 
@@ -309,16 +337,55 @@ async def settings_timezone():
         return jsonify({"error": f"Invalid timezone: {new_tz}"}), 400
 
     # Write to genesis.yaml
+    import shutil
     import tempfile
-    from pathlib import Path
+
     cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
+    malformed_backup: str | None = None
     try:
         import yaml
         existing = {}
         if cfg_path.is_file():
             with cfg_path.open() as fh:
-                existing = yaml.safe_load(fh) or {}
+                loaded = yaml.safe_load(fh)
+            # `or {}` covers an empty file but keeps a truthy non-mapping root, and
+            # the assignment below would then TypeError into an opaque 500. This
+            # dropdown is the recovery surface for a broken genesis.yaml, so it has
+            # to survive the one file the operator has just broken.
+            #
+            # BUT SURVIVING MUST NOT MEAN DELETING. Coercing a non-mapping root to
+            # {} and then writing the file back replaces whatever was in it with a
+            # lone timezone key — so a stray top-level list carrying real network /
+            # github / custom settings would be destroyed by the very control
+            # documented as the way to recover. That is worse than the 500 it
+            # replaced, which at least left the file intact. Side the original
+            # first, and tell the operator where it went.
+            if not isinstance(loaded, dict):
+                # Second-resolution timestamps COLLIDE: two malformed writes in
+                # the same second would have the second overwrite the first
+                # backup, losing the very content the backup exists to preserve.
+                # Find a free name instead of trusting the clock to be unique.
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                backup = cfg_path.with_suffix(f".malformed-{stamp}.yaml")
+                suffix = 2
+                while backup.exists():
+                    backup = cfg_path.with_suffix(f".malformed-{stamp}-{suffix}.yaml")
+                    suffix += 1
+                shutil.copy2(cfg_path, backup)
+                malformed_backup = str(backup)
+                logger.warning(
+                    "genesis.yaml root is %s, not a mapping — copied the original to %s "
+                    "before writing the timezone; its other settings are NOT carried over.",
+                    type(loaded).__name__,
+                    backup,
+                )
+            existing = loaded if isinstance(loaded, dict) else {}
         existing["timezone"] = new_tz
+        # Ensure the config dir exists — on an install that never ran
+        # setup-local-config, ~/.genesis/config/ may be absent and the dropdown
+        # is the first thing to create genesis.yaml. 0o700 matches the personal
+        # config-dir posture (genesis.yaml holds no secrets, but stay tight).
+        cfg_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp_fd, tmp_path = tempfile.mkstemp(
             dir=str(cfg_path.parent), suffix=".yaml.tmp",
         )
@@ -328,7 +395,9 @@ async def settings_timezone():
                 yaml.dump(existing, f, default_flow_style=False)
             os.replace(tmp_path, str(cfg_path))
         except Exception:
-            os.unlink(tmp_path)
+            import contextlib
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)  # don't mask the original error if cleanup fails
             raise
     except Exception as exc:
         logger.error("Failed to write timezone config: %s", exc, exc_info=True)
@@ -341,7 +410,16 @@ async def settings_timezone():
     from genesis.util.tz import reload as tz_reload
     effective = tz_reload()
 
-    return jsonify({
+    payload = {
         "timezone": effective,
         "note": "Scheduler timezone updates on next restart",
-    })
+    }
+    if malformed_backup:
+        # Surfaced, never silent: the operator's other settings were NOT carried
+        # into the rewritten file, and they need to know where the original went.
+        payload["warning"] = (
+            "genesis.yaml had a malformed (non-mapping) root. The original was copied to "
+            f"{malformed_backup} and the file was rewritten with only the timezone — "
+            "any other settings it contained must be restored by hand from that copy."
+        )
+    return jsonify(payload)

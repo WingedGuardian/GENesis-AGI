@@ -1,0 +1,155 @@
+{
+  "git 2>/dev/null push": [
+    "git   push"
+  ],
+  "git > out.log push": [
+    "git   push"
+  ],
+  "git >>out.log push": [
+    "git   push"
+  ],
+  "git 2>&1 push": [
+    "git   push"
+  ],
+  "git &>log push": [
+    "git   push"
+  ],
+  "git &>>log push": [
+    "git   push"
+  ],
+  "git >|out push": [
+    "git   push"
+  ],
+  "git <in push": [
+    "git   push"
+  ],
+  "git <<<here push": [
+    "git   push"
+  ],
+  "echo hi 1>o 2>e": [
+    "echo hi"
+  ],
+  "git 2>'$(rm x)' push": [
+    "git  '$(rm x)' push"
+  ],
+  "git 2>\"`rm x`\" push": [
+    "git  \"`rm x`\" push"
+  ],
+  "git 2>$'a b' push": [
+    "git  $'a b' push"
+  ],
+  "git 2>a$(echo x)b push": [
+    "git  a$(echo x)b push"
+  ],
+  "git 2>$(rm x) push": [
+    "git  $(rm x) push"
+  ],
+  "git 22>$(rm x) push": [
+    "git  $(rm x) push"
+  ],
+  "git 3>$(rm x) push": [
+    "git  $(rm x) push"
+  ],
+  "git push2>$(rm x)": [
+    "git push2 $(rm x)"
+  ],
+  "git 2>\"$(rm x); rm y\" push": [
+    "git  \"$(rm x); rm y\" push"
+  ],
+  "echo hi 2>$(rm -rf /tmp/x)a\\ b": [
+    "echo hi  $(rm -rf /tmp/x)a\\ b"
+  ],
+  "git 2>err\\ log push": [
+    "git   push"
+  ],
+  "git 2>pre\"a b\"post push": [
+    "git   push"
+  ],
+  "diff <(a) <(b)": [
+    "diff  (a)  (b)"
+  ],
+  "tee >(cat) < in": [
+    "tee  (cat)"
+  ],
+  "git 2>": [
+    "git"
+  ],
+  "git 2>'unterminated push": [
+    "git"
+  ],
+  "git 2>\"$(rm x": [
+    "git  \"$(rm x"
+  ],
+  "git 2>'$(rm x": [
+    "git  '$(rm x"
+  ],
+  "git 12>&34 push": [
+    "git   push"
+  ],
+  "cat 3< in": [
+    "cat"
+  ],
+  "git 2>$(a)3>b": [
+    "git  $(a)3"
+  ],
+  "git 2>$(a)>b push": [
+    "git  $(a)  push"
+  ],
+  "git 1>$(a) 2>$(b) push": [
+    "git  $(a)  $(b) push"
+  ],
+  "git 2>${VAR} push": [
+    "git  ${VAR} push"
+  ],
+  "git 2>$VAR push": [
+    "git  $VAR push"
+  ],
+  "echo \"$(rm x)\"": [
+    "echo \"$(rm x)\""
+  ],
+  "git commit -m \"2>x\"": [
+    "git commit -m \"2>x\""
+  ],
+  "ruff check . && pytest -q": [
+    "ruff check .",
+    "pytest -q"
+  ],
+  "a | b ; c && d || e": [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e"
+  ],
+  "bash -c 'git 2>/dev/null push'": [
+    "bash -c 'git 2>/dev/null push'"
+  ],
+  "grep '2>x' file": [
+    "grep '2>x' file"
+  ],
+  "echo 'a && b' ; echo done": [
+    "echo 'a && b'",
+    "echo done"
+  ],
+  "cd /wt && git 2>\"$(rm x)\" push": [
+    "cd /wt",
+    "git  \"$(rm x)\" push"
+  ],
+  "git -C /wt merge a && git 2>\"$(rm x)\" merge b": [
+    "git -C /wt merge a",
+    "git  \"$(rm x)\" merge b"
+  ],
+  "git 2>\"$(rm x)\" commit -m a && git commit -m b": [
+    "git  \"$(rm x)\" commit -m a",
+    "git commit -m b"
+  ],
+  "git 2>\"$(rm x)\" commit -n": [
+    "git  \"$(rm x)\" commit -n"
+  ],
+  "git push origin main --force": [
+    "git push origin main --force"
+  ],
+  "pytest tests/foo.py --basetemp /wt": [
+    "pytest tests/foo.py --basetemp /wt"
+  ]
+}

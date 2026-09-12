@@ -31,6 +31,16 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # ── Defaults & arg parsing ────────────────────────────────────────────
 
 CONTAINER_NAME=""
@@ -417,8 +427,13 @@ fi
 echo ""
 echo "[3/14] Creating virtual environment..."
 
-if [ ! -d "$VENV_DIR" ]; then
-    $PYTHON -m venv "$VENV_DIR"
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    # Gate on the interpreter, not the directory: a partial/broken venv dir
+    # (interrupted create, missing OR dangling bin/python) must be rebuilt, not
+    # skipped. --clear wipes a partial dir so even a dangling symlink is repaired
+    # (a plain re-run of venv skips an existing-but-dangling bin/python link).
+    # Only reached when bin/python is already unusable, so nothing good is lost.
+    $PYTHON -m venv --clear "$VENV_DIR"
 fi
 
 # Debian creates venvs without pip even when ensurepip imports (ensurepip
@@ -677,6 +692,10 @@ SYSCTL
     if [ -d "$INSTALL_DIR/config" ] && [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
         sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ || true
         sudo udevadm control --reload-rules 2>/dev/null || true
+        # trigger re-applies the scheduler rule to existing block devices
+        # (reload only refreshes the rules DB); scoped to block to avoid
+        # re-triggering unrelated subsystems on the host.
+        sudo udevadm trigger --subsystem-match=block 2>/dev/null || true
         echo "  + BFQ I/O scheduler rule installed"
     fi
 else

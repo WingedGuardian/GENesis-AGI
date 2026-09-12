@@ -14,6 +14,48 @@ from genesis.guardian.credential_bridge import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_credential_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail-closed default for EVERY test in this module: point all three host
+    credential sources at absent tmp paths so NO combined-bridge invocation can
+    escrow a real host token into pytest's output dirs. (Reproduced on a live
+    install: an un-isolated ``propagate_guardian_credentials`` writes the real
+    ``~/.genesis/cc_oauth_token.env`` into the shared dir.)
+
+    A positive-contract test overrides ONLY its intended source IN-BODY (the test
+    body runs after this fixture, so its ``monkeypatch`` write layers on top and
+    wins during the test, and is restored at teardown):
+      - HOME             → the mirror leg's ~/backups/genesis-backups clone source
+      - _CC_TOKEN_SOURCE → the CC-OAuth leg's import-frozen dedicated file
+      - GENESIS_HOME     → the internal-api-token leg's source dir
+
+    Applying it module-wide (not per-class) is the chokepoint: hand-classifying
+    which classes invoke the bridge is what leaked (three combined-bridge tests
+    lived outside the old per-class fixture). A test that never touches the bridge
+    just gets three harmless env patches — a miss is cosmetic, never a leak.
+
+    Uses the SHARED ``monkeypatch`` fixture, NOT a fixture-owned ``MonkeyPatch``.
+    Several positive-contract tests override the SAME keys in-body (HOME on the
+    mirror-leg tests, _CC_TOKEN_SOURCE on the CC-OAuth leg); a fixture-owned instance
+    patching those same keys creates TWO MonkeyPatch stacks over one key that restore
+    in the wrong order at teardown, leaking HOME to a deleted tmp dir and reddening
+    unrelated test_hooks/test_scripts files in the full-suite CI run (green in
+    isolation). One shared instance → correct LIFO teardown.
+
+    INVARIANT: no test in this module may call ``monkeypatch.undo()`` or
+    ``monkeypatch.delenv``/``delattr`` on HOME / GENESIS_HOME / _CC_TOKEN_SOURCE
+    mid-body — that would pop this isolation off the shared stack and could escrow a
+    REAL host token. (The fixture-owned form blocked that at the cost of the leak
+    above; the shared form trades it for the ban here plus the positive-contract
+    ``... not in names`` escrow assertions, which fail loudly if isolation is defeated.)
+    """
+    from genesis.guardian import credential_bridge as cb
+
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
+
+
 class TestPropagateTelegramCredentials:
     """Test container-side credential writer."""
 
@@ -291,14 +333,11 @@ class TestProvisioningCredentials:
 
 
 class TestCombinedBridge:
-    """propagate_guardian_credentials fans out to both, each guarded."""
+    """propagate_guardian_credentials fans out to both, each guarded.
 
-    @pytest.fixture(autouse=True)
-    def _isolate_home(self, tmp_path: Path, monkeypatch):
-        # The mirror leg defaults its source to ~/backups/genesis-backups. Isolate
-        # HOME to a clone-free sandbox so these telegram/proxmox assertions stay
-        # deterministic regardless of the host having a real backup clone.
-        monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    All three host credential sources are isolated module-wide by the
+    ``_isolate_credential_sources`` autouse fixture.
+    """
 
     def test_writes_both_when_present(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import propagate_guardian_credentials
@@ -365,13 +404,11 @@ class TestBackupPassphraseEscrow:
         from genesis.guardian.credential_bridge import load_backup_passphrase
         assert load_backup_passphrase(str(tmp_path / "nope")) == {}
 
-    def test_combined_bridge_includes_passphrase(self, tmp_path: Path, monkeypatch) -> None:
+    def test_combined_bridge_includes_passphrase(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import propagate_guardian_credentials
-        # Isolate HOME so the mirror leg (which defaults its source to
-        # ~/backups/genesis-backups) is a deterministic no-op here — no clone in
-        # the sandbox home means no "creds-mirror" entry. Mirror is covered by
-        # TestMirrorCredentialBackup below.
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        # All three host credential sources are isolated module-wide
+        # (_isolate_credential_sources), so the mirror/CC/internal legs no-op and
+        # the exact-name assertion below is deterministic on any install.
         secrets = tmp_path / "secrets.env"
         secrets.write_text(
             "TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_FORUM_CHAT_ID=chat\n"
@@ -402,6 +439,11 @@ class TestBackupPassphraseEscrow:
         names = sorted(p.name for p in written)
         assert "creds-mirror" in names
         assert "backup_passphrase.env" in names
+        # Regression guard (symmetry with the cc/internal positive tests): this test
+        # overrides ONLY HOME, so the CC and internal legs must stay isolated by
+        # _isolate_credential_sources — no real host token is escrowed here.
+        assert "cc_oauth_token.env" not in names
+        assert "internal_api_token.env" not in names
 
 
 class TestMirrorCredentialBackup:
@@ -557,7 +599,13 @@ class TestCCOAuthTokenSync:
         written = cb.propagate_guardian_credentials(
             shared_dir=tmp_path / "state" / "shared", secrets_path=secrets,
         )
-        assert "cc_oauth_token.env" in [p.name for p in written]
+        names = [p.name for p in written]
+        assert "cc_oauth_token.env" in names
+        # Regression guard: this test overrides ONLY its intended source (CC). The
+        # internal-token leg must stay isolated by _isolate_credential_sources, so
+        # no real host internal token is escrowed here. (RED before the module-wide
+        # fixture — the un-isolated leg leaked internal_api_token.env.)
+        assert "internal_api_token.env" not in names
 
     def test_never_reads_from_secrets_env(self, tmp_path: Path) -> None:
         # A token in secrets.env must NOT be picked up — the leg reads only its

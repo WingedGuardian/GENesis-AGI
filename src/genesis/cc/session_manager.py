@@ -9,13 +9,22 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from genesis.cc.types import CCModel, ChannelType, EffortLevel, SessionType
+from genesis.cc.types import (
+    CCModel,
+    ChannelType,
+    EffortLevel,
+    SessionType,
+    session_origin_for_channel,
+)
 from genesis.db.crud import cc_sessions
+from genesis.util import tz
 
 logger = logging.getLogger(__name__)
 
 # Callback signatures for session lifecycle hooks
-OnSessionStart = Callable[[str, str, str], Awaitable[None]]  # (session_id, session_type, source_tag)
+OnSessionStart = Callable[
+    [str, str, str], Awaitable[None]
+]  # (session_id, session_type, source_tag)
 OnSessionEnd = Callable[[str], Awaitable[None]]  # (session_id,)
 
 
@@ -50,9 +59,19 @@ class SessionManager:
     ) -> dict:
         ch = str(channel)
         existing = await cc_sessions.get_active_foreground(
-            self._db, user_id=user_id, channel=ch, thread_id=thread_id,
+            self._db,
+            user_id=user_id,
+            channel=ch,
+            thread_id=thread_id,
         )
         if existing:
+            # A dark foreground session reaped to 'checkpointed' by the
+            # liveness reaper (D3) is still resumable — flip it back to 'active'
+            # on reuse so the turn resumes via --resume exactly as before the
+            # reap (cc_session_id / model / effort are left untouched).
+            if existing.get("status") == "checkpointed":
+                await cc_sessions.update_status(self._db, existing["id"], status="active")
+                existing["status"] = "active"
             return existing
 
         # Process any pending auto-bookmark from the previous session
@@ -76,6 +95,13 @@ class SessionManager:
             source_tag="foreground",
             thread_id=thread_id,
             chat_id=chat_id,
+            # WS-3 durable gateway origin: a gateway conversation (web/OpenClaw,
+            # WhatsApp, voice) stamps external_untrusted so reflection_window_origin
+            # (which reads cc_sessions.origin_class) does not treat a reflection
+            # overlapping it as first_party and launder its user_model_delta.
+            # Owner-attended (terminal/Telegram) → None (foreground stays NULL,
+            # read as first_party — unchanged).
+            origin_class=session_origin_for_channel(channel),
         )
         return await cc_sessions.get_by_id(self._db, sess_id)
 
@@ -167,19 +193,21 @@ class SessionManager:
         now = datetime.now(UTC).isoformat()
         await cc_sessions.update_activity(self._db, session_id, last_activity_at=now)
 
-    async def check_morning_reset(self, *, user_id: str) -> bool:
+    async def check_morning_reset(self, *, user_id: str, now: datetime | None = None) -> bool:
         """Check if sessions from a previous day boundary should be reset.
 
         Returns True if there are completed/expired sessions from before
         the current day boundary (suggesting a new day has started).
+
+        The boundary is local-midnight (``day_boundary_hour`` in the user's
+        timezone) serialized in UTC — matching the ``+00:00`` timestamps stored
+        in ``cc_sessions`` so the ``query_stale`` string ``<`` comparison stays
+        lexicographically correct (see :func:`genesis.util.tz.local_day_boundary`).
+
+        *now* is injectable for deterministic tests; defaults to the current
+        instant.
         """
-        now = datetime.now(UTC)
-        boundary = now.replace(
-            hour=self._day_boundary_hour, minute=0, second=0, microsecond=0,
-        )
-        if now < boundary:
-            boundary -= timedelta(days=1)
-        boundary_iso = boundary.isoformat()
+        boundary_iso = tz.local_day_boundary(self._day_boundary_hour, now=now).isoformat()
 
         # Check if there are sessions that completed before today's boundary
         rows = await cc_sessions.query_stale(self._db, older_than=boundary_iso)
@@ -188,13 +216,20 @@ class SessionManager:
     # Source tags that are safe to auto-expire. Reflection output is persisted
     # in the observations table (not cc_sessions), so expiring session records
     # does NOT lose reflection history or context continuity.
-    _EXPIRABLE_SOURCE_TAGS = frozenset({
-        "reflection_light", "reflection_micro",
-        "reflection_deep", "reflection_strategic",
-        "brainstorm", "weekly_assessment", "quality_calibration",
-        "code_audit", "infrastructure_monitor",
-        "direct_session",
-    })
+    _EXPIRABLE_SOURCE_TAGS = frozenset(
+        {
+            "reflection_light",
+            "reflection_micro",
+            "reflection_deep",
+            "reflection_strategic",
+            "brainstorm",
+            "weekly_assessment",
+            "quality_calibration",
+            "code_audit",
+            "infrastructure_monitor",
+            "direct_session",
+        }
+    )
     # Source tags to NEVER auto-expire — currently empty. Only foreground
     # sessions are preserved (handled by the session_type check below).
     _PRESERVE_SOURCE_TAGS: frozenset[str] = frozenset()
@@ -223,15 +258,19 @@ class SessionManager:
 
             # Expire if source_tag is in the expirable set, OR if it's a
             # background_task type, OR if unrecognised (default: expire)
-            if (source_tag in self._EXPIRABLE_SOURCE_TAGS
-                    or session_type == "background_task"
-                    or session_type != "foreground"):
+            if (
+                source_tag in self._EXPIRABLE_SOURCE_TAGS
+                or session_type == "background_task"
+                or session_type != "foreground"
+            ):
                 await cc_sessions.update_status(self._db, row["id"], status="expired")
                 await self._fire_end_hooks(row["id"])
                 count += 1
 
         if count:
-            logger.info("Expired %d stale background sessions (idle > %d min)", count, max_idle_minutes)
+            logger.info(
+                "Expired %d stale background sessions (idle > %d min)", count, max_idle_minutes
+            )
         return count
 
     async def process_pending_bookmark(self) -> str | None:
@@ -252,6 +291,7 @@ class SessionManager:
         finally:
             # Always clean up the file to avoid reprocessing
             import contextlib
+
             with contextlib.suppress(OSError):
                 self._PENDING_BOOKMARK_FILE.unlink(missing_ok=True)
 
@@ -282,7 +322,8 @@ class SessionManager:
             )
             logger.info(
                 "Auto-created bookmark %s for previous session %s",
-                bookmark_id[:8], session_id[:8],
+                bookmark_id[:8],
+                session_id[:8],
             )
             return bookmark_id
         except Exception:

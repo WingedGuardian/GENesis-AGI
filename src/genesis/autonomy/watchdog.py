@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config" / "autonomy.yaml"
 
+# Restart reasons persisted under an older name, normalised once on load.
+# ~/.genesis/watchdog_state.json survives upgrades, so a rename that stopped
+# matching the old entries would silently reset the flap counter for a full
+# flap_window (6h) — granting flap_threshold extra unrestrained restarts on a
+# service that is ALREADY flapping.
+#
+# Normalising on load rather than matching aliases at compare time keeps the
+# flap filter a plain equality, self-heals the persisted `last_reason` the
+# dashboard renders, and leaves no alias set that could be written without its
+# own current name (which would stop a reason matching its own go-forward
+# history). `restart_history` is pruned to flap_window_s on every write, so this
+# shim goes inert on its own within one window of the rename.
+_LEGACY_REASONS: dict[str, str] = {
+    # Renamed once the watchdog's target became genesis-server: `_detect_genesis_service`
+    # prefers genesis-server whenever that unit FILE is installed, so the old label
+    # named a unit this never monitors.
+    "bridge_inactive": "target_inactive",
+}
+
 
 class WatchdogChecker:
     """Stateless health checker — called by systemd timer or standalone script.
@@ -64,6 +83,14 @@ class WatchdogChecker:
         secrets_path: str | Path | None = None,
         state_file: str | Path = "~/.genesis/watchdog_state.json",
         stabilization_s: int = 120,
+        flap_window_s: int = 21600,
+        flap_threshold: int = 3,
+        flap_backoff_max_s: int = 7200,
+        liveness_url: str = "http://127.0.0.1:5000/api/genesis/liveness",
+        liveness_lag_suppress_ms: float = 1000.0,
+        liveness_sample_stale_s: float = 120.0,
+        liveness_max_starved_skips: int = 6,
+        max_bootstrap_grace_skips: int = 4,
         remediation_registry: RemediationRegistry | None = None,
         outreach_fn: OutreachFn | None = None,
     ) -> None:
@@ -78,6 +105,14 @@ class WatchdogChecker:
         self._secrets_path = Path(resolved_secrets).expanduser()
         self._state_path = Path(state_file).expanduser()
         self._stabilization_s = stabilization_s
+        self._flap_window_s = flap_window_s
+        self._flap_threshold = flap_threshold
+        self._flap_backoff_max_s = flap_backoff_max_s
+        self._liveness_url = liveness_url
+        self._liveness_lag_suppress_ms = liveness_lag_suppress_ms
+        self._liveness_sample_stale_s = liveness_sample_stale_s
+        self._liveness_max_starved_skips = liveness_max_starved_skips
+        self._max_bootstrap_grace_skips = max_bootstrap_grace_skips
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
         self._target_service = self._detect_target_service()
@@ -91,8 +126,10 @@ class WatchdogChecker:
         """Auto-detect which Genesis service to monitor.
 
         Reuses the canonical detector (``observability.service_status``): it
-        probes ``is-enabled`` then ``is-active`` for genesis-server, then the
-        legacy relay, and defaults to genesis-server. It never targets the
+        probes whether the genesis-server unit FILE is installed
+        (``list-unit-files``) and prefers it whenever it is — enabled or not,
+        running or not — falling back to the legacy relay only when that unit is
+        genuinely absent. It never targets the
         deprecated relay when genesis-server is present (the 2026-07-02 §7
         recovery bug: restarting an inactive unit "succeeds" but hides
         genesis-server crash loops) while still recovering a relay-only legacy
@@ -117,6 +154,16 @@ class WatchdogChecker:
                 backoff_max_s=wd.get("backoff_max_seconds", 300),
                 config_validation=wd.get("config_validation", True),
                 stabilization_s=wd.get("stabilization_seconds", 120),
+                flap_window_s=wd.get("flap_window_seconds", 21600),
+                flap_threshold=wd.get("flap_threshold", 3),
+                flap_backoff_max_s=wd.get("flap_backoff_max_seconds", 7200),
+                liveness_url=wd.get(
+                    "liveness_url", "http://127.0.0.1:5000/api/genesis/liveness"
+                ),
+                liveness_lag_suppress_ms=wd.get("liveness_lag_suppress_ms", 1000.0),
+                liveness_sample_stale_s=wd.get("liveness_sample_stale_s", 120.0),
+                liveness_max_starved_skips=wd.get("liveness_max_starved_skips", 6),
+                max_bootstrap_grace_skips=wd.get("max_bootstrap_grace_skips", 4),
             )
         except (yaml.YAMLError, OSError, AttributeError):
             logger.warning("Failed to load watchdog config — using defaults", exc_info=True)
@@ -137,12 +184,18 @@ class WatchdogChecker:
         bridge_active = self._is_bridge_active()
         if bridge_active is False:
             if self._bridge_exited_unconfigured():
-                logger.info("Bridge exited unconfigured (exit 2) — skipping restart")
+                logger.info(
+                    "%s exited unconfigured (exit 2) — skipping restart",
+                    self._target_service,
+                )
                 return WatchdogAction.SKIP
-            logger.warning("Bridge service is not active — skipping staleness check, going to restart logic")
+            logger.warning(
+                "%s is not active — skipping staleness check, going to restart logic",
+                self._target_service,
+            )
             # Fall through to backoff/validation/restart below
             state = self._load_state()
-            return self._restart_if_allowed(state, reason="bridge_inactive")
+            return self._restart_if_allowed(state, reason="target_inactive")
 
         # 1. Read status.json
         status = self._read_status()
@@ -181,6 +234,55 @@ class WatchdogChecker:
                     )
                     return WatchdogAction.SKIP
 
+                # ...but `uptime_s` belongs to whichever process WROTE the
+                # file. When a restart lands while the previous status.json is
+                # still inside the freshness window, that file is retained: its
+                # `uptime_s` is the PRIOR runtime's (stamped from that process's
+                # own bootstrap — see status_writer.py `_bootstrap_completed_at`)
+                # and its scheduler heartbeats describe a runtime that no longer
+                # exists. A large `uptime_s` therefore cannot establish that THIS
+                # process is old, and the first tick after boot would restart a
+                # healthy, still-bootstrapping server — the same defect the stale
+                # branch below closes, via the fresh/zombie path instead.
+                # systemd's clock is the only reading tied to the CURRENT
+                # activation: a status file older than the unit's own uptime was
+                # written before the service started. (Mixed clock domains, and
+                # CLOCK_REALTIME steps BOTH ways: a forward step inflates
+                # `staleness_s`, erring toward suppression, which the counter
+                # bounds; a backward step deflates it, so the grace simply does
+                # not fire and this branch restarts as it did before it existed.)
+                service_uptime = self._service_uptime_s()
+                if (
+                    service_uptime is not None
+                    and staleness_s > service_uptime
+                    and self._grant_bootstrap_grace(
+                        service_uptime,
+                        context=(
+                            f"Zombie heartbeats ({', '.join(zombie)}) but the "
+                            f"status file ({staleness_s:.0f}s old) predates this "
+                            f"activation of {self._target_service} "
+                            f"({service_uptime:.0f}s ago), so they belong to the "
+                            f"previous process"
+                        ),
+                    )
+                ):
+                    return WatchdogAction.SKIP
+                # An exhausted / unpersisted grace falls through to the normal
+                # zombie-restart path below.
+
+                # Connectivity forgiveness (PR-2): a zombie scheduler during a
+                # network outage is surplus dispatch stalled on dead-network
+                # provider calls — a restart cannot fix an ISP outage (it just
+                # wipes in-memory circuit-breaker state and re-walks the dead
+                # chain slowly). Skip while the network is degraded/offline.
+                if self._network_suppresses_restart(status):
+                    logger.info(
+                        "Zombie detected (%s) but network degraded/offline "
+                        "(fresh probe) — restart can't fix connectivity, skipping",
+                        ", ".join(zombie),
+                    )
+                    return WatchdogAction.SKIP
+
                 logger.warning(
                     "Zombie scheduler detected: %s — triggering restart",
                     ", ".join(zombie),
@@ -190,14 +292,159 @@ class WatchdogChecker:
             self._reset_state()
             return WatchdogAction.SKIP  # Healthy — no action needed
 
+        # 3. Bootstrap grace: a file stale from BEFORE the service started says
+        # nothing about THIS process — after an outage the status.json predates
+        # the boot, so raw staleness is guaranteed huge while the server is
+        # still mid-bootstrap (2026-09-08: 22,583s-stale file, server 49s into
+        # a ~2min bootstrap, SIGKILLed on both boots that day). Service start
+        # is the freshness epoch: until the unit's own uptime exceeds the
+        # staleness threshold, the file cannot yet be expected fresh. A wedged
+        # (still-active) server restarts once its uptime crosses the threshold.
+        # A RESTARTING server is the hole: ActiveEnter resets on every
+        # activation, so a crash-loop that stays `active` at tick time would
+        # renew the grace forever — which is why the grace is bounded by an
+        # explicit skip counter (like every other suppression in this file),
+        # not by uptime alone. The counter clears with the rest of the state at
+        # _reset_state's FULL-reset branch (its post-restart stabilization
+        # cooldown branch preserves the count on purpose, exactly like
+        # consecutive_failures), so a healthy bootstrap spends at most one skip.
+        # A failed probe suppresses nothing. The zombie branch needs no
+        # equivalent: it runs only on a FRESH file, already uptime_s-checked.
+        service_uptime = self._service_uptime_s()
+        if (
+            service_uptime is not None
+            and service_uptime < self._staleness_threshold
+            and self._grant_bootstrap_grace(
+                service_uptime,
+                context=(
+                    f"Status file stale ({staleness_s:.0f}s) but "
+                    f"{self._target_service} started only {service_uptime:.0f}s "
+                    f"ago (< {self._staleness_threshold}s threshold)"
+                ),
+            )
+        ):
+            return WatchdogAction.SKIP
+        # An exhausted / unpersisted grace falls through to the normal
+        # stale-restart path below.
+
         logger.warning(
-            "Status file stale: %.0fs old (threshold %ds) — bridge may be down",
-            staleness_s, self._staleness_threshold,
+            "Status file stale: %.0fs old (threshold %ds) — %s may be down",
+            staleness_s, self._staleness_threshold, self._target_service,
         )
 
-        # 3. Stale — attempt restart via shared logic
+        # 4. Stale — attempt restart via shared logic
         state = self._load_state()
         return self._restart_if_allowed(state, reason="stale_status_restart")
+
+    def _grant_bootstrap_grace(self, service_uptime: float, *, context: str) -> bool:
+        """Consume one bounded bootstrap-grace slot. True ⇒ suppress this cycle.
+
+        Shared by the two branches that can be handed a status.json written
+        BEFORE the current activation: the stale branch (file older than the
+        staleness threshold) and the zombie branch (file still inside the
+        freshness window, but carrying the previous process's heartbeats and
+        `uptime_s`). They share ONE counter deliberately — a crash loop must
+        not get a fresh budget per branch, and the counter clears for both when
+        a fresh status file reaches ``_reset_state``'s full-reset branch.
+
+        Returns False — do not suppress — in exactly two cases: the bound is
+        spent (logged + alerted once), or the incremented counter did not
+        persist. The second matters because an unwritable state file would
+        otherwise reload the old count on every oneshot invocation and re-grant
+        the same slot forever, which is precisely the unbounded grace the
+        counter exists to close.
+        """
+        state = self._load_state()
+        skips = self._coerce_counter(state.get("bootstrap_grace_skips")) + 1
+        if skips > self._max_bootstrap_grace_skips:
+            logger.error(
+                "Bootstrap grace exhausted (%d skips): %s keeps presenting a "
+                "young uptime without ever writing a fresh status file — "
+                "likely a restart loop; no longer suppressing. (%s)",
+                skips - 1, self._target_service, context,
+            )
+            self._alert_grace_exhausted(service_uptime, skips - 1)
+            return False
+
+        state["bootstrap_grace_skips"] = skips
+        if not self._save_state(state):
+            logger.error(
+                "Bootstrap grace NOT granted: skip counter could not be "
+                "persisted — falling through to normal handling. (%s)",
+                context,
+            )
+            return False
+
+        logger.info(
+            "%s — bootstrap grace %d/%d, skipping",
+            context, skips, self._max_bootstrap_grace_skips,
+        )
+        return True
+
+    def _service_uptime_s(self) -> float | None:
+        """Seconds since the target unit entered active, or None if unknowable.
+
+        Reads systemd's MONOTONIC ActiveEnter timestamp so a wall-clock step
+        during boot (a containerized install's clock is stepped by the host
+        rather than disciplined by a local NTP daemon) cannot fake a large
+        uptime. Never raises: unit absent, systemd
+        unreachable, or unparsable output all return None, and the caller
+        falls through to the pre-existing restart path — the grace suppresses
+        only on a positive young reading.
+        """
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show", self._target_service,
+                 "--property=ActiveEnterTimestampMonotonic", "--value"],
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
+            )
+            raw = (result.stdout or "").strip()
+            if result.returncode != 0 or not raw.isdigit() or int(raw) == 0:
+                return None
+            uptime = time.clock_gettime(time.CLOCK_MONOTONIC) - int(raw) / 1e6
+            return uptime if uptime >= 0 else None
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+            return None
+
+    def _network_suppresses_restart(self, status: dict) -> bool:
+        """True ONLY when a FRESH sentinel probe reports degraded/offline.
+
+        Fails safe (returns False → allow restart) on: absent network field,
+        missing/garbled timestamp, or a STALE probe (dead/stalled sentinel).
+        status.json's own top-level freshness is not sufficient — the 60s
+        status-writer loop refreshes the file timestamp independently of the
+        sentinel, so a dead sentinel + live writer would look fresh forever with
+        a frozen network field. We therefore staleness-check the sentinel's OWN
+        last_probe_at, so a genuinely wedged server with a healthy network is
+        never left unrestarted.
+        """
+        try:
+            from datetime import UTC, datetime
+
+            from genesis.resilience import network_config, network_state
+
+            net = status.get("network")
+            if not isinstance(net, dict):
+                return False
+            if net.get("state") not in ("DEGRADED", "OFFLINE"):
+                return False
+            age = network_state.probe_age_s(net, datetime.now(UTC))
+            # None (absent/garbled) OR negative (a future timestamp from clock
+            # skew / bad data) → not a trustworthy fresh probe; fail toward restart.
+            if age is None or age < 0:
+                return False
+            threshold = network_config.structural().staleness_threshold_s
+            if age > threshold:
+                logger.info(
+                    "Network field stale (%.0fs > %ds) — NOT suppressing restart",
+                    age, threshold,
+                )
+                return False
+            return True
+        except Exception:
+            # Any failure in the connectivity check must fail toward restart.
+            logger.debug("Network suppression check failed — allowing restart", exc_info=True)
+            return False
 
     def _restart_if_allowed(self, state: dict, *, reason: str) -> WatchdogAction:
         """Shared restart logic: backoff → validation → restart or skip."""
@@ -213,6 +460,103 @@ class WatchdogChecker:
                 "Deploy in progress — deferring %s restart until it completes", reason,
             )
             return WatchdogAction.SKIP
+
+        # Down-vs-starved gate: for a genesis-server staleness/zombie restart,
+        # consult the OFF-loop liveness probe before restarting. A fresh, high-lag
+        # sample means the event loop is STARVED (background work saturating it),
+        # not dead — and a restart re-triggers the boot extraction backlog that
+        # caused the starvation (the mutual false-positive storm). Suppress the
+        # restart (BOUNDED, so a genuinely-stuck loop still recovers) and alert
+        # instead. Every ambiguous / dead / wedged verdict falls through to the
+        # normal restart path below: suppression requires a POSITIVE starved
+        # reading, so a truly-dead server is never left unrestarted. Runs BEFORE
+        # _record_failure so a suppressed cycle never trips backoff/flap counters.
+        if reason in ("stale_status_restart", "zombie_scheduler") and self._targets_server():
+            verdict, detail = self._probe_liveness()
+            d = detail or {}
+            if verdict == "starved":
+                skips = self._coerce_counter(state.get("starved_skips")) + 1
+                if skips <= self._liveness_max_starved_skips:
+                    state["starved_skips"] = skips
+                    if not self._save_state(state):
+                        # Same class as the bootstrap-grace persistence gate:
+                        # a suppression whose counter did not land is unbounded
+                        # on a box with a failing state write. Fall through to
+                        # the normal restart path instead of suppressing.
+                        logger.error(
+                            "Starved suppression NOT granted: skip counter "
+                            "could not be persisted — proceeding to normal "
+                            "restart logic.",
+                        )
+                    else:
+                        self._alert_starved(reason, d, skips)
+                        logger.warning(
+                            "Liveness probe: server UP but event loop STARVED "
+                            "(lag %sms, sample %ss old, executor=%s) — "
+                            "suppressing '%s' restart (%d/%d); a restart would "
+                            "re-trigger the starvation. Alerting instead.",
+                            d.get("lag_ms", "?"), d.get("sample_age_s", "?"),
+                            d.get("executor"), reason, skips,
+                            self._liveness_max_starved_skips,
+                        )
+                        return WatchdogAction.SKIP
+                # Past the suppression bound: stop suppressing and proceed to the
+                # restart path. Deliberately do NOT reset starved_skips here (that
+                # would re-enable suppression next cycle) — it stays pinned so we
+                # keep pressing to restart. Flap-damping/backoff below may still
+                # defer the actual restart, so this is "proceed", not a guarantee.
+                logger.error(
+                    "Liveness probe: loop still STARVED past the suppression bound "
+                    "(%d skips, bound %d) — no longer suppressing; proceeding to the "
+                    "restart path (flap-damping/backoff may still defer it).",
+                    skips - 1, self._liveness_max_starved_skips,
+                )
+                # fall through to restart
+            else:
+                # Any NON-starved verdict breaks the consecutive-starved run, so
+                # reset the counter (it means CONSECUTIVE starved skips) — else a
+                # responsive/unknown cycle that lands in a backoff window (no
+                # _record_failure) would leave a stale count to accumulate against.
+                if verdict == "wedged":
+                    logger.error(
+                        "Liveness probe: server reachable but loop-health sample is "
+                        "STALE (%ss old) — loop fully wedged (awareness/status/"
+                        "telegram all dead); restarting.",
+                        d.get("sample_age_s", "?"),
+                    )
+                if state.get("starved_skips"):
+                    state["starved_skips"] = 0
+                    self._save_state(state)
+                # down / unknown / wedged / responsive → normal restart logic below
+
+        # Flap damping: a SLOW recurring same-reason restart (spaced beyond the
+        # 120s stabilization window, so consecutive_failures keeps resetting to
+        # 0) would otherwise restart forever — restart cannot fix a persistent
+        # external cause (the 2026-07 outage flapped zombie_scheduler ~25x/12h).
+        # Once >= flap_threshold same-reason restarts land within flap_window,
+        # apply an escalating (capped) backoff and surface ONE durable warning
+        # instead of silently restarting again. This is a BACKOFF, never a
+        # permanent refusal — it self-heals once the window prunes. Rapid crash
+        # recovery is unaffected (that trips consecutive_failures/backoff below,
+        # within the stabilization window). PR-2 will additionally suppress
+        # zombie restarts outright when the connectivity sentinel reports offline.
+        now = time.time()
+        same_reason = [
+            h for h in state.get("restart_history", [])
+            if h.get("reason") == reason and now - h.get("ts", 0) <= self._flap_window_s
+        ]
+        if len(same_reason) >= self._flap_threshold:
+            over = len(same_reason) - self._flap_threshold + 1
+            flap_backoff = min(self._flap_backoff_max_s, self._backoff_max * (2**over))
+            last_ts = max(h["ts"] for h in same_reason)
+            if now < last_ts + flap_backoff:
+                self._alert_flap(reason, len(same_reason), flap_backoff)
+                logger.warning(
+                    "Flap damping: %d '%s' restarts within %ds — backing off "
+                    "%.0fs (restart cannot fix a recurring same-reason failure)",
+                    len(same_reason), reason, self._flap_window_s, flap_backoff,
+                )
+                return WatchdogAction.BACKOFF
 
         if state["consecutive_failures"] >= self._max_restarts:
             logger.error(
@@ -417,29 +761,328 @@ class WatchdogChecker:
     def _load_state(self) -> dict:
         if self._state_path.exists():
             try:
-                return json.loads(self._state_path.read_text())
+                loaded = json.loads(self._state_path.read_text())
             except (json.JSONDecodeError, OSError):
-                pass
-        return {"consecutive_failures": 0, "next_attempt_after": None, "last_reason": None, "last_restart_at": None, "last_check_at": None}
+                loaded = None
+            # Valid JSON that is not an object (a list, a bare string, a
+            # number) has no `.get`, so every normaliser and reader below
+            # would raise AttributeError. Treat it like unreadable state.
+            if isinstance(loaded, dict):
+                return self._normalise_numeric_fields(
+                    self._normalise_legacy_reasons(loaded),
+                )
+        return {"consecutive_failures": 0, "next_attempt_after": None, "last_reason": None, "last_restart_at": None, "last_check_at": None, "restart_history": []}
 
-    def _save_state(self, state: dict) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _coerce_counter(value: Any) -> int:
+        """A persisted counter as a usable non-negative int; 0 for anything else.
+
+        The suppression paths do arithmetic on these (``int(x) + 1``,
+        ``x += 1``), so a state file carrying null, a string, a dict or a
+        negative — corruption, a partial write, a hand-edit — otherwise takes
+        the oneshot down with TypeError/ValueError/KeyError on every check
+        instead of returning an action. Booleans are rejected explicitly: bool
+        is a subclass of int, but True is not a count. Resetting corruption to
+        0 re-grants a budget, which is the conservative direction (suppress,
+        bounded) rather than restart-storm, and it is self-limiting — the next
+        successful save rewrites the field as a real int.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            return 0
+        return max(0, int(value))
+
+    @staticmethod
+    def _coerce_epoch(value: Any) -> float | None:
+        """A persisted epoch/deadline as a float, or None for anything unusable.
+
+        ``next_attempt_after`` and ``last_restart_at`` are fed straight into
+        ``time.time() < x`` / ``time.time() - x``, which raise TypeError on a
+        string, a container or None-with-arithmetic. None is the field's own
+        "unset" value, so degrading to it is the correct failure mode: the
+        backoff/cooldown simply does not apply this cycle, and the next
+        decision writes a real timestamp.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            return None
+        return float(value)
+
+    @classmethod
+    def _normalise_numeric_fields(cls, state: dict) -> dict:
+        """Coerce every numeric field at the ONE load boundary, in place.
+
+        Same rationale as ``_normalise_legacy_reasons`` above: state enters the
+        checker through a single path, so hardening here is what keeps each
+        individual reader from having to remember the guard (and keeps a future
+        reader from reintroducing the crash). ``_record_check`` then writes the
+        cleaned values back, so corruption does not survive a tick.
+
+        The set is derived from the readers, not guessed: every field that
+        ``check()``/``_restart_if_allowed`` index with ``state[...]`` or do
+        arithmetic on. ``consecutive_failures`` and ``next_attempt_after`` are
+        materialised UNCONDITIONALLY because three readers subscript them
+        directly (watchdog.py:561, :568-569, :883) and would raise KeyError on a
+        state file that merely omits them — MEASURED, not hypothesised.
+        """
+        for key in ("starved_skips", "bootstrap_grace_skips"):
+            if key in state:
+                state[key] = cls._coerce_counter(state[key])
+        state["consecutive_failures"] = cls._coerce_counter(
+            state.get("consecutive_failures"),
+        )
+        state["next_attempt_after"] = cls._coerce_epoch(state.get("next_attempt_after"))
+        if "last_restart_at" in state:
+            state["last_restart_at"] = cls._coerce_epoch(state["last_restart_at"])
+        return state
+
+    @staticmethod
+    def _normalise_legacy_reasons(state: dict) -> dict:
+        """Rewrite reason strings persisted under a previous name, in place.
+
+        Covers both surfaces that carry one: every `restart_history` entry (which
+        the flap window matches by equality) and `last_reason` (which the
+        dashboard's degraded card renders). Without the second, an operator keeps
+        seeing the retired label until the next restart decision writes over it.
+
+        It also DROPS entries the rest of the class cannot read. Three separate
+        sites filter `restart_history` with ``h.get("reason")`` and
+        ``now - h.get("ts", 0)``, so a persisted entry that is not a dict, or
+        whose timestamp is not a number, takes the watchdog down with an
+        AttributeError or a TypeError — MEASURED on both shapes. Skipping such an
+        entry here (the previous behaviour) left it in the list for those three
+        readers to trip over.
+
+        Filtering at this ONE load path is deliberate: it is the only way state
+        enters the checker, so the three readers cannot each forget the guard.
+        The alternative — teaching every filter to skip malformed entries — is a
+        convention three call sites have to remember, and a fourth reader would
+        reintroduce the crash.
+
+        Valid unrelated entries are kept: a malformed neighbour must not discard
+        real flap history, or a corrupt write would silently reset the damping
+        that stops a restart loop.
+        """
+        history = state.get("restart_history") or []
+        if isinstance(history, list):
+            kept = []
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                ts = entry.get("ts", 0)
+                # bool is a subclass of int; a True timestamp is not a time.
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                    continue
+                if entry.get("reason") in _LEGACY_REASONS:
+                    entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+                kept.append(entry)
+            state["restart_history"] = kept
+        else:
+            # Not even a list — the shape below it cannot be trusted either.
+            state["restart_history"] = []
+        if state.get("last_reason") in _LEGACY_REASONS:
+            state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
+        return state
+
+    def _save_state(self, state: dict) -> bool:
+        """Persist state; True only when the write actually landed.
+
+        The return value is load-bearing for the bounded suppressions (bootstrap
+        grace, starved skips): a suppression whose counter did not persist is
+        unbounded on a box with a failing state write (disk-full, permissions —
+        each oneshot invocation would reload the old count and re-grant the same
+        slot forever), so callers grant a skip only on True.
+        """
         try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
             self._state_path.write_text(json.dumps(state))
+            return True
         except OSError:
             logger.error("Failed to save watchdog state to %s", self._state_path, exc_info=True)
+            return False
 
     def _record_failure(self, state: dict, *, reason: str) -> None:
+        now = time.time()
         state["consecutive_failures"] += 1
         state["last_reason"] = reason
-        state["last_restart_at"] = time.time()
+        state["last_restart_at"] = now
+        # An actual restart ends the current run of suppressed-starved cycles —
+        # the counter tracks CONSECUTIVE starved skips, so reset it here (a
+        # healthy reset via _reset_state also clears it by writing a fresh dict).
+        state["starved_skips"] = 0
+        # Rolling per-reason restart history for flap damping. Recorded on
+        # every actual restart decision (never on a backoff-skip), pruned to
+        # the flap window. Deliberately survives _reset_state so SLOW
+        # recurrences (spaced beyond the 120s stabilization window, which
+        # resets consecutive_failures to 0) are still counted — the hole that
+        # let the 2026-07 outage flap ~25x/12h.
+        history = [
+            h for h in state.get("restart_history", [])
+            if now - h.get("ts", 0) <= self._flap_window_s
+        ]
+        history.append({"ts": now, "reason": reason})
+        state["restart_history"] = history
         # Exponential backoff: initial * 2^(failures-1), capped
         backoff = min(
             self._backoff_initial * (2 ** (state["consecutive_failures"] - 1)),
             self._backoff_max,
         )
-        state["next_attempt_after"] = time.time() + backoff
+        state["next_attempt_after"] = now + backoff
         self._save_state(state)
+
+    def _alert_flap(self, reason: str, count: int, backoff_s: float) -> None:
+        """Surface ONE durable warning that the watchdog is flap-damping a
+        recurring same-reason restart. Routed through the alert queue (drained
+        to the owner by the awareness tick) because the oneshot watchdog has no
+        outreach pipeline; the dedupe_key collapses repeats to a single live
+        entry per reason. Best-effort — never raises."""
+        try:
+            from genesis.env import alert_queue_root
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                alert_queue_root(),
+                severity="warning",
+                source="watchdog",
+                title="Watchdog flap-damping repeated restarts",
+                body=(
+                    f"{count} '{reason}' restarts within {self._flap_window_s}s — "
+                    f"backing off {backoff_s:.0f}s. Restart cannot fix a recurring "
+                    f"same-reason failure; investigate the root cause "
+                    f"(e.g. connectivity loss or a crash loop)."
+                ),
+                dedupe_key=f"watchdog:flap:{reason}",
+            )
+        except Exception:
+            logger.debug("flap alert enqueue failed", exc_info=True)
+
+    def _targets_server(self) -> bool:
+        """True when this watchdog monitors genesis-server (not the legacy relay).
+
+        The liveness probe reflects the SERVER process's event loop; consulting it
+        for a relay-only legacy install would be meaningless, so the down-vs-starved
+        gate only engages when genesis-server is the target.
+        """
+        return "genesis-server" in self._target_service
+
+    def _probe_liveness(self) -> tuple[str, dict | None]:
+        """Classify the server's loop health via the OFF-loop sync probe.
+
+        Returns ``(verdict, loop_block)``. Verdicts:
+          - ``"down"``       — connection refused (nothing listening on the port)
+          - ``"unknown"``    — timeout / non-200 / unparseable / no loop sample
+          - ``"wedged"``     — 200 but the loop-health sample is STALE (sampler stopped)
+          - ``"starved"``    — 200, fresh sample, lag at/over the suppress threshold
+          - ``"responsive"`` — 200, fresh sample, low lag
+
+        Fail-closed: every ambiguous outcome is ``"unknown"``, which the caller
+        treats as "restart still allowed" — suppression requires a POSITIVE
+        ``"starved"`` reading. Never raises. Uses stdlib ``urllib`` (the watchdog
+        is a minimal oneshot; no httpx dependency). The 3s timeout bounds only a
+        hung TCP connect — the sync route reads memory and answers in milliseconds
+        even under full loop starvation, so this is not a speculative work-timeout.
+        """
+        import urllib.error
+        import urllib.request
+
+        try:
+            req = urllib.request.Request(self._liveness_url, method="GET")  # noqa: S310
+            # Loopback probe must NEVER traverse a proxy: an inherited http_proxy
+            # without a 127.0.0.1 no_proxy entry would route this LOCAL health check
+            # to the proxy — a proxy error → 'unknown' (blind restart returns), or a
+            # proxy-forged 200 → a WRONG 'starved' suppression of a needed restart.
+            # Mirror the proactive hook's trust_env=False with a proxy-free opener.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=3.0) as resp:
+                if resp.status != 200:
+                    return "unknown", None
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            # Connection refused (port not listening) is the unambiguous DOWN
+            # signal; everything else here (timeout, DNS, HTTP error) is unknown.
+            if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+                return "down", None
+            return "unknown", None
+        except (TimeoutError, OSError, ValueError):
+            # ValueError = JSON parse failure; TimeoutError/OSError = socket-level
+            # failures not wrapped in URLError. All ambiguous → unknown.
+            return "unknown", None
+
+        loop_block = body.get("loop") if isinstance(body, dict) else None
+        if not isinstance(loop_block, dict):
+            return "unknown", None
+        age = loop_block.get("sample_age_s")
+        lag = loop_block.get("lag_ms")
+        if not isinstance(age, (int, float)) or not isinstance(lag, (int, float)):
+            return "unknown", loop_block
+        if age > self._liveness_sample_stale_s:
+            return "wedged", loop_block
+        # Honor the CONFIGURED suppression floor only — do NOT also suppress on the
+        # sampler's independent warn-level `lagging` flag (default 250ms), which is
+        # below the 1000ms floor: suppressing there would contradict autonomy.yaml
+        # and hold back a restart on a merely-mildly-laggy server (bias to restart).
+        if lag >= self._liveness_lag_suppress_ms:
+            return "starved", loop_block
+        return "responsive", loop_block
+
+    def _alert_grace_exhausted(self, service_uptime: float, skips: int) -> None:
+        """Surface ONE durable alert that the bootstrap grace ran out — the
+        target keeps presenting a young uptime without ever writing a fresh
+        status file, the signature of a restart loop. Same queue + dedupe
+        mechanism as ``_alert_starved``. Best-effort — never raises."""
+        try:
+            from genesis.env import alert_queue_root
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                alert_queue_root(),
+                severity="warning",
+                source="watchdog",
+                title="Watchdog bootstrap grace exhausted — possible restart loop",
+                body=(
+                    f"{self._target_service} has consumed all "
+                    f"{skips}/{self._max_bootstrap_grace_skips} bootstrap-grace "
+                    f"skips: its unit uptime keeps reading young "
+                    f"({service_uptime:.0f}s) while the status file stays stale, "
+                    "which means it keeps (re)starting without ever finishing "
+                    "bootstrap. The watchdog has resumed normal stale-restart "
+                    "handling. Check the service journal for the crash cause."
+                ),
+                dedupe_key="watchdog:bootstrap-grace-exhausted",
+            )
+        except Exception:
+            logger.debug("Failed to enqueue grace-exhausted alert", exc_info=True)
+
+    def _alert_starved(self, reason: str, detail: dict, count: int) -> None:
+        """Surface ONE durable alert that a restart was suppressed because the
+        server is up-but-starved. Same queue + dedupe mechanism as ``_alert_flap``
+        (the oneshot watchdog has no outreach pipeline); the awareness tick drains
+        it to the owner. Best-effort — never raises."""
+        try:
+            from genesis.env import alert_queue_root
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                alert_queue_root(),
+                severity="warning",
+                source="watchdog",
+                title="Watchdog suppressed restart — server starved, not down",
+                body=(
+                    f"'{reason}' restart suppressed ({count}/"
+                    f"{self._liveness_max_starved_skips}): the liveness probe reports "
+                    f"the server UP but its event loop starved (lag "
+                    f"{detail.get('lag_ms', '?')}ms, sample "
+                    f"{detail.get('sample_age_s', '?')}s old, executor "
+                    f"{detail.get('executor')}). Restarting would re-trigger the boot "
+                    f"backlog that caused the starvation. Investigate loop/executor "
+                    f"load; the watchdog restarts anyway if it does not clear."
+                ),
+                dedupe_key="watchdog:starved",
+            )
+        except Exception:
+            logger.debug("starved alert enqueue failed", exc_info=True)
 
     def _reset_state(self) -> None:
         if not self._state_path.exists():
@@ -449,10 +1092,9 @@ class WatchdogChecker:
         # was attempted recently.  This prevents the counter from bouncing
         # back to 0 when a service briefly appears healthy right after
         # restart but crashes again within the cooldown window.
-        try:
-            state = json.loads(self._state_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            state = {}
+        # Via the hardened loader (not a raw json.loads) so the arithmetic
+        # below cannot trip over a corrupt/foreign-typed last_restart_at.
+        state = self._load_state()
 
         last_restart_at = state.get("last_restart_at")
         if last_restart_at is not None:
@@ -471,6 +1113,13 @@ class WatchdogChecker:
                     logger.error("Failed to save watchdog state", exc_info=True)
                 return
 
+        # Preserve the rolling restart history (pruned) across a healthy reset
+        # — wiping it here is exactly what let slow recurrences dodge damping.
+        now = time.time()
+        history = [
+            h for h in state.get("restart_history", [])
+            if now - h.get("ts", 0) <= self._flap_window_s
+        ]
         try:
             self._state_path.write_text(
                 json.dumps({
@@ -479,6 +1128,7 @@ class WatchdogChecker:
                     "last_reason": None,
                     "last_restart_at": None,
                     "last_check_at": datetime.now(UTC).isoformat(),
+                    "restart_history": history,
                 })
             )
         except OSError:

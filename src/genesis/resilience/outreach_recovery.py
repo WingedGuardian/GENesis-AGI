@@ -129,7 +129,11 @@ class OutreachRecoveryWorker:
         await self._queue.mark_processing(item_id)
 
         try:
-            from genesis.outreach.types import OutreachCategory, OutreachRequest
+            from genesis.outreach.types import (
+                OutreachCategory,
+                OutreachRequest,
+                OutreachStatus,
+            )
 
             category = OutreachCategory(payload.get("category", "alert"))
             request = OutreachRequest(
@@ -151,14 +155,47 @@ class OutreachRecoveryWorker:
 
             result = await self._pipeline.submit_raw(content, request)
 
-            if result.status.value == "delivered":
+            if result.status == OutreachStatus.DELIVERED:
                 await self._queue.mark_completed(item_id)
                 logger.info(
                     "Outreach recovery: delivered %s on attempt %d",
                     item_id, attempts + 1,
                 )
+            elif result.status in (OutreachStatus.REJECTED, OutreachStatus.HELD):
+                # TERMINAL, not a failure — stop retrying (mirrors alert_drain:
+                # DELIVERED and REJECTED are both terminal).
+                #  - REJECTED = governance dedup: an identical send already
+                #    reached the user; retrying just re-trips the dedup and
+                #    (pre-fix) burned all 5 attempts + filed a junk
+                #    delivery_exhausted observation.
+                #  - HELD = WS-8 email autonomy gate recorded a pending hold and
+                #    owns delivery via its resolution watcher; retrying here
+                #    re-gates and records a NEW hold each cycle.
+                # mark_completed (not discarded) so the row is not surfaced as a
+                # failure by crud.query_failed.
+                await self._queue.mark_completed(item_id)
+                logger.info(
+                    "Outreach recovery: %s terminal for %s (%s) — done, no retry",
+                    result.status.value, item_id,
+                    "duplicate of a delivered send"
+                    if result.status == OutreachStatus.REJECTED
+                    else "held by email autonomy gate",
+                )
+            elif result.status == OutreachStatus.IGNORED:
+                # Permanent non-delivery (self-addressed / unresolved recipient
+                # — pipeline._deliver returns IGNORED), NOT a transient failure.
+                # Discard so it neither retries nor files a junk
+                # delivery_exhausted observation (same class as REJECTED/HELD).
+                await self._queue.mark_discarded(
+                    item_id,
+                    f"outreach ignored (not retriable): {result.error or 'suppressed'}",
+                )
+                logger.info(
+                    "Outreach recovery: ignored (not retriable) for %s: %s",
+                    item_id, result.error or "suppressed",
+                )
             else:
-                # Delivery failed again
+                # Delivery failed again (FAILED/PENDING/…) — retry next cycle.
                 await self._queue.reset_to_pending(item_id)
                 logger.warning(
                     "Outreach recovery: retry %d/%d failed for %s: %s",

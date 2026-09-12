@@ -26,6 +26,7 @@ import time
 
 from genesis.cc.conversation import ConversationLoop
 from genesis.cc.system_prompt import SystemPromptAssembler
+from genesis.channels.bridge_config import build_bridge_config, parse_secrets_env_text
 from genesis.channels.config import load_channel_defaults as _load_channel_defaults  # noqa: F401
 from genesis.env import secrets_path
 from genesis.runtime import GenesisRuntime
@@ -49,50 +50,14 @@ def _load_bridge_config() -> dict | None:
         log.error("Secrets file not found: %s — cannot start (broken install?)", path)
         sys.exit(2)
 
-    secrets: dict[str, str] = {}
     with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, _, value = line.partition("=")
-                secrets[key.strip()] = value.strip().strip('"')
+        text = f.read()
 
-    token = secrets.get("TELEGRAM_BOT_TOKEN", "")
-    if not token or token == "PLACEHOLDER":  # noqa: S105 - sentinel placeholder, not a credential
-        log.info("TELEGRAM_BOT_TOKEN not set — Telegram adapter will not start")
-        return None
-
-    allowed_users: set[int] = set()
-    allowed_raw = secrets.get("TELEGRAM_ALLOWED_USERS", "")
-    if allowed_raw:
-        for uid in allowed_raw.split(","):
-            uid = uid.strip()
-            if uid.isdigit():
-                allowed_users.add(int(uid))
-            elif uid:
-                log.warning("Invalid UID in TELEGRAM_ALLOWED_USERS: %r", uid)
-
-    if not allowed_users:
-        log.error(
-            "TELEGRAM_ALLOWED_USERS is empty or has no valid user IDs — "
-            "Telegram will not start. Set numeric user IDs "
-            "(get yours from @userinfobot on Telegram)"
-        )
-        return None
-
-    # Optional forum chat ID for per-session topics
-    forum_raw = secrets.get("TELEGRAM_FORUM_CHAT_ID", "")
-    forum_chat_id = int(forum_raw) if forum_raw.strip().lstrip("-").isdigit() else None
-
-    return {
-        "token": token,
-        "allowed_users": allowed_users,
-        "whisper_model": secrets.get("WHISPER_MODEL", "whisper-large-v3"),
-        "day_boundary_hour": int(secrets.get("DAY_BOUNDARY_HOUR", "0")),
-        "forum_chat_id": forum_chat_id,
-    }
+    # Parse + validate via the shared, side-effect-free loader (the SAME code the
+    # onboarding readiness T2 signal uses, so the "would Telegram start?" answer can
+    # never drift between the two). ``log`` threads the adapter's diagnostics; a
+    # malformed value still raises here exactly as before (adapter stays stopped).
+    return build_bridge_config(parse_secrets_env_text(text), log=log)
 
 
 

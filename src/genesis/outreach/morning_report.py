@@ -7,13 +7,45 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+import httpx
 
 from genesis.content.drafter import ContentDrafter
 from genesis.content.types import DraftRequest, FormatTarget
 from genesis.db.crud.observations import INTERNAL_OBS_TYPES as _INTERNAL_OBS_TYPES_SET
 from genesis.outreach.types import OutreachCategory, OutreachRequest
+from genesis.session_awareness.ledger_escalation_link import (
+    ESCALATION_SOURCE as _LEDGER_ESCALATION_SOURCE,
+)
 
 logger = logging.getLogger(__name__)
+
+# Follow-up sources whose CONTENT has not been through a redaction pass and so
+# must never reach this report. The report is an EGRESS surface — it renders
+# `content[:200]` into a Telegram message — and these carry text this system did
+# not author.
+#
+# `ledger_escalation` reproduces `session_ledger` row text verbatim, and real
+# rows on a live install have carried credentials a session pasted into the
+# ledger. Those rows ship `domain=None`, which every bucket's exact-match
+# `user_world` filter already excludes — but the follow-up's own body ASKS the
+# reader to classify it, so a guarantee resting on that default holds only until
+# someone answers the question the feature itself poses.
+_UNREDACTED_CONTENT_SOURCES = frozenset({_LEDGER_ESCALATION_SOURCE})
+
+
+def _drop_unredacted_sources(rows: list[dict]) -> list[dict]:
+    """Remove rows whose source is not safe to render to an egress surface.
+
+    ONE chokepoint applied to EVERY bucket, rather than a filter at the bucket
+    that happened to prompt it. The first version of this guarded only the
+    "Needs your input" list; `blocked/failed` and `completed (24h)` render the
+    same `content` field to the same Telegram message and had no filter at all,
+    so the leak had three doors and one was shut. A source-exclusion rule that
+    each new bucket must REMEMBER to apply is a convention, and conventions are
+    what reviewers find one instance of at a time — so a bucket now has to route
+    through here to render anything.
+    """
+    return [row for row in rows if row.get("source") not in _UNREDACTED_CONTENT_SOURCES]
 
 # Convert to tuple for db.execute() compatibility (requires sequence, not frozenset)
 _INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
@@ -61,8 +93,51 @@ _STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "med
 _BUILD_PR_CI_TIMEOUT_S = 20  # per-PR gh call; PRs are checked concurrently
 _MAX_BUILD_PR_CHECKS = 10    # cap concurrent gh calls (rate-limit safety)
 
+_GITHUB_STATUS_URL = "https://www.githubstatus.com/api/v2/components.json"
+_GH_STATUS_TIMEOUT_S = 5  # preflight only; a slow/unreachable status page fails open
+# Statuspage's documented non-operational component states. An explicit
+# allowlist: any OTHER value (schema-invalid types, new/unknown states,
+# "operational") does NOT count as degraded — fail-open by construction.
+# under_maintenance included (Codex P2): scheduled Actions maintenance stalls
+# CI for infra reasons exactly like an outage does.
+_GH_DEGRADED_STATUSES = frozenset(
+    {"degraded_performance", "partial_outage", "major_outage", "under_maintenance"}
+)
 
-async def _pr_ci_status(pr_url: str) -> str | None:
+
+async def _github_actions_degraded() -> bool:
+    """True only when the GitHub *Actions* component reports a degraded state.
+
+    Component-scoped (``/api/v2/components.json``, the ``Actions`` entry) — the
+    aggregate status indicator also trips on unrelated components (Packages,
+    Codespaces), which would mislabel genuine CI failures as infra incidents.
+    Degraded ONLY when the component's status is a string in the documented
+    non-operational enum (explicit allowlist). Fail-OPEN: any error, timeout,
+    missing component, or malformed/unknown status returns False, so a real CI
+    failure is never masked — this only ever ADDS a hedged 'incident' annotation
+    when GitHub positively confirms an Actions problem.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_GH_STATUS_TIMEOUT_S) as client:
+            resp = await client.get(_GITHUB_STATUS_URL)
+            resp.raise_for_status()
+            components = (resp.json() or {}).get("components") or []
+        for comp in components:
+            if not isinstance(comp, dict):
+                continue
+            if str(comp.get("name") or "").strip().lower() != "actions":
+                continue
+            status = comp.get("status")
+            return isinstance(status, str) and status.lower() in _GH_DEGRADED_STATUSES
+        return False  # Actions component not found → cannot confirm → fail open
+    except Exception:
+        logger.debug("githubstatus preflight failed; failing open", exc_info=True)
+        return False
+
+
+async def _pr_ci_status(
+    pr_url: str, *, actions_degraded: bool | None = None
+) -> str | None:
     """One-shot CI rollup for a draft build PR via
     ``gh pr view <url> --json statusCheckRollup``. Returns a compact word
     ('passing'/'failing'/'pending'/'no checks'), or None on error/timeout.
@@ -70,6 +145,10 @@ async def _pr_ci_status(pr_url: str) -> str | None:
     Uses the shared ``run_gh`` helper, which kills+reaps the child process on
     timeout (the process-kill sequence is easy to get subtly wrong, so it is
     not re-implemented here).
+
+    ``actions_degraded`` is the GitHub-incident state, resolved ONCE per report
+    by the caller and passed in so an outage does not trigger one status GET per
+    failing PR. When ``None`` (default), it is resolved lazily per call.
     """
     import json
 
@@ -87,7 +166,18 @@ async def _pr_ci_status(pr_url: str) -> str | None:
         checks = json.loads(raw).get("statusCheckRollup") or []
     except (ValueError, TypeError):
         return None
-    return _summarize_ci_rollup(checks)
+    summary = _summarize_ci_rollup(checks)
+    # A GitHub Actions outage surfaces as 'failing' (runner startup/cancel) or a
+    # stuck 'pending' — annotate (never suppress) when GitHub confirms an incident.
+    if summary in ("failing", "pending"):
+        degraded = (
+            actions_degraded
+            if actions_degraded is not None
+            else await _github_actions_degraded()
+        )
+        if degraded:
+            return f"{summary} (GitHub Actions incident, may not be a code issue)"
+    return summary
 
 
 def _summarize_ci_rollup(checks: list) -> str:
@@ -652,8 +742,17 @@ class MorningReportGenerator:
 
         if open_prs:
             checked = open_prs[:_MAX_BUILD_PR_CHECKS]
+            # Resolve the GitHub-incident state ONCE per report — it is global to
+            # all PRs; resolving per-PR would fire N concurrent identical status
+            # GETs during an outage (exactly when this path is hot).
+            actions_degraded = await _github_actions_degraded()
             ci_states = await asyncio.gather(
-                *[_pr_ci_status(r.get("pr_url") or "") for r in checked]
+                *[
+                    _pr_ci_status(
+                        r.get("pr_url") or "", actions_degraded=actions_degraded
+                    )
+                    for r in checked
+                ]
             )
             lines.append("")
             lines.append("Open build PRs (draft, awaiting your review/merge):")
@@ -781,6 +880,7 @@ class MorningReportGenerator:
         user_items = await follow_ups.get_pending(
             self._db, strategy="user_input_needed", domain="user_world",
         )
+        user_items = _drop_unredacted_sources(user_items)
         if user_items:
             shown = (
                 f" (showing 5 of {len(user_items)})" if len(user_items) > 5 else ""
@@ -794,6 +894,7 @@ class MorningReportGenerator:
         # Blocked/failed items
         blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
         blocked += await follow_ups.get_by_status(self._db, "blocked", domain="user_world")
+        blocked = _drop_unredacted_sources(blocked)
         if blocked:
             shown = (
                 f" (showing 5 of {len(blocked)})" if len(blocked) > 5 else ""
@@ -810,6 +911,7 @@ class MorningReportGenerator:
         completed = await follow_ups.get_recently_completed(
             self._db, hours=24, limit=5, domain="user_world",
         )
+        completed = _drop_unredacted_sources(completed)
         if completed:
             lines.append("**Completed (24h):**")
             for row in completed:
@@ -852,6 +954,12 @@ class MorningReportGenerator:
         section entirely. This is not a standing checklist.
         """
         lines: list[str] = []
+        # Subsystems already surfaced via a ``subsystem_stale:<name>`` or
+        # ``subsystem_never_started:<name>`` alert in the health-alerts block below —
+        # the heartbeat-staleness block must not list them a SECOND time (P2-6 dedup).
+        # Populated from the alerts actually emitted, so it stays correct if the alert
+        # set changes.
+        stale_alert_names: set[str] = set()
 
         # Health alerts (call sites down, queue depth, resilience warnings)
         try:
@@ -873,15 +981,28 @@ class MorningReportGenerator:
                         f"- **{severity}**: {a.get('message', 'Unknown')} "
                         f"(id: {alert_id})"
                     )
+                    if alert_id.startswith(
+                        ("subsystem_stale:", "subsystem_never_started:")
+                    ):
+                        # never_started is rendered HERE (via the alert), and its
+                        # heartbeat status ("never_started") is not "overdue" so the
+                        # block below skips it anyway — capture the name regardless so
+                        # the dedup set stays complete if that block ever widens.
+                        stale_alert_names.add(alert_id.split(":", 1)[1])
         except Exception:
             logger.warning("Failed to query health alerts for morning report", exc_info=True)
 
-        # Subsystem heartbeat staleness (detects silent deaths)
+        # Subsystem heartbeat staleness (detects silent deaths). Covers subsystems
+        # NOT already alerted above (e.g. surplus/outreach have a heartbeat but no
+        # subsystem_stale alert) — the alerted ones are skipped to avoid a duplicate
+        # line. A "paused" verdict is legitimately quiet (not overdue) → skipped.
         try:
             from genesis.mcp.health.manifest import _impl_subsystem_heartbeats
 
             heartbeats = await _impl_subsystem_heartbeats()
             for name, info in heartbeats.items():
+                if name in stale_alert_names:
+                    continue  # already surfaced via its subsystem_stale alert above
                 if info.get("status") == "overdue":
                     age = info.get("age_seconds", 0)
                     age_h = age / 3600 if age else 0

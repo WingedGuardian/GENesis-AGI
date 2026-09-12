@@ -1,8 +1,9 @@
 """Adversarial review for dream cycle synthesis and entity resolution.
 
-Uses a different LLM provider than the synthesizer to verify faithfulness.
-Synthesis: DeepSeek produces, Kimi challenges.
-Entity: Kimi judges, DeepSeek challenges.
+Uses a different LLM model than the base call to verify faithfulness, so the
+challenge is model-independent (guarded by the base != challenge routing invariant):
+Synthesis: DeepSeek produces, a non-DeepSeek model challenges.
+Entity: a free SLM judges, DeepSeek challenges.
 
 Fail-safe: any error or ambiguity defaults to blocking deprecation.
 """

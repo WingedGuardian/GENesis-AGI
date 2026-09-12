@@ -79,18 +79,130 @@ async def ego_status():
             "gated": False,
         }
         # Display hint: is this ego currently blocked on a pending CLI approval?
-        # Best-effort — a query failure must not 500 the dashboard.
+        # Policy-aware: when the mandatory gate is OFF a leftover pending row no
+        # longer blocks dispatch (see approval_gate), so it must not read as
+        # "gated" here either — otherwise the badge shows a phantom "waiting on
+        # approval". Best-effort — a query failure must not 500 the dashboard.
         try:
-            snap["gated"] = await ego_crud.has_pending_cli_approval(
+            from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+
+            gate_on = load_autonomous_cli_policy().manual_approval_required
+            snap["gated"] = (
+                await ego_crud.has_pending_cli_approval(rt._db, mgr.source_tag)
+                if gate_on
+                else False
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "ego gated-badge query failed for %s",
+                getattr(mgr, "source_tag", "?"),
+                exc_info=True,
+            )
+            snap["gated_error"] = True
+        # Truthful liveness: is the ego actively trying to cycle but NOT
+        # completing? Compares last INTENT-to-cycle (_last_proactive_fire_at,
+        # set only after every cadence gate passes) with last COMPLETED cycle
+        # (job_health.last_success) — NOT the is_running / next_fire_at proxies
+        # that stay green while deadlocked. Every legitimate non-running reason
+        # (idle/quiet/paused/global-pause/circuit) prevents an intent from being
+        # recorded, so it is excluded by construction; gated is excluded in the
+        # helper. Best-effort. (see ego.liveness)
+        snap["last_success_at"] = None
+        snap["stalled"] = False
+        snap["stall_reason"] = None
+        try:
+            from genesis.db.crud import job_health as job_health_crud
+            from genesis.ego.liveness import compute_ego_liveness
+
+            last_success = await job_health_crud.get_job_last_success(
                 rt._db,
                 mgr.source_tag,
             )
+            last_intent = await ego_crud.get_state(
+                rt._db,
+                f"last_proactive_fire:{mgr.source_tag}",
+            )
+            last_gated = await ego_crud.get_state(
+                rt._db,
+                f"last_gated:{mgr.source_tag}",
+            )
+            live = compute_ego_liveness(
+                last_success_at=last_success,
+                last_intent_at=last_intent,
+                current_interval_minutes=mgr.current_interval_minutes,
+                gated=bool(snap.get("gated")),
+                last_gated_at=last_gated,
+            )
+            snap["last_success_at"] = live.last_success_at
+            snap["stalled"] = live.stalled
+            snap["stall_reason"] = live.reason
         except Exception:
-            snap["gated_error"] = True
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "ego liveness computation failed for %s",
+                getattr(mgr, "source_tag", "?"),
+                exc_info=True,
+            )
+            snap["liveness_error"] = True
         return snap
 
     user_cadence = await _cadence_snapshot(rt._ego_cadence_manager)
     genesis_cadence = await _cadence_snapshot(rt._genesis_ego_cadence_manager)
+
+    # Total-cessation (scheduler-death) tile signal. The per-ego intent-lag
+    # liveness (``stalled`` above) is BLIND to it: when a cadence scheduler dies,
+    # last_proactive_fire and last_success freeze together, the lag never opens,
+    # and the verdict stays healthy (see ego.liveness coverage boundary). The
+    # dedicated 5-min ego_heartbeat pulse keeps beating through a consumer/gate
+    # deadlock and stops ONLY on scheduler death, so its staleness is the honest
+    # total-cessation signal — reading the SAME signal + 4h threshold as the
+    # subsystem_stale:ego alert, so tile and alert can never disagree.
+    # SCHEDULER-LEVEL: the Subsystem.EGO heartbeat is shared across both ego
+    # managers, so it goes stale only when BOTH stop (or the process dies);
+    # single-ego cessation needs per-ego heartbeat tagging (follow-up).
+    # raise_on_error=True → a broken read fails LOUD (unknown), never a spurious
+    # healthy tile.
+    ego_heartbeat_stale = False
+    ego_heartbeat_age_s = None
+    ego_heartbeat_error = False
+    try:
+        from datetime import UTC, datetime
+
+        from genesis.mcp.health.manifest import (
+            HEARTBEAT_EXPECTED,
+            compute_heartbeat_staleness,
+        )
+
+        hb = await compute_heartbeat_staleness("ego", db=rt._db, raise_on_error=True)
+        status = hb.get("status")
+        ego_heartbeat_stale = status == "overdue"
+        ego_heartbeat_age_s = hb.get("age_seconds")
+        # unknown (unparseable/future ts) can't confirm liveness → error, not healthy.
+        # never_started (#10): compute_heartbeat_staleness now resolves the manifest-
+        # informed "failed to start / never pulsed" verdict itself → error, not healthy
+        # (this is the case the no_heartbeat boot-grace block below used to catch before
+        # compute owned it; keep flagging it so a dead-at-boot ego tile is never green).
+        ego_heartbeat_error = status in ("unknown", "never_started")
+        # no_heartbeat = NO pulse on record. ego emits a "start" pulse at bootstrap
+        # (cadence.py:302), so past a short boot-grace window this is a real absence
+        # (never-started / lost), NOT a healthy tile. Within the grace window (just
+        # after boot, ego's first pulse pending) it is benign. A None boot stamp
+        # (degraded boot) → no grace → treat as error (fail-loud, the safe way). (P2-5)
+        if status == "no_heartbeat":
+            _booted_at = getattr(rt, "_bootstrap_completed_at", None)
+            _grace_s = HEARTBEAT_EXPECTED["ego"][0] + 60  # one pulse interval + margin
+            within_grace = False
+            if _booted_at is not None:
+                within_grace = (datetime.now(UTC) - _booted_at).total_seconds() < _grace_s
+            ego_heartbeat_error = not within_grace
+    except Exception:
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug("ego heartbeat-staleness read failed", exc_info=True)
+        ego_heartbeat_error = True
 
     # Genesis ego config — uses dedicated config fields
     genesis_ego_config = {
@@ -145,6 +257,11 @@ async def ego_status():
             "uncompacted_cycles": uncompacted,
             "shadow_morning_report": config.shadow_morning_report,
             "board_size": config.board_size,
+            # Scheduler-level total-cessation signal (egoSemantic flips the tile
+            # + rollup red on stale; unknown/error → unknown, never a green lie).
+            "ego_heartbeat_stale": ego_heartbeat_stale,
+            "ego_heartbeat_age_s": ego_heartbeat_age_s,
+            "ego_heartbeat_error": ego_heartbeat_error,
             "egos": egos,
         }
     )
@@ -253,6 +370,9 @@ async def ego_proposals():
                 "recurring": bool(p.get("recurring", 0)),
                 "ego_source": p.get("ego_source"),
                 "realist_verdict": p.get("realist_verdict"),
+                "revision_num": p.get("revision_num", 1),
+                "revalidate_at": p.get("revalidate_at"),
+                "last_validated_at": p.get("last_validated_at"),
             }
             for p in pending
         ]
@@ -335,6 +455,8 @@ async def ego_cadence():
 @_async_route
 async def ego_proposals_all():
     """Return all proposals with optional status filter and limit."""
+    import contextlib
+
     from genesis.db.crud import ego as ego_crud
     from genesis.runtime import GenesisRuntime
 
@@ -346,6 +468,18 @@ async def ego_proposals_all():
     limit = min(request.args.get("limit", 50, type=int), 200)
 
     proposals = await ego_crud.list_proposals(rt._db, status=status, limit=limit)
+    # Surface completed ego-dispatch findings: attach the dispatch session's
+    # output excerpt + transcript pointer so the debrief is discoverable in the
+    # dashboard, not just the 1000-char user_response summary.
+    from genesis.db.crud import cc_sessions as cc_sessions_crud
+
+    # Best-effort: a join failure (e.g. a legacy row with non-JSON metadata) must
+    # never 500 the core proposals list — degrade to no dispatch info.
+    dispatch_map: dict = {}
+    with contextlib.suppress(Exception):
+        dispatch_map = await cc_sessions_crud.dispatch_info_for_proposals(
+            rt._db, [p["id"] for p in proposals]
+        )
     return jsonify(
         [
             {
@@ -368,6 +502,10 @@ async def ego_proposals_all():
                 "execution_plan": p.get("execution_plan"),
                 "recurring": bool(p.get("recurring", 0)),
                 "ego_source": p.get("ego_source"),
+                "revision_num": p.get("revision_num", 1),
+                "revalidate_at": p.get("revalidate_at"),
+                "last_validated_at": p.get("last_validated_at"),
+                "dispatch": dispatch_map.get(p["id"]),
             }
             for p in proposals
         ]
@@ -391,13 +529,46 @@ async def ego_proposal_resolve(proposal_id: str):
         return jsonify({"ok": False, "error": "status must be 'approved' or 'rejected'"}), 400
 
     user_response = body.get("response", "")
+    # PR-6a resolve-side guard: pin the resolve to the revision the browser
+    # rendered (sent in the POST body). Absent → None → unguarded (behaves as
+    # today); NEVER default to 1. Coerce a stringified body value to int so a
+    # well-formed guard cannot misfire on a type mismatch.
+    expected_revision = body.get("revision_num")
+    if isinstance(expected_revision, str):
+        expected_revision = int(expected_revision) if expected_revision.isdigit() else None
     updated = await ego_crud.resolve_proposal(
         rt._db,
         proposal_id,
         status=status,
         user_response=user_response,
+        expected_revision=expected_revision,
     )
     if not updated:
+        # Disambiguate a stale-revision refusal (row still pending but revised
+        # since the browser rendered it) from a genuinely gone / already-resolved
+        # proposal — the client shows a re-review prompt on 409, an error on 404.
+        fresh = None
+        try:
+            fresh = await ego_crud.get_proposal(rt._db, proposal_id)
+        except Exception:
+            fresh = None
+        if (
+            fresh is not None
+            and fresh.get("status") == "pending"
+            and expected_revision is not None
+            and fresh.get("revision_num") != expected_revision
+        ):
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "stale_revision",
+                        "message": "This proposal was revised — re-review before resolving.",
+                        "revision_num": fresh.get("revision_num"),
+                    }
+                ),
+                409,
+            )
         return jsonify({"ok": False, "error": "proposal not found or not pending"}), 404
 
     # Shared post-resolution hook: journal + J-9 + decision capture +
@@ -488,3 +659,140 @@ async def ego_vcr():
 
     data = await compute_vcr(rt._db, days=30)
     return jsonify(data)
+
+
+# ── Directives & goals visibility (read + user-driven retire) ──────────
+
+
+def _directive_view(d: dict) -> dict:
+    """Project a directive row to the dashboard payload."""
+    return {
+        "id": d["id"],
+        "content": d["content"],
+        "priority": d["priority"],
+        "source": d["source"],
+        "ego_target": d["ego_target"],
+        "status": d["status"],
+        "created_at": d["created_at"],
+        "resolved_at": d.get("resolved_at"),
+        "resolution": d.get("resolution"),
+        "reaffirm_count": d.get("reaffirm_count", 0),
+        "last_reaffirmed_at": d.get("last_reaffirmed_at"),
+    }
+
+
+def _goal_view(g: dict) -> dict:
+    """Project a goal row to the dashboard payload."""
+    return {
+        "id": g["id"],
+        "title": g["title"],
+        "description": g.get("description"),
+        "category": g["category"],
+        "priority": g["priority"],
+        "status": g["status"],
+        "timeline": g.get("timeline"),
+        "confidence": g.get("confidence"),
+        "goal_type": g.get("goal_type"),
+        "origin": g.get("origin"),
+        "created_at": g["created_at"],
+        "updated_at": g.get("updated_at"),
+    }
+
+
+@blueprint.route("/api/genesis/ego/directives")
+@_async_route
+async def ego_directives():
+    """Active directives (both egos) + recently-resolved history.
+
+    Visibility surface so the user can see — and via the resolve endpoint,
+    retire — the standing directives driving each ego. Decision rows
+    (kind='decision') are excluded; they have their own lifecycle.
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"active": [], "resolved": []})
+
+    active = await ego_crud.list_directives(rt._db, statuses=("active",), limit=50)
+    resolved = await ego_crud.list_directives(rt._db, statuses=("completed", "cancelled"), limit=5)
+    # Recency window: directives resolve rarely, so without a cutoff the same
+    # handful of resolved rows lingers in this history for months.
+    from datetime import UTC, datetime, timedelta
+
+    _cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat()
+    resolved = [d for d in resolved if (d.get("resolved_at") or "") >= _cutoff]
+    return jsonify(
+        {
+            "active": [_directive_view(d) for d in active],
+            "resolved": [_directive_view(d) for d in resolved],
+        }
+    )
+
+
+@blueprint.route("/api/genesis/ego/goals")
+@_async_route
+async def ego_goals():
+    """Active goals split by provenance — user directives vs ego own-goals.
+
+    Read-only visibility (no goal mutation here). ``genesis_ego`` is the ego's
+    own-goal lane; ``user`` are the user's goals. Either list may be empty on a
+    fresh install.
+    """
+    from genesis.db.crud import user_goals as goals_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"user": [], "genesis_ego": []})
+
+    # Query each lane separately so a busy user-goal lane can't starve the
+    # own-goal lane under a shared LIMIT, and only the two known origins render.
+    user_goals = await goals_crud.list_active(rt._db, limit=50, origin="user")
+    own_goals = await goals_crud.list_active(rt._db, limit=50, origin="genesis_ego")
+    return jsonify(
+        {
+            "user": [_goal_view(g) for g in user_goals],
+            "genesis_ego": [_goal_view(g) for g in own_goals],
+        }
+    )
+
+
+@blueprint.route("/api/genesis/ego/directives/<directive_id>/resolve", methods=["POST"])
+@_async_route
+async def ego_directive_resolve(directive_id: str):
+    """Retire a standing directive from the dashboard (a user action).
+
+    Default is a 'cancelled' retire (no longer relevant); pass
+    status='completed' to mark it done instead. Decision rows are structurally
+    refused by ``resolve_directive`` (kind != 'decision').
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"ok": False, "error": "not bootstrapped"}), 503
+
+    body = request.get_json(silent=True) or {}
+    status = body.get("status", "cancelled")
+    if status not in ("completed", "cancelled"):
+        return jsonify({"ok": False, "error": "status must be 'completed' or 'cancelled'"}), 400
+    resolution = body.get("resolution") or "Retired via dashboard"
+
+    updated = await ego_crud.resolve_directive(
+        rt._db,
+        directive_id,
+        status=status,
+        resolution=resolution,
+    )
+    if not updated:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "directive not found, already resolved, or a decision row",
+            }
+        ), 404
+
+    return jsonify({"ok": True, "id": directive_id, "status": status})

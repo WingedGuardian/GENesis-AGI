@@ -19,6 +19,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from genesis.db.crud.observations import SAFE_ORIGIN_SQL
+
 logger = logging.getLogger(__name__)
 
 _OUTPUT_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
@@ -165,10 +167,13 @@ async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
     """
     try:
         cursor = await db.execute(
-            "SELECT source, content, MAX(created_at) as latest "
+            "SELECT source, content, MAX(created_at) as latest "  # noqa: S608 - SAFE_ORIGIN_SQL is a module constant literal, no user input
             "FROM observations "
             "WHERE type = 'conversation_pivot' "
             "AND created_at > datetime('now', '-4 hours') "
+            # WS-3: exclude external/unknown-origin rows from the L1 file
+            # (fail-closed; NULL excluded). Own-session pivots stamp `owner`.
+            f"AND {SAFE_ORIGIN_SQL} "
             "GROUP BY source "
             "ORDER BY latest DESC LIMIT 5"
         )
@@ -255,6 +260,9 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
             "SELECT content FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
+            # WS-3: exclude external/unknown-origin content from the L1 file
+            # (fail-closed; NULL excluded post-backfill).
+            f"AND {SAFE_ORIGIN_SQL} "
             "AND created_at > datetime('now', ?) "
             "ORDER BY created_at DESC LIMIT 10",
             (*_EXCLUDED_TYPES, f"-{days} days"),

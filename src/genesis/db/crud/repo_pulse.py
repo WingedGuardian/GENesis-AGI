@@ -21,6 +21,9 @@ import aiosqlite
 
 RUN_STATUSES = ("ok", "failed", "timeout", "lock_busy", "no_new_prs")
 TIERS = ("exact", "fuzzy")
+# Which store an annotation's item_id addresses (a8a4f59e). Absent → 'ledger'
+# (the original lane), so pre-target_kind callers keep working unchanged.
+TARGET_KINDS = ("ledger", "follow_up")
 ANNOTATION_STATUSES = ("applied", "proposed", "confirmed", "rejected", "superseded")
 # Terminal states a 'proposed' annotation may resolve to (reconciliation / 4b buttons).
 RESOLUTION_STATUSES = ("confirmed", "rejected", "superseded")
@@ -44,6 +47,37 @@ async def _tables_available(db: aiosqlite.Connection) -> bool:
     if exists:
         _tables_verified = True
     return exists
+
+
+_ANNOTATION_INSERT_SQL = (
+    "INSERT OR IGNORE INTO repo_pulse_annotations "
+    "(id, run_id, observed_at, tier, item_id, item_session_id, "
+    "item_text, pr_number, pr_title, pr_merged_at, confidence, "
+    "rationale, status, resolved_at, resolution_ref, target_kind) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _annotation_params(ann: dict, run_id: str) -> tuple:
+    """Positional params for ``_ANNOTATION_INSERT_SQL`` from an annotation dict."""
+    return (
+        ann["id"],
+        run_id,
+        ann["observed_at"],
+        ann["tier"],
+        ann["item_id"],
+        ann.get("item_session_id"),
+        ann.get("item_text"),
+        ann["pr_number"],
+        ann.get("pr_title"),
+        ann.get("pr_merged_at"),
+        ann.get("confidence"),
+        ann.get("rationale"),
+        ann["status"],
+        ann.get("resolved_at"),
+        ann.get("resolution_ref"),
+        ann.get("target_kind", "ledger"),
+    )
 
 
 async def record_run(
@@ -89,6 +123,8 @@ async def record_run(
     for ann in annotations or []:
         if ann.get("tier") not in TIERS:
             raise ValueError(f"invalid annotation tier: {ann.get('tier')!r}")
+        if ann.get("target_kind", "ledger") not in TARGET_KINDS:
+            raise ValueError(f"invalid annotation target_kind: {ann.get('target_kind')!r}")
         if ann.get("status") not in ANNOTATION_STATUSES:
             raise ValueError(f"invalid annotation status: {ann.get('status')!r}")
         if not ann.get("item_id"):
@@ -124,31 +160,33 @@ async def record_run(
         ),
     )
     for ann in annotations or []:
-        await db.execute(
-            "INSERT OR IGNORE INTO repo_pulse_annotations "
-            "(id, run_id, observed_at, tier, item_id, item_session_id, "
-            "item_text, pr_number, pr_title, pr_merged_at, confidence, "
-            "rationale, status, resolved_at, resolution_ref) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                ann["id"],
-                run_id,
-                ann["observed_at"],
-                ann["tier"],
-                ann["item_id"],
-                ann.get("item_session_id"),
-                ann.get("item_text"),
-                ann["pr_number"],
-                ann.get("pr_title"),
-                ann.get("pr_merged_at"),
-                ann.get("confidence"),
-                ann.get("rationale"),
-                ann["status"],
-                ann.get("resolved_at"),
-                ann.get("resolution_ref"),
-            ),
-        )
+        await db.execute(_ANNOTATION_INSERT_SQL, _annotation_params(ann, run_id))
     await db.commit()
+    return True
+
+
+async def insert_annotation(
+    db: aiosqlite.Connection, ann: dict, *, run_id: str, commit: bool = True
+) -> bool:
+    """Persist ONE annotation (INSERT OR IGNORE), optionally committing.
+
+    Lets the worker record a follow-up ABSORB and its 'applied' audit annotation
+    in a SINGLE transaction: call ``absorb_followup(..., commit=False)`` then this
+    with ``commit=True`` on the same connection, so a crash — or a failed
+    end-of-run ``record_run`` — can't leave a completed follow_up with no
+    annotation. Validates tier/target_kind/status like ``record_run``; a no-op
+    returning False before migration 0062 (tables absent)."""
+    if ann.get("tier") not in TIERS:
+        raise ValueError(f"invalid annotation tier: {ann.get('tier')!r}")
+    if ann.get("target_kind", "ledger") not in TARGET_KINDS:
+        raise ValueError(f"invalid annotation target_kind: {ann.get('target_kind')!r}")
+    if ann.get("status") not in ANNOTATION_STATUSES:
+        raise ValueError(f"invalid annotation status: {ann.get('status')!r}")
+    if not await _tables_available(db):
+        return False
+    await db.execute(_ANNOTATION_INSERT_SQL, _annotation_params(ann, run_id))
+    if commit:
+        await db.commit()
     return True
 
 
@@ -170,22 +208,32 @@ async def tables_available(db: aiosqlite.Connection) -> bool:
 
 
 async def annotation_exists(
-    db: aiosqlite.Connection, tier: str, item_id: str, pr_number: int
+    db: aiosqlite.Connection,
+    tier: str,
+    item_id: str,
+    pr_number: int,
+    *,
+    target_kind: str = "ledger",
 ) -> bool:
-    """True when this (tier, item_id, pr_number) match was already recorded.
+    """True when this (tier, target_kind, item_id, pr_number) match was recorded.
 
     The worker's re-absorb guard: a re-covered enumeration window (or a
     deliberately reopened item) must not be acted on twice for the same
     PR. Any status counts — a rejected proposal is still a decision made.
+    ``target_kind`` scopes by store (ledger vs follow_up ids share the
+    uuid4.hex shape); it defaults to 'ledger' so the original lane's
+    positional callers are unchanged.
     """
     if tier not in TIERS:
         raise ValueError(f"invalid annotation tier: {tier!r}")
+    if target_kind not in TARGET_KINDS:
+        raise ValueError(f"invalid target_kind: {target_kind!r}")
     if not await _tables_available(db):
         return False
     cursor = await db.execute(
         "SELECT 1 FROM repo_pulse_annotations "
-        "WHERE tier = ? AND item_id = ? AND pr_number = ? LIMIT 1",
-        (tier, item_id, pr_number),
+        "WHERE tier = ? AND target_kind = ? AND item_id = ? AND pr_number = ? LIMIT 1",
+        (tier, target_kind, item_id, pr_number),
     )
     return await cursor.fetchone() is not None
 
@@ -226,24 +274,88 @@ async def list_runs(db: aiosqlite.Connection, *, limit: int = 200) -> list[dict]
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def latest_annotation_per_item(
+    db: aiosqlite.Connection,
+    item_ids: list[str],
+    *,
+    status: str,
+    target_kind: str,
+) -> dict[str, dict]:
+    """The NEWEST matching annotation for each of *item_ids*, keyed by item id.
+
+    Exists because :func:`list_annotations` cannot answer this without a row cap,
+    and a cap is the wrong shape for a per-row lookup. Filtering that function by
+    ``item_ids`` bounds WHICH rows are considered but not HOW MANY results return:
+    with one item holding 500 newer annotations, a second item's older one falls
+    past the limit and its row comes back undecorated — indistinguishable from a
+    row with nothing to report, while the caller still reports the source as read.
+    Here the result is at most one row per requested id BY CONSTRUCTION, so there
+    is no cap to exceed and no truncation to detect.
+
+    Relies on SQLite's documented bare-column behaviour: in a ``GROUP BY`` query
+    using ``MAX()``, the non-aggregated columns come from the row holding that
+    maximum. Ties (identical ``observed_at`` within one item) resolve arbitrarily
+    but consistently — acceptable, since either row is equally "the newest".
+    Requires ``db.row_factory = aiosqlite.Row``.
+    """
+    if status not in ANNOTATION_STATUSES:
+        raise ValueError(f"invalid annotation status: {status!r}")
+    if target_kind not in TARGET_KINDS:
+        raise ValueError(f"invalid target_kind: {target_kind!r}")
+    if not item_ids:
+        return {}
+    placeholders = ",".join("?" * len(item_ids))
+    cursor = await db.execute(
+        "SELECT *, MAX(observed_at) AS _newest FROM repo_pulse_annotations "  # noqa: S608
+        f"WHERE status = ? AND target_kind = ? AND item_id IN ({placeholders}) "
+        "GROUP BY item_id",
+        (status, target_kind, *(str(i) for i in item_ids)),
+    )
+    return {str(r["item_id"]): dict(r) for r in await cursor.fetchall()}
+
+
 async def list_annotations(
     db: aiosqlite.Connection,
     *,
     session_id: str | None = None,
     status: str | None = None,
+    target_kind: str | None = None,
+    item_ids: list[str] | None = None,
     limit: int = 500,
 ) -> list[dict]:
-    """Annotations newest first, optionally filtered by session and/or status."""
+    """Annotations newest first, optionally filtered by session, status,
+    target_kind, and/or a specific set of item ids. Each returned dict carries
+    ``target_kind`` (SELECT *), so a caller may also dispatch per-row without
+    pre-filtering.
+
+    ``item_ids`` exists so a caller decorating a KNOWN set of rows can bound the
+    query by that set instead of by ``limit``. Without it such a caller must scan
+    the global matching set and trust it fits under the cap — and a result AT the
+    cap is a truncated read, indistinguishable from a complete one, so rows past
+    the cut silently look like rows with nothing to report. An empty list is a
+    real filter (matches nothing), distinct from ``None`` (no filter).
+    """
     if status is not None and status not in ANNOTATION_STATUSES:
         raise ValueError(f"invalid annotation status: {status!r}")
+    if target_kind is not None and target_kind not in TARGET_KINDS:
+        raise ValueError(f"invalid target_kind: {target_kind!r}")
     lim = max(1, min(int(limit), 2000))
     clauses, params = [], []
+    if item_ids is not None:
+        if not item_ids:
+            return []
+        placeholders = ",".join("?" * len(item_ids))
+        clauses.append(f"item_id IN ({placeholders})")  # noqa: S608 — bound placeholders
+        params.extend(str(i) for i in item_ids)
     if session_id is not None:
         clauses.append("item_session_id = ?")
         params.append(session_id)
     if status is not None:
         clauses.append("status = ?")
         params.append(status)
+    if target_kind is not None:
+        clauses.append("target_kind = ?")
+        params.append(target_kind)
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     cursor = await db.execute(
         f"SELECT * FROM repo_pulse_annotations {where}"  # noqa: S608 — clauses are literals

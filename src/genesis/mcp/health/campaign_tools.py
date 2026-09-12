@@ -20,7 +20,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db.connection import BUSY_TIMEOUT_MS
+from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ async def _get_db() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(_DB_PATH))
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
     return db
 
 
@@ -76,6 +76,35 @@ async def _impl_campaign_create(
     initial_state: dict | None = None,
 ) -> dict:
     """Create and activate a new campaign."""
+    # Normalize the name up front so the uniqueness check below and the stored value
+    # AGREE — crud.create_campaign also strips as the storage choke point, but the
+    # pre-check here runs on the raw arg, so without this a control-char name could
+    # pass the raw-name check yet collide on the stripped stored value. Hygiene, not
+    # validation: a printable name is untouched.
+    from genesis.security.sanitizer import strip_control_chars
+
+    name = strip_control_chars(name)
+    if not name:
+        return {
+            "error": "Campaign name is empty after control-character removal. "
+            "Provide a name with at least one visible character."
+        }
+
+    # The runner registers jobs of its own under the same derived
+    # ``campaign_{name}`` id, AFTER it schedules the campaigns, with
+    # replace_existing=True — so a campaign holding one of these names is evicted
+    # at startup with no error and never ticks again. Refusing at the write
+    # boundary is the only place a human sees why; the startup heal enforces the
+    # same set for rows that predate this check.
+    from genesis.campaigns.runner import RESERVED_CAMPAIGN_NAMES
+
+    if name in RESERVED_CAMPAIGN_NAMES:
+        return {
+            "error": f"Campaign name {name!r} is reserved by the scheduler — a "
+            "campaign with this name would be silently replaced at startup and "
+            "never run. Choose another name."
+        }
+
     # Validate the session profile against the live registry BEFORE persisting.
     # An unknown profile would pass here but raise ValueError at DirectSession
     # init on every tick — a silent campaign outage. Mirrors user_job_tools.py /
@@ -160,11 +189,20 @@ async def _impl_campaign_list(status_filter: str | None = None) -> dict:
         campaigns = await crud.list_campaigns(db, status_filter=status_filter)
         items = []
         for c in campaigns:
+            # last_run_at only advances on SUBSTANTIVE runs, so an idle-skipping
+            # campaign (skips every cadence via a pre-check) reads as stalled.
+            # Surface last_tick (most recent tick of any outcome) so "active,
+            # idle-skipping" is distinguishable from "dead". Newest-first.
+            latest = await crud.list_runs(db, c["id"], limit=1)
+            tick = latest[0] if latest else None
             items.append({
                 "name": c["name"],
                 "status": c["status"],
                 "cadence": c["cron_cadence"],
                 "last_run": c.get("last_run_at"),
+                "last_tick": tick["started_at"] if tick else None,
+                "last_tick_outcome": tick["outcome"] if tick else None,
+                "last_skip_reason": tick.get("skip_reason") if tick else None,
                 "total_runs": c["total_runs"],
                 "total_cost": f"${c['total_cost_usd']:.2f}",
                 "model": c["model"],
@@ -201,6 +239,11 @@ async def _impl_campaign_status(name: str) -> dict:
         # Filter internal keys from state display
         visible_state = {k: v for k, v in state.items() if not k.startswith("_")}
 
+        # last_run_at only advances on SUBSTANTIVE runs; last_tick is the most
+        # recent tick of ANY outcome (runs is newest-first) so an idle-skipping
+        # campaign is legible as "active, skipping" rather than stalled.
+        tick = runs[0] if runs else None
+
         return {
             "name": campaign["name"],
             "status": campaign["status"],
@@ -211,6 +254,9 @@ async def _impl_campaign_status(name: str) -> dict:
             "max_daily_cost": f"${campaign['max_daily_cost_usd']:.2f}",
             "state": visible_state,
             "last_run": campaign.get("last_run_at"),
+            "last_tick": tick["started_at"] if tick else None,
+            "last_tick_outcome": tick["outcome"] if tick else None,
+            "last_skip_reason": tick.get("skip_reason") if tick else None,
             "total_runs": campaign["total_runs"],
             "total_cost": f"${campaign['total_cost_usd']:.2f}",
             "recent_runs": [

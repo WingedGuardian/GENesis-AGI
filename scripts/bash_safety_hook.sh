@@ -2,8 +2,40 @@
 # PreToolUse hook for Bash commands — blocks destructive operations.
 # CC passes tool input as JSON on stdin with schema:
 #   { "tool_input": { "command": "..." }, "tool_name": "Bash", ... }
+#
+# This is the GLOBAL chokepoint (user-level ~/.claude/settings.json): it fires
+# for EVERY Bash call in EVERY directory, including non-genesis projects where
+# the project-level Python guards are not loaded.
+#
+# 2026-08 rewrite (guard-correctness PR):
+#   * rm checks DELEGATE to the token-parsing Python guards
+#     (scripts/hooks/destructive_command_guard.py + protected_paths_guard.py)
+#     instead of substring globs — the old *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*
+#     cases blocked rm -rf on ANY absolute path, ANY ~/ path, and ANY
+#     .-prefixed relative (.venv, .pytest_cache): a standing false-positive
+#     cluster. USER-APPROVED POLICY (2026-08-01): deep non-protected paths
+#     (depth >= 4) are now deletable everywhere; shallow/broad targets and the
+#     protected data dirs (genesis data/DB, transcripts, backups, snapshots,
+#     browser profiles) stay hard-blocked. If the guards are unavailable or
+#     crash, the legacy globs run instead (degraded, never open).
+#   * force-push detection is scoped to the SEGMENT containing `git push`
+#     (split on ; && || | and newlines) — `rm -f x && git push` is not a
+#     force push. Residual (documented): the split is quote-naive, so a
+#     separator inside quotes can hide a same-segment -f from THIS hook;
+#     inside genesis the argv-based git_push_guard still catches it.
+#   * the soft push/PR reminders and the gh-pr-merge gate are SKIPPED inside
+#     the genesis repo for interactive sessions — the project-level
+#     git_push_guard runs the same (richer) gates there, and the duplicate
+#     cost 2x live gh API calls per merge (audit D4). Dispatched sessions
+#     (GENESIS_CC_SESSION=1) keep this belt until project-hook coverage in
+#     autonomous sessions is separately verified.
 
-CMD=$(jq -r '.tool_input.command // empty' 2>/dev/null)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Capture the payload ONCE — jq consumes stdin, and the rm delegation below
+# needs the verbatim payload to re-feed the Python guards.
+RAW=$(cat)
+CMD=$(printf '%s' "$RAW" | jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$CMD" ] && exit 0
 
 # Bash allowlist gate — scoped background profiles (e.g. "steward") export
@@ -33,14 +65,101 @@ if [ -n "$GENESIS_BASH_ALLOWLIST" ]; then
     esac
 fi
 
+# Is the CURRENT cwd inside a genesis checkout — i.e. one whose project-level
+# git_push_guard.py is loaded for this session? Detected by resolving the
+# repo's MAIN worktree root (git-common-dir's parent, so a linked worktree
+# resolves to main) and checking it carries the project push guard. This is
+# cwd-based, not tied to where THIS user-level script physically lives, so it
+# works for the deployed main-tree copy and any worktree copy alike.
+_in_genesis=0
+_gc=$(git rev-parse --git-common-dir 2>/dev/null)
+if [ -n "$_gc" ]; then
+    _main_root=$(cd "$(dirname "$_gc")" 2>/dev/null && pwd)
+    [ -n "$_main_root" ] && [ -f "$_main_root/scripts/hooks/git_push_guard.py" ] && _in_genesis=1
+fi
+
 # pip install -e from/to worktree — catches both explicit worktree paths AND
 # "pip install -e ." run from inside a worktree directory.
-if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
+#
+# DELIBERATELY OVER-MATCHING ON COMMAND POSITION — do not "fix" that. An earlier
+# revision of this PR keyed the arm on command position so the phrase could not
+# match inside a heredoc, a grep pattern or a commit message. Cross-model review
+# found fail-OPEN bypasses in that version — a leading redirection
+# (`2>/dev/null <cmd>`) and the `command` / `env` wrappers — that the crude form
+# caught. The reason is structural, not a bug to patch: this arm runs SHELL-side
+# in the global user-level hook with no access to the canonical tokenizer
+# (scripts/hooks/shell_parse.py), so anchoring the COMMAND means modelling shell
+# grammar with a regex. That is an open set, and the review loop finds one member
+# of it per round without converging. Over-blocking there is friction;
+# under-blocking risks the editable-install spiral that OOM-crashed this
+# container on 2026-03-16, so friction is the correct side to err on.
+#
+# THE FLAG IS A DIFFERENT AXIS, and it is closed. "Is there a `-e` OPTION here?"
+# is a claim about one whitespace-delimited word, decidable from the word alone
+# with no grammar at all — so it neither buys nor costs anything on the axis
+# above. The old predicate did not make that claim: `-e` was an unanchored
+# SUBSTRING, so every long option whose name starts with `e` supplied one
+# (`--extra-index-url`, `--exclude-files`, `--exists-action`), as did a package
+# name with `-e` inside it (`pytest-env`). Because the `_gc`/`_gd` check below
+# also fires when the CWD is a worktree, an ORDINARY pip command run from ANY
+# worktree was hard blocked — MEASURED twice in one session, and a block discards
+# the whole Bash call. The same blindness ran the other way: `-qe` / `-ve` are
+# real editable installs carrying no literal `-e`, so the arm never saw them.
+#
+# Every spelling below was VERIFIED 2026-09-06 by running pip's own parser, not
+# read off its --help: `-e X`, `-qe X`, `-ve X`, `-eX` (glued value),
+# `--editable=X` and the abbreviations in the next paragraph all reach the
+# editable code path. The optional quote lets `pip install '-e' .` keep matching,
+# which the substring form covered.
+#
+# The LONG form is matched by the prefix `--ed`, not by the full spelling,
+# because optparse accepts any UNAMBIGUOUS abbreviation and pip therefore really
+# installs from `--ed`, `--edi`, `--edit` and `--editab` (MEASURED against pip's
+# own parser, 2026-09-06: each reaches "not a valid editable requirement", i.e.
+# the editable code path; `--e` is rejected as ambiguous). The old substring
+# caught those by accident, since `--edit` contains a literal `-e`, so spelling
+# out `--editable` here would have been a silent NARROWING of a hard block.
+# `--editable` is the only `--ed…` option pip install has, so the prefix cannot
+# collide; a hypothetical future pip that accepted a 3-character `--e` is the
+# stated residual.
+#
+# The SHORT form has two clauses, and the split is the whole trick. A token
+# STARTING `-e` is unambiguous: `e` is the first option letter, so whatever is
+# glued after it is its value — no knowledge of any other flag is needed, which
+# is what keeps this a closed-set claim rather than a model of pip's option
+# table. A token where `e` is deeper in a BUNDLE (`-qe`, `-ve`) is ambiguous
+# with a glued value that merely contains an e, so that clause borrows the shape
+# the git-clean and force-push arms below already use — a run of letters that
+# must END, at a blank, at end of line, or where a path-like value begins.
+#
+# MEASURED against a generated matrix of 158,312 command shapes, graded by pip's
+# OWN parser (optparse with pip's option spec) rather than by another regex, so
+# the grader is not the thing under test. Of the 36,499 shapes that really are
+# editable installs, the old substring missed 16,635 (45.6%) and this predicate
+# misses 11,994 (32.9%). BOTH directions, because a catch rate alone would hide
+# the cost:
+#   * real installs the old form caught and this one does not: 117 (0.07% of the
+#     matrix) — all of them a BUNDLE with a glued value that is neither path-like
+#     nor quoted (`-qepytest-env`). pip rejects such a value as "not a valid
+#     editable requirement" anyway, and every worktree path starts with `/`, `.`
+#     or `~`, which the terminator does cover.
+#   * NEW false positives: 2,354 (1.5%) — a glued value on some OTHER short
+#     option that happens to contain an e (`pip install -Urequests`). This is the
+#     price of the bundle clause, and the bundle clause is what closes `-qe` /
+#     `-ve`. Separating those two would mean knowing which short options take a
+#     value, i.e. modelling pip's option table — the open set this file refuses.
+# Both figures come from a generated matrix rather than real traffic, so they
+# describe the predicate, not this install's command mix.
+#
+# The durable fix for the command-position axis is DELEGATION to a Python guard —
+# the idiom this file already uses for rm and git-clean below, which is how those
+# arms get the real tokenizer without leaving the shell. Filed as a follow-up
+# rather than done inline, because it needs a guard that does not yet exist.
+if echo "$CMD" | grep -qE "pip install.*[[:space:]][\"']?(--ed|-e|-[a-zA-Z]+e[a-zA-Z]*([[:space:]=./~\"']|\$))"; then
     _block=0
     # Check 1: explicit worktree path in command
     echo "$CMD" | grep -qiE "worktree" && _block=1
     # Check 2: CWD is a git worktree (git-common-dir != git-dir)
-    _gc=$(git rev-parse --git-common-dir 2>/dev/null)
     _gd=$(git rev-parse --git-dir 2>/dev/null)
     [ -n "$_gc" ] && [ -n "$_gd" ] && [ "$_gc" != "$_gd" ] && _block=1
     if [ "$_block" = 1 ]; then
@@ -63,7 +182,6 @@ if echo "$CMD" | grep -qE "genesis[[:space:]]+serve"; then
     # Check 1: explicit worktree path anywhere in the command (incl. PYTHONPATH=)
     echo "$CMD" | grep -qiE "worktree" && _block=1
     # Check 2: CWD is a git worktree (git-common-dir != git-dir)
-    _gc=$(git rev-parse --git-common-dir 2>/dev/null)
     _gd=$(git rev-parse --git-dir 2>/dev/null)
     [ -n "$_gc" ] && [ -n "$_gd" ] && [ "$_gc" != "$_gd" ] && _block=1
     if [ "$_block" = 1 ]; then
@@ -77,37 +195,207 @@ if echo "$CMD" | grep -qE "genesis[[:space:]]+serve"; then
 fi
 
 # git worktree remove --force / -f
-if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
+#
+# DELIBERATELY OVER-MATCHING ON COMMAND POSITION — do not "fix" that. An earlier
+# revision of this PR keyed it on command position so the phrase could not match
+# inside a heredoc, a grep pattern or a commit message. Cross-model review found
+# three fail-OPEN bypasses in that version, and replaying the same shapes against
+# the sibling arm found more: a leading redirection (`2>/dev/null <cmd>`) and the
+# `command` / `env` wrappers all slipped past the anchor while the substring form
+# caught each one. (The bundled short flag reported alongside them belongs to the
+# FLAG axis below, not this one, and is now closed on both arms.)
+#
+# The reason is structural, not a bug to patch. This arm runs SHELL-side in the
+# global user-level hook, with no access to the canonical tokenizer
+# (scripts/hooks/shell_parse.py), so it is modelling shell grammar with a regex.
+# That is an open set: every named bypass is one member of it, and the review
+# loop finds them one per round without converging.
+#
+# Over-blocking here is friction (a read-only `grep` for the phrase is
+# refused); under-blocking loses uncommitted work in a worktree, which is
+# unrecoverable. MEASURED on this arm: 5 of 8 probed shapes regressed from
+# BLOCK to allow under the anchored predicate.
+#
+# Inside a genesis checkout the project-level worktree_cwd_guard.py already covers
+# this with the real parser; this arm is the belt for everywhere else, where
+# no project hooks are loaded.
+#
+# The FLAG, as in the pip arm above, is the one axis here that is closed and was
+# wrong, in BOTH of its spellings.
+#
+# Short: `-f` used to require a LITERAL SPACE after it, so the shell's other word
+# separators did not end the flag — a tab before the operand, or `-f` as the last
+# word on the line, ran a forced removal and were allowed. It now ends at any
+# blank, a quote, or end of line, and must START at one too, so the `-f` inside a
+# path like `/tmp/wt-f` is no longer read as the flag.
+#
+# Long: `--force` is matched by the prefix `--f`, because git's parse-options
+# accepts any unambiguous abbreviation. MEASURED 2026-09-06 on a scratch repo —
+# `--f`, `--fo` and `--forc` each returned 0 and the worktree was really gone,
+# while `--foo` was refused as an unknown option. `git worktree remove -h` lists
+# `-f, --[no-]force` as its ONLY option, so nothing else can collide. The old
+# predicate caught these by accident (`--f ` contains `-f `), so requiring the
+# full spelling — or adding the leading blank without this clause — would have
+# been a silent NARROWING of a hard block that exists because a forced removal
+# destroys uncommitted work irrecoverably.
+#
+# Both are claims about one word and say nothing about where the command starts,
+# so neither can reintroduce the command-position bypasses this arm was reverted
+# over. MEASURED over a generated matrix of 18,018 shapes graded by git's own
+# option grammar: of the 9,996 that really are forced removals the old predicate
+# missed 3,927 (39%) and this one misses 0, with 0 real removals lost.
+if echo "$CMD" | grep -qE "worktree remove.*(--f[a-zA-Z]*|[[:space:]][\"']?-f([[:space:]\"']|$))"; then
     echo "BLOCKED: git worktree remove --force destroys uncommitted work in the worktree." >&2
     echo "Use git worktree remove without --force, or ask the user first." >&2
     exit 2
 fi
 
-# Hard-blocked destructive commands — checked BEFORE the softer push/PR warnings
-# below, because the generic "git push" warning (exit 0) would otherwise
-# short-circuit a force-push before this block could hard-block it.
+# rm safety — delegate to the token-parsing Python guards (one parser, zero
+# divergence with the project-level hooks). Pre-filtered on *rm* so the
+# python spawn cost (~50ms) is paid only when an rm might be present.
 case "$CMD" in
-    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
-        echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
-        exit 2;;
+    *rm*)
+        _delegated=0
+        _py=$(command -v python3 2>/dev/null || true)
+        if [ -n "$_py" ] \
+           && [ -f "$SCRIPT_DIR/hooks/destructive_command_guard.py" ] \
+           && [ -f "$SCRIPT_DIR/hooks/protected_paths_guard.py" ]; then
+            _delegated=1
+            for _guard in destructive_command_guard.py protected_paths_guard.py; do
+                _rc=0
+                printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/$_guard" >&2 || _rc=$?
+                if [ "$_rc" -eq 2 ]; then
+                    exit 2
+                elif [ "$_rc" -ne 0 ]; then
+                    # Guard crashed/unusable — fall back to the legacy globs
+                    # below (degraded, never open).
+                    _delegated=0
+                    break
+                fi
+            done
+        fi
+        if [ "$_delegated" -eq 0 ]; then
+            case "$CMD" in
+                *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
+                    echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
+                    exit 2;;
+            esac
+        fi
+        ;;
+esac
+
+# git-discard safety (2026-08-24 recoverability redesign; the review loop proved
+# that DECIDING destructiveness from argv is an open-set parser problem — every
+# round found another spelling). Structure:
+#   (1) reset --hard SPEED-BUMP — a dependency-free substring block, kept only as
+#       a best-effort nudge. reset is RECOVERABLE (the snapshot net below undoes
+#       it), so any spelling that dodges this substring is recovered, not lost.
+#       Checked BEFORE the softer push/PR warnings below (a "git push" warning
+#       exits 0 and would short-circuit a block).
+#   (2) git_discard_guard.py — the PRECISE, quote-aware authority (invoked just
+#       below): it SNAPSHOTS checkout/restore/switch/reset/rm/mv/checkout-index/
+#       read-tree (advisory) and BLOCKS a non-dry-run `git clean` (clean is
+#       UNrecoverable — `stash create` cannot
+#       capture untracked files — so it keeps a real closed-set block, honoring
+#       `# discard-override`). A coarse dependency-free clean block survives ONLY
+#       as a python-LESS fallback there (the guard is stdlib-only, so that
+#       fallback is an extreme edge). Making the guard authoritative — not a
+#       parallel coarse regex — is deliberate: only a quote-aware parser can tell
+#       `git clean -f` from `git commit -m "clean up"` / `git checkout clean-x`.
+case "$CMD" in
     *"git reset --hard"*)
         echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
         exit 2;;
-    *"git clean -f"*)  # substring also covers -fd
-        echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
-        exit 2;;
+esac
+# git_discard_guard.py — the PRECISE, quote-aware authority for both jobs:
+#   * SNAPSHOT (advisory, exit 0) for checkout/restore/switch/reset/rm/mv/
+#     checkout-index/read-tree — leaves a recovery sha; a crash/miss never blocks.
+#   * BLOCK (exit 2) for a non-dry-run `git clean` — clean is UNrecoverable
+#     (`git stash create` can't capture untracked files), so it keeps a real,
+#     closed-set block that honors `# discard-override`.
+# We invoke it once and propagate ONLY exit 2 (the clean block). Any OTHER
+# non-zero is a guard crash -> stay advisory (fail-OPEN for the recoverable
+# verbs, never a false block). A quote-aware guard here is why the coarse floor
+# below is a python-LESS-only fallback: only the guard can tell `git clean -f`
+# from `git commit -m "clean up"` / `git checkout clean-branch` / a message that
+# merely mentions clean. The broad `*git*clean*` etc. pre-filter is just a cheap
+# gate; the guard re-filters precisely by verb/argv.
+case "$CMD" in
+    *git*checkout*|*git*restore*|*git*reset*|*git*switch*|*git*clean*|*git*rm*|*git*mv*|*git*read-tree*)
+        _py=$(command -v python3 2>/dev/null || true)
+        _handled=0
+        if [ -n "$_py" ] && [ -f "$SCRIPT_DIR/hooks/git_discard_guard.py" ]; then
+            # Propagate ONLY exit 2 (the clean block). rc 0 = guard ran (snapshot
+            # done / clean allowed) -> skip the fallback. A CRASH (rc != 0,2 — e.g.
+            # a partially-synced scripts/hooks/ missing a sibling module) leaves
+            # _handled=0 so the coarse fallback STILL protects the UNrecoverable
+            # clean verb (clean must fail CLOSED). Mirrors the rm-delegation idiom
+            # above. A crash never false-blocks the recoverable verbs: the fallback
+            # only ever matches `git clean`, so for checkout/restore/switch/reset it
+            # finds nothing and stays advisory.
+            _rc=0
+            printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/git_discard_guard.py" >&2 || _rc=$?
+            if [ "$_rc" -eq 2 ]; then
+                exit 2
+            elif [ "$_rc" -eq 0 ]; then
+                _handled=1
+            fi
+        fi
+        if [ "$_handled" -eq 0 ]; then
+            # Coarse dependency-free clean block — reached when python3/the guard is
+            # ABSENT or the guard CRASHED. Quote-NAIVE best-effort: unlike reset
+            # --hard (recoverable), clean is unrecoverable, so it must catch every
+            # non-dry-run form. MEASURED (git 2.43): any dry-run flag makes clean
+            # print-only, so ALLOW iff a dry-run flag rides in the clean segment,
+            # BLOCK the complement. Splits on & too (background) so a dry-run in one
+            # bg command can't mask a destructive clean in another. `clean` must be
+            # a token adjacent to a `git` invocation (dodges the worst
+            # message/branch/file false-blocks); honors `# discard-override`.
+            _gcb=0
+            while IFS= read -r _seg; do
+                printf '%s' "$_seg" | grep -qE '(^|[[:space:]])git([[:space:]]+-[cC][[:space:]]+[^[:space:]]+)*[[:space:]]+clean([[:space:]]|$)' || continue
+                printf '%s' "$_seg" | grep -qE -- '(^|[[:space:]])-[dfxXneqi]*n[dfxXneqi]*([[:space:]]|$)|--dry-run' && continue
+                case "$_seg" in *"#"*discard-override*) continue ;; esac
+                _gcb=1
+            done <<EOF
+$(printf '%s\n' "$CMD" | sed -E 's/\|\||&&|;|\||&/\n/g')
+EOF
+            if [ "$_gcb" -eq 1 ]; then
+                echo "BLOCKED: git clean permanently deletes untracked files (not snapshot-recoverable). Preview with 'git clean -nd', append '# discard-override', or ask the user." >&2
+                exit 2
+            fi
+        fi
+        ;;
 esac
 
-# Force push — hard-block. MUST precede the soft "git push" warning below (which
-# exits 0). Match -f only as a FLAG token — a whitespace-delimited short-flag
-# cluster containing 'f' (so '-f', '-fv', '-uf' all count; 'f' is force-only
-# among push short flags). The leading start/space anchor is what keeps a branch
-# name that merely CONTAINS "-f" — e.g. "skill-funnel", "bug-fix" — from looking
-# like a force push. Also covers any --force* variant.
-if echo "$CMD" | grep -qE 'git push' \
-   && echo "$CMD" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|--force'; then
+# Force push — hard-block. MUST precede the soft "git push" warning below
+# (which exits 0). Scoped to the SEGMENT containing `git push`: split the
+# command on shell separators and require the force flag in the SAME segment,
+# so `rm -f x && git push` is not a force push (the old whole-command grep
+# false-matched exactly that). Match -f only as a FLAG token — a
+# whitespace-delimited short-flag cluster containing 'f' ('-f', '-fv', '-uf';
+# 'f' is force-only among push short flags); a branch name that merely
+# CONTAINS "-f" (skill-funnel, bug-fix) never matches. Also covers --force*.
+_force_push=0
+while IFS= read -r _seg; do
+    printf '%s' "$_seg" | grep -qE 'git push' || continue
+    if printf '%s' "$_seg" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|--force'; then
+        _force_push=1
+    fi
+done <<EOF
+$(printf '%s' "$CMD" | sed -E 's/\|\||&&|;|\|/\n/g')
+EOF
+if [ "$_force_push" -eq 1 ]; then
     echo "BLOCKED: Force push not allowed. Use a PR." >&2
     exit 2
+fi
+
+# Inside the genesis repo, an INTERACTIVE session's push/PR/merge is gated by
+# the richer project-level git_push_guard (native approval dialogs, CI/review
+# gates) — running this hook's duplicates there only doubles the live gh API
+# calls and stderr noise (audit D4). Dispatched sessions keep the belt.
+if [ "$_in_genesis" -eq 1 ] && [ "${GENESIS_CC_SESSION:-}" != "1" ]; then
+    exit 0
 fi
 
 # Push / PR protection — remind to get explicit user approval
@@ -157,8 +445,11 @@ if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
     _repo=$(echo "$CMD" | grep -oP -- '--repo \K\S+' || true)
     [ -n "$_repo" ] && _repo_args=(--repo "$_repo")
     if [ -z "$_pr_num" ]; then
-        # No number in the command — resolve the current branch's open PR
-        _pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || true)
+        # No number in the command — resolve the open PR, honoring an explicit
+        # --repo (the old bare `gh pr view` resolved the CWD branch's PR number
+        # and then gated it against the OTHER repo — wrong-PR gate). With
+        # --repo and no selector gh errors → _pr_num stays empty → fail CLOSED.
+        _pr_num=$(gh pr view "${_repo_args[@]}" --json number --jq '.number' 2>/dev/null || true)
     fi
     if [ -z "$_pr_num" ]; then
         echo "BLOCKED: cannot resolve which PR this merges (no number in the command, no open PR for the current branch)." >&2

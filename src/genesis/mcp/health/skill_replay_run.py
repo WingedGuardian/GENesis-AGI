@@ -31,7 +31,14 @@ def _default_suite_path(skill_name: str) -> Path:
 
 async def _resolve_ledger_old_content(db, target_path: str) -> str | None:
     """OLD content = ``prior_content`` of the most-recent ``skill_evolution`` edit
-    to ``target_path`` (the pre-image the applicator captured before overwriting)."""
+    to ``target_path`` (the pre-image the applicator captured before overwriting).
+
+    DORMANT UNDER PROPOSE-ONLY (2026-08-01): the skill-evolution pipeline no longer
+    auto-writes skill files, so no ``skill_evolution`` ledger pre-image is created —
+    this returns None for auto-fired edits and the replay gate then has no OLD
+    baseline. Re-source OLD = current-on-disk / NEW = the staged proposal's
+    ``proposed_content`` when wiring the future WS1 ``enforce`` mode (tracked as a
+    follow-up). Callers may still pass OLD content explicitly in the meantime."""
     if db is None:
         return None
     try:

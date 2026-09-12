@@ -119,6 +119,11 @@ async def load_persisted_job_health(rt: GenesisRuntime) -> None:
         import aiosqlite
 
         async with rt._db.execute(
+            # error_type is deliberately NOT selected: it is only read by the
+            # persist path, which re-supplies it on every write (set on failure,
+            # popped on success/clear), so nothing goes stale by omitting it —
+            # and selecting a column added by a later migration would fail this
+            # whole load, not just one field.
             "SELECT job_name, last_run, last_success, last_failure, "
             "last_error, consecutive_failures FROM job_health"
         ) as cur:
@@ -164,11 +169,14 @@ def clear_stale_job_failures(rt: GenesisRuntime) -> int:
             continue
         logger.info(
             "Cleared stale failures for job %s (last_failure=%s, was=%d)",
-            job_name, last_failure, entry["consecutive_failures"],
+            job_name,
+            last_failure,
+            entry["consecutive_failures"],
         )
         entry["consecutive_failures"] = 0
         entry.pop("last_failure", None)
         entry.pop("last_error", None)
+        entry.pop("error_type", None)
         persist_job_health(rt, job_name, entry, now_iso)
         cleared += 1
 
@@ -187,7 +195,18 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        logger.debug("No event loop — job health for %s persisted in-memory only", job_name)
+        # WARNING, not debug: this is a SILENT data-loss path — the in-memory
+        # entry is updated and the DB row never is, so job_health (which reads
+        # sqlite) shows the job as if it had never run. A threaded caller that
+        # records health without a running loop hit exactly this and went
+        # unnoticed until an unrelated E2E check missed the row. If this fires,
+        # the caller must record from a live loop (see the heartbeat daemons'
+        # _tick), not lower this log level.
+        logger.warning(
+            "job health for %s NOT persisted (no running event loop) — "
+            "in-memory only; the job_health table will not reflect this run",
+            job_name,
+        )
         return
 
     from genesis.util.tasks import tracked_task
@@ -199,9 +218,9 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
             await rt._db.execute(
                 """INSERT INTO job_health
                    (job_name, last_run, last_success, last_failure, last_error,
-                    consecutive_failures, total_runs, total_successes,
+                    error_type, consecutive_failures, total_runs, total_successes,
                     total_failures, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                    ON CONFLICT(job_name) DO UPDATE SET
                        last_run = excluded.last_run,
                        last_success = COALESCE(excluded.last_success, last_success),
@@ -210,6 +229,9 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                        -- recovery; the failure path always supplies both (WS-3b).
                        last_failure = excluded.last_failure,
                        last_error = excluded.last_error,
+                       -- Same clear-on-recovery contract as last_error: a stale
+                       -- error_type would mislabel a recovered job.
+                       error_type = excluded.error_type,
                        consecutive_failures = excluded.consecutive_failures,
                        total_runs = total_runs + 1,
                        total_successes = total_successes + CASE WHEN excluded.last_success IS NOT NULL THEN 1 ELSE 0 END,
@@ -222,6 +244,7 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                     snapshot.get("last_success"),
                     snapshot.get("last_failure"),
                     snapshot.get("last_error"),
+                    snapshot.get("error_type"),
                     snapshot.get("consecutive_failures", 0),
                     1 if snapshot.get("last_success") else 0,
                     1 if snapshot.get("last_failure") else 0,
@@ -312,6 +335,7 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
     # failures in the SQL CASE WHEN excluded.last_failure IS NOT NULL check.
     entry.pop("last_failure", None)
     entry.pop("last_error", None)
+    entry.pop("error_type", None)
     rt._persist_job_health(job_name, entry, now)
 
     # WS-2 M9: debounced success run-event — first success ever, or >= 1h since
@@ -331,12 +355,53 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
         )
 
 
-def record_job_failure(rt: GenesisRuntime, job_name: str, error: str) -> None:
+def record_job_failure(
+    rt: GenesisRuntime,
+    job_name: str,
+    error: str | None = None,
+    *,
+    exc: BaseException | None = None,
+    error_type: str | None = None,
+    emit_event: bool = True,
+) -> None:
     """Record a failed scheduled job execution (in-memory + DB).
 
     When consecutive failures reach the retry threshold (3), triggers
     an automatic retry via the JobRetryRegistry if one is wired.
+
+    *exc* is the exception object when one caused the failure. Pass it in
+    preference to a pre-stringified *error*: it is the single richest artifact,
+    and it is what turns a background-job failure into a diagnosable **reflex
+    signal**. When *exc* is given, *error* and *error_type* are derived from it
+    (an explicit *error* still wins for the human message).
+
+    *error_type* is the exception class name when an exception caused the
+    failure, else ``None`` (a semantic failure — e.g. an external quota block
+    surfaced as a result reason). Keyword-only and optional so the ~110 existing
+    call sites keep working untouched; only callers that actually hold the
+    exception need to pass it.
+
+    The funnel (WS-reflex): when *exc* is present this ALSO emits a throttled
+    ``job.failed`` event onto the bus (see the emit block below) so the reflex
+    arc — which subscribes to the bus, not this table — can see the largest
+    class of internal Genesis defects (background-job exceptions). Semantic /
+    no-exception failures stay off the bus: an external blocker is not a Genesis
+    bug the reflex arc can act on. Set *emit_event=False* to suppress the emit
+    for callers that already emit their own richer domain ``.failed`` event
+    (the reflection/outreach/surplus schedulers), so one failure is not counted
+    twice.
     """
+    # Derive the human/DB fields from the exception when one was supplied, so
+    # every exc-bearing caller records a typed error even when str(exc) is blank
+    # (a bare TypeError renders "" — the type is then the only signal).
+    if exc is not None:
+        from genesis.observability.failure_details import error_summary
+
+        if error is None:
+            error = error_summary(exc)
+        if error_type is None:
+            error_type = type(exc).__name__
+
     now = datetime.now(UTC).isoformat()
     entry = rt._job_health.setdefault(job_name, {"consecutive_failures": 0})
     prev_consecutive = entry.get("consecutive_failures", 0)  # 0 → this is a streak ONSET
@@ -345,6 +410,10 @@ def record_job_failure(rt: GenesisRuntime, job_name: str, error: str) -> None:
     entry["last_run"] = now
     entry["last_failure"] = now
     entry["last_error"] = error
+    # Always assign (even None) so a semantic failure overwrites a previous
+    # exception's type instead of inheriting it — a stale error_type would
+    # mislabel an external blocker as an internal defect.
+    entry["error_type"] = error_type
     entry["consecutive_failures"] = prev_consecutive + 1
     rt._persist_job_health(job_name, entry, now)
 
@@ -367,6 +436,34 @@ def record_job_failure(rt: GenesisRuntime, job_name: str, error: str) -> None:
             error=error,
             now=now,
         )
+        # Reflex funnel: surface exception-driven job failures onto the event
+        # bus so the reflex arc (and health/ego consumers) can see them. Shares
+        # the run-event throttle above → bounded ~24/day/job. Gated on an actual
+        # exception (semantic/external failures stay off the bus) and on a live
+        # bus. Fully fire-and-forget: a broken emit must NEVER stop the
+        # job_health record above from being written. getattr (not rt._event_bus
+        # directly) so a bare test runtime built via __new__ — with no
+        # _event_bus attribute set — degrades to no-emit instead of raising.
+        bus = getattr(rt, "_event_bus", None)
+        if exc is not None and emit_event and bus is not None:
+            try:
+                from genesis.observability.failure_details import failure_details
+                from genesis.util.tasks import emit_sync
+
+                emit_sync(
+                    bus,
+                    severity_str="ERROR",
+                    event_type="job.failed",
+                    message=f"Scheduled job {job_name!r} failed: {error}",
+                    task_name=job_name,
+                    **failure_details(exc=exc),
+                )
+            except Exception:
+                logger.warning(
+                    "job.failed emit failed for %r (job_health still recorded)",
+                    job_name,
+                    exc_info=True,
+                )
 
     consecutive = entry["consecutive_failures"]
     if consecutive >= 3 and rt._job_retry_registry is not None:
@@ -386,7 +483,6 @@ def register_channel(
         rt._outreach_pipeline._channels[name] = adapter
         if recipient:
             rt._outreach_pipeline._recipients[name] = recipient
-    if (rt._outreach_scheduler is not None
-            and not rt._outreach_scheduler.is_running):
+    if rt._outreach_scheduler is not None and not rt._outreach_scheduler.is_running:
         logger.info("First outreach channel '%s' registered — starting scheduler", name)
         rt._outreach_scheduler.start()

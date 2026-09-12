@@ -57,7 +57,7 @@ class TestRejectsProseFalsePositives:
         # "content pass committed" → was captured as credentials value "committed"
         ext = _ext(
             "The portfolio website is complete, with all four threads and the "
-            "content pass committed to main, authored by Jay Wingard.",
+            "content pass committed to main, authored by Test User.",
             entities=["portfolio website"],
         )
         assert classify_as_reference(ext) is None
@@ -122,8 +122,8 @@ class TestStillClassifiesGenuine:
     def test_lowercase_password_pair_still_captured(self):
         # all-lowercase passwords are legitimate (no entropy gate that rejects them)
         ext = _ext(
-            "ScarletAndRage login: username: buckeye614 password: verysecretword",
-            entities=["ScarletAndRage"],
+            "HobbyForum login: username: forumuser42 password: verysecretword",
+            entities=["HobbyForum"],
         )
         ref = classify_as_reference(ext)
         assert ref is not None
@@ -172,7 +172,7 @@ async def test_mixed_chunk_ingests_only_genuine_references(_db, _store):
         ),
         _ext(
             "The portfolio website is complete; the content pass committed to "
-            "main, authored by Jay Wingard.",
+            "main, authored by Test User.",
             ["portfolio website"],
         ),
         _ext(
@@ -187,8 +187,8 @@ async def test_mixed_chunk_ingests_only_genuine_references(_db, _store):
         ),
         # genuine references that MUST still be captured:
         _ext(
-            "ScarletAndRage login: username: buckeye614 password: Sup3r!secret",
-            ["ScarletAndRage"],
+            "HobbyForum login: username: forumuser42 password: Sup3r!secret",
+            ["HobbyForum"],
         ),
         _ext(
             "The Genesis API server runs on host 203.0.113.50 for embeddings",

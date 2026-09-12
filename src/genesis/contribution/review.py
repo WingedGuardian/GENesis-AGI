@@ -21,11 +21,14 @@ blocking decision here.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shutil
 import subprocess
 from pathlib import Path
+
+from genesis.util.proc_kill import kill_process_group
 
 from .findings import ReviewResult
 
@@ -86,6 +89,12 @@ def _parse_verdict(text: str) -> tuple[bool, int, str]:
     return passed, finding_count, summary
 
 
+# Bound for the post-kill pipe drain: SIGKILL of the whole group means the
+# pipes close near-instantly; 30s is pure headroom so a pathological state
+# can't turn the timeout recovery itself into a hang.
+_CODEX_KILL_DRAIN_S = 30.0
+
+
 def _try_codex(diff: str, *, timeout: int = CODEX_TIMEOUT) -> ReviewResult | None:
     """Try the codex exec path. Returns None if codex is missing or errors."""
     if shutil.which("codex") is None:
@@ -97,36 +106,61 @@ def _try_codex(diff: str, *, timeout: int = CODEX_TIMEOUT) -> ReviewResult | Non
     # the single-argv length limit (P2-2 from the 6.1b.2 review) and
     # argv contents leak through `ps auxwww`. Codex exec with `-`
     # reads the prompt from stdin.
+    #
+    # Popen + start_new_session (not subprocess.run): codex is a Node
+    # launcher that forks workers — run()'s timeout kills only the direct
+    # child and orphans the tree. Own group → guarded killpg reaps it all.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 "codex", "exec", "-",
                 "-s", "read-only",
                 "-c", 'model_reasoning_effort="medium"',
                 "--json",
             ],
-            input=prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        logger.warning("review: codex exec timed out after %ss", timeout)
-        return None
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        logger.warning("review: codex spawn failed: %s", exc)
+        return None
+
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "review: codex exec timed out after %ss — killing process group",
+            timeout,
+        )
+        kill_process_group(proc)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.communicate(timeout=_CODEX_KILL_DRAIN_S)  # bounded drain/reap
+        return None
+    except BaseException:
+        # KeyboardInterrupt above all: start_new_session detached codex from
+        # the CLI's terminal group, so a human's Ctrl+C never reaches it —
+        # kill the group before propagating, or the interrupt itself leaks
+        # the tree.
+        kill_process_group(proc)
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=_CODEX_KILL_DRAIN_S)
+        raise
 
     if proc.returncode != 0:
         logger.warning(
             "review: codex exec rc=%s, stderr=%r",
-            proc.returncode, (proc.stderr or "")[:200],
+            proc.returncode, (stderr or "")[:200],
         )
         return None
 
     # codex --json emits JSONL; we want the final agent_message text
     pieces: list[str] = []
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue

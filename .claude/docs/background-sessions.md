@@ -30,6 +30,30 @@ the next few minutes → sub-agent.
 > its own report); oversized output is saved under `~/.genesis/output/` and delivered
 > as a summary + file pointer.
 
+## Dispatched from a channel? Long work MUST be a background session
+
+When you are a foreground session driving a **Telegram/voice/OpenClaw reply**, your
+turn **ends after you respond** — there is no live session left to report back when a
+later-finishing task completes. A deep-research `Workflow` (or any 100+-agent fan-out)
+run **inline** in such a turn is force-killed by the CLI's headless background-wait
+ceiling (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, ~10 min) with only a partial result,
+and nothing delivers it. This silently killed a real Telegram deep-research request on
+2026-07-20.
+
+So for a channel-dispatched request needing deep/multi-source research or any
+background work likely to exceed a few minutes: **do NOT run it inline — dispatch it
+via `direct_session_run` (`profile="research"`, `deliver_to_origin=true`) and reply
+that it's running in the background.** The background lane owns a longer wait ceiling
+(set to its full `timeout_s`), runs to completion, and — with `deliver_to_origin` —
+delivers the finished outcome back to this exact conversation (the delivery model
+merged in #1192). Terminal/interactive sessions may still run Workflows inline (you're
+present to see them). The foreground system prompt (`conversation._BG_RESEARCH_ROUTING`)
+nudges this automatically — but only for channels the delivery model can actually
+report back to (**Telegram**, per `origin_delivery_supported`). On channels the
+resolver can't address (WEB/OpenClaw, WhatsApp, VOICE) the result would fall back to
+the owner surface, so the nudge is withheld rather than promise a report-back that
+lands elsewhere.
+
 ## Profiles
 
 | Profile | Browser | observation_write | outreach_send | follow_up_create | Web search |
@@ -46,6 +70,17 @@ user. Use `research` for investigation that writes observations/follow-ups;
 it also reaches the `genesis-recon` discovery tools (GitHub/model-intel/skill
 scanning, findings storage) — the only profile that does.
 Use `observe` for read-only investigation.
+
+**MCP scoping is secure-by-default.** `CCInvocation.strict_mcp_config` defaults to
+True, so every background session gets `--strict-mcp-config`: it loads ONLY the
+servers in its generated `--mcp-config` (its `mcp_profile`) and never additively
+inherits the operator's user-scoped `~/.claude.json` MCP servers (Claude Code's
+`--mcp-config` is additive without strict — probe-verified). A profile that maps to
+no genesis servers therefore runs with zero MCP tools (fail-closed), not the
+operator's full set. Only human-driven foreground/interactive sessions
+(`cc/conversation.py`, `cc/checkpoint.py`) opt out (`strict_mcp_config=False`) to
+keep the full user-scoped toolset. As defense-in-depth, `_UNIVERSAL_DISALLOW` also
+denies the user-scoped servers by name (`_USER_SCOPED_MCP_WILDCARDS`).
 
 **`steward` is the one built-in Bash-enabled profile** — its Bash is restricted
 to the `gh` CLI only, enforced by `scripts/bash_safety_hook.sh` via the

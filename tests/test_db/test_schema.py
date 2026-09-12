@@ -36,8 +36,6 @@ EXPECTED_TABLES = [
     "inbox_items",
     "deferred_work_queue",
     "pending_embeddings",
-    "predictions",
-    "calibration_curves",
     "events",
     "approval_requests",
     "task_states",
@@ -61,6 +59,7 @@ EXPECTED_TABLES = [
     "campaign_runs",
     "capability_grants",  # WS-8 PR-B: per-(domain,verb,risk_class) cells
     "pending_email_sends",  # WS-8 PR-C: email autonomy gate hold store
+    "pending_issue_posts",  # Contributor Work-Log: sanitized issue-draft hold store
     "autonomous_email_sends",  # WS-8 PR-D: autonomous-send ledger (visibility + flag + rate-limit)
     "capability_shadow_events",  # WS5 Stage 2: Discord capability shadow-gate observations
     "immunity_shadow_events",  # WS-3 B1: provenance-gate (injection) shadow observations
@@ -81,6 +80,8 @@ EXPECTED_TABLES = [
     "reflex_signals",  # reflex arc P0: fingerprint-deduped task.failed signals + lifecycle
     "reflex_diagnoses",  # reflex arc P0: Tier-0 diagnose session artifacts (PR2 writes)
     "reflex_verdicts",  # reflex arc P0: taste corpus — every human verdict, never pruned
+    "ego_proposal_revisions",  # ego lifecycle PR-4: prior-value audit trail for versioned revision (dark)
+    "marketing_prospects",  # marketing cold-send substrate: owner-curated cold-outreach target inventory
 ]
 
 
@@ -139,6 +140,7 @@ async def test_no_unexpected_tables(db):
         "knowledge_uploads",
         "file_modifications",
         "direct_session_queue",
+        "cc_rate_limit_parks",
         "eval_events",
         "eval_snapshots",
         "memory_events",
@@ -161,8 +163,13 @@ async def test_no_unexpected_tables(db):
         "entities",
         "entity_mentions",
         "entity_links",  # entity layer (WS-H P2)
+        "entity_merge_journal",  # reversibility snapshot for applied merges (approval gate)
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
+        "memory_consistency_reports",
+        "recall_probe_runs",  # memory integrity Phase 0 ("make silence loud")
+        "memory_reconcile_runs",  # memory integrity Phase 1 (repair lane audit)
+        "pr_verifications",  # post-merge E2E obligation ledger (issue #1718)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

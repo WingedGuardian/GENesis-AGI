@@ -14,31 +14,64 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Find the Python venv. In a worktree, .venv lives in the main repo, not here.
-PYTHON="$GENESIS_ROOT/.venv/bin/python"
-if [[ ! -x "$PYTHON" ]]; then
-    # Worktree: .venv lives in the MAIN repo. Resolve the main worktree root via
-    # `git rev-parse --git-common-dir` (the main repo's .git; its parent is the
-    # main worktree root). Do NOT use `git worktree list | head` here: head closes
-    # the pipe after one line, so with many worktrees git gets SIGPIPE, and under
-    # `set -euo pipefail` that silently kills this launcher (exit 141, no stderr),
-    # breaking every hook in the worktree.
-    _common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
+# Resolve the MAIN worktree root ONCE — used for BOTH the venv fallback and the
+# hook-script path. In a worktree, `git rev-parse --git-common-dir` gives the
+# main repo's .git; its parent is the main worktree root. Do NOT use
+# `git worktree list | head`: head closes the pipe after one line, so with many
+# worktrees git gets SIGPIPE, and under `set -euo pipefail` that silently kills
+# this launcher (exit 141, no stderr), breaking every hook in the worktree.
+# `env -u` scrubs ambient Git location overrides for THIS discovery: an exported
+# GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR would otherwise resolve an UNRELATED repo
+# despite the `cd`, redirecting every hook (security gates included) to a foreign
+# checkout's same-named script.
+_common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
+MAIN_ROOT=""
+if [[ -n "$_common_dir" ]]; then
+    MAIN_ROOT="$(cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
+fi
+# Trust MAIN_ROOT only if it actually looks like a Genesis checkout. A
+# `--separate-git-dir` clone makes `--git-common-dir` point at external metadata
+# whose parent is NOT the worktree root, which would send hooks to a bogus path;
+# require a `scripts/` dir there, else fall back to GENESIS_ROOT (the non-worktree path).
+if [[ -n "$MAIN_ROOT" && ! -d "$MAIN_ROOT/scripts" ]]; then
     MAIN_ROOT=""
-    if [[ -n "$_common_dir" ]]; then
-        MAIN_ROOT="$(cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
+fi
+
+# Resolve the hook SCRIPT ROOT: the MAIN worktree by default, so every session
+# runs the CURRENT hook + policy. Git-tracked hooks otherwise DRIFT per branch —
+# a worktree session runs whatever hook version its branch froze until it rebases,
+# so a worktree can enforce an OUTDATED security gate (measured 2026-08: 60 of 70
+# worktrees ran a stale, warn-only full_suite_guard). Escape hatch:
+# GENESIS_HOOK_DEV_LOCAL=1 runs the worktree's OWN copy — for deliberately testing
+# a hook change live in-worktree; it is ANNOUNCED on stderr so it is never a
+# silent downgrade of the whole session's gates. Fallback to GENESIS_ROOT when
+# MAIN_ROOT is unresolvable (a non-worktree install, or not a git repo).
+HOOK_ROOT="$GENESIS_ROOT"
+if [[ -n "$MAIN_ROOT" && "${GENESIS_HOOK_DEV_LOCAL:-}" != "1" ]]; then
+    HOOK_ROOT="$MAIN_ROOT"
+elif [[ -n "$MAIN_ROOT" && "${GENESIS_HOOK_DEV_LOCAL:-}" == "1" ]]; then
+    echo "genesis-hook: GENESIS_HOOK_DEV_LOCAL=1 — running the WORKTREE-local hook copy (not main-tree)" >&2
+fi
+
+# Find the Python venv, co-located with the hook tree (HOOK_ROOT) so the script
+# and its interpreter/site-packages come from the SAME tree. A worktree rarely
+# has its own .venv (worktrees never pip-install), so fall back to the other
+# known roots rather than fail.
+PYTHON=""
+for _root in "$HOOK_ROOT" "$MAIN_ROOT" "$GENESIS_ROOT"; do
+    if [[ -n "$_root" && -x "$_root/.venv/bin/python" ]]; then
+        PYTHON="$_root/.venv/bin/python"
+        break
     fi
-    if [[ -n "$MAIN_ROOT" && -x "$MAIN_ROOT/.venv/bin/python" ]]; then
-        PYTHON="$MAIN_ROOT/.venv/bin/python"
-    else
-        echo "ERROR: Genesis venv not found at $GENESIS_ROOT/.venv/bin/python" >&2
-        echo "Run: cd $GENESIS_ROOT && python -m venv .venv && pip install -e ." >&2
-        exit 1
-    fi
+done
+if [[ -z "$PYTHON" ]]; then
+    echo "ERROR: Genesis venv not found (looked in HOOK_ROOT/MAIN_ROOT/GENESIS_ROOT/.venv/bin/python)" >&2
+    echo "Run: cd $GENESIS_ROOT && python -m venv .venv && pip install -e ." >&2
+    exit 1
 fi
 
 SCRIPT_NAME="${1:?Usage: genesis-hook <script_name.py> [args...]}"
-SCRIPT_PATH="$GENESIS_ROOT/scripts/$SCRIPT_NAME"
+SCRIPT_PATH="$HOOK_ROOT/scripts/$SCRIPT_NAME"
 
 if [[ ! -f "$SCRIPT_PATH" ]]; then
     echo "ERROR: Hook script not found: $SCRIPT_PATH" >&2

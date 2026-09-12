@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime
 
 from genesis.mcp.health import mcp  # noqa: E402
@@ -180,6 +181,106 @@ def _backups_enabled() -> bool:
     except Exception:
         logger.warning("Could not determine backup configuration", exc_info=True)
         return True
+
+
+# How long an alert must have been continuously open before its message carries a
+# duration. Most alerts flap briefly; decorating those is noise. An hour is well
+# above the 5-minute awareness tick and well below any outage worth naming.
+_ONGOING_FLOOR_S = 3600.0
+
+# `_compute_alerts` recomputes the whole set every tick, so a message must never
+# accrete suffixes. Stripping any existing one before recomputing gives BOTH
+# idempotence and freshness — a skip-if-present guard would give only the first.
+# That matters because the fail-open re-emit path below copies the message
+# STORED in `alert_events`, which is captured at first fire and never rewritten:
+# skipping a decorated message would pin the displayed age to whenever the row
+# was written. A stale duration is worse than none, since it reads as current.
+# Anchored at end-of-string so a legitimate parenthetical in the message body
+# (e.g. "DOWN (all providers exhausted)") is untouched.
+_ONGOING_MARK = "(ongoing for "
+# Derived from the mark so the two cannot drift: changing the mark without
+# this would silently stop the strip and let suffixes accrete.
+_ONGOING_RE = re.compile(rf"\s*{re.escape(_ONGOING_MARK)}[^)]*\)\s*$")
+
+
+def _ongoing_for(created_at: str | None, now: datetime) -> str | None:
+    """Human duration an alert has been open, or None if it should not be shown.
+
+    Returns None for anything younger than the floor, unparseable, or dated in
+    the future (clock skew). Never raises: this decorates the alert path, and a
+    bad row must cost a suffix, not the whole alert set.
+    """
+    if not created_at:
+        return None
+    try:
+        started = datetime.fromisoformat(str(created_at))
+    except (TypeError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    elapsed = (now - started).total_seconds()
+    if elapsed < _ONGOING_FLOOR_S:
+        return None
+    hours = int(elapsed // 3600)
+    days, rem = divmod(hours, 24)
+    if days and rem:
+        return f"{days}d {rem}h"
+    if days:
+        return f"{days}d"
+    return f"{hours}h"
+
+
+def _apply_ongoing_duration(
+    alerts: list[dict], open_rows: dict, *, now: datetime | None = None,
+) -> None:
+    """Append "(ongoing for Xd Yh)" to alerts with a durable open row.
+
+    `alert_events` has carried `created_at` with 90-day retention since WS-2 M10
+    and had no production reader — every surface rendered instantaneous state, so
+    a 3-day provider outage read exactly like a 3-minute one (incident
+    2026-08-28/29). Enriching the MESSAGE reaches the dashboard banner, the
+    morning report and the Telegram path at once, because all three render
+    `message`.
+
+    Mutates in place. An alert firing for the FIRST time has no row yet (the
+    awareness tick writes it after this runs), so it simply gets no suffix.
+
+    KNOWN LIMIT, declined deliberately rather than patched (Codex P2): the only
+    writer of `alert_events` is the awareness tick, so if that loop dies no new
+    open rows appear and alerts first detected afterwards stay undecorated no
+    matter how long they persist. The fail-soft behaviour is correct — no suffix
+    is the honest output when the outage clock has no data.
+
+    A fallback start time was considered and rejected: the only clock available
+    without that writer is "when this process first saw the alert", which resets
+    on every restart. That is precisely the flapping this whole change removes,
+    and a duration that silently understates the outage is worse than none
+    because it reads as current. A second persistence path would be a new store
+    for data one tick already owns. The dead-writer condition is separately
+    visible (`awareness:tick_overdue`), which is the right place to surface it.
+    """
+    now = now or datetime.now(UTC)
+    for alert in alerts:
+        try:
+            raw = alert.get("message")
+            if raw is None:
+                # No message to decorate. Skipping rather than writing is
+                # deliberate: this function widened from "only touch decorated
+                # alerts that have a row" to "always rewrite", and without this
+                # guard a messageless alert would gain `message=""` — which
+                # `outreach/morning_report.py` renders as blank instead of
+                # falling back to its own "Unknown". Not reachable from the
+                # current append sites (all pass a literal message); the guard
+                # keeps the widening from carrying a latent regression.
+                continue
+            # Strip FIRST, unconditionally: an alert whose row has gone must
+            # not keep a suffix describing an age nothing can still vouch for.
+            base = _ONGOING_RE.sub("", str(raw)).strip()
+            row = open_rows.get(alert.get("id", ""))
+            human = _ongoing_for(row.get("created_at"), now) if row else None
+            alert["message"] = f"{base} {_ONGOING_MARK}{human})".strip() if human else base
+        except Exception:  # noqa: BLE001 - never break the alert path
+            logger.debug("ongoing-duration decoration failed", exc_info=True)
 
 
 async def _compute_alerts() -> tuple[list[dict], set[str]]:
@@ -622,6 +723,24 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
         )
         current_ids.add(alert_id)
 
+    # Internet connectivity. WARNING (not CRITICAL): the container Sentinel can't
+    # fix an ISP outage, so this stays out of the Sentinel-waking CRITICAL tier.
+    # Fires only on a confirmed OFFLINE (down) — DEGRADED/unknown/absent do not
+    # alert (a slow or unmonitored network is not an incident). The infra probe
+    # already staleness-guards, so a stale sentinel reads 'unknown', not 'down'.
+    internet = snap.get("infrastructure", {}).get("internet", {})
+    if isinstance(internet, dict) and internet.get("status") == "down":
+        alert_id = "infra:internet_down"
+        detail = internet.get("message") or "offline"
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"Internet connectivity down ({detail})",
+            }
+        )
+        current_ids.add(alert_id)
+
     if _activity_tracker is not None:
         emb_summary = _activity_tracker.summary("episodic_memory_embedding")
         if (
@@ -796,17 +915,31 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
             from genesis.mcp.health.critical_sites import (
                 CALLSITE_DOWN_RECENCY_HOURS,
                 CRITICAL_CALL_SITES,
+                CRITICAL_CALLSITE_DOWN_RECENCY_HOURS,
             )
 
+            # Two-tier recency: CRITICAL sites keep alarming for weeks (a
+            # failed weekly reflection must not fall silent after a day —
+            # "quieter the longer it's broken" is the inversion this fixes),
+            # while non-critical sites keep the tight window (a weeks-old
+            # failed row on a watched-only site is stale noise, not an
+            # outage). The SQL fetches the WIDE window; the tight filter is
+            # applied per row below with the same string-compare semantics
+            # (both sides are isoformat-with-offset, like the SQL compare).
             cs_cutoff = (datetime.now(UTC) - _td3(hours=CALLSITE_DOWN_RECENCY_HOURS)).isoformat()
+            cs_critical_cutoff = (
+                datetime.now(UTC) - _td3(hours=CRITICAL_CALLSITE_DOWN_RECENCY_HOURS)
+            ).isoformat()
             cs_cursor = await _service._db.execute(
                 "SELECT call_site_id, last_run_at, provider_used "
                 "FROM call_site_last_run WHERE success = 0 AND last_run_at >= ?",
-                (cs_cutoff,),
+                (cs_critical_cutoff,),
             )
             for cs_row in await cs_cursor.fetchall():
                 site_id, last_run_at, provider_used = cs_row
                 is_critical = site_id in CRITICAL_CALL_SITES
+                if not is_critical and str(last_run_at) < cs_cutoff:
+                    continue
                 alert_id = f"callsite:down:{site_id}"
                 alerts.append(
                     {
@@ -850,6 +983,10 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     # job runs without succeeding, so a healthy job reads 0 regardless of
     # cadence — no per-job schedule lookup needed.
     if _service and _service._db:
+        # Two INDEPENDENT detectors in separate try blocks: a raise in one must not
+        # blind the other on the same tick (both query the same always-present table,
+        # so correlated failure is likely, but the split makes it impossible for the
+        # gap detector to swallow the never-succeeded check or vice versa).
         try:
             from genesis.db.crud import job_health as job_health_crud
 
@@ -871,11 +1008,231 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 )
                 current_ids.add(alert_id)
         except Exception:
-            # job_health is a core table that always exists — a failure here is
-            # a real operational fault, not an expected-absent-table case, so
-            # ERROR (unlike the credit-exhaustion block, which queries the
-            # optionally-absent activity_log).
+            # job_health is a core table that always exists — a failure here is a real
+            # operational fault, not an expected-absent-table case, so ERROR.
             logger.error("Silently-stale job alert check failed", exc_info=True)
+
+        # Never-succeeded jobs: the gap query above filters last_success IS NOT NULL,
+        # so a job that has run + failed repeatedly but never once succeeded
+        # (last_success NULL forever) is invisible to it AND to consecutive_failures
+        # (reset on restart). total_runs/total_failures are monotonic → restart-proof.
+        # (An 8-day OAuth outage on a daily actuator hid here until this was added.)
+        try:
+            from datetime import timedelta as _td4
+
+            from genesis.db.crud import job_health as job_health_crud
+
+            # Recency bound: only alarm jobs still running recently — a never-succeeded
+            # job that was disabled/removed leaves a fossil row (nothing auto-purges
+            # job_health) that would otherwise WARNING forever. The slowest scheduled
+            # cadence is WEEKLY (verified — no monthly/quarterly jobs exist), so 35d
+            # covers every real job with wide margin (and a plausible future monthly
+            # actuator) while bounding a removed job's fossil WARNING to ≤35d — and this
+            # alert is dashboard/health-only (not escalated), so that lag is harmless.
+            # A job that runs LESS often than 35d would fall through both this and the
+            # gap detector; documented in get_never_succeeded_jobs' CONTRACT.
+            recent_since = (datetime.now(UTC) - _td4(days=35)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for row in await job_health_crud.get_never_succeeded_jobs(
+                _service._db, recent_since=recent_since
+            ):
+                alert_id = f"job_never_succeeded:{row['job_name']}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"Scheduled job '{row['job_name']}' has failed "
+                            f"{row['total_failures']} times and has NEVER succeeded "
+                            f"(last error: {str(row['last_error'] or 'n/a')[:80]}) — "
+                            f"invisible to the gap + consecutive-failure alarms"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+        except Exception:
+            # job_health is a core table that always exists — a failure here is a real
+            # operational fault, not an expected-absent-table case, so ERROR.
+            logger.error("Never-succeeded job alert check failed", exc_info=True)
+
+    # ── Stopped-firing subsystems (total-cessation) ──────────────────
+    # Each subsystem below pulses a durable ``heartbeat`` event whose emission is
+    # independent of pause (ego: dedicated ego_heartbeat job; dashboard + outreach:
+    # dedicated daemon threads) or is downgraded to "paused" while paused (inbox, whose
+    # pulse stops behind ``if paused: return`` — handled in compute_heartbeat_staleness).
+    # When that pulse goes overdue past its per-subsystem threshold the
+    # scheduler/loop has stopped — a SILENT death the failure-gap alarms above
+    # cannot see (those need a RUNNING-but-failing job; a stopped job never
+    # advances last_run either). Complements job_stale/job_never_succeeded.
+    # SET = ego (CRITICAL — the dead-ego-scheduler failure this batch began with)
+    # + inbox + dashboard + outreach (WARNING). Outreach's dedicated heartbeat
+    # (``outreach/heartbeat.py``) pulses only while its scheduler is running and is
+    # enable-gated (``_subsystem_enabled('outreach')`` = Telegram configured), so a
+    # Telegram-less (dashboard-only) install is benign — closing the old false-alarm
+    # trap (its pulse used to be config-gated + emergent). EXCLUDED: surplus — PR-B's
+    # shipped tile already flips red on a wedged/dead surplus via its finer job_health
+    # signal, and surplus's event-heartbeat is load-fragile (loop-END emit gaps under a
+    # 15-30min dispatch); reflection — its pulse is the awareness loop, not
+    # reflection-engine liveness; awareness — has the more precise
+    # ``awareness:tick_overdue`` above. Coverage cap: the ~90 non-pulse scheduled jobs
+    # get ONLY the failure-gap signals above; and outreach's own boundary — a
+    # Telegram-configured install whose scheduler NEVER started (registration failed)
+    # emits no pulse ever → benign no_heartbeat. Outreach IS a bootstrap-manifest entry
+    # (records ``ok`` = scheduler CONSTRUCTED, not running), so it is explicitly exempted
+    # from the started-silent never_started inference (manifest ``_CONDITIONAL_PULSE_SUBSYSTEMS``)
+    # — a constructed-but-not-started scheduler is benign; only a genuine init FAILURE
+    # (``failed:``/``degraded``) fires never_started, and only ``subsystem_stale`` (a
+    # once-running scheduler that then died) fires on cessation. The shared
+    # ``compute_heartbeat_staleness`` reads the same signal the ego dashboard tile
+    # does, so alert and tile agree on the OVERDUE verdict. (They diverge by design
+    # on ``no_heartbeat``: the tile applies a boot-grace and flips to error past it,
+    # while the alert path treats no-pulse-ever as empty-state — a once-run subsystem
+    # always retains a pulse via keep_latest GC, so this only differs on a truly
+    # fresh, never-bootstrapped install.)
+    _stale_read_failed: list[str] = []
+    try:
+        from genesis.mcp.health.manifest import (
+            _subsystem_enabled,
+            compute_heartbeat_staleness,
+        )
+
+        _stale_db = _service._db if _service else None
+        for _hb_name in ("ego", "inbox", "dashboard", "outreach"):
+            try:
+                # raise_on_error=True → a read failure fails LOUD (handled below by
+                # preserving any open alert), never a silent green that lets
+                # reconcile auto-resolve a genuinely-open subsystem_stale alert.
+                _hb = await compute_heartbeat_staleness(_hb_name, db=_stale_db, raise_on_error=True)
+            except Exception:
+                logger.error(
+                    "Pulse-staleness read failed for subsystem %s", _hb_name, exc_info=True
+                )
+                _stale_read_failed.append(_hb_name)
+                continue
+            _status = _hb.get("status")
+            if _status == "unknown":
+                # Unreadable pulse (corrupt / materially-future timestamp) → liveness
+                # cannot be confirmed. Surface LOUDLY as a WARNING (honest: "can't
+                # tell", NOT "died" — distinct id from subsystem_stale) instead of a
+                # silent skip; auto-resolves when a fresh parseable pulse lands.
+                logger.error(
+                    "Subsystem %s heartbeat unreadable (unknown) — liveness unconfirmable",
+                    _hb_name,
+                )
+                _unk_last = str(_hb.get("last_seen") or "")[:40]
+                alert_id = f"subsystem_heartbeat_unknown:{_hb_name}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"Subsystem '{_hb_name}' heartbeat is unreadable (corrupt "
+                            f"or clock-skewed timestamp '{_unk_last}') — liveness "
+                            f"cannot be confirmed"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+                continue
+            if _status == "never_started":
+                # Registered/expected but failed to start or never pulsed once (#10) —
+                # a dead liveness signal that no_heartbeat (empty-state) would hide.
+                # Distinct id from subsystem_stale (a once-live scheduler that DIED)
+                # and heartbeat_unknown (corrupt pulse). compute_heartbeat_staleness
+                # has already gated this on _subsystem_enabled, so a disabled/
+                # unconfigured subsystem never reaches here. ego CRITICAL, else WARNING;
+                # auto-resolves when the subsystem finally pulses (verdict → alive).
+                # Coverage: only ego + inbox can reach this — both are bootstrap init
+                # steps recorded in the manifest. `dashboard` is in this loop for the
+                # stale/unknown paths only; it is a daemon thread, NOT a manifest entry,
+                # so its verdict is always benign here. A never-started dashboard needs
+                # its own signal (a manifest entry for the thread) — a separate follow-up.
+                _ns_failed = _hb.get("reason") == "init-failed"
+                _detail = (
+                    "failed to initialize at bootstrap"
+                    if _ns_failed
+                    else "started but has never emitted a heartbeat"
+                )
+                alert_id = f"subsystem_never_started:{_hb_name}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL" if _hb_name == "ego" else "WARNING",
+                        "message": (
+                            f"Subsystem '{_hb_name}' is not running — it {_detail} "
+                            f"(never started); a restart-safe config/code fault, not a "
+                            f"transient stall"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+                continue
+            if _status != "overdue":
+                # alive / paused / resuming / no_heartbeat (empty-state) → no alert
+                continue
+            if not _subsystem_enabled(_hb_name):
+                # Intentionally DISABLED after having pulsed → its retained stale pulse
+                # is deliberate, not a death; suppress the (else permanent) alert.
+                continue
+            _age = int(_hb.get("age_seconds") or 0)
+            _last_seen = str(_hb.get("last_seen") or "")[:19]
+            alert_id = f"subsystem_stale:{_hb_name}"
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "CRITICAL" if _hb_name == "ego" else "WARNING",
+                    "message": (
+                        f"Subsystem '{_hb_name}' heartbeat overdue — no pulse in "
+                        f"{_age}s (last seen {_last_seen}); its scheduler/loop may "
+                        f"have died"
+                    ),
+                }
+            )
+            current_ids.add(alert_id)
+
+        # Fail-open guard (P2-4): a subsystem whose staleness read FAILED this tick
+        # is in an unknown state — we must NOT let the reconcile writer auto-resolve
+        # a genuinely-open subsystem_stale alert for it on a transient read blip.
+        # The reconcile writer (awareness/loop.py:158-168) builds its active-set
+        # from this ``alerts`` LIST (it does not consult current_ids), so RE-EMIT
+        # the already-open alert (reconstructed from its open row) — keeping it both
+        # open and displayed — for only the SPECIFIC failed subsystems (ones that
+        # read fine resolve/alert normally).
+        if _stale_read_failed and _service and _service._db:
+            try:
+                from genesis.db.crud import alert_events as _ae
+
+                _open_rows = {r.get("alert_id", ""): r for r in await _ae.list_open(_service._db)}
+                # Preserve EVERY alert family this per-subsystem block can emit
+                # (subsystem_stale: overdue, subsystem_heartbeat_unknown: unreadable,
+                # subsystem_never_started: failed/silent start) — otherwise the omitted
+                # family flaps (auto-resolved by the reconciler on the failed tick,
+                # re-opened on the next successful one). Keep in lockstep with the
+                # branches above that append to ``alerts``/``current_ids``.
+                for _n in _stale_read_failed:
+                    for _aid in (
+                        f"subsystem_stale:{_n}",
+                        f"subsystem_heartbeat_unknown:{_n}",
+                        f"subsystem_never_started:{_n}",
+                    ):
+                        _row = _open_rows.get(_aid)
+                        if _row is not None:
+                            alerts.append(
+                                {
+                                    "id": _aid,
+                                    "severity": _row.get("severity", "WARNING"),
+                                    "message": _row.get("message", ""),
+                                }
+                            )
+                            current_ids.add(_aid)  # lockstep, for alert-history dedup
+            except Exception:
+                logger.error(
+                    "Preserving open subsystem-heartbeat alerts on read failure failed",
+                    exc_info=True,
+                )
+    except Exception:
+        # Own try/except so a pulse-staleness read failure can't blind the other
+        # alert blocks; ERROR-logged (never a silent green).
+        logger.error("Subsystem pulse-staleness alert check failed", exc_info=True)
 
     # ── Genesis update available ─────────────────────────────────────
     if _service and _service._db:
@@ -1055,6 +1412,25 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 current_ids.add(alert_id)
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Decorate with how long each alert has been continuously open. The durable
+    # open-set in `alert_events` (written by the awareness tick, 90d retention)
+    # has carried `created_at` since WS-2 M10 with no production reader, so every
+    # surface rendered instantaneous state and a multi-day outage read exactly
+    # like a momentary one. Self-isolating: a failure here costs the duration
+    # suffix, never the alert set.
+    if _service is not None and _service._db is not None:
+        try:
+            from genesis.db.crud import alert_events as _ae_dur
+
+            _open = {
+                r.get("alert_id", ""): r for r in await _ae_dur.list_open(_service._db)
+            }
+            _apply_ongoing_duration(alerts, _open)
+        except Exception:  # noqa: BLE001 - observability must not break on this
+            # ERROR, not debug: nothing else reports this path failing, so a
+            # debug-level swallow means durations silently stop forever.
+            logger.error("could not attach ongoing durations to alerts", exc_info=True)
 
     return alerts, current_ids
 

@@ -165,10 +165,14 @@ async def test_error_does_not_corrupt_connection(sconn):
 
 # ── WS-15: shared raw-connection helper for ad-hoc / standalone opens ──
 
-async def test_get_raw_db_sets_standard_pragmas(tmp_path):
+async def test_get_raw_db_sets_standard_pragmas(tmp_path, monkeypatch):
     """get_raw_db must apply WAL + NORMAL sync + busy_timeout + Row factory so
     ad-hoc/subprocess opens can't fail immediately on a concurrent write lock."""
     from genesis.db.connection import BUSY_TIMEOUT_MS, get_raw_db
+
+    # Hermetic against the per-process override (e.g. an MCP-child test env or
+    # a dev shell exporting it) — this asserts the DEFAULT.
+    monkeypatch.delenv("GENESIS_DB_BUSY_TIMEOUT_MS", raising=False)
 
     db_path = tmp_path / "raw.db"
     async with get_raw_db(db_path) as db:

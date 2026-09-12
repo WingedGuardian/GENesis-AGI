@@ -71,7 +71,22 @@ case "$1" in
       [ "$a" = "--" ] && seen=1
     done
     case "$inner" in
-      pgrep) [ "${INCUS_CLAUDE_RUNNING:-0}" = "1" ] && exit 0 || exit 1 ;;
+      pgrep)
+        # count form (-c / -xc) prints a number like real `pgrep -c`; the plain
+        # existence form (-x) just sets exit status. The lib uses -x for the guard
+        # decision (before create AND again before attach) and -xc to report the
+        # count when a session is live.
+        for a in "$@"; do case "$a" in -*c*)
+          if [ "${INCUS_CLAUDE_RUNNING:-0}" = "1" ] || [ -n "${INCUS_CLAUDE_LIVE_FROM_CALL:-}" ]; then echo "${INCUS_CLAUDE_COUNT:-3}"; exit 0; else echo 0; exit 1; fi ;;
+        esac; done
+        # existence form. INCUS_CLAUDE_LIVE_FROM_CALL simulates TOCTOU: not live at
+        # the first guard, live by the Nth existence check (count kept in a file).
+        if [ -n "${INCUS_CLAUDE_LIVE_FROM_CALL:-}" ]; then
+          _pn=$(( $(cat "${INCUS_PGREP_CALLS:-/dev/null}" 2>/dev/null || echo 0) + 1 ))
+          echo "$_pn" > "${INCUS_PGREP_CALLS:-/dev/null}" 2>/dev/null || true
+          [ "$_pn" -ge "$INCUS_CLAUDE_LIVE_FROM_CALL" ] && exit 0 || exit 1
+        fi
+        [ "${INCUS_CLAUDE_RUNNING:-0}" = "1" ] && exit 0 || exit 1 ;;
       getent) echo "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash"; exit 0 ;;
       id)
         for a in "$@"; do
@@ -97,6 +112,7 @@ def _sandbox(tmp_path, **incus_env):
     env = {
         "PATH": f"{bindir}:/usr/bin:/bin",
         "INCUS_LOG": str(tmp_path / "incus.log"),
+        "INCUS_PGREP_CALLS": str(tmp_path / "pgrep_calls"),  # TOCTOU sim counter
         "HOME": str(tmp_path),  # so a stray guardian.yaml lookup can't leak
     }
     env.update({k: str(v) for k, v in incus_env.items()})
@@ -308,3 +324,115 @@ def test_guardian_paths_include_the_lib_everywhere():
     assert "scripts/lib/cc_tmp_volume.sh" in UPDATE_SH.read_text()
     assert "scripts/lib/cc_tmp_volume.sh" in WATCHDOG.read_text()
     assert "scripts/lib/cc_tmp_volume.sh" in DEPLOY_HEALTH.read_text()
+
+
+# ── machine-readable result tokens (consumed by the gateway cc-tmp-apply verb) ──
+
+
+def _result(env, extra_env=None):
+    """Run cc_tmp_volume_apply and return (rc, result_token, claude_procs)."""
+    if extra_env:
+        env = {**env, **extra_env}
+    script = (
+        f'set -euo pipefail; source "{LIB}"; '
+        "cc_tmp_volume_apply >/dev/null 2>&1; "
+        r'printf "RESULT=%s\nPROCS=%s\n" "${_cctmpvol_result:-}" "${_cctmpvol_claude_procs:-}"'
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    res = procs = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("RESULT="):
+            res = line[len("RESULT=") :]
+        elif line.startswith("PROCS="):
+            procs = line[len("PROCS=") :]
+    return r.returncode, res, procs
+
+
+def test_result_token_disabled(tmp_path):
+    rc, res, _ = _result(_sandbox(tmp_path, CCTMPVOL_DISABLE=1))
+    assert rc == 0 and res == "disabled"
+
+
+def test_result_token_no_incus(tmp_path):
+    env = _sandbox(tmp_path)
+    onlybash = tmp_path / "onlybash2"
+    onlybash.mkdir()
+    os.symlink(shutil.which("bash"), onlybash / "bash")
+    env["PATH"] = str(onlybash)
+    rc, res, _ = _result(env)
+    assert rc == 0 and res == "no-incus"
+
+
+def test_result_token_not_running(tmp_path):
+    rc, res, _ = _result(_sandbox(tmp_path, INCUS_INFO_STATUS="Stopped"))
+    assert rc == 0 and res == "not-running"
+
+
+def test_result_token_already_isolated(tmp_path):
+    rc, res, _ = _result(_sandbox(tmp_path, INCUS_DEVICE_ATTACHED=1))
+    assert rc == 0 and res == "already-isolated"
+
+
+def test_result_token_live_cc_reports_reason_and_count(tmp_path):
+    # The whole point of the token: report WHY (blocked on a live session) AND how
+    # many, so the awareness posture can mark the gap "converging" not "broken".
+    rc, res, procs = _result(_sandbox(tmp_path, INCUS_CLAUDE_RUNNING=1, INCUS_CLAUDE_COUNT=5))
+    assert rc == 0 and res == "live-cc"
+    assert procs == "5"
+
+
+def test_result_token_unsupported_pool(tmp_path):
+    rc, res, _ = _result(_sandbox(tmp_path, INCUS_DRIVER="dir"))
+    assert rc == 0 and res == "unsupported-pool"
+
+
+def test_result_token_applied_on_happy_path(tmp_path):
+    rc, res, procs = _result(_sandbox(tmp_path))
+    assert rc == 0 and res == "applied"
+    assert procs == ""  # count only populated on a live-cc skip
+
+
+def test_result_token_verify_failed_rolledback(tmp_path):
+    rc, res, _ = _result(_sandbox(tmp_path, INCUS_VERIFY_RC=1))
+    assert rc == 0 and res == "verify-failed-rolledback"
+
+
+# ── TOCTOU narrowing: re-check for a live session right before the attach ─────
+
+
+def test_live_cc_between_create_and_attach_skips_attach(tmp_path):
+    # Quiet at the first guard (call 1) → past create; a session launches before
+    # the attach (live from call 2). The pre-attach re-check must abort the attach:
+    # the volume was created (kept for reuse) but is NOT attached over the newly
+    # live session's temp tree.
+    env = _sandbox(tmp_path, INCUS_CLAUDE_LIVE_FROM_CALL=2)
+    res = _run(env)
+    assert res.returncode == 0 and "__DONE__" in res.stdout
+    log = _log(tmp_path)
+    assert "storage volume create" in log  # got past the first guard
+    assert "config device add" not in log  # the re-check aborted the attach
+
+
+def test_result_token_live_cc_at_recheck(tmp_path):
+    rc, res, procs = _result(_sandbox(tmp_path, INCUS_CLAUDE_LIVE_FROM_CALL=2))
+    assert rc == 0 and res == "live-cc"
+    assert procs == "3"  # count reported at the re-check skip
+
+
+# ── container resolution honors the authoritative guardian.yaml default ──────
+
+
+def test_guardian_yaml_default_resolves_container_name(tmp_path):
+    # The lib's CCTMPVOL_GUARDIAN_YAML default must point at the authoritative
+    # path install_guardian.sh writes ($HOME/.local/share/genesis-guardian/config/
+    # guardian.yaml). If it points elsewhere, container_name is never read and the
+    # apply silently targets the "genesis" literal — breaking non-default installs.
+    env = _sandbox(tmp_path)  # HOME=tmp_path; CCTMPVOL_GUARDIAN_YAML unset → default
+    cfgdir = tmp_path / ".local" / "share" / "genesis-guardian" / "config"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "guardian.yaml").write_text('container_name: "mybox"\n')
+    res = _run(env)
+    assert res.returncode == 0 and "__DONE__" in res.stdout
+    log = _log(tmp_path)
+    assert "info mybox" in log  # incus ops target the configured container
+    assert "genesis-cc-tmp" not in log  # NOT the default-name fallback volume

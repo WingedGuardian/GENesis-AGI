@@ -19,9 +19,10 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
-# Default judge is a healthy free provider, NOT the runner module's stale
-# ``nvidia-nim-deepseek`` default (which is frequently down); both are
-# caller-overridable.
+# Interactive default judge is a healthy free provider (groq-free) — this MCP
+# tool favors a fast, no-cost check. (Historically this avoided the then-default
+# ``nvidia-nim-deepseek``, which was frequently down; the offline judge default
+# is now the calibrated ``openrouter-deepseek-v4``.) Both are caller-overridable.
 _DEFAULT_GEN_PROVIDER = "groq-free"
 _DEFAULT_JUDGE_PROVIDER = "groq-free"
 

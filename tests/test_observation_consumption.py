@@ -98,15 +98,16 @@ async def test_light_context_includes_memory_hits(db, identity_dir):
 
     now = datetime.now(UTC).isoformat()
     # Create some observations — must be recent to pass age guard
+    # WS-3: first-party so the fail-closed read gate surfaces them into memory_hits.
     await observations.create(
         db, id="mh-1", source="sensor", type="metric",
         content="CPU spike detected", priority="high",
-        created_at=now,
+        created_at=now, origin_class="first_party",
     )
     await observations.create(
         db, id="mh-2", source="sensor", type="metric",
         content="Memory leak found", priority="medium",
-        created_at=now,
+        created_at=now, origin_class="first_party",
     )
 
     loader = IdentityLoader(identity_dir)
@@ -146,7 +147,8 @@ async def test_memory_hits_tracks_retrieval(db, identity_dir):
 
     now = datetime.now(UTC).isoformat()
     await observations.create(db, id="mh-track", source="sensor", type="metric",
-                              content="cpu at 90%", priority="high", created_at=now)
+                              content="cpu at 90%", priority="high", created_at=now,
+                              origin_class="first_party")  # WS-3: surface into memory_hits
 
     loader = IdentityLoader(identity_dir)
     assembler = ContextAssembler(identity_loader=loader)

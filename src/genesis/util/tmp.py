@@ -29,3 +29,39 @@ def big_tmp_dir() -> str:
     target = os.environ.get("GENESIS_BIG_TMP") or str(Path.home() / "tmp")
     Path(target).mkdir(parents=True, exist_ok=True)
     return target
+
+
+def should_redirect_pytest_basetemp(
+    current_basetemp: str | None,
+    tmpdir_env: str | None,
+    home: str,
+) -> bool:
+    """Whether pytest's basetemp should be steered off cc-tmp. Pure — no I/O.
+
+    pytest's ``tmp_path``/``basetemp`` default to ``<TMPDIR>/pytest-of-<user>/``.
+    On a Genesis install ``TMPDIR`` is ``~/.genesis/cc-tmp`` (set for CC sessions
+    by ``scripts/cc-slot.sh``), the budget-policed dir the ``genesis-tmp-watchgod``
+    service reacts to — so an un-redirected suite dumps hundreds of MB there and
+    trips the watchgod.
+
+    Redirect ONLY when BOTH hold (else ``False`` — leave pytest's default AND do
+    no filesystem work):
+      * the caller did not already pass ``--basetemp`` (``current_basetemp is None``);
+      * ``TMPDIR`` resolves to ``<home>/.genesis/cc-tmp`` or a path under it.
+
+    On CI ``TMPDIR`` is unset → ``False`` → no-op (CI keeps its own tmp). Being a
+    pure predicate (no ``big_tmp_dir()`` call) is deliberate: the caller must not
+    create ``~/tmp`` on the no-op / explicit-``--basetemp`` path (that would break
+    a read-only-home or CI run during config). The caller redirects to a
+    per-process leaf under :func:`big_tmp_dir` (``~/tmp``) only when this is True;
+    per-process because pytest clears an explicit basetemp at session start, so
+    concurrent runs sharing one path would delete each other's temp. This never
+    rewrites the process ``TMPDIR`` (see the module docstring).
+    """
+    if current_basetemp is not None:
+        return False
+    if not tmpdir_env:
+        return False
+    cc_tmp = os.path.realpath(os.path.join(home, ".genesis", "cc-tmp"))
+    resolved = os.path.realpath(tmpdir_env)
+    return resolved == cc_tmp or resolved.startswith(cc_tmp + os.sep)

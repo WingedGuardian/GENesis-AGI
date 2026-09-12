@@ -32,9 +32,7 @@ class TestBashHookPipEditable:
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_pip_install_editable_worktree_blocked(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_pip_install_editable_worktree_blocked(self, bash_hook_command: str) -> None:
         """pip install --editable ./.claude/worktrees/foo -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
@@ -44,43 +42,26 @@ class TestBashHookPipEditable:
         assert "BLOCKED" in result.stderr
         assert "PYTHONPATH" in result.stderr  # suggests alternative
 
-    def test_pip_install_e_absolute_worktree_blocked(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_pip_install_e_absolute_worktree_blocked(self, bash_hook_command: str) -> None:
         """pip install -e /home/ubuntu/genesis/.claude/worktrees/my-branch -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {
-                "command": (
-                    "pip install -e "
-                    "/home/ubuntu/genesis/.claude/worktrees/my-branch"
-                )
-            },
+            {"command": ("pip install -e /home/ubuntu/genesis/.claude/worktrees/my-branch")},
         )
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_pip_install_normal_package_allowed(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_pip_install_normal_package_allowed(self, bash_hook_command: str) -> None:
         """pip install requests -> allowed (no worktree, no -e)."""
-        result = run_hook(
-            bash_hook_command, {"command": "pip install requests"}
-        )
+        result = run_hook(bash_hook_command, {"command": "pip install requests"})
         assert result.returncode == 0
 
-    def test_pip_install_e_non_worktree_allowed(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_pip_install_e_non_worktree_allowed(self, bash_hook_command: str) -> None:
         """pip install -e ./src -> allowed (not a worktree path)."""
-        result = run_hook(
-            bash_hook_command, {"command": "pip install -e ./src"}
-        )
+        result = run_hook(bash_hook_command, {"command": "pip install -e ./src"})
         assert result.returncode == 0
 
-    def test_pip_install_e_with_extras_worktree_blocked(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_pip_install_e_with_extras_worktree_blocked(self, bash_hook_command: str) -> None:
         """pip install -e '.claude/worktrees/x[dev]' -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
@@ -103,9 +84,7 @@ class TestBashHookWorktreeServe:
     non-worktree cwd; the hook's cwd check is exercised in real sessions.)
     """
 
-    def test_serve_with_worktree_pythonpath_blocked(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_serve_with_worktree_pythonpath_blocked(self, bash_hook_command: str) -> None:
         """PYTHONPATH=<worktree>/src python -m genesis serve -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
@@ -124,19 +103,12 @@ class TestBashHookWorktreeServe:
         """cd into a worktree && genesis serve -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {
-                "command": (
-                    "cd .claude/worktrees/my-branch && "
-                    "python -m genesis serve --port 5050"
-                )
-            },
+            {"command": ("cd .claude/worktrees/my-branch && python -m genesis serve --port 5050")},
         )
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_systemctl_restart_genesis_server_allowed(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_systemctl_restart_genesis_server_allowed(self, bash_hook_command: str) -> None:
         """systemctl --user restart genesis-server -> allowed (not 'genesis serve')."""
         result = run_hook(
             bash_hook_command,
@@ -144,9 +116,7 @@ class TestBashHookWorktreeServe:
         )
         assert result.returncode == 0
 
-    def test_journalctl_genesis_server_allowed(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_journalctl_genesis_server_allowed(self, bash_hook_command: str) -> None:
         """journalctl --user -u genesis-server -> allowed."""
         result = run_hook(
             bash_hook_command,
@@ -154,9 +124,7 @@ class TestBashHookWorktreeServe:
         )
         assert result.returncode == 0
 
-    def test_plain_serve_without_worktree_allowed(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_plain_serve_without_worktree_allowed(self, bash_hook_command: str) -> None:
         """python -m genesis serve (no worktree reference) -> allowed by THIS
         guard (the lock-file discipline for bare serves is a separate rule)."""
         result = run_hook(
@@ -172,34 +140,28 @@ class TestBashHookWorktreeServe:
 
 
 class TestBashHookWorktreeForceRemove:
-    """Block git worktree remove --force (destroys uncommitted work)."""
+    """The INLINE mega-guard no longer owns `git worktree remove --force` (2026-08,
+    PR-Guards): it duplicated worktree_cwd_guard.py (which blocks ALL `git worktree
+    remove`, force or not — see tests/test_hooks/test_worktree_guard.py) and
+    scripts/bash_safety_hook.sh (which still blocks the --force form). The inline
+    guard now passes these through (returncode 0)."""
 
-    def test_worktree_remove_force_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """git worktree remove --force .claude/worktrees/foo -> BLOCKED."""
+    def test_worktree_remove_force_not_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(
             bash_hook_command,
             {"command": "git worktree remove --force .claude/worktrees/foo"},
         )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
+        assert result.returncode == 0
 
-    def test_worktree_remove_f_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """git worktree remove -f .claude/worktrees/foo -> BLOCKED."""
+    def test_worktree_remove_f_not_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(
             bash_hook_command,
             {"command": "git worktree remove -f .claude/worktrees/foo"},
         )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
+        assert result.returncode == 0
 
-    def test_worktree_remove_without_force_allowed(
-        self, bash_hook_command: str
-    ) -> None:
-        """git worktree remove .claude/worktrees/foo -> allowed (no --force)."""
+    def test_worktree_remove_without_force_allowed(self, bash_hook_command: str) -> None:
+        """git worktree remove .claude/worktrees/foo -> allowed by the inline guard."""
         result = run_hook(
             bash_hook_command,
             {"command": "git worktree remove .claude/worktrees/foo"},
@@ -247,9 +209,7 @@ class TestBashHookRmRf:
         result = run_hook(rm_rf_hook_command, {"command": "rm -rf /tmp/foo"})
         assert result.returncode == 2
 
-    def test_rm_rf_shallow_relative_blocked(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_rm_rf_shallow_relative_blocked(self, rm_rf_hook_command: str) -> None:
         """rm -rf ./src -> BLOCKED (depth 1 < 4)."""
         result = run_hook(
             rm_rf_hook_command,
@@ -259,9 +219,7 @@ class TestBashHookRmRf:
 
     def test_rm_rf_home_subpath_blocked(self, rm_rf_hook_command: str) -> None:
         """rm -rf ~/Downloads -> BLOCKED (depth 3 < 4)."""
-        result = run_hook(
-            rm_rf_hook_command, {"command": "rm -rf ~/Downloads"}
-        )
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf ~/Downloads"})
         assert result.returncode == 2
 
     def test_rm_rf_bare_dirname_blocked(self, rm_rf_hook_command: str) -> None:
@@ -301,9 +259,7 @@ class TestBashHookRmRf:
 
     def test_rm_long_flags_blocked(self, rm_rf_hook_command: str) -> None:
         """rm --recursive --force . -> BLOCKED."""
-        result = run_hook(
-            rm_rf_hook_command, {"command": "rm --recursive --force ."}
-        )
+        result = run_hook(rm_rf_hook_command, {"command": "rm --recursive --force ."})
         assert result.returncode == 2
 
     def test_rm_capital_r_blocked(self, rm_rf_hook_command: str) -> None:
@@ -316,9 +272,7 @@ class TestBashHookRmRf:
         result = run_hook(rm_rf_hook_command, {"command": "rm -rf -- /"})
         assert result.returncode == 2
 
-    def test_rm_broad_second_operand_blocked(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_rm_broad_second_operand_blocked(self, rm_rf_hook_command: str) -> None:
         """rm -rf deep/ok/nested/path / -> BLOCKED (each operand checked)."""
         result = run_hook(
             rm_rf_hook_command,
@@ -328,23 +282,15 @@ class TestBashHookRmRf:
 
     def test_rm_after_separator_blocked(self, rm_rf_hook_command: str) -> None:
         """echo ok && rm -r -f ~ -> BLOCKED (rm found past separators)."""
-        result = run_hook(
-            rm_rf_hook_command, {"command": "echo ok && rm -r -f ~"}
-        )
+        result = run_hook(rm_rf_hook_command, {"command": "echo ok && rm -r -f ~"})
         assert result.returncode == 2
 
-    def test_rm_unparseable_falls_back_to_regex(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_rm_unparseable_falls_back_to_regex(self, rm_rf_hook_command: str) -> None:
         """Unclosed quote (shlex fails) + classic spelling -> legacy block."""
-        result = run_hook(
-            rm_rf_hook_command, {"command": "rm -rf / 'unclosed"}
-        )
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf / 'unclosed"})
         assert result.returncode == 2
 
-    def test_rm_split_flags_deep_path_allowed(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_rm_split_flags_deep_path_allowed(self, rm_rf_hook_command: str) -> None:
         """rm -r -f on a 4+-deep path -> allowed (parity with -rf)."""
         result = run_hook(
             rm_rf_hook_command,
@@ -355,43 +301,165 @@ class TestBashHookRmRf:
     # -- 2026-07-10 review findings: leading-'..' traversal + abbreviated
     # -- GNU long flags were both live bypasses.
 
-    @pytest.mark.parametrize("target", [
-        "../../../etc",
-        "../../../../../../../../etc",  # bottoms out at /etc from root
-        "../foo/bar/baz/qux",           # depth 4 textually, still traverses up
-        "a/b/../../../../etc",          # interior '..' escapes past the base
-    ])
-    def test_rm_rf_upward_traversal_blocked(
-        self, rm_rf_hook_command: str, target: str
-    ) -> None:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "../../../etc",
+            "../../../../../../../../etc",  # bottoms out at /etc from root
+            "../foo/bar/baz/qux",  # depth 4 textually, still traverses up
+            "a/b/../../../../etc",  # interior '..' escapes past the base
+        ],
+    )
+    def test_rm_rf_upward_traversal_blocked(self, rm_rf_hook_command: str, target: str) -> None:
         """rm -rf on any path whose normalized form keeps a '..' -> BLOCKED.
 
         A relative '..' cannot be depth-bounded without the real cwd, so
         the guard refuses (`../../../etc` used to report depth 4 and pass
         while resolving to /etc)."""
-        result = run_hook(
-            rm_rf_hook_command, {"command": f"rm -rf {target}"}
-        )
+        result = run_hook(rm_rf_hook_command, {"command": f"rm -rf {target}"})
         assert result.returncode == 2
 
-    def test_rm_rf_abbrev_long_flags_blocked(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_rm_rf_abbrev_long_flags_blocked(self, rm_rf_hook_command: str) -> None:
         """rm --rec --f / -> BLOCKED (GNU unambiguous prefix abbreviations)."""
-        result = run_hook(
-            rm_rf_hook_command, {"command": "rm --rec --f /"}
-        )
+        result = run_hook(rm_rf_hook_command, {"command": "rm --rec --f /"})
         assert result.returncode == 2
 
-    def test_rm_non_destructive_long_flags_allowed(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_rm_non_destructive_long_flags_allowed(self, rm_rf_hook_command: str) -> None:
         """--dir/--verbose are not recursive+force -> deep path allowed."""
         result = run_hook(
             rm_rf_hook_command,
             {"command": "rm --dir --verbose /a/b/c/d/e"},
         )
         assert result.returncode == 0
+
+    # -- Regression: shell metacharacters (redirections, newlines, line
+    # -- continuations) were parsed as rm operands and spuriously blocked a
+    # -- SAFE deep path, once #1227 revived the guard (found live 2026-07-24).
+    # -- The fix must never let a dangerous rm through, so each 'allow' case is
+    # -- paired with the dangerous variant that must still block.
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "rm -rf /home/u/proj/node_modules 2>/dev/null",  # stderr redirect
+            "rm -rf /a/b/c/d >log 2>&1",  # stdout redirect + fd dup
+            "rm -rf /a/b/c/d 2>>errors.log",  # append redirect
+            "rm -rf /a/b/c/d &>/dev/null",  # both-streams redirect
+            "rm -rf /a/b/c/d <input",  # input redirect (glued)
+        ],
+    )
+    def test_rm_rf_redirect_deep_path_allowed(self, rm_rf_hook_command: str, cmd: str) -> None:
+        """A glued redirect after a safe deep path must not be read as a target."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 0, f"redirect false-positive: {cmd!r}\n{result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "rm -rf / 2>/dev/null",  # dangerous target, redirect stripped
+            "rm -rf ~ >log",
+            "rm -rf ../../../etc 2>/dev/null",  # upward traversal + redirect
+        ],
+    )
+    def test_rm_rf_dangerous_with_redirect_still_blocked(
+        self, rm_rf_hook_command: str, cmd: str
+    ) -> None:
+        """Stripping the redirect must not weaken the block on a real target."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 2, f"redirect strip weakened block: {cmd!r}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            'rm -r -f "a\\">"',  # backslash-escaped quote inside "..." (shlex: a">)
+            'rm --recursive --force "a\\">"',  # same, long flags
+            'rm -Rf "a>b"',  # operand does NOT start with a redirect op
+        ],
+    )
+    def test_rm_rf_non_redirect_shaped_operand_still_blocked(
+        self, rm_rf_hook_command: str, cmd: str
+    ) -> None:
+        """An operand that merely CONTAINS a redirect char but does not START with
+        one (e.g. shlex resolves `"a\\">"` to `a">`) is a normal path and is still
+        depth-checked and blocked.
+
+        Regression: earlier fixes hand-rolled a pre-shlex redirect parser that
+        diverged from shlex's quote/escape rules across three review rounds
+        (2026-07-24), each a bypass. The final design delegates ALL quoting to
+        shlex and skips a token only when it *starts with* a redirect operator."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 2, f"non-redirect-shaped operand allowed: {cmd!r}"
+
+    def test_rm_rf_redirect_then_real_target_still_blocked(self, rm_rf_hook_command: str) -> None:
+        """CRITICAL: skipping a redirect-shaped token must NEVER skip the FOLLOWING
+        token — `rm -rf ">" /etc` must still depth-check and block `/etc`."""
+        result = run_hook(rm_rf_hook_command, {"command": 'rm -rf ">" /etc'})
+        assert result.returncode == 2
+
+    def test_rm_rf_digit_glued_background_second_rm_blocked(self, rm_rf_hook_command: str) -> None:
+        """A background `&` glued to a digit-ending word must still split, so a
+        second `rm -rf /` after it is caught (not swallowed as one glued token).
+
+        The separator lookbehind is `(?<![<>])` (no `\\d`): a bare digit before
+        `&` is never part of a redirection, so the `&` is correctly spaced."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /a/b/c/d5&rm -rf /"})
+        assert result.returncode == 2
+
+    def test_rm_rf_redirect_target_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        """A quoted redirect TARGET glued to the operator after a safe deep path
+        is still recognized as a redirect and skipped."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": 'rm -rf /home/u/proj/build >"my file"'},
+        )
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "cmd", ['rm -rf ">log"', 'rm -r -f ">"', 'rm -rf ">etc"', 'rm -rf "<in"']
+    )
+    def test_rm_rf_redirect_shaped_filename_allowed(
+        self, rm_rf_hook_command: str, cmd: str
+    ) -> None:
+        """DESIGN (user decision 2026-07-24, "simple + catastrophe-safe"): shlex
+        erases the quoted/unquoted distinction, so a token that STARTS WITH a
+        redirect operator is uniformly treated as a redirect and skipped — even a
+        quoted file literally named `>etc`/`>`. This is deliberately accepted:
+        such a token starts with `<`/`>`/`&>`, which no catastrophic target
+        (`. .. / ~ *` or any real path) ever does, so nothing dangerous is
+        missed; and blocking these would re-break the real `rm -rf /deep >log`
+        false-positive. See _REDIR_TOKEN's safety proof in the guard."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 0, result.stderr
+
+    def test_rm_rf_newline_separated_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        """A follow-on command after a newline must not fold into rm's operands.
+
+        shlex drops a bare newline as whitespace, so before the fix `echo done`
+        was depth-checked as a shallow rm target."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -rf /home/u/proj/build\necho done"},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_rm_rf_line_continuation_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        r"""A `\`-newline continuation inside one rm invocation stays one path."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -rf \\\n/home/u/proj/build"},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_rm_rf_background_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        """A trailing `&` (background) must not be read as an rm target."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /a/b/c/d &"})
+        assert result.returncode == 0, result.stderr
+
+
+# NOTE: the run_in_background pipe check moved OUT of the inline mega-guard into a
+# dedicated Python hook (scripts/hooks/background_pipe_guard.py, quote/redirect-aware
+# via shell_parse.has_top_level_pipe) — see tests/test_hooks/test_background_pipe_guard.py.
+# The inline guard no longer reads run_in_background.
 
 
 # ---------------------------------------------------------------------------
@@ -400,61 +468,67 @@ class TestBashHookRmRf:
 
 
 class TestBashHookGitPushForce:
-    """Block force pushes."""
+    """The INLINE mega-guard no longer owns force-push detection (2026-08,
+    PR-Guards): that whole-command substring check carried a false positive
+    (`git push origin main && rm -f x`), so it was removed. Force push is now
+    owned by the tracked git_push_guard.py (argv-based, hard-blocks force to
+    origin — see tests/test_hooks/test_push_create_override.py) and by
+    scripts/bash_safety_hook.sh (segment-scoped — see
+    tests/test_scripts/test_bash_safety_hook.py). These assert the inline guard
+    PASSES force-push commands through (returncode 0); it is not the owner."""
 
-    def test_git_push_force_blocked(self, bash_hook_command: str) -> None:
-        """git push --force origin main -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push --force origin main"},
-        )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-        assert "Force push" in result.stderr
+    def test_git_push_force_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push --force origin main"})
+        assert result.returncode == 0
 
-    def test_git_push_f_blocked(self, bash_hook_command: str) -> None:
-        """git push -f -> BLOCKED."""
+    def test_git_push_f_not_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git push -f"})
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
+        assert result.returncode == 0
 
-    def test_git_push_f_with_remote_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """git push -f origin feature -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push -f origin feature"},
-        )
-        assert result.returncode == 2
+    def test_git_push_f_with_remote_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push -f origin feature"})
+        assert result.returncode == 0
 
-    def test_git_push_u_then_f_blocked(self, bash_hook_command: str) -> None:
-        """git push -u origin -f main -> BLOCKED (-f anywhere after 'git push')."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push -u origin -f main"},
-        )
-        assert result.returncode == 2
+    def test_git_push_u_then_f_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push -u origin -f main"})
+        assert result.returncode == 0
 
-    def test_git_push_force_with_lease_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """git push --force-with-lease -> BLOCKED.
+    def test_git_push_force_with_lease_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push --force-with-lease origin main"})
+        assert result.returncode == 0
 
-        The pattern *"--force"* matches --force-with-lease too. This is
-        intentional — even safe-ish force pushes require explicit user approval.
-        """
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push --force-with-lease origin main"},
-        )
-        assert result.returncode == 2
+    def test_push_then_rm_f_fp_gone(self, bash_hook_command: str) -> None:
+        """The exact FP that motivated the removal: a plain push next to an
+        unrelated `rm -f` no longer false-blocks at the inline guard."""
+        result = run_hook(bash_hook_command, {"command": "git push origin main && rm -f /tmp/x"})
+        assert result.returncode == 0
 
     def test_git_push_normal_allowed(self, bash_hook_command: str) -> None:
         """git push origin feature-branch -> allowed (no force)."""
         result = run_hook(
             bash_hook_command,
             {"command": "git push origin feature-branch"},
+        )
+        assert result.returncode == 0
+
+    def test_git_push_branch_name_with_dash_f_allowed(self, bash_hook_command: str) -> None:
+        """A branch name containing '-f' is NOT a force flag -> allowed.
+
+        Regression: the old pattern *"-f"* matched the '-f' inside a branch
+        name like 'fix/...-false-positives'; requiring a space before the flag
+        (*" -f"*) fixes the false-positive without letting a real -f through.
+        """
+        result = run_hook(
+            bash_hook_command,
+            {"command": "git push origin fix/guard-false-positives"},
+        )
+        assert result.returncode == 0
+
+    def test_git_push_branch_add_foo_allowed(self, bash_hook_command: str) -> None:
+        """'-f' inside 'add-foo' must not trip the force gate -> allowed."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "git push origin feature/add-foo"},
         )
         assert result.returncode == 0
 
@@ -478,48 +552,33 @@ class TestBashHookGitPushForce:
 
 
 class TestBashHookGitResetHard:
-    """Block git reset --hard."""
+    """The inline blob is the dependency-free BLOCK FLOOR for `git reset --hard`
+    (2026-08-24 recoverability redesign): deciding destructiveness from argv is an
+    open-set parser problem, so the Python guard (git_discard_guard.py) no longer
+    blocks — it only SNAPSHOTS for recovery. The crude substring block is an honest
+    best-effort speed-bump that holds even on a fresh checkout with no venv. These
+    assert the inline guard OWNS reset --hard (returncode 2)."""
 
-    def test_git_reset_hard_blocked(self, bash_hook_command: str) -> None:
-        """git reset --hard -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command, {"command": "git reset --hard"}
-        )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-        assert "git stash" in result.stderr  # suggests alternative
-
-    def test_git_reset_hard_with_ref_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """git reset --hard HEAD~3 -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command, {"command": "git reset --hard HEAD~3"}
-        )
+    def test_git_reset_hard_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git reset --hard"})
         assert result.returncode == 2
 
-    def test_git_reset_hard_origin_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """git reset --hard origin/main -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git reset --hard origin/main"},
-        )
+    def test_git_reset_hard_with_ref_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git reset --hard HEAD~3"})
+        assert result.returncode == 2
+
+    def test_git_reset_hard_origin_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git reset --hard origin/main"})
         assert result.returncode == 2
 
     def test_git_reset_soft_allowed(self, bash_hook_command: str) -> None:
         """git reset --soft HEAD~1 -> allowed."""
-        result = run_hook(
-            bash_hook_command, {"command": "git reset --soft HEAD~1"}
-        )
+        result = run_hook(bash_hook_command, {"command": "git reset --soft HEAD~1"})
         assert result.returncode == 0
 
     def test_git_reset_mixed_allowed(self, bash_hook_command: str) -> None:
         """git reset HEAD~1 -> allowed (default mixed mode)."""
-        result = run_hook(
-            bash_hook_command, {"command": "git reset HEAD~1"}
-        )
+        result = run_hook(bash_hook_command, {"command": "git reset HEAD~1"})
         assert result.returncode == 0
 
     def test_git_reset_no_args_allowed(self, bash_hook_command: str) -> None:
@@ -534,38 +593,35 @@ class TestBashHookGitResetHard:
 
 
 class TestBashHookGitClean:
-    """Block git clean with force flags."""
+    """The inline blob NO LONGER owns `git clean` (2026-08-24 recoverability
+    redesign). clean is UNrecoverable (`git stash create` can't capture untracked
+    files), so it needs a REAL block — but deciding a clean's destructiveness from
+    a quote-NAIVE inline regex mis-fires on `git checkout clean-branch`,
+    `git commit -m "clean up"`, etc. So clean is now owned by the precise,
+    quote-aware tracked guard git_discard_guard.py (invoked via
+    bash_safety_hook.sh globally + the project git_discard_guard hook), EXACTLY as
+    force-push and worktree-remove were moved out of this blob to their tracked
+    guards. The inline blob must NOT block clean (returncode 0) — see
+    tests/test_scripts/test_bash_safety_hook.py::TestGitCleanFloor for the real
+    enforcement, and test_git_discard_guard.py for the guard's closed-set logic."""
 
-    def test_git_clean_f_blocked(self, bash_hook_command: str) -> None:
-        """git clean -f -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "git clean -f"})
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-
-    def test_git_clean_fd_blocked(self, bash_hook_command: str) -> None:
-        """git clean -fd -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "git clean -fd"})
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-
-    def test_git_clean_fdx_blocked(self, bash_hook_command: str) -> None:
-        """git clean -fdx -> BLOCKED (contains 'git clean -fd')."""
-        result = run_hook(bash_hook_command, {"command": "git clean -fdx"})
-        assert result.returncode == 2
-
-    def test_git_clean_fx_blocked(self, bash_hook_command: str) -> None:
-        """git clean -fx -> BLOCKED (contains 'git clean -f')."""
-        result = run_hook(bash_hook_command, {"command": "git clean -fx"})
-        assert result.returncode == 2
-
-    def test_git_clean_n_allowed(self, bash_hook_command: str) -> None:
-        """git clean -n -> allowed (dry run, no -f)."""
-        result = run_hook(bash_hook_command, {"command": "git clean -n"})
-        assert result.returncode == 0
-
-    def test_git_clean_nd_allowed(self, bash_hook_command: str) -> None:
-        """git clean -nd -> allowed (dry run with directories)."""
-        result = run_hook(bash_hook_command, {"command": "git clean -nd"})
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -f",
+            "git clean -fd",
+            "git clean --force",
+            "git clean -xf",
+            "git clean -f .",
+            "git clean",
+            # the false-blocks a naive inline `clean` match WOULD have caused:
+            "git checkout clean-branch",
+            "git diff clean.py",
+            'git commit -m "clean up the repo"',
+        ],
+    )
+    def test_git_clean_not_inline_blocked(self, bash_hook_command: str, cmd: str) -> None:
+        result = run_hook(bash_hook_command, {"command": cmd})
         assert result.returncode == 0
 
 
@@ -616,9 +672,7 @@ class TestBashHookBenignCommands:
             "pythonpath-worktree",
         ],
     )
-    def test_benign_command_allowed(
-        self, bash_hook_command: str, cmd: str
-    ) -> None:
+    def test_benign_command_allowed(self, bash_hook_command: str, cmd: str) -> None:
         """Normal commands pass through the hook."""
         result = run_hook(bash_hook_command, {"command": cmd})
         assert result.returncode == 0, (
@@ -634,9 +688,7 @@ class TestBashHookBenignCommands:
 class TestBashHookErrorMessages:
     """Verify hook stderr contains actionable guidance."""
 
-    def test_pip_editable_suggests_pythonpath(
-        self, bash_hook_command: str
-    ) -> None:
+    def test_pip_editable_suggests_pythonpath(self, bash_hook_command: str) -> None:
         result = run_hook(
             bash_hook_command,
             {"command": "pip install -e .claude/worktrees/branch"},
@@ -645,25 +697,10 @@ class TestBashHookErrorMessages:
         assert "PYTHONPATH" in result.stderr
         assert "worktree" in result.stderr.lower()
 
-    def test_force_push_suggests_pr(self, bash_hook_command: str) -> None:
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push --force origin main"},
-        )
-        assert result.returncode == 2
-        assert "PR" in result.stderr
-
-    def test_reset_hard_suggests_stash(self, bash_hook_command: str) -> None:
-        result = run_hook(
-            bash_hook_command, {"command": "git reset --hard"}
-        )
-        assert result.returncode == 2
-        assert "stash" in result.stderr
-
-    def test_git_clean_suggests_user(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git clean -f"})
-        assert result.returncode == 2
-        assert "user" in result.stderr.lower()
+    # (force-push is no longer owned by the inline guard — its PR-suggesting
+    # message now lives in git_push_guard.py / bash_safety_hook.sh. reset --hard /
+    # git clean messages likewise moved to git_discard_guard.py in the 2026-08
+    # git-discard consolidation — see test_git_discard_guard.py for those.)
 
     def test_rm_rf_suggests_confirm(self, rm_rf_hook_command: str) -> None:
         """rm -rf on shallow path suggests asking the user to confirm."""
@@ -685,19 +722,21 @@ class TestBashHookEdgeCases:
         result = run_hook(bash_hook_command, {"command": ""})
         assert result.returncode == 0
 
-    def test_multiline_command_with_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """Multiline command containing git reset --hard -> BLOCKED."""
+    # These verify the inline blob matches a blocked pattern regardless of command
+    # STRUCTURE (multiline/chained/piped/subshell). The vehicle is an inline-OWNED
+    # block — a pip-install-to-worktree (reset --hard moved to git_discard_guard.py
+    # in the 2026-08 consolidation, so it is no longer an inline-owned vehicle).
+    _INLINE_BLOCKED = "pip install -e .claude/worktrees/foo"
+
+    def test_multiline_command_with_blocked(self, bash_hook_command: str) -> None:
+        """Multiline command containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "echo hello\ngit reset --hard\necho done"},
+            {"command": f"echo hello\n{self._INLINE_BLOCKED}\necho done"},
         )
         assert result.returncode == 2
 
-    def test_multiline_command_with_rm_rf_blocked(
-        self, rm_rf_hook_command: str
-    ) -> None:
+    def test_multiline_command_with_rm_rf_blocked(self, rm_rf_hook_command: str) -> None:
         """Multiline command containing rm -rf / -> BLOCKED."""
         result = run_hook(
             rm_rf_hook_command,
@@ -705,47 +744,40 @@ class TestBashHookEdgeCases:
         )
         assert result.returncode == 2
 
-    def test_chained_command_with_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """Command chained with && containing blocked op -> BLOCKED."""
+    def test_chained_command_with_blocked(self, bash_hook_command: str) -> None:
+        """Command chained with && containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "ls -la && git push --force origin main"},
+            {"command": f"ls -la && {self._INLINE_BLOCKED}"},
         )
         assert result.returncode == 2
 
-    def test_piped_command_with_blocked(
-        self, bash_hook_command: str
-    ) -> None:
-        """Piped command containing blocked op -> BLOCKED."""
+    def test_piped_command_with_blocked(self, bash_hook_command: str) -> None:
+        """Piped command containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "echo yes | git push --force origin main"},
+            {"command": f"echo yes | {self._INLINE_BLOCKED}"},
         )
         assert result.returncode == 2
 
     def test_subshell_with_blocked(self, bash_hook_command: str) -> None:
-        """Subshell containing blocked op -> BLOCKED."""
+        """Subshell containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "$(git reset --hard)"},
+            {"command": f"$({self._INLINE_BLOCKED})"},
         )
         assert result.returncode == 2
 
     def test_malformed_json_input(self, bash_hook_command: str) -> None:
-        """Malformed JSON in CLAUDE_TOOL_INPUT -> graceful (jq fails, no crash).
-
-        When jq can't parse the input, CMD becomes empty string, which
-        doesn't match any blocked pattern, so the hook passes.
-        """
+        """Malformed JSON on stdin -> graceful (jq fails, CMD empty, no crash)."""
         import os
         import subprocess
 
-        env = {**os.environ, "CLAUDE_TOOL_INPUT": "not-json{{{"}
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
         result = subprocess.run(
             bash_hook_command,
             shell=True,
+            input="not-json{{{",
             env=env,
             capture_output=True,
             text=True,
@@ -755,12 +787,12 @@ class TestBashHookEdgeCases:
         assert result.returncode in (0, 2)
 
     def test_missing_command_field(self, bash_hook_command: str) -> None:
-        """JSON without 'command' field -> jq returns null, hook passes."""
+        """Payload without a command field -> jq returns empty, hook passes."""
         result = run_hook(bash_hook_command, {"url": "https://example.com"})
         assert result.returncode == 0
 
-    def test_no_tool_input_env(self, bash_hook_command: str) -> None:
-        """No CLAUDE_TOOL_INPUT env var set -> hook handles gracefully."""
+    def test_no_stdin_payload(self, bash_hook_command: str) -> None:
+        """Empty stdin (no payload) -> hook handles gracefully."""
         import os
         import subprocess
 
@@ -768,6 +800,7 @@ class TestBashHookEdgeCases:
         result = subprocess.run(
             bash_hook_command,
             shell=True,
+            input="",
             env=env,
             capture_output=True,
             text=True,
@@ -795,19 +828,13 @@ class TestWebFetchHookYouTubeBlocking:
         assert "BLOCKED" in result.stderr
         assert "YouTube" in result.stderr
 
-    def test_youtube_short_url_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtube_short_url_blocked(self, webfetch_hook_command: str) -> None:
         """https://youtu.be/abc123 -> BLOCKED."""
-        result = run_hook(
-            webfetch_hook_command, {"url": "https://youtu.be/abc123"}
-        )
+        result = run_hook(webfetch_hook_command, {"url": "https://youtu.be/abc123"})
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_youtube_no_www_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtube_no_www_blocked(self, webfetch_hook_command: str) -> None:
         """https://youtube.com/watch?v=xyz -> BLOCKED."""
         result = run_hook(
             webfetch_hook_command,
@@ -815,9 +842,7 @@ class TestWebFetchHookYouTubeBlocking:
         )
         assert result.returncode == 2
 
-    def test_youtube_uppercase_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtube_uppercase_blocked(self, webfetch_hook_command: str) -> None:
         """https://www.YOUTUBE.COM/watch?v=abc -> BLOCKED (case-insensitive)."""
         result = run_hook(
             webfetch_hook_command,
@@ -825,9 +850,7 @@ class TestWebFetchHookYouTubeBlocking:
         )
         assert result.returncode == 2
 
-    def test_youtube_mixed_case_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtube_mixed_case_blocked(self, webfetch_hook_command: str) -> None:
         """https://YouTube.com/playlist?list=PL... -> BLOCKED."""
         result = run_hook(
             webfetch_hook_command,
@@ -835,9 +858,7 @@ class TestWebFetchHookYouTubeBlocking:
         )
         assert result.returncode == 2
 
-    def test_youtube_embed_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtube_embed_blocked(self, webfetch_hook_command: str) -> None:
         """https://www.youtube.com/embed/abc -> BLOCKED."""
         result = run_hook(
             webfetch_hook_command,
@@ -845,13 +866,9 @@ class TestWebFetchHookYouTubeBlocking:
         )
         assert result.returncode == 2
 
-    def test_youtu_be_mixed_case_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtu_be_mixed_case_blocked(self, webfetch_hook_command: str) -> None:
         """https://YOUTU.BE/abc -> BLOCKED."""
-        result = run_hook(
-            webfetch_hook_command, {"url": "https://YOUTU.BE/abc123"}
-        )
+        result = run_hook(webfetch_hook_command, {"url": "https://YOUTU.BE/abc123"})
         assert result.returncode == 2
 
 
@@ -888,9 +905,7 @@ class TestWebFetchHookAllowedUrls:
             "httpbin",
         ],
     )
-    def test_non_youtube_allowed(
-        self, webfetch_hook_command: str, url: str
-    ) -> None:
+    def test_non_youtube_allowed(self, webfetch_hook_command: str, url: str) -> None:
         """Non-YouTube URLs pass through the hook."""
         result = run_hook(webfetch_hook_command, {"url": url})
         assert result.returncode == 0, (
@@ -923,9 +938,7 @@ class TestWebFetchHookErrorMessages:
         )
         assert "SSL" in result.stderr
 
-    def test_shows_transcript_example(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_shows_transcript_example(self, webfetch_hook_command: str) -> None:
         """Error message includes transcript extraction example."""
         result = run_hook(
             webfetch_hook_command,
@@ -952,9 +965,7 @@ class TestWebFetchHookEdgeCases:
         result = run_hook(webfetch_hook_command, {"command": "ls"})
         assert result.returncode == 0
 
-    def test_youtube_in_query_param_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_youtube_in_query_param_blocked(self, webfetch_hook_command: str) -> None:
         """URL with youtube.com in the domain -> BLOCKED even with params."""
         result = run_hook(
             webfetch_hook_command,
@@ -962,9 +973,7 @@ class TestWebFetchHookEdgeCases:
         )
         assert result.returncode == 2
 
-    def test_url_containing_youtube_as_substring_blocked(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_url_containing_youtube_as_substring_blocked(self, webfetch_hook_command: str) -> None:
         """notyoutube.com contains 'youtube.com' substring -> BLOCKED.
 
         The grep pattern matches any URL containing the substring
@@ -996,16 +1005,12 @@ class TestSettingsStructure:
 
     def test_has_bash_matcher(self, settings: dict) -> None:
         """PreToolUse section has a Bash matcher entry."""
-        matchers = [
-            h.get("matcher") for h in settings["hooks"]["PreToolUse"]
-        ]
+        matchers = [h.get("matcher") for h in settings["hooks"]["PreToolUse"]]
         assert "Bash" in matchers
 
     def test_has_webfetch_matcher(self, settings: dict) -> None:
         """PreToolUse section has a WebFetch matcher entry."""
-        matchers = [
-            h.get("matcher") for h in settings["hooks"]["PreToolUse"]
-        ]
+        matchers = [h.get("matcher") for h in settings["hooks"]["PreToolUse"]]
         assert "WebFetch" in matchers
 
     def test_bash_hook_is_command(self, settings: dict) -> None:
@@ -1014,10 +1019,7 @@ class TestSettingsStructure:
             if entry.get("matcher") == "Bash":
                 hooks = entry["hooks"]
                 commands = [
-                    h
-                    for h in hooks
-                    if h.get("type") == "command"
-                    and h.get("command", "").strip()
+                    h for h in hooks if h.get("type") == "command" and h.get("command", "").strip()
                 ]
                 assert len(commands) >= 1, "No command hook found for Bash matcher"
 
@@ -1029,48 +1031,50 @@ class TestSettingsStructure:
                 inline = [
                     h
                     for h in hooks
-                    if h.get("type") == "command"
-                    and h.get("command", "").startswith("bash -c")
+                    if h.get("type") == "command" and h.get("command", "").startswith("bash -c")
                 ]
                 assert len(inline) >= 1, "No inline WebFetch hook found"
 
-    def test_bash_hook_checks_all_expected_patterns(
-        self, settings: dict
-    ) -> None:
+    def test_bash_hook_checks_all_expected_patterns(self, settings: dict) -> None:
         """Bash hooks collectively cover all expected danger patterns.
 
         The inline bash hook handles git/pip patterns. The rm-rf guard is
         a separate Python script referenced via destructive_command_guard.
         """
+        import re
         from pathlib import Path
 
-        # Collect all Bash hook commands and any scripts they reference
+        repo_root = next(
+            (a for a in Path(__file__).resolve().parents if (a / "scripts" / "hooks").is_dir()),
+            None,
+        )
+
+        # Collect all Bash hook commands AND every referenced hooks/<name>.py
+        # guard script — force-push/worktree checks moved OUT of the inline blob
+        # into the dedicated guards (git_push_guard.py, worktree_cwd_guard.py),
+        # so "collectively covered" must include their source.
         combined = ""
         for entry in settings["hooks"]["PreToolUse"]:
-            if entry.get("matcher") == "Bash":
-                for hook in entry.get("hooks", []):
-                    cmd = hook.get("command", "")
-                    combined += cmd + "\n"
-                    # If it references an external script, read that too
-                    if "destructive_command_guard" in cmd:
-                        here = Path(__file__).resolve()
-                        for ancestor in here.parents:
-                            script = ancestor / "scripts" / "hooks" / "destructive_command_guard.py"
-                            if script.exists():
-                                combined += script.read_text()
-                                break
+            if entry.get("matcher") != "Bash":
+                continue
+            for hook in entry.get("hooks", []):
+                cmd = hook.get("command", "")
+                combined += cmd + "\n"
+                if repo_root:
+                    for name in re.findall(r"hooks/(\w+)\.py", cmd):
+                        script = repo_root / "scripts" / "hooks" / f"{name}.py"
+                        if script.exists():
+                            combined += script.read_text()
 
         assert "pip install" in combined
         assert "worktree" in combined
-        assert "rm" in combined and "rf" in combined  # rm -rf in Python script
-        assert "git push" in combined
+        assert "rm" in combined and "rf" in combined  # rm -rf in the destructive guard
+        assert "git push" in combined  # git_push_guard.py
         assert "--force" in combined or "force" in combined
-        assert "git reset --hard" in combined
-        assert "git clean" in combined
+        assert "git reset --hard" in combined  # git_discard_guard.py (referenced)
+        assert "git clean" in combined  # git_discard_guard.py (referenced)
 
-    def test_webfetch_hook_checks_youtube(
-        self, webfetch_hook_command: str
-    ) -> None:
+    def test_webfetch_hook_checks_youtube(self, webfetch_hook_command: str) -> None:
         """WebFetch hook command contains YouTube pattern check."""
         assert "youtube" in webfetch_hook_command.lower()
         assert "youtu.be" in webfetch_hook_command.lower() or "youtu\\.be" in webfetch_hook_command

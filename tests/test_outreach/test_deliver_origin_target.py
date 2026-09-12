@@ -153,6 +153,7 @@ async def test_defer_carries_target_fields_for_retry(config, db, mock_formatter)
     failing_adapter = AsyncMock()
     failing_adapter.send_message.side_effect = RuntimeError("transient telegram error")
     deferred_queue = AsyncMock()
+    deferred_queue.has_open = AsyncMock(return_value=False)  # no open dup
     pipeline = OutreachPipeline(
         governance=GovernanceGate(config, db),
         drafter=AsyncMock(),

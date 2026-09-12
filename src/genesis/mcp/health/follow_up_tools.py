@@ -33,11 +33,12 @@ async def _impl_follow_up_create(
     reason: str,
     strategy: str,
     *,
+    work_state: str,
     scheduled_at: str | None = None,
     priority: str = "medium",
     pinned: bool = False,
     domain: str | None = None,
-    kind: str = "follow_up",
+    revisit_condition: str = "",
     source_session: str | None = None,
 ) -> dict:
     """Create a follow-up item in the accountability ledger."""
@@ -63,9 +64,47 @@ async def _impl_follow_up_create(
             "error": f"Invalid domain '{domain}'. Must be one of: {', '.join(sorted(valid_domains))}"
         }
 
-    valid_kinds = {"follow_up", "tabled"}
-    if kind not in valid_kinds:
-        return {"error": f"Invalid kind '{kind}'. Must be one of: {', '.join(sorted(valid_kinds))}"}
+    from genesis.db.crud import follow_ups
+
+    if work_state not in follow_ups.VALID_WORK_STATE:
+        return {
+            "error": (
+                f"Invalid work_state '{work_state}'. Must be one of: "
+                f"{', '.join(sorted(follow_ups.VALID_WORK_STATE))}. "
+                "ready = actionable now, just needs doing (manpower) → follow_up (hot list). "
+                "blocked_on_trigger = intended but waiting on a specific time/event/"
+                "precondition → follow_up (hot list); requires revisit_condition. "
+                "deferred_cold = consciously NOT pursuing near-term (vague/hard/someday) "
+                "→ tabled (cold list). This is an intent axis, NOT priority — a "
+                "low-priority item you still intend to do is 'ready', not 'deferred_cold'."
+            )
+        }
+    kind = follow_ups.WORK_STATE_TO_KIND[work_state]
+    if work_state == "blocked_on_trigger" and not revisit_condition.strip():
+        return {
+            "error": (
+                "work_state='blocked_on_trigger' requires revisit_condition — name the "
+                "specific time/event/precondition you're waiting on. If there is no "
+                "concrete trigger and you're just not pursuing this near-term, use "
+                "work_state='deferred_cold' (tabled). If it needs doing now, use "
+                "work_state='ready'."
+            )
+        }
+    if work_state == "blocked_on_trigger" and strategy == "surplus_task":
+        # surplus_task dispatches immediately on idle compute (dispatcher.py:63-70),
+        # which would run the work BEFORE the trigger fires. A prose trigger can't
+        # gate an immediate dispatch — steer to a strategy that honors waiting.
+        return {
+            "error": (
+                "work_state='blocked_on_trigger' cannot use strategy='surplus_task' — "
+                "surplus tasks dispatch immediately on idle compute and would run before "
+                "the trigger fires. Use strategy='scheduled_task' (with scheduled_at) for "
+                "a time trigger, or 'user_input_needed' / 'ego_judgment' for an event "
+                "trigger so it isn't auto-dispatched before the event."
+            )
+        }
+    if work_state == "ready":
+        revisit_condition = ""  # a 'ready' item has no trigger — never store one
 
     if strategy == "scheduled_task" and not scheduled_at:
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
@@ -73,7 +112,6 @@ async def _impl_follow_up_create(
     try:
         import os
 
-        from genesis.db.crud import follow_ups
         from genesis.ego.domain_classifier import classify_domain
 
         # Detect dispatched session context for proper source attribution
@@ -82,11 +120,52 @@ async def _impl_follow_up_create(
         else:
             source = "foreground_session"
 
+        # Sacred-board authorization: the hot `follow_up` board is reserved for
+        # sanctioned (≈ foreground) paths. An autonomous/dispatched CC session's
+        # LLM-authored follow-up is routed to the COLD `tabled` lane — tracked and
+        # surfaceable for review, never auto-dispatched; a human/foreground session
+        # promotes it to the board if warranted. Root cause of the 2026-07-03
+        # fabricated-follow-up incident: an autonomous session minted a board item.
+        # (Templated pipelines that call crud.follow_ups.create() directly bypass
+        # this tool and are governed at their own call sites.)
+        autonomous_routed = False
+        if source == "ego_dispatch" and kind != "tabled":
+            kind = "tabled"
+            autonomous_routed = True
+
         # The session declares domain when it knows; otherwise fall back to the
         # internal-only classifier (returns 'internal' on a keyword hit, else
         # None → stored NULL, never a user_world guess).
         if domain is None:
             domain = classify_domain(f"{content} {reason}")
+
+        # Provenance: resolve a truncated session id (the per-turn tag shows 8
+        # chars) to the full one, the same way session_charter_tools does. A
+        # prefix that does not resolve uniquely is stored as NULL, never as the
+        # truncated string — resolve_session_id's own contract: "WRITE callers
+        # must refuse to create rows for unresolved short ids". The create must
+        # not fail over provenance, so the drop is reported, not fatal.
+        source_session_note = None
+        if source_session:
+            from genesis.db.crud import session_charters as _charters
+
+            resolved = await _charters.resolve_session_id(db, source_session)
+            # SHAPE, not length. `resolve_session_id` returns the input
+            # unchanged when it cannot resolve, so a >= 32-char value reaching
+            # here has never been checked against anything — a mistyped UUID or
+            # a 32-char fragment used to pass a length test and be written as
+            # provenance (Codex P2, PR #1622). A valid-shaped id that no store
+            # knows yet is still accepted: this asks what the value IS, not
+            # whether it has been seen.
+            if _charters.is_full_session_id(resolved):
+                source_session = resolved
+            else:
+                source_session_note = (
+                    f"source_session '{source_session}' did not resolve to a "
+                    "unique full session id — stored NULL rather than a "
+                    "truncated or malformed id"
+                )
+                source_session = None
 
         fid = await follow_ups.create(
             db,
@@ -100,26 +179,121 @@ async def _impl_follow_up_create(
             pinned=pinned,
             domain=domain,
             kind=kind,
+            revisit_condition=revisit_condition or None,
         )
-        lane_msg = (
-            "Tabled (someday/maybe — tracked, not surfaced as actionable work)."
-            if kind == "tabled"
-            else f"Follow-up created. Strategy: {strategy}."
-        )
+        cond = revisit_condition.strip() or None
+        if autonomous_routed:
+            lane_msg = (
+                "Routed to the tabled (cold) lane: this is an autonomous/dispatched "
+                "session, and the hot follow-up board is reserved for sanctioned "
+                "(foreground) paths. Tracked and surfaceable for review; a foreground "
+                "session can promote it to the board."
+            )
+        elif kind == "tabled":
+            lane_msg = (
+                "Tabled (cold list — consciously not pursuing near-term; tracked, not "
+                "surfaced as actionable work)."
+            )
+        else:
+            lane_msg = f"Follow-up created (hot list). Strategy: {strategy}."
         return {
             "id": fid,
             "status": "pending",
             "kind": kind,
+            "work_state": work_state,
+            "revisit_condition": cond,
             "strategy": strategy,
             "domain": domain,
             "pinned": pinned,
-            "message": lane_msg
+            "source_session": source_session,
+            "message": (f"NOTE: {source_session_note} " if source_session_note else "")
+            + lane_msg
+            + (f" Revisit when: {cond}." if cond else "")
             + (f" Domain: {domain}." if domain else "")
             + (" (pinned — ego cannot auto-resolve)" if pinned else ""),
         }
     except Exception as exc:
         logger.error("follow_up_create failed", exc_info=True)
         return {"error": f"Failed to create follow-up: {exc}"}
+
+
+async def _enrich_external_state(db, items: list[dict]) -> dict[str, str]:
+    """Decorate *items* in place with the external state a triage pass needs, and
+    report whether each source could actually be read.
+
+    Two things about a follow-up live outside the ``follow_ups`` row, and neither
+    was reachable from here before:
+
+    ``issue``
+        The GitHub issue Genesis filed for this row. The link is stored in the
+        other direction (``pending_issue_posts.source_ref → follow_ups.id``), so
+        without this a triage pass cannot tell an unfiled row from a filed one and
+        re-files work that is already public.
+    ``pulse_proposal``
+        A repo-pulse annotation proposing that a merged PR completed this row.
+        These are written for ``target_kind='follow_up'`` and rendered NOWHERE —
+        the charter block is ledger-only (correctly: it renders a
+        ``session_ledger_update`` confirm command that cannot resolve a follow_up
+        id, and follow_up proposals are session-agnostic) and the dashboard panel
+        lists ledger only. Any proposal written would therefore go stale unseen.
+        MEASURED on this install: no follow_up annotation has yet been *proposed*
+        (all are ``applied``, which auto-absorbs and needs no surface), so this
+        closes a LATENT gap rather than one currently losing data. It fires on the
+        four branches that propose instead of absorbing — a pinned row, an
+        absorb-miss race, ``propose_only`` mode, and a bare-hex citation.
+
+    Returns a per-source availability map rather than failing the listing. Both
+    sources sit behind migrations (0079, 0084) an older install may not have, and
+    the sources are independent — one being absent must not blank the other.
+
+    The distinction the map exists to preserve: a MISSING key means "looked, found
+    nothing"; ``unavailable`` means "could not look". Collapsing those is how a
+    reader concludes a follow-up has no issue when the truth is nobody asked.
+    """
+    availability = {"issues": "unavailable", "proposals": "unavailable"}
+    by_id = {str(it["id"]): it for it in items if it.get("id")}
+
+    try:
+        from genesis.db.crud import pending_issue_posts
+
+        index = await pending_issue_posts.issue_by_follow_up(db)
+        for follow_up_id, linked in index.items():
+            row = by_id.get(follow_up_id)
+            if row is not None:
+                row["issue"] = linked
+        availability["issues"] = "ok"
+    except Exception:
+        logger.debug("follow_up_list: issue link unavailable", exc_info=True)
+
+    try:
+        from genesis.db.crud import repo_pulse
+
+        if await repo_pulse.tables_available(db):
+            # At most ONE row per requested id, by construction — so there is no
+            # cap to exceed. Filtering a capped listing by item id is not enough:
+            # that bounds WHICH rows are considered, not HOW MANY return, so one
+            # busy item can push another item's proposal past the limit and that
+            # row comes back undecorated — indistinguishable from having nothing
+            # to report, while the map still says the source was read. The query
+            # is made incapable of truncating rather than watched for it.
+            latest = await repo_pulse.latest_annotation_per_item(
+                db, list(by_id), status="proposed", target_kind="follow_up"
+            )
+            for item_id, ann in latest.items():
+                row = by_id.get(item_id)
+                if row is not None:
+                    row["pulse_proposal"] = {
+                        "annotation_id": ann.get("id"),
+                        "pr_number": ann.get("pr_number"),
+                        "pr_title": ann.get("pr_title"),
+                        "confidence": ann.get("confidence"),
+                        "observed_at": ann.get("observed_at"),
+                    }
+            availability["proposals"] = "ok"
+    except Exception:
+        logger.debug("follow_up_list: pulse proposals unavailable", exc_info=True)
+
+    return availability
 
 
 async def _impl_follow_up_list(
@@ -155,14 +329,24 @@ async def _impl_follow_up_list(
 
         counts = await follow_ups.get_summary_counts(db, include_tabled=include_tabled)
 
+        listed = items[:limit]
+        # Enrich only what is RETURNED, not everything fetched — the decoration is
+        # for the reader, and doing it before the slice would query on behalf of
+        # rows nobody sees.
+        external = await _enrich_external_state(db, listed)
         result = {
-            "follow_ups": items[:limit],
+            "follow_ups": listed,
             "counts": counts,
             "total": sum(counts.values()),
+            "external_state": external,
         }
         if not include_tabled:
-            all_counts = await follow_ups.get_summary_counts(db, include_tabled=True)
-            result["tabled_count"] = sum(all_counts.values()) - sum(counts.values())
+            # Count each non-follow_up lane DIRECTLY (not by subtraction, which
+            # would lump 'idea' into 'tabled' now that a third kind exists).
+            tabled_counts = await follow_ups.get_summary_counts(db, kind="tabled")
+            idea_counts = await follow_ups.get_summary_counts(db, kind="idea")
+            result["tabled_count"] = sum(tabled_counts.values())
+            result["idea_count"] = sum(idea_counts.values())
         return result
     except Exception as exc:
         logger.error("follow_up_list failed", exc_info=True)
@@ -177,35 +361,158 @@ async def _impl_follow_up_update(
     blocked_reason: str | None = None,
     priority: str | None = None,
     pinned: bool | None = None,
-    kind: str | None = None,
+    work_state: str | None = None,
+    revisit_condition: str | None = None,
 ) -> dict:
     """Update an existing follow-up item."""
     db = _get_db()
     if db is None:
-        return {"error": "Database not available"}
+        return {"error": "Database not available", "error_code": "db_unavailable"}
 
     valid_statuses = {"pending", "scheduled", "in_progress", "completed", "failed", "blocked"}
     if status and status not in valid_statuses:
         return {
-            "error": f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}"
+            "error": f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}",
+            "error_code": "invalid_status",
         }
 
     valid_priorities = {"low", "medium", "high", "critical"}
     if priority and priority not in valid_priorities:
         return {
-            "error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"
+            "error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}",
+            "error_code": "invalid_priority",
         }
 
-    valid_kinds = {"follow_up", "tabled"}
-    if kind and kind not in valid_kinds:
-        return {"error": f"Invalid kind '{kind}'. Must be one of: {', '.join(sorted(valid_kinds))}"}
+    from genesis.db.crud import follow_ups
+
+    if work_state is not None and work_state not in follow_ups.VALID_WORK_STATE:
+        return {
+            "error": (
+                f"Invalid work_state '{work_state}'. Must be one of: "
+                f"{', '.join(sorted(follow_ups.VALID_WORK_STATE))}. See follow_up_create "
+                "for the ready / blocked_on_trigger / deferred_cold meanings."
+            ),
+            "error_code": "invalid_work_state",
+        }
 
     try:
-        from genesis.db.crud import follow_ups
+        # Resolve a full id OR a short hex prefix (the proactive hook / memory_expand
+        # hand out ``id:<8-char>`` handles, so callers pass them here too). An
+        # ambiguous prefix is NEVER guessed; a bare exact miss is loud.
+        from genesis.db.crud import _id_resolve
+
+        matches, outcome = await follow_ups.resolve_id(db, follow_up_id)
+        resolved_from: str | None = None
+        if outcome == _id_resolve.AMBIGUOUS:
+            shown = ", ".join(m[:12] for m in matches[:2])
+            more = " (and possibly more)" if len(matches) >= 3 else ""
+            return {
+                "error": (
+                    f"Follow-up id '{follow_up_id}' is AMBIGUOUS — it matches {shown}{more}. "
+                    "NOTHING was updated. Re-run with a longer id prefix or the full id."
+                ),
+                "error_code": "ambiguous_id",
+            }
+        if outcome == _id_resolve.RESOLVED and matches[0] != follow_up_id:
+            resolved_from = follow_up_id
+            follow_up_id = matches[0]
+        elif outcome == _id_resolve.PASSTHROUGH and matches and matches[0] != follow_up_id:
+            # A full-length / tagged / whitespace-padded handle (e.g. the
+            # ``id:<32hex>`` the proactive hook emits) is normalized by the resolver
+            # but not "resolved from a prefix". Adopt the normalized id for the exact
+            # lookup — WITHOUT a resolved_from note (it's transparent normalization,
+            # not prefix disambiguation). Skipping this leaves the exact lookup on the
+            # raw ``id:``-tagged string, which misses though the row exists.
+            follow_up_id = matches[0]
 
         existing = await follow_ups.get_by_id(db, follow_up_id)
         if not existing:
-            return {"error": f"Follow-up '{follow_up_id}' not found"}
+            return {
+                "error": (
+                    f"No follow-up matches id '{follow_up_id}'. NOTHING was updated — "
+                    "the change you intended did NOT happen. Run follow_up_list (or check "
+                    "the id against a recent follow_up_create response) and retry with a "
+                    "correct id."
+                ),
+                "error_code": "not_found",
+            }
+
+        # Resolve any lane change UP-FRONT (before writes) so a gate failure never
+        # leaves a partial update. Lane moves go through work_state (the item's
+        # declared state) — there is no raw-`kind` lane override, so priority can't
+        # pick the lane on update any more than on create. blocked_on_trigger
+        # requires a revisit_condition (newly supplied, or already on the row).
+        resolved_kind: str | None = None
+        autonomous_promotion_blocked = False
+        if work_state is not None:
+            resolved_kind = follow_ups.WORK_STATE_TO_KIND[work_state]
+            # Sacred-board authorization (mirror of _impl_follow_up_create): an
+            # autonomous/dispatched session may NOT PROMOTE a follow-up onto the hot
+            # board — only sanctioned (foreground) sessions may. Without this gate an
+            # autonomous session could follow_up_create (→ forced tabled) and then
+            # follow_up_update(work_state='ready') to flip it straight back onto the
+            # board, defeating Part B. Gate ONLY a genuine promotion (off-board → board):
+            # a re-affirm of an already-on-board item (existing kind == 'follow_up') is a
+            # no-op that must NOT demote it, and moving TO tabled stays allowed.
+            if resolved_kind == "follow_up" and existing.get("kind") != "follow_up":
+                import os
+
+                if os.environ.get("GENESIS_CC_SESSION") == "1":
+                    resolved_kind = "tabled"
+                    autonomous_promotion_blocked = True
+            effective_cond = (
+                revisit_condition
+                if revisit_condition is not None
+                else existing.get("revisit_condition")
+            ) or ""
+            if work_state == "blocked_on_trigger" and not effective_cond.strip():
+                return {
+                    "error": (
+                        "work_state='blocked_on_trigger' requires revisit_condition — "
+                        "name the time/event/precondition you're waiting on, or use "
+                        "'deferred_cold' (tabled) / 'ready' instead."
+                    ),
+                    "error_code": "blocked_on_trigger_needs_revisit",
+                }
+            if work_state == "blocked_on_trigger" and existing.get("strategy") == "surplus_task":
+                return {
+                    "error": (
+                        "work_state='blocked_on_trigger' can't apply to a surplus_task "
+                        "follow-up — surplus tasks dispatch immediately on idle compute, "
+                        "ignoring the trigger. Recreate it as scheduled_task (time trigger) "
+                        "or user_input_needed / ego_judgment (event trigger)."
+                    ),
+                    "error_code": "blocked_on_trigger_surplus_conflict",
+                }
+
+        # H2 — reject the orphan-making transition INTO status='scheduled'.
+        # status='scheduled' is set legitimately only by link_task(), atomically
+        # with a linked_task_id. This tool can set the status but not the link, so
+        # a manual follow_up_update(status='scheduled') on an UNLINKED row produces
+        # a row invisible to every surface (not in get_actionable — which excludes
+        # 'scheduled'; not in get_scheduled_due — needs status='pending'+scheduled_at;
+        # not in get_linked_active — needs linked_task_id). That is exactly the
+        # black hole the July-2026 bake-off row fell into. A row that already
+        # carries a linked_task_id stays visible via get_linked_active, so only the
+        # unlinked case is blocked. 'blocked' is intentionally NOT gated (it is
+        # visible in get_actionable).
+        if (
+            status == "scheduled"
+            and existing.get("status") != "scheduled"
+            and not existing.get("linked_task_id")
+        ):
+            return {
+                "error": (
+                    "Refusing status='scheduled' on a follow-up with no linked task — "
+                    "it would be INVISIBLE to every surface (not actionable, not "
+                    "dispatched, not linked-active). NOTHING was updated. To park this "
+                    "for later, use work_state='blocked_on_trigger' with a "
+                    "revisit_condition (event trigger) or recreate it with "
+                    "strategy='scheduled_task' + a scheduled_at (time trigger). "
+                    "'scheduled' status is set by the dispatcher, not by hand."
+                ),
+                "error_code": "scheduled_needs_link",
+            }
 
         if priority and priority != existing.get("priority"):
             await db.execute(
@@ -217,8 +524,13 @@ async def _impl_follow_up_update(
         if pinned is not None:
             await follow_ups.set_pinned(db, follow_up_id, pinned)
 
-        if kind:
-            await follow_ups.set_kind(db, follow_up_id, kind)
+        if resolved_kind:
+            await follow_ups.set_kind(db, follow_up_id, resolved_kind)
+        if work_state == "ready":
+            # a 'ready' item has no trigger — clear any stale revisit_condition
+            await follow_ups.set_revisit_condition(db, follow_up_id, None)
+        elif revisit_condition is not None:
+            await follow_ups.set_revisit_condition(db, follow_up_id, revisit_condition)
 
         if status:
             updated = await follow_ups.update_status(
@@ -229,7 +541,7 @@ async def _impl_follow_up_update(
                 blocked_reason=blocked_reason,
             )
             if not updated:
-                return {"error": "Update failed — row not modified"}
+                return {"error": "Update failed — row not modified", "error_code": "not_modified"}
         elif blocked_reason is not None:
             # blocked_reason without an explicit status means "block this" — honor
             # the documented contract (it previously silently kept the existing
@@ -253,17 +565,28 @@ async def _impl_follow_up_update(
             )
 
         refreshed = await follow_ups.get_by_id(db, follow_up_id)
-        return {
+        result = {
             "id": follow_up_id,
             "status": refreshed["status"],
             "kind": refreshed.get("kind"),
+            "revisit_condition": refreshed.get("revisit_condition"),
             "priority": refreshed["priority"],
             "pinned": bool(refreshed.get("pinned", 0)),
-            "message": "Follow-up updated.",
+            "message": (
+                "Kept on the tabled (cold) lane: an autonomous/dispatched session "
+                "cannot promote a follow-up onto the hot board — a foreground session "
+                "must do that."
+                if autonomous_promotion_blocked
+                else "Follow-up updated."
+            ),
         }
+        if resolved_from is not None:
+            # Echo the full id so the caller learns it for subsequent calls.
+            result["resolved_from"] = resolved_from
+        return result
     except Exception as exc:
         logger.error("follow_up_update failed", exc_info=True)
-        return {"error": f"Failed to update follow-up: {exc}"}
+        return {"error": f"Failed to update follow-up: {exc}", "error_code": "internal_error"}
 
 
 # ---------------------------------------------------------------------------
@@ -276,62 +599,97 @@ async def follow_up_create(
     content: str,
     reason: str,
     strategy: str,
+    work_state: str,
     scheduled_at: str = "",
     priority: str = "medium",
     pinned: bool = False,
     domain: str = "",
-    kind: str = "follow_up",
+    revisit_condition: str = "",
+    source_session: str = "",
 ) -> dict:
-    """Create a follow-up (or a tabled someday/maybe) in the accountability ledger.
+    """Create a follow-up in the accountability ledger.
 
-    Two lanes, chosen by `kind` — pick deliberately:
-    - kind="follow_up" (default): ACTIONABLE deferred work Genesis should own and
-      eventually DO. Enters the ledger, surfaces in the morning report, and the
-      ego/sessions act on it. Use ONLY when there is a real, intended next step.
-    - kind="tabled": a SOMEDAY/MAYBE — worth remembering but NOT committing to.
-      Tracked, but never surfaced as work or auto-actioned. Use for ideas,
-      interests, or possibilities to revisit later so they don't clog the
-      actionable queue. When torn between a low-priority follow_up and a maybe
-      with no concrete next step, prefer tabled.
+    FIRST — is this the right home? Genesis-repo work (code, tests, docs, infra —
+    anything that would live in the public repo, even when hit locally) belongs on
+    the PUBLIC TRACKER as a GitHub issue, not here — but ONLY from an install that
+    owns the tracker, and only with the user's explicit approval each time (a public
+    post is irreversible). A security defect is never filed publicly before it is
+    fixed. Where those do not hold, it stays HERE until a maintainer carries it over.
+
+    This ledger is otherwise for USER-OWNED work (a deliverable, an errand, something
+    asked for and unfinished) and operational state purely LOCAL to this box.
+    Something you are consciously NOT pursuing is `deferred_cold` (tabled) — never an
+    issue, because we don't want it picked up.
+
+    A DISPATCHED session records here rather than filing publicly — but the row is
+    FORCED onto the COLD `tabled` lane by sacred-board authorization, whatever
+    work_state you pass, and tabled rows are excluded from every default listing.
+    Say in `reason` that it is repo work awaiting a foreground session, and expect
+    to need `follow_up_list(include_tabled=True)` to find it again.
+
+    Mechanics: `.claude/docs/mcp-tools-guide.md`, "Where Deferred Work Goes".
+
+    Declare the item's WORK_STATE — the tool DERIVES the lane from it, so priority
+    never decides the lane. Two lists:
+    - HOT (follow_up): work you INTEND to do near-term. May be blocked on time, an
+      event, or just manpower — but NEVER hard-blocked / not-an-easy-fix / vague.
+    - COLD (tabled): things you are CONSCIOUSLY NOT doing near-term (further off,
+      harder, vaguer — maybe someday). Kept off the actionable queue.
 
     Args:
-        content: What needs to happen (actionable description)
-        reason: Why this follow-up exists (context for future sessions/ego)
-        kind: "follow_up" (actionable, default) or "tabled" (someday/maybe, never
-            auto-actioned). See the two-lane note above — don't file a real
-            commitment as tabled, and don't clog the actionable queue with maybes.
-        strategy: How to handle it — choose based on what kind of work this requires:
-            - user_input_needed: Park this for a future interactive session. No
-              automation touches it. Use for anything requiring real CC sessions:
-              coding, plan execution, Genesis development, file edits. Surfaces in
-              morning report so the user can trigger a session when ready.
-            - surplus_task: Enqueue to the free-model surplus system. Runs on idle
-              compute using lightweight free-tier models. ONLY for pure analysis,
-              summarization, or data processing. NOT for code changes, file edits,
-              or anything requiring an interactive CC session.
-            - scheduled_task: Same as surplus_task but triggered at a specific time.
-              Same constraints — free model only, no interactive work.
-            - ego_judgment: Hand to ego for evaluation in its next cycle. Ego decides
-              whether to act, defer, or escalate. Not auto-executed.
-        scheduled_at: ISO datetime for scheduled_task strategy (required if strategy is scheduled_task)
-        priority: low | medium | high | critical
-        pinned: If true, ego can see this follow-up but cannot auto-resolve it.
-            Only the user can close a pinned follow-up. Use for items you want
-            to track personally.
-        domain: Whose world this belongs to — "internal" (Genesis's own system
-            work: runtime, routing, memory, health, dev) or "user_world" (the
-            user's life, career, content, interests). Leave empty to let Genesis
-            classify (it only auto-detects internal; otherwise leaves it unset).
+        content: What needs to happen (actionable description).
+        reason: Why this follow-up exists (context for future sessions/ego).
+        work_state: The item's actual state — this DERIVES the lane. Pick honestly;
+            it is an intent/tractability axis, NOT priority (a low-priority item you
+            still intend to do is 'ready', not 'deferred_cold'):
+            - "ready": actionable now, just needs doing → HOT (follow_up).
+            - "blocked_on_trigger": intended, waiting on a specific time/event/
+              precondition → HOT (follow_up). REQUIRES revisit_condition. Not valid
+              with strategy="surplus_task" (that dispatches immediately, ignoring the
+              trigger) — use scheduled_task (time) or user_input_needed/ego_judgment (event).
+            - "deferred_cold": consciously not pursuing near-term (vague/hard/
+              someday) → COLD (tabled).
+        strategy: How to EXECUTE it if/when acted on (orthogonal to work_state):
+            - user_input_needed: park for a future interactive CC session (coding,
+              plan execution, Genesis dev, file edits). Surfaces in morning report.
+            - surplus_task: enqueue to the free-model surplus system — pure analysis/
+              summarization only, never code/file edits or interactive work.
+            - scheduled_task: like surplus_task but time-triggered (the time-based
+              form of blocked_on_trigger); requires scheduled_at. Free model only.
+            - ego_judgment: hand to ego to evaluate next cycle (a good default for
+              deferred_cold items, which have no near-term execution route).
+        revisit_condition: The trigger to revisit — REQUIRED when
+            work_state="blocked_on_trigger" (name the time/event/precondition).
+            Optional but encouraged for deferred_cold (what would revive it).
+        scheduled_at: ISO datetime (required when strategy is scheduled_task).
+        priority: low | medium | high | critical. Does NOT affect the lane.
+        pinned: If true, ego can see but cannot auto-resolve; only the user closes it.
+        domain: "internal" (operational Genesis work that stays LOCAL — repo work
+            belongs on the public tracker, not here) or "user_world" (the user's
+            life/career/content). Leave empty to let Genesis classify (internal-only);
+            note the classifier keyword-matches repo-ish terms, so an empty domain on
+            a misrouted repo item will still look correctly filed.
+        source_session: which session this work originated from — pass your own
+            session id. A FOREGROUND session reads it from the per-turn
+            ``[Clock: … | Session: xxxxxxxx]`` tag (the 8-char prefix resolves to
+            the full id); a DISPATCHED session reads it from the ``## This
+            Session`` block at session start, which is where its full id is
+            given (that session never receives the per-turn tag). Recorded as
+            provenance; repo-pulse uses it to attribute completions. A prefix
+            that does not resolve uniquely is stored as NULL, never truncated.
+            Leave empty only when the origin genuinely is not a CC session.
     """
     return await _impl_follow_up_create(
         content,
         reason,
         strategy,
+        work_state=work_state,
         scheduled_at=scheduled_at or None,
         priority=priority,
         pinned=pinned,
         domain=domain or None,
-        kind=kind,
+        revisit_condition=revisit_condition,
+        source_session=source_session or None,
     )
 
 
@@ -343,23 +701,35 @@ async def follow_up_update(
     blocked_reason: str = "",
     priority: str = "",
     pinned: str = "",
-    kind: str = "",
+    work_state: str = "",
+    revisit_condition: str = "",
 ) -> dict:
     """Update an existing follow-up item.
 
-    Use this to change status, add resolution notes, mark as blocked,
-    adjust priority, pin/unpin, or move it between the follow_up/tabled lanes.
+    Change status, add resolution notes, mark blocked, adjust priority, pin/unpin,
+    or move it between the hot (follow_up) and cold (tabled) lanes.
 
     Args:
-        follow_up_id: The ID of the follow-up to update
-        status: New status (pending, scheduled, in_progress, completed, failed, blocked). Empty to keep current.
+        follow_up_id: The follow-up id — a full id OR a short hex prefix (>=4 chars,
+            e.g. an 8-char ``id:`` handle from the proactive hook). A unique prefix
+            resolves; an ambiguous one is rejected (never guessed); an unknown id
+            fails LOUD with error_code='not_found' (the update did NOT happen).
+        status: New status (pending, in_progress, completed, failed, blocked). Empty
+            to keep current. NOTE: 'scheduled' is set by the dispatcher (link_task),
+            not by hand — passing status='scheduled' on an unlinked row is REJECTED
+            (error_code='scheduled_needs_link') because it would be invisible to
+            every surface. To park for later use work_state='blocked_on_trigger'
+            (event) or recreate with strategy='scheduled_task' (time).
         resolution_notes: Notes on resolution or progress. Appended context for future sessions.
         blocked_reason: Why this follow-up is blocked (sets status to blocked if status not provided).
         priority: New priority (low, medium, high, critical). Empty to keep current.
-        pinned: Set to "true" to pin (ego cannot auto-resolve) or "false" to unpin. Empty to keep current.
-        kind: Move between lanes — "follow_up" (actionable) or "tabled" (someday/maybe).
-            Empty to keep current. Use to demote a follow-up you're no longer
-            committing to into tabled, or promote a tabled idea back to actionable work.
+        pinned: "true" to pin (ego cannot auto-resolve) or "false" to unpin. Empty to keep current.
+        work_state: Re-declare the item's state to move lanes:
+            "ready"/"blocked_on_trigger" → hot (follow_up); "deferred_cold" → cold
+            (tabled). blocked_on_trigger requires revisit_condition (new or already
+            set). Empty to keep the current lane.
+        revisit_condition: Set/replace the revisit trigger (the event that would
+            resurface the item). Empty to leave unchanged.
     """
     pinned_bool: bool | None = None
     if pinned.lower() in ("true", "1", "yes"):
@@ -374,7 +744,8 @@ async def follow_up_update(
         blocked_reason=blocked_reason or None,
         priority=priority or None,
         pinned=pinned_bool,
-        kind=kind or None,
+        work_state=work_state or None,
+        revisit_condition=revisit_condition or None,
     )
 
 
@@ -389,6 +760,17 @@ async def follow_up_list(
     By default only the actionable follow_up lane is listed; the response's
     ``tabled_count`` says how many someday/maybe items are shelved. Set
     include_tabled=True to include tabled items in the list itself.
+
+    Each row may carry two keys describing state that lives OUTSIDE the follow-up:
+    ``issue`` (``{number, url, repo}``) when Genesis already filed a GitHub issue
+    for it — check this before filing another — and ``pulse_proposal`` when
+    repo-pulse has proposed that a merged PR completed it.
+
+    ``external_state`` reports whether each source could be READ, and the
+    difference is load-bearing: a row with NO ``issue`` key was checked and has
+    none, but ``external_state.issues == "unavailable"`` means the lookup could
+    not run at all, so absence proves nothing for ANY row in that response. Do not
+    conclude "no issue filed" from a missing key while its source is unavailable.
 
     Args:
         status_filter: Filter by status (pending, scheduled, in_progress, completed, failed, blocked). Empty for all.

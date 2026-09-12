@@ -49,7 +49,20 @@ CCTMPVOL_DEVICE_NAME="${CCTMPVOL_DEVICE_NAME:-cc-tmp}"
 CCTMPVOL_VOLUME_NAME="${CCTMPVOL_VOLUME_NAME:-}" # "" → <container>-cc-tmp (collision-safe per host)
 CCTMPVOL_POOL="${CCTMPVOL_POOL:-}"               # "" → the root device's pool
 CCTMPVOL_MOUNT_PATH="${CCTMPVOL_MOUNT_PATH:-}"   # "" → <container home>/.genesis/cc-tmp
-CCTMPVOL_GUARDIAN_YAML="${CCTMPVOL_GUARDIAN_YAML:-$HOME/.local/state/genesis-guardian/guardian.yaml}"
+# Default matches the authoritative path install_guardian.sh writes + every other
+# gateway verb reads ($INSTALL_DIR/config/guardian.yaml, INSTALL_DIR=.local/share/
+# genesis-guardian). A wrong default here silently resolves the container to the
+# "genesis" literal (container_name never read) — breaking every non-default-name
+# install for BOTH this helper's callers (redeploy + cc-tmp-apply).
+CCTMPVOL_GUARDIAN_YAML="${CCTMPVOL_GUARDIAN_YAML:-$HOME/.local/share/genesis-guardian/config/guardian.yaml}"
+
+# Machine-readable outcome of the LAST cc_tmp_volume_apply, set at every return
+# site (and reset at entry). Lets a caller — the guardian `cc-tmp-apply` verb —
+# report WHY the apply skipped, distinguishing "blocked on a live CC session"
+# (converges later) from a terminal skip (unsupported pool, verify-failed) or
+# success. Sourced into the caller's shell, so it persists after the call.
+_cctmpvol_result=""
+_cctmpvol_claude_procs=""
 
 # _cctmpvol_container — resolve the target container: explicit seam, else the
 # container_name from guardian.yaml, else the universal "genesis" default
@@ -115,12 +128,16 @@ _cctmpvol_mount_path() {
 # cc_tmp_volume_apply — the entrypoint. Always returns 0.
 cc_tmp_volume_apply() {
     echo "--- cc-tmp dedicated volume (blast-radius isolation) ---"
+    _cctmpvol_result=""
+    _cctmpvol_claude_procs=""
 
     if [[ "$CCTMPVOL_DISABLE" == "1" ]]; then
+        _cctmpvol_result="disabled"
         echo "  Skipped: CCTMPVOL_DISABLE=1."
         return 0
     fi
     if ! command -v incus >/dev/null 2>&1; then
+        _cctmpvol_result="no-incus"
         echo "  Skipped: incus not available (not a guardian host vantage)."
         return 0
     fi
@@ -130,16 +147,19 @@ cc_tmp_volume_apply() {
     dev="$CCTMPVOL_DEVICE_NAME"
 
     if ! incus info "$c" >/dev/null 2>&1; then
+        _cctmpvol_result="not-found"
         echo "  Skipped: container '$c' not found."
         return 0
     fi
     if [[ "$(incus info "$c" 2>/dev/null | awk -F': *' '/^Status:/ {print tolower($2); exit}')" != "running" ]]; then
+        _cctmpvol_result="not-running"
         echo "  Skipped: container '$c' is not running."
         return 0
     fi
 
     # Idempotency: the device already exists → cc-tmp is already isolated.
     if incus config device get "$c" "$dev" source >/dev/null 2>&1; then
+        _cctmpvol_result="already-isolated"
         echo "  cc-tmp already on a dedicated volume (device '$dev' on '$c')."
         return 0
     fi
@@ -150,6 +170,8 @@ cc_tmp_volume_apply() {
     # apply permanently unreachable on a live install; its cc-tmp temp files
     # are short-lived and the pre-split contents are shadowed, not deleted.
     if incus exec "$c" -- pgrep -x claude >/dev/null 2>&1; then
+        _cctmpvol_result="live-cc"
+        _cctmpvol_claude_procs="$(incus exec "$c" -- pgrep -xc claude 2>/dev/null || echo '')"
         echo "  Skipped: a Claude Code session is live in '$c' — attach would shadow its"
         echo "           open temp files. Converges on a later apply during a quiet window."
         return 0
@@ -157,6 +179,7 @@ cc_tmp_volume_apply() {
 
     pool="$(_cctmpvol_pool "$c")"
     if [[ -z "$pool" ]]; then
+        _cctmpvol_result="no-pool"
         echo "  Skipped: could not resolve a storage pool for '$c'."
         return 0
     fi
@@ -172,6 +195,7 @@ cc_tmp_volume_apply() {
     case "$driver" in
         lvm | zfs | btrfs | ceph) : ;;
         *)
+            _cctmpvol_result="unsupported-pool"
             echo "  Skipped: pool '$pool' (driver='${driver:-unknown}') does not enforce a"
             echo "           per-volume size cap on its own device — cc-tmp isolation would be"
             echo "           cosmetic. A block/CoW-backed pool (lvm/zfs/btrfs/ceph) is required."
@@ -185,16 +209,35 @@ cc_tmp_volume_apply() {
     # Create the volume if absent (thin — an empty create costs ~zero pool).
     if ! incus storage volume show "$pool" "$vol" >/dev/null 2>&1; then
         if ! incus storage volume create "$pool" "$vol" "size=${size}GiB" >/dev/null 2>&1; then
+            _cctmpvol_result="volume-create-failed"
             echo "  WARNING: could not create storage volume '$pool/$vol' — cc-tmp NOT isolated."
             return 0
         fi
         echo "  + created storage volume '$pool/$vol' (${size}GiB)."
     fi
 
+    # Re-check for a live CC session IMMEDIATELY before the attach. The guard at
+    # the top ran before the pool/driver/volume-create steps; a session could have
+    # launched in that window (a periodic apply competes with cc-slot / CCInvoker /
+    # interactive `claude` launches, none of which share this lock). This does NOT
+    # fully serialize against launches — an external/interactive `claude` cannot be
+    # made to take a Genesis lock — but it narrows the shadow-a-live-session window
+    # to a single incus call. The deterministic cold-start apply (ordered before
+    # genesis-server) stays the race-free convergence path. The volume just created
+    # is kept and reused by a later apply.
+    if incus exec "$c" -- pgrep -x claude >/dev/null 2>&1; then
+        _cctmpvol_result="live-cc"
+        _cctmpvol_claude_procs="$(incus exec "$c" -- pgrep -xc claude 2>/dev/null || echo '')"
+        echo "  Skipped: a Claude Code session became live before attach — deferring"
+        echo "           to a later apply during a quiet window (volume kept for retry)."
+        return 0
+    fi
+
     # Attach (hot-plug, no restart — spike-proven). Leave the volume on failure
     # so a later apply can retry without re-creating it.
     if ! incus config device add "$c" "$dev" disk \
         pool="$pool" source="$vol" path="$path" >/dev/null 2>&1; then
+        _cctmpvol_result="attach-failed"
         echo "  WARNING: could not attach volume at '$path' — cc-tmp NOT isolated (volume kept for retry)."
         return 0
     fi
@@ -221,8 +264,10 @@ cc_tmp_volume_apply() {
     if [[ -n "$uid" && -n "$gid" ]] \
         && incus exec "$c" --user "$uid" --group "$gid" -- \
             sh -c "touch '$path/.cctmpvol-verify' && rm -f '$path/.cctmpvol-verify'" 2>/dev/null; then
+        _cctmpvol_result="applied"
         echo "  + cc-tmp now on dedicated volume '$pool/$vol' (${size}GiB) at $path on '$c'."
     else
+        _cctmpvol_result="verify-failed-rolledback"
         incus config device remove "$c" "$dev" >/dev/null 2>&1 || true
         echo "  WARNING: volume attached but not writable by $CCTMPVOL_USER — rolled back the device."
         echo "           cc-tmp stays on the rootfs (un-isolated). Check container idmap:"

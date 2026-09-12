@@ -68,6 +68,89 @@ async def test_purge_completed_keeps_pending(db):
     assert row["status"] == "pending"
 
 
+# ── absorb_followup: repo-pulse conditional absorb (a8a4f59e) ─────────────
+
+
+async def test_absorb_followup_completes_open_row(db):
+    """A pending row is marked completed with PR evidence + completed_at."""
+    fid = await follow_ups.create(db, **_BASE)
+    changed = await follow_ups.absorb_followup(db, fid, evidence="PR #1305 [repo-pulse exact]")
+    assert changed is True
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["completed_at"]
+    assert "PR #1305" in row["resolution_notes"]
+
+
+async def test_absorb_followup_appends_not_overwrites_notes(db):
+    """Prior resolution_notes context is preserved (append, never clobber)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_notes(db, fid, resolution_notes="earlier triage note")
+    await follow_ups.absorb_followup(db, fid, evidence="PR #42 evidence")
+    row = await follow_ups.get_by_id(db, fid)
+    assert "earlier triage note" in row["resolution_notes"]
+    assert "PR #42 evidence" in row["resolution_notes"]
+
+
+async def test_absorb_followup_skips_non_open_row(db):
+    """Lost-update safety: a row a concurrent writer moved off open (e.g.
+    'blocked') is NOT clobbered — the absorb no-ops and returns False."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fid, status="blocked", blocked_reason="waiting")
+    changed = await follow_ups.absorb_followup(db, fid, evidence="PR #99")
+    assert changed is False
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "blocked"
+    assert "PR #99" not in (row["resolution_notes"] or "")
+
+
+async def test_absorb_followup_idempotent_replay(db):
+    """A re-covered enumeration window absorbing the same row twice: the first
+    transitions it, the second matches nothing (already completed)."""
+    fid = await follow_ups.create(db, **_BASE)
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #7") is True
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #7 again") is False
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["resolution_notes"].count("PR #7") == 1
+
+
+async def test_absorb_followup_refuses_tabled_kind(db):
+    """Atomic kind guard: the cold tabled/idea lane is never absorbed, even when
+    'pending' and even if a caller's snapshot was stale (Codex P2)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_kind(db, fid, "tabled")
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #1") is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+
+
+async def test_absorb_followup_require_unpinned_refuses_pinned(db):
+    """require_unpinned=True (the worker's auto-absorb) refuses a pinned row
+    atomically — closing the load→UPDATE pin race. The dashboard path
+    (require_unpinned=False) can still complete a pinned row (human override)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_pinned(db, fid, True)
+    assert (
+        await follow_ups.absorb_followup(db, fid, evidence="PR #1", require_unpinned=True)
+    ) is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #1") is True
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "completed"
+
+
+async def test_get_open_followups_single_snapshot(db):
+    """One consistent snapshot of the hot open lane: pending + in_progress,
+    kind='follow_up' only; tabled and terminal rows excluded."""
+    fp = await follow_ups.create(db, **_BASE)  # pending
+    fi = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fi, status="in_progress")
+    ft = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_kind(db, ft, "tabled")  # cold lane — excluded
+    fc = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fc, status="completed")  # terminal — excluded
+    ids = {r["id"] for r in await follow_ups.get_open_followups(db)}
+    assert ids == {fp, fi}
+
+
 async def test_purge_failed_old(db):
     """Old failed follow-ups are also purged."""
     fid = await follow_ups.create(db, **_BASE)
@@ -669,3 +752,97 @@ async def test_update_status_batch_reopen_clears_completed_at(db):
         row = await follow_ups.get_by_id(db, fid)
         assert row["status"] == "pending"
         assert row["completed_at"] is None
+
+
+# ── source_session provenance (the 513/513-NULL fix) ─────────────────────────
+# The column existed, a consumer read it (repo_pulse_worker's item_session_id),
+# and NOTHING populated it: 513/513 live rows NULL across all four sources.
+# The contract: explicit param > runtime ContextVar > honest NULL. Never guessed.
+
+
+async def test_source_session_defaults_from_the_runtime_contextvar(db):
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id("11111111-2222-3333-4444-555555555555")
+    try:
+        fid = await follow_ups.create(
+            db, content="scoped work", source="foreground_session", strategy="ego_judgment"
+        )
+    finally:
+        set_session_id(None)
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] == "11111111-2222-3333-4444-555555555555"
+
+
+async def test_source_session_is_null_when_no_scope_and_no_param(db):
+    """Honest NULL: a caller with no session scope stores nothing, never a guess."""
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id(None)  # explicit: the ContextVar must read empty here
+    fid = await follow_ups.create(
+        db, content="scopeless work", source="surplus_ideation", strategy="surplus_task"
+    )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] is None
+
+
+async def test_an_explicit_source_session_beats_the_contextvar(db):
+    """The param is the deterministic hand-off (inbox passes the EVALUATED
+    session's id, not its own scope); the ContextVar is only the fallback."""
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id("99999999-8888-7777-6666-555555555555")
+    try:
+        fid = await follow_ups.create(
+            db,
+            content="hand-off",
+            source="inbox_evaluation",
+            strategy="ego_judgment",
+            source_session="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+    finally:
+        set_session_id(None)
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+async def test_an_intended_null_is_not_overridden_by_an_active_scope(db):
+    """None means NULL, even with the ContextVar set.
+
+    Without the _UNSET sentinel this FAILED: `None` fell through to the
+    ContextVar and stored the ambient id — so the MCP tool's "unresolvable
+    prefix -> stored NULL" promise held only while the MCP process happened to
+    never set a scope. A refusal to substitute must be expressible.
+    """
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id("77777777-6666-5555-4444-333333333333")
+    try:
+        fid = await follow_ups.create(
+            db,
+            content="provenance refused",
+            source="foreground_session",
+            strategy="ego_judgment",
+            source_session=None,
+        )
+    finally:
+        set_session_id(None)
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] is None
+
+
+async def test_an_empty_string_session_id_normalizes_to_null(db):
+    """"" is not provenance: degraded CC results construct CCOutput with
+    session_id="" on three invoker paths, and "" is invisible to IS NULL
+    consumers. Normalized at the crud chokepoint so no call site has to
+    remember an `or None` (one already forgot)."""
+    fid = await follow_ups.create(
+        db,
+        content="degraded result",
+        source="task_executor",
+        strategy="ego_judgment",
+        source_session="",
+    )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] is None
+

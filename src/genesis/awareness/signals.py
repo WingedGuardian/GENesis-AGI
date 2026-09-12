@@ -290,7 +290,10 @@ class ContainerMemoryCollector:
     async def collect(self) -> SignalReading:
         from genesis.autonomy.watchdog import get_container_anon_memory
 
-        mem = get_container_anon_memory()
+        # Offload the synchronous cgroup reads off the event loop — this runs on
+        # every 5-min awareness tick and the /sys/fs/cgroup reads can stall under
+        # memory pressure (same chronic loop-lag class as the snapshot path).
+        mem = await asyncio.to_thread(get_container_anon_memory)
         if mem is None or mem[1] == 0:
             return _bootstrap_placeholder_reading(self.signal_name, "cgroup")
 
@@ -304,7 +307,12 @@ class ContainerMemoryCollector:
             normal_max=0.80,
             warning_threshold=0.85,
             critical_threshold=0.90,
-            baseline_note="Includes page cache; 70-80% is normal for containerized workloads",
+            baseline_note=(
+                "Anon+kernel memory / cgroup limit (excludes the reclaimable page cache "
+                "that inflates memory.current). A pressure INDICATOR, not a definitive "
+                "OOM/PSI verdict — kernel slab can still include some reclaimable memory. "
+                "70-80% is normal headroom; sustained higher warrants attention."
+            ),
         )
 
 
@@ -356,7 +364,9 @@ class JobHealthCollector:
 
     Reads runtime.job_health for scheduled jobs with consecutive_failures > 0.
     Value = max(consecutive_failures) / threshold, clamped to 1.0.
-    Metadata includes list of failed job names and quarantine status.
+    When firing, the baseline_note NAMES the failing jobs — that is the field the
+    tick serializer + reflection prompt formatter retain (metadata is dropped by
+    both), so the reflection can say WHICH job is failing rather than guessing.
     """
 
     signal_name = "scheduled_job_health"
@@ -394,12 +404,17 @@ class JobHealthCollector:
         # Normalize: threshold = 0.5, 2x threshold = 1.0
         value = min(1.0, max_failures / (self._threshold * 2))
 
+        failing = ", ".join(sorted(failed_jobs))
         return SignalReading(
             name=self.signal_name,
             value=round(value, 3),
             source="runtime",
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note="0.0=all jobs healthy. Brief spikes normal after restart",
+            baseline_note=(
+                f"Jobs failing (>= {self._threshold} consecutive failures): "
+                f"{failing} (worst {max_failures}). 0.0=all jobs healthy; brief "
+                "spikes normal after restart."
+            ),
         )
 
 
@@ -477,7 +492,11 @@ class SchedulerLivenessCollector:
             return SignalReading(
                 name=self.signal_name, value=0.0, source="runtime",
                 collected_at=now.isoformat(),
-                baseline_note="0.0=scheduler active. Rises if surplus jobs stop running",
+                baseline_note=(
+                    "0.0=surplus scheduler active (checks ONLY the surplus jobs "
+                    "surplus_dispatch/surplus_brainstorm/schedule_code_index, not the "
+                    "awareness loop's own scheduler). Rises if those jobs stop running"
+                ),
             )
 
         return SignalReading(
@@ -485,6 +504,11 @@ class SchedulerLivenessCollector:
             value=min(1.0, len(stale_schedulers) * 0.5),
             source="runtime",
             collected_at=now.isoformat(),
+            baseline_note=(
+                "0.5=the surplus scheduler has not run ANY of its jobs "
+                "(surplus_dispatch/surplus_brainstorm/schedule_code_index) in "
+                f"{self._stale_threshold_s // 60}+ min — it may be wedged"
+            ),
             metadata={"stale": stale_schedulers},
         )
 

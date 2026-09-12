@@ -21,6 +21,8 @@
 #   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
 #                     storage pool, incus version + container limits.*) for the
 #                     container's infra_profile host plane
+#   cc-tmp-apply    — attach ~/.genesis/cc-tmp to its dedicated incus volume IF
+#                     no CC session is live (idempotent; JSON result token)
 #   bundle-status   — read-only offline repo-bundle archive JSON (host-only
 #                     archived `git bundle` copies + newest stamp; F.4 lifeline)
 #   provision-status          — read-only Proxmox host capacity (audit token)
@@ -59,7 +61,45 @@
 
 set -euo pipefail
 
-STATE_DIR="${HOME}/.local/state/genesis-guardian"
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
+# Honor the GUARDIAN_STATE_DIR override (the same env the guardian config reads,
+# config.py) so the pause file the gateway writes lands where _gateway_pause_active
+# looks. Default matches GuardianConfig.state_dir. (A guardian.yaml-only override
+# with no env is a pre-existing gateway limitation shared by the status verb.)
+STATE_DIR="${GUARDIAN_STATE_DIR:-${HOME}/.local/state/genesis-guardian}"
+
+# Write the gateway pause file with a bounded TTL (arg = seconds ahead). The
+# Guardian (check.py::_gateway_pause_active) stands down while this is present and
+# unexpired, and IGNORES it once expires_at passes — so a deploy killed before
+# `resume` runs self-heals rather than muting the watchdog. The cap mirrors the
+# guardian's gateway_pause_max_ahead_s (3600). Distinct from the container-side
+# ~/.genesis/paused.json (the shared runtime kill switch).
+_write_gateway_pause() {
+    local ttl="$1"
+    mkdir -p "$STATE_DIR"
+    local now_epoch expires_epoch now_iso expires_iso
+    now_epoch=$(date -u +%s)
+    expires_epoch=$((now_epoch + ttl))
+    now_iso=$(date -u -d "@${now_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    expires_iso=$(date -u -d "@${expires_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    # Atomic write (temp + mv): a guardian read racing the write must never see
+    # truncated JSON. The fail direction is already safe (ValueError -> not
+    # paused), but a torn read at deploy start could still cost one tick.
+    local tmp="$STATE_DIR/paused.json.tmp.$$"
+    printf '{"paused": true, "reason": "deploy", "since": "%s", "expires_at": "%s"}' \
+        "$now_iso" "$expires_iso" > "$tmp"
+    mv -f "$tmp" "$STATE_DIR/paused.json"
+    printf '{"ok": true, "action": "pause", "expires_at": "%s"}\n' "$expires_iso"
+}
 
 case "${SSH_ORIGINAL_COMMAND:-}" in
     restart-timer)
@@ -67,9 +107,38 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         echo '{"ok": true, "action": "restart-timer"}'
         ;;
     pause)
-        mkdir -p "$STATE_DIR"
-        printf '{"paused": true, "since": "%s"}' "$(date -Is)" > "$STATE_DIR/paused.json"
-        echo '{"ok": true, "action": "pause"}'
+        _write_gateway_pause 1800
+        ;;
+    pause\ *)
+        # pause <ttl_seconds> — deploy sets a generous TTL; EXIT-trap resume ends
+        # it early on success. Validate strictly (mirrors the redeploy arg guard).
+        _PAUSE_TTL="${SSH_ORIGINAL_COMMAND#pause }"
+        case "$_PAUSE_TTL" in
+            ''|*[!0-9]*)
+                echo '{"ok": false, "action": "pause", "error": "invalid ttl (want positive integer seconds)"}' >&2
+                exit 1
+                ;;
+        esac
+        # Reject oversized magnitudes BEFORE base-10 conversion. Bash arithmetic
+        # uses fixed-width integers with NO overflow check, so a value beyond
+        # 64-bit (e.g. `pause 18446744073709551617`) silently WRAPS into the
+        # accepted range and reports success. Max valid is 3600 (4 digits): strip
+        # leading zeros, then reject anything longer than 4 digits — the numeric
+        # range check below catches 4-digit overshoot (e.g. 3601).
+        _TTL_MAG="${_PAUSE_TTL#"${_PAUSE_TTL%%[!0]*}"}"
+        [ -z "$_TTL_MAG" ] && _TTL_MAG=0
+        if [ "${#_TTL_MAG}" -gt 4 ]; then
+            echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
+            exit 1
+        fi
+        # Force base-10: a leading-zero value (e.g. 0888) would be read as octal
+        # by bash arithmetic and abort under set -e.
+        _PAUSE_TTL=$((10#$_PAUSE_TTL))
+        if [ "$_PAUSE_TTL" -lt 1 ] || [ "$_PAUSE_TTL" -gt 3600 ]; then
+            echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
+            exit 1
+        fi
+        _write_gateway_pause "$_PAUSE_TTL"
         ;;
     resume)
         rm -f "$STATE_DIR/paused.json"
@@ -77,6 +146,21 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         ;;
     status)
         cat "$STATE_DIR/state.json" 2>/dev/null || echo '{"current_state": "unknown"}'
+        ;;
+    paused)
+        # Read-only: report whether an UNEXPIRED gateway pause is currently active,
+        # so a deploy can avoid clobbering a pause it did not create. Mirrors the
+        # guardian's own check.py::_gateway_pause_active — present + paused is the
+        # literal boolean true + expires_at in the future. Fail-safe: a missing,
+        # malformed, or expired file reads as NOT paused (single-line python, like
+        # the version verb, to avoid case-body indentation errors).
+        # Fully mirror check.py::_gateway_pause_active: paused is literal true, and
+        # now < expires_at <= now + 3600 (max_ahead — a far-future pause is IGNORED,
+        # so it never mutes monitoring; 3600 matches this gateway's own TTL cap and
+        # the guardian's default gateway_pause_max_ahead_s). A naive timestamp is
+        # coerced to UTC (as check.py does) so the compare can't raise.
+        _PAUSED_STATE=$(python3 -c "import json,datetime as dt;d=json.load(open('$STATE_DIR/paused.json'));e=d.get('expires_at');now=dt.datetime.now(dt.timezone.utc);x=(dt.datetime.fromisoformat(e.replace('Z','+00:00')) if e else None);x=(x.replace(tzinfo=dt.timezone.utc) if (x and x.tzinfo is None) else x);print('true' if (d.get('paused') is True and x is not None and now<x<=now+dt.timedelta(seconds=3600)) else 'false')" 2>/dev/null || echo false)
+        printf '{"paused": %s}\n' "$_PAUSED_STATE"
         ;;
     reset-state)
         # Reset Guardian state to HEALTHY when stuck in confirmed_dead/recovering/recovered.
@@ -288,7 +372,7 @@ except Exception:
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
         if [ -d "$INSTALL_DIR/.git" ]; then
             cd "$INSTALL_DIR"
-            OLD=$(git rev-parse --short HEAD 2>/dev/null)
+            OLD=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
             # Discard CLAUDE.md before pull — it's a generated file that the
             # repo's version would overwrite with the wrong content (container
             # dev instructions vs Guardian diagnostic instructions). We
@@ -361,6 +445,10 @@ except Exception:
                     if [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
                         sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ 2>/dev/null || true
                         sudo udevadm control --reload-rules 2>/dev/null || true
+                        # reload alone only refreshes the rules DB; trigger re-applies
+                        # the scheduler rule to already-present block devices (scoped to
+                        # block so a live host's network/other udev isn't re-triggered).
+                        sudo udevadm trigger --subsystem-match=block 2>/dev/null || true
                     fi
                     # Regenerate I/O sysctl from canonical values
                     sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null 2>&1 << 'IOSYSCTL' || true
@@ -884,6 +972,35 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --ram-status
+        ;;
+    cc-tmp-apply)
+        # Host-side cc-tmp isolation apply — attaches ~/.genesis/cc-tmp to its
+        # dedicated incus volume IF no CC session is live (the lib's own guard).
+        # Fired opportunistically by the container's cc_tmp_align_host.sh (a
+        # cold-start oneshot + a periodic timer), so the apply converges during a
+        # quiet window instead of only when a redeploy happens to land quiet.
+        # Emits ONE JSON line on stdout carrying the lib's result token; the lib's
+        # human progress text goes to stderr to preserve the stdout=JSON contract.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        _CCTMP_LIB="$INSTALL_DIR/scripts/lib/cc_tmp_volume.sh"
+        if [ ! -f "$_CCTMP_LIB" ]; then
+            echo '{"ok": false, "action": "cc-tmp-apply", "error": "cc_tmp_volume lib not found — run update to redeploy"}' >&2
+            exit 1
+        fi
+        # shellcheck source=/dev/null
+        . "$_CCTMP_LIB"
+        cc_tmp_volume_apply 1>&2
+        _cctmp_res="${_cctmpvol_result:-unknown}"
+        _cctmp_procs="${_cctmpvol_claude_procs:-}"
+        _cctmp_applied=false
+        if [ "$_cctmp_res" = "applied" ]; then _cctmp_applied=true; fi
+        if [[ "$_cctmp_procs" =~ ^[0-9]+$ ]]; then
+            _cctmp_procs_json="$_cctmp_procs"
+        else
+            _cctmp_procs_json="null"
+        fi
+        printf '{"ok": true, "action": "cc-tmp-apply", "result": "%s", "claude_procs": %s, "applied": %s}\n' \
+            "$_cctmp_res" "$_cctmp_procs_json" "$_cctmp_applied"
         ;;
     host-profile)
         # Read-only: print the host body-schema JSON (system identity, storage

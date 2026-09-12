@@ -4,7 +4,25 @@
 Every commit must be preceded by a fresh review. This hook clears the marker
 after any successful git commit, so the next commit will require review again.
 
-Reads CLAUDE_TOOL_USE_RESULT from environment (set by CC hook framework).
+Reads the CC PostToolUse payload from stdin (via hook_input) — the git
+command from tool_input, the outcome from tool_response.
+
+Marker resolution (the dir whose per-worktree marker this commit cleared) MUST
+match the dir the PreToolUse checker (``review_enforcement_commit``) validated,
+or a stale marker survives and a later ``git add && git commit`` chain sails
+through the existence-only gate on a review that no longer applies.
+
+The two hooks see DIFFERENT cwd semantics, so they resolve differently (verified
+by a live probe 2026-07-30 — ``process_cwd == payload cwd`` in every sample):
+  - PreToolUse (checker): payload ``cwd`` is PRE-execution, so it walks the
+    command's ``cd``s onto that base (``_effective_diff_cwd``).
+  - PostToolUse (here): payload ``cwd`` is POST-execution — it ALREADY reflects
+    every ``cd`` the command ran — so we take it as-is and only adjust for a
+    ``git -C`` on the commit segment (which redirects git without moving the
+    shell). Re-walking the command's ``cd``s here (i.e. sharing
+    ``_effective_diff_cwd`` verbatim) would DOUBLE-APPLY a relative ``cd`` and
+    resolve a nonexistent dir → the ``"default"`` key → the stale-marker bypass
+    this hook exists to prevent.
 
 Exit codes:
   0 = always (PostToolUse hooks cannot block)
@@ -18,32 +36,221 @@ import re
 import sys
 from pathlib import Path
 
-_COMMIT_PATTERN = re.compile(r"\bgit\s+commit\b")
-_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import field, read_payload, tool_response  # noqa: E402
+
+# review_state lives in scripts/ (this file's own dir).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from review_state import clear_all_markers, clear_marker  # noqa: E402
+
+# Commit DETECTION uses shell_parse (the same precise `analyze()` the checker
+# uses) so a loose "commit" token match doesn't clear on a non-commit that merely
+# mentions the word. Commit-DIR resolution additionally needs the checker's cwd
+# primitives, imported (not copied) so the pair can never drift:
+#   _seg_dash_C   — the `git -C <dir>` on an argv (argv parse)
+#   _resolve_against — resolve a dir against a base to an absolute path
+#   _cd_target    — classify a segment as a cd (target / _CWD_UNKNOWN / None)
+#   _CWD_UNKNOWN  — the "cannot resolve confidently" sentinel
+# Both are guarded: a broken import must never crash the hook (a crash clears
+# NOTHING → every marker stays valid for its TTL = the bypass). Detection degrades
+# to a strict regex; resolution degrades to clearing the candidate set.
+try:
+    from shell_parse import analyze_checked, git_subcommand  # noqa: E402
+
+    _PARSE_OK = True
+except Exception:  # pragma: no cover - defensive
+    _PARSE_OK = False
+
+try:
+    from review_enforcement_commit import (  # noqa: E402
+        _CWD_UNKNOWN,
+        _cd_target,
+        _effective_diff_cwd,
+        _resolve_against,
+        _seg_dash_C,
+    )
+    from shell_parse import split_segments  # noqa: E402
+
+    _RESOLVER_OK = _PARSE_OK
+except Exception:  # pragma: no cover - defensive
+    _RESOLVER_OK = False
+    # Bind the one name used on a path reachable when the import fails (_over_clear),
+    # so it is always defined; its call is still gated behind _RESOLVER_OK.
+    _effective_diff_cwd = None
+
+# Strict fallback commit-detector for the (rare) case shell_parse is unavailable —
+# matches the pre-broadening behavior so a bare "commit" mention can't trigger a
+# clear when we cannot parse. `git -C` forms are then missed. Note this is a
+# degraded regime, not a safe one: the CHECKER imports shell_parse UNGUARDED, so
+# the same failure makes it crash (a non-blocking hook error → commits proceed)
+# and go inert — the review gate as a whole is already compromised, so the
+# invalidator's own conservative fallback here neither adds nor removes exposure.
+# (Hardening the checker to fail-closed on that import is a separate follow-up.)
+_STRICT_COMMIT = re.compile(r"\bgit\s+commit\b")
+
+# Cheap early-out on the "commit" token — NOT a rigid "git commit" adjacency,
+# which misses `git -C <dir> commit` / `git -c k=v commit` (see the matching
+# comment in review_enforcement_commit.py). The pair MUST detect the same commit
+# set: if the invalidator early-exits on a form the checker gates, the checked
+# marker is never cleared → a later commit reuses the stale review.
+_COMMIT_PATTERN = re.compile(r"\bcommit\b")
+
+
+def _extract_working_dir(command: str) -> str | None:
+    """The dir named by a leading ``cd <path> && ...`` (legacy signal).
+
+    Retained as one member of the ambiguity over-clear set: it is the only
+    resolver that recovers the ``cd W && git commit && cd Z`` case (commit runs
+    in W, but the post-execution cwd is Z), where W is this leading ``cd``.
+    """
+    m = re.match(r"^cd\s+([^\s&|;]+)", command)
+    if not m:
+        return None
+    path = os.path.expanduser(m.group(1))
+    return path if os.path.isdir(path) else None
+
+
+def _payload_cwd(payload: dict) -> str | None:
+    """The Bash tool's POST-execution working directory from the payload."""
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    if isinstance(cwd, str) and cwd:
+        return os.path.normpath(cwd)
+    return None
+
+
+def _effective_clear_cwd(command: str, payload: dict, segs: list):
+    """The dir whose marker this commit cleared — POST-execution aware.
+
+    Returns an absolute ``str`` dir, or ``_CWD_UNKNOWN`` when the post-execution
+    cwd cannot be trusted to be the commit's dir (a ``cd`` AFTER the commit
+    segment, or a commit nested in a subshell/``bash -c``). ``_CWD_UNKNOWN``
+    tells the caller to over-clear the candidate set (fail toward clearing).
+    """
+    commit_seg = next((s for s in segs if git_subcommand(s.argv) == "commit"), None)
+    if commit_seg is None:
+        return _CWD_UNKNOWN
+    if getattr(commit_seg, "depth", 0) > 0:
+        # Nested (subshell / bash -c): the top-level post cwd need not reflect
+        # the nested scope's cd. Over-clear rather than trust it.
+        return _CWD_UNKNOWN
+
+    base = _payload_cwd(payload)
+
+    # A top-level `cd` AFTER the commit segment moves the post cwd DOWNSTREAM of
+    # where the commit actually ran, so `base` is no longer the commit's dir.
+    target_raw = getattr(commit_seg, "raw", None)
+    seen_commit = False
+    for raw in split_segments(command):
+        if not seen_commit:
+            if raw == target_raw:
+                seen_commit = True
+            continue
+        if _cd_target(raw) is not None:  # any cd (resolvable or UNKNOWN) after commit
+            return _CWD_UNKNOWN
+
+    # `git -C <dir>` redirects git WITHOUT moving the shell, so the post cwd
+    # (`base`) is not the commit's dir — resolve the -C target against it.
+    dash_c = _seg_dash_C(getattr(commit_seg, "argv", None))
+    if dash_c is not None:
+        return _resolve_against(base, dash_c)
+    return base
+
+
+def _over_clear(command: str, payload: dict, segs: list | None = None) -> None:
+    """Clear every candidate marker key (each a no-op if that key has no marker).
+
+    Used when resolution is ambiguous or the shared resolver is unavailable.
+    Over-clearing only forces a redundant re-review; under-clearing leaves a
+    stale marker — the bypass — so the safe direction is to clear more.
+
+    Candidates: the post-execution payload cwd, the legacy leading-``cd`` dir,
+    ``None`` (the hook process cwd, which real CC keeps == payload cwd), and —
+    when ``segs`` is available — the checker's OWN walk-based resolution
+    (``_effective_diff_cwd``). The last candidate is what covers a contrived
+    ``cd A && … ; cd W && git commit && cd Z`` form: the trailing ``cd Z`` makes
+    the post cwd (Z) and the leading ``cd`` (A) both miss the real commit dir W,
+    but the checker's walk lands on W — so including it clears the marker the
+    checker actually validated. It can over-resolve a relative-``cd`` command
+    (post-execution base), but that only adds a harmless extra clear, never an
+    under-clear. Clearing an uninvolved worktree's marker at worst forces that
+    session a redundant review; it never authorizes an unreviewed commit.
+    """
+    candidates = {_payload_cwd(payload), _extract_working_dir(command), None}
+    if segs is not None and _RESOLVER_OK:
+        walked = _effective_diff_cwd(command, payload, segs)
+        if isinstance(walked, str):
+            candidates.add(walked)
+    for cwd in candidates:
+        clear_marker(cwd=cwd)
 
 
 def main() -> None:
-    result_raw = os.environ.get("CLAUDE_TOOL_USE_RESULT", "")
-    if not result_raw:
-        sys.exit(0)
+    payload = read_payload()
 
-    # Check if the tool input contained a git commit command
-    tool_input_raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-    if not tool_input_raw:
-        sys.exit(0)
-
-    try:
-        tool_input = json.loads(tool_input_raw)
-    except json.JSONDecodeError:
-        sys.exit(0)
-
-    command = tool_input.get("command", "")
+    # Cheap early-out: no "commit" token anywhere → definitely not a commit.
+    command = field(payload, "command")
     if not _COMMIT_PATTERN.search(command):
+        sys.exit(0)
+
+    # Confirm a REAL executed `git commit` segment before clearing anything — the
+    # loose token match also hits "commit" in a filename / message / a non-commit
+    # git subcommand (`commit-tree`), none of which should invalidate a review.
+    # This mirrors the checker's post-early-out `analyze()` confirmation.
+    #
+    # A parse stopped by one of shell_parse's BOUNDS over-clears UNCONDITIONALLY.
+    #
+    # An earlier version of this set `segs = None` to reuse the missing-parser path,
+    # with a comment claiming that "keeps the failure on the side this module already
+    # chose, where the cost is one redundant re-review". That comment was WRONG, and
+    # measurably so: the missing-parser path is not an unconditional over-clear — it
+    # is gated on `_STRICT_COMMIT`, `\bgit\s+commit\b`, which requires adjacency and
+    # so does NOT match `git -C <dir> commit` or `git -c k=v commit`. MEASURED:
+    #     'git commit -m x'              -> _STRICT_COMMIT True   (cleared)
+    #     'git -C /repo commit -m x'     -> _STRICT_COMMIT False  (NOT cleared)
+    #     'git -c user.name=x commit -m x' -> _STRICT_COMMIT False (NOT cleared)
+    # So for exactly the forms the PreToolUse checker still gates, the marker
+    # survived — which is this module's documented bypass, named in its own header:
+    # "if the invalidator early-exits on a form the checker gates, the checked marker
+    # is never cleared -> a later commit reuses the stale review". The regression test
+    # written alongside that comment used `git commit -m done`, the one form the
+    # regex DOES match, so it passed while the `git -C` form stayed broken.
+    #
+    # Clearing more than necessary costs one redundant re-review. Clearing less costs
+    # an unreviewed commit riding an old approval, silently, for the marker's TTL.
+    segs, blind = analyze_checked(command) if _PARSE_OK else (None, None)
+    # Bounds-blind bypasses the strict-adjacency gate below and falls through to the
+    # unconditional over-clear. It does NOT clear here directly: the success check
+    # further down still applies, so a FAILED commit does not invalidate a review.
+    bounds_blind = blind is not None and blind.bounds_induced
+
+    # UNTOKENIZABLE KEEPS ITS SEGMENTS. An earlier version discarded them along with
+    # the bounded ones, and that was a third way to reach this module's documented
+    # bypass. `untokenizable` does not truncate — shlex fails while the parse still
+    # resolves a complete argv — so throwing the segments away dropped an EXACT
+    # answer and fell back to `_STRICT_COMMIT`, which requires adjacency. MEASURED:
+    # `git -C /other/worktree commit -m x # don't` is valid shell (the apostrophe is
+    # inside a comment), the parser returns the full `git -C` argv, and the regex
+    # misses it — so invalidation exited and the target marker survived.
+    #
+    # Its segments are USED but not TRUSTED-TO-BE-COMPLETE: a commit they find is
+    # real, while finding none is not evidence of absence, so that case still falls
+    # through to the regex. A bounded parse returns nothing at all, by design.
+    has_commit_seg = bool(segs) and any(git_subcommand(s.argv) == "commit" for s in segs)
+    if bounds_blind:
+        segs = None  # nothing was parsed; force the unconditional over-clear below
+    elif blind is None and segs is not None:
+        if not has_commit_seg:
+            sys.exit(0)  # complete parse, no commit segment: nothing to invalidate
+    elif not has_commit_seg and not _STRICT_COMMIT.search(command):
+        # No parser, or an unreliable one that found nothing: neither source of
+        # evidence names a commit.
         sys.exit(0)
 
     # Only invalidate on successful commits (exit code 0)
     try:
-        result = json.loads(result_raw)
+        result = tool_response(payload)
         # CC wraps Bash results — check for error indicators
         _stdout = result.get("stdout", "")  # noqa: F841
         _stderr = result.get("stderr", "")  # noqa: F841
@@ -54,10 +261,42 @@ def main() -> None:
     except (json.JSONDecodeError, AttributeError):
         pass  # Can't parse result — be conservative, invalidate anyway
 
-    # Clear the review marker
-    import contextlib
-    with contextlib.suppress(OSError):
-        _STATE_FILE.unlink(missing_ok=True)
+    # A BOUNDED parse cannot IDENTIFY the marker to clear, so it clears all of them.
+    # The candidate-set over-clear below covers the payload cwd, a leading `cd`, and
+    # the hook process cwd — every shell-side candidate. It cannot cover a repository
+    # named only by an explicit selector: for `git -C /other/worktree commit -m
+    # '<payload over the cap>'` the target is discoverable solely from the parse, and
+    # a bounded parse returns nothing by design. Recovering the selector from the raw
+    # string would mean a second, hand-rolled shell parser — the exact trap these
+    # guards exist to avoid — so the fail-safe is breadth instead. MEASURED at 0 of
+    # 45,956 real commands, against a bypass that authorizes an unreviewed commit for
+    # the marker's TTL.
+    if bounds_blind:
+        cleared, failures = clear_all_markers()
+        if failures:
+            # Never silent: a marker that survived is the bypass itself, and the one
+            # thing a later session must not have to guess at.
+            print(
+                f"[review-invalidate] cleared {cleared} review marker(s) after a "
+                f"commit whose command could not be fully parsed, but could NOT "
+                f"clear: {'; '.join(failures)}. A surviving marker can authorize an "
+                f"unreviewed commit — remove it by hand.",
+                file=sys.stderr,
+            )
+        sys.exit(0)
+
+    # Clear the per-worktree review marker (matching the dir that authorized this
+    # commit) so the next commit requires a fresh review. Resolution mirrors the
+    # PreToolUse checker; ambiguity or a missing resolver over-clears.
+    if not _RESOLVER_OK or segs is None:
+        _over_clear(command, payload)
+        sys.exit(0)
+
+    eff = _effective_clear_cwd(command, payload, segs)
+    if eff is _CWD_UNKNOWN:
+        _over_clear(command, payload, segs)  # segs → include the checker's walk dir
+    else:
+        clear_marker(cwd=eff)
 
     sys.exit(0)
 

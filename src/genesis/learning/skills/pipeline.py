@@ -55,11 +55,22 @@ class SkillEvolutionPipeline:
         proposed = 0
         applied = 0
         staged = 0
+        suppressed = 0
 
         for report in needs_review:
             content = load_skill(report.skill_name)
             if content is None:
                 logger.warning("Skill %s has no SKILL.md, skipping", report.skill_name)
+                continue
+
+            # Dampening: skip (and save the refiner LLM call) if an unresolved
+            # proposal for this skill is already awaiting human review.
+            if await self._has_pending_proposal(report.skill_name):
+                logger.info(
+                    "Skipping %s — an unresolved skill proposal is already pending review",
+                    report.skill_name,
+                )
+                suppressed += 1
                 continue
 
             proposal = await self._refiner.propose(
@@ -88,6 +99,7 @@ class SkillEvolutionPipeline:
             "proposed": proposed,
             "applied": applied,
             "staged": staged,
+            "suppressed": suppressed,
         }
         logger.info("Skill evolution pipeline: %s", summary)
         return summary
@@ -107,6 +119,13 @@ class SkillEvolutionPipeline:
         if content is None:
             return None
 
+        # Dampening: skip if an unresolved proposal for this skill already awaits review.
+        if await self._has_pending_proposal(skill_name):
+            logger.info(
+                "Skipping proposal for %s — one is already pending review", skill_name
+            )
+            return {"action": "suppressed", "skill_name": skill_name, "reason": "pending_proposal"}
+
         proposal = await self._refiner.propose(
             report, content, router=self._router,
         )
@@ -122,6 +141,36 @@ class SkillEvolutionPipeline:
             await self._notify_proposal(proposal)
 
         return result
+
+    async def _has_pending_proposal(self, skill_name: str) -> bool:
+        """True if an UNRESOLVED skill proposal already awaits review for this skill.
+
+        Propose-only dampening: don't re-propose (or spend the refiner LLM call)
+        while a prior proposal for the same skill is still pending review. The
+        window matches the ``skill_proposal`` 60d TTL so a pending proposal
+        suppresses for its full review life. Indexed on ``observations.category``
+        (stamped = ``skill_name``). Fails open (proceeds) on a query error — a
+        staged proposal is low-harm under propose-only.
+        """
+        from genesis.db.crud import observations
+
+        try:
+            return await observations.exists_recent_by_type(
+                self._db,
+                source="skill_evolution",
+                type="skill_proposal",
+                window_minutes=60 * 24 * 60,  # 60 days — matches the proposal TTL
+                # EXACT match — skill names can contain SQL LIKE metacharacters
+                # (e.g. `user_evaluate`), so a LIKE would over-suppress siblings.
+                category=skill_name,
+            )
+        except Exception:
+            logger.warning(
+                "dampening check failed for %s; proceeding with proposal",
+                skill_name,
+                exc_info=True,
+            )
+            return False
 
     async def _notify_proposal(self, proposal: SkillProposal) -> None:
         """Send outreach notification for a staged proposal."""

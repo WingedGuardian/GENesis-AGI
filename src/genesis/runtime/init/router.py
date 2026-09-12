@@ -52,6 +52,26 @@ def init(rt: GenesisRuntime) -> None:
         rt._resilience_state_machine = ResilienceStateMachine()
         logger.info("Resilience state machine created")
 
+        # Connectivity sentinel — probes the open internet and publishes the
+        # `network` axis (drives watchdog forgiveness, recovery gating, and the
+        # dashboard Internet light). Own try/except so a sentinel failure never
+        # aborts router setup; gated by GENESIS_NETWORK_SENTINEL_DISABLED /
+        # network.enabled (disabled → empty-state, everything behaves as before).
+        from genesis.resilience import network_config
+
+        try:
+            if network_config.sentinel_enabled():
+                from genesis.resilience.network_sentinel import NetworkSentinel
+
+                rt._network_sentinel = NetworkSentinel(
+                    state_machine=rt._resilience_state_machine,
+                )
+                rt._network_sentinel.start()
+            else:
+                logger.info("Network sentinel disabled (kill switch / config) — skipping")
+        except Exception:
+            logger.exception("Failed to start network sentinel (non-fatal)")
+
         degradation = DegradationTracker(resilience_state=rt._resilience_state_machine)
 
         from genesis.routing.dead_letter import DeadLetterQueue
@@ -88,6 +108,7 @@ def init(rt: GenesisRuntime) -> None:
             rt._awareness_loop.set_resilience_state_machine(rt._resilience_state_machine)
             if rt._circuit_breakers is not None:
                 rt._awareness_loop.set_circuit_breakers(rt._circuit_breakers)
+            rt._awareness_loop.set_degradation_tracker(degradation)
             logger.info("Deferred queue + resilience state machine + circuit breakers injected into awareness loop")
 
     except ImportError:

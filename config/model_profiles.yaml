@@ -57,11 +57,13 @@ profiles:
     best_for: [foreground_conversation, research_synthesis, long_context_work]
     avoid_for: [micro_reflection, math_heavy]
     free_tier:
-      available: true
-      provider: nvidia_nim
-      limits: "5000 credits, 40 RPM"
-    last_reviewed: "2026-03-14"
-    review_source: manual
+      # NIM's free Kimi route (moonshotai/kimi-k2.6) was retired 2026-08 —
+      # 404-for-account (live probe). No free route remains; paid only (the
+      # kimi-k2.5 provider bills via OpenRouter). available:false so
+      # match(require_free=True) no longer returns Kimi as a free option.
+      available: false
+    last_reviewed: "2026-08-19"
+    review_source: nvidia_nim_live_probe
 
   glm-5.1:
     display_name: "GLM-5.1"
@@ -165,13 +167,18 @@ profiles:
     anti_sycophancy: B
     context_window: 131072
     cost_tier: moderate
-    cost_per_mtok_in: 2.00
-    cost_per_mtok_out: 6.00
+    # Paid-plan list price. Kept in step with the `free: false` flip on
+    # `mistral-large-free` in model_routing.yaml — that flip activates the
+    # profile-based cost fallback in litellm_delegate._cost_from_profile
+    # (used whenever litellm.completion_cost() raises), so a stale figure here
+    # is silently recorded as real spend. These were 2.00/6.00, which would
+    # have over-recorded every fallback-priced call by 4x.
+    cost_per_mtok_in: 0.50
+    cost_per_mtok_out: 1.50
     latency: moderate
     strengths:
       - JSON instruction following
       - multilingual mastery
-      - data privacy (free tier data NOT used for training)
     weaknesses:
       - creative output is boring
       - 128k context is small
@@ -179,11 +186,152 @@ profiles:
     best_for: [memory_consolidation, fact_extraction, triage, outreach_draft]
     avoid_for: [creative_writing, long_context_work]
     free_tier:
+      # Revoked 2026-08: Mistral removed Large from free-tier entitlement,
+      # surfacing as 403 tier_not_allowed. Consumers selecting on
+      # `require_free=True` must stop treating this as a $0 option — leaving it
+      # true is what makes a never-pays selector pick a paid model.
+      available: false
+      provider: mistral
+      note: "Large is paid-plan only since 2026-08; Small remains free-tier."
+    # See the `entitlement:` block on mistral-medium for what these three fields
+    # separate and why. Large is the case that motivated it: REFUSED on this
+    # account, with a precondition the operator can satisfy. Note that clearing
+    # the precondition changes `status`, NOT the routing `free:` flag — unlocking
+    # a model does not start charging per call. Conflating those is what put a
+    # fabricated price on a model nobody was being billed for.
+    entitlement:
+      status: refused           # MEASURED: 403 tier_not_allowed, two independent free-tier accounts
+      # HYPOTHESIS, NOT MEASURED — and the two fields differ in evidence, which is
+      # why this says so rather than letting `verified:` below cover both. `status`
+      # was probed. `requires` is the expected vendor shape (put credits on the
+      # account, previously-refused models unlock, calls stay $0 under the tier's
+      # rate limits) and NOBODY HAS TESTED IT on this install. Settling it needs
+      # someone to fund an account and re-probe. Until then this is a lead for
+      # whoever does, not a fact to route on.
+      requires: funded_account
+      requires_confidence: hypothesis   # measured | reported | hypothesis
+      verified: "2026-08-27"    # applies to `status` only
+      method: live_probe
+    last_reviewed: "2026-09-03"
+    review_source: provider_pricing_page
+
+  mistral-medium:
+    display_name: "Mistral Medium (latest)"
+    provider: mistral
+    api_id: "mistralai/mistral-medium-latest"
+    # Tier is INFERRED from Mistral's own positioning of Medium 3 as its
+    # frontier-class workhorse, not benchmarked on this install — no routing
+    # history exists for it yet. Revisit against real call outcomes once it
+    # carries traffic; the rest of the row mirrors the vendor pricing page.
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    # NOT "cheap", and these are litellm's numbers rather than the vendor page's.
+    #
+    # These figures shipped as 0.40/2.00 (the pricing page for Medium 3). But the
+    # ledger does not use this row when litellm can price the model: the delegate
+    # tries `litellm.completion_cost()` FIRST and only falls back to the profile in
+    # the `except` branch. litellm has `mistral/mistral-medium-latest` at 1.50/7.50,
+    # so every recorded call would have been written at 1.50/7.50 while this file
+    # documented 0.40/2.00 — 3.75x, with no reader able to tell which was real.
+    #
+    # That is the PR #1619 defect one model over: flipping a provider to
+    # `free: false` while leaving its profile at a stale rate. The guard written
+    # after #1619 was hardcoded to `mistral-large-3`, so it could not see this.
+    #
+    # WHAT GUARDS THIS TODAY: nothing, and saying so is the point. An earlier
+    # draft of this comment promised a
+    # `test_paid_profiles_agree_with_the_rate_litellm_will_record` that checks
+    # every paid provider — that test was written, then LIFTED OUT of this PR
+    # because it fails on ten pre-existing providers (openrouter-deepseek-v4
+    # declares 0.43/0.87 against a recorded 1.32/3.96, on the provider carrying
+    # the most spend), and correcting ten unrelated providers does not belong in
+    # a release-blocking config change. The comment was not updated with it, so
+    # it advertised a guard that does not exist — caught by cross-model review,
+    # 2026-09-07. It ships separately.
+    #
+    # Second half of the same gap: `_paid_providers_with_profiles()` selects on
+    # `not spec.get("free")`, so now that both mistral rungs are `free: true` the
+    # family is outside even the nonzero-rate check. That is harmless while
+    # `free: true` holds — the delegate short-circuits to `cost = 0.0` and never
+    # reads these figures, making them documentation — but it means a future flip
+    # back to `free: false` re-arms the exact PR #1619 trap with no test watching.
+    # Anyone making that flip must re-check this row against litellm by hand until
+    # the generalised guard lands.
+    #
+    # Also: at 1.50/7.50 Medium is DEARER than mistral-large-3 (0.50/1.50), which is
+    # the opposite of what `cost_tier: cheap` told a reader choosing between them.
+    # (litellm's `-latest` entry appears to track Medium 3.5; the vendor page prices
+    # Medium 3 at 0.40/2.00. Recorded spend follows litellm, so this row does too.)
+    cost_tier: expensive
+    cost_per_mtok_in: 1.50
+    cost_per_mtok_out: 7.50
+    latency: moderate
+    strengths:
+      - JSON instruction following
+      - strong quality-per-cost
+    weaknesses:
+      - 128k context is small
+    best_for: [memory_consolidation, fact_extraction, triage, outreach_draft]
+    avoid_for: [creative_writing, long_context_work]
+    free_tier:
+      # ENTITLEMENT VERIFIED 2026-09-06; PRICING STILL PRESUMED (user decision
+      # 2026-09-05). A live probe of all three tiers on one free-tier account,
+      # same request shape, same minute:
+      #     mistral-large-latest  -> 403 tier_not_allowed
+      #     mistral-medium-latest -> 429 rate_limited
+      #     mistral-small-latest  -> 429 rate_limited
+      # A tier check precedes rate limiting, so Large is refused by entitlement
+      # while Medium is only throttled — Medium IS reachable on a tier that
+      # refuses Large. What the 429 does NOT establish is $0: it proves
+      # reachable, not free. `available: true` therefore remains an
+      # account-tier COST assumption until a completion's billed cost is read.
+      # Keep this comment and the one on `mistral-medium-free` in
+      # config/model_routing.yaml in agreement — they were briefly contradictory
+      # (one VERIFIED, one UNVERIFIED) after the entitlement probe landed in only
+      # one of them.
       available: true
       provider: mistral
-      limits: "2 RPM, 4M tokens/month"
-    last_reviewed: "2026-04-01"
-    review_source: api_headers
+      # Two SEPARATE claims, and the note used to blur them into one. The 429
+      # settles ENTITLEMENT (the account may call this model). It settles
+      # nothing about COST. Cross-model review, 2026-09-06: this field still
+      # read "entitlement unverified as of 2026-09-05" while the comment 15
+      # lines above recorded the 09-06 probe — a third contradiction inside the
+      # very block whose comment makes keeping the two files in agreement an
+      # explicit contract.
+      note: >-
+        Entitlement VERIFIED 2026-09-06 (429 rate_limited, not 403
+        tier_not_allowed). Marginal cost $0 under the free tier's rate limits,
+        which is what `free: true` in model_routing.yaml asserts.
+    # ── ENTITLEMENT: the third question `free:` was being asked to answer ─────
+    # There are THREE independent facts about a model, and the routing `free:`
+    # flag only carries the first:
+    #   1. marginal cost   — does a successful call add to the bill?  (`free:`)
+    #   2. entitlement     — may THIS account call it at all?          (here)
+    #   3. precondition    — what must be true for (2) to hold?        (here)
+    # They come apart in a case this install expects to hit: adding credits to a
+    # Mistral account unlocks models the free tier refuses, while calls under the
+    # rate limits remain $0. That is entitled + precondition:funded + free — and
+    # with only a boolean there was nowhere to say it, so the fact was being
+    # smuggled into `free:` and corrupting the budget gate.
+    # ADVISORY METADATA. No code reads this block yet; it exists so the reasoning
+    # has a home instead of living in a comment that the next probe contradicts.
+    entitlement:
+      status: entitled          # entitled | refused | unknown
+      requires: none            # none | funded_account | paid_plan | phone_verified
+      # MEASURED, unlike the sibling field on mistral-large-3: the 429 came from
+      # an UNFUNDED free-tier account, which is itself the evidence that no
+      # precondition is needed. `requires_confidence` is written on every
+      # entitlement block, always — an absent field would leave a reader guessing
+      # which half of the block was probed, and that guess is exactly what a
+      # confident-looking config invites.
+      requires_confidence: measured   # measured | reported | hypothesis
+      verified: "2026-09-06"
+      method: live_probe        # 429 rate_limited (throttled, therefore entitled)
+    last_reviewed: "2026-09-06"
+    review_source: provider_live_probe
 
   mistral-small:
     display_name: "Mistral Small (latest)"
@@ -693,47 +841,25 @@ profiles:
     last_reviewed: "2026-06-22"
     review_source: manual
 
-  qwen-2.5-72b:
-    display_name: "Qwen 2.5 72B Instruct"
-    provider: alibaba
-    api_id: "qwen/qwen-2.5-72b-instruct"
-    intelligence_tier: B
-    reasoning: B
-    instruction_following: A
-    anti_sycophancy: B
-    context_window: 131072
-    cost_tier: free
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    latency: moderate
-    strengths:
-      - structured output (reliable JSON)
-      - multilingual capability
-      - free tier on OpenRouter
-    weaknesses:
-      - reasoning depth vs frontier models
-      - creative tasks
-    best_for: [memory_consolidation, fact_extraction, triage, surplus_brainstorm]
-    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
-    free_tier:
-      available: true
-      provider: openrouter
-      limits: "free tier variant"
-    last_reviewed: "2026-03-26"
-    review_source: manual
+  # NOTE (2026-08-07): the qwen-2.5-72b profile was removed — openrouter-free no
+  # longer points at qwen/qwen-2.5-72b-instruct (repointed to a curated gemma /
+  # nemotron :free pool), leaving this profile orphaned. See gemma-4-26b below.
 
-  mimo-v2-pro:
-    display_name: "MiMo V2 Pro"
+  mimo-v2.5-pro:
+    display_name: "MiMo V2.5 Pro"
     provider: xiaomi
-    api_id: "xiaomi/mimo-v2-pro"
+    api_id: "xiaomi/mimo-v2.5-pro"
     intelligence_tier: A
     reasoning: A
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
     cost_tier: cheap
-    cost_per_mtok_in: 0.60
-    cost_per_mtok_out: 2.40
+    # OpenRouter endpoints range ~$0.35-$1.00 in / ~$0.70-$3.00 out per MTok
+    # (2026-08-07). litellm's own DB prices this model, so completion_cost handles
+    # it directly; these are the cost-fallback figures (conservative upper end).
+    cost_per_mtok_in: 1.0
+    cost_per_mtok_out: 3.0
     latency: moderate
     strengths:
       - mathematical reasoning (strong chain-of-thought)
@@ -747,7 +873,7 @@ profiles:
     avoid_for: [foreground_conversation, outreach_draft, creative_writing]
     free_tier:
       available: false
-    last_reviewed: "2026-03-26"
+    last_reviewed: "2026-08-07"
     review_source: manual
 
   deepseek-v3:
@@ -835,33 +961,33 @@ profiles:
     last_reviewed: "2026-06-02"
     review_source: openrouter_pricing
 
-  nvidia-nim-deepseek-v4-pro:
-    display_name: "DeepSeek V4 Pro (NIM)"
+  nvidia-nim-deepseek-v4-flash-0731:
+    display_name: "DeepSeek V4 Flash 0731 (NIM)"
     provider: nvidia_nim
-    api_id: "deepseek-ai/deepseek-v4-pro"
-    intelligence_tier: S
-    reasoning: S
+    api_id: "deepseek-ai/deepseek-v4-flash-0731"
+    intelligence_tier: A
+    reasoning: A
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
     cost_tier: free
     cost_per_mtok_in: 0.0
     cost_per_mtok_out: 0.0
-    latency: moderate
+    latency: low
     strengths:
-      - free tier access to frontier DeepSeek V4
-      - same model quality as paid V4 Pro
+      - fast free flash inference (~5s, valid strict JSON on live probe 2026-08-19)
+      - strong coding and structured extraction
     weaknesses:
-      - rate limited (40 RPM, 5000 credits)
-      - creative writing and conversational tone
-    best_for: [code_work, triage, fallback_reasoning]
-    avoid_for: [foreground_conversation, outreach_draft, high_throughput]
+      - rate limited (~40 RPM per-model free tier)
+      - fast variant, not the frontier deep-reasoning V4 Pro — calibrated judging
+        stays on paid openrouter-deepseek-v4 (V4 Pro)
+    best_for: [code_work, triage, fast_reasoning, fallback_reasoning]
+    avoid_for: [calibrated_judging, foreground_conversation, outreach_draft]
     free_tier:
       available: true
-      credits: 5000
       rpm_limit: 40
-    last_reviewed: "2026-06-02"
-    review_source: nvidia_nim_catalog
+    last_reviewed: "2026-08-19"
+    review_source: nvidia_nim_live_probe
 
   grok-3-mini:
     display_name: "Grok 3 Mini"
@@ -1045,34 +1171,36 @@ profiles:
     last_reviewed: "2026-04-14"
     review_source: manual
 
-  qwen3-coder:
-    display_name: "Qwen3-Coder 480B"
-    provider: alibaba
-    api_id: "qwen/qwen3-coder:free"
+  # gemma-4-26b — primary of the curated openrouter-free :free pool (2026-08-07).
+  # Replaced the orphaned qwen3-coder profile (its qwen/qwen3-coder:free slug was
+  # delisted; the provider was unwired and removed from model_routing.yaml).
+  gemma-4-26b:
+    display_name: "Gemma 4 26B A4B (MoE)"
+    provider: google
+    api_id: "google/gemma-4-26b-a4b-it:free"
     intelligence_tier: B
     reasoning: B
     instruction_following: B
-    anti_sycophancy: C
+    anti_sycophancy: B
     context_window: 262144
     cost_tier: free
     cost_per_mtok_in: 0.0
     cost_per_mtok_out: 0.0
     latency: moderate
     strengths:
-      - code-specialized (SWE-bench 69.6)
-      - large MoE architecture (480B params, 35B active)
-      - 256k context window
+      - reliable structured output / JSON (10/10 on the structured_output golden set, 2026-08-07)
+      - token-efficient (no reasoning-token bloat, clean JSON at tight max_tokens)
+      - genuinely free (:free OpenRouter endpoint)
     weaknesses:
-      - code-focused, weaker on general reasoning
-      - benchmark data sparse (no GPQA/MMLU-Pro scores)
-      - quality unverified for Genesis tasks
-    best_for: [code_work, code_audit]
-    avoid_for: [deep_reflection, strategic_reflection, triage]
+      - smaller MoE, less nuance than 70B+ dense models
+      - creative writing
+    best_for: [extraction, classification, tagging, fact_extraction, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection]
     free_tier:
       available: true
       provider: openrouter
-      limits: "OpenRouter free tier (20 RPM, 200-1000 RPD)"
-    last_reviewed: "2026-04-14"
+      limits: "OpenRouter :free endpoint (curated openrouter-free primary; nemotron-3-super-120b:free failover)"
+    last_reviewed: "2026-08-07"
     review_source: manual
 
   deepseek-r1:
@@ -1159,33 +1287,5 @@ profiles:
     avoid_for: [foreground_conversation, creative_writing]
     free_tier:
       available: false
-    last_reviewed: "2026-03-14"
-    review_source: manual
-
-  nvidia-nim-kimi-k2.6:  # carried from kimi-k2.6 (NIM free variant)
-    display_name: "Kimi K2.6 (NIM)"
-    provider: nvidia_nim
-    api_id: "moonshotai/kimi-k2.6"
-    intelligence_tier: A
-    reasoning: A
-    instruction_following: A
-    anti_sycophancy: B
-    context_window: 2097152
-    cost_tier: free
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    latency: moderate
-    strengths:
-      - free NIM access to Kimi K2.6
-      - long-context summarization (2M tokens)
-    weaknesses:
-      - rate limited (40 RPM, 5000 credits, shared NIM pool)
-      - single-thread speed slower than Flash
-    best_for: [research_synthesis, long_context_work, fallback_reasoning]
-    avoid_for: [micro_reflection, math_heavy, high_throughput]
-    free_tier:
-      available: true
-      credits: 5000
-      rpm_limit: 40
     last_reviewed: "2026-03-14"
     review_source: manual

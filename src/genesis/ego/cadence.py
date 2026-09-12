@@ -5,6 +5,7 @@ Owns an APScheduler with jobs:
 2. CronTrigger for the mandatory morning report
 3. IntervalTrigger for the 30-min mechanical sweep (proposal expiry/dispatch)
 4. CronTrigger for goal staleness scanning (user ego only, twice daily)
+5. CronTrigger for the advisory capability-improvement scan (genesis ego only)
 
 All cycle types (proactive, morning report, reactive, escalation) flow
 through the unified signal consumer loop: signal sources push EgoSignal
@@ -152,6 +153,7 @@ class EgoCadenceManager:
         # floor throttles overnight ticks relative to this.
         self._last_proactive_fire_at: datetime | None = None
 
+
         # Prevent concurrent cycles (interval + morning could overlap)
         self._lock = asyncio.Lock()
 
@@ -264,6 +266,24 @@ class EgoCadenceManager:
                 self._check_stale_goals,
                 CronTrigger(hour="10,16", timezone=user_timezone()),
                 id="ego_goal_staleness",
+                max_instances=1,
+                misfire_grace_time=600,
+            )
+        # Capability-improvement scanner (advisory): read the weakest domains
+        # from the capability map and push priority=low capability_improvement
+        # signals for the ego to CONSIDER. Genesis ego only — the COO owns
+        # operational self-improvement, and gating to one ego stops both from
+        # pushing duplicate deficiency signals for the shared self-model. Cron
+        # (not Interval) per the >1h reset trap; phased just after the twice-
+        # daily capability_map refresh (09:15/21:15) so it reads fresh scores.
+        if (
+            self._session._source_tag == "genesis_ego_cycle"
+            and self._config.capability_improvement_enabled
+        ):
+            self._scheduler.add_job(
+                self._check_weak_capabilities,
+                CronTrigger(hour="10,22", timezone=user_timezone()),
+                id="ego_capability_improvement",
                 max_instances=1,
                 misfire_grace_time=600,
             )
@@ -437,7 +457,7 @@ class EgoCadenceManager:
             )
             if auto_tabled:
                 logger.info(
-                    "Pre-sweep auto-table: %d proposal(s) tabled (>14d)",
+                    "Pre-sweep auto-table: %d proposal(s) tabled (urgency-stale)",
                     auto_tabled,
                 )
         except Exception:
@@ -586,6 +606,80 @@ class EgoCadenceManager:
                 )
         except Exception:
             logger.debug("Goal staleness scanner failed", exc_info=True)
+
+    # -- Capability improvement scanner (advisory) -------------------------
+
+    async def _check_weak_capabilities(self) -> None:
+        """Push advisory capability_improvement signals for the weakest domains.
+
+        Reads the capability map (Genesis's self-model, refreshed twice daily by
+        the learning scheduler) and surfaces domains whose composite confidence
+        is below ``capability_weakness_threshold`` — so the ego can CONSIDER
+        proposing an improvement. ADVISORY ONLY: the signal is priority=low, it
+        never throttles, gates, or auto-dispatches a loop, and it never asks the
+        ego to propose less (hard quality-over-cost rule). Genesis ego only —
+        registration is gated in start(), but we re-check source_tag here as
+        defense-in-depth. Best-effort — a query failure logs and no-ops.
+        """
+        if self._session._source_tag != "genesis_ego_cycle":
+            return
+        if not self._config.capability_improvement_enabled:
+            return
+        if not self._should_run(skip_idle_check=True):
+            return
+
+        try:
+            from genesis.db.crud import capability_map as cap_crud
+
+            weak = await cap_crud.get_weakest(
+                self._session._db,
+                max_confidence=self._config.capability_weakness_threshold,
+                min_sample_size=self._config.capability_improvement_min_sample_size,
+                limit=self._config.capability_improvement_max_signals,
+            )
+            if not weak:
+                return
+
+            pushed = 0
+            for entry in weak:
+                domain = entry.get("domain")
+                if not domain:
+                    continue
+                confidence = entry.get("confidence") or 0.0
+                trend = entry.get("trend") or "stable"
+                sample = entry.get("sample_size") or 0
+                sig_summary = (
+                    f"Capability deficiency: {domain} at {confidence:.0%} "
+                    f"confidence ({trend}, n={sample})"
+                )
+                signal = EgoSignal(
+                    signal_type="timer",
+                    focus_category="capability_improvement",
+                    summary=sig_summary,
+                    priority="low",
+                    focus_id=domain,
+                    metadata={
+                        # Advisory marker — a consumer must never read this as a
+                        # directive to throttle or auto-act.
+                        "advisory": True,
+                        "confidence": confidence,
+                        "trend": trend,
+                        "sample_size": sample,
+                        "evidence": entry.get("evidence_summary", ""),
+                    },
+                    # 24h: the next capability scan re-detects anything still weak.
+                    expires_at=_expires_in(24 * 60),
+                )
+                if self._signal_queue.push(signal):
+                    pushed += 1
+
+            if pushed:
+                logger.info(
+                    "Capability improvement scanner: %d advisory signal(s) pushed",
+                    pushed,
+                )
+        except Exception:
+            logger.debug("Capability improvement scanner failed", exc_info=True)
 
     # -- Autonomy earn-back ------------------------------------------------
 
@@ -867,8 +961,21 @@ class EgoCadenceManager:
         resolves. Fail-open — a query error falls through to the authoritative
         dispatch gate (backed by the requeue safety net below), never silently
         suppresses a cycle.
+
+        Policy-aware: when ``manual_approval_required`` is False (the user's
+        sovereign gate-off choice), the authoritative gate auto-approves and
+        creates NO new pending row, so a LEFTOVER pending row (raised while the
+        gate was on) must not keep parking the cycle. Report not-gated so the
+        cycle proceeds to the gate, which clears the stale row on dispatch. This
+        does NOT weaken the gate: the default stays True, and with the gate on
+        the pending-row check below is unchanged.
         """
         try:
+            from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+
+            if not load_autonomous_cli_policy().manual_approval_required:
+                return False
+
             from genesis.db.crud import ego as ego_crud
 
             return await ego_crud.has_pending_cli_approval(
@@ -993,7 +1100,7 @@ class EgoCadenceManager:
                 return "ran"
             except Exception as exc:
                 logger.error("Unified cycle failed", exc_info=True)
-                self._record_failure(str(exc))
+                self._record_failure(str(exc), exc=exc)
                 return "ran"
 
             if cycle is None:
@@ -1059,6 +1166,11 @@ class EgoCadenceManager:
                 await asyncio.sleep(2)  # Brief batch window
                 status = await self._process_signals()
                 if status == "gated":
+                    # Record the gate-hold moment so the liveness gate-RELEASE
+                    # grace excuses the unblocked cycle's catch-up window (the
+                    # instant `gated` flips False at approval, `last_success`
+                    # still trails until the cycle completes).
+                    await self._mark_gated()
                     # Signals remain queued (pre-drain gate) or were requeued
                     # (dispatch block). The notify event is still set, so wait
                     # out a retry window instead of spinning — a resolved
@@ -1107,11 +1219,33 @@ class EgoCadenceManager:
 
     def _should_run(self, *, skip_idle_check: bool = False) -> bool:
         """Check all gates. Returns True if the cycle should proceed."""
-        # Don't run before onboarding completes
+        # Don't run before bootstrap has finished (marker) AND the install is
+        # actually functional (live floor: CC login + LLM + embedding keys).
+        # The marker preserves bootstrap's "don't run until I've finished"
+        # guarantee; the floor adds "don't run autonomy without a working brain".
         setup_marker = Path.home() / ".genesis" / "setup-complete"
         if not setup_marker.exists():
-            logger.debug("Ego cycle skipped — onboarding not complete")
+            logger.debug("Ego cycle skipped — bootstrap not complete (marker absent)")
             return False
+        # Floor gate is fail-CLOSED for an autonomy gate: if the floor is unmet —
+        # including because secrets.env momentarily couldn't be read (the floor
+        # helper logs that at WARNING) — we can't confirm a working brain, so we
+        # skip rather than act. Only a catastrophic import/helper crash (e.g. a
+        # broken deploy) falls through fail-OPEN on the marker alone, so a code bug
+        # can't wedge autonomy forever.
+        try:
+            from genesis.onboarding.floor import compute_floor
+
+            if not compute_floor().floor_met:
+                logger.debug(
+                    "Ego cycle skipped — install not functional "
+                    "(floor unmet: needs CC login + an LLM key + an embedding key)"
+                )
+                return False
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Ego floor check crashed; proceeding on marker alone", exc_info=True
+            )
 
         if self._paused:
             logger.debug("Ego cycle skipped — paused")
@@ -1176,8 +1310,15 @@ class EgoCadenceManager:
         except Exception:
             logger.debug("Failed to record ego job success", exc_info=True)
 
-    def _record_failure(self, error: str) -> None:
-        """Increment circuit breaker, record job failure."""
+    def _record_failure(self, error: str, *, exc: BaseException | None = None) -> None:
+        """Increment circuit breaker, record job failure.
+
+        When an exception caused the failure, pass it as *exc*: ``record_job_failure``
+        then derives ``error_type``/``error_frames`` and emits the throttled
+        ``job.failed`` reflex event (ingested since #1304). Semantic failures with no
+        exception behind them (e.g. "cycle produced no usable output") pass ``exc=None``
+        and stay off the reflex bus — they are not Genesis bugs the reflex arc can act on.
+        """
         self._consecutive_failures += 1
 
         if self._consecutive_failures >= self._config.consecutive_failure_limit:
@@ -1197,6 +1338,7 @@ class EgoCadenceManager:
             GenesisRuntime.instance().record_job_failure(
                 self._session._source_tag,
                 error,
+                exc=exc,
             )
         except ImportError:
             pass
@@ -1451,6 +1593,34 @@ class EgoCadenceManager:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         self._last_proactive_fire_at = parsed
+
+    async def _mark_gated(self) -> None:
+        """Record 'the consumer was held on a gate just now' to
+        ``ego_state last_gated:<tag>`` — read directly from the DB by the
+        dashboard + awareness liveness surfaces to grant the gate-RELEASE
+        grace. Persisted (not just in-memory), so the grace survives restarts.
+
+        SAFETY INVARIANT (load-bearing — do NOT break): this must fire ONLY
+        from the top of the consumer loop on a "gated" return. That is what
+        keeps the grace from ever masking a REAL deadlock: a wedged cycle
+        blocks inside the cycle lock (``_process_signals`` → ``run_unified_cycle``)
+        and never loops back here, so ``last_gated`` stops refreshing and the
+        grace expires — the stall then fires one interval late, never *never*.
+        A future change that refreshes this from inside a running cycle, or via
+        a watchdog that re-pumps the loop, would VOID the no-masking guarantee.
+
+        Best-effort — a persistence failure must never break the loop.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            await ego_crud.set_state(
+                self._db,
+                key=f"last_gated:{self._session._source_tag}",
+                value=datetime.now(UTC).isoformat(),
+            )
+        except Exception:
+            logger.debug("Failed to persist last gated-at", exc_info=True)
 
     async def _update_interval(self, *, had_proposals: bool) -> None:
         """Adjust cycle interval based on productivity and user recency.

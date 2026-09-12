@@ -56,6 +56,100 @@ async def _try_alter(db: aiosqlite.Connection, sql: str, label: str) -> None:
             logger.error("Migration %s failed: %s", label, exc, exc_info=True)
 
 
+async def _intersection_copy(
+    db: aiosqlite.Connection,
+    *,
+    src: str,
+    dst: str,
+    or_ignore: bool = False,
+) -> None:
+    """Copy rows ``src`` -> ``dst`` over the intersection of their columns, by NAME.
+
+    Used by table-rebuild migrations (SQLite can't ALTER a CHECK/UNIQUE, so the
+    table is rebuilt as ``dst`` then renamed over ``src``). Computing the copy
+    column list at runtime from ``PRAGMA table_info`` — instead of a hardcoded
+    list frozen at some past column set — means a rebuild can never silently
+    DROP a column's data: whatever the live table actually has, if ``dst`` also
+    declares it, it is copied; columns only ``dst`` has take their DEFAULT.
+
+    Drift guard: if the LIVE table has any column ``dst`` does NOT (a rebuild
+    target that has fallen behind the canonical DDL), this RAISES rather than
+    dropping that column's data. Both callers wrap the rebuild in a fail-soft
+    try/except that leaves the ORIGINAL table intact and logs — so genuine drift
+    (a dev error that escaped the base-vs-rebuild parity test) fails the CHECK/
+    UNIQUE upgrade for that one boot but never loses data, and self-heals once
+    the rebuild CREATE is corrected. Dropping-then-logging would be the "mute the
+    symptom" antipattern; preserving irreversible data and failing loud is the
+    right default.
+
+    ``or_ignore`` copies with INSERT OR IGNORE (rebuilds that add a UNIQUE
+    constraint dedup on it — first row per key wins); the number of rows dropped
+    by that dedup is logged so the row-level loss the column drift-guard cannot
+    see is still surfaced.
+
+    Table/column names are schema identifiers (from PRAGMA or in-repo string
+    literals), never user input, so the f-string interpolation is safe.
+    """
+    cur = await db.execute(f"PRAGMA table_info({src})")  # noqa: S608
+    src_cols = [r[1] for r in await cur.fetchall()]
+    cur = await db.execute(f"PRAGMA table_info({dst})")  # noqa: S608
+    dst_cols = {r[1] for r in await cur.fetchall()}
+
+    dropped = [c for c in src_cols if c not in dst_cols]
+    if dropped:
+        # Refuse to proceed: copying only the shared columns would permanently
+        # drop `dropped`'s data. Raise so the caller's fail-soft handler keeps
+        # the original table (recoverable) instead of losing data (irreversible).
+        raise RuntimeError(
+            f"Table-rebuild drift: column(s) {dropped} exist on live '{src}' but "
+            f"not on rebuild target '{dst}'; refusing to copy and drop their "
+            f"data. Add them to the '{dst}' CREATE in _migrations.py to match the "
+            f"canonical _tables.py DDL."
+        )
+
+    shared = [c for c in src_cols if c in dst_cols]
+    collist = ", ".join(shared)
+    verb = "INSERT OR IGNORE INTO" if or_ignore else "INSERT INTO"
+    await db.execute(f"{verb} {dst} ({collist}) SELECT {collist} FROM {src}")  # noqa: S608
+
+    if or_ignore:
+        # dst was freshly created empty before this copy, so its row count is the
+        # number actually inserted; the shortfall vs src is what OR IGNORE dropped.
+        cur = await db.execute(f"SELECT COUNT(*) FROM {src}")  # noqa: S608
+        src_count = (await cur.fetchone())[0]
+        cur = await db.execute(f"SELECT COUNT(*) FROM {dst}")  # noqa: S608
+        dst_count = (await cur.fetchone())[0]
+        merged = src_count - dst_count
+        if merged > 0:
+            logger.info(
+                "Table-rebuild dedup: %s row(s) in '%s' collided on the new "
+                "UNIQUE constraint and were dropped (first row per key wins).",
+                merged, src,
+            )
+
+
+async def _capture_entity_aux(db: aiosqlite.Connection) -> list[str]:
+    """CREATE-SQL of local secondary indexes+triggers on ``entities`` that a
+    table rebuild's ``DROP TABLE`` auto-removes and must replay. Excludes
+    ``idx_entities_norm`` (recreated explicitly) and auto-indexes (``sql IS
+    NULL``, recreated by the new UNIQUE). Mirrors the self-contained copy in
+    migration 0083."""
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE tbl_name='entities' AND type IN ('index','trigger') "
+        "AND sql IS NOT NULL AND name != 'idx_entities_norm'"
+    )
+    return [r[0] for r in await cursor.fetchall()]
+
+
+async def _replay_entity_aux(db: aiosqlite.Connection, captured: list[str]) -> None:
+    """Recreate captured aux objects after the RENAME. A replay failure raises
+    inside the caller's savepoint → the whole rebuild rolls back loud rather
+    than silently losing the object."""
+    for sql in captured:
+        await db.execute(sql)
+
+
 async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after Phase 0."""
 
@@ -100,6 +194,33 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE follow_ups ADD COLUMN dedup_key TEXT",
         "follow_ups.dedup_key")
+
+    # a8a4f59e: which store a repo-pulse annotation's item_id addresses
+    # ('ledger' | 'follow_up').
+    await _try_alter(db,
+        "ALTER TABLE repo_pulse_annotations ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'ledger'",
+        "repo_pulse_annotations.target_kind")
+    # ...and widen its dedupe index HERE too, not only in migration 0084: the
+    # INDEXES pass below uses CREATE ... IF NOT EXISTS, which cannot replace an
+    # already-existing 3-col idx_rpa_dedupe. Without this, a legacy DB upgraded
+    # via create_all_tables (whichever runs first vs the numbered runner) keeps
+    # the 3-col UNIQUE and INSERT OR IGNORE silently drops one store's annotation
+    # for a shared (tier,item_id,pr). Safe: a pre-0084 DB has no follow_up-target
+    # rows yet, so the narrower->wider swap can't collide. Best-effort (0084 is
+    # the authoritative swap); runs after the column ALTER so the 4-col ref is valid.
+    with contextlib.suppress(Exception):
+        await db.execute("DROP INDEX IF EXISTS idx_rpa_dedupe")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
+            "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)"
+        )
+
+    # B2b dispatch follow-through: who created an intention — 'ego' (LLM,
+    # counts against MAX_ACTIVE_PER_SOURCE) or 'system' (mechanical dispatch
+    # follow-through, bypasses the cap). Mirrored in migration 0086.
+    await _try_alter(db,
+        "ALTER TABLE ego_intentions ADD COLUMN origin TEXT NOT NULL DEFAULT 'ego'",
+        "ego_intentions.origin")
 
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
@@ -257,9 +378,25 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             total_runs       INTEGER NOT NULL DEFAULT 0,
             total_successes  INTEGER NOT NULL DEFAULT 0,
             total_failures   INTEGER NOT NULL DEFAULT 0,
-            updated_at       TEXT NOT NULL
+            updated_at       TEXT NOT NULL,
+            -- Exception class name when an exception caused the failure, else
+            -- NULL (a semantic failure — e.g. an external quota block). Cleared
+            -- on recovery alongside last_error.
+            --
+            -- LAST on purpose: ALTER TABLE ADD COLUMN appends, so declaring it
+            -- last here keeps a fresh install's column ORDER identical to an
+            -- upgraded one. Both dashboard readers use SELECT * with dict(row)
+            -- (name-based) today, but a positional reader would otherwise
+            -- silently disagree between fresh and migrated installs.
+            error_type       TEXT
         )
     """)
+
+    # Failure-emitter payloads: error_type on job_health for DBs created before
+    # the column existed (the CREATE above only applies to fresh installs).
+    await _try_alter(db,
+        "ALTER TABLE job_health ADD COLUMN error_type TEXT",
+        "job_health.error_type")
 
     # Dashboard Phase 4: manual error resolution tracking
     # CREATE TABLE IF NOT EXISTS is inherently idempotent — no suppress needed
@@ -768,6 +905,108 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             exc_info=True,
         )
 
+    # Add 'marketing' category so the marketing campaign's tick digest routes to
+    # its own "Marketing" supergroup topic (never the shared Morning Reports
+    # topic that 'digest' lands in).  Rebuild #5, appended AFTER the enforcing
+    # engagement rebuild (#4) so this becomes the FINAL DDL — it therefore
+    # carries the ENFORCING engagement CHECK ('engaged' + IS NULL OR ...) and
+    # preserves every earlier category-probe fragment VERBATIM, or an older
+    # rebuild re-fires next boot (see test_final_ddl_preserves_all_chain_probe_
+    # fragments).  Probe on the exact trailing pair 'notification', 'marketing'.
+    # By the time this runs the engagement rebuild has already normalized
+    # engagement_outcome, so a straight column copy is safe.
+    _MARKETING_FRAGMENT = "'notification', 'marketing'"
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='outreach_history'"
+        )
+        row = await cursor.fetchone()
+        if row and _MARKETING_FRAGMENT not in (row[0] or ""):
+            # Clean up an orphaned temp table from any prior failed rebuild
+            await db.execute("DROP TABLE IF EXISTS outreach_history_new")
+            await db.execute("""
+                CREATE TABLE outreach_history_new (
+                    id                  TEXT PRIMARY KEY,
+                    person_id           TEXT,
+                    signal_type         TEXT NOT NULL,
+                    topic               TEXT NOT NULL,
+                    category            TEXT NOT NULL CHECK (category IN (
+                        'blocker', 'alert', 'finding', 'insight', 'opportunity',
+                        'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
+                    )),
+                    salience_score      REAL NOT NULL,
+                    channel             TEXT NOT NULL,
+                    message_content     TEXT NOT NULL,
+                    drive_alignment     TEXT,
+                    labeled_surplus     INTEGER DEFAULT 0,
+                    content_hash        TEXT,
+                    delivery_id         TEXT,
+                    delivered_at        TEXT,
+                    opened_at           TEXT,
+                    user_response       TEXT,
+                    action_taken        TEXT,
+                    engagement_outcome  TEXT CHECK (
+                        engagement_outcome IS NULL OR engagement_outcome IN (
+                        'useful', 'engaged', 'acted_on', 'acknowledged',
+                        'not_useful', 'ambivalent', 'ignored'
+                    )),
+                    engagement_signal   TEXT,
+                    prediction_error    REAL,
+                    created_at          TEXT NOT NULL
+                )
+            """)
+            # Copy over the live↔rebuild column INTERSECTION (drift-safe). If the
+            # live table carries a column this rebuild target lacks — e.g. a
+            # concurrent schema-bearing branch added one — _intersection_copy
+            # RAISES instead of silently dropping it; the enclosing try/except then
+            # keeps the ORIGINAL table intact (recoverable) and the rebuild
+            # self-heals once this CREATE is corrected to match the canonical
+            # _tables.py DDL. By the time this block runs, rebuild #4 has already
+            # normalized engagement_outcome under the enforcing CHECK, so the
+            # straight column copy is clean.
+            await _intersection_copy(
+                db, src="outreach_history", dst="outreach_history_new"
+            )
+            await db.execute("DROP TABLE outreach_history")
+            await db.execute(
+                "ALTER TABLE outreach_history_new RENAME TO outreach_history"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_channel "
+                "ON outreach_history(channel)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_category "
+                "ON outreach_history(category)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_delivered "
+                "ON outreach_history(delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_outcome "
+                "ON outreach_history(engagement_outcome)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_dedup "
+                "ON outreach_history(signal_type, topic, category, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_content_hash "
+                "ON outreach_history(signal_type, category, content_hash, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_person "
+                "ON outreach_history(person_id)"
+            )
+            await db.commit()
+            logger.info("outreach_history table rebuilt with 'marketing' category")
+    except Exception:
+        logger.error(
+            "outreach_history CHECK constraint migration (marketing) failed",
+            exc_info=True,
+        )
+
     # Memory photographic: extraction watermark tracking on cc_sessions
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_at TEXT",
@@ -775,6 +1014,20 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_line INTEGER DEFAULT 0",
         "cc_sessions.last_extracted_line")
+    # Incremental transcript resume: byte offset of the START of line
+    # last_extracted_line. NULLable, NO default — NULL means "never computed"
+    # → the reader falls back to a full scan from byte 0 once, then populates.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN last_extracted_byte INTEGER",
+        "cc_sessions.last_extracted_byte")
+    # Per-device voice-session attribution: the satellite (device) id is hashed
+    # into the uuid5 session id and otherwise dropped. NULLable, NO default —
+    # NULL = unknown device (historical rows / a writer that passed none);
+    # captured on a voice session's FIRST registration. Powers the optional
+    # per_device scope of voice_recency_resume; the default (global) ignores it.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN satellite_id TEXT",
+        "cc_sessions.satellite_id")
 
     # Memory photographic: expand memory_links CHECK constraint to support
     # typed relationships from conversation extraction (discussed_in,
@@ -831,6 +1084,149 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             "memory_links CHECK constraint migration failed", exc_info=True
         )
 
+    # MW-2 (0082) edge-metadata on memory_links — classifier-verdict stamping
+    # location (GROUNDWORK(mw-5-merge-gate)). Mirrored here because
+    # create_all_tables runs _migrate_add_columns but NOT the numbered runner,
+    # so an existing DB upgraded via the base path needs the columns too
+    # (schema_both_build_paths). All NULLable, no backfill; NULL safe_for_boost
+    # = boost-eligible (legacy default).
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN proposed_type TEXT",
+        "memory_links.proposed_type")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN confidence REAL",
+        "memory_links.confidence")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN classifier TEXT",
+        "memory_links.classifier")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN review_state TEXT",
+        "memory_links.review_state")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN safe_for_boost INTEGER",
+        "memory_links.safe_for_boost")
+
+    # MW-3 (0083) entities: expand the entity_type CHECK with host/install/project
+    # (§6.4 first-card classes) + add card-materialization columns
+    # (summary_updated_at, summary_dirty). SQLite can't ALTER a CHECK, so rebuild.
+    # Mirrored here because create_all_tables runs _migrate_add_columns but NOT the
+    # numbered runner (schema_both_build_paths). Idempotency keys on the FULL new
+    # signature (all three type literals AND both card columns) — not one token —
+    # so a partially-upgraded table still completes. The row copy is a column-name
+    # intersection (_intersection_copy): the two card columns are dst-only and take
+    # DEFAULTs; a drift canary raises if the live table has a column the target
+    # lacks. The destructive DROP+RENAME runs inside a SAVEPOINT so a post-DROP
+    # failure ROLLS BACK to the intact table instead of committing its deletion
+    # (this block is OUTSIDE the numbered runner's atomic txn — connection init
+    # commits unconditionally, so without the savepoint a mid-rebuild failure would
+    # permanently lose the table).
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'"
+        )
+        row = await cursor.fetchone()
+        table_sql = (row[0] or "") if row else None
+        if table_sql is not None:
+            cursor = await db.execute("PRAGMA table_info(entities)")
+            live_cols = {r[1] for r in await cursor.fetchall()}
+            fully_migrated = all(
+                t in table_sql for t in ("'host'", "'install'", "'project'")
+            ) and {"summary_updated_at", "summary_dirty"} <= live_cols
+            if not fully_migrated:
+                # `DROP TABLE entities` auto-drops its secondary indexes+triggers
+                # (recreating only idx_entities_norm would silently lose local
+                # ones), and a dependent VIEW makes the RENAME itself fail under
+                # the default legacy_alter_table=OFF. Capture indexes/triggers to
+                # replay after the RENAME, and rename under legacy_alter_table=ON
+                # so a view survives (SQLite's documented table-rebuild procedure).
+                aux = await _capture_entity_aux(db)
+                await db.execute("SAVEPOINT entities_rebuild")
+                try:
+                    # Inside the try so a SAVEPOINT failure can't leak the pragma
+                    # ON into the later knowledge_units rebuild; every exit below
+                    # (success, inner except) restores it OFF.
+                    await db.execute("PRAGMA legacy_alter_table=ON")
+                    await db.execute("DROP TABLE IF EXISTS entities_new")
+                    await db.execute("""
+                        CREATE TABLE entities_new (
+                            entity_id   TEXT PRIMARY KEY,
+                            name        TEXT NOT NULL,
+                            norm_name   TEXT NOT NULL,
+                            entity_type TEXT NOT NULL CHECK (entity_type IN (
+                                'code_file','code_symbol','pr','commit',
+                                'product','device','repo','subsystem','person','org','concept',
+                                'host','install','project'
+                            )),
+                            summary     TEXT,
+                            summary_updated_at TEXT,
+                            summary_dirty INTEGER NOT NULL DEFAULT 0,
+                            source      TEXT NOT NULL DEFAULT 'extracted',
+                            status      TEXT NOT NULL DEFAULT 'active'
+                                            CHECK (status IN ('active','merged','gone')),
+                            merged_into TEXT,
+                            created_at  TEXT NOT NULL,
+                            updated_at  TEXT NOT NULL,
+                            UNIQUE (norm_name, entity_type)
+                        )
+                    """)
+                    await _intersection_copy(db, src="entities", dst="entities_new")
+                    await db.execute("DROP TABLE entities")
+                    await db.execute("ALTER TABLE entities_new RENAME TO entities")
+                    await db.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)"
+                    )
+                    await _replay_entity_aux(db, aux)
+                    await db.execute("RELEASE entities_rebuild")
+                    await db.execute("PRAGMA legacy_alter_table=OFF")
+                    await db.commit()
+                    logger.info(
+                        "entities table rebuilt: +host/install/project types, +card columns"
+                    )
+                except BaseException:
+                    # Restore entities to its pre-rebuild state — never leave the
+                    # table deleted for the unconditional init commit to persist.
+                    # BaseException, not Exception (Codex round-8): an
+                    # asyncio.CancelledError landing in the DROP→RENAME window
+                    # would otherwise skip this rollback and leave `entities`
+                    # dropped inside an open savepoint on a caller-owned,
+                    # possibly-reused connection.
+                    with contextlib.suppress(Exception):
+                        await db.execute("ROLLBACK TO entities_rebuild")
+                        await db.execute("RELEASE entities_rebuild")
+                    with contextlib.suppress(Exception):
+                        await db.execute("PRAGMA legacy_alter_table=OFF")
+                    raise
+    except Exception:
+        logger.error(
+            "entities CHECK/card-column migration failed", exc_info=True
+        )
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS entities_new")
+        # LOUD, not swallowed (Codex round-7): every entity read names the card
+        # columns explicitly, so committing init with an unmigrated `entities`
+        # would defer this failure to a runtime 'no such column' crash on the
+        # write path. Match the numbered runner's posture — stop init here with
+        # the actionable drift message; the savepoint above already restored
+        # the pre-rebuild table, so nothing is lost or half-rebuilt.
+        raise
+
+    # Entity human-approval gate (0090): approved_at/approved_by on
+    # entity_adjudications. Mirrored here because create_all_tables runs
+    # _migrate_add_columns but NOT the numbered runner (schema_both_build_paths),
+    # and — critically — the INDEXES pass that follows this function creates
+    # idx_entity_adjud_approved ON entity_adjudications(verdict, approved_at). On a
+    # legacy DB the table pre-exists WITHOUT these columns (CREATE TABLE IF NOT
+    # EXISTS is a no-op), so without these ALTERs the index build crashes bootstrap
+    # with 'no such column: approved_at' before the numbered runner ever runs (the
+    # #1123/#1127 class). NULL = unreviewed; the apply path filters on approved_at
+    # IS NOT NULL so no merge is ever auto-applied.
+    await _try_alter(db,
+        "ALTER TABLE entity_adjudications ADD COLUMN approved_at TEXT",
+        "entity_adjudications.approved_at")
+    await _try_alter(db,
+        "ALTER TABLE entity_adjudications ADD COLUMN approved_by TEXT",
+        "entity_adjudications.approved_by")
+
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,
         "ALTER TABLE session_bookmarks ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
@@ -847,6 +1243,15 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
         row = await cursor.fetchone()
         if row and "UNIQUE(project_type, domain, concept)" not in (row[0] or ""):
+            # Clear any orphaned temp table from a prior failed/aborted attempt
+            # so the rebuild is retry-safe (mirrors ego_proposals_rebuild).
+            await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
+            # Rebuild target mirrors the canonical knowledge_units CREATE in
+            # _tables.py (all 21 columns incl. source_pipeline/purpose/
+            # ingestion_source/origin_class) so no column data is dropped; the
+            # row copy is a runtime column-name intersection with OR IGNORE dedup
+            # (first row per (project_type,domain,concept) wins). A drift canary
+            # in _intersection_copy logs any live column this target lacks.
             await db.execute("""
                 CREATE TABLE knowledge_units_new (
                     id               TEXT PRIMARY KEY,
@@ -866,21 +1271,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     qdrant_id        TEXT,
                     embedding_model  TEXT,
                     retrieved_count  INTEGER NOT NULL DEFAULT 0,
+                    source_pipeline  TEXT,
+                    purpose          TEXT,
+                    ingestion_source TEXT,
+                    origin_class     TEXT,
                     UNIQUE(project_type, domain, concept)
                 )
             """)
-            await db.execute("""
-                INSERT OR IGNORE INTO knowledge_units_new
-                    (id, project_type, domain, source_doc, source_platform,
-                     section_title, concept, body, relationships, caveats, tags,
-                     confidence, source_date, ingested_at, qdrant_id,
-                     embedding_model, retrieved_count)
-                SELECT id, project_type, domain, source_doc, source_platform,
-                       section_title, concept, body, relationships, caveats, tags,
-                       confidence, source_date, ingested_at, qdrant_id,
-                       embedding_model, retrieved_count
-                FROM knowledge_units
-            """)
+            await _intersection_copy(
+                db, src="knowledge_units", dst="knowledge_units_new", or_ignore=True
+            )
             await db.execute("DROP TABLE knowledge_units")
             await db.execute(
                 "ALTER TABLE knowledge_units_new RENAME TO knowledge_units"
@@ -890,6 +1290,8 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                 "knowledge_units table rebuilt with UNIQUE(project_type, domain, concept)"
             )
     except Exception:
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
         logger.error(
             "knowledge_units UNIQUE constraint migration failed", exc_info=True
         )
@@ -1085,6 +1487,34 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE memory_metadata ADD COLUMN room TEXT",
         "memory_metadata.room")
+
+    # MW-1 Tier-0 extraction judgment axes (0081_mw1_extraction_judgment).
+    # These MUST be mirrored here (the base create_all_tables path) and not only
+    # in the numbered migration: create_all_tables runs _migrate_add_columns but
+    # NOT the numbered runner, so on an existing DB the CREATE TABLE is a no-op
+    # and a create_all_tables→MemoryStore.store→create_metadata INSERT (e.g.
+    # scripts/migrate_faiss_to_qdrant.py) would hit 'no such column: speech_act'
+    # AFTER the Qdrant+FTS writes commit — a cross-store partial record. The
+    # columns are unindexed, so the INDEXES-parity guard cannot catch this;
+    # test_memory_metadata_base_path_upgrade does. schema_both_build_paths.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN speech_act TEXT",
+        "memory_metadata.speech_act")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN speech_act_confidence REAL",
+        "memory_metadata.speech_act_confidence")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN assertion_provenance TEXT",
+        "memory_metadata.assertion_provenance")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN durability TEXT",
+        "memory_metadata.durability")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN expires_at TEXT",
+        "memory_metadata.expires_at")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN preference_domain TEXT",
+        "memory_metadata.preference_domain")
 
     # Bi-temporal columns for temporal fact tracking (0010_bitemporal_memory)
     await _try_alter(db,
@@ -1403,6 +1833,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE memory_metadata ADD COLUMN dream_cycle_run_id TEXT",
         "memory_metadata.dream_cycle_run_id")
 
+    # Dream merge link rewiring: authoritative deprecation timestamp used to age
+    # out a soft-deleted original's stale links after the rollback window (the
+    # synthesis's created_at is unreliable — store()'s exact-dedup can return an
+    # old pre-existing memory). NULL for non-dream deprecations.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN deprecated_at TEXT",
+        "memory_metadata.deprecated_at")
+
     # Memory supersession: track which memory replaced this one (PR #551+).
     await _try_alter(db,
         "ALTER TABLE memory_metadata ADD COLUMN superseded_by TEXT",
@@ -1497,6 +1935,35 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE ego_proposals ADD COLUMN expected_outputs TEXT",
         "ego_proposals.expected_outputs")
+
+    # PR-4 (ego proposal-lifecycle redesign, dark schema): revision +
+    # revalidation tracking. Added on the base path here (every boot) AND by
+    # numbered migration 0071 (PRAGMA-guarded) so the migration ledger is never
+    # marked applied with the columns still absent (0071 also runs standalone
+    # via `python -m genesis.db.migrations`, without this base path). Both are
+    # idempotent: _try_alter suppresses duplicate-column, 0071 skips on PRAGMA —
+    # whichever runs first, the other no-ops (no double-add crash).
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN revision_num INTEGER DEFAULT 1",
+        "ego_proposals.revision_num")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN revalidate_at TEXT",
+        "ego_proposals.revalidate_at")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN last_validated_at TEXT",
+        "ego_proposals.last_validated_at")
+
+    # Scope stamp (operate|develop): base path + numbered migration 0078,
+    # same dual-idempotent pattern as the PR-4 columns above.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN scope TEXT",
+        "ego_proposals.scope")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN scope_revision INTEGER",
+        "ego_proposals.scope_revision")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposal_revisions ADD COLUMN scope TEXT",
+        "ego_proposal_revisions.scope")
 
     # surplus_tasks.not_before — existed in CREATE TABLE DDL but lacked
     # ALTER TABLE migration for installs created before the column was added.
@@ -1710,6 +2177,36 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "memory_metadata.capture_clarity",
     )
 
+    # The two stamps the peer-line topic recency comparison needs. Neither
+    # table had a timestamp meaning what the comparison requires:
+    # session_charters.updated_at is a ROW timestamp (set_pointers and the
+    # upsert bump it too), and cc_sessions.last_extracted_at is a PASS
+    # watermark the extraction job advances even when it writes no topic
+    # (measured: 219/899 live rows carry a watermark with no topic). Mirrored
+    # in migration 0091 for the standalone runner; added here so an existing DB
+    # gets them on the base create_all_tables path (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT",
+        "session_charters.mission_updated_at",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN topic_updated_at TEXT",
+        "cc_sessions.topic_updated_at",
+    )
+
+    # Dedup key for the Stop-hook Edit/Write outcome scanner (#1597). Mirrored
+    # in migration 0092 for the standalone runner; added here so an existing DB
+    # gets the column on the base create_all_tables path BEFORE the unique index
+    # idx_tco_tool_use_id is built (INDEXES runs before numbered migrations —
+    # schema_both_build_paths / the #1123/#1127 bootstrap-crash class).
+    await _try_alter(
+        db,
+        "ALTER TABLE tool_call_outcomes ADD COLUMN tool_use_id TEXT",
+        "tool_call_outcomes.tool_use_id",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
@@ -1767,6 +2264,19 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
 
     SQLite doesn't support ALTER CHECK — must rebuild the table.
     Idempotent: skips if the constraint already includes the new statuses.
+
+    Does NOT recreate indexes: its sole caller (create_all_tables via
+    _migrate_add_columns) runs the module-level INDEXES pass immediately after,
+    re-applying all 8 idx_ego_proposals_*. Do not call this standalone in a
+    context that needs indexes present.
+
+    LOAD-BEARING ORDER: this runs on the base path BEFORE the numbered-migration
+    runner, so it flips the CHECK first and the numbered ego_proposals rebuilds
+    (0007/0012) early-return as no-ops. Those numbered migrations still carry
+    frozen, column-incomplete copy lists; do NOT remove or reorder this base-path
+    rebuild after them, or they could fire on a legacy DB and drop columns
+    (locked by test_rebuild_column_preservation.py
+    ::test_numbered_ego_rebuilds_stay_inert_on_current_db).
     """
     try:
         cursor = await db.execute(
@@ -1780,6 +2290,13 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
             return  # Already up to date
 
         await db.execute("DROP TABLE IF EXISTS ego_proposals_rebuild")
+        # The rebuild target MUST mirror the canonical ego_proposals CREATE in
+        # _tables.py exactly (same columns/types/defaults), differing only by the
+        # corrected status CHECK — that parity is asserted by the Unit-D
+        # base-vs-rebuild schema test. The row copy below is a runtime
+        # column-name intersection (_intersection_copy), NOT a frozen hardcoded
+        # list, so a column added to the live table after this CREATE was written
+        # can never be silently dropped (a drift canary logs any this lacks).
         await db.execute("""
             CREATE TABLE ego_proposals_rebuild (
                 id              TEXT PRIMARY KEY,
@@ -1808,40 +2325,27 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
                 realist_verdict  TEXT,
                 realist_reasoning TEXT,
                 ego_source       TEXT,
-                goal_id          TEXT
+                goal_id          TEXT,
+                content_hash     TEXT,
+                content_size     INTEGER,
+                original_content TEXT,
+                expected_outputs TEXT,
+                revision_num      INTEGER DEFAULT 1,
+                revalidate_at     TEXT,
+                last_validated_at TEXT,
+                scope             TEXT,
+                scope_revision    INTEGER
             )
         """)
-        await db.execute("""
-            INSERT INTO ego_proposals_rebuild
-                (id, action_type, action_category, content, rationale,
-                 confidence, urgency, alternatives, status, user_response,
-                 cycle_id, batch_id, created_at, resolved_at, expires_at,
-                 rank, execution_plan, recurring, memory_basis,
-                 realist_verdict, realist_reasoning, ego_source, goal_id)
-            SELECT
-                id, action_type, action_category, content, rationale,
-                confidence, urgency, alternatives, status, user_response,
-                cycle_id, batch_id, created_at, resolved_at, expires_at,
-                rank, execution_plan, recurring, memory_basis,
-                realist_verdict, realist_reasoning, ego_source, goal_id
-            FROM ego_proposals
-        """)
+        await _intersection_copy(db, src="ego_proposals", dst="ego_proposals_rebuild")
         await db.execute("DROP TABLE ego_proposals")
         await db.execute(
             "ALTER TABLE ego_proposals_rebuild RENAME TO ego_proposals"
         )
-        # Recreate indexes
-        for idx_sql in [
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_status ON ego_proposals(status)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_created ON ego_proposals(created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_cycle ON ego_proposals(cycle_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_category ON ego_proposals(action_category, status)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_goal ON ego_proposals(goal_id)",
-        ]:
-            await db.execute(idx_sql)
+        # Indexes are (re)created by create_all_tables' trailing INDEXES pass —
+        # this migration's sole caller runs it right after _migrate_add_columns,
+        # and all 8 idx_ego_proposals_* live in the module-level INDEXES list —
+        # so no inline recreation is needed here.
         await db.commit()
         logger.info("ego_proposals table rebuilt with 'tabled'/'withdrawn' statuses")
     except Exception:

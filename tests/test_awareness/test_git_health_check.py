@@ -109,9 +109,9 @@ async def test_probe_exception_never_raises(monkeypatch):
     await loop._check_git_health(object())
 
 
-def _deep_report(ok: bool, failures=None):
+def _deep_report(ok: bool, failures=None, details=None):
     return git_health.GitHealthReport(
-        ok=ok, failures=failures or [], details={}, kind="deep", checked_at="t"
+        ok=ok, failures=failures or [], details=details or {}, kind="deep", checked_at="t"
     )
 
 
@@ -162,6 +162,64 @@ class TestDeepCheck:
         assert kw["source"] == "git_health_monitor"
         assert "fsck --full" in kw["content"]
         assert "fsck_failed" in kw["content"]
+
+    @pytest.mark.asyncio
+    async def test_deep_alert_is_truthful_no_false_claims(self, monkeypatch):
+        # The alert must surface the ACTUAL fsck stderr and must NOT repeat the
+        # old hard-coded false narrative: "objects missing or corrupt" (it may be
+        # any fsck failure) and "disables the REVERT_CODE lever" (the deep verdict
+        # does not gate REVERT_CODE — the guardian preflight uses a live cheap
+        # probe). Verified 2026-08-25.
+        monkeypatch.setattr(
+            git_health,
+            "check_git_deep",
+            AsyncMock(
+                return_value=_deep_report(
+                    False,
+                    ["fsck_failed"],
+                    {"fsck_stderr": "error: sentinel-xyz object corrupt marker"},
+                )
+            ),
+        )
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        obs = AsyncMock()
+        monkeypatch.setattr(loop.observations, "create", obs)
+
+        await loop._check_git_health_deep(object())
+
+        content = obs.call_args.kwargs["content"]
+        assert "sentinel-xyz" in content, "alert must show the real fsck stderr"
+        assert "REVERT_CODE" not in content, "must not repeat the false REVERT_CODE claim"
+        assert "missing or corrupt" not in content, "must not hard-code a corruption narrative"
+
+    @pytest.mark.asyncio
+    async def test_deep_alert_dedup_hash_stable_across_varying_stderr(self, monkeypatch):
+        # The alert BODY now shows run-varying fsck stderr, but the dedup identity
+        # must key on the stable failure-CLASS (create() dedups on content_hash) —
+        # else two transient failures with differing stderr both insert, piling up
+        # stale criticals the self-heal is meant to prevent. Lock the stable hash.
+        hashes: list[str | None] = []
+
+        async def _capture(*a, **k):
+            hashes.append(k.get("content_hash"))
+            return "id"
+
+        monkeypatch.setattr(loop.observations, "create", _capture)
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+
+        for stderr in ("error: unable to read aaaa", "error: unable to read bbbb"):
+            loop._last_git_deep_run_at = None  # bypass the daily guard for the 2nd run
+            monkeypatch.setattr(
+                git_health,
+                "check_git_deep",
+                AsyncMock(
+                    return_value=_deep_report(False, ["fsck_failed"], {"fsck_stderr": stderr})
+                ),
+            )
+            await loop._check_git_health_deep(object())
+
+        assert hashes[0] is not None, "must pass an explicit stable content_hash"
+        assert hashes[0] == hashes[1], "dedup hash must be stable despite differing stderr"
 
     @pytest.mark.asyncio
     async def test_daily_guard_skips_second_run_within_window(self, monkeypatch):

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 
-from genesis.db.schema import TABLES
+from genesis.db.schema import TABLES, create_all_tables
 from genesis.ego.cadence import _RECENCY_TIERS, EgoCadenceManager
 from genesis.ego.session import CycleBlockedError
 from genesis.ego.types import EgoConfig, EgoCycle
@@ -77,15 +77,22 @@ def mock_idle_detector():
 
 @pytest.fixture(autouse=True)
 def _setup_complete_marker(tmp_path, monkeypatch):
-    """Ensure the onboarding marker exists so ego gates pass by default.
+    """Ensure the onboarding marker exists AND the functional floor is met so ego
+    gates pass by default.
 
-    Tests that specifically check onboarding-incomplete behavior override
-    Path.home() themselves.
+    The cadence gate now requires BOTH the bootstrap marker and the live functional
+    floor (CC login + LLM + embedding keys). Tests that specifically check
+    onboarding-incomplete behavior override Path.home() / the floor themselves.
     """
     genesis_dir = tmp_path / ".genesis"
     genesis_dir.mkdir()
     (genesis_dir / "setup-complete").write_text("2026-01-01")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from genesis.onboarding import floor as _floor
+
+    monkeypatch.setattr(
+        _floor, "compute_floor", lambda *a, **k: _floor.FloorStatus(True, True, True)
+    )
 
 
 @pytest.fixture
@@ -136,25 +143,10 @@ class TestCadenceLifecycle:
 # Restart-safe boot first-fire (B1): anchor ego_cycle to job_health.last_success
 # ---------------------------------------------------------------------------
 
-_JOB_HEALTH_DDL = """
-    CREATE TABLE IF NOT EXISTS job_health (
-        job_name         TEXT PRIMARY KEY,
-        last_run         TEXT,
-        last_success     TEXT,
-        last_failure     TEXT,
-        last_error       TEXT,
-        consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        total_runs       INTEGER NOT NULL DEFAULT 0,
-        total_successes  INTEGER NOT NULL DEFAULT 0,
-        total_failures   INTEGER NOT NULL DEFAULT 0,
-        updated_at       TEXT NOT NULL
-    )
-"""
-
 
 async def _seed_last_success(conn, job_name: str, last_success: datetime) -> None:
     """Create job_health (not in TABLES) and seed one ego's last_success row."""
-    await conn.execute(_JOB_HEALTH_DDL)
+    await create_all_tables(conn)
     iso = last_success.isoformat()
     await conn.execute(
         "INSERT INTO job_health "
@@ -194,7 +186,7 @@ class TestBootFirstFire:
 
     async def test_no_row_returns_none(self, cadence, mock_session, db):
         mock_session._source_tag = "genesis_ego_cycle"
-        await db.execute(_JOB_HEALTH_DDL)  # table exists, no row for this ego
+        await create_all_tables(db)  # table exists, no row for this ego
         await db.commit()
         assert await cadence._compute_boot_first_fire() is None
 
@@ -366,6 +358,23 @@ class TestCadenceTick:
     ):
         # Remove the marker created by autouse fixture
         (tmp_path / ".genesis" / "setup-complete").unlink()
+        await cadence._on_tick()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
+
+    async def test_tick_skips_when_floor_unmet(
+        self,
+        cadence,
+        mock_session,
+        monkeypatch,
+    ):
+        # Marker present (autouse) but the live functional floor is unmet (e.g. CC
+        # not logged in, or no keys) → autonomy must not run.
+        from genesis.onboarding import floor as _floor
+
+        monkeypatch.setattr(
+            _floor, "compute_floor", lambda *a, **k: _floor.FloorStatus(False, False, False)
+        )
         await cadence._on_tick()
         mock_session.run_unified_cycle.assert_not_called()
         assert cadence._signal_queue.empty()
@@ -1419,6 +1428,162 @@ class TestGoalStaleness:
         assert goal_cadence._signal_queue.empty()
 
 
+class TestCapabilityImprovement:
+    """Tests for _check_weak_capabilities() — advisory capability_improvement scanner."""
+
+    @pytest.fixture
+    async def cap_db(self):
+        """DB with the capability_map table."""
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            for table in ("ego_cycles", "ego_state", "cc_sessions", "capability_map"):
+                await conn.execute(TABLES[table])
+            await conn.commit()
+            yield conn
+
+    @pytest.fixture
+    def cap_cadence(self, mock_session, config, mock_idle_detector, cap_db):
+        # Genesis ego owns the capability-improvement scanner.
+        mock_session._source_tag = "genesis_ego_cycle"
+        mock_session._db = cap_db
+        return EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=cap_db,
+        )
+
+    @staticmethod
+    async def _insert_domain(db, domain, confidence, sample_size=5, trend="stable"):
+        from datetime import datetime as _dt
+
+        await db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                domain,  # id doubles as a unique key for the test
+                domain,
+                confidence,
+                sample_size,
+                trend,
+                f"{domain} evidence",
+                _dt.now(UTC).isoformat(),
+            ),
+        )
+        await db.commit()
+
+    async def test_weak_domain_pushes_advisory_signal(self, cap_cadence, cap_db):
+        """A weak domain surfaces a priority=low advisory capability_improvement signal."""
+        await self._insert_domain(cap_db, "outreach", 0.30, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+
+        assert not cap_cadence._signal_queue.empty()
+        signals = cap_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.focus_category == "capability_improvement"
+        assert sig.priority == "low"
+        assert sig.focus_id == "outreach"
+        assert sig.metadata.get("advisory") is True
+        assert "outreach" in sig.summary
+
+    async def test_strong_domain_no_signal(self, cap_cadence, cap_db):
+        """A domain above the weakness threshold does NOT surface a signal."""
+        await self._insert_domain(cap_db, "investigate", 0.90, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_low_sample_domain_skipped(self, cap_cadence, cap_db):
+        """A weak-but-low-n domain is ignored as a fluke (min_sample_size gate)."""
+        await self._insert_domain(cap_db, "flaky", 0.10, sample_size=1)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_weakest_first_and_capped(self, cap_cadence, cap_db):
+        """Signals come from the weakest domains, capped at max_signals."""
+        cap_cadence._config.capability_improvement_max_signals = 2
+        await self._insert_domain(cap_db, "d1", 0.10)
+        await self._insert_domain(cap_db, "d2", 0.20)
+        await self._insert_domain(cap_db, "d3", 0.40)
+        await self._insert_domain(cap_db, "d4", 0.95)  # strong — excluded
+
+        await cap_cadence._check_weak_capabilities()
+
+        signals = cap_cadence._signal_queue.drain()
+        assert len(signals) == 2
+        focus_ids = {s.focus_id for s in signals}
+        assert focus_ids == {"d1", "d2"}  # two weakest, d4 excluded
+
+    async def test_user_ego_skipped(self, cap_cadence, cap_db):
+        """The user ego does NOT run the capability scanner (genesis ego only)."""
+        cap_cadence._session._source_tag = "user_ego_cycle"
+        await self._insert_domain(cap_db, "outreach", 0.30, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_disabled_config_skips(self, cap_cadence, cap_db):
+        """capability_improvement_enabled=False silences the scanner."""
+        cap_cadence._config.capability_improvement_enabled = False
+        await self._insert_domain(cap_db, "outreach", 0.30, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_empty_map_no_signal(self, cap_cadence, cap_db):
+        """Empty capability map (fresh install) is a clean no-op."""
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_job_registered_for_genesis_ego(
+        self,
+        mock_session,
+        config,
+        mock_idle_detector,
+        cap_db,
+    ):
+        """start() registers the ego_capability_improvement job for the genesis ego."""
+        mock_session._source_tag = "genesis_ego_cycle"
+        mock_session._db = cap_db
+        mgr = EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=cap_db,
+        )
+        try:
+            await mgr.start()
+            assert mgr._scheduler.get_job("ego_capability_improvement") is not None
+        finally:
+            await mgr.stop()
+
+    async def test_job_not_registered_for_user_ego(
+        self,
+        mock_session,
+        config,
+        mock_idle_detector,
+        cap_db,
+    ):
+        """The user ego cadence does NOT register the capability scanner job."""
+        mock_session._source_tag = "user_ego_cycle"
+        mock_session._db = cap_db
+        mgr = EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=cap_db,
+        )
+        try:
+            await mgr.start()
+            assert mgr._scheduler.get_job("ego_capability_improvement") is None
+        finally:
+            await mgr.stop()
+
+
 class TestJobHealthKeyPerEgo:
     """Each ego records job health under its OWN key, never a shared 'ego_cycle'.
 
@@ -1460,7 +1625,7 @@ class TestJobHealthKeyPerEgo:
             classmethod(lambda cls: mock_rt),
         )
         cadence._record_failure("boom")
-        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom")
+        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom", exc=None)
 
     async def test_two_egos_write_distinct_keys(
         self,
@@ -1727,10 +1892,17 @@ class TestQuietHours:
         return _dt.datetime(2026, 1, 1, hour, 0, tzinfo=_dt.UTC)
 
     def test_suppress_mode_skips_entire_window(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(
-            db, mock_session, mock_idle_detector, quiet_hours_mode="suppress",
+            db,
+            mock_session,
+            mock_idle_detector,
+            quiet_hours_mode="suppress",
         )
         now = self._at(2)
         monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
@@ -1742,7 +1914,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is True
 
     def test_floor_mode_is_default_and_throttles(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)  # default mode
         assert mgr._config.quiet_hours_mode == "floor"
@@ -1755,12 +1931,19 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is False
 
     def test_suppress_mode_reschedules_past_window(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         from unittest.mock import MagicMock
 
         mgr = self._mgr(
-            db, mock_session, mock_idle_detector, quiet_hours_mode="suppress",
+            db,
+            mock_session,
+            mock_idle_detector,
+            quiet_hours_mode="suppress",
         )
         now = self._at(2)  # inside the 23→7 window
         monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
@@ -1960,6 +2143,56 @@ class TestPendingCliApproval:
         )
         await db.commit()
         assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is True
+
+
+class TestApprovalPendingPolicyAware:
+    """_approval_pending is policy-aware: a LEFTOVER pending row must not park
+    the ego when the mandatory gate is disabled (the deadlock fix)."""
+
+    async def _seed_pending(self, db, source_tag="user_ego_cycle"):
+        await db.execute(TABLES["approval_requests"])
+        await db.execute(
+            "INSERT INTO approval_requests "
+            "(id, action_type, action_class, description, context, status) "
+            "VALUES ('appol1', 'autonomous_cli_fallback', 'costly_reversible', "
+            "'Approve Claude Code session for user ego cycle?', "
+            f'\'{{"policy_id": "{source_tag}", "subsystem": "ego"}}\', '
+            "'pending')",
+        )
+        await db.commit()
+
+    async def test_gate_on_pending_row_blocks(self, cadence, db, monkeypatch):
+        from genesis.autonomy import cli_policy
+
+        cadence._session._source_tag = "user_ego_cycle"
+        await self._seed_pending(db)
+        monkeypatch.setattr(
+            cli_policy,
+            "load_autonomous_cli_policy",
+            lambda *a, **k: cli_policy.AutonomousCliPolicy(
+                manual_approval_required=True,
+            ),
+        )
+        assert await cadence._approval_pending() is True
+
+    async def test_gate_off_pending_row_does_not_block(
+        self,
+        cadence,
+        db,
+        monkeypatch,
+    ):
+        from genesis.autonomy import cli_policy
+
+        cadence._session._source_tag = "user_ego_cycle"
+        await self._seed_pending(db)
+        monkeypatch.setattr(
+            cli_policy,
+            "load_autonomous_cli_policy",
+            lambda *a, **k: cli_policy.AutonomousCliPolicy(
+                manual_approval_required=False,
+            ),
+        )
+        assert await cadence._approval_pending() is False
 
 
 # ---------------------------------------------------------------------------

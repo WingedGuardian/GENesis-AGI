@@ -25,6 +25,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from genesis.awareness.types import STEADY_STATE_SIGNALS
 from genesis.db.crud import ego as ego_crud
 from genesis.db.crud import j9_eval
 from genesis.db.crud import memory as memory_crud
@@ -87,6 +88,24 @@ async def _compute_cognitive_drift(
         "n_with_verdict": len(verdicts),
     }
     return metrics, total
+
+
+def factors_with_reason(grade_info: dict) -> dict:
+    """Return a grader's factors with its top-level `reason` folded in.
+
+    Graders return `reason` alongside `factors`, but `eval_subsystem_grades`
+    has no `reason` column and the dashboard reads `factors["reason"]`
+    (dashboard/routes/eval.py), so every withheld grade rendered a blank
+    explanation. This is the single chokepoint where the fold happens — named
+    so the persist call below and its test exercise the same code, rather than
+    a test re-implementing the fold and passing whatever production does.
+
+    A grader that already put `reason` in its own factors keeps it.
+    """
+    factors = dict(grade_info.get("factors") or {})
+    if grade_info.get("reason") and "reason" not in factors:
+        factors["reason"] = grade_info["reason"]
+    return factors
 
 
 async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
@@ -155,6 +174,9 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
     ]:
         try:
             grade_info = await grade_fn(db, period_start, period_end, results)
+            # Fold `reason` into factors HERE, at the one persist call, so no
+            # future grader has to remember to. See factors_with_reason.
+            grade_factors = factors_with_reason(grade_info)
             await j9_eval.insert_subsystem_grade(
                 db,
                 period_start=period_start,
@@ -163,7 +185,7 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
                 subsystem=sub_name,
                 grade=grade_info["grade"],
                 score=grade_info["score"],
-                factors=grade_info["factors"],
+                factors=grade_factors,
                 sample_count=grade_info["sample_count"],
             )
             subsystem_results[sub_name] = grade_info
@@ -416,7 +438,7 @@ async def _compute_system_composite(
         "WHERE deprecated = 0 AND draft = 0",
     )
     row = await cursor.fetchone()
-    proc_mean_conf = round(row["avg_conf"], 4) if row and row["avg_conf"] else None
+    proc_mean_conf = round(row["avg_conf"], 4) if row and row["avg_conf"] is not None else None
 
     # Get memory precision from this week's snapshot (if computed already)
     mem_snapshot = await j9_eval.get_latest_snapshot(db, dimension="memory")
@@ -446,6 +468,19 @@ async def _compute_system_composite(
 
 # ── Dimension 3: Ego Proposal Quality ────────────────────────────────────────
 
+#: Confidence-calibration buckets, written as explicit pairs. Accumulating them
+#: as ``low + 0.2`` gives 0.4 + 0.2 == 0.6000000000000001, which put a
+#: confidence of exactly 0.6 in two buckets and one of exactly 1.0 in none.
+#: The last bucket is closed on the right so 1.0 is counted.
+_CALIBRATION_BUCKETS: list[tuple[float, float]] = [
+    (0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0),
+]
+
+#: Bumped whenever the approval_rate denominator changes. Trend consumers
+#: must not mix versions — see _extract_trend_values.
+_EGO_APPROVAL_RATE_DEFN = "v2_judged_only"
+
+
 
 async def _compute_ego_quality(
     db: aiosqlite.Connection, since: str, until: str,
@@ -458,11 +493,31 @@ async def _compute_ego_quality(
 
     if not total:
         return {"approval_rate": None, "execution_success_rate": None,
-                "confidence_calibration": {}, "total_proposals": 0}, 0
+                "confidence_calibration": {}, "total_proposals": 0,
+                # A quiet week is still computed under the CURRENT definition;
+                # without the marker it reads to detect_series_break as a break.
+                "approval_rate_defn": _EGO_APPROVAL_RATE_DEFN}, 0
 
-    # Approval rate (resolved proposals only)
-    resolved = [p for p in proposals if p["status"] not in ("pending", "expired")]
-    approved = [p for p in resolved if p["status"] in ("approved", "executed")]
+    # Approval rate — JUDGED proposals only.
+    #
+    # A proposal counts here only if someone actually ruled on it. Four of the
+    # eight statuses are not rulings: 'pending'/'expired' never got an answer,
+    # and 'tabled'/'withdrawn' are reachable with NO human involved at all —
+    # `auto_table_stale_proposals` tables anything past its TTL, the
+    # develop-scope roadmap gate tables a proposal in the same cycle it was
+    # created, and the ego's own reconcile stage withdraws on premise
+    # invalidation. Scoring those as rejections graded the ego down for its own
+    # bookkeeping (2026-09-06: one self-tabled row was the entire denominator).
+    _NOT_A_JUDGMENT = ("pending", "expired", "tabled", "withdrawn")
+    resolved = [p for p in proposals if p["status"] not in _NOT_A_JUDGMENT]
+    # 'failed' belongs in the NUMERATOR: it is reachable only from 'approved'
+    # (execute_proposal) or from 'executed' (mark_proposal_verification_failed),
+    # so a failed proposal is by definition one the user approved. Counting it
+    # as an approval failure conflates execution with approval — the same
+    # conflation this whole change exists to remove. Its failure is already
+    # measured, separately and correctly, by execution_success_rate below.
+    _WAS_APPROVED = ("approved", "executed", "failed")
+    approved = [p for p in resolved if p["status"] in _WAS_APPROVED]
     approval_rate = round(len(approved) / len(resolved), 4) if resolved else None
 
     # Execution success rate
@@ -473,15 +528,17 @@ async def _compute_ego_quality(
 
     # Confidence calibration: bin by confidence decile
     calibration: dict[str, dict] = {}
-    for bucket_low in [0.0, 0.2, 0.4, 0.6, 0.8]:
-        bucket_high = bucket_low + 0.2
+    for i, (bucket_low, bucket_high) in enumerate(_CALIBRATION_BUCKETS):
         label = f"{bucket_low:.1f}-{bucket_high:.1f}"
+        is_last = i == len(_CALIBRATION_BUCKETS) - 1
         in_bucket = [p for p in resolved
                      if p.get("confidence") is not None
-                     and bucket_low <= p["confidence"] < bucket_high]
+                     and bucket_low <= p["confidence"]
+                     and (p["confidence"] <= bucket_high if is_last
+                          else p["confidence"] < bucket_high)]
         if in_bucket:
             bucket_approved = [p for p in in_bucket
-                               if p["status"] in ("approved", "executed")]
+                               if p["status"] in _WAS_APPROVED]
             calibration[label] = {
                 "count": len(in_bucket),
                 "success_rate": round(len(bucket_approved) / len(in_bucket), 4),
@@ -493,6 +550,18 @@ async def _compute_ego_quality(
         "confidence_calibration": calibration,
         "total_proposals": total,
         "total_resolved": len(resolved),
+        # Observability: non-judgments are excluded from scoring, but a week
+        # made entirely of them should be legible rather than invisible.
+        "total_unjudged": total - len(resolved),
+        # SERIES BREAK MARKER. approval_rate is the ego dimension's headline
+        # metric — it drives the dashboard sparkline and _extract_trend_values
+        # -> ego_slope -> go_ready. v2 (2026-09-06) changes it three ways
+        # against v1: tabled/withdrawn leave the denominator, `failed` joins
+        # the numerator, and the calibration buckets stop dropping a
+        # confidence of exactly 1.0. All three RAISE the rate. Without this
+        # marker the trend would read as improvement caused by nothing but the
+        # redefinition. Same discipline as judge_prompt_versions above.
+        "approval_rate_defn": _EGO_APPROVAL_RATE_DEFN,
     }
     return metrics, total
 
@@ -585,7 +654,7 @@ async def _compute_procedural_effectiveness(
     )
     row = await cursor.fetchone()
     total_procedures = row["total"] if row else 0
-    mean_confidence = round(row["avg_conf"], 4) if row and row["avg_conf"] else None
+    mean_confidence = round(row["avg_conf"], 4) if row and row["avg_conf"] is not None else None
 
     # Tier distribution
     cursor = await db.execute(
@@ -1098,6 +1167,14 @@ def _extract_trend_values(dimension: str, snapshots: list[dict]) -> list[float]:
     values = []
     for s in snapshots:
         m = s.get("metrics", {})
+        # The ego's approval_rate denominator was redefined on 2026-09-06
+        # (tabled/withdrawn are no longer counted as rejections). Mixing the
+        # two definitions in one slope would report improvement caused purely
+        # by the smaller denominator, and ego_slope feeds go_ready. Skip
+        # snapshots that predate the marker rather than comparing across it.
+        if (dimension == "ego"
+                and m.get("approval_rate_defn") != _EGO_APPROVAL_RATE_DEFN):
+            continue
         v = m.get(key_metric)
         if v is not None:
             values.append(float(v))
@@ -1123,20 +1200,34 @@ _MIN_SAMPLES = {"memory": 10, "ego": 5, "procedural": 5,
                 "awareness": 20, "reflection": 10}
 
 
-def _score_with_zero_fill(
+def _score_available_factors(
     available: list[tuple[float | None, float]],
     *,
-    max_nulls: int = 1,
+    max_absent: int = 1,
 ) -> float | None:
-    """Compute weighted score, treating null factors as 0.0.
+    """Weighted score over the factors that HAVE a denominator.
 
-    Returns None if more than *max_nulls* factors are null — the grade
-    should be withheld rather than computed from mostly-absent data.
+    ``None`` means "no data", never "measured zero" — the callers below build
+    it that way (a rate over an empty population is None, a real zero is 0.0).
+    An absent factor is therefore EXCLUDED and the remaining weights are
+    renormalised, so a grade rests on what was actually measured.
+
+    It used to be zero-filled instead, which made "nothing was dispatched"
+    score identically to "everything failed" and produced two recorded ego F
+    grades — including one where the approval rate was 100%. See
+    ``test_absent_factor_never_drags_a_grade_downward``.
+
+    Returns None if more than *max_absent* factors are absent — too little was
+    measured to judge on, so the grade is withheld rather than invented.
     """
-    null_count = sum(1 for v, _ in available if v is None)
-    if null_count > max_nulls:
+    absent = sum(1 for v, _ in available if v is None)
+    if absent > max_absent:
         return None
-    return sum((v if v is not None else 0.0) * w for v, w in available) * 100
+    present = [(v, w) for v, w in available if v is not None]
+    total_weight = sum(w for _, w in present)
+    if total_weight <= 0:
+        return None
+    return sum(v * w for v, w in present) / total_weight * 100
 
 
 def _score_to_grade(score: float | None) -> str | None:
@@ -1181,7 +1272,7 @@ async def _grade_memory(
                 "sample_count": total,
                 "reason": f"insufficient data ({total} recalls, need {_MIN_SAMPLES['memory']})"}
 
-    score = _score_with_zero_fill(available, max_nulls=1)
+    score = _score_available_factors(available, max_absent=1)
     if score is None:
         return {"grade": None, "score": None, "factors": factors,
                 "sample_count": total,
@@ -1208,6 +1299,11 @@ async def _grade_ego(
     approval = metrics.get("approval_rate")
     exec_success = metrics.get("execution_success_rate")
     total = metrics.get("total_proposals", 0)
+    # Gate on the population the FACTORS came from, not on every proposal in
+    # the window. Every factor below is computed over judged proposals only, so
+    # counting pending ones toward _MIN_SAMPLES let a grade issue off n=1 while
+    # reporting a sample of 12 (2026-09-06).
+    judged = metrics.get("total_resolved", 0)
 
     # Confidence calibration accuracy: how well does stated confidence
     # predict actual approval? Perfect calibration = 1.0.
@@ -1227,23 +1323,25 @@ async def _grade_ego(
 
     factors = {"approval_rate": approval, "execution_success_rate": exec_success,
                "calibration_accuracy": cal_accuracy,
-               "total_proposals": total}
+               "total_proposals": total,
+               "total_judged": judged}
 
     available = [(cal_accuracy, 0.4), (exec_success, 0.4), (approval, 0.2)]
 
-    if all(v is None for v, _ in available) or total < _MIN_SAMPLES["ego"]:
+    if all(v is None for v, _ in available) or judged < _MIN_SAMPLES["ego"]:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": total,
-                "reason": f"insufficient data ({total} proposals, need {_MIN_SAMPLES['ego']})"}
+                "sample_count": judged,
+                "reason": (f"insufficient data ({judged} judged of {total} "
+                           f"proposals, need {_MIN_SAMPLES['ego']})")}
 
-    score = _score_with_zero_fill(available, max_nulls=1)
+    score = _score_available_factors(available, max_absent=1)
     if score is None:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": total,
+                "sample_count": judged,
                 "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
-            "factors": factors, "sample_count": total}
+            "factors": factors, "sample_count": judged}
 
 
 async def _grade_procedural(
@@ -1256,12 +1354,25 @@ async def _grade_procedural(
 
     Factors: success_rate (50%), mean_confidence (25%),
     invocation_activity (25% — normalized by total procedures).
+
+    `sample_count` is the OUTCOME count on every return path, withheld or
+    graded. It is the population the dominant factor (success_rate, 50%) is
+    measured over and the one the gate below withholds on, so it is the number
+    that says how much the grade rests on. Reporting invocations here was how
+    a grade computed from ONE outcome came back labelled `sample_count 435`.
+    Both counts stay in `factors`.
     """
     metrics = dimension_results.get("procedure", {})
     success = metrics.get("success_rate")
     confidence = metrics.get("mean_confidence")
     invocations = metrics.get("invocation_count", 0)
     total_procs = metrics.get("total_procedures", 1)
+    # success_rate is computed over procedure_OUTCOME events, a different and
+    # independently-sized population from the invocation_count the gate below
+    # reads. Without this, a week with 20 invocations and 1 outcome cleared the
+    # sufficiency bar and graded on that single outcome — the same
+    # gate-vs-factor population mismatch that produced the 2026-09-06 ego F.
+    outcomes = metrics.get("outcome_count", 0)
 
     # Invocation activity: ratio of invocations to total procedures.
     # >1.0 per procedure per week = healthy, cap at 1.0 for scoring.
@@ -1269,30 +1380,38 @@ async def _grade_procedural(
 
     factors = {"success_rate": success, "mean_confidence": confidence,
                "invocation_count": invocations, "activity_ratio": round(activity, 4),
+               "outcome_count": outcomes,
                "total_procedures": total_procs}
 
     available = [(success, 0.5), (confidence, 0.25), (activity, 0.25)]
 
     if invocations < _MIN_SAMPLES["procedural"]:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": invocations,
+                "sample_count": outcomes,
                 "reason": f"insufficient data ({invocations} invocations, need {_MIN_SAMPLES['procedural']})"}
 
-    # Primary factor gate: success_rate is the most important signal.
-    # Without it, grading on confidence + activity alone is misleading.
+    # Primary factor gate: success_rate is the most important signal (50%).
+    # Without it — or without enough of it — grading on confidence + activity
+    # alone is misleading, so withhold rather than invent a letter.
     if success is None:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": invocations,
+                "sample_count": outcomes,
                 "reason": "primary metric (success_rate) not yet measurable"}
+    if outcomes < _MIN_SAMPLES["procedural"]:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": outcomes,
+                "reason": (f"insufficient data ({outcomes} outcomes, need "
+                           f"{_MIN_SAMPLES['procedural']}) — success_rate is "
+                           "50% of the score")}
 
-    score = _score_with_zero_fill(available, max_nulls=1)
+    score = _score_available_factors(available, max_absent=1)
     if score is None:
         return {"grade": None, "score": None, "factors": factors,
-                "sample_count": invocations,
+                "sample_count": outcomes,
                 "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
-            "factors": factors, "sample_count": invocations}
+            "factors": factors, "sample_count": outcomes}
 
 
 async def _grade_awareness(
@@ -1326,8 +1445,13 @@ async def _grade_awareness(
     expected_ticks = 2016  # 7 * 24 * 60 / 5
     tick_regularity = min(total_ticks / expected_ticks, 1.0) if total_ticks else 0.0
 
-    # Signal completeness: are all expected collectors producing output?
-    # Sample recent ticks and count distinct signal names.
+    # Signal completeness: are all expected steady-state collectors producing
+    # output? Every steady-state collector always emits its signal name each tick
+    # (value 0.0 when idle), so a MISSING name means the collector was dropped from
+    # the learning-phase swap. Score against the canonical expected set
+    # (STEADY_STATE_SIGNALS); a magic denominator masks a drop — a too-low count
+    # saturates at 1.0 (the prior `/ 18` never detected two dropped collectors).
+    # Names outside the expected set (bootstrap-only / renamed) don't inflate it.
     cursor = await db.execute(
         "SELECT signals_json FROM awareness_ticks "
         "WHERE created_at >= ? AND created_at < ? "
@@ -1345,9 +1469,12 @@ async def _grade_awareness(
                     signal_names.add(name)
         except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
             pass
-    # 18 expected signals (21 total minus 3 conditional: genesis/cc version, stale items)
-    expected_signals = 18
-    signal_completeness = min(len(signal_names) / expected_signals, 1.0) if expected_signals else 0.0
+    expected_count = len(STEADY_STATE_SIGNALS)
+    signal_completeness = (
+        len(signal_names & STEADY_STATE_SIGNALS) / expected_count
+        if expected_count
+        else 0.0
+    )
 
     # Informational: classification stats (not scored)
     cursor = await db.execute(
@@ -1374,7 +1501,7 @@ async def _grade_awareness(
                 "reason": f"insufficient data ({total_ticks} ticks, need {_MIN_SAMPLES['awareness']})"}
 
     available = [(tick_regularity, 0.6), (signal_completeness, 0.4)]
-    score = _score_with_zero_fill(available, max_nulls=0)
+    score = _score_available_factors(available, max_absent=0)
     if score is None:
         return {"grade": None, "score": None, "factors": factors,
                 "sample_count": total_ticks,
@@ -1436,7 +1563,7 @@ async def _grade_reflection(
                 "reason": f"insufficient data ({total_obs} observations, need {_MIN_SAMPLES['reflection']})"}
 
     available = [(volume_score, 0.25), (influence_rate, 0.5), (type_diversity, 0.25)]
-    score = _score_with_zero_fill(available, max_nulls=1)
+    score = _score_available_factors(available, max_absent=1)
     if score is None:
         return {"grade": None, "score": None, "factors": factors,
                 "sample_count": total_obs,

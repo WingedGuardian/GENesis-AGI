@@ -41,8 +41,8 @@ async def withdraw_recovered_proposals(
     drop exactly them). Best-effort: never raises into the caller.
 
     Legacy rows filed before this column was populated have an empty
-    ``action_category`` and are intentionally left for the 14-day auto-table —
-    never matched by free-text content here.
+    ``action_category`` and are intentionally left for the per-urgency
+    auto-table sweep — never matched by free-text content here.
 
     Returns the number of rows withdrawn.
     """

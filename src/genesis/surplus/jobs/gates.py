@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import surplus as surplus_crud
+from genesis.observability.failure_details import failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.jobs._guard import (
     job_guard,
@@ -38,6 +39,7 @@ async def brainstorm_check(sched: SchedulerContext) -> None:
     """Ensure today's brainstorm sessions are queued."""
     try:
         from genesis.runtime import GenesisRuntime
+
         if GenesisRuntime.instance().paused:
             logger.debug("Brainstorm check skipped (Genesis paused)")
             return
@@ -52,14 +54,18 @@ async def brainstorm_check(sched: SchedulerContext) -> None:
         record_failure("surplus_brainstorm", str(exc))
         if sched._event_bus:
             await sched._event_bus.emit(
-                Subsystem.SURPLUS, Severity.ERROR,
+                Subsystem.SURPLUS,
+                Severity.ERROR,
                 "brainstorm.failed",
                 "Brainstorm check failed with exception",
+                **failure_details(exc=exc),
             )
 
 
 async def recently_completed(
-    sched: SchedulerContext, task_type, cooldown_hours: int | float,
+    sched: SchedulerContext,
+    task_type,
+    cooldown_hours: int | float,
 ) -> bool:
     """Return ``True`` if *task_type* completed within *cooldown_hours*.
 
@@ -86,11 +92,10 @@ async def schedule_code_index(sched: SchedulerContext) -> None:
 
     active = await sched._queue.active_by_type(TaskType.CODE_INDEX)
     if active == 0 and not await sched._recently_completed(
-        TaskType.CODE_INDEX, sched._code_index_hours,
+        TaskType.CODE_INDEX,
+        sched._code_index_hours,
     ):
-        await sched._queue.enqueue(
-            TaskType.CODE_INDEX, ComputeTier.FREE_API, 0.6, "competence"
-        )
+        await sched._queue.enqueue(TaskType.CODE_INDEX, ComputeTier.FREE_API, 0.6, "competence")
 
 
 @job_guard("schedule_j9_eval_batch", "J9 eval batch scheduling failed")
@@ -100,11 +105,10 @@ async def schedule_j9_eval_batch(sched: SchedulerContext) -> None:
 
     active = await sched._queue.active_by_type(TaskType.J9_EVAL_BATCH)
     if active == 0 and not await sched._recently_completed(
-        TaskType.J9_EVAL_BATCH, sched._j9_eval_batch_hours,
+        TaskType.J9_EVAL_BATCH,
+        sched._j9_eval_batch_hours,
     ):
-        await sched._queue.enqueue(
-            TaskType.J9_EVAL_BATCH, ComputeTier.FREE_API, 0.3, "competence"
-        )
+        await sched._queue.enqueue(TaskType.J9_EVAL_BATCH, ComputeTier.FREE_API, 0.3, "competence")
 
 
 @job_guard("schedule_fresh_session_test", "Fresh session test scheduling failed")
@@ -128,13 +132,76 @@ async def schedule_model_eval(sched: SchedulerContext) -> None:
 
     active = await sched._queue.active_by_type(TaskType.MODEL_EVAL)
     if active == 0 and not await sched._recently_completed(
-        TaskType.MODEL_EVAL, sched._model_eval_hours,
+        TaskType.MODEL_EVAL,
+        sched._model_eval_hours,
     ):
         payload = json.dumps({"model_id": "groq-free"})
         await sched._queue.enqueue(
-            TaskType.MODEL_EVAL, ComputeTier.FREE_API, 0.4, "competence",
+            TaskType.MODEL_EVAL,
+            ComputeTier.FREE_API,
+            0.4,
+            "competence",
             payload=payload,
         )
+
+
+async def _promote_staged_ideas(db: aiosqlite.Connection) -> int:
+    """Graduate pending staged ideation into the follow_ups 'idea' review lane.
+
+    WS-M PR-2. Capped + FIFO + idempotent (a stable dedup_key spans all statuses
+    so a completed/dismissed idea is never recreated, and promote() flips the
+    staged row out of 'pending' so the next pass skips it). Crash-consistent: the
+    follow_up create and the surplus promote are separate commits, so a crash
+    between them leaves the staged row pending with its follow_up already present
+    — the next pass's exists_by_dedup_key precheck reconciles it. Gated by the
+    surplus_ideation_promotion settings lever; returns the count promoted.
+    """
+    import hashlib
+
+    import aiosqlite as _aiosqlite
+
+    # source_session stays NULL here, honestly: surplus ideation rows carry no
+    # generating-session column, this job runs under no session scope (the crud
+    # ContextVar default reads None), and a guessed id is worse than none.
+    from genesis.db.crud import follow_ups as fu_crud
+    from genesis.surplus.promotion_config import cap_per_run, is_enabled
+    from genesis.surplus.types import IDEA_TASK_TYPES
+
+    if not is_enabled():
+        return 0
+
+    task_types = [str(t) for t in IDEA_TASK_TYPES]
+    rows = await surplus_crud.list_promotable_ideas(db, task_types=task_types, limit=cap_per_run())
+    promoted = 0
+    for row in rows:
+        sid = row["id"]
+        dedup_key = hashlib.sha256(f"surplus_ideation|{sid}".encode()).hexdigest()
+        try:
+            if await fu_crud.exists_by_dedup_key(db, dedup_key):
+                # Follow-up already exists (a prior crash-interrupted pass, or a
+                # user-completed idea) — flip the staged row out of pending.
+                await surplus_crud.promote(db, sid, promoted_to="follow_up:dedup")
+                continue
+            reason = f"{row['source_task_type']} · {row['drive_alignment']}"
+            fid = await fu_crud.create(
+                db,
+                content=row["content"],
+                source="surplus_ideation",
+                strategy="surplus_task",
+                reason=reason,
+                kind="idea",
+                domain="internal",
+                dedup_key=dedup_key,
+            )
+            await surplus_crud.promote(db, sid, promoted_to=f"follow_up:{fid}")
+            promoted += 1
+        except _aiosqlite.IntegrityError:
+            # Lost a dedup race (unique dedup index) — the follow_up exists;
+            # reconcile by flipping the staged row out of pending.
+            await surplus_crud.promote(db, sid, promoted_to="follow_up:dedup")
+        except Exception:
+            logger.warning("Idea promotion failed for surplus insight %s", sid, exc_info=True)
+    return promoted
 
 
 async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
@@ -147,9 +214,26 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("GC: surplus insights purge failed", exc_info=True)
 
+    # Hard-delete long-discarded surplus insights (bound inert-row accumulation)
+    try:
+        deleted = await surplus_crud.purge_discarded(db, older_than_days=30)
+        if deleted:
+            logger.info("Deleted %d long-discarded surplus insights", deleted)
+    except Exception:
+        logger.warning("GC: surplus discarded purge failed", exc_info=True)
+
+    # Promote pending staged ideation into the follow_ups 'idea' review lane
+    try:
+        promoted = await _promote_staged_ideas(db)
+        if promoted:
+            logger.info("Promoted %d staged ideas to the 'idea' review lane", promoted)
+    except Exception:
+        logger.warning("GC: idea promotion failed", exc_info=True)
+
     # GC: remove completed/failed pending_embeddings older than 30 days
     try:
         from genesis.db.crud import pending_embeddings as pe_crud
+
         pe_purged = await pe_crud.purge_completed(db, older_than_days=30)
         if pe_purged:
             logger.info("Purged %d completed pending_embeddings", pe_purged)
@@ -164,14 +248,17 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     # this is the monitored tripwire that would justify one.)
     try:
         from genesis.db.crud import memory as mem_crud
+
         fts_ghosts, fts_invisible = await mem_crud.count_fts_metadata_drift(db)
         if fts_ghosts or fts_invisible:
             logger.warning(
                 "FTS/metadata drift: %d FTS-ghost rows (no metadata), "
                 "%d metadata rows invisible to FTS",
-                fts_ghosts, fts_invisible,
+                fts_ghosts,
+                fts_invisible,
             )
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             if rt.event_bus:
                 await rt.event_bus.emit(
@@ -183,23 +270,38 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("GC: FTS/metadata tripwire failed", exc_info=True)
 
-    # GC: rotate heartbeat events older than 7 days
+    # GC: rotate heartbeat events older than 7 days, but KEEP the most-recent
+    # pulse per subsystem — the pulse-staleness detector (compute_heartbeat_
+    # staleness) reads "the last pulse" to tell a scheduler dead > the window
+    # from one that never pulsed. Pruning the sole old pulse would revert a
+    # long-dead subsystem to a false ``no_heartbeat``/green (the exact lie the
+    # subsystem_stale alert + ego tile exist to kill). One retained row per
+    # subsystem is negligible volume.
     try:
         from genesis.db.crud import events as events_crud
+
         hb_cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
         hb_purged = await events_crud.prune(
-            db, older_than=hb_cutoff, event_type="heartbeat",
+            db,
+            older_than=hb_cutoff,
+            event_type="heartbeat",
+            keep_latest_per_subsystem=True,
         )
         if hb_purged:
-            logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
+            # Count spans both retention (>7d, below the per-subsystem anchor) and
+            # implausibly-future corrupt rows the keep-latest GC also removes.
+            logger.info("Pruned %d stale/corrupt heartbeat events", hb_purged)
     except Exception:
         logger.warning("GC: heartbeat event rotation failed", exc_info=True)
 
     # GC: prune weak memory links (strength <= 0.3, older than 30d)
     try:
         from genesis.db.crud import memory_links as links_crud
+
         links_pruned = await links_crud.prune_weak(
-            db, max_strength=0.3, min_age_days=30,
+            db,
+            max_strength=0.3,
+            min_age_days=30,
         )
         if links_pruned:
             logger.info("Pruned %d weak memory links", links_pruned)
@@ -209,13 +311,15 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     # GC: archive old transcript files (gzip .jsonl > 90 days)
     try:
         from genesis.surplus.maintenance import archive_old_transcripts
+
         transcripts_archived = await archive_old_transcripts(
             Path.home() / ".genesis" / "background-sessions",
             older_than_days=90,
         )
         if transcripts_archived:
             logger.info(
-                "Archived %d old transcript files", transcripts_archived,
+                "Archived %d old transcript files",
+                transcripts_archived,
             )
     except Exception:
         logger.warning("GC: transcript archival failed", exc_info=True)
@@ -236,14 +340,19 @@ async def schedule_maintenance(sched: SchedulerContext) -> None:
     for task_type, priority, drive in maintenance_tasks:
         active = await sched._queue.active_by_type(task_type)
         if active == 0 and not await sched._recently_completed(
-            task_type, sched._maintenance_hours,
+            task_type,
+            sched._maintenance_hours,
         ):
             await sched._queue.enqueue(
-                task_type, ComputeTier.FREE_API, priority, drive,
+                task_type,
+                ComputeTier.FREE_API,
+                priority,
+                drive,
             )
 
     # ── GC operations ──────────────────────────────────────────
     from genesis.runtime import GenesisRuntime
+
     rt = GenesisRuntime.instance()
     if rt.db is not None:
         await _run_maintenance_gc(rt.db)
@@ -266,10 +375,14 @@ async def schedule_analytical(sched: SchedulerContext) -> None:
     for task_type, priority, drive in analytical_tasks:
         active = await sched._queue.active_by_type(task_type)
         if active == 0 and not await sched._recently_completed(
-            task_type, sched._analytical_hours,
+            task_type,
+            sched._analytical_hours,
         ):
             await sched._queue.enqueue(
-                task_type, ComputeTier.FREE_API, priority, drive,
+                task_type,
+                ComputeTier.FREE_API,
+                priority,
+                drive,
             )
     # prompt_effectiveness runs as a 3-step pipeline.
     await sched.schedule_pipeline("prompt_effectiveness")
@@ -283,9 +396,7 @@ async def schedule_wing_audit(sched: SchedulerContext) -> None:
 
     active = await sched._queue.active_by_type(TaskType.WING_AUDIT)
     if active == 0:
-        await sched._queue.enqueue(
-            TaskType.WING_AUDIT, ComputeTier.FREE_API, 0.4, "competence"
-        )
+        await sched._queue.enqueue(TaskType.WING_AUDIT, ComputeTier.FREE_API, 0.4, "competence")
 
 
 @job_guard("schedule_cc_memory_staleness", "CC memory staleness scheduling failed")
@@ -324,7 +435,8 @@ async def schedule_pipeline(sched: SchedulerContext, pipeline_name: str) -> str 
     # Uses the last step because that's when the full pipeline finished.
     last_step = defn.steps[-1]
     if await sched._recently_completed(
-        last_step.task_type, sched._analytical_hours,
+        last_step.task_type,
+        sched._analytical_hours,
     ):
         return None
 

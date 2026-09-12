@@ -17,6 +17,28 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
+# --warn: NON-gating advisory sweep for the contributor-facing CI. It also
+# covers tests/ and ALWAYS exits 0 (fixtures may carry in-class placeholder
+# addresses — surfaced as warnings, never a hard block). Default (no flag)
+# keeps the fail-fast gate for local/maintainer use. This is the single source
+# of truth for the network-address class vocabulary shared with sanitize.py's
+# _PORTABILITY_PATTERNS and the commit-msg hook (a drift test asserts parity).
+WARN=0
+if [ "${1:-}" = "--warn" ]; then
+    WARN=1
+    shift
+fi
+
 REPO_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 patterns=(
@@ -36,6 +58,13 @@ targets=(
   "$REPO_DIR/scripts"
   "$REPO_DIR/env.example"
 )
+# Advisory mode also sweeps tests/ — the gitleaks/portability gates exclude it,
+# so an in-class fixture value ships unseen; surfacing it as a warning closes
+# that blind spot without gating (exact install values are hard-gated by the
+# CI secret scan instead).
+if [ "$WARN" -eq 1 ]; then
+    targets+=("$REPO_DIR/tests")
+fi
 
 # scripts/hooks/commit-msg is a scanner DEFINITION (its pattern string
 # contains address fragments as data) — same rationale as CI excluding
@@ -51,6 +80,10 @@ excludes=(
   --glob '!**/scripts/hooks/commit-msg'
   --glob '!**/scripts/cc_cli_output/**'
   --glob '!**/scripts/spike_*'
+  # netclass.py is a LAN/WAN classifier — it defines the RFC-grounded private
+  # address ranges (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) as data,
+  # not install-specific addresses. Same rationale as excluding sanitize.py.
+  --glob '!**/src/genesis/util/netclass.py'
 )
 
 # Scan only targets that exist: a missing path makes rg exit 2 even when
@@ -76,9 +109,14 @@ for pattern in "${patterns[@]}"; do
     rc=0
     rg -n --hidden "${excludes[@]}" "$pattern" "${existing[@]}" >"$SCAN_OUT" || rc=$?
     if [ "$rc" -eq 0 ]; then
-        echo "Portability check failed for pattern: $pattern"
-        cat "$SCAN_OUT"
-        status=1
+        if [ "$WARN" -eq 1 ]; then
+            # Advisory: emit the hits for the caller to annotate; never gate.
+            cat "$SCAN_OUT"
+        else
+            echo "Portability check failed for pattern: $pattern"
+            cat "$SCAN_OUT"
+            status=1
+        fi
     elif [ "$rc" -ge 2 ]; then
         # rg itself failed (bad glob, I/O error) — never report clean.
         echo "check_portability: rg error (exit $rc) for pattern: $pattern" >&2
@@ -86,4 +124,9 @@ for pattern in "${patterns[@]}"; do
     fi
 done
 
+# --warn is purely advisory — CI must never fail on it (grep/rg no-match and
+# fixture hits alike exit 0). The exact-value hard gate lives in the CI secret scan.
+if [ "$WARN" -eq 1 ]; then
+    exit 0
+fi
 exit "$status"

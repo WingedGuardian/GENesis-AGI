@@ -78,10 +78,10 @@ def emit(sha: str, subject: str) -> int:
                 """
                 INSERT INTO observations
                     (id, source, type, category, content, priority,
-                     created_at, content_hash, expires_at)
+                     created_at, content_hash, expires_at, origin_class)
                 VALUES
                     (?,  ?,      ?,    ?,        ?,       ?,
-                     ?,          ?,            ?)
+                     ?,          ?,            ?,          ?)
                 """,
                 (
                     obs_id,
@@ -93,6 +93,12 @@ def emit(sha: str, subject: str) -> int:
                     now,
                     chash,
                     expires_at,
+                    # WS-3: source="post_commit_hook" is a Genesis-authored
+                    # first-party source (memory.provenance._FIRST_PARTY_OBS_SOURCES);
+                    # content is commit metadata, never external text. Hardcoded
+                    # (stdlib-only hook — no genesis import); matches what
+                    # _origin_from_source(source) would derive at backfill.
+                    "first_party",
                 ),
             )
             conn.commit()

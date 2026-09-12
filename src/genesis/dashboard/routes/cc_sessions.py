@@ -16,6 +16,7 @@ waypoint spine (this is its first reader), and repo-pulse annotations.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -26,6 +27,8 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.observability.commit_identity import is_stale
+from genesis.observability.mcp_spawn_store import read_spawn_identity
 
 logger = logging.getLogger(__name__)
 
@@ -44,16 +47,22 @@ _RECENT_WINDOW_SQL = (
 )
 
 
-def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
-    """Seconds since an ISO timestamp, treating naive values as UTC."""
+def _parse_iso_utc(iso_ts: str | None) -> datetime | None:
+    """Parse an ISO timestamp to a tz-aware UTC datetime (naive → UTC), or None."""
     if not iso_ts:
         return None
     try:
         ts = datetime.fromisoformat(iso_ts)
     except (ValueError, TypeError):
         return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
+
+
+def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
+    """Seconds since an ISO timestamp, treating naive values as UTC."""
+    ts = _parse_iso_utc(iso_ts)
+    if ts is None:
+        return None
     return round((now - ts).total_seconds(), 1)
 
 
@@ -109,11 +118,37 @@ async def _charter_lookup(db, cc_ids: list[str]) -> tuple[dict[str, dict], bool]
     return charters, True
 
 
-async def _collect_detail(db, slots: list[dict], now: datetime | None = None) -> dict:
-    """Assemble the modal payload. `slots` is passed in so tests inject fakes
-    instead of scanning /proc."""
+async def _collect_detail(
+    db,
+    slots: list[dict],
+    now: datetime | None = None,
+    deploy: tuple[str, str] | None = None,
+) -> dict:
+    """Assemble the modal payload. `slots` and `deploy` are passed in so tests
+    inject fakes instead of scanning /proc or reading update_history.
+
+    `deploy` is `(completed_at, new_commit)` of the last successful deploy
+    (`update_history.last_successful_update`, or None). A live proc is flagged
+    `stale_code` iff its PERSISTED (spawn_commit, spawn_at) — read per slot,
+    pid-validated — is BEHIND that deploy: commit differs AND the deploy completed
+    after the proc started. This is the exact `commit_identity.is_stale` verdict
+    Part A's guard uses, so a session AHEAD of the last recorded deploy (main tree
+    advanced by a manual `git pull`) is NOT flagged. Fail-open: unknown identity or
+    no deploy → not stale. Default None → nothing stale (empty-state)."""
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
+
+    def _slot_stale(
+        slot: str | None, spid: int | None, proc_start: str | None = None
+    ) -> tuple[bool, str | None]:
+        """(stale, deploy_commit_to_restart_to) for a live slot proc."""
+        ident = read_spawn_identity(slot, spid, proc_start)
+        if not ident or not deploy:
+            return False, None
+        completed_at, new_commit = deploy
+        if is_stale(ident[0], ident[1], completed_at, new_commit):
+            return True, new_commit
+        return False, None
 
     cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     cursor = await db.execute(_RECENT_WINDOW_SQL, (cutoff,))
@@ -135,18 +170,25 @@ async def _collect_detail(db, slots: list[dict], now: datetime | None = None) ->
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
+        "stale_code": 0,
     }
     for row in rows:
         live = None
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
+            stale, dc = _slot_stale(s.get("slot"), s.get("pid"), s.get("started_at"))
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
                 "rss_mb": s.get("rss_mb"),
                 "slot_status": s.get("status"),
+                "started_at": s.get("started_at"),
+                "stale_code": stale,
+                "deploy_commit": dc,
             }
+            if stale:
+                stats["stale_code"] += 1
             consumed.add(pid)
 
         flags: list[str] = []
@@ -186,9 +228,19 @@ async def _collect_detail(db, slots: list[dict], now: datetime | None = None) ->
             }
         )
 
-    unmatched_slots = [
-        dict(s) for s in slots if s.get("pid") is not None and s["pid"] not in consumed
-    ]
+    # Unmatched live procs are still live procs — carry the same staleness so a
+    # slot with no matching DB row isn't a visibility blind spot.
+    unmatched_slots = []
+    for s in slots:
+        if s.get("pid") is None or s["pid"] in consumed:
+            continue
+        d = dict(s)
+        stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
+        d["stale_code"] = stale
+        d["deploy_commit"] = dc
+        if stale:
+            stats["stale_code"] += 1
+        unmatched_slots.append(d)
     stats["discrepant"] += len(unmatched_slots)
 
     return {
@@ -204,6 +256,7 @@ async def _collect_detail(db, slots: list[dict], now: datetime | None = None) ->
 async def cc_sessions_detail():
     """Per-session detail for the CC Sessions modal: DB rows × live procs ×
     charters, with discrepancy flags."""
+    from genesis.db.crud.update_history import last_successful_update
     from genesis.observability.cc_slots import enumerate_cc_slots
     from genesis.runtime import GenesisRuntime
 
@@ -211,8 +264,10 @@ async def cc_sessions_detail():
     if not rt.is_bootstrapped or rt.db is None:
         return jsonify({"error": "not bootstrapped"}), 503
 
-    slots = enumerate_cc_slots()
-    return jsonify(await _collect_detail(rt.db, slots))
+    # /proc scan is ~1s of sync syscalls — keep it off the event loop.
+    slots = await asyncio.to_thread(enumerate_cc_slots)
+    deploy = await last_successful_update(rt.db)  # (completed_at, new_commit) | None
+    return jsonify(await _collect_detail(rt.db, slots, deploy=deploy))
 
 
 # ── per-session cockpit detail (session-manager PR-4b) ──────────────────────
@@ -258,7 +313,19 @@ async def _pulse_lookup(db, cc_session_id: str) -> dict:
     try:
         from genesis.db.crud.repo_pulse import list_annotations, summary
 
-        annotations = await list_annotations(db, session_id=cc_session_id, limit=100)
+        # Ledger-only: this per-session panel keys on item_session_id, which is
+        # a ledger-shaped binding. follow_up-target proposals are session-agnostic
+        # (source_session is often NULL), so rendering them here would either hide
+        # the NULL ones or offer a ledger confirm command that cannot resolve a
+        # follow_up id. Their global surface is the `follow_up_list` MCP tool,
+        # which decorates each row with any pending proposal
+        # (mcp/health/follow_up_tools.py, _enrich_external_state). Until that
+        # existed the promise was unkept and the proposals rendered nowhere at
+        # all; a dashboard panel over the same data would be a fine addition, but
+        # it must not be THIS session-keyed one.
+        annotations = await list_annotations(
+            db, session_id=cc_session_id, target_kind="ledger", limit=100
+        )
         health = await summary(db)
     except Exception as exc:
         logger.debug("pulse tables unavailable (pre-0062 install?): %s", exc)
@@ -369,6 +436,7 @@ async def cc_sessions_pulse_resolve(annotation_id: str):
 
 async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int]:
     """Resolve core (extracted so tests exercise it on the fixture loop)."""
+    from genesis.db.crud.follow_ups import absorb_followup
     from genesis.db.crud.repo_pulse import get_annotation, resolve_annotation
     from genesis.db.crud.session_charters import get_ledger_item, ledger_update
 
@@ -377,12 +445,16 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         row = await get_annotation(db, annotation_id)
         if row is None or row["status"] != "proposed":
             return {"error": "unknown or already-resolved annotation"}, 404
-        # Resolve the annotation FIRST: its conditional proposed→terminal
-        # UPDATE is the race arbiter. Two concurrent resolutions can't both
-        # win it, so the ledger absorb below only ever runs for the winner —
-        # never an absorbed item under a rejected annotation. (The inverse
-        # residue — confirmed annotation, absorb missed — is visible and
-        # human-fixable via the injected hint.)
+        # Resolve the annotation FIRST — the conditional proposed→terminal UPDATE
+        # is the race arbiter: a concurrent confirm+reject can't both win it, so
+        # the absorb below only ever runs for the confirm winner, never under a
+        # rejected annotation. (Absorb-FIRST was tried and REVERTED: it reopened a
+        # WORSE residue — a follow_up completed under a human-REJECTED annotation,
+        # permanent + invisible since reconcile never revisits a terminal row.)
+        # The milder residue this order can leave — a confirmed annotation whose
+        # absorb missed because the row moved off-open — is accepted, consistent
+        # with the ledger path; the follow_up confirm surface is dormant anyway
+        # until the global proposal surface lands.
         ok = await resolve_annotation(
             db,
             annotation_id,
@@ -392,15 +464,21 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         )
         absorbed = False
         if ok and status == "confirmed":
-            item = await get_ledger_item(db, row["item_id"])
-            if item is not None and item.get("status") in ("open", "in_progress"):
-                absorbed = await ledger_update(
-                    db,
-                    row["item_id"],
-                    status="absorbed",
-                    evidence=f"PR #{row['pr_number']}: {row['pr_title'] or ''} "
-                    f"[pulse confirm via dashboard]",
-                )
+            # Dispatch by store: a follow_up-target annotation absorbs the
+            # follow_up (conditional open-only), NOT a ledger row that doesn't
+            # exist. Defensive default 'ledger' keeps pre-0084 rows correct.
+            target_kind = dict(row).get("target_kind") or "ledger"
+            evidence = (
+                f"PR #{row['pr_number']}: {row['pr_title'] or ''} [pulse confirm via dashboard]"
+            )
+            if target_kind == "follow_up":
+                absorbed = await absorb_followup(db, row["item_id"], evidence=evidence)
+            else:
+                item = await get_ledger_item(db, row["item_id"])
+                if item is not None and item.get("status") in ("open", "in_progress"):
+                    absorbed = await ledger_update(
+                        db, row["item_id"], status="absorbed", evidence=evidence
+                    )
     except (sqlite3.Error, aiosqlite.Error) as exc:
         logger.error("pulse resolve failed: %s", exc)
         return {"error": "pulse store unavailable"}, 503

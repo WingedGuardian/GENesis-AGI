@@ -26,6 +26,7 @@ class _ObservationWriter(Protocol):
         content: str,
         priority: str,
         category: str | None = None,
+        origin_class: str | None = None,
     ) -> str: ...
 
 
@@ -34,8 +35,15 @@ async def route_learning_signals(
     delta: RequestDeliveryDelta,
     outcome: OutcomeClass,
     observation_writer: _ObservationWriter,
+    *,
+    origin_class: str | None = None,
 ) -> dict[str, str]:
     """Route each attribution to its concrete write target.
+
+    ``origin_class`` (WS-3): the analyzed session's channel origin, forwarded to
+    every ``retrospective`` observation write. ``delta.evidence`` characterizes
+    the analyzed conversation, so an external session's evidence must not be
+    stamped first-party. See :func:`genesis.cc.types.observation_origin_for_channel`.
 
     Returns summary of actions taken.
     """
@@ -49,6 +57,7 @@ async def route_learning_signals(
                 type="external_limitation",
                 content=delta.evidence,
                 priority="medium",
+                origin_class=origin_class,
             )
             actions["external_limitation"] = "observation_written"
 
@@ -59,6 +68,7 @@ async def route_learning_signals(
                 type="user_model_gap",
                 content=delta.evidence,
                 priority="high",
+                origin_class=origin_class,
             )
             actions["user_model_gap"] = "observation_written"
 
@@ -82,6 +92,7 @@ async def route_learning_signals(
                     type="capability_improvement",
                     content=delta.evidence,
                     priority="medium",
+                    origin_class=origin_class,
                 )
                 actions["genesis_capability"] = "observation_written"
 
@@ -92,6 +103,7 @@ async def route_learning_signals(
                 type="interpretation_correction",
                 content=delta.evidence,
                 priority="medium",
+                origin_class=origin_class,
             )
             actions["genesis_interpretation"] = "observation_written"
 
@@ -102,6 +114,7 @@ async def route_learning_signals(
                 type="scope_clarification",
                 content=delta.evidence,
                 priority="low",
+                origin_class=origin_class,
             )
             actions["scope_underspecified"] = "observation_written"
 

@@ -24,15 +24,18 @@ Every verdict is deduped and recorded in ``entity_adjudications`` (order-indepen
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import json
 import logging
 import re
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from genesis.db.connection import _is_lock_error, get_raw_db
 from genesis.db.crud import deferred_work as dw_crud
 from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import entity_adjudications as adj_crud
@@ -54,26 +57,47 @@ CALL_SITE_CHALLENGE = "entity_adjudication_challenge"
 _MAX_ATTEMPTS = 5
 # Fuzzy-comparison groups mirror entity_registry.resolve_entity: concept-cluster
 # types are compared cross-type within the cluster; person/org each same-type.
+# Keep in lockstep with entity_registry._CONCEPT_CLUSTER (host/install/project are
+# deliberately excluded — see the note there; their identity is handled evidence-
+# based in MW-3 PR-3/PR-4, not by name-fold).
 _CONCEPT_CLUSTER = frozenset({"product", "device", "concept", "subsystem", "repo"})
 _FUZZY_THRESHOLD = 0.85
 _SNIPPET_CHARS = 300
 _MENTIONS_PER_ENTITY = 3
 
 _ADJUDICATION_PROMPT = """\
-You are deduplicating a knowledge graph's ENTITY NODES. These two entities already
-passed a text-similarity filter, so their names ARE close. Your job is to decide
-WHY they are close:
+You are deduplicating a knowledge graph's ENTITY NODES. These two entities passed a
+name-similarity filter (their names share tokens, or one name's words are contained
+in the other's). Decide WHETHER THE TWO NAMES DENOTE THE SAME REAL-WORLD THING.
+Use the "Mentioned in" snippets as evidence — the names alone are often ambiguous.
 
-- MERGE if the difference is purely COSMETIC — the same words/terms written
-  differently: spacing, hyphenation, underscores, casing, punctuation, delimiters,
-  or word order. These are one real-world thing recorded two ways.
-  Examples to merge: "neural monitor" / "neural-monitor" / "neural_monitor";
-  "dispatch: cli" / "dispatch=cli"; "dream cycle" / "dream-cycle" / "dream cycles".
-- DISTINCT if there is a SEMANTIC difference — a different word, a version/number/
-  letter suffix, or a specific sub-item vs its parent.
-  Examples to keep distinct: "system" vs "systemd" (different program);
-  "safety gate" vs "safety gap" (different word: gate ≠ gap); "PR-1" vs "PR-1a"
-  (different identifiers); a project vs a numbered issue under it.
+MERGE when the two names are the SAME thing recorded two ways:
+- COSMETIC/formatting variants — same terms, different spacing, hyphenation,
+  underscores, casing, punctuation, delimiters, or word order.
+  ("neural monitor" / "neural-monitor" / "neural_monitor"; "dispatch: cli" / "dispatch=cli")
+- QUALIFIER variants that just RESTATE what the thing is — a bare identifier and the
+  same identifier plus a descriptive word for its KIND, or a short form and its
+  fully-qualified / address form WHEN THE SNIPPETS SHOW both denote the same
+  host/endpoint. ("prod cache" / "prod cache host"; a machine's shorthand and its
+  full dotted address, evidenced as the same box)
+
+DISTINCT when the names denote DIFFERENT things, even if closely related:
+- A compound naming a distinct ACTIVITY, EVENT, TASK, ROLE, or ARTIFACT about the
+  base thing — not the thing itself. ("prod cache" the store vs "prod cache migration"
+  the task; "gateway" vs "gateway timeout" the error; a machine vs "<machine> handoff"
+  the event vs "<machine> steward" the role).
+- A specific sub-item vs its parent, a numbered/lettered series ("PR-1" vs "PR-1a"),
+  or a genuinely different word — a SEMANTIC difference ("system" vs "systemd";
+  "safety gate" vs "safety gap").
+- VERSION-like dotted numbers. One dotted number being a suffix of another
+  ("3.12" vs "1.3.12") is NOT evidence of sameness — version strings, release
+  numbers, and section numbers are DISTINCT unless the snippets show both name
+  the very same artifact. Only address-like usage (a host/endpoint) merges on
+  the short-form/full-form pattern, and only with snippet evidence.
+
+The test: does name B refer to the SAME real-world thing as A, just described with an
+extra word — or does B name a distinct thing (an event/task/role/artifact/part) that
+is merely ABOUT or RELATED TO A? Same thing → merge; related-but-different → distinct.
 
 Entity A:
 {profile_a}
@@ -84,13 +108,14 @@ Entity B:
 Respond with JSON only, no other text:
 {{"verdict": "merge|distinct", "reasoning": "one sentence"}}
 
-If a genuine semantic difference is plausible, choose "distinct" — a wrong merge
-erases a real distinction. But do NOT call a pure formatting difference "distinct"."""
+When in genuine doubt, choose "distinct" — a wrong merge erases a real distinction
+that a wrong split does not."""
 
 _CHALLENGE_PROMPT = """\
-A reviewer judged these two entity nodes to be the SAME real-world thing and wants
+A reviewer judged these two entity nodes to name the SAME real-world thing and wants
 to merge them (one is absorbed into the other, irreversibly). CHALLENGE that — but
-only on SEMANTIC grounds.
+only if the names genuinely denote DIFFERENT things. Use the "Mentioned in" snippets
+as evidence.
 
 Entity A:
 {profile_a}
@@ -98,18 +123,26 @@ Entity A:
 Entity B:
 {profile_b}
 
-The names are already known to be textually similar. A merge is WRONG only if
-there is a genuine MEANING difference — a different word, a distinguishing
-version/number/letter, or a specific sub-item vs its parent (e.g. "system" vs
-"systemd", "safety gate" vs "safety gap", "PR-1" vs "PR-1a"). A mere formatting
-difference (spacing, hyphenation, casing, punctuation, delimiter, word order of the
-SAME terms) is NOT a reason to keep them apart — that is the same thing written two
-ways.
+A merge is WRONG only when B names a DISTINCT thing rather than the same thing:
+- a distinct activity/event/task/role/artifact ABOUT the base ("<name>" vs
+  "<name> migration" / "<name> handoff" / "<name> steward"),
+- a specific sub-item vs its parent, or a numbered/lettered series ("PR-1" vs "PR-1a"),
+- a genuinely different word — a SEMANTIC difference ("system" vs "systemd"),
+- VERSION-like dotted numbers whose only relation is a suffix match ("3.12" vs
+  "1.3.12") — versions/releases/sections are distinct things unless the snippets
+  show both name the very same artifact.
+
+A merge is RIGHT — do NOT challenge — when B is the SAME thing written differently: a
+COSMETIC/formatting variant (spacing, hyphenation, casing, delimiters, word order of
+the SAME terms), or a QUALIFIER variant that just restates what the thing is (a bare
+identifier and the same identifier + a descriptive word for its kind, or a short
+address form and its fully-qualified form when the snippets evidence the same
+host/endpoint).
 
 Respond with JSON only, no other text:
 {{"verdict": "merge|distinct", "reasoning": "one sentence"}}
 
-Say "distinct" ONLY if you can name a real semantic difference; otherwise "merge"."""
+Say "distinct" ONLY if you can name a real thing-vs-thing difference; otherwise "merge"."""
 
 
 # ── digit-guard ──────────────────────────────────────────────────────────────
@@ -319,6 +352,9 @@ async def run_adjudication_drain(
     during the shadow period (with a staleness guard). Phase 1 then judges pending
     queue rows. Emits one aggregate observation if anything changed.
     """
+    # A negative budget is a SQLite LIMIT of -1 = UNLIMITED; clamp to 0 so an
+    # invalid budget bounds work to nothing rather than draining everything.
+    budget = max(int(budget), 0)
     counts = {
         "judged": 0,
         "distinct": 0,
@@ -470,6 +506,10 @@ async def _process_row(
         # changed the mention counts survivor selection is based on, so choosing
         # from the pre-race snapshot could tombstone the now-better-attested node.
         survivor_id, loser_id = await _pick_survivor(db, fresh_a, fresh_b)
+        # NEW-pair live path: a freshly-adjudicated pair auto-merges in `live` mode
+        # WITHOUT the human-approval gate (that gate is Phase 0 / the backlog only).
+        # This is deliberate — but it means flipping mode→'live' is NOT globally safe
+        # for NEW pairs; that is a separate Phase-B decision. Prod stays propose_only.
         await entities_crud.merge_entity(db, loser_id=loser_id, survivor_id=survivor_id)
         await adj_crud.record_verdict(
             db,
@@ -495,6 +535,134 @@ async def _process_row(
     await dw_crud.update_status(db, item_id, status="completed", completed_at=_now())
 
 
+# Per-row apply retries a transient SQLite write-lock (SQLITE_BUSY): an OWNED
+# get_raw_db() connection has no built-in lock retry (unlike SerializedConnection), and a
+# rolled-back transaction wrote nothing so re-running a whole row is idempotent.
+_APPLY_MAX_ATTEMPTS = 3
+_APPLY_RETRY_BACKOFF_S = 0.2
+
+
+async def _apply_one_proposal(
+    p: dict[str, Any],
+    counts: dict[str, int],
+    example_merges: list[str],
+) -> None:
+    """Apply ONE approved proposal under its OWN dedicated connection + transaction.
+
+    Uses an OWNED ``get_raw_db()`` connection (NOT the shared ``SerializedConnection``)
+    so a ``BEGIN IMMEDIATE`` … ``COMMIT`` envelope gives real single-writer isolation
+    across the identity re-read + claim + destructive merge. On the shared connection the
+    lock is released after every call (``connection.py:106-121``), so a foreign
+    ``commit()`` between the claim and the merge could durably commit a partial merge, and
+    nested savepoints can cross-release (Codex #6/#8). This is deliberately NOT the
+    migration runner's shared-conn ``BEGIN IMMEDIATE``: that stays atomic only because
+    migrations run as the SOLE DB user (``runtime/init/db.py:30-34``); entity apply runs
+    concurrently with the whole live system, so it needs its own connection.
+
+    Identity/staleness is re-checked INSIDE the transaction, after the write lock is held,
+    closing the check-then-apply TOCTOU (#8); ``claim_approved_for_apply`` is the atomic
+    winner-take-all (#5); and ``except BaseException`` rolls the OWNED txn back on
+    ``CancelledError`` too (#7) without ever touching another coroutine's writes.
+    """
+    # Resolve the DB path LAZILY (function-scope import) so tests' conftest redirect of
+    # env.genesis_db_path() applies — a module-frozen DEFAULT_DB_PATH would open the real
+    # install DB (or a stray worktree DB). Canonical pattern: mcp/health/web_tools.py:700.
+    from genesis.env import genesis_db_path
+
+    pair_key = p["pair_key"]
+    survivor_id = p.get("survivor_id")
+    loser_id = p.get("loser_id")
+
+    for attempt in range(_APPLY_MAX_ATTEMPTS):
+        try:
+            async with get_raw_db(genesis_db_path()) as own:
+                try:
+                    await own.execute("BEGIN IMMEDIATE")
+
+                    # Re-read identities INSIDE the write-locked transaction so no other
+                    # writer can drift them before our claim+merge commit (#8). A `stale`
+                    # verdict is not a dead end: the reconcile sweep re-enqueues it (it is
+                    # excluded from settled_pair_keys) to be re-adjudicated with current
+                    # identities; mark_stale also VOIDS the human approval, since the
+                    # thing they approved changed and must be re-reviewed before it applies.
+                    ent_a = await _resolve_active(own, p["entity_a"])
+                    ent_b = await _resolve_active(own, p["entity_b"])
+                    is_stale = (
+                        ent_a is None
+                        or ent_b is None
+                        or ent_a["entity_id"] == ent_b["entity_id"]
+                        # norm_name drift → the thing we judged is not the thing we'd
+                        # merge now.
+                        or ent_a["norm_name"] != p.get("norm_a")
+                        or ent_b["norm_name"] != p.get("norm_b")
+                        # Honor the STORED, human-approved direction. Do NOT recompute the
+                        # survivor from CURRENT mention counts: counts can shift between
+                        # approval and apply, and recomputing could tombstone the very
+                        # entity the human chose to KEEP. Require the approved pair to still
+                        # be exactly the live resolved pair; any drift → stale (re-review),
+                        # never a silent re-pick.
+                        or not survivor_id
+                        or not loser_id
+                        or {survivor_id, loser_id} != {ent_a["entity_id"], ent_b["entity_id"]}
+                    )
+                    if is_stale:
+                        # Conditional stale write (WHERE verdict='proposed_merge'):
+                        # if a concurrent applier already flipped this row to `merge`,
+                        # or a human rejected it to `distinct`, between our batch read
+                        # and this write-locked re-read, mark_stale is a no-op and we
+                        # must NOT clobber that terminal state back to stale. It
+                        # returns False then — count the row as skipped, not stale.
+                        marked = await adj_crud.mark_stale(own, pair_key=pair_key, _commit=False)
+                        await own.commit()
+                        if marked:
+                            counts["stale"] += 1
+                        else:
+                            counts["skipped"] = counts.get("skipped", 0) + 1
+                        return
+
+                    # Atomic claim: flip proposed_merge→merge ONLY while it is still
+                    # proposed_merge AND approved. Of two concurrent appliers — or an apply
+                    # racing a reject landing after our batch read — exactly one wins
+                    # (rowcount 1); the loser skips instead of double-merging (#5).
+                    claimed = await adj_crud.claim_approved_for_apply(
+                        own,
+                        pair_key=pair_key,
+                        loser_id=loser_id,
+                        survivor_id=survivor_id,
+                        _commit=False,
+                    )
+                    if not claimed:
+                        await own.commit()  # nothing written; release the write lock
+                        counts["skipped"] = counts.get("skipped", 0) + 1
+                        return
+
+                    await entities_crud.merge_entity(
+                        own, loser_id=loser_id, survivor_id=survivor_id, _commit=False
+                    )
+                    await own.commit()
+                    counts["merged"] += 1
+                    _note_merge(example_merges, ent_a, ent_b)
+                    return
+                except BaseException:
+                    # Roll the OWNED transaction back on ANY exit — including
+                    # CancelledError (Python 3.12 makes it a BaseException that bypasses
+                    # `except Exception`), so a cancelled apply leaves no claim or partial
+                    # destructive merge (#7). Owned connection → this can never discard
+                    # another coroutine's uncommitted writes.
+                    with contextlib.suppress(Exception):
+                        await own.rollback()
+                    raise
+        except sqlite3.OperationalError as exc:
+            # BEGIN IMMEDIATE / COMMIT on the owned connection can hit SQLITE_BUSY under
+            # write contention (get_raw_db lacks the shared conn's built-in lock retry).
+            # The rolled-back txn wrote nothing, so retrying the whole row is idempotent;
+            # give the lock a bounded, backing-off chance to clear before giving up.
+            if _is_lock_error(exc) and attempt < _APPLY_MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_APPLY_RETRY_BACKOFF_S * (2**attempt))
+                continue
+            raise
+
+
 async def _apply_proposed_backlog(
     db: aiosqlite.Connection,
     counts: dict[str, int],
@@ -504,32 +672,50 @@ async def _apply_proposed_backlog(
 ) -> None:
     """Live-mode Phase 0: apply proposed_merge verdicts stored during shadow.
 
-    Staleness guard: an identity that drifted since the proposal (one side
-    merged/renamed/gone) is marked ``stale`` and NOT applied.
+    Human-approval gate: ONLY rows a human approved (``approved_at IS NOT NULL``) are
+    applied — so flipping the drainer to ``live`` can never bulk-auto-apply the un-reviewed
+    shadow backlog. Each row is applied on its OWN connection under a single
+    ``BEGIN IMMEDIATE`` transaction (:func:`_apply_one_proposal`); the shared ``db`` here
+    is used only for the initial batch READ.
     """
-    proposals = await adj_crud.list_proposed_merges(db, limit=budget)
+    proposals = await adj_crud.list_proposed_merges(db, limit=budget, approved_only=True)
     for p in proposals:
-        # A `stale` verdict is not a dead end: the reconcile sweep's dedup set
-        # (settled_pair_keys) excludes stale, so a stale pair is re-enqueued on
-        # the next sweep pass and re-adjudicated with its current identities.
-        ent_a = await _resolve_active(db, p["entity_a"])
-        ent_b = await _resolve_active(db, p["entity_b"])
-        if ent_a is None or ent_b is None or ent_a["entity_id"] == ent_b["entity_id"]:
-            await adj_crud.mark_stale(db, pair_key=p["pair_key"])
-            counts["stale"] += 1
+        try:
+            await _apply_one_proposal(p, counts, example_merges)
+        except Exception:
+            # Per-row isolation: the row's OWN transaction already rolled back, so nothing
+            # partial persists. CancelledError is deliberately NOT caught here — it
+            # propagates (the row's txn was already rolled back in _apply_one_proposal).
+            logger.exception("entity apply row failed: %s", p.get("pair_key"))
+            counts["errors"] = counts.get("errors", 0) + 1
             continue
-        # norm_name drift → the thing we judged is not the thing we'd merge now.
-        if ent_a["norm_name"] != p.get("norm_a") or ent_b["norm_name"] != p.get("norm_b"):
-            await adj_crud.mark_stale(db, pair_key=p["pair_key"])
-            counts["stale"] += 1
-            continue
-        survivor_id, loser_id = await _pick_survivor(db, ent_a, ent_b)
-        await entities_crud.merge_entity(db, loser_id=loser_id, survivor_id=survivor_id)
-        await adj_crud.mark_applied(
-            db, pair_key=p["pair_key"], loser_id=loser_id, survivor_id=survivor_id
-        )
-        counts["merged"] += 1
-        _note_merge(example_merges, ent_a, ent_b)
+
+
+async def apply_approved_merges(db: aiosqlite.Connection, *, budget: int = 50) -> dict[str, int]:
+    """Apply human-APPROVED proposed_merge rows — mode-independent.
+
+    Entry point for the review surface (the ``entity_adjudication_apply`` MCP tool):
+    once a human approves rows, this applies them WITHOUT requiring the drainer be
+    flipped to ``live`` (which would also grant new-pair auto-merge authority). Reuses
+    the SAME gated, staleness-guarded apply loop as the live-mode Phase 0
+    (``_apply_proposed_backlog``, which lists only approved rows). Returns a counts
+    summary: {'merged': N, 'stale': M}.
+
+    Human-only: refuses a dispatched/unsupervised session at this service entry (below
+    the MCP wrapper) so a direct import can't apply an irreversible merge without a
+    human. The live-mode drainer bypasses this (it calls ``_apply_proposed_backlog``
+    directly and runs in-server, not dispatched); its gate is the ``live`` mode setting.
+    """
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("entity_adjudication_apply")
+    # Clamp a negative budget to 0 (a negative SQLite LIMIT is UNLIMITED — the
+    # apply(budget=-1) unbounded-apply bug). Defense-in-depth with the crud clamp.
+    budget = max(int(budget), 0)
+    counts = {"merged": 0, "stale": 0}
+    example_merges: list[str] = []
+    await _apply_proposed_backlog(db, counts, example_merges, budget=budget)
+    return counts
 
 
 async def _exhaust(db: aiosqlite.Connection, item: dict, counts: dict[str, int]) -> None:
@@ -618,6 +804,60 @@ def _fuzzy_group(entity_type: str) -> str:
     return entity_type  # person / org compare same-type; others never fuzzy-match
 
 
+# ── containment blocking (MW-3) ──────────────────────────────────────────────
+# difflib >= 0.85 is blind to the dominant fragmentation class: a bare
+# identifier vs the same identifier + a qualifier word ("foo" vs "foo server"),
+# and a short form vs its fully-qualified/dotted form. Token-set CONTAINMENT +
+# a dotted-numeric suffix rule recover those, blocked by a rare-token index so
+# common words don't nominate thousands of junk pairs (measured on live data:
+# ~2.5k nominations, full alias-pair coverage). The adjudicator (with mention
+# snippets + two-model agreement) decides whether a nominee actually merges.
+_DF_CAP = 10  # a WORD token shared by > this many entities is too common to block on
+_DOTTED_RE = re.compile(r"\d+(?:\.\d+)+")  # address-like token, e.g. "10.20.30"
+
+
+def _tokens(norm: str) -> frozenset[str]:
+    """Token set for containment. Dotted-numeric runs (e.g. addresses) are kept
+    whole; everything else splits on underscore/punctuation into word tokens.
+    ``[^\\W_]`` is Unicode word-char minus underscore, so non-Latin identifiers
+    ("東京", "café") tokenize correctly instead of vanishing under an ASCII-only
+    class — while underscore/punct still split (``dream_cycle`` → dream, cycle).
+    norm_names are already lowercased."""
+    return frozenset(re.findall(r"\d+(?:\.\d+)+|[^\W_]+", norm))
+
+
+def _dotted_tokens(norm: str) -> list[str]:
+    """Dotted-numeric tokens only (an address short form vs its qualified form)."""
+    return _DOTTED_RE.findall(norm)
+
+
+def _rare_token_index(
+    candidates: list[tuple[str, str, str]],
+) -> dict[str, set[str]]:
+    """token -> {entity_id} for tokens that can anchor a containment pair
+    (document-frequency >= 2, length >= 3, not a pure-digit run).
+
+    WORD tokens are additionally capped at _DF_CAP so a common word like
+    "service" doesn't block every "* service" pair together. DOTTED-NUMERIC
+    tokens (addresses) are EXEMPT from that cap: they are inherently specific
+    identifiers, so a heavily-fragmented entity whose core address token appears
+    in many shards (document-frequency > _DF_CAP) must still connect its shards —
+    exactly the fragmentation this generator exists to heal. (Measured: zero
+    dotted tokens currently exceed the cap; acronym tokens like "e2e"/"ws2" DO,
+    and stay capped because they are word-class noise, not identifiers.)"""
+    idx: dict[str, set[str]] = {}
+    for cand_norm, cand_id, _ct in candidates:
+        for tok in _tokens(cand_norm):
+            if len(tok) < 3 or tok.isdigit():
+                continue
+            idx.setdefault(tok, set()).add(cand_id)
+    return {
+        t: ids
+        for t, ids in idx.items()
+        if len(ids) >= 2 and (_DOTTED_RE.fullmatch(t) or len(ids) <= _DF_CAP)
+    }
+
+
 def _compute_sweep_pairs(
     slice_entities: list[tuple[str, str, str]],
     group_candidates: dict[str, list[tuple[str, str, str]]],
@@ -626,32 +866,82 @@ def _compute_sweep_pairs(
 ) -> list[tuple[str, str]]:
     """Pure-CPU pair discovery (runs off the event loop via ``to_thread``).
 
-    For each entity in the slice, find the fuzzy neighbours (difflib ≥ threshold,
-    same comparison group) that are not digit-only differences and not already
-    recorded/pending. Returns up to ``cap`` ``(entity_id, similar_entity_id)`` pairs.
+    For each entity in the slice, nominate same-group neighbours from three
+    blocking sources, unioned: (1) difflib >= threshold (cosmetic variants),
+    (2) token-set CONTAINMENT via a shared rare token (qualifier variants),
+    (3) a dotted-numeric suffix match (short form vs fully-qualified form).
+    Pairs that are digit-only differences or already recorded/pending are
+    dropped. Returns up to ``cap`` ``(entity_id, similar_entity_id)`` pairs.
+    Emission is sorted per slice-entity for determinism.
     """
+    # Per-group blocking structures (built once per call; cheap — entity counts
+    # are small enough to scan, mirroring list_norm_names).
+    rare_idx: dict[str, dict[str, set[str]]] = {}
+    dotted_by_group: dict[str, list[tuple[str, str]]] = {}
+    id_tokens: dict[str, frozenset[str]] = {}
+    id_norm: dict[str, str] = {}
+    for group, cands in group_candidates.items():
+        rare_idx[group] = _rare_token_index(cands)
+        dotted_by_group[group] = [
+            (dt, cid) for cnorm, cid, _ct in cands for dt in _dotted_tokens(cnorm)
+        ]
+        for cnorm, cid, _ct in cands:
+            id_tokens[cid] = _tokens(cnorm)
+            id_norm[cid] = cnorm
+
     out: list[tuple[str, str]] = []
     for norm, eid, etype in slice_entities:
         group = _fuzzy_group(etype)
         candidates = group_candidates.get(group, ())
+        my_tokens = _tokens(norm)
+        my_dotted = _dotted_tokens(norm)
+        matched: set[str] = set()
+
+        # (1) difflib — cosmetic near-matches (existing MATCH SET preserved; the
+        # emission order is now sorted-by-id below, not DB order — idempotent
+        # since seen+pending feed `seen_pair_keys` so every pair enqueues).
         for cand_norm, cand_id, _ct in candidates:
-            # Skip only the SAME entity. Do NOT skip on ``cand_norm == norm``: two
-            # DIFFERENT entities can share a norm_name across types (UNIQUE is on
-            # norm_name+entity_type). Live resolve_entity reuses those cross-type,
-            # but historical/legacy duplicates are only recoverable HERE — an
-            # exact-norm cross-type pair is a legitimate merge candidate.
             if cand_id == eid:
                 continue
+            if difflib.SequenceMatcher(None, norm, cand_norm).ratio() >= _FUZZY_THRESHOLD:
+                matched.add(cand_id)
+
+        # (2) containment — a candidate sharing a rare token whose token set is a
+        # subset of ours or vice versa (one name is the other + a qualifier).
+        ridx = rare_idx.get(group, {})
+        for tok in my_tokens:
+            for cand_id in ridx.get(tok, ()):
+                if cand_id == eid:
+                    continue
+                ct = id_tokens.get(cand_id, frozenset())
+                if my_tokens <= ct or ct <= my_tokens:
+                    matched.add(cand_id)
+
+        # (3) dotted-numeric suffix — "113.7" vs "203.0.113.7" (short form vs full
+        # address; no shared whole-token, so containment above cannot catch it).
+        if my_dotted:
+            for dt, cand_id in dotted_by_group.get(group, ()):
+                if cand_id == eid:
+                    continue
+                for mine in my_dotted:
+                    if dt != mine and (dt.endswith("." + mine) or mine.endswith("." + dt)):
+                        matched.add(cand_id)
+                        break
+
+        # Shared filters + deterministic emission. Skip only the SAME entity; two
+        # DIFFERENT entities can share a norm_name across types (UNIQUE is on
+        # norm_name+entity_type) and those cross-type duplicates are a legitimate
+        # merge candidate recoverable only here.
+        for cand_id in sorted(matched):
             key = f"{min(eid, cand_id)}|{max(eid, cand_id)}"
             if key in seen_pair_keys:
                 continue
-            if digit_only_difference(norm, cand_norm):
+            if digit_only_difference(norm, id_norm.get(cand_id, "")):
                 continue
-            if difflib.SequenceMatcher(None, norm, cand_norm).ratio() >= _FUZZY_THRESHOLD:
-                seen_pair_keys.add(key)  # dedupe within this run too
-                out.append((eid, cand_id))
-                if len(out) >= cap:
-                    return out
+            seen_pair_keys.add(key)  # dedupe within this run too
+            out.append((eid, cand_id))
+            if len(out) >= cap:
+                return out
     return out
 
 
@@ -738,7 +1028,11 @@ async def run_reconcile_sweep(
 
     The producer only enqueues newly-created near-duplicates; this recovers the
     historical backlog and heals any install. Slice bounds per-run CPU; the caller
-    advances/persists ``cursor_offset``. Difflib runs off-thread.
+    advances/persists ``cursor_offset``. Pair discovery runs off-thread and unions
+    three blocking sources (difflib cosmetic-match + token-set containment + a
+    dotted-numeric suffix rule — see ``_compute_sweep_pairs``), so qualifier
+    variants and short-vs-fully-qualified forms that difflib cannot reach are
+    recovered too.
 
     Returns ``{"enqueued": int, "next_offset": int, "completed": bool,
     "total": int}``.
@@ -770,6 +1064,16 @@ async def run_reconcile_sweep(
         await entities_crud.enqueue_adjudication(db, entity_id=eid, similar_entity_id=cand_id)
         enqueued += 1
 
+    # A slice can hold more matches than enqueue_cap; the overflow surfaces on
+    # the NEXT full weekly pass (already-settled/pending pairs are excluded, so
+    # coverage is monotonic). That latency is a KNOWN, ACCEPTED tradeoff — the
+    # convergence redesign belongs to MW-3 PR-2b (immediate stale re-enqueue),
+    # NOT to cursor tricks here: a park-on-cap variant was tried and REVERTED
+    # (2026-08-12) because pairs whose drain attempts exhaust (`discarded` rows
+    # are in neither settled_pair_keys nor _pending_pair_keys) would be
+    # re-nominated forever at a parked offset, wedging the sweep. Any future
+    # change to this return MUST enumerate every deferred_work_queue status
+    # (pending, processing, completed, discarded, expired) first.
     next_offset = cursor_offset + slice_size
     completed = next_offset >= total
     return {

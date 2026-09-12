@@ -401,9 +401,11 @@ class TestHealthBootstrapLifespan:
                     # DB should be connected and PRAGMAs set
                     mock_connect.assert_awaited_once_with(str(fake_db))
                     mock_conn.execute.assert_any_await("PRAGMA journal_mode=WAL")
-                    from genesis.db.connection import BUSY_TIMEOUT_MS
+                    from genesis.env import db_busy_timeout_ms
 
-                    mock_conn.execute.assert_any_await(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                    mock_conn.execute.assert_any_await(
+                        f"PRAGMA busy_timeout={db_busy_timeout_ms()}"
+                    )
 
                 # DB should be closed after exit
                 mock_conn.close.assert_awaited_once()
@@ -465,6 +467,17 @@ class TestStandaloneServiceDetection:
 
 class TestHeartbeatQueriesWithDB:
     """Test that heartbeat queries work when DB is connected."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_bootstrap_manifest(self):
+        """Hermetic: compute_heartbeat_staleness reads ~/.genesis/bootstrap_manifest.json
+        for the never_started verdict (#10). This box HAS that file; CI does not. Patch
+        it to None so a no-pulse subsystem reads the fresh-install empty state
+        (no_heartbeat), the behavior these DB-pulse tests assert — never the real file."""
+        from unittest.mock import patch
+
+        with patch("genesis.mcp.health.manifest._read_persisted_manifest", return_value=None):
+            yield
 
     async def test_heartbeats_find_events_in_db(self, db) -> None:
         """With a real DB containing heartbeat events, subsystem_heartbeats

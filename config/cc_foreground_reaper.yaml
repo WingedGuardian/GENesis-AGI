@@ -1,0 +1,23 @@
+# Foreground-session liveness reaper (D3).
+# See src/genesis/cc/foreground_reaper_config.py for the full contract.
+#
+# A foreground cc_sessions row stays 'active' by design so the next turn can
+# --resume it, so a crash/OOM/restart mid-turn leaves it 'active' forever. This
+# reaper relabels such dark rows to 'checkpointed' (non-destructive, still
+# resumable), records a dark-session observation, and — on the crisp
+# "unanswered user turn" signal — notifies the origin user that their request
+# was interrupted.
+
+enabled: true
+
+# off | observe | notify
+#   off     — do nothing (dark rows stay 'active', pre-D3 status quo)
+#   observe — reap + observe, but never notify the user
+#   notify  — observe + notify on the crisp unanswered-user signal
+mode: notify
+
+# A foreground row idle at least this long with no live turn is treated as dark.
+idle_hours: 24
+
+# Loud-truncation cap on dark rows processed per reaper pass.
+max_per_tick: 200

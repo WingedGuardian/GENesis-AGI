@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
-import re
+import math
+import os
 import sqlite3
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -20,12 +21,22 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db._migration_discovery import discover_numbered_modules
+from genesis.db._migration_ids import DATA, DATA_MIGRATION_PATTERN
 from genesis.db.crud import data_migrations as crud
+from genesis.db.data_migrations._util import MigrationDependencyUnavailable
 
 logger = logging.getLogger(__name__)
 
 _DATA_MIGRATIONS_DIR = Path(__file__).parent
-_DATA_MIGRATION_PATTERN = re.compile(r"^(d\d{4})_\w+\.py$")
+#: A ``d`` + 4-digit legacy id OR ``d`` + a 14-digit UTC timestamp. Defined in
+#: ``db/_migration_ids`` (stdlib-only, shared with CI's guard); see the schema
+#: runner's module docstring for why new ids are timestamps.
+#:
+#: MATCHING IS NOT SUFFICIENT — the pattern says well-FORMED, not ALLOWED; the
+#: legacy set is enumerated, and ``classify`` is the verdict. Discovery raises
+#: on anything that presents as a data migration and cannot run, because a
+#: silently-skipped backfill is indistinguishable from one that ran.
+_DATA_MIGRATION_PATTERN = DATA_MIGRATION_PATTERN
 
 # The ledger bookkeeping (mark_completed / mark_failed) writes through the shared
 # server connection, which waits only BUSY_TIMEOUT_MS (5s) for the write lock. A
@@ -37,6 +48,39 @@ _DATA_MIGRATION_PATTERN = re.compile(r"^(d\d{4})_\w+\.py$")
 # defense-in-depth for the bookkeeping itself.
 _LEDGER_LOCK_RETRIES = 5
 _LEDGER_RETRY_DELAY_S = 0.5
+
+# Boot-settle delay before running data migrations. They kick as a background
+# task very early in boot and some make live network calls (e.g. d0011's embedder,
+# d0008's Qdrant client) that fail if egress / a local service isn't warm yet —
+# an EXPECTED cold-boot transient that logged a scary ERROR+traceback every restart.
+# Waiting lets boot IO quiet down before the first call; mirrors the same pattern in
+# runtime/init/infra_profile (which sleeps before its first network refresh). These
+# migrations are non-urgent idempotent backfills, so a one-time delay costs nothing.
+# Env-tunable (0 disables — used by tests and available to operators).
+_DEFAULT_BOOT_SETTLE_DELAY_S = 120.0
+
+
+def _boot_settle_delay_s() -> float:
+    """Seconds to wait after boot before running data migrations (see above).
+
+    Reads ``GENESIS_DATA_MIGRATION_BOOT_DELAY_S``; falls back to the default on an
+    unset or unparseable value. Clamped to ``>= 0``.
+    """
+    raw = os.environ.get("GENESIS_DATA_MIGRATION_BOOT_DELAY_S")
+    if raw is None:
+        return _DEFAULT_BOOT_SETTLE_DELAY_S
+    try:
+        val = float(raw)
+        if not math.isfinite(val):  # reject inf/nan: sleep(inf) would hang migrations forever
+            raise ValueError("non-finite")
+        return max(0.0, val)
+    except ValueError:
+        logger.warning(
+            "Invalid GENESIS_DATA_MIGRATION_BOOT_DELAY_S=%r; using default %.0fs",
+            raw,
+            _DEFAULT_BOOT_SETTLE_DELAY_S,
+        )
+        return _DEFAULT_BOOT_SETTLE_DELAY_S
 
 
 async def _ledger_write(make_coro: Callable[[], Awaitable[None]], *, what: str) -> bool:
@@ -74,7 +118,9 @@ class DataMigrationRunner:
         self._db = db
 
     def _discover(self) -> list[tuple[str, str, Path]]:
-        return discover_numbered_modules(_DATA_MIGRATIONS_DIR, _DATA_MIGRATION_PATTERN)
+        # Raises if any file presents as a data migration but cannot run — a
+        # silently-skipped backfill is indistinguishable from one that ran.
+        return discover_numbered_modules(_DATA_MIGRATIONS_DIR, DATA)
 
     async def run_pending(self) -> list[dict]:
         """Run every claimable data migration once. Returns per-migration outcomes.
@@ -84,7 +130,7 @@ class DataMigrationRunner:
         task) and never blocks the others."""
         available = self._discover()
 
-        # Pre-flight: two files sharing a dNNNN prefix would collide on the
+        # Pre-flight: two files sharing a d-prefix would collide on the
         # ledger PRIMARY KEY. Unlike the schema runner (whose plain INSERT
         # surfaces the clash as a UNIQUE error mid-run), our ensure_row uses
         # INSERT OR IGNORE, so a collision would SILENTLY drop the second
@@ -95,7 +141,8 @@ class DataMigrationRunner:
             if mid in seen:
                 raise RuntimeError(
                     f"Duplicate data-migration prefix '{mid}': '{seen[mid]}' and "
-                    f"'{name}'. Rename one to the next free prefix."
+                    f"'{name}'. Rename one to a fresh UTC timestamp id "
+                    f"(`d$(date -u +%Y%m%d%H%M%S)`)."
                 )
             seen[mid] = name
 
@@ -163,6 +210,24 @@ class DataMigrationRunner:
                 }
             logger.info("Data migration %s completed: %s", name, summary_str)
             return {"id": mid, "name": name, "success": True, "summary": summary}
+        except MigrationDependencyUnavailable as exc:
+            # EXPECTED transient (cold boot: a dependency — embedder egress, Qdrant —
+            # wasn't warm yet). Same retry-next-boot handling as any failure (mark
+            # failed so reset_running_to_pending replays it), but WARN without a
+            # traceback: this is not a bug, and screaming ERROR+traceback on every
+            # restart was the whole complaint. A genuine bug raises a DIFFERENT
+            # exception and still hits the ERROR+traceback branch below.
+            err = repr(exc)  # bind before the closure (exc is except-scoped, del'd on exit)
+            await _ledger_write(
+                lambda: crud.mark_failed(self._db, mid, error=err),
+                what="mark_failed",
+            )
+            logger.warning(
+                "Data migration %s deferred: dependency not ready (%s) — will retry next boot",
+                name,
+                exc,
+            )
+            return {"id": mid, "name": name, "success": False, "error": str(exc), "deferred": True}
         except Exception as exc:  # noqa: BLE001 — record + continue; never abort the batch
             err = repr(exc)  # bind before the closure (exc is except-scoped, del'd on exit)
             await _ledger_write(
@@ -187,7 +252,15 @@ def _module_requires_operator(path: Path) -> bool:
 
 
 async def run_data_migrations(db: aiosqlite.Connection) -> list[dict]:
-    """Module entry point for the post-boot kick. Never raises."""
+    """Module entry point for the post-boot kick. Never raises.
+
+    Waits a boot-settle delay first (see ``_boot_settle_delay_s``) so cold-boot
+    network/service dependencies are warm before any migration's first call.
+    """
+    delay = _boot_settle_delay_s()
+    if delay > 0:
+        logger.debug("Data migrations: waiting %.0fs for boot IO to settle", delay)
+        await asyncio.sleep(delay)
     try:
         return await DataMigrationRunner(db).run_pending()
     except Exception:

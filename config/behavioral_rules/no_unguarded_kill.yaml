@@ -8,9 +8,25 @@
 # linter checks Edit new_string content, and a guarded killpg (with pgid > 1
 # check on a preceding line) would false-positive. The os.kill(-1) and
 # os.kill(0) patterns are always dangerous regardless of context.
+#
+# behavioral-lint: ignore no-unguarded-kill
+# behavioral-lint: ignore no-hide-problems
+# ^ This rule-definition file necessarily contains the trigger literals it
+#   matches, so it is exempt from self-linting (also enforced structurally by
+#   the linter skipping config/behavioral_rules/). The tokens leave an audit
+#   trail per the linter's own convention.
 
 name: no-unguarded-kill
 severity: block
+# Fires on ALL code — including extensionless CLI scripts (shebang python),
+# notebooks, and templates that carry the real call. Only doc formats are
+# excluded, so a markdown/rst file quoting the literal (this rule's audit, the
+# hook-audit report) is not hard-blocked, while a `.py` allow-list would have
+# silently un-guarded the dangerous call in every extensionless script.
+excludes:
+  - "*.md"
+  - "*.rst"
+  - "*.txt"
 description: >
   Never call os.kill(-1, ...) or os.kill(0, ...) — these kill all processes
   owned by the user or in the process group. Use os.killpg() with a

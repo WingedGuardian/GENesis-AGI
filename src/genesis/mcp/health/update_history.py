@@ -18,7 +18,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db.connection import BUSY_TIMEOUT_MS
+from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
 
     try:
         async with aiosqlite.connect(str(_DB_PATH)) as db:
-            await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
 
             # Detect missing table explicitly — don't hide absence behind
             # a generic empty response.

@@ -142,11 +142,25 @@ async def send_dialogue(
         import urllib.error
         import urllib.request
 
+        # Internal bearer (escrowed from the container via the credential bridge)
+        # so this POST passes the server's /api mutation gate when a dashboard
+        # password is set. Absent token → no header (gate inactive). stdlib-only
+        # credential_bridge is host-safe to import.
+        headers = {"Content-Type": "application/json"}
+        try:
+            from genesis.guardian.credential_bridge import load_internal_api_token
+
+            _tok = load_internal_api_token(state_dir=config.state_dir)
+            if _tok:
+                headers["Authorization"] = f"Bearer {_tok}"
+        except Exception:
+            pass
+
         req = urllib.request.Request(  # noqa: S310 - stdlib-only guardian; https endpoint from config
             url,
             data=payload,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
 
         # Use executor to avoid blocking

@@ -71,19 +71,13 @@ def _release_lock(fh) -> None:
 
 
 def _build_judge_router(judge_provider: str | None):
-    """The runtime `judge` call site's free-first chain (mirrors run_bench)."""
+    """The runtime `judge` call site's chain (derived from config; mirrors run_bench)."""
     from genesis.experimentation.standalone_router import (
-        DEFAULT_JUDGE_PROVIDER,
         StandaloneLiteLLMRouter,
+        default_judge_chain,
     )
 
-    chain = [
-        DEFAULT_JUDGE_PROVIDER,
-        "openrouter-deepseek-v4",
-        "openrouter-deepseek-v4-flash",
-    ]
-    if judge_provider:
-        chain = [judge_provider, *[p for p in chain if p != judge_provider]]
+    chain = default_judge_chain(judge_provider)
     return StandaloneLiteLLMRouter(chain[0], fallback_providers=tuple(chain[1:]))
 
 

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db.connection import BUSY_TIMEOUT_MS
+from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ async def _get_db() -> aiosqlite.Connection:
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA synchronous=NORMAL")
-    await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
     return db
 
 

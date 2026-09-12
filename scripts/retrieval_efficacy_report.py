@@ -32,7 +32,7 @@ from pathlib import Path
 _DATASET = "longmemeval_oracle"
 
 # A lever does not flip live on this report alone — but the report renders the
-# gate so the numbers are read against the agreed bar (Jay pulls each flip).
+# gate so the numbers are read against the agreed bar (the operator pulls each flip).
 _GATE_CHECKLIST = (
     (
         "scope (PR-A)",

@@ -28,8 +28,13 @@ from genesis.cc.types import model_name_supports_effort
 from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
 from genesis.guardian.config import GuardianConfig
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
+
+# Bound for the `claude auth status` pre-flight probe: node startup + one
+# network round-trip, generous for a degraded host.
+_AUTH_PROBE_TIMEOUT_S = 15.0
 
 # Pre-flight memory thresholds.  Guardian must always attempt diagnosis
 # above the hard floor.  The systemd MemoryMax cap on the Guardian
@@ -569,6 +574,11 @@ class DiagnosisEngine:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(work_dir),
             env=await self._resolve_cc_env(cc_path),
+            # Own session/group so the timeout below can reap the WHOLE
+            # claude tree — the agentic brain forks tool children, and a
+            # leaked tree on the host has no genesis-server cgroup to
+            # clean it up (setsid in the C helper; never preexec_fn).
+            start_new_session=True,
         )
 
         try:
@@ -577,12 +587,20 @@ class DiagnosisEngine:
                 timeout=self._config.cc.timeout_s,
             )
         except TimeoutError as exc:
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            # Group-kill (guarded pid-as-pgid — immune to the leader-reaped
+            # race) with a bounded reap; a bare proc.kill() orphans the
+            # brain's tool/MCP children.
+            kill_process_group(proc)
+            await reap_bounded(proc)
             raise CCDiagnosisError(
                 f"CC timed out after {self._config.cc.timeout_s}s"
             ) from exc
+        except asyncio.CancelledError:
+            # Cancellation: the detached brain tree sees no ambient signal —
+            # group-kill before propagating or it runs on host-side.
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
 
         if proc.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace")[:300]
@@ -635,17 +653,24 @@ class DiagnosisEngine:
                 cc_path, "auth", "status", "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                # Own group so the timeout can reap any node children too.
+                start_new_session=True,
             )
             try:
-                # 15s: node startup + a network round-trip, generous for a
+                # Node startup + a network round-trip, generous for a
                 # degraded host but bounded so a wedged probe can't hang the
                 # (already timeout-bounded) diagnosis. Never inherits the token.
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=_AUTH_PROBE_TIMEOUT_S,
+                )
             except TimeoutError:
-                if proc.returncode is None:
-                    proc.kill()
-                    await proc.wait()
+                kill_process_group(proc)
+                await reap_bounded(proc)
                 return None  # ambiguous → inherit; fail-safe covers a real outage
+            except asyncio.CancelledError:
+                kill_process_group(proc)
+                await reap_bounded(proc)
+                raise
             try:
                 logged_in = json.loads(
                     stdout.decode("utf-8", errors="replace"),

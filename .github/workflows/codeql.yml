@@ -1,0 +1,62 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
+
+# Cancel a branch's superseded CodeQL run the instant a new commit is pushed, so
+# stale in-flight analyses stop holding runner slots. Uncancelled fan-out across
+# many active branches was starving the shared runner budget and leaving CodeQL
+# queued for 50-75 min before it got cancelled. Never cancel main's post-merge run.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    # A CodeQL analysis of interpreted languages normally finishes in a few
+    # minutes; cap a genuinely hung run so it frees the runner instead of holding
+    # it for the 6h default (the only specific failure mode a timeout addresses here).
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python is the core codebase; javascript-typescript covers the dashboard
+        # JS/TS. Dropped the redundant 'javascript'/'typescript' slices and the
+        # low-value 'actions' analysis the default setup also ran — together they
+        # tripled the per-push job count and were the slices starving in the queue.
+        include:
+          - language: python
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # No `queries:` → the default code-scanning suite (same coverage the
+          # prior default setup ran). The only built-in suites are
+          # security-extended / security-and-quality; "default" is not a valid
+          # value and is obtained by omission.
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

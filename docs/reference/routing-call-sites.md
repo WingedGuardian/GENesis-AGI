@@ -190,6 +190,131 @@ Three IDs whose descriptors collided were renamed to lead with the domain:
 
 Migration `0015_rename_confusable_call_sites` renames existing rows in `call_site_last_run` and `deferred_work_queue` at server start. `cost_events.metadata` historical entries are intentionally untouched (audit log fidelity). The old IDs survive only as `Renamed from …` annotations in `_call_site_meta.py`. Historical planning docs under `docs/plans/2026-03-*` reference the old names by design (snapshots in time).
 
+### 2026-08-31 — Probe healing no longer erases a permanent outage
+
+A provider whose account lost entitlement to a model (403 `tier_not_allowed`)
+stayed *listed* by `GET /v1/models`. `ProviderHealthChecker._sync_to_breakers`
+heals on `model_available is True`, so three probe sweeps closed the breaker,
+fired `on_recovery`, and `ProviderEscalation.record_recovery` resolved the
+`provider_failure` observation and cleared its `first_trip_at` — the only
+per-provider "failing since" timestamp in the system. The next real call failed
+again and the cycle repeated, so a multi-day outage was recorded as a series of
+short incidents that each recovered, and no surface could report a duration.
+Measured on a live install: 32 calls, 32 failures, zero successes over 23h (a
+sibling provider on the same key and code path succeeded 351/352 in the same
+window), with EIGHT separate `provider_failure` observations opened and
+auto-resolved between 2026-08-27 and 2026-08-31 — re-measured 2026-09-01, when
+all eight read `resolved=1` while the provider was still returning
+`tier_not_allowed` on every call. The false heals were roughly 9-12h apart, not per probe
+cycle — between them the breaker's backoff escalated normally (consecutive trips
+5/5/10/20/35/65/128 minutes apart, matching `120 * 2^(trip-1)`).
+
+The fix is **evidence symmetry**: a probe may only undo what a probe did.
+`probe_suspect()` moves CLOSED to HALF_OPEN on a failed or rate-limited probe,
+and a clean probe may clear exactly that. A breaker opened by a real call
+failure carries `_opened_by_call`, and only a real `record_success()` closes it.
+
+No category allowlist is involved, which is the point — five successive review
+rounds each added a qualifier to a category-based predicate before it was clear
+that the predicate was asking the wrong question. The rule now names the thing
+it actually depends on.
+
+`record_probe_success` also no longer fires `on_recovery`. That hook resolves
+the `provider_failure` observation and clears `first_trip_at`; reaching a probe
+heal means the breaker was probe-suspected, which never trips and so never
+escalates, so there is nothing to resolve. Removing the call rather than
+guarding it means a later loosening cannot silently restore the clock-erase.
+
+**This does not hold a provider out of rotation.** An OPEN breaker
+auto-transitions to HALF_OPEN when its backoff window expires, and HALF_OPEN is
+`is_available()` — so the next real call routed to that provider IS the retry,
+and a success closes it. What the probe no longer does is declare recovery
+before that call happens. The visible cost is that a provider nobody is calling
+shows as *unverified* rather than green until it is next used, which is what the
+dashboard now says.
+
+Supersedes PR #705 (2026-06-19), which added probe healing so "a low/no-traffic
+fallback can heal instead of being stuck in HALF_OPEN forever" — a concern about
+the rendered state, not routing.
+This does not strand a provider: `HALF_OPEN` is still `is_available()`, so real
+traffic is attempted and a real `record_success()` closes the breaker as before —
+recovery now requires evidence of a working *call* rather than a listing.
+
+It does change the retry schedule, which is the deliberate cost. The heal branch
+also reset `_trip_count`, so refusing it leaves the backoff climbing: a dead
+provider's open window now settles at the cap (30 min, or 4 h when the failure is
+classified `QUOTA_EXHAUSTED`) instead of dropping back to the 120 s base every
+9-12 h. That is the intent for a genuinely dead provider, but it means a provider
+whose *quota* resets may not be retried for up to 4 h. Reading the provider's own
+retry hint (`Retry-After`, or the interval named in a 429 body) is the exact fix
+and is tracked separately — until then the cap is the bound.
+
+Related, same incident: alert messages now carry `(ongoing for Xd Yh)` from
+`alert_events.created_at` (90-day retention, previously unread), and four
+frontend comparisons against an uppercase `'OPEN'` were fixed — the routing API
+emits `cb.state.value` from a lowercase `StrEnum`, so the dashboard was
+structurally unable to render a tripped breaker.
+
+**Two follow-on defects in the new field, both of the same shape**, found in
+review after the redesign landed. Neither was in the heal guard — the guard was
+correct — but both were something that changed breaker state without keeping
+`_opened_by_call` in step, i.e. the field was a CONVENTION that every mutation
+site had to remember:
+
+- **The persisted schema had no migration.** A state file written before the
+  field existed carries no key, and `.get()` read that absence as "a probe
+  opened it" — the one origin a saved-OPEN row cannot have, since
+  `probe_suspect()` only ever produced HALF_OPEN, and at the time the migration
+  default was designed a non-OPEN save restored as CLOSED. (The restore has
+  since been widened: HALF_OPEN now also restores, carrying its origin — but a
+  KEYLESS half_open row still defaults to probe-origin, because that state is
+  reachable both ways and assuming "call" would strand a provider that never
+  failed a real call.) Measured against a live install mid-outage: the affected provider was
+  persisted OPEN with no key, so the first post-deploy probe could have healed
+  it once more and the fix would have failed on the very incident that motivated
+  it. A saved-OPEN row with no recorded origin now defaults to call-opened. An
+  explicit value in a new-format file is preserved.
+- **The dashboard toggle assigned breaker fields directly**, so it left the flag
+  wrong in both directions: disabling a provider left it probe-clearable (a
+  health check could undo an operator's decision), and re-enabling one left a
+  stale "real calls failed here" mark that refused probe healing until real
+  traffic or a restart.
+
+The fix for the second is a chokepoint rather than two patches:
+`CircuitBreaker.force_open()` / `force_close()` set the state and its origin
+together, `providers.py` calls those, and a guard test fails any module outside
+`circuit_breaker.py` that changes breaker private state. That is what stops the
+next persisted field repeating this.
+
+Be precise about what the guard is worth, because two successive audits found
+defects in it rather than in the rule. It parses the source (`ast`) rather than
+matching text, and the rule it enforces is *assigning a guarded private
+attribute on some other object* — so it catches `breakers.get(name)._state = …`,
+`cb._trip_count += 1` and `setattr(cb, "_state", …)` whatever the receiver is
+called, while a class assigning its own `self._state` (several unrelated state
+machines here do) is correctly ignored. Comments, docstrings and keyword
+arguments cannot trigger it, because none of them is an assignment.
+
+The regex versions failed twice in different directions — first blind to
+`breakers.get(name)._state`, then, once keyed on the attribute, over-matching
+every unrelated `self._state` in the tree and needing a file filter that turned
+out to exclude `dashboard/routes/routing.py`, the module most likely to hold the
+next offender. Parsing removes the need for that filter.
+
+It scans `src/genesis` and `scripts/`, and pins the files that actually hold
+breaker objects so a refactor cannot quietly drop one out of scope. What it
+still cannot see: `__dict__` writes, `object.__setattr__`, and dynamically built
+attribute names. The measured present population is zero external assigners.
+
+The premise of the migration was measured the same way: across all 18 historical
+versions of `probe_suspect` in this repository, ZERO reference `ProviderState.OPEN`,
+and no version of `load_state` BEFORE this branch had ever restored a saved
+non-OPEN state (it now restores HALF_OPEN too — that widening postdates the
+measurement, and every file the widened code can read was written by a version
+that already had the key, so the keyless-OPEN reasoning is unaffected). A
+persisted OPEN with no recorded origin really does have only two possible causes,
+both of which must refuse a probe heal.
+
 ### 2026-05-10 — Silent-drop fix for keyless call sites (PR #308)
 
 Partial API-key configuration is now treated as a first-class normal state, not a load-time filter condition. Previously, the config loader auto-disabled any provider whose API key env var was unset/empty AND filtered those providers out of every chain. Sites whose entire chain was keyless were dropped from `cfg.call_sites` entirely — invisible everywhere downstream (neural monitor, routing API, health snapshot). On a partially-configured install (the normal install state), this masked which sites were unreachable and what env vars would unblock them.

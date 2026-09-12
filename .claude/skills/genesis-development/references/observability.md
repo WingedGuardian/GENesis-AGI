@@ -55,5 +55,6 @@ Write/Edit containing hide-problem patterns in code, plans, or comments.
 **Bugs you see get fixed or tracked — never ignored.** Every bug you
 encounter during any work (even unrelated work, pre-existing bugs, things
 mentioned in passing) must be either fixed inline (if small and low-risk)
-or filed as a follow-up (observation, task, TODO) AND raised in your next
+or filed — a Genesis-repo bug as a GitHub issue, a someday one as `tabled`
+(see CLAUDE.md "Where deferred work goes") — AND raised in your next
 user-facing report. "Out of scope" is not an option.

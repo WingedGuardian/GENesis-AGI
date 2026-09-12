@@ -109,6 +109,13 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
         "the result is discarded (never rendered, reaches no prompt) and "
         "skip_writeback drops all write-backs — no injection sink",
     ),
+    "memory/recall_probe.py::run_recall_probe": (
+        "pipeline-internal",
+        "memory-integrity recall-health probe: reads ONLY result memory_ids to "
+        "compute hit-rate/rank against a curated install-local golden set; result "
+        "CONTENT never reaches a prompt, and skip_writeback drops all "
+        "write-backs — no injection sink",
+    ),
 }
 
 # NOTE: memory_expand and memory_core_facts (mcp/memory/core.py) are ALSO
@@ -345,6 +352,21 @@ def test_every_recall_site_is_classified():
 _QDRANT_READ_VALID = {"prompt-gated", "infra", "library", "deferred-with-reason"}
 
 KNOWN_QDRANT_READ_SITES: dict[str, tuple[str, str]] = {
+    "db/data_migrations/d0008_reconcile_memory_cross_store.py::_scroll_points": (
+        "infra",
+        "one-time reconcile migration; scrolls point ids (with_payload=[created_at]) "
+        "to set-diff against memory_metadata — never prompted",
+    ),
+    "db/data_migrations/d0008_reconcile_memory_cross_store.py::_export_ghosts": (
+        "infra",
+        "one-time reconcile migration; retrieves orphaned ghost payloads to export "
+        "before deletion — never prompted",
+    ),
+    "memory/integrity_repair.py::_export_ghosts": (
+        "infra",
+        "periodic reconcile lane (Phase 1); retrieves orphaned ghost payloads to "
+        "export before deletion — never prompted",
+    ),
     "eval/bench/isolation.py::_scroll_usage": (
         "infra",
         "bench snapshot usage-payload copy between collections",

@@ -56,7 +56,9 @@ class GenesisEgoContextBuilder:
             Keys that match genesis section names are applied; unknown
             keys are ignored (default to "deep").
         focus_id:
-            Accepted for API compatibility. Not used by Genesis ego.
+            The focused target for this cycle. On a capability_improvement
+            cycle it is the weak domain name, surfaced as a "Focused
+            deficiency" row in the capability performance section.
         """
         import asyncio
 
@@ -67,6 +69,22 @@ class GenesisEgoContextBuilder:
         for section in _ALWAYS_SECTIONS:
             if weights.get(section) in ("skip", "light"):
                 weights[section] = "deep"
+
+        # Capability-improvement cycles target a specific weak domain, carried
+        # as focus_id. Stash it for _capability_performance_section so the
+        # focused (low-confidence, hence off the top-N table) domain's row is
+        # always surfaced. Reset each build — a stale value would mislabel a
+        # later cycle's context.
+        self._focus_id = focus_id
+
+        # Blind drafting: when the reconcile stage is active (shadow/live) the
+        # pending board is withheld from drafting context so the cycle no longer
+        # anchors on (and riffs variations of) already-pending proposals — the
+        # reconcile stage matches drafts to the board afterward instead. off =
+        # today's behavior (board stays in context).
+        from genesis.ego import reconcile_config
+
+        self._blind_drafting = reconcile_config.effective_mode() != "off"
 
         sections: list[str] = []
         sections.append("# GENESIS_EGO_CONTEXT — Operations Briefing\n")
@@ -81,6 +99,7 @@ class GenesisEgoContextBuilder:
         section_map: list[tuple[str, Any]] = [
             ("system_health", self._system_health_section),
             ("intentions", self._intentions_section),
+            ("directives", self._directives_section),
             ("settled_decisions", self._settled_decisions_section),
             ("signals", self._signals_section),
             ("observations", self._observations_section),
@@ -98,6 +117,9 @@ class GenesisEgoContextBuilder:
             ("confidence_calibration", self._confidence_calibration_section),
             ("output_contract", self._output_contract_section),
         ]
+
+        if self._blind_drafting:
+            section_map = [(k, m) for k, m in section_map if k != "proposal_board"]
 
         for key, method in section_map:
             depth = weights.get(key, "deep")
@@ -125,6 +147,26 @@ class GenesisEgoContextBuilder:
         """
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "genesis_ego_cycle")
+
+    async def _directives_section(self, *, depth: str = "deep") -> str:
+        """User directives targeted at the Genesis (COO) ego.
+
+        Renders active genesis_ego directives (empty string when none). The
+        query + render live in the shared build_directives_section helper; the
+        COO differs only in framing.
+        """
+        from genesis.ego.directives_context import build_directives_section
+
+        return await build_directives_section(
+            self._db,
+            "genesis_ego",
+            framing=(
+                "*The user flagged these for you (the operations ego). Factor "
+                "them into your thinking, act on or resolve them, or disagree "
+                "with reasoning — but never ignore one silently.*\n"
+            ),
+            error_body="*Directives unavailable (query error — see logs).*",
+        )
 
     async def _system_health_section(self, *, depth: str = "deep") -> str:
         """Live system health from health_data snapshot."""
@@ -162,16 +204,19 @@ class GenesisEgoContextBuilder:
         queues = snap.get("queues", {})
         if queues:
             lines.append("\n### Queues")
-            deferred = queues.get("deferred_work_queue", {})
-            dead_letter = queues.get("dead_letter_queue", {})
-            if isinstance(deferred, dict):
-                lines.append(
-                    f"- Deferred work: {deferred.get('pending', 0)} pending"
-                )
-            if isinstance(dead_letter, dict):
-                lines.append(
-                    f"- Dead letter: {dead_letter.get('count', 0)} items"
-                )
+            # A FAILED queue query leaves the producer's value None while the
+            # KEY stays present, so `.get(name, 0)` never defaults — rendering
+            # it raw puts the token "None" in this context, and defaulting it
+            # to 0 states "nothing pending" for a depth nobody measured. Say
+            # unknown; the snapshot's `errors` list carries the reason.
+            deferred = queues.get("deferred_work")
+            dead = queues.get("dead_letters")
+            lines.append(
+                f"- Deferred work: {'unknown' if deferred is None else deferred} pending"
+            )
+            lines.append(
+                f"- Dead letter: {'unknown' if dead is None else dead} items"
+            )
 
         # Surplus
         surplus = snap.get("surplus", {})
@@ -445,38 +490,43 @@ class GenesisEgoContextBuilder:
         (withdrawn/tabled/rejected/failed/expired) so active proposals
         are always visible regardless of withdrawn noise volume.
         """
-        lines = ["## Active Proposals\n"]
+        blind = getattr(self, "_blind_drafting", False)
+        lines: list[str] = []
         table_header = (
             "| Action | Content | Status | Response |\n"
             "|--------|---------|--------|----------|"
         )
 
         try:
-            # Section 1: Active proposals (genesis ego only)
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, "
-                "user_response, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-7 days') "
-                "AND status IN ('pending', 'approved', 'executed') "
-                "AND (ego_source = 'genesis_ego_cycle' OR ego_source IS NULL) "
-                "ORDER BY created_at DESC "
-                "LIMIT 15"
-            )
-            active_rows = await cursor.fetchall()
+            # Section 1: Active (pending) proposals — WITHHELD under blind drafting
+            # so the drafting cycle no longer anchors on the pending board. The
+            # Recently Tried learning signal (Section 2) always stays.
+            if not blind:
+                lines.append("## Active Proposals\n")
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, "
+                    "user_response, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-7 days') "
+                    "AND status IN ('pending', 'approved', 'executed') "
+                    "AND (ego_source = 'genesis_ego_cycle' OR ego_source IS NULL) "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 15"
+                )
+                active_rows = await cursor.fetchall()
 
-            if not active_rows:
-                lines.append("*No active proposals.*\n")
-            else:
-                lines.append(table_header)
-                for action_type, content, status, response, _created in active_rows:
-                    short = content[:80] + "..." if len(content) > 80 else content
-                    short = short.replace("\n", " ").replace("|", "/")
-                    resp = (response or "\u2014")[:50]
-                    lines.append(
-                        f"| {action_type} | {short} | {status} | {resp} |"
-                    )
-                lines.append("")
+                if not active_rows:
+                    lines.append("*No active proposals.*\n")
+                else:
+                    lines.append(table_header)
+                    for action_type, content, status, response, _created in active_rows:
+                        short = content[:80] + "..." if len(content) > 80 else content
+                        short = short.replace("\n", " ").replace("|", "/")
+                        resp = (response or "\u2014")[:50]
+                        lines.append(
+                            f"| {action_type} | {short} | {status} | {resp} |"
+                        )
+                    lines.append("")
 
             # Section 2: Recently tried (genesis ego only)
             lines.append("## Recently Tried (do not re-propose)\n")
@@ -639,8 +689,9 @@ class GenesisEgoContextBuilder:
 
         Informational context for the ``confidence`` field (rendered right before
         the output contract), NOT a limiter and NOT a mechanical rescale. Reads
-        ``ego_calibration_snapshots`` ONLY (never ``calibration_curves`` — that table
-        is auto-injected into the perception context). Genesis ego only for v1 — the
+        ``ego_calibration_snapshots`` ONLY — deliberately separate from the
+        perception-facing calibration surface (``calibration_cells``, WS-2 P3).
+        Genesis ego only for v1 — the
         aggregate calibration is genesis-ego dominated; per-ego split is future work.
 
         Live flag ``EgoConfig.calibration_injection_enabled`` (default ON) is read
@@ -676,8 +727,9 @@ class GenesisEgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
+            from genesis.ego import _capability_render as _cap_render
 
-            entries = await cap_crud.get_all(self._db)
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
             logger.warning("Failed to query capability performance", exc_info=True)
             lines.append(
@@ -685,29 +737,124 @@ class GenesisEgoContextBuilder:
             )
             return "\n".join(lines)
 
-        if not entries:
-            lines.append("*No performance data yet.*\n")
-            return "\n".join(lines)
-
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
 
-        lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
-        lines.append("|--------|-----------|-------|---------|----------|")
-        for e in entries[:15]:
-            domain = e.get("domain", "?")
-            conf = e.get("confidence", 0.0)
-            trend = e.get("trend", "stable")
-            samples = e.get("sample_size", 0)
-            evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
-            icon = _TREND_ICONS.get(trend, "=")
+        # Focused deficiency: a capability_improvement cycle targets a specific
+        # weak domain (self._focus_id). The table below is confidence-DESC and
+        # capped at 15, so a low-confidence target is otherwise absent — surface
+        # its full row explicitly so the advisory names a deficiency the ego can
+        # actually see.
+        #
+        # Read it with get_by_domain rather than scanning `entries`:
+        # get_prompt_rows drops rows that are stale or below the sample floor,
+        # and the focus domain is precisely the kind that is. Scanning that list
+        # would lose the line exactly when the cycle exists to address it. This
+        # is also what keeps a scanner target visible when the operator tunes
+        # capability_improvement_min_sample_size below MIN_SAMPLE_SIZE.
+        #
+        # It is resolved BEFORE the empty-table check on purpose: if the bars
+        # filter every row away, the focused deficiency is the one thing that
+        # still must reach the ego.
+        focus_id = getattr(self, "_focus_id", None)
+        focused = None
+        if focus_id:
+            try:
+                focused = await cap_crud.get_by_domain(self._db, focus_id)
+            except Exception:
+                logger.warning(
+                    "Failed to read focused capability domain", exc_info=True
+                )
+
+        # Two DIFFERENT states reach here and must not produce the same
+        # sentence: a genuinely empty map, and a full map whose every row failed
+        # a bar. Each message is a false claim in the other's situation, so the
+        # count decides which is rendered.
+        #
+        # Computed BEFORE the focus branch, and rendered in whichever arm runs,
+        # because the cell where `entries` is empty AND a focus row exists is
+        # reachable: gating the sentence on `focused is None` while gating the
+        # table on `entries` left that cell rendering neither, so the section
+        # silently withheld the row count it exists to state.
+        _empty_note = None
+        if not entries:
+            _empty_note = _cap_render.empty_state_note(
+                await _cap_render.safe_count(self._db),
+                unusable=await _cap_render.safe_count_unusable(self._db),
+                empty="*No performance data yet — the map is empty.*\n",
+                filtered="*No qualifying capability rows ({total} present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying capability rows (count unavailable — "
+                        "see logs).*\n",
+            )
+            if focused is None:
+                lines.append(_empty_note)
+                return "\n".join(lines)
+
+        if focused is not None:
+            _fc = focused.get("confidence", 0.0)
+            _ft = focused.get("trend", "stable")
+            _fs = focused.get("sample_size", 0)
+            _fe = (focused.get("evidence_summary") or "")[:120].replace("|", "/")
+            # Stamp the age. This is the ONE row shown unfiltered, so without a
+            # date it is also the one row most likely to be read as a
+            # present-tense claim on months-old evidence — the exact failure
+            # this section's filtering exists to remove.
+            _fu = (focused.get("updated_at") or "")[:10]
+            _fstamp = f", last vouched {_fu}" if _fu else ""
             lines.append(
-                f"| {domain} | {conf:.0%} | {icon} | {samples} | {evidence} |"
+                f"**Focused deficiency — {focus_id}**: {_fc:.0%} confidence "
+                f"({_ft}, {_fs} samples{_fstamp}). {_fe}\n"
             )
 
-        lines.append(
-            "\nDeclining domains may need investigation. Improving domains "
-            "indicate effective maintenance patterns.\n"
-        )
+        # Guarded: reachable with entries empty but a focus row present, and a
+        # headers-only table reads as "these columns have no values" rather than
+        # "nothing qualified". When there is no table, the withheld-count note
+        # takes its place so the section never goes silent about the real state.
+        if not entries and _empty_note is not None:
+            lines.append(_empty_note)
+        if entries:
+            # Honour the depth we ACCEPT. Taking the keyword and rendering the
+            # full table anyway is worse than not offering it: the dispatcher
+            # believes it asked for the cheap form and is silently billed for
+            # fifteen rows. The sibling `_own_goals_section` in this file has
+            # always branched here; this one only declared the parameter.
+            #
+            # Figures are stated as the QUALIFYING SUBSET, never as whole-map
+            # facts -- this branch renders no table, so the sentence is the
+            # entire claim and an unqualified count would be read as the map.
+            if depth == "light":
+                _light_clause = _cap_render.unusable_note(
+                    await _cap_render.safe_count_unusable(self._db)
+                )
+                lines.append(
+                    _cap_render.qualifying_subset_line(entries, _light_clause)
+                    + "\n"
+                )
+                return "\n".join(lines)
+
+            lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
+            lines.append("|--------|-----------|-------|---------|----------|")
+            for e in entries[:15]:
+                domain = e.get("domain", "?")
+                conf = e.get("confidence", 0.0)
+                trend = e.get("trend", "stable")
+                samples = e.get("sample_size", 0)
+                evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
+                icon = _TREND_ICONS.get(trend, "=")
+                lines.append(
+                    f"| {domain} | {conf:.0%} | {icon} | {samples} | {evidence} |"
+                )
+
+            _clause = _cap_render.unusable_note(
+                await _cap_render.safe_count_unusable(self._db)
+            )
+            if _clause:
+                lines.append(f"*{_clause.strip()}*")
+
+            lines.append(
+                "\nDeclining domains may need investigation. Improving domains "
+                "indicate effective maintenance patterns.\n"
+            )
         return "\n".join(lines)
 
 
@@ -807,6 +954,12 @@ class GenesisEgoContextBuilder:
             '  "notifications": [\n'
             "    {\n"
             '      "content": "what to tell the user (informational, no approval needed)",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "content": "a direct question when you need the user\'s input or a decision — sent without approval; the reply comes back to you as a signal, and you\'ll see an observation if delivery or reply fails",\n'
             '      "urgency": "low|normal|high"\n'
             "    }\n"
             "  ],\n"

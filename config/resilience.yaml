@@ -26,3 +26,35 @@ notifications:
     - state_changed
     - recovery_complete
     - queue_overflow
+
+# Connectivity sentinel (genesis.resilience.network_sentinel). Read live per
+# round via genesis.resilience.network_config (no restart needed to retune).
+# Env kill switch: GENESIS_NETWORK_SENTINEL_DISABLED=1 stops it starting.
+network:
+  enabled: true
+  # Degraded-mode parking lever (PR-3): off | shadow | live. Default shadow —
+  # observe one real outage before granting parking authority. Invalid → shadow.
+  # PREREQUISITE before flipping to `live`: harden the periodic CC-invoker
+  # consumers (inbox retry budget, autonomy/ego outcome signals, direct_session)
+  # to treat CCNetworkOfflineError as "not attempted" rather than a failure —
+  # otherwise an outage pollutes calibration/retry state. In `shadow` the preflight
+  # never raises, so that class is dormant. See the PR-3b follow-up.
+  parking_mode: shadow
+  # Restore push-retry lever (PR-4): off | live. Invalid → off.
+  backup_push_retry: live
+  # Probe anchors — public DNS (Cloudflare + Google). DNS+TCP anchors exercise
+  # resolution + connectivity; IP-literal anchors isolate a DNS-only failure.
+  dns_tcp_anchors:
+    - one.one.one.one
+    - dns.google
+  ip_anchors:
+    - 1.1.1.1
+    - 8.8.8.8
+  probe_port: 443
+  probe_timeout_s: 3
+  fast_cadence_s: 20      # while not solidly green — catch recovery quickly
+  steady_cadence_s: 120   # while green
+  offline_all_fail_rounds: 2   # consecutive all-fail rounds → OFFLINE
+  online_clean_rounds: 3       # consecutive clean rounds → back ONLINE
+  stable_online_s: 300         # hold ONLINE before the recovery hook fires
+  merge_gap_s: 600             # a new outage within this merges into the last

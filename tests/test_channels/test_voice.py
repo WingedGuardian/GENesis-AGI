@@ -186,20 +186,26 @@ class TestVoiceChannelAdapter:
 
     def test_entity_defaults_from_env(self):
         """Entity IDs read from env vars when not passed explicitly."""
-        with patch.dict("os.environ", {
-            "HA_TTS_ENTITY": "tts.custom",
-            "HA_MEDIA_PLAYER_ENTITY": "media_player.custom_device",
-        }):
+        with patch.dict(
+            "os.environ",
+            {
+                "HA_TTS_ENTITY": "tts.custom",
+                "HA_MEDIA_PLAYER_ENTITY": "media_player.custom_device",
+            },
+        ):
             adapter = VoiceChannelAdapter()
             assert adapter._tts_entity == "tts.custom"
             assert adapter._media_player == "media_player.custom_device"
 
     def test_entity_explicit_overrides_env(self):
         """Explicit constructor params take precedence over env vars."""
-        with patch.dict("os.environ", {
-            "HA_TTS_ENTITY": "tts.from_env",
-            "HA_MEDIA_PLAYER_ENTITY": "media_player.from_env",
-        }):
+        with patch.dict(
+            "os.environ",
+            {
+                "HA_TTS_ENTITY": "tts.from_env",
+                "HA_MEDIA_PLAYER_ENTITY": "media_player.from_env",
+            },
+        ):
             adapter = VoiceChannelAdapter(
                 tts_entity="tts.explicit",
                 media_player_entity="media_player.explicit",
@@ -212,8 +218,7 @@ class TestVoiceChannelAdapter:
         (proactive voice disabled) — a hardcoded device id silently broke when
         the device was renamed. tts keeps the generic piper default."""
         # Scrub any HA_ env vars that might be set in the test environment
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("HA_")}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HA_")}
         with patch.dict("os.environ", env, clear=True):
             adapter = VoiceChannelAdapter()
             assert adapter._tts_entity == "tts.piper"
@@ -328,7 +333,9 @@ class TestVoiceChannelAdapter:
             calls.append(url)
             if "media_player/play_media" in url:
                 raise httpx.HTTPStatusError(
-                    "Not Found", request=MagicMock(), response=MagicMock(status_code=404),
+                    "Not Found",
+                    request=MagicMock(),
+                    response=MagicMock(status_code=404),
                 )
             resp = MagicMock()
             resp.raise_for_status = MagicMock()
@@ -437,9 +444,12 @@ class TestVoiceAPI:
             patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}),
             app.test_client() as client,
         ):
-            resp = client.post("/v1/voice/chat/completions", json={
-                "messages": [{"role": "user", "content": "hello"}],
-            })
+            resp = client.post(
+                "/v1/voice/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
             assert resp.status_code == 401
 
     def test_wrong_token(self, app):
@@ -547,6 +557,7 @@ class TestVoiceAPI:
     def test_tool_call_missing_name(self, app):
         """Returns 400 when tool_name is missing."""
         import json as json_mod
+
         bridge = MagicMock()
         bridge.handle_tool_call = AsyncMock(return_value=json_mod.dumps({"answer": "ok"}))
         app.config["GENESIS_BRIDGE"] = bridge
@@ -602,7 +613,10 @@ class TestVoiceAPI:
             ):
                 resp = client.post(
                     "/v1/voice/tool_call",
-                    json={"tool_name": "ask_genesis", "arguments": {"query": "what did we work on"}},
+                    json={
+                        "tool_name": "ask_genesis",
+                        "arguments": {"query": "what did we work on"},
+                    },
                     headers={"Authorization": "Bearer secret"},
                 )
                 assert resp.status_code == 200
@@ -646,8 +660,8 @@ class TestVoiceAPI:
             assert "Genesis" in data["prompt"]
 
     def test_tool_declarations_endpoint(self, app):
-        """Tool declarations endpoint returns the advertised voice tools
-        (ask_genesis disabled until the memory refactor)."""
+        """Tool declarations endpoint advertises the voice tools, including the
+        re-enabled ask_genesis delegation channel."""
         with (
             patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
             app.test_client() as client,
@@ -660,7 +674,7 @@ class TestVoiceAPI:
             data = resp.get_json()
             assert "tools" in data
             tool_names = [t["name"] for t in data["tools"]]
-            assert "ask_genesis" not in tool_names  # disabled until the memory refactor
+            assert "ask_genesis" in tool_names  # delegation channel re-enabled
             assert "web_search" in tool_names
             assert "approve_pending" in tool_names
 

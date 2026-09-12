@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable, Coroutine
 from typing import Any
 
+from genesis.cc.types import is_owner_attended_channel
 from genesis.learning.classification.attribution import route_learning_signals
 from genesis.learning.classification.delta import DeltaAssessor
 from genesis.learning.classification.outcome import OutcomeClassifier
@@ -14,6 +15,7 @@ from genesis.learning.events import LEARNING_EVENTS
 from genesis.learning.harvesting.debrief import parse_debrief
 from genesis.learning.observation_writer import ObservationWriter
 from genesis.learning.procedural.extractor import extract_procedure
+from genesis.learning.response_context import fenced
 from genesis.learning.triage.classifier import TriageClassifier
 from genesis.learning.triage.prefilter import should_skip
 from genesis.learning.triage.summarizer import build_summary
@@ -38,12 +40,82 @@ _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
 # in the room. The gate only OBSERVES (shadow) -- a deny-list escape that
 # writes a steering rule now produces a would-block row instead of being
 # invisible.
+# WARNING to the next editor: this map now has a SECOND, ENFORCING consumer --
+# _PROCEDURE_EXTRACTION_CHANNELS below derives its owner half from here. Adding
+# a `"x": "owner"` entry for the shadow classifier also grants `x` procedure-
+# extraction eligibility, so the test pins that set literally; expect it to fail.
 _CHANNEL_ORIGIN = {
     "terminal": "owner",
     "telegram": "owner",
     "whatsapp": "owner",
     "web": "owner",
 }
+
+# Channels whose text may feed PROCEDURE EXTRACTION. The extractor's output
+# becomes a stored procedure that later sessions recall and follow, so its input
+# is restricted to the owner-map channels plus Genesis's own cognition:
+#   - the owner half is DERIVED from _CHANNEL_ORIGIN (never retyped) so the two
+#     cannot drift apart;
+#   - reflection/surplus are Genesis's own cognition: the "user_text" there is
+#     Genesis's own output, not anyone's input.
+# Everything else is excluded, including `inbox` and `mail` (whose user_text is
+# externally writable -- raw email subjects, raw inbox item content) and `voice`
+# (excluded for the reason _CHANNEL_ORIGIN states above). ALLOW-list, not a
+# deny-list, for that same stated reason: a deny-list fails OPEN for every
+# channel nobody remembered to add.
+#
+# Scope, stated honestly rather than overclaimed: `_CHANNEL_ORIGIN`'s owner map
+# is BROADER than `cc.types.is_owner_attended_channel`, which counts only
+# terminal + telegram as owner-authenticated and names web/OpenClaw, WhatsApp
+# and voice as gateway channels. So this set still admits `web` (live -- every
+# OpenClaw HTTP completion arrives on it) and `whatsapp` (no caller constructs
+# it today). Both reached the extractor before this gate existed, so neither is
+# a regression, but neither is owner-AUTHENTICATED either. Narrowing to
+# is_owner_attended_channel is a deliberate open question, not an oversight.
+_SELF_COGNITION_CHANNELS = frozenset({"reflection", "surplus"})
+_OWNER_CHANNELS = frozenset(
+    channel for channel, origin in _CHANNEL_ORIGIN.items() if origin == "owner"
+)
+_PROCEDURE_EXTRACTION_CHANNELS = _OWNER_CHANNELS | _SELF_COGNITION_CHANNELS
+
+# Channels that may write a STEERING.md rule. DELIBERATELY NARROWER than
+# _PROCEDURE_EXTRACTION_CHANNELS, and the difference is the load-bearing part.
+# Two independent reasons for the gap, and neither survives collapsing them:
+#
+#   * Extraction also admits Genesis's own cognition (reflection/surplus). A
+#     procedure derived from Genesis's own work is legitimate institutional
+#     knowledge; Genesis authoring the USER's identity file is not.
+#   * Extraction admits the whole `_CHANNEL_ORIGIN` owner map; this gate takes
+#     the STRICTER `cc.types.is_owner_attended_channel`, which counts only
+#     terminal + telegram. Its docstring calls itself "the one predicate for
+#     owner-vs-gateway trust at the conversation boundary", and both
+#     task_detected_origin and the CC `supervised` flag already derive from it
+#     -- so deriving here too is what stops a THIRD notion of owner-trust
+#     existing next to those two. The practical difference is `web`: every
+#     OpenClaw HTTP completion arrives on it and its user_text is whatever the
+#     caller sent, which is not a thing that may write the user's identity file.
+#
+# Derived by CALLING the predicate, never by copying its channel set -- but be
+# precise about what that buys, because the obvious stronger claim is false: the
+# gate tracks a NARROWING of the predicate automatically, and tracks a widening
+# only for channels `_CHANNEL_ORIGIN` already classifies. A predicate widened to
+# some channel nobody has classified does NOT reach here. That lag is safe by
+# direction (narrower, never wider), not automatic, and the literal pin in
+# test_steering_set_is_owner_attended_only_and_narrower is what makes drift in
+# EITHER direction fail loudly.
+#
+# The universe is `_CHANNEL_ORIGIN` -- every channel anyone has classified --
+# and deliberately NOT `_PROCEDURE_EXTRACTION_CHANNELS`. Deriving one gate from
+# the other reads a set whose stated purpose is a different question, and makes
+# "steering is a strict subset of extraction" true by construction (A ∩ B ⊂ B)
+# rather than a claim worth asserting. Two independent derivations, one real
+# assertion between them.
+#
+# Do NOT "simplify" the two gates into one: doing so either grants Genesis
+# authorship of STEERING.md or strips reflection/surplus of procedure extraction.
+_STEERING_CHANNELS = frozenset(
+    channel for channel in _CHANNEL_ORIGIN if is_owner_attended_channel(channel)
+)
 
 
 # A STEERING.md rule must READ as a terse imperative directive addressed to
@@ -116,12 +188,28 @@ def build_triage_pipeline(
             if runtime is not None:
                 runtime.record_job_success("retrospective_triage")
             _record_call_site(triage_depth=None)
-        except Exception:
+        except Exception as exc:
             if runtime is not None:
-                runtime.record_job_failure("retrospective_triage", "pipeline exception")
+                # _fire_triage (inbox/monitor + cc/conversation) wraps this in a
+                # tracked_task but SWALLOWS the re-raise with a bare except+log,
+                # so no task.failed is ever emitted for this path. Let the funnel
+                # emit job.failed — it is the only bus signal this failure gets.
+                runtime.record_job_failure("retrospective_triage", "pipeline exception", exc=exc)
             raise
 
     async def _run_pipeline(output: Any, user_text: str, channel: str) -> None:
+        # WS-3: origin for the observations this pipeline writes ABOUT the session.
+        # retrospective/cc_debrief content characterizes the analyzed conversation,
+        # so it must inherit THAT conversation's channel trust — owner-attended
+        # (terminal/Telegram) → first_party; every gateway/inbox channel →
+        # external_untrusted (fail-closed). Without this an inbox/mail session's
+        # debrief "learnings" would stamp first_party and launder external content
+        # into L1/reflection. Stamped explicitly here (not source-derived: the
+        # source strings are channel-agnostic).
+        from genesis.cc.types import observation_origin_for_channel
+
+        obs_origin = observation_origin_for_channel(channel)
+
         # 1. Summarise
         summary = build_summary(
             output,
@@ -185,8 +273,11 @@ def build_triage_pipeline(
                 content=f"Outcome: {outcome.value}\n{triage.rationale}",
                 priority="medium",
                 category="learning",
+                origin_class=obs_origin,
             )
-            await route_learning_signals(db, delta, outcome, observation_writer)
+            await route_learning_signals(
+                db, delta, outcome, observation_writer, origin_class=obs_origin
+            )
 
             # 6.1. Drive adaptation (error-isolated — must not crash pipeline)
             try:
@@ -214,13 +305,43 @@ def build_triage_pipeline(
         # This legacy path (500-char summary extractor) remains as a fallback
         # during the transition. Remove after 2026-07-09.
         is_autonomous = summary.channel in _AUTONOMOUS_CHANNELS
-        if router is not None and (
-            outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS)
-            or (outcome == OutcomeClass.SUCCESS and is_autonomous)
+        if (
+            router is not None
+            # Fail-closed allow-list, checked BEFORE the outcome clauses: the
+            # failure-class clauses below are channel-agnostic, so without this
+            # an externally-writable user_text (inbox/mail) or a non-owner
+            # speaker (voice) reached the extractor on any failure outcome.
+            and summary.channel in _PROCEDURE_EXTRACTION_CHANNELS
+            and (
+                outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS)
+                or (outcome == OutcomeClass.SUCCESS and is_autonomous)
+            )
         ):
             try:
                 logger.debug("Running deprecated procedure extraction (legacy 500-char path)")
-                summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
+                # Both fields are untrusted, and this prompt's output becomes a
+                # STORED PROCEDURE that later sessions recall and follow — so an
+                # injection here PERSISTS, where the same trick against a grader
+                # skews one verdict. That makes it the highest-consequence
+                # instance of the class the grader prompts already closed, and it
+                # gets the SAME helper rather than a second mechanism: a
+                # per-payload delimiter proven absent from the payload it fences.
+                # Before this it was a bare f-string, so a response carrying
+                # `RESPONSE>>>` ended the region early and its own `## Outcome`
+                # heading landed where `_PROMPT_TEMPLATE`'s real one goes.
+                #
+                # The `[:500]` slice is PRE-EXISTING and deliberately left alone
+                # here: it is a silent truncation with no marker (the defect this
+                # PR fixed for the graders), but changing it would alter what this
+                # legacy path feeds the extractor, which is a separate decision.
+                # Fenced at the sliced value, so the delimiter is proven absent
+                # from the text actually emitted rather than from its longer source.
+                summary_text = "\n".join(
+                    [
+                        *fenced("Request", summary.user_text),
+                        *fenced("Response", summary.response_text[:500]),
+                    ]
+                )
                 await extract_procedure(
                     db,
                     summary_text=summary_text,
@@ -234,6 +355,12 @@ def build_triage_pipeline(
         # 6.6. STEERING.md auto-population from user corrections
         # Only extract from foreground user sessions — autonomous pipelines
         # (inbox, mail, reflection) must never write to identity files.
+        # This deny-list is NOT what protects the identity file: it fails OPEN
+        # for `voice` and for any channel nobody listed. The steering WRITE
+        # carries its own fail-closed owner allow-list, applied inside
+        # _extract_steering_rule (_STEERING_CHANNELS). This condition is left as
+        # it was so it keeps scoping the BIS correction capture below, which is
+        # a different question with a different answer.
         if (
             outcome == OutcomeClass.APPROACH_FAILURE
             and identity_loader is not None
@@ -243,9 +370,18 @@ def build_triage_pipeline(
                 written_rule = _extract_steering_rule(summary, identity_loader)
                 if written_rule:
                     # WS-3 B1 gate-2 (identity): shadow-record the steering
-                    # write, classified by CHANNEL (allow-map; unknown/voice ->
-                    # external_untrusted, fail-closed) -- so a deny-list escape
-                    # is OBSERVED. Owner channels self-guard to no row.
+                    # write, classified by CHANNEL (allow-map, fail-closed to
+                    # external_untrusted).
+                    # This no longer OBSERVES a deny-list escape, and the old
+                    # comment saying it did is retired: the owner allow-list now
+                    # lives INSIDE _extract_steering_rule, so a written_rule
+                    # implies an owner channel, origin_class is always "owner",
+                    # and is_blockable() short-circuits this to zero rows BY
+                    # DESIGN. Kept as the structural emit point -- if a non-owner
+                    # path ever reaches a write again, this records it instead of
+                    # staying silent -- and the `.get` default stays fail-closed
+                    # for that reason, though it is unreachable today. The
+                    # REFUSAL is what carries the signal now, logged at the gate.
                     # Best-effort, never raises; counts only, never content.
                     from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
                     from genesis.security import immunity_shadow
@@ -287,6 +423,7 @@ def build_triage_pipeline(
                 content=learning,
                 priority="low",
                 category="learning",
+                origin_class=obs_origin,
             )
 
     def _extract_steering_rule(
@@ -295,17 +432,49 @@ def build_triage_pipeline(
     ) -> str | None:
         """Extract a steering rule from a user correction and add to STEERING.md.
 
-        Fires only on approach_failure (gated upstream). A rule is written ONLY
-        if the user's text reads as a terse imperative directive addressed to
-        Genesis — see :func:`_looks_like_directive`. This defends against a
-        mis-classified chatty status update becoming a "hard constraint" (the
-        2026-06-30 incident, where a benign Telegram DM containing "its never
-        too late" was captured verbatim as a rule).
+        Fires only on approach_failure (gated upstream). Two further layers, both
+        fail-CLOSED, both applied HERE so the write is gated at its own function
+        rather than relying on the caller:
+
+        1. CHANNEL — the rule's author must be the owner
+           (:data:`_STEERING_CHANNELS`). The enclosing block's deny-list did not
+           list `voice`, so an ambient multi-speaker STT session could write the
+           user's identity file while the block's own shadow record classified
+           that same write external_untrusted and let it through
+           (``record_would_block`` only OBSERVES).
+        2. SHAPE — the text must read as a terse imperative directive addressed
+           to Genesis; see :func:`_looks_like_directive`. This defends against a
+           mis-classified chatty status update becoming a "hard constraint" (the
+           2026-06-30 incident, where a benign Telegram DM containing "its never
+           too late" was captured verbatim as a rule).
 
         Note: add_steering_rule() does synchronous file I/O (read + write
         STEERING.md). Acceptable because the file is tiny (<2KB) and local, and
         this runs in a fire-and-forget background task.
         """
+        if summary.channel not in _STEERING_CHANNELS:
+            # Log the REFUSAL: it is the only signal this attempt produces. The
+            # shadow row below fires on a WRITE, and a refused attempt never
+            # reaches one — so without this line a channel repeatedly trying to
+            # author the user's identity file would be entirely invisible.
+            #
+            # But SEVERITY is split, because the steady state matters more than
+            # the sentence above. `web` is live — every OpenClaw completion
+            # arrives on it — and the §6.6 deny-list does not stop it, so every
+            # OpenClaw approach_failure reaches this line BY DESIGN. Logging
+            # that at WARNING would make the warning routine, which is exactly
+            # how a signal written to read as an attack stops being read. A
+            # channel `_CHANNEL_ORIGIN` has classified is expected here; one
+            # nobody enumerated is the case this was written for.
+            expected = summary.channel in _CHANNEL_ORIGIN
+            logger.log(
+                logging.INFO if expected else logging.WARNING,
+                "Steering write refused: channel %r is not owner-attended "
+                "(_STEERING_CHANNELS). STEERING.md is user-sovereign.",
+                summary.channel,
+            )
+            return None
+
         user_text = (summary.user_text or "").strip()
         if not _looks_like_directive(user_text):
             return None

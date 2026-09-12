@@ -195,7 +195,8 @@ class TestUpdateAndFormatTrail:
 
 
 class TestObservationStorage:
-    def test_pivot_observation_written(self, tmp_path: Path) -> None:
+    @staticmethod
+    def _make_db(tmp_path: Path) -> Path:
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(str(db_path))
         conn.execute(
@@ -206,23 +207,76 @@ class TestObservationStorage:
                 content TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                expires_at TEXT
+                expires_at TEXT,
+                origin_class TEXT
             )"""
         )
         conn.commit()
         conn.close()
+        return db_path
+
+    def test_pivot_observation_written(self, tmp_path: Path) -> None:
+        db_path = self._make_db(tmp_path)
 
         _mod._record_pivot_observation(db_path, "test-session", "memory search", "let's search memory")
 
         conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT * FROM observations").fetchone()
+        row = conn.execute(
+            "SELECT source, type, content, expires_at, origin_class FROM observations"
+        ).fetchone()
         conn.close()
 
         assert row is not None
-        assert "session:test-session" in row[1]  # source
-        assert row[2] == "conversation_pivot"  # type
-        assert "memory search" in row[3]  # content
-        assert row[6] is not None  # expires_at should be set
+        assert "session:test-session" in row[0]  # source
+        assert row[1] == "conversation_pivot"  # type
+        assert "memory search" in row[2]  # content
+        assert row[3] is not None  # expires_at should be set
+
+    def test_pivot_origin_owner_when_no_session_origin(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """WS-3: interactive terminal (no GENESIS_SESSION_ORIGIN) → owner.
+
+        This is the only reachable case in production — the hook exits before
+        this writer when GENESIS_CC_SESSION==1 (the only context that also sets
+        GENESIS_SESSION_ORIGIN)."""
+        monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+        db_path = self._make_db(tmp_path)
+
+        _mod._record_pivot_observation(db_path, "s1", "topic", "trigger")
+
+        conn = sqlite3.connect(str(db_path))
+        origin = conn.execute("SELECT origin_class FROM observations").fetchone()[0]
+        conn.close()
+        assert origin == "owner"
+
+    def test_pivot_origin_honors_valid_session_origin(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Defensive belt: an explicit valid GENESIS_SESSION_ORIGIN wins."""
+        monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+        db_path = self._make_db(tmp_path)
+
+        _mod._record_pivot_observation(db_path, "s1", "topic", "trigger")
+
+        conn = sqlite3.connect(str(db_path))
+        origin = conn.execute("SELECT origin_class FROM observations").fetchone()[0]
+        conn.close()
+        assert origin == "external_untrusted"
+
+    def test_pivot_origin_falls_back_on_garbage_session_origin(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A typo'd/invalid origin must not be written — fail-closed to owner."""
+        monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "not-a-real-origin")
+        db_path = self._make_db(tmp_path)
+
+        _mod._record_pivot_observation(db_path, "s1", "topic", "trigger")
+
+        conn = sqlite3.connect(str(db_path))
+        origin = conn.execute("SELECT origin_class FROM observations").fetchone()[0]
+        conn.close()
+        assert origin == "owner"
 
 
 class TestHarnessEnvelopeFiltering:

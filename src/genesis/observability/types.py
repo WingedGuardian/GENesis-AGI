@@ -35,6 +35,11 @@ class Subsystem(StrEnum):
     OBSERVABILITY = "observability"
     GUARDIAN = "guardian"
     SENTINEL = "sentinel"
+    # The GenesisRuntime itself — pause/resume events (runtime/_pause_state.py).
+    # Was referenced there without being defined, so the emit raised AttributeError
+    # and was swallowed → pause/resume events were never recorded. Defining it
+    # restores that intended historical-visibility record.
+    RUNTIME = "runtime"
 
 
 class ProbeStatus(StrEnum):
@@ -91,6 +96,10 @@ class ProbeResult:
     message: str = ""
     checked_at: str = ""  # ISO datetime
     details: dict | None = None
+    # True when the DOWN was a timeout (vs a hard error like connection-refused).
+    # A timeout under a starved event loop is a scheduling artifact, not a real
+    # outage — critical_failure uses this to avoid firing on loop starvation.
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)

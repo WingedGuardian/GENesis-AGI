@@ -10,6 +10,22 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# WS-3 read-side origin gate. The origin classes trusted to surface content into
+# laundering-critical LLM context (essential_knowledge L1, the reflection /
+# perception prompt pipeline). NULL is EXCLUDED (fail-closed): after the origin
+# backfill (migration 0085) an unstamped row is an UNKNOWN-origin row, and an
+# unknown-origin observation must never reach a privileged surface.
+#
+# Two forms of the SAME trusted set:
+#  - SAFE_SURFACING_ORIGINS — for observations.query(origin_class_in=...) callers.
+#  - SAFE_ORIGIN_SQL — a raw predicate for the two essential_knowledge readers
+#    that build SQL directly (not via query()).
+# Literals (not imported from memory.provenance) to avoid a crud→memory layering
+# cycle; pinned equal to provenance.ORIGIN_OWNER/ORIGIN_FIRST_PARTY by
+# tests/test_db/test_observations.py::test_safe_surfacing_origins_match_constants.
+SAFE_SURFACING_ORIGINS: tuple[str, str] = ("owner", "first_party")
+SAFE_ORIGIN_SQL = "origin_class IN ('owner', 'first_party')"
+
 # Types that should NEVER expire — the observation IS the authoritative record.
 _PERMANENT_TYPES: frozenset[str] = frozenset(
     {
@@ -72,6 +88,29 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # aggregate infrastructure_alert (raised by the awareness cap detector when
         # a run of these accumulates) surfaces to the user.
         "cc_cap_empty_event",
+        # GitHub account-activity monitor — the Telegram ping (priority) and the
+        # 6h digest campaign are the delivery paths; these rows must NOT surface
+        # via the generic observation surfacers (would double-notify).
+        "github_account_activity",
+        "github_actor_seen",
+        # Owed first-time ping the monitor retries each tick until delivered —
+        # internal retry state, never a user-facing surface.
+        "github_ping_pending",
+        # Career-outreach monitor — per-draft "already nudged the owner" dedup
+        # marker. The owner nudge (Telegram) is the delivery path; these rows must
+        # NOT surface via the generic observation surfacers (would double-notify).
+        "career_outreach_nudged",
+        # Career bite-relay — per (company, stage) "already relayed this advance"
+        # dedup marker. A stage-advance is a POINT EVENT; the owner Telegram nudge is
+        # the delivery path, so these rows must NOT surface via the generic surfacers.
+        "career_bite",
+        # Ego questions channel — the Telegram question itself + the reactive
+        # signal are the delivery paths. Surfacing user_reply would echo the
+        # user's own answer back at them (double-notify); no_reply/not_delivered
+        # are internal ego state.
+        "user_reply",
+        "no_reply",
+        "not_delivered",
     }
 )
 
@@ -95,7 +134,14 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "light_reflection_candidate": timedelta(days=3),
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
+    # Ego questions channel — unanswered/undelivered are transient ego state.
+    "no_reply": timedelta(days=3),
+    "not_delivered": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
+    # ego cycle liveness: self-resolving + re-fireable, so a long TTL only delays
+    # the next re-fire; matches infrastructure_alert. Surfaces in the dashboard
+    # observations panel (deliberately NOT in INTERNAL_OBS_TYPES).
+    "ego_alert": timedelta(days=3),
     "cc_cap_empty_event": timedelta(days=3),
     "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
@@ -104,6 +150,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "task_detected": timedelta(days=1),
     "model_downgrade": timedelta(days=1),
     # ── 7-day (version tracking, operational) ──────────────────────────
+    # A captured user answer stays readable across a week of ego cycles.
+    "user_reply": timedelta(days=7),
     "conversation_pivot": timedelta(days=7),
     "genesis_version_change": timedelta(days=7),
     "memory_index": timedelta(days=7),
@@ -124,13 +172,15 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "sentinel_escalated": timedelta(days=7),
     "guardian_diagnosis": timedelta(days=7),
     "infrastructure_drift": timedelta(days=7),
+    # entity-resolution adjudication run summaries — a per-run diagnostic
+    # observation (memory/entity_adjudication.py), same class as guardian_diagnosis.
+    "entity_adjudication": timedelta(days=7),
     # ── 14-day (learning artifacts & assessments — also the DEFAULT) ───
     "build_state": timedelta(days=14),
     "project_context": timedelta(days=14),
     "learning": timedelta(days=14),
     "learning_regression": timedelta(days=14),
     "skill_evolution": timedelta(days=14),
-    "skill_proposal": timedelta(days=14),
     "scope_clarification": timedelta(days=14),
     "interpretation_correction": timedelta(days=14),
     "merged_observation": timedelta(days=14),
@@ -155,6 +205,35 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "test_isolation_gap": timedelta(days=30),
     "operational_gap": timedelta(days=30),
     "interaction_theme": timedelta(days=30),
+    # ── GitHub steward (account-activity monitor) ──────────────────────
+    # Activity events kept 30d for the 6h digest campaign to consume. The
+    # per-actor "seen" marker is written once (first sighting) and never
+    # deleted — the expiry sweep only flips resolved=1, it does not purge rows,
+    # and exists_by_hash checks all rows regardless of resolved state, so a
+    # contributor never decays back to "first-time". If a real purge job is ever
+    # added, give this type a no-expiry TTL to preserve that invariant.
+    "github_account_activity": timedelta(days=30),
+    "github_actor_seen": timedelta(days=90),
+    # Owed first-time ping, retried each ~2h tick. 7d cap: if a ping cannot be
+    # delivered for a week something is badly wrong and the 30d activity row is
+    # the backstop; short so an abandoned marker cannot linger.
+    "github_ping_pending": timedelta(days=7),
+    # Career-outreach monitor — per-draft "already nudged" dedup marker. 30d:
+    # long enough that a still-open staged draft is not re-nudged, bounded so an
+    # abandoned marker cannot linger. The external engine's own staged-draft state is
+    # the source of truth for draft counts; this row only records "owner already nudged".
+    "career_outreach_nudged": timedelta(days=30),
+    # Career bite-relay — per (company, stage) advance-relayed dedup marker. 365d
+    # (vs 30d for the re-emittable "N staged" nudge marker): a stage advance is a
+    # POINT EVENT, so the marker must permanently suppress a re-nudge across a full
+    # search cycle — long enough that a company sitting in one stage for months never
+    # re-fires. Checked with unresolved_only=False (a point event never re-emits).
+    # This TTL bounds the MARKER, not the guarantee: past 365d the row ages out, but the
+    # relay then re-derives it from the UNWINDOWED `outreach_history` delivered-topic
+    # lookup (`outreach.delivered_topic_exists`), which has no retention prune. So the
+    # at-most-once contract outlives this window by design — the TTL only keeps the
+    # observations table from carrying a marker it no longer needs to answer from.
+    "career_bite": timedelta(days=365),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
     # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the
@@ -167,6 +246,11 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # stays visible for adjudication.
     "skill_replay_verdict": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
+    # skill_proposal: the propose-only human-review queue — an autonomous skill
+    # edit staged for a human/CC to review + apply. Must NOT self-erase quickly
+    # (resolve_expired auto-resolves on TTL), which would silently empty the
+    # only safety queue; 60d gives real review headroom.
+    "skill_proposal": timedelta(days=60),
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),
     "architecture_risk": timedelta(days=60),
@@ -179,6 +263,18 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quarantined_reflection": timedelta(days=14),
     "code_audit": timedelta(days=14),
     "cc_memory_staleness": timedelta(days=14),
+    # WS-M PR-2 self-observation ideation — self-directed audits / gap-cluster /
+    # unblock / prompt-review output routed here (instead of the immortal KB) by
+    # surplus/intake.py Step 3a. Meta-observations about Genesis's own state:
+    # NOT in INTERNAL_OBS_TYPES (they surface in the dashboard observations panel
+    # for review), written at priority="low" so they never crowd the capped
+    # morning-report digest. 14d matches the sibling audit/meta types above.
+    "gap_clustering": timedelta(days=14),
+    "wing_audit": timedelta(days=14),
+    "self_unblock": timedelta(days=14),
+    "memory_audit": timedelta(days=14),
+    "procedure_audit": timedelta(days=14),
+    "prompt_effectiveness_review": timedelta(days=14),
     # provider_failure resolves on breaker recovery (ProviderEscalation); the
     # explicit TTL is only a backstop for a provider that never comes back
     # (= the previous implicit default, made explicit to silence the warning).
@@ -215,6 +311,20 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
     return _DEFAULT_TTL
 
 
+def _resolve_origin(origin_class: str | None, source: str) -> str | None:
+    """WS-3 write-boundary origin derivation for an observation row.
+
+    Delegates to :func:`genesis.memory.provenance.derive_observation_origin`
+    (explicit → session env → source-string → None/fail-closed). Local import
+    keeps the db.crud layer free of a module-level memory dependency. Returns
+    ``None`` for an unknown source BY DESIGN — the read side treats ``None`` as
+    external, so a missed writer degrades to cosmetically-excluded, never trusted.
+    """
+    from genesis.memory.provenance import derive_observation_origin
+
+    return derive_observation_origin(origin_class=origin_class, source=source)
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -232,6 +342,8 @@ async def create(
     skip_if_duplicate: bool = False,
     origin_class: str | None = None,
 ) -> str | None:
+    origin_class = _resolve_origin(origin_class, source)
+
     # Auto-compute content_hash if not provided
     if content_hash is None and content and content.strip():
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -272,6 +384,11 @@ async def create(
         # schema-level unique index (which would change semantics for every
         # other observation writer).
         cursor = await db.execute(
+            # WS-3: dedup identity includes origin_class (NULL-safe IS) so a
+            # less-trusted duplicate can't suppress a more-trusted one — e.g. a
+            # gateway (external) task_detected must NOT block the owner's identical
+            # Telegram/terminal request from being recorded with owner authority.
+            # Same-origin duplicates still dedup (monitors are single-origin).
             """INSERT INTO observations
                (id, person_id, source, type, category, content, priority,
                 speculative, created_at, expires_at, content_hash, origin_class)
@@ -279,8 +396,9 @@ async def create(
                WHERE NOT EXISTS (
                    SELECT 1 FROM observations
                    WHERE source = ? AND content_hash = ? AND resolved = 0
+                     AND origin_class IS ?
                )""",
-            (*params, source, content_hash),
+            (*params, source, content_hash, origin_class),
         )
         await db.commit()
         if cursor.rowcount == 0:
@@ -319,6 +437,7 @@ async def upsert(
     origin_class: str | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict."""
+    origin_class = _resolve_origin(origin_class, source)
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
@@ -387,6 +506,7 @@ async def query(
     category: str | None = None,
     resolved: bool | None = None,
     exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
     if sum(map(bool, (source, source_in, source_prefix))) > 1:
@@ -424,6 +544,15 @@ async def query(
         type_placeholders = ",".join("?" for _ in exclude_types)
         sql += f" AND type NOT IN ({type_placeholders})"
         params.extend(exclude_types)
+    if origin_class_in:
+        # SQL-level origin filter — applied BEFORE the LIMIT so barred rows can
+        # never crowd trusted rows out of the result window (the user-model
+        # poisoning-gate consumers pass the trusted set here). NULL origin_class
+        # is excluded by SQL IN-semantics (fail-closed), which is the intended
+        # behaviour for the privileged-read consumers.
+        oc_placeholders = ",".join("?" for _ in origin_class_in)
+        sql += f" AND origin_class IN ({oc_placeholders})"
+        params.extend(origin_class_in)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)
@@ -586,6 +715,7 @@ async def exists_recent_by_type(
     source: str,
     type: str,
     window_minutes: int = 30,
+    category: str | None = None,
     category_like: str | None = None,
     category_not_like: str | None = None,
 ) -> bool:
@@ -593,6 +723,8 @@ async def exists_recent_by_type(
 
     Used as a cooldown gate to prevent near-duplicate observations from
     LLM reflections that produce different wording for the same system state.
+    ``category`` scopes the check to an EXACT category (use this when the value
+    may contain SQL ``LIKE`` metacharacters, e.g. a skill name with ``_``).
     ``category_like`` / ``category_not_like`` scope the check to categories
     matching (or not matching) a SQL LIKE pattern (e.g. ``"%:user"``) so
     cooldowns can mirror an ego-visibility partition — a reflection visible to
@@ -608,6 +740,9 @@ async def exists_recent_by_type(
         "AND created_at > ? "
     )
     params: list = [source, type, cutoff]
+    if category is not None:
+        query += "AND category = ? "
+        params.append(category)
     if category_like is not None:
         query += "AND category LIKE ? "
         params.append(category_like)
@@ -986,6 +1121,14 @@ async def count_external_by_ids(
     just-accepted user-model deltas: external iff ANY contributing delta row
     carries ``origin_class='external_untrusted'``. NULL/legacy rows count as
     first-party by omission — pre-substrate rows must not manufacture signal.
+
+    WS-3 CAVEAT: this bare ``= 'external_untrusted'`` predicate treats NULL as
+    first-party, the OPPOSITE of the fail-closed READ contract
+    (``immunity.effective_origin_class(None) -> external``). Safe TODAY only
+    because this feeds the identity gate-2 SHADOW emit (observability, not
+    enforcement). Before that gate flips to ENFORCE, route this through
+    ``effective_origin_class`` (None->external) so a missed-writer / pre-backfill
+    NULL external row is not trusted. Tracked with the WS-3 read-side PR.
     """
     if not ids:
         return 0

@@ -89,6 +89,95 @@ class StandaloneAdapter:
         # dashboard route still needs the loop reference.
         self._app.config["GENESIS_EVENT_LOOP"] = self._loop
 
+        # Event-loop lag sampler — names the hog behind recall 503s. Dashboard
+        # routes bridge sync→async onto THIS loop and enforce their budget
+        # thread-side (dashboard/_blueprint.py), so when background cognition
+        # (awareness tick, reflection/session-observer dispatch, repo-bundle
+        # publish) blocks the loop, the recall coroutine can't progress and the
+        # route 503s even though recall itself is fast. This samples scheduling
+        # drift so a lag spike is timestamp-correlatable with those log lines.
+        # Cheap (wakes 2×/s, one subtraction); threshold + on/off are env levers.
+        from genesis.util.tasks import tracked_task
+
+        lag_sampler_task = None
+        if os.environ.get("GENESIS_LOOP_LAG_SAMPLER", "1").lower() not in (
+            "0",
+            "false",
+            "off",
+        ):
+            lag_sampler_task = tracked_task(
+                self._loop_lag_sampler(), name="loop-lag-sampler",
+            )
+
+        # Off-loop stall-stack sampler: the on-loop lag sampler above can only
+        # MEASURE a stall after it clears, so it never captures the synchronous
+        # frame that blocked the loop. This daemon thread reads the loop-health
+        # heartbeat and, when it goes stale (loop wedged NOW), snapshots the loop
+        # thread's stack. The stack shows where the loop WAS when sampled; it is
+        # evidence, not a verdict on the cause. Diagnostic-only.
+        stall_stop_event = None
+        if os.environ.get("GENESIS_LOOP_STALL_SAMPLER", "1").lower() not in (
+            "0",
+            "false",
+            "off",
+        ):
+            # The sampler is diagnostic-only: any failure to start it (import
+            # error, thread-limit RuntimeError from Thread.start under resource
+            # pressure) must disable only the sampler, never abort serve() before
+            # Flask/Telegram come up.
+            try:
+                if lag_sampler_task is None:
+                    logger.warning(
+                        "loop-stall sampler enabled but its heartbeat publisher "
+                        "(the loop-lag sampler, GENESIS_LOOP_LAG_SAMPLER) is "
+                        "disabled — the stall sampler will no-op until it runs",
+                    )
+                from genesis.util.loop_stall import (
+                    _MIN_STALL_MS,
+                    run_loop_stall_sampler,
+                )
+
+                try:
+                    stall_ms = float(os.environ.get("GENESIS_LOOP_STALL_MS", "1000"))
+                except ValueError:
+                    stall_ms = _MIN_STALL_MS
+                # float() accepts nan/inf/negatives, and a value below the ~500ms
+                # heartbeat cadence flags normal gaps as wedged — surface a
+                # misconfig (the sampler's __init__ also clamps as a backstop).
+                # `not (x > 0)` catches NaN (NaN>0 is False), 0, and negatives.
+                if (
+                    not (stall_ms > 0)
+                    or stall_ms == float("inf")
+                    or stall_ms < _MIN_STALL_MS
+                ):
+                    logger.warning(
+                        "GENESIS_LOOP_STALL_MS=%r invalid or below the %.0fms "
+                        "floor (heartbeat cadence); using %.0fms",
+                        stall_ms,
+                        _MIN_STALL_MS,
+                        _MIN_STALL_MS,
+                    )
+                    stall_ms = _MIN_STALL_MS
+                stall_stop_event = threading.Event()
+                # serve() runs on the event-loop thread, so this ident IS the loop's.
+                loop_thread_id = threading.get_ident()
+                threading.Thread(
+                    target=run_loop_stall_sampler,
+                    kwargs={
+                        "loop_thread_id": loop_thread_id,
+                        "stop_event": stall_stop_event,
+                        "stall_ms": stall_ms,
+                    },
+                    daemon=True,
+                    name="loop-stall-sampler",
+                ).start()
+            except Exception:
+                logger.warning(
+                    "loop-stall sampler failed to start; continuing without it",
+                    exc_info=True,
+                )
+                stall_stop_event = None
+
         # Create shared ConversationLoop for the OpenClaw endpoint.
         # Same pattern as _start_telegram() but without channel-specific
         # wiring (TTS, reply waiter, etc.).
@@ -138,13 +227,138 @@ class StandaloneAdapter:
                     uptime_h = (time.monotonic() - start_time) / 3600
                     logger.info("Standalone heartbeat: uptime=%.1fh", uptime_h)
 
-        from genesis.util.tasks import tracked_task
-
         heartbeat_task = tracked_task(_heartbeat(), name="standalone-heartbeat")
 
         # Block until shutdown
         await self._shutdown_event.wait()
         heartbeat_task.cancel()
+        if lag_sampler_task is not None:
+            lag_sampler_task.cancel()
+        if stall_stop_event is not None:
+            stall_stop_event.set()  # daemon thread exits its next wait()
+
+    async def _loop_lag_sampler(self) -> None:
+        """Sample event-loop scheduling drift; WARN when the loop stalls.
+
+        Sleeps a fixed interval and measures how much longer than the interval
+        the wake-up actually took — that excess is time the loop spent unable to
+        schedule ready callbacks. Drift alone does NOT say why: a synchronous
+        frame, a VM pause, a SIGSTOP and cgroup CPU starvation all delay
+        ``asyncio.sleep`` identically. When drift exceeds the threshold we log at
+        WARNING so the stall is timestamp-correlatable with awareness-tick /
+        dispatch / bundle log lines; establishing the CAUSE is the off-loop stack
+        sampler's job (util/loop_stall.py). This docstring previously claimed the
+        warning names what starves the recall coroutine behind route 503s — it
+        cannot, and that claim misdirected a real investigation.
+
+        The WARN also carries ``executor=`` — the default-executor pending depth
+        (PR-2c). Read ``pending`` and ONLY ``pending``: a sustained non-zero value
+        means ``to_thread`` work is backing up. ``workers`` is NOT an occupancy
+        gauge (see util/loop_diag.py) and says nothing about saturation.
+
+        Debounced per stall EPISODE: one WARNING when drift first crosses the
+        threshold, one INFO with the peak drift when it clears. A sustained
+        multi-minute stall (the worst case, and exactly when log noise competes
+        with other diagnostics) would otherwise emit a line every interval.
+
+        Env levers (no restart of the feature's *logic* required to retune):
+        ``GENESIS_LOOP_LAG_WARN_MS`` (default 250) — drift threshold to warn at;
+        ``GENESIS_LOOP_LAG_SAMPLER`` (0/false/off) — disables the sampler at
+        startup. Best-effort: any error ends the sampler without touching serve.
+        """
+        from genesis.util import loop_health
+        from genesis.util.loop_diag import default_executor_pending
+
+        interval = 0.5
+        try:
+            threshold_ms = float(os.environ.get("GENESIS_LOOP_LAG_WARN_MS", "250"))
+        except ValueError:
+            threshold_ms = 250.0
+        loop = asyncio.get_running_loop()
+        lagging = False
+        peak_ms = 0.0
+        try:
+            while not self._shutdown_event.is_set():
+                t0 = loop.time()
+                await asyncio.sleep(interval)
+                drift_ms = (loop.time() - t0 - interval) * 1000
+                executor = default_executor_pending()
+                if drift_ms > threshold_ms:
+                    peak_ms = max(peak_ms, drift_ms)
+                    if not lagging:
+                        # Entering a stall episode — warn once, then suppress
+                        # per-sample noise until it clears.
+                        lagging = True
+                        # Report the MEASUREMENT ONLY. This line used to assert
+                        # "background work is starving the loop; recall 503s
+                        # correlate here" on every episode. Nothing measured that
+                        # correlation, and it fires at a 250ms default threshold —
+                        # an order of magnitude under the 4.5s recall budget — so
+                        # it named a cause it could not have observed. It cost a
+                        # real investigation: the claim was taken as evidence, and
+                        # recall timeouts turned out to be read-pool checkout
+                        # contention, unrelated to loop lag.
+                        #
+                        # Drift measures only that callbacks could not be
+                        # scheduled. It does NOT establish that a synchronous
+                        # frame was responsible: a VM pause, SIGSTOP, cgroup CPU
+                        # starvation or plain descheduling delay asyncio.sleep()
+                        # identically. MEASURED — of 40 wedge dumps on one host, 5
+                        # caught the loop idle in `selectors.select`, i.e. not
+                        # blocked at all. Establishing a blocking frame is the
+                        # off-loop stack sampler's job (util/loop_stall.py), which
+                        # prints the actual stack; this line must not pre-empt it
+                        # with a guess, which is the very error above.
+                        #
+                        # `workers` is len(executor._threads) — threads ever
+                        # CREATED, which never shrinks. It is NOT an occupancy
+                        # gauge, and once the pool has touched its cap it reads
+                        # cap-forever, identically at rest and under load.
+                        # `pending` is the only saturation signal, so label it
+                        # rather than dumping a dict a reader will misread.
+                        pending = (executor or {}).get("pending")
+                        logger.warning(
+                            "event-loop lag %.0fms (interval %.0fms) — the loop "
+                            "could not schedule callbacks (cause NOT established "
+                            "here; see the loop-stall stack dump); executor "
+                            "queue-depth(pending)=%s of max_workers=%s "
+                            "[pending>0 means to_thread work is backing up; "
+                            "workers= is threads-ever-created, not busy count] "
+                            "%s (further lag suppressed until it clears)",
+                            drift_ms,
+                            interval * 1000,
+                            "unknown" if pending is None else pending,
+                            (executor or {}).get("max_workers", "unknown"),
+                            executor,
+                        )
+                elif lagging:
+                    # Episode cleared — report the peak so the stall's severity is
+                    # in the journal without the per-sample flood.
+                    logger.info(
+                        "event-loop lag cleared (peak %.0fms, drift back under %.0fms)",
+                        peak_ms,
+                        threshold_ms,
+                    )
+                    lagging = False
+                    peak_ms = 0.0
+                # Publish the reading OFF-loop every iteration so a sync Flask
+                # worker (and the watchdog via the HTTP probe) can read loop
+                # health during starvation — exactly when every @_async_route
+                # endpoint hangs on this same loop. If starvation is severe
+                # enough that asyncio.sleep stops returning, publishes cease and
+                # the sample's age grows: that growing age is the WEDGED signal.
+                loop_health.publish(
+                    loop_health.LoopHealthSample(
+                        drift_ms=drift_ms,
+                        peak_ms=peak_ms,
+                        lagging=lagging,
+                        threshold_ms=threshold_ms,
+                        executor=executor,
+                        sampled_monotonic=time.monotonic(),
+                    )
+                )
+        except asyncio.CancelledError:
+            pass
 
     async def _voice_last_breath(self) -> None:
         """Best-effort spoken shutdown notice via the held VoiceChannelAdapter.
@@ -334,6 +548,7 @@ class StandaloneAdapter:
             bridge = GenesisBridge(
                 voice_handler=voice_handler,
                 approval_gate=approval_gate,
+                runtime=self._runtime,
             )
 
             # S2S session manager — conversations land as per-turn transcript
@@ -419,6 +634,15 @@ class StandaloneAdapter:
         app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
         app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB (knowledge uploads)
 
+        # Internal API token + /api mutation gate. Mint the token once at boot
+        # (mode 0600) so trusted loopback/host callers can authenticate to /api
+        # mutations when a dashboard password is set. The gate is registered
+        # APP-LEVEL (not blueprint-level) so it covers every blueprint uniformly —
+        # the dashboard blueprint AND the separate outreach_api blueprint.
+        from genesis.dashboard.auth import apply_api_mutation_gate
+
+        apply_api_mutation_gate(app)
+
         # Login page (on app, not blueprint — must be reachable before auth)
         @app.route("/genesis/login")
         def genesis_login_page():
@@ -471,6 +695,19 @@ class StandaloneAdapter:
                     logger.exception("Failed to start dashboard heartbeat")
         except Exception:
             logger.exception("Failed to register dashboard blueprint")
+
+        # Outreach liveness heartbeat — a dedicated daemon (NOT gated on dashboard
+        # registration) so outreach is monitored independent of Telegram channel
+        # registration. It self-gates to pulse only while the outreach scheduler is
+        # running (see outreach/heartbeat.py), so it is a no-op until/unless outreach
+        # actually runs; the cessation alert is enable-gated on Telegram being
+        # configured, so a dashboard-only install stays benign.
+        try:
+            from genesis.outreach.heartbeat import OutreachHeartbeat
+
+            OutreachHeartbeat(interval_seconds=60).start()
+        except Exception:
+            logger.exception("Failed to start outreach heartbeat")
 
         # Terminal WebSocket
         try:

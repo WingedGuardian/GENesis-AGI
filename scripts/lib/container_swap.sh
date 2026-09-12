@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# (sourced fragment, not an executable script — no shebang)
 # Live-activate container memory swap on a RUNNING incus/LXC container.
 # Sourced, not executed (no shebang) — host-setup.sh dot-sources it and its
 # caller runs under `set -euo pipefail`, so every step here must be errexit-safe.

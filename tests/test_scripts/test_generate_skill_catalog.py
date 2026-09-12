@@ -155,3 +155,285 @@ def test_scan_tier_relative_paths_under_repo_root(tmp_path):
     assert results[0]["path"] == str(
         Path(".claude") / "skills" / "gitnexus" / "gitnexus-cli"
     )
+
+
+# ---------------------------------------------------------------------------
+# _parse_frontmatter — description extraction across YAML scalar forms.
+#
+# The legacy regex (`description:\s*["\']?([^"\'\n]+)`) truncated the value at
+# the first apostrophe/quote/newline, dropping searchable text from the
+# catalog. These tests pin the full-value behavior for every scalar form the
+# real skill corpus uses. Name + keywords extraction is unchanged and its
+# happy path is guarded too. All fixtures synthetic — no live-repo dependence.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_frontmatter_plain_apostrophe_not_truncated():
+    """A plain scalar with apostrophes survives in full (was cut at the ')."""
+    content = (
+        "---\n"
+        "name: voice\n"
+        "description: Apply when Genesis writes as itself. "
+        "Not for the user's voice (that's other). Activate here.\n"
+        "keywords: [voice]\n"
+        "---\n# body\n"
+    )
+    r = _gen._parse_frontmatter(content, fallback_name="voice")
+    assert r["name"] == "voice"
+    assert r["description"] == (
+        "Apply when Genesis writes as itself. Not for the user's voice "
+        "(that's other). Activate here."
+    )
+    assert r["keywords"] == ["voice"]
+
+
+def test_parse_frontmatter_double_quoted_unescapes_and_keeps_full():
+    """A double-quoted scalar with escaped quotes is captured whole + unescaped."""
+    content = (
+        "---\n"
+        "name: gx\n"
+        'description: "Use when X. Examples: \\"Index this repo\\", \\"Reanalyze\\""\n'
+        "keywords: [a]\n"
+        "---\n"
+    )
+    r = _gen._parse_frontmatter(content, "gx")
+    assert r["description"] == 'Use when X. Examples: "Index this repo", "Reanalyze"'
+
+
+def test_parse_frontmatter_single_quoted_doubled_apostrophe():
+    """A single-quoted scalar with a doubled '' escape survives (was cut at ')."""
+    content = "---\nname: s\ndescription: 'It''s a thing'\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "s")
+    assert r["description"] == "It's a thing"
+
+
+def test_parse_frontmatter_plain_multiline_folds_indented_continuations():
+    """A plain scalar wrapped across indented lines folds into one line."""
+    content = (
+        "---\n"
+        "name: ci\n"
+        "description: Line one,\n"
+        "  line two,\n"
+        "  line three\n"
+        "keywords: [a]\n"
+        "---\n"
+    )
+    r = _gen._parse_frontmatter(content, "ci")
+    assert r["description"] == "Line one, line two, line three"
+
+
+def test_parse_frontmatter_plain_multiline_stops_at_next_key():
+    """Plain-scalar folding must not swallow the following (non-indented) key."""
+    content = (
+        "---\n"
+        "name: ci\n"
+        "description: Only this line.\n"
+        "keywords: [alpha, beta]\n"
+        "---\n"
+    )
+    r = _gen._parse_frontmatter(content, "ci")
+    assert r["description"] == "Only this line."
+    assert r["keywords"] == ["alpha", "beta"]  # not eaten by the description
+
+
+def test_parse_frontmatter_folded_block_scalar_joined():
+    """`>` folded block: indented continuation lines are collected (guard)."""
+    content = (
+        "---\nname: f\ndescription: >\n  Folded one\n  folded two\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "f")
+    assert r["description"] == "Folded one folded two"
+
+
+def test_parse_frontmatter_literal_block_scalar_joined():
+    """`|` literal block: collected the same way as folded (guard)."""
+    content = (
+        "---\nname: l\ndescription: |\n  Literal one\n  literal two\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "l")
+    assert r["description"] == "Literal one literal two"
+
+
+def test_parse_frontmatter_chomped_folded_indicator():
+    """`>-` chomping indicator is treated as a block scalar, not literal text."""
+    content = (
+        "---\nname: c\ndescription: >-\n  Chomped one\n  chomped two\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "c")
+    assert r["description"] == "Chomped one chomped two"
+
+
+def test_parse_frontmatter_folded_block_multi_paragraph():
+    """A blank line inside a block scalar is a paragraph break, not the end —
+    content after it must not be dropped (matches yaml.safe_load)."""
+    content = (
+        "---\nname: mp\ndescription: >\n"
+        "  Paragraph one line.\n"
+        "\n"
+        "  Paragraph two line.\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "mp")
+    assert r["description"] == "Paragraph one line. Paragraph two line."
+
+
+def test_parse_frontmatter_block_scalar_single_space_indent():
+    """Block content only needs to be MORE indented than the col-0 key; a
+    single leading space must not yield an empty description."""
+    content = (
+        "---\nname: sp\ndescription: |\n"
+        " One line.\n"
+        " Two line.\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "sp")
+    assert r["description"] == "One line. Two line."
+
+
+def test_parse_frontmatter_block_scalar_stops_at_col0_key():
+    """A block scalar still terminates at the next column-0 key (no absorb)."""
+    content = (
+        "---\nname: b\ndescription: >\n"
+        "  Folded body.\n"
+        "keywords: [x, y]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "b")
+    assert r["description"] == "Folded body."
+    assert r["keywords"] == ["x", "y"]
+
+
+def test_parse_frontmatter_indented_mapping_stops_at_sibling_key():
+    """When the whole frontmatter mapping is indented, a plain description must
+    stop at the SIBLING key (same indent as the description key), not fold it.
+    Matches yaml.safe_load -> 'useful'."""
+    content = "---\n  name: im\n  description: useful\n  keywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "im")
+    assert r["description"] == "useful"
+    assert r["keywords"] == ["x"]
+
+
+def test_parse_frontmatter_plain_scalar_skips_comment_line():
+    """An indented comment line ends a plain scalar (yaml ignores it) -> 'foo'."""
+    content = "---\nname: c\ndescription: foo\n  # a trailing comment\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "c")
+    assert r["description"] == "foo"
+
+
+def test_parse_frontmatter_block_scalar_keeps_hash_as_content():
+    """Inside a block scalar, '#' is literal content, not a comment
+    (yaml.safe_load folds it in)."""
+    content = (
+        "---\nname: h\ndescription: >\n  line one\n  # still content here\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "h")
+    assert r["description"] == "line one # still content here"
+
+
+def test_parse_frontmatter_deeper_indent_child_then_col0_key():
+    """A more-indented continuation folds; a col-0 sibling key stops it."""
+    content = "---\nname: d\ndescription: foo\n    deeper\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "d")
+    assert r["description"] == "foo deeper"
+    assert r["keywords"] == ["a"]
+
+
+def test_parse_frontmatter_missing_description_is_empty():
+    content = "---\nname: n\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "n")
+    assert r["name"] == "n"
+    assert r["description"] == ""
+
+
+def test_parse_frontmatter_no_frontmatter_uses_fallback_name():
+    r = _gen._parse_frontmatter("# just a heading\nsome text\n", "fallback")
+    assert r["name"] == "fallback"
+    assert r["description"] == ""
+    assert r["keywords"] == []
+
+
+def test_parse_frontmatter_keywords_flow_list_unchanged():
+    content = "---\nname: k\ndescription: d\nkeywords: [alpha, beta, gamma]\n---\n"
+    r = _gen._parse_frontmatter(content, "k")
+    assert r["keywords"] == ["alpha", "beta", "gamma"]
+
+
+def test_parse_frontmatter_plain_scalar_folds_across_blank_line():
+    """A plain scalar spans a blank line (yaml folds the paragraphs) -> both."""
+    content = "---\nname: a\ndescription: first\n\n  second\nkeywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "a")
+    assert r["description"] == "first second"
+
+
+def test_parse_frontmatter_inline_comment_stripped():
+    """An inline ' # comment' suffix on a plain scalar is removed (yaml)."""
+    content = "---\nname: a\ndescription: real text # author note\nkeywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "a")
+    assert r["description"] == "real text"
+
+
+def test_parse_frontmatter_double_quoted_unicode_escape_decoded():
+    r'''A double-quoted \u / \x escape decodes to the real character (yaml).'''
+    content = '---\nname: a\ndescription: "em\\u2014dash \\x20 gap"\nkeywords: [x]\n---\n'
+    r = _gen._parse_frontmatter(content, "a")
+    # — -> em dash, \x20 -> space; whitespace collapsed to single spaces.
+    assert r["description"] == "em—dash gap"
+    assert "—" in r["description"] and "u2014" not in r["description"]
+
+
+def test_parse_frontmatter_alias_bomb_is_refused_and_bounded():
+    """A YAML alias-multiplication payload is refused at the composer and the
+    parse falls back to the linear legacy regex — no object-graph expansion.
+    (Fails without _FrontmatterLoader's alias refusal.)"""
+    payload = ",".join(['"x"'] * 50)
+    refs = ",".join(["*a"] * 50)
+    content = f"---\nname: b\ndescription: &a [{payload}]\nkeywords: [{refs}]\n---\n"
+    r = _gen._parse_frontmatter(content, "b")
+    assert isinstance(r, dict)
+    # No alias expansion: keywords are the literal unexpanded tokens, not a
+    # multiplied structure, and the description stayed a short scalar.
+    assert len(r["keywords"]) <= 60
+    assert len(r["description"]) < 200
+
+
+def test_parse_frontmatter_merge_key_alias_is_refused():
+    """A YAML merge-key alias (`<<: *a`) is refused at the composer and routed to
+    the bounded legacy path — not expanded. (Pins compose_node coverage.)"""
+    content = (
+        "---\nname: m\ndescription: base &a real text\n"
+        "extra:\n  <<: *a\nkeywords: [x]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "m")
+    assert isinstance(r, dict)
+    assert len(r["description"]) < 200  # no alias-driven growth
+
+
+def test_parse_frontmatter_alias_as_mapping_key_is_refused():
+    """An alias used as a mapping key (`*a : v`) is refused → bounded legacy."""
+    content = "---\nname: k\ndescription: &a hello\n*a : world\nkeywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "k")
+    assert isinstance(r, dict)
+    assert len(r["description"]) < 200
+
+
+def test_parse_frontmatter_oversized_block_falls_back_bounded():
+    """A frontmatter block over the size cap skips YAML for the linear legacy
+    regex (no object-graph amplification). (Fails without the size cap.)"""
+    huge = "y" * (_gen._MAX_FRONTMATTER_CHARS + 5000)
+    content = f"---\nname: o\ndescription: {huge}\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "o")
+    assert r["name"] == "o"
+    assert len(r["description"]) <= len(content)
+
+
+def test_parse_frontmatter_pathological_input_is_bounded():
+    """Unterminated double-quote + many escapes must complete (no ReDoS/hang)
+    and never amplify beyond the input (no object graph)."""
+    big = '"' + ("\\a" * 200_000)  # unterminated quote, no closing "
+    content = f"---\nname: p\ndescription: {big}\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "p")
+    assert isinstance(r["description"], str)
+    assert len(r["description"]) <= len(content)

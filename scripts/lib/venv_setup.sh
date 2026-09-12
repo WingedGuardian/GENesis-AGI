@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# (sourced fragment, not an executable script — no shebang)
 # Genesis — shared venv/package-install helpers.
 # Sourced by install.sh and bootstrap.sh; not executable on its own.
 
@@ -11,7 +13,8 @@
 #
 # Return codes (callers decide severity):
 #   0 — installed and import-verified
-#   1 — blocked: <repo_dir> is a git worktree (message already printed)
+#   1 — blocked: <repo_dir> is a git worktree, OR git could not tell us whether
+#       it is one (message already printed)
 #   2 — pip ran but the package is not importable
 editable_install_guarded() {
     local repo_dir="$1"
@@ -21,9 +24,32 @@ editable_install_guarded() {
     # in a linked worktree. Checked against repo_dir explicitly (git -C), not
     # the caller's cwd — the installer may be invoked from anywhere.
     local git_common git_dir
-    git_common="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)"
-    git_dir="$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null)"
-    if [ -n "$git_common" ] && [ -n "$git_dir" ] && [ "$git_common" != "$git_dir" ]; then
+    # Guarded: `git rev-parse` exits 128 when repo_dir is not a repo OR under
+    # git's safe.directory "dubious ownership" refusal — realistic when the
+    # installer runs as a different user than the repo owner. A bare assignment
+    # would abort under the callers' `set -e`, returning 128 rather than this
+    # function's documented 0/1/2 contract; both callers mis-map that to
+    # "pip install completed but Genesis is not importable".
+    git_common="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)" || git_common=""
+    git_dir="$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null)" || git_dir=""
+
+    # UNDETERMINABLE MUST BLOCK. Letting empty vars fall through to the
+    # not-a-worktree path made the guard perform the exact install it exists to
+    # prevent: an editable install is system-wide state, so pointing it at a
+    # worktree redirects EVERY Genesis process to that worktree's code (the
+    # 2026-03-16 I/O death spiral). "I could not determine whether this is a
+    # worktree" is not evidence that it is not one — and the realistic cause is
+    # git's safe.directory refusal, which fires precisely when the installer
+    # runs as a different user than the repo owner.
+    if [ -z "$git_common" ] || [ -z "$git_dir" ]; then
+        echo "    BLOCKED: cannot determine whether $repo_dir is a git worktree."
+        echo "    (git rev-parse failed — not a repository, or refused for dubious"
+        echo "    ownership when the installer's user differs from the repo owner.)"
+        echo "    Refusing a system-wide editable install on an unverified checkout."
+        return 1
+    fi
+
+    if [ "$git_common" != "$git_dir" ]; then
         echo "    BLOCKED: pip install -e from a worktree redirects ALL system imports."
         echo "    Use PYTHONPATH=$repo_dir/src instead, or run from the main checkout."
         return 1

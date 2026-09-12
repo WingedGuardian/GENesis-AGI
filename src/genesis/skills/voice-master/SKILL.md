@@ -112,7 +112,11 @@ curate) × **whose voice** (user's [default] / stealth, see Stealth Mode).
    invent stale-able specifics (elapsed time like "four months building",
    star/line/version counts, adoption stats); if a number isn't given, omit it.
    Register scales with audience (see table); drop profanity at formality 3 and
-   above.
+   above. **First person is fine:** use I/my/me where they fit — "I" reads as
+   honest, not unprofessional; don't sterilize the pronoun out to sound
+   "objective." **Exclamation marks are fine:** use them where they feel natural
+   for energy or genuine enthusiasm; don't overdo it, but don't strip them out of
+   otherwise-human writing either.
 4. **Hand off to medium skill** — if a downstream skill exists for the medium
    (e.g., linkedin-post-writer), hand the voice-loaded content off for
    medium-specific formatting.

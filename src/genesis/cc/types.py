@@ -8,6 +8,33 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+# CC's spawn/escape-class tool names — the single source of truth for the restricted CC
+# sessions where spawning would escape the parent's tool restrictions: reflection (fully
+# read-only), the inbox/mail judges, the experimentation completion, sentinel-degraded.
+# (The inbox/mail judges are spawn-hardened here but NOT yet fully read-only — they still
+# leave Bash / MCP writes on external input; that boundary is a separate tracked
+# follow-up. Surplus is NOT here: its live executor runs via the tool-less Router, not a
+# claude -p session.)
+# Each of these lets a CHILD escape the lockdown with a fresh, unrestricted toolset
+# (Bash/Write/Edit):
+#   Agent    — spawns a subagent (the CURRENT Claude Code tool name; registered in
+#              util/tool_bootstrap.py CC_TOOLS, matched by the PreToolUse hook in
+#              .claude/settings.json).
+#   Task     — the OBSOLETE name for Agent, retained so a re-introduction is also denied.
+#   Workflow — orchestrates/spawns subagents (reachable inside background sessions —
+#              see .claude/docs/background-sessions.md).
+#   Skill    — invokes a skill, some of which run in a subagent.
+# NOT applied to ``cc/direct_session`` (its ``research`` profile runs a DOCUMENTED
+# deep-research Workflow — .claude/docs/background-sessions.md) or the autonomy-executor
+# sessions; those legitimately spawn/orchestrate and need a separate design (a
+# sandbox-preserving Workflow, or an accepted-porousness decision) — tracked follow-up.
+# Blocking the bare tool name removes it from the model's context entirely — and only
+# --disallowedTools removes a tool (--allowedTools does NOT, under
+# --dangerously-skip-permissions; verified empirically 2026-08-07 via the init-event
+# tool list). Home is this leaf module so every site can reference it with no new
+# import edge (all denylist sites already import from genesis.cc.types).
+SPAWN_TOOL_NAMES: tuple[str, ...] = ("Agent", "Task", "Workflow", "Skill")
+
 
 class SessionType(StrEnum):
     FOREGROUND = "foreground"
@@ -51,6 +78,98 @@ class ChannelType(StrEnum):
     WHATSAPP = "whatsapp"
     WEB = "web"
     VOICE = "voice"
+
+
+def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
+    """Whether ``direct_session_run(deliver_to_origin=True)`` can actually deliver a
+    background result back to an origin on this channel.
+
+    Single source of truth, mirrored by ``DirectSessionRunner._resolve_origin_target``:
+    that resolver returns a real ``(chat_id, thread_id)`` target ONLY for Telegram
+    origins (a Telegram voice message arrives on the ``telegram`` channel — the
+    ``VOICE`` channel is the separate S2S surface, which has no addressable thread).
+    Every other channel (WEB/OpenClaw, WhatsApp, VOICE, terminal) falls back to the
+    default owner surface. The channel research-reroute nudge is gated on this so it
+    never promises "I'll report back to this conversation" on a channel where the
+    delivery model would silently redirect the result to the owner surface instead.
+    """
+    if channel is None:
+        return False
+    value = channel.value if isinstance(channel, ChannelType) else str(channel)
+    return value == ChannelType.TELEGRAM.value
+
+
+def is_owner_attended_channel(channel: ChannelType | str | None) -> bool:
+    """Whether a conversation on *channel* is owner-authenticated at the message
+    boundary — the single owner-ATTENDED channel set (terminal, Telegram).
+
+    Every gateway channel (web/OpenClaw, WhatsApp, voice) is NOT owner-
+    authenticated when a message arrives, and an unknown/None channel is treated
+    as not-attended (fail-closed). This is the one predicate for owner-vs-gateway
+    trust at the conversation boundary; both :func:`task_detected_origin` (what
+    origin a detected task carries) and the CC ``supervised`` flag (gate-4
+    pushed-surfaces enforce exemption) derive from it, so they can never diverge.
+    """
+    value = channel.value if isinstance(channel, ChannelType) else str(channel or "")
+    return value in (ChannelType.TERMINAL.value, ChannelType.TELEGRAM.value)
+
+
+def session_origin_for_channel(channel: ChannelType | str | None) -> str | None:
+    """``CCInvocation.origin`` for a CONVERSATION session on *channel*.
+
+    Owner-attended (terminal/Telegram) → ``None``: the invoker leaves
+    ``GENESIS_SESSION_ORIGIN`` unset and the memory/observation chokepoints
+    coalesce server/foreground writes to first_party (unchanged behaviour).
+    Every gateway channel (web/OpenClaw, WhatsApp, voice) → ``external_untrusted``
+    so the session's OWN memory/``observation_write`` calls are stamped untrusted —
+    without this a gateway session runs with no origin env and its writes coalesce
+    to first_party (mcp/memory/observations.py), which the read-side origin gate
+    would then TRUST (the producer half of the gate-4 channel fix). Fail-closed:
+    an unknown/None channel → external_untrusted.
+    """
+    if is_owner_attended_channel(channel):
+        return None
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
+    return ORIGIN_EXTERNAL_UNTRUSTED
+
+
+def observation_origin_for_channel(channel: ChannelType | str | None) -> str:
+    """WS-3 ``origin_class`` for an OBSERVATION whose trust follows the analyzed
+    conversation's channel (e.g. a retrospective/debrief the learning pipeline
+    writes ABOUT a session on *channel*).
+
+    Owner-attended (terminal/Telegram) → ``first_party``; every other channel
+    (web/OpenClaw, WhatsApp, voice, inbox, or unknown) → ``external_untrusted``
+    (fail-closed). Note the polarity difference from
+    :func:`session_origin_for_channel`, which returns ``None`` for owner-attended:
+    an OBSERVATION with NULL origin is EXCLUDED from surfacing (the read side
+    treats NULL as external), so an owner-attended observation must carry an
+    EXPLICIT ``first_party`` to survive — it cannot rely on a NULL coalesce.
+    Local import keeps cc.types dependency-light.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_FIRST_PARTY
+
+    return ORIGIN_FIRST_PARTY if is_owner_attended_channel(channel) else ORIGIN_EXTERNAL_UNTRUSTED
+
+
+def task_detected_origin(channel: ChannelType | str | None) -> str:
+    """WS-3 origin_class to stamp on a ``task_detected`` observation, by channel.
+
+    Owner-ATTENDED channels (terminal, Telegram) stamp ``owner`` — a task the
+    owner typed legitimately carries dispatch authority. Every gateway channel
+    (web/OpenClaw, WhatsApp, voice) is NOT owner-authenticated at the message
+    boundary, so its detected tasks are ``external_untrusted``: still visible,
+    but never auto-dispatch-authorized (the autonomy dispatcher's origin gate
+    bars them). Fail-closed: an unknown/None channel → external_untrusted.
+
+    Explicit here (not left to source-string derivation) because the write
+    source is the channel-agnostic ``conversation_intent`` — only the channel
+    distinguishes owner from gateway. Local import keeps cc.types dependency-light.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_OWNER
+
+    return ORIGIN_OWNER if is_owner_attended_channel(channel) else ORIGIN_EXTERNAL_UNTRUSTED
 
 
 class CCModel(StrEnum):
@@ -234,8 +353,18 @@ class CCInvocation:
     # (probe-verified 2026-07-09). Built-in tools remain available.
     safe_mode: bool = False
     # --strict-mcp-config: CC honors ONLY the servers in --mcp-config, ignoring
-    # user/project-scope MCP configs. Without it, mcp_config is additive.
-    strict_mcp_config: bool = False
+    # user/project-scope MCP configs. Without it, mcp_config is additive — CC
+    # merges in the user-scoped ~/.claude.json servers (gitnexus, codebase-memory,
+    # the claude.ai connectors) and, at repo cwd, project-scoped serena, none of
+    # which any Genesis denylist names. So the default is SECURE-BY-DEFAULT (True):
+    # every session gets --strict-mcp-config unless it opts out. Human-driven
+    # foreground/interactive sessions that legitimately want the full user-scoped
+    # toolset set strict_mcp_config=False explicitly (see cc/conversation.py,
+    # cc/checkpoint.py). A site that forgets fails CLOSED (loses the additive
+    # servers), never open. Pair strict with a real --mcp-config path (a genesis
+    # profile, or config/no_mcp.json for zero servers) — bare strict with no
+    # --mcp-config is an undocumented CC combination; avoid it.
+    strict_mcp_config: bool = True
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
     # Headless CC (-p) waits for dispatched background Workflow/subagent tasks
@@ -352,8 +481,8 @@ def cc_project_key(working_dir: str) -> str:
     CC names each project's transcript directory under
     ``~/.claude/projects/`` by replacing every non-alphanumeric character
     in the absolute path with ``-`` (consecutive separators are NOT
-    collapsed).  e.g. ``/home/u/.genesis/background-sessions`` →
-    ``-home-u--genesis-background-sessions`` (the ``/.`` becomes ``--``).
+    collapsed).  e.g. ``/home/USER/.genesis/background-sessions`` →
+    ``-home-USER--genesis-background-sessions`` (the ``/.`` becomes ``--``).
 
     Replicating the FULL encoding (not just ``/`` → ``-``) matters because
     the background-session dir is ``~/.genesis/...``: the leading dot must
@@ -379,7 +508,7 @@ class CCOutput:
     downgraded: bool = False
     via_proxy: bool = False
     # The roster model NAME selected at the chokepoint (genesis.cc.roster) — e.g.
-    # "claude" (native) or "glm-5.2". Ground truth for what we ROUTED to (set from
+    # "claude" (native) or a configured peer. Ground truth for what we ROUTED to (set from
     # apply_active), independent of the provider's self-reported model_used, which
     # may be a variant string or empty. Used for resume-endpoint persistence.
     roster_model: str = ""
@@ -390,6 +519,20 @@ class CCOutput:
     # user and/or a cc.bg_truncated observability event — so the silent-death
     # class (2026-07-20 deep-research) can never recur unremarked.
     bg_truncated: bool = False
+    # Tool names the RUNTIME observed, in first-seen order, from the stream's
+    # `tool_use` events. Out-of-band by construction: the model's own text
+    # cannot write this, whereas scraping tool names out of `text` cannot tell
+    # a tool that RAN from one the response merely talked about.
+    #
+    # THREE states, and the third is why this is not a plain tuple:
+    #   None -> no runtime report at all (a non-streaming `run()`, or a
+    #           hand-built CCOutput). Consumers fall back to whatever they can
+    #           derive, and must NOT read this as "no tools ran".
+    #   ()   -> the runtime watched the stream and saw no tool_use event.
+    #   (…,) -> the tools it saw.
+    # Collapsing the first two into () made "no report" indistinguishable from
+    # "reported zero", which turned an absence of evidence into a claim.
+    tools_used: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -402,6 +545,31 @@ class StreamEvent:
     tool_input: dict | None = None
     session_id: str | None = None
     raw: dict | None = None
+
+    #: Block types ``from_raw`` recognizes, in the order it tests them. Named so
+    #: a caller can ask "how many blocks would this line have produced?" without
+    #: re-implementing the extraction — see ``recognized_blocks``.
+    _RECOGNIZED_BLOCKS = ("thinking", "text", "tool_use")
+
+    @staticmethod
+    def recognized_blocks(raw: dict) -> int:
+        """How many blocks on an ``assistant`` line ``from_raw`` could have used.
+
+        ``from_raw`` returns on the FIRST recognized block, so anything past the
+        first is dropped. This counts the RECOGNIZED ones specifically: a line
+        carrying an unrecognized block (``redacted_thinking``, a future type)
+        alongside one recognized block loses nothing, and a canary that counted
+        raw length would cry wolf on it. Lives here, next to the loop it mirrors,
+        so the two cannot drift apart.
+        """
+        blocks = raw.get("message", {}).get("content", [])
+        if not isinstance(blocks, list):
+            return 0
+        return sum(
+            1
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") in StreamEvent._RECOGNIZED_BLOCKS
+        )
 
     @classmethod
     def from_raw(cls, raw: dict) -> StreamEvent:

@@ -7,14 +7,15 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from genesis.cc import roster
+from genesis.cc import peer_availability, rate_limit_park, roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
+    CCNetworkOfflineError,
     CCQuotaExhaustedError,
     CCRateLimitError,
     CCTimeoutError,
@@ -23,9 +24,20 @@ from genesis.cc.formatter import ResponseFormatter
 from genesis.cc.intent import IntentParser
 from genesis.cc.session_manager import SessionManager
 from genesis.cc.system_prompt import SystemPromptAssembler
-from genesis.cc.types import CCInvocation, CCModel, ChannelType, EffortLevel, StreamEvent
+from genesis.cc.types import (
+    CCInvocation,
+    CCModel,
+    ChannelType,
+    EffortLevel,
+    StreamEvent,
+    is_owner_attended_channel,
+    origin_delivery_supported,
+    session_origin_for_channel,
+    task_detected_origin,
+)
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
+from genesis.util import tz
 
 if TYPE_CHECKING:
     from genesis.cc.contingency import CCContingencyDispatcher
@@ -46,6 +58,46 @@ _BG_TRUNCATION_NOTICE = (
 def _bg_notice(output) -> str:
     """The truncation notice when a reply's background work was cut off, else ''."""
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
+
+
+# Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
+# durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
+# kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
+# Pairs with the merged delivery model (PR #1192): deliver_to_origin=true sends the
+# finished outcome back to THIS conversation, so the "I'll report back" promise is kept
+# instead of a successful background run going silent (the deferral condition in d7aedfdf).
+_BG_RESEARCH_ROUTING = (
+    "\n\n## Dispatching long-running work from this channel\n"
+    "Your turn here ends after you reply, and any deep-research or Workflow you run "
+    "inline is force-killed after about 10 minutes with only a partial result, with no "
+    "live session left to report back. So when a request needs deep or multi-source "
+    "research, or background work likely to run more than a few minutes, do NOT run it "
+    "inline. Call the `mcp__genesis-health__direct_session_run` tool "
+    '(profile="research", deliver_to_origin=true) with a clear task prompt, then reply '
+    "that it is running in the background and will report back with results when done. "
+    "That background session runs to completion and delivers the finished outcome — "
+    "success or failure — back to this exact conversation. Keep quick answers and short "
+    "tool use inline as usual."
+)
+
+
+def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
+    """Append the long-research routing nudge for channels the delivery model can
+    actually report back to.
+
+    The nudge tells the model to hand long research to the background lane with
+    ``deliver_to_origin=true`` and promise "I'll report back to this conversation."
+    That promise is only keepable where ``direct_session`` can resolve an origin
+    target — i.e. Telegram (see ``origin_delivery_supported``, the single source of
+    truth shared with ``DirectSessionRunner._resolve_origin_target``). On any other
+    channel (WEB/OpenClaw, WhatsApp, VOICE) the result would silently fall back to the
+    owner surface, so the nudge is withheld rather than promise a report-back the
+    delivery model cannot keep. Terminal is interactive anyway (user present), so
+    inline work is fine there.
+    """
+    if not origin_delivery_supported(channel):
+        return system_prompt
+    return (system_prompt + _BG_RESEARCH_ROUTING) if system_prompt else _BG_RESEARCH_ROUTING
 
 
 class ConversationLoop:
@@ -117,8 +169,19 @@ class ConversationLoop:
         channel: ChannelType,
         thread_id: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
-        """Process a user message and return the response text."""
+        """Process a user message and return the response text.
+
+        ``intent_text`` (WS-3): the OWNER-authored text to scan for slash intents
+        (/task, /model, /effort, /resume) when *text* is a composite the caller
+        built (e.g. a Telegram quote-reply = quoted bot message + owner reply).
+        Quoted bot text can relay external content (inbox digests, recon
+        findings), so scanning it would let that content forge an owner-authorized
+        /task or flip the model. When set, control tokens + task-intent content
+        come ONLY from ``intent_text`` while *text* stays the LLM prompt (so the
+        quoted context is preserved). ``None`` → scan *text* itself (unchanged).
+        """
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
@@ -127,11 +190,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -144,9 +214,14 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -209,6 +284,13 @@ class ConversationLoop:
                 )
                 resume_id = None
 
+            # Non-terminal (dispatched) channels end the turn after replying, so long
+            # inline work is killed at the CC bg-wait ceiling with nothing left to report
+            # back — nudge routing to the durable background lane (delivers back via
+            # deliver_to_origin). Applied on resume too (append_system_prompt=True carries
+            # it into the resumed session). See _apply_research_routing.
+            system_prompt = _apply_research_routing(system_prompt, channel)
+
             invocation = CCInvocation(
                 prompt=prompt_text,
                 model=model,
@@ -218,9 +300,20 @@ class ConversationLoop:
                 skip_permissions=True,
                 append_system_prompt=True,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
+                # Owner-attended interactive session: keep the full user-scoped
+                # MCP toolset. Opt OUT of secure-by-default strict scoping
+                # (see CCInvocation.strict_mcp_config).
+                strict_mcp_config=False,
                 **resume_overrides,
             )
 
@@ -271,10 +364,19 @@ class ConversationLoop:
                     "Contingency fallback failed after rate limit: %s", e,
                     exc_info=True,
                 )
-                return (
-                    "[Rate limit reached — Genesis is temporarily running in reduced mode. "
-                    "Background tasks are queued and will resume automatically.]"
+                # Both fallbacks failed → the user got no answer. Park the turn
+                # durably so it auto-resumes when capacity returns (rate_limit_park
+                # owns the reset parse, the cc_sessions resume-time write, and the
+                # mode-aware copy — replacing the old sentence nothing backed).
+                outcome = await rate_limit_park.park_conversation(
+                    self._db,
+                    prompt=prompt_text,
+                    origin_session_id=session["id"],
+                    exc=e,
+                    model=model,
+                    effort=effort,
                 )
+                return outcome.copy
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -353,11 +455,14 @@ class ConversationLoop:
         thread_id: str | None = None,
         session_key: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
         """Like handle_message but uses streaming for live progress.
 
         ``session_key`` (opaque) is stamped on the CC invocation so a caller's
         interrupt (Telegram /stop) targets this session's subprocess (cc-loop-01).
+        ``intent_text`` (WS-3): owner-authored text to scan for slash intents when
+        *text* is a composite (quote-reply) — see :meth:`handle_message`.
         """
         try:
             from genesis.runtime import GenesisRuntime
@@ -367,11 +472,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -384,9 +496,14 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -396,11 +513,9 @@ class ConversationLoop:
             self._db, user_id=user_id, channel=str(channel),
             thread_id=thread_id,
         )
-        session_was_reset = False
         if session and self._should_reset(session):
             self._session_locks.pop(session["id"], None)
             await self._session_mgr.complete(session["id"])
-            session_was_reset = True
             session = None
 
         model = intent.model_override or (
@@ -454,9 +569,15 @@ class ConversationLoop:
             # notify the user and inject conversation context.
             cc_sid = session.get("cc_session_id")
             recovery_context = ""
-            if not cc_sid and (session_was_reset or not session.get("message_count")):
+            # Every fresh (non-resumed) CC session gets the recovery recap —
+            # the old `or not session.get("message_count")` clause read a
+            # column that does not exist (always falsy), so this HAS always
+            # fired on fresh sessions; the condition now says so honestly.
+            if not cc_sid:
                 recovery_context = await self._build_recovery_context(
-                    user_id, channel, thread_id,
+                    str(chat_id) if chat_id else user_id.replace("tg-", ""),
+                    channel,
+                    thread_id,
                 )
                 if recovery_context and on_event:
                     await on_event(StreamEvent(
@@ -477,6 +598,15 @@ class ConversationLoop:
                 )
                 system_prompt = await self._enrich_with_context(
                     system_prompt, prompt_text,
+                )
+                # Always tell a fresh telegram session which chat it is in
+                # (enables the scoped conversation_history scroll-up). Use the
+                # REAL chat id (correct in groups); fall back to the DM
+                # convention (user id == chat id in private chats).
+                system_prompt += self._conversation_identity_block(
+                    str(chat_id) if chat_id else user_id.replace("tg-", ""),
+                    channel,
+                    thread_id,
                 )
                 if recovery_context:
                     system_prompt += (
@@ -499,6 +629,9 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
+            # Route long research off this turn to the durable background lane
+            # (dispatched channels end the turn). See _apply_research_routing.
+            system_prompt = _apply_research_routing(system_prompt, channel)
 
             invocation = CCInvocation(
                 prompt=prompt_text,
@@ -510,19 +643,46 @@ class ConversationLoop:
                 append_system_prompt=True,
                 session_key=session_key,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
+                # Owner-attended interactive session: keep the full user-scoped
+                # MCP toolset. Opt OUT of secure-by-default strict scoping
+                # (see CCInvocation.strict_mcp_config).
+                strict_mcp_config=False,
                 **resume_overrides,
             )
 
-            # Phase 3: track whether any answer TEXT streamed this turn. If it did,
-            # we must NOT fail over (re-streaming a peer's reply would double-output
-            # to the user); tool_use/system_notice progress is fine before a failover.
-            streamed = {"text": False}
+            # Phase 3: track what this turn actually DID. Two different stakes:
+            #
+            #   text  — answer text reached the user, so failing over would
+            #           double-output. Cosmetic-but-confusing.
+            #   tools — the peer executed MCP tools, so re-running the prompt on
+            #           another peer can REPEAT the effect: an outreach send, a
+            #           database write. These invocations carry the full
+            #           user-scoped toolset with permission checks skipped, so
+            #           there is nothing downstream to catch a duplicate.
+            #
+            # Only `text` was tracked before, and a comment here asserted
+            # "tool_use progress is fine before a failover". That was true while
+            # failover happened solely on an exception; it stopped being true when
+            # an empty non-error return also advanced to the next peer.
+            streamed = {"text": False, "tools": False}
 
             async def _failover_tracked(ev: StreamEvent) -> None:
-                if ev.event_type == "text" and ev.text:
+                # strip(): this flag is EVIDENCE — it gates the double-output
+                # guard and, in the failover loop, records the peer as having
+                # SERVED and clears stale blocks. A whitespace-only text block
+                # is truthy but shows the user nothing, so counting it let a
+                # silent-cap attempt erase a genuine quota block.
+                if ev.event_type == "text" and ev.text and ev.text.strip():
                     streamed["text"] = True
                 if on_event:
                     await on_event(ev)
@@ -578,10 +738,19 @@ class ConversationLoop:
                     "Contingency fallback failed after rate limit: %s", e,
                     exc_info=True,
                 )
-                return (
-                    "[Rate limit reached — Genesis is temporarily running in reduced mode. "
-                    "Background tasks are queued and will resume automatically.]"
+                # Both fallbacks failed → the user got no answer. Park the turn
+                # durably so it auto-resumes when capacity returns (rate_limit_park
+                # owns the reset parse, the cc_sessions resume-time write, and the
+                # mode-aware copy — replacing the old sentence nothing backed).
+                outcome = await rate_limit_park.park_conversation(
+                    self._db,
+                    prompt=prompt_text,
+                    origin_session_id=session["id"],
+                    exc=e,
+                    model=model,
+                    effort=effort,
                 )
+                return outcome.copy
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -675,10 +844,18 @@ class ConversationLoop:
         try:
             output = await self._invoker.run(invocation)
             return output, session
-        except (CCRateLimitError, CCQuotaExhaustedError, CCTimeoutError):
+        except (
+            CCRateLimitError,
+            CCQuotaExhaustedError,
+            CCTimeoutError,
+            CCNetworkOfflineError,
+        ):
             # Rate limits are account-wide, and a timeout is NOT a stale-resume
             # failure — retrying fresh won't help. A timeout retry just burns a
-            # second full window (the 2026-06-30 DM double-timeout). Let the
+            # second full window (the 2026-06-30 DM double-timeout). Likewise a
+            # network-offline preflight (PR-3): the resume session is fine, the
+            # internet is down — DON'T fail the live session as stale-resume and
+            # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
             raise
         except CCError:
@@ -692,6 +869,7 @@ class ConversationLoop:
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
                 session_id=session["id"], session_key=invocation.session_key,
+                channel=channel,
             )
             # Retry — if this also fails, the exception propagates to caller
             output = await self._invoker.run(fresh_inv)
@@ -715,9 +893,16 @@ class ConversationLoop:
         try:
             output = await self._invoker.run_streaming(invocation, on_event=on_event)
             return output, session
-        except (CCRateLimitError, CCQuotaExhaustedError, CCTimeoutError):
+        except (
+            CCRateLimitError,
+            CCQuotaExhaustedError,
+            CCTimeoutError,
+            CCNetworkOfflineError,
+        ):
             # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
-            # a timeout retry just burns a second full window (2026-06-30 DM).
+            # a timeout retry just burns a second full window (2026-06-30 DM). A
+            # network-offline preflight (PR-3) likewise must NOT fail the live
+            # session as a stale resume — the internet is down, not the session.
             raise
         except CCError:
             if not was_resume:
@@ -729,6 +914,7 @@ class ConversationLoop:
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
                 session_id=session["id"], session_key=invocation.session_key,
+                channel=channel,
             )
             output = await self._invoker.run_streaming(fresh_inv, on_event=on_event)
             return output, session
@@ -741,6 +927,7 @@ class ConversationLoop:
         effort: EffortLevel,
         session_id: str | None = None,
         session_key: str | None = None,
+        channel: ChannelType | None = None,
     ) -> CCInvocation:
         """Build a fresh invocation (with system prompt, no resume)."""
         system_prompt = await self._assembler.assemble(
@@ -748,6 +935,9 @@ class ConversationLoop:
             session_id=session_id,
         )
         system_prompt = await self._enrich_with_context(system_prompt, prompt_text)
+        # A stale-resume retry rebuilds the prompt from scratch — re-apply the
+        # dispatched-channel research routing so the nudge isn't lost on recovery.
+        system_prompt = _apply_research_routing(system_prompt, channel)
         return CCInvocation(
             prompt=prompt_text,
             model=model,
@@ -758,8 +948,15 @@ class ConversationLoop:
             append_system_prompt=True,
             session_key=session_key,  # cc-loop-01: keep /stop working on retry
             roster_eligible=True,  # fresh retry stays roster-routable (no resume)
-            # WS-3 B4: owner-attended interactive conversation (fresh retry).
-            supervised=True,
+            # WS-3 B4/gate-4 (fresh retry): supervised ONLY for owner-attended
+            # channels (terminal/Telegram); gateway conversations stay
+            # unsupervised. Mirrors the primary invocation sites above.
+            supervised=is_owner_attended_channel(channel),
+            origin=session_origin_for_channel(channel),  # WS-3 gate-4 producer half
+            # Owner-attended interactive session: keep the full user-scoped MCP
+            # toolset. Opt OUT of secure-by-default strict scoping
+            # (see CCInvocation.strict_mcp_config).
+            strict_mcp_config=False,
         )
 
     @staticmethod
@@ -866,12 +1063,37 @@ class ConversationLoop:
             inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
         try:
             return await self._invoke_peer(inv, on_event)
-        except (CCRateLimitError, CCQuotaExhaustedError):
+        except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError):
+            # Offline joins the fast-re-raise (same class as CAVEAT A): a dead
+            # network is not a stale peer resume — retrying fresh won't help and
+            # must not mark the sticky peer session stale.
             raise
-        except CCError:
-            # Don't re-stream: nothing to recover if already fresh, and never retry
-            # once answer text has reached the user (would double-output).
-            if inv.resume_session_id is None or (streamed and streamed.get("text")):
+        except CCError as exc:
+            # Don't re-run: nothing to recover if already fresh, and never once
+            # answer text has reached the user (would double-output) — this is a
+            # full re-run of the same prompt on the same peer.
+            #
+            # And never for a provider refusal. A DRAINED prepaid account arrives
+            # here as a generic CCProcessError rather than CCQuotaExhaustedError,
+            # because the invoker's global classifier deliberately does not know
+            # the balance phrases (teaching it would let a drained BACKUP report
+            # the primary as down — see peer_availability._BALANCE_REFUSALS). So
+            # it lands on this branch and buys a full second invocation of the
+            # same dead peer before the caller ever classifies it. A fresh
+            # session cannot refill an empty balance.
+            #
+            # Module-level import, deliberately: a DEFERRED import here would sit
+            # inside the `except` block, and an ImportError from it is not a
+            # CCError — it would skip both handlers in the peer loop, land on the
+            # outer `except Exception`, and abandon every remaining peer. That is
+            # the same outage-amplifier shape the never-raises guard exists to
+            # prevent. `peer_availability` imports only stdlib and `genesis.env`,
+            # so there is no cycle to work around.
+            if (
+                inv.resume_session_id is None
+                or (streamed and streamed.get("text"))
+                or peer_availability.is_provider_refusal(exc)
+            ):
                 raise
             logger.warning(
                 "failover peer %s sticky resume failed — retrying fresh", peer_name,
@@ -912,7 +1134,62 @@ class ConversationLoop:
                 base_inv = replace(base_inv, system_prompt=system_prompt)
             peers = roster.failover_invocations(home, base_inv)
             if not peers:
+                # Say so. This is the one branch that degrades SILENTLY at the
+                # exact moment the fallback exists for — the subscription has
+                # capped and there is nothing to fail over to. The turn goes on
+                # to contingency and rate_limit_park, which do surface something
+                # to the user, but nothing anywhere names the actual cause: no
+                # usable peer is configured. `failover_chain` also drops any
+                # peer whose auth_env is unset, so "declared but keyless" lands
+                # here too and looks identical to "none declared".
+                logger.warning(
+                    "CC failover: no usable roster peer for home=%r — degrading "
+                    "to contingency. Declare one in "
+                    "~/.genesis/config/cc_roster.local.yaml (a peer whose "
+                    "auth_env key is unset is skipped).",
+                    home,
+                )
                 return None
+            async def _record_peer(fn, *args) -> bool:
+                """Run a peer_availability recorder OFF the event loop, safely.
+
+                The recorder itself is exhaustively guarded against raising,
+                because a raise here escapes into the peer loop and abandons
+                every REMAINING peer. Moving it to a worker thread put that
+                guarantee back at risk: `asyncio.to_thread` raises RuntimeError
+                once the default executor is shut down, which the outer handler
+                catches by returning None — abandoning the whole failover, which
+                is strictly worse than the lost row it was protecting. Advisory
+                bookkeeping must never decide whether the user gets an answer.
+
+                CancelledError is deliberately re-raised: it is a BaseException
+                and means the turn itself is going away.
+                """
+                try:
+                    return await asyncio.to_thread(fn, *args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("peer availability record failed", exc_info=True)
+                    return False
+
+            async def _remember_peer_session(out) -> None:
+                """Persist this peer's session id so the turn can be continued.
+
+                Only with a real session id: an empty one cannot resume anything.
+                One named writer rather than an inline block, so any future path
+                that ends the turn on a peer has exactly one thing to call.
+                """
+                if not getattr(out, "session_id", ""):
+                    return
+                await self._merge_session_metadata(
+                    session["id"],
+                    {"fallback_session": {
+                        "cc_session_id": out.session_id,
+                        "roster_model": peer_name,
+                    }},
+                )
+
             sticky = self._session_fallback_session(session)
             for peer_name, peer_inv in peers:
                 if streamed and streamed.get("text"):
@@ -923,23 +1200,85 @@ class ConversationLoop:
                         peer_name, peer_inv, sticky=sticky,
                         on_event=on_event, streamed=streamed,
                     )
-                except (CCRateLimitError, CCQuotaExhaustedError):
+                except (CCRateLimitError, CCQuotaExhaustedError) as exc:
+                    # The prose lives HERE, not in the availability record. This
+                    # handler previously logged nothing at all, while the record
+                    # persisted the provider's text into a file that is read into
+                    # every health snapshot and JSON-dumped into an LLM prompt.
+                    # The log is both the better home for it and outside that
+                    # exposure path, so the record carries no free text.
+                    logger.warning(
+                        "failover peer %s refused: %s", peer_name, exc, exc_info=True,
+                    )
+                    # Provider refused on a usage ceiling — real evidence about the
+                    # peer. Recording is advisory and never changes which peers are
+                    # tried; it exists so a blocked standby is VISIBLE, since the
+                    # roster admits a peer on credential presence alone.
+                    # to_thread: the recorder takes a lock with bounded retry
+                    # sleeps, then a tempfile write, fsync and replace. Run inline
+                    # it blocks the event loop — stalling every other conversation
+                    # during the very outage it exists to observe.
+                    # This branch is no longer refusals-only: since the MCP
+                    # exclusion, a tool's own 429 arrives HERE typed as a
+                    # rate-limit error and is correctly DECLINED as evidence.
+                    # So the declined-plus-streamed cleanup below applies on
+                    # this branch too — without it, a previously blocked peer
+                    # that just SERVED text stayed falsely blocked for days
+                    # because its clearing lived only on the generic branch.
+                    declined = not peer_availability.is_provider_refusal(exc)
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
+                    if streamed and streamed.get("text"):
+                        if declined:
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        # Text already reached the user this turn. Returning ""
+                        # (not None) stops the caller running contingency, which
+                        # would stack a SECOND answer on the first.
+                        return ""
                     continue  # this peer is also down → try the next one
-                except CCError:
+                except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
+                    # Routed through the SAME classifier on purpose: a local fault
+                    # (offline — which never left the box — our own timeout, an MCP
+                    # server crash, a stale sticky session) is a CCError here too,
+                    # but is not evidence about the peer. note_failure declines it,
+                    # so one local blip can't mark the whole standby fleet down.
+                    # Classified SEPARATELY from recording: `note_failure` returns
+                    # False for four different reasons, so reading its return as
+                    # "declined" let a transient write failure flip a refusal into
+                    # a recorded success.
+                    declined = not peer_availability.is_provider_refusal(exc)
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
+                    if streamed and streamed.get("text"):
+                        if declined:
+                            # The peer ANSWERED — text is on the user's screen —
+                            # and then a local fault ended the turn. A PRIOR block
+                            # must not survive an attempt that demonstrably served
+                            # from this peer; records only refresh during a home
+                            # outage, so a stale "blocked" stands for days.
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        return ""  # double-output guard, as above
                     continue
+                # Record availability only when the peer DEMONSTRABLY served the
+                # turn: a usable output, or answer text already on the user's
+                # screen. The degenerate empty non-error output (a silent cap)
+                # otherwise takes the success path below — behaviour identical to
+                # what shipped before this feature — and recording "available" on
+                # it would clear a real block with a turn that showed nothing.
+                # What to DO about that empty reply (advance? dead-end?) is retry
+                # policy, deliberately out of scope here; the effects-guard
+                # follow-up owns it.
+                usable = not output.is_error and bool((output.text or "").strip())
+                if usable or (streamed and streamed.get("text")):
+                    await _record_peer(peer_availability.note_success, peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
                 transitioned = fallback_state.enter(home, peer_name, "rate_limit")
-                if output.session_id:
-                    await self._merge_session_metadata(
-                        session["id"],
-                        {"fallback_session": {
-                            "cc_session_id": output.session_id,
-                            "roster_model": peer_name,
-                        }},
-                    )
+                await _remember_peer_session(output)
                 # Keep the session fresh. Cost + triage are intentionally NOT recorded
                 # for failover turns: CC's cost_usd is bogus for routed models, and
                 # triage must not attribute a peer model's output to the home model's
@@ -1189,50 +1528,163 @@ class ConversationLoop:
             logger.warning("Context injection skipped", exc_info=True)
         return system_prompt
 
+    # Total BYTE budget for the recovery recap (env-overridable settings
+    # lever: GENESIS_RECOVERY_CONTEXT_BUDGET). Sized so several full-length
+    # analytical replies survive — the old per-message 300-char HEAD chop
+    # dropped exactly the part that matters (numbered options/conclusions sit
+    # at the END of long replies; measured miss 2026-08-18: "option 3" at char
+    # ~3,850 of a 4,463-char reply).
+    RECOVERY_CONTEXT_BUDGET = 6000
+    RECOVERY_CONTEXT_MESSAGES = 20
+
+    @staticmethod
+    def _conversation_identity_block(
+        chat_ref: str,
+        channel: ChannelType,
+        thread_id: str | None,
+    ) -> str:
+        """One prompt block telling the session WHICH chat it is in, so it can
+        scroll up on demand. Without an explicit chat_id the model cannot make
+        a scoped ``conversation_history`` call — the 2026-08-18 failure mode
+        was a session truthfully claiming earlier context "isn't retrievable"
+        while the full thread sat one tool call away.
+
+        ``chat_ref`` is the REAL chat id (the handler's ``msg.chat.id`` —
+        negative for groups), optionally ``tg-``-prefixed. Never pass a
+        sender/user id here: in group/topic sessions the sender's personal id
+        is a valid-looking number that would misdirect scoped scroll-up at
+        the sender's private DM.
+        """
+        if str(channel) != "telegram":
+            return ""
+        chat_id_str = chat_ref.replace("tg-", "")
+        try:
+            int(chat_id_str)  # negative group ids are valid
+        except ValueError:
+            return ""
+        thread_note = f", thread_id={thread_id}" if thread_id else ""
+        # Scope the suggested call to the ACTIVE topic when in a forum thread —
+        # an unscoped group call would pull unrelated topics' messages.
+        thread_arg = f", thread_id={thread_id}" if thread_id else ""
+        return (
+            "\n\n## Conversation identity\n"
+            f"This is the Telegram chat with chat_id={chat_id_str}{thread_note}. "
+            "When the user references earlier conversation that is not in your "
+            "context, SCROLL UP before claiming it is unavailable: call "
+            f"`conversation_history(channel='telegram', chat_id={chat_id_str}"
+            f"{thread_arg}, limit=50)` (add `before=<oldest timestamp seen>` to "
+            "page further back). Messages return full-length."
+        )
+
     async def _build_recovery_context(
         self,
-        user_id: str,
+        chat_ref: str,
         channel: ChannelType,
         thread_id: str | None,
     ) -> str:
         """Load recent messages for session recovery context injection.
 
+        ``chat_ref``: the real chat id (optionally ``tg-``-prefixed; negative
+        for groups) — same contract as ``_conversation_identity_block``.
+
+        Byte-budgeted and TAIL-biased: messages are kept whole newest-first
+        until the budget runs low; a message too large for the remaining
+        budget keeps its END (marked with a leading ellipsis), because that is
+        where long analytical replies put their conclusions and option lists.
         Returns a formatted string of recent conversation, or "" if none.
         """
         if str(channel) != "telegram":
             return ""
         try:
+            import os
+
             from genesis.db.crud.telegram_messages import query_recent
 
-            # Extract numeric chat_id from user_id (tg-<id>)
-            chat_id_str = user_id.replace("tg-", "")
-            if not chat_id_str.isdigit():
+            try:
+                chat_id = int(chat_ref.replace("tg-", ""))
+            except ValueError:
                 return ""
-            chat_id = int(chat_id_str)
+
+            try:
+                budget = int(
+                    os.environ.get("GENESIS_RECOVERY_CONTEXT_BUDGET", "")
+                    or self.RECOVERY_CONTEXT_BUDGET,
+                )
+            except ValueError:
+                budget = self.RECOVERY_CONTEXT_BUDGET
+            budget = max(500, budget)
 
             messages = await query_recent(
                 self._db,
                 chat_id,
                 thread_id=int(thread_id) if thread_id else None,
-                limit=10,
+                limit=self.RECOVERY_CONTEXT_MESSAGES,
             )
             if not messages:
                 return ""
 
-            lines = []
-            for m in messages:
-                sender = m.get("sender", "?")
-                content = m.get("content", "")
-                if content:
-                    prefix = "User" if sender == "user" else "Genesis"
-                    # Truncate long messages
-                    if len(content) > 300:
-                        content = content[:300] + "..."
-                    lines.append(f"{prefix}: {content}")
+            def _tail_by_bytes(s: str, max_bytes: int) -> str:
+                """Longest end-slice of ``s`` whose UTF-8 length ≤ max_bytes, cut
+                on a CHARACTER boundary. Slicing raw bytes then decoding with
+                errors='ignore' drops only the leading partial multibyte char, so
+                the result is always valid UTF-8 (never a U+FFFD)."""
+                if max_bytes <= 0:
+                    return ""
+                encoded = s.encode()
+                if len(encoded) <= max_bytes:
+                    return s
+                return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
-            if not lines:
+            # Walk newest → oldest, spending the BYTE budget where recency is;
+            # then restore chronological order for readability. Bytes (not chars)
+            # so a multibyte-heavy transcript can't balloon the real payload ~3-4x.
+            kept: list[str] = []
+            remaining = budget  # bytes
+            for m in reversed(messages):
+                content = str(m.get("content") or "")
+                if not content:
+                    continue
+                prefix = "User" if m.get("sender") == "user" else "Genesis"
+                line = f"{prefix}: {content}"
+                # Charge the "\n" that "\n".join will insert before this line
+                # (one per line after the first) so the budget is enforced on the
+                # ACTUAL recap size, not the sum of lines alone.
+                sep = 1 if kept else 0
+                line_bytes = len(line.encode()) + sep
+                if line_bytes <= remaining:
+                    kept.append(line)
+                    remaining -= line_bytes
+                elif remaining - sep > 200:
+                    # Tail-keep: the end of a long reply carries its
+                    # conclusions/option lists — never the head alone. Measured
+                    # in bytes, cut on a char boundary so the recap stays valid
+                    # UTF-8. Reserve the separator + exact marker cost so the kept
+                    # entry (and its joining newline) fits.
+                    marker = f"{prefix}: …"
+                    tail = _tail_by_bytes(
+                        content, remaining - sep - len(marker.encode()),
+                    )
+                    kept.append(marker + tail)
+                    remaining = 0
+                else:
+                    # Doesn't fit and no room for a meaningful tail — STOP
+                    # rather than skip: appending a smaller OLDER message here
+                    # would leave an unmarked hole mid-recap.
+                    break
+                if remaining <= 0:
+                    break
+            if not kept:
                 return ""
-            return "\n".join(lines)
+            kept.reverse()
+            recap = "\n".join(kept)
+            logger.info(
+                "Recovery context built for chat %s: %d msgs, %d/%d bytes",
+                chat_id,
+                len(kept),
+                len(recap.encode()),
+                budget,
+            )
+            return recap
         except Exception:
             logger.warning("Failed to load recovery context", exc_info=True)
             return ""
@@ -1324,11 +1776,19 @@ class ConversationLoop:
         except Exception:
             logger.debug("User correction scan failed", exc_info=True)
 
-    def _should_reset(self, session: dict) -> bool:
+    def _should_reset(self, session: dict, *, now: datetime | None = None) -> bool:
         """Check if session is from a previous day boundary.
+
+        The boundary is local-midnight (``day_boundary_hour`` in the user's
+        timezone), not UTC-midnight — otherwise the daily reset fires at the
+        UTC-midnight instant instead of local midnight on any UTC-offset install
+        (see :func:`genesis.util.tz.local_day_boundary`).
 
         Supergroup topic sessions (thread_id set) are persistent — they
         only compact when CC context limits are hit, never by day boundary.
+
+        *now* is injectable for deterministic tests; defaults to the current
+        instant.
         """
         # Supergroup topic sessions are persistent — no daily reset
         if session.get("thread_id"):
@@ -1339,10 +1799,5 @@ class ConversationLoop:
         started_dt = datetime.fromisoformat(started)
         if started_dt.tzinfo is None:
             started_dt = started_dt.replace(tzinfo=UTC)
-        now = datetime.now(UTC)
-        boundary = now.replace(
-            hour=self._day_boundary_hour, minute=0, second=0, microsecond=0,
-        )
-        if now < boundary:
-            boundary -= timedelta(days=1)
+        boundary = tz.local_day_boundary(self._day_boundary_hour, now=now)
         return started_dt < boundary

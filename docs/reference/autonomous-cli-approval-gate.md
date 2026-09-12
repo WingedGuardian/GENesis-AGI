@@ -7,6 +7,26 @@ Approvals are delivered to Telegram with inline buttons and gated
 per-call-site so the system **pauses** a call site while an approval
 is in flight instead of queuing duplicate prompts.
 
+## Shipped default
+
+The gate ships **ON by default**: `config/autonomous_cli_policy.yaml` commits
+`manual_approval_required: true`, so a fresh clone is safe-by-default — no
+autonomous background Claude Code session runs without an explicit user approval.
+
+Note *which* layer provides that guarantee. The `AutonomousCliPolicy` dataclass
+default is also `True`, but that is **not** what protects a fresh install:
+`load_autonomous_cli_policy` honors the committed YAML value whenever the key is
+present (it is), so the **committed file — not the code default — is the effective
+default**. A guardrail test
+(`test_committed_policy_ships_manual_approval_required_true`) reads the committed
+YAML directly and pins it to `true`, so the safe default cannot silently regress.
+
+The gate is mandatory and non-negotiable in Genesis's own behavior: it ships on,
+and no code path bypasses, auto-approves, or default-offs it — every autonomous
+background session Genesis dispatches is rooted in an explicit user approval. (An
+operator ultimately controls their own install's config, but that is a deliberate
+act on their own machine, not a Genesis-provided way to run unattended.)
+
 ## Delivery destination
 
 Approvals are posted to the `"Approvals"` topic in the supergroup

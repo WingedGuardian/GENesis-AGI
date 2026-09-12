@@ -7,6 +7,7 @@ from functools import wraps
 
 from flask import Blueprint, jsonify, request
 
+from genesis.outreach.types import OWNER_FACING_CHANNELS_SQL_IN as _OWNER_CHANNELS
 from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
 
 logger = logging.getLogger(__name__)
@@ -56,16 +57,19 @@ async def get_queue():
     return jsonify(rows)
 
 
-@outreach_api.route("/engagement")
-@_async_route
-async def get_engagement():
-    if not _db:
-        return jsonify({"error": "not initialized"}), 503
-    cursor = await _db.execute(
-        "SELECT engagement_outcome, COUNT(*) as count FROM outreach_history "
-        "WHERE delivered_at >= datetime('now', '-7 days') "
-        "AND engagement_outcome IS NOT NULL "
-        "GROUP BY engagement_outcome"
+async def engagement_summary_7d(db) -> dict:
+    """7-day engagement summary over EXTERNAL outreach only (non-owner channel),
+    consistent with the snapshot/signal/reflection sites — otherwise owner-facing
+    Telegram housekeeping pollutes the rate (see genesis.outreach.types).
+
+    Standalone (db-injected) so it is testable without a Flask/event-loop bridge.
+    """
+    cursor = await db.execute(
+        f"SELECT engagement_outcome, COUNT(*) as count FROM outreach_history "  # noqa: S608
+        f"WHERE delivered_at >= datetime('now', '-7 days') "
+        f"AND engagement_outcome IS NOT NULL "
+        f"AND channel NOT IN ({_OWNER_CHANNELS}) "
+        f"GROUP BY engagement_outcome"
     )
     rows = await cursor.fetchall()
     summary = {r[0]: r[1] for r in rows}
@@ -73,12 +77,20 @@ async def get_engagement():
     # Count every positive engagement value, not just the literal 'engaged'
     # (see genesis.outreach.types.POSITIVE_ENGAGEMENT_OUTCOMES).
     engaged = sum(summary.get(k, 0) for k in POSITIVE_ENGAGEMENT_OUTCOMES)
-    return jsonify({
+    return {
         "period": "7d",
         "total": total,
         "breakdown": summary,
         "engagement_rate": engaged / total if total else 0,
-    })
+    }
+
+
+@outreach_api.route("/engagement")
+@_async_route
+async def get_engagement():
+    if not _db:
+        return jsonify({"error": "not initialized"}), 503
+    return jsonify(await engagement_summary_7d(_db))
 
 
 @outreach_api.route("/surplus")

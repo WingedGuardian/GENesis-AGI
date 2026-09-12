@@ -23,6 +23,7 @@ from .sanitize import (
     MAX_DIFF_BYTES,
     parse_diff,
     scan_diff,
+    scan_prose,
 )
 from .version_gate import (
     CONFIDENCE_THRESHOLD,
@@ -66,5 +67,6 @@ __all__ = [
     "read_install_version",
     "run_review_chain",
     "scan_diff",
+    "scan_prose",
     "write_review_log",
 ]

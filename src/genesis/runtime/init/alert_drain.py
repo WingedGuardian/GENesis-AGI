@@ -16,11 +16,8 @@ meaningful tick outreach is up; until then entries are kept and retried.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-_QUEUE_ROOT = Path.home() / ".genesis" / "alerts" / "queue"
 
 
 def wire(rt) -> None:
@@ -80,9 +77,15 @@ def _make_drainer(rt):
         return result.status in (OutreachStatus.DELIVERED, OutreachStatus.REJECTED)
 
     async def _drainer() -> None:
-        drained = await alert_queue.drain(_QUEUE_ROOT, _send)
+        # Resolve at drain time (call-time) via the GENESIS_HOME-aware resolver,
+        # so the queue root matches what watchdog writes and the test suite can
+        # isolate both through one seam (_isolate_alert_queue).
+        from genesis.env import alert_queue_root
+
+        root = alert_queue_root()
+        drained = await alert_queue.drain(root, _send)
         if drained:
             logger.info("Delivered %d queued alert(s) via outreach", drained)
-        alert_queue.prune(_QUEUE_ROOT)
+        alert_queue.prune(root)
 
     return _drainer

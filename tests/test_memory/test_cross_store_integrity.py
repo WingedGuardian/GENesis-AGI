@@ -29,6 +29,35 @@ def _store(db):
     )
 
 
+class TestDeleteHoldsPerIdLock:
+    """delete() runs its whole locate→delete→cascade under the memory's id-lock,
+    so a concurrent re-embed/reconcile-requeue of the same memory is serialized
+    and can't resurrect a vector. Assert the lock is HELD during the cascade."""
+
+    @pytest.mark.asyncio
+    async def test_delete_cascade_runs_under_lock(self, db, monkeypatch):
+        from genesis.memory._locks import memory_id_lock
+
+        await memory_crud.create(db, memory_id="mem-lk", content="x")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-lk",
+            created_at="2026-03-11T12:00:00",
+        )
+        held: dict[str, bool] = {}
+        real_delete_meta = memory_crud.delete_metadata
+
+        async def _spy(*args, **kwargs):
+            held["at_cascade"] = memory_id_lock("mem-lk").locked()
+            return await real_delete_meta(*args, **kwargs)
+
+        monkeypatch.setattr(store_mod.memory_crud, "delete_metadata", _spy)
+
+        await _store(db).delete("mem-lk")
+        assert held.get("at_cascade") is True
+        assert memory_id_lock("mem-lk").locked() is False  # released after
+
+
 class TestDeleteCascadesEntityMentions:
     """F4: delete() must cascade entity_mentions or leave dangling rows."""
 
@@ -112,3 +141,74 @@ class TestHotPathOffloadedToThread:
 
         # delete_point dispatched through to_thread (both collections)
         assert mock_del in seen
+
+
+class TestDeleteFailClosedOrdering:
+    """Point-first, fail-closed: a Qdrant delete failure must NOT drop the
+    SQLite rows (which would orphan the point as a ghost). Prevention half of
+    the cross-store consistency work."""
+
+    @pytest.mark.asyncio
+    async def test_delete_defers_when_qdrant_raises(self, db):
+        # A fully-embedded memory: metadata + FTS both present.
+        await memory_crud.create(db, memory_id="mem-x", content="keep me")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-x",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        with patch.object(store_mod, "delete_point", side_effect=RuntimeError("qdrant down")):
+            results = await _store(db).delete("mem-x")
+
+        # Deferred — nothing in SQLite was touched, memory stays coherent.
+        assert results["deferred"] is True
+        assert results["metadata"] is False
+        assert results["fts5"] is False
+        meta = await memory_crud.get_metadata(db, "mem-x")
+        assert meta is not None  # metadata row survived
+        fts = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_id = ?",
+            ("mem-x",),
+        )
+        assert fts[0][0] == 1  # FTS row survived
+
+    @pytest.mark.asyncio
+    async def test_delete_proceeds_when_point_gone(self, db):
+        # delete_point (MagicMock) does not raise → point confirmed gone →
+        # the SQLite layers are removed as normal.
+        await memory_crud.create(db, memory_id="mem-y", content="remove me")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-y",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        results = await _store(db).delete("mem-y")
+
+        assert "deferred" not in results
+        assert await memory_crud.get_metadata(db, "mem-y") is None
+        fts = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_id = ?",
+            ("mem-y",),
+        )
+        assert fts[0][0] == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_defers_when_locate_raises(self, db):
+        # If the point-location retrieve itself fails (Qdrant unreachable), the
+        # delete must defer without touching SQLite — we cannot prove the point is
+        # gone, so we must not drop the rows.
+        await memory_crud.create(db, memory_id="mem-z", content="keep me")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-z",
+            created_at="2026-03-11T12:00:00",
+        )
+        store = _store(db)
+        store._qdrant.retrieve = MagicMock(side_effect=RuntimeError("qdrant down"))
+
+        results = await store.delete("mem-z")
+
+        assert results["deferred"] is True
+        assert await memory_crud.get_metadata(db, "mem-z") is not None

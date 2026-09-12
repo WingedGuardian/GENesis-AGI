@@ -85,7 +85,7 @@ async def get_active_foreground(
         cursor = await db.execute(
             """SELECT * FROM cc_sessions
                WHERE session_type = 'foreground'
-                 AND status = 'active'
+                 AND status IN ('active', 'checkpointed')
                  AND user_id = ?
                  AND channel = ?
                  AND thread_id = ?
@@ -96,7 +96,7 @@ async def get_active_foreground(
         cursor = await db.execute(
             """SELECT * FROM cc_sessions
                WHERE session_type = 'foreground'
-                 AND status = 'active'
+                 AND status IN ('active', 'checkpointed')
                  AND user_id = ?
                  AND channel = ?
                  AND thread_id IS NULL
@@ -161,6 +161,57 @@ async def query_stale(
         (older_than,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def query_stale_foreground(
+    db: aiosqlite.Connection,
+    *,
+    older_than: str,
+) -> list[dict]:
+    """Return active FOREGROUND sessions idle since before *older_than*.
+
+    The inverse of :func:`query_stale` (which excludes foreground). Used by
+    the foreground-liveness reaper (D3): a foreground row stays ``active`` by
+    design so the next turn can ``--resume`` it, so a crash / OOM / restart
+    mid-turn leaves it ``active`` forever — indistinguishable from a healthy
+    resumable session. Voice foreground rows are excluded (they have their own
+    orphan sweep, :func:`complete_orphaned_voice_sessions`); a NULL source_tag
+    is treated as non-voice so legacy foreground rows are still swept.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM cc_sessions
+           WHERE status = 'active'
+             AND session_type = 'foreground'
+             AND COALESCE(source_tag, '') != 'voice'
+             AND last_activity_at < ?
+           ORDER BY last_activity_at ASC""",
+        (older_than,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def checkpoint_dark(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    checkpointed_at: str,
+) -> bool:
+    """Relabel a dark (abandoned) foreground row ``active`` → ``checkpointed``.
+
+    Non-destructive: touches only ``status`` / ``checkpointed_at``, never
+    ``cc_session_id`` / model / effort / metadata, so the row stays resumable
+    (``get_active_foreground`` matches ``checkpointed`` and
+    ``get_or_create_foreground`` flips it back to ``active`` on reuse). The
+    ``status = 'active'`` guard makes this a no-op (rowcount 0) when a
+    concurrent turn revived the row between the reaper's read and this write.
+    """
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
+        "WHERE id = ? AND status = 'active'",
+        (checkpointed_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 # reap_stale (bulk UPDATE → 'completed') was deleted. It relabeled
@@ -292,6 +343,58 @@ async def query_by_skill_tag(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def dispatch_info_for_proposals(
+    db: aiosqlite.Connection,
+    proposal_ids: list[str],
+) -> dict[str, dict]:
+    """Map ``proposal_id -> {session_id, transcript_path, output_excerpt}`` for
+    ego-dispatch sessions whose ego-proposal linkage is ``ego_proposal:<id>``
+    (set by ``direct_session._store_result``).
+
+    Matches on ``COALESCE(origin_caller_context, caller_context)``: a rate-limit
+    park→resume rewrites ``caller_context`` to ``rate_limit_resume:<park_id>`` and
+    carries the original ``ego_proposal:<id>`` on ``origin_caller_context``, so the
+    resumed (delivering) session would otherwise be invisible to this read (see
+    ``rate_limit_park.effective_caller_context``). One bounded query over the
+    passed id set (the caller caps it). Newest session wins per proposal — a resume
+    started later than its parked original, so its output correctly supersedes.
+    The excerpt is capped so the dashboard payload stays small — the full text
+    lives in ``metadata.output_text`` and the CC transcript at ``transcript_path``.
+    An unindexed scan of cc_sessions, acceptable for an on-demand dashboard read.
+    """
+    if not proposal_ids:
+        return {}
+    keys = [f"ego_proposal:{pid}" for pid in proposal_ids]
+    placeholders = ",".join("?" * len(keys))
+    _ctx = (
+        "COALESCE(json_extract(metadata, '$.origin_caller_context'), "
+        "json_extract(metadata, '$.caller_context'))"
+    )
+    cursor = await db.execute(
+        f"""SELECT id AS session_id,
+                   {_ctx} AS caller_context,
+                   json_extract(metadata, '$.transcript_path') AS transcript_path,
+                   json_extract(metadata, '$.output_text') AS output_text
+            FROM cc_sessions
+            WHERE json_valid(metadata)
+              AND {_ctx} IN ({placeholders})
+            ORDER BY started_at DESC""",
+        tuple(keys),
+    )
+    out: dict[str, dict] = {}
+    for r in await cursor.fetchall():
+        cc = r["caller_context"] or ""
+        pid = cc.split(":", 1)[1] if ":" in cc else ""
+        if not pid or pid in out:  # newest wins (DESC order above)
+            continue
+        out[pid] = {
+            "session_id": r["session_id"],
+            "transcript_path": r["transcript_path"],
+            "output_excerpt": (r["output_text"] or "")[:4000],
+        }
+    return out
+
+
 async def get_by_session_types(
     db: aiosqlite.Connection,
     session_types: set[str],
@@ -397,6 +500,7 @@ async def register_voice_session(
     id: str,
     started_at: str,
     channel: str = "voice_s2s",
+    satellite_id: str | None = None,
 ) -> bool:
     """Register a voice conversation session for memory extraction.
 
@@ -409,20 +513,29 @@ async def register_voice_session(
     make re-registration idempotent across restarts and replays.
     Returns True if a new row was inserted.
     """
+    # WS-3: voice is a gateway channel — far-field, multi-speaker STT means the
+    # user_text may be a non-owner human in the room, so it is NOT owner-attended
+    # (is_owner_attended_channel excludes it). Stamp external_untrusted durably so
+    # reflection_window_origin (which reads cc_sessions.origin_class) treats a
+    # reflection overlapping a voice session as external and does NOT launder its
+    # user_model_delta to first_party. A speaker-authenticated upgrade to owner is
+    # future W1b work. NULL would read as first_party — the exact hole this closes.
     cursor = await db.execute(
         "INSERT OR IGNORE INTO cc_sessions "
         "(id, cc_session_id, session_type, channel, model, source_tag, "
-        " status, started_at, last_activity_at) "
+        " status, started_at, last_activity_at, satellite_id, origin_class) "
         "VALUES (?, ?, 'foreground', ?, 'voice', 'voice', "
-        " 'active', ?, ?)",
-        (id, id, channel, started_at, started_at),
+        " 'active', ?, ?, ?, 'external_untrusted')",
+        (id, id, channel, started_at, started_at, satellite_id),
     )
     await db.commit()
     return cursor.rowcount > 0
 
 
 async def complete_orphaned_voice_sessions(
-    db: aiosqlite.Connection, *, idle_before: str,
+    db: aiosqlite.Connection,
+    *,
+    idle_before: str,
 ) -> int:
     """Mark ``active`` voice sessions idle since before ``idle_before`` completed.
 
@@ -454,7 +567,7 @@ async def get_extractable(
     status_ph = ",".join("?" for _ in statuses)
     cursor = await db.execute(
         f"SELECT id, cc_session_id, source_tag, last_extracted_at, "
-        f"       last_extracted_line, started_at "
+        f"       last_extracted_line, last_extracted_byte, started_at "
         f"FROM cc_sessions "
         f"WHERE source_tag IN ({tag_ph}) "
         f"  AND status IN ({status_ph}) "
@@ -471,12 +584,26 @@ async def update_extraction_watermark(
     *,
     last_extracted_line: int,
     last_extracted_at: str,
+    last_extracted_byte: int | None = None,
 ) -> bool:
-    """Update the extraction watermark for a session."""
-    cursor = await db.execute(
-        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
-        (last_extracted_at, last_extracted_line, id),
-    )
+    """Update the extraction watermark for a session.
+
+    ``last_extracted_byte`` is the incremental-resume hint (byte offset of the
+    START of line ``last_extracted_line``). When None the column is left
+    untouched, preserving any prior value — callers that computed a byte offset
+    pass it; legacy/reference paths omit it.
+    """
+    if last_extracted_byte is None:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
+            (last_extracted_at, last_extracted_line, id),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ?, "
+            "last_extracted_byte = ? WHERE id = ?",
+            (last_extracted_at, last_extracted_line, last_extracted_byte, id),
+        )
     await db.commit()
     return cursor.rowcount > 0
 
@@ -497,11 +624,26 @@ async def update_topic_and_keywords(
     *,
     topic: str,
     keywords: str,
+    topic_updated_at: str | None = None,
 ) -> bool:
-    """Update the session topic and keywords index."""
+    """Update the session topic and keywords index.
+
+    Stamps ``topic_updated_at`` alongside. ``last_extracted_at`` is NOT a
+    substitute and must not be used as the topic's age: it is written by
+    ``update_extraction_watermark``, a different function, and the extraction
+    job advances it unconditionally while calling THIS function only when it
+    actually has a topic. MEASURED on a live install: 219 of 899 rows carry a
+    watermark with no topic. The concurrent-session peer line compares this
+    stamp against the charter's ``mission_updated_at`` to decide which is the
+    more recent account of what a session is doing; using the watermark there
+    would let a pass that produced no topic suppress a genuinely newer mission.
+    """
+    from datetime import UTC, datetime  # local, matching this module's idiom
+
+    stamp = topic_updated_at or datetime.now(UTC).isoformat()
     cursor = await db.execute(
-        "UPDATE cc_sessions SET topic = ?, keywords = ? WHERE id = ?",
-        (topic, keywords, id),
+        "UPDATE cc_sessions SET topic = ?, keywords = ?, topic_updated_at = ? WHERE id = ?",
+        (topic, keywords, stamp, id),
     )
     await db.commit()
     return cursor.rowcount > 0

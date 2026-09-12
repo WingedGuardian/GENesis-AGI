@@ -24,7 +24,7 @@
 
         configFiles: [],
         // providerActivity moved to operationalVitals
-        errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 } },
+        errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 }, partial: false, sources_failed: [] },
         budgets: [],
         // providerHealthSummary removed — provider data now in health.api_keys
         routingConfig: null,
@@ -125,6 +125,7 @@
           expandedCycle: null,
           rejectingId: null,
           rejectReason: "",
+          resolveError: "",
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
         egoStatus: null,
@@ -193,11 +194,19 @@
         commsCategoryFilter: null,
         commsRejectingId: null,
         commsRejectReason: '',
+        commsResolveError: '',
+
+        // ── Directives & goals (ego visibility — read + user retire) ──
+        // Shared by the Chat-tab strips and the ego-modal Overview card.
+        egoDirectives: { active: [], resolved: [] },
+        egoGoals: { user: [], genesis_ego: [] },
+        retiringDirectiveId: null,
 
         // ── Memory tab state ──────────────────────────────────────
         memorySearch: { query: "", results: [], loading: false },
         memoryRecent: { items: [], total: 0, loading: false },
         memoryStats: {},
+        memoryIntegrity: {},
         memoryDetail: null,
         knowledgeQuery: "",
         knowledgeSearchResults: [],
@@ -270,7 +279,9 @@
         settingsData: {},         // domain_name → config object
         settingsEditing: null,    // domain being edited
         settingsViewing: null,    // readonly domain being viewed
-        systemTimezone: null,     // from /api/genesis/settings/timezone
+        systemTimezone: null,     // current tz from /api/genesis/settings/timezone
+        timezoneOptions: [],      // IANA zone list for the dropdown (from same GET)
+        timezoneSaving: false,    // true while a timezone POST is in flight
         settingsSaving: false,
         settingsRestartMessage: null,
 
@@ -282,7 +293,37 @@
         secretsEditing: {},       // key_name → true when input open
         secretsSaving: false,
         secretsValues: {},        // key_name → input value during edit
+        // ── First-run onboarding wizard (Setup card on Overview) ──
+        setupStatus: null,        // {onboarded,password_set,cc_oauth,llm_key_present,embedding_key_present,floor_met,identity_set}
+        setupCardDismissed: false,
+        pwNudgeDismissed: false,
+        setupStep: 1,             // 1=password 2=key 3=identity 4=done
+        setupBusy: false,
+        setupMsg: null,           // {type,text}
+        setupPassword: "",
+        setupProviderIdx: 0,
+        setupKeyValue: "",
+        setupKeyTest: null,       // 'testing' | {valid,error}
+        setupIdentity: "",
+        setupIdentityLoaded: false,
+        setupProviders: [
+          // Only routing-CONSUMED providers are offered, tagged by which floor leg
+          // they satisfy. Anthropic is excluded (no type:anthropic provider — Claude
+          // routes via OpenRouter); Voyage is excluded (rerank-only, not embedding);
+          // DeepSeek is excluded (enabled:false in model_routing.yaml).
+          {label: "OpenRouter (chat)",       keyName: "API_KEY_OPENROUTER", providerType: "openrouter", kind: "chat",      testable: true},
+          {label: "Groq (chat)",             keyName: "API_KEY_GROQ",       providerType: "groq",       kind: "chat",      testable: true},
+          {label: "Mistral (chat)",          keyName: "API_KEY_MISTRAL",    providerType: "mistral",    kind: "chat",      testable: true},
+          {label: "NVIDIA NIM (chat)",       keyName: "API_KEY_NVIDIA_NIM", providerType: "nvidia_nim", kind: "chat",      testable: false},
+          {label: "DeepInfra (embeddings)",  keyName: "API_KEY_DEEPINFRA",  providerType: "deepinfra",  kind: "embedding", testable: false},
+          {label: "Qwen / DashScope (embeddings)", keyName: "API_KEY_QWEN", providerType: "qwen", kind: "embedding", testable: false},
+        ],
         secretsMessage: null,     // {type, text}
+
+        // ── Readiness panel (persistent, Overview) — renders setupStatus; no new fetch ──
+        readinessPanelOpen: true,    // in-memory; smart-defaulted in loadSetupStatus (auto-collapsed at T3)
+        readinessPanelTouched: false, // set once the user toggles, so the smart default stops overriding
+        setupStatusStale: false,     // last refresh failed → the shown snapshot may be out of date
 
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
@@ -310,10 +351,14 @@
           comms: { state: "idle", lastSuccess: null, error: null },
           autonomyGrants: { state: "idle", lastSuccess: null, error: null },
           autonomySends: { state: "idle", lastSuccess: null, error: null },
+          campaigns: { state: "idle", lastSuccess: null, error: null },
+          watchlist: { state: "idle", lastSuccess: null, error: null },
+          knowledgeRecent: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
         _healthInterval: null,
+        _backupInterval: null,
         _activityInterval: null,
 
         _sessionsInterval: null,
@@ -393,13 +438,20 @@
 
         // ── Campaigns ──
         async fetchCampaigns() {
+          this.startFetch("campaigns");
           try {
             const resp = await fetchApi("/api/genesis/campaigns/list");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.campaignsList = data.campaigns || [];
+              this.finishFetch("campaigns");
+            } else {
+              this.failFetch("campaigns", "Campaigns endpoint returned an error");
             }
-          } catch (e) { console.warn("fetchCampaigns failed:", e); }
+          } catch (e) {
+            console.warn("fetchCampaigns failed:", e);
+            this.failFetch("campaigns", "Failed to fetch campaigns");
+          }
         },
         async openCampaignDetail(name) {
           try {
@@ -478,6 +530,10 @@
         _onTabChange(oldTab, newTab) {
           this._stopTabIntervals(oldTab);
           this._startTabIntervals(newTab);
+          // Class-fix for stale setup-status: any mutation elsewhere (Provider Keys,
+          // ego/Settings, the wizard) that changes the readiness signals is reflected
+          // when the user returns to Overview — no full page reload, no per-path patching.
+          if (newTab === "overview") { this.loadSetupStatus(); }
         },
 
         _stopTabIntervals(tab) {
@@ -511,6 +567,10 @@
               // Re-fit terminal on tab re-entry
               if (!first && this._xterm && this._fitAddon) { this._fitAddon.fit(); }
               if (first) { this.fetchComms(); this.fetchApprovals(); }
+              // Refresh directives/goals on every Chat activation (not just first)
+              // so re-entry can't show standing state that changed elsewhere while
+              // the dashboard stayed open. Rarely changes → refreshed here, not polled.
+              this.fetchEgoDirectivesGoals();
               this._commsInterval = setInterval(() => this.fetchComms(), 15000);
               this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
@@ -540,7 +600,7 @@
               this._autonomyInterval = setInterval(() => { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }, 30000);
               break;
             case "memory":
-              if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
+              if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); this.fetchMemoryIntegrity(); }
               break;
             case "knowledge":
               if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); this.fetchWatchlist(); }
@@ -600,6 +660,7 @@
             this.fetchEgoStatus(),
             this.fetchApprovals(),
             this.fetchObservationsSummary(),
+            this.loadSetupStatus(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -623,10 +684,23 @@
             this.fetchEgoStatus();
             this.fetchObservationsSummary();
           }, 15000);
+
+          // Fire-and-forget: drives the page-top backup banner on every tab. Must
+          // NOT gate initial paint — /backup/status shells out to git + systemctl,
+          // and backupBanner() is null-safe until backupStatus resolves (the banner
+          // just appears once it does). The banner reads the server-computed
+          // backup_health only — it does NOT depend on backupConfig, so there is no
+          // status/config fetch race and no need to fetch the config here.
+          this.fetchBackupStatus();
+          // Backup state changes slowly (6h cadence) and the route shells out to
+          // systemctl, so poll on a slow, separate cadence — catches an unattended
+          // scheduled-backup failure without a reload, at negligible cost.
+          this._backupInterval = setInterval(() => this.fetchBackupStatus(), 180000);
         },
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
+          if (this._backupInterval) clearInterval(this._backupInterval);
           for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
             this._stopTabIntervals(tab);
           }
@@ -948,7 +1022,11 @@
               const resp = await fetchApi("/api/genesis/files/upload", { method: "POST", body: form });
               if (resp && resp.ok) {
                 const data = await resp.json();
-                uploaded.push(data.filename);
+                // Only count a real string relpath: keeps uploaded.length honest for
+                // the success message AND guarantees uploaded.every(...) below never
+                // dereferences a non-string (defense-in-depth, matching the uploadRoot
+                // typeof guard on the next line — the backend always returns a string).
+                if (typeof data.filename === "string") uploaded.push(data.filename);
                 lastDir = data.path.substring(0, data.path.lastIndexOf("/"));
                 if (uploadRoot === null && typeof data.filename === "string") {
                   uploadRoot = data.path.slice(0, data.path.length - data.filename.length).replace(/\/$/, "");
@@ -969,8 +1047,28 @@
             this.fileUpload.success = uploaded.length === 1
               ? `Uploaded ${uploaded[0]} → ${dest}`
               : `Uploaded ${uploaded.length} files → ${dest} (${uploaded.join(", ")})`;
-            // Stay put — refresh the current directory in place (no jump to uploads).
-            if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
+            // Navigate the browser to WHERE the upload landed (was: stay put). For a
+            // folder upload, jump INTO the new top-level folder (uploadRoot/<name>),
+            // not its parent; a single loose file → its own directory; multiple loose
+            // files → the uploads root. Fall back to refreshing the current dir.
+            let navTarget;
+            if (droppedFolder) {
+              // Derive the folder from the SERVER-sanitized relpath (uploaded[] hold
+              // data.filename), NOT the raw client path: the backend rewrites unsafe
+              // chars (e.g. "Q3 (final)" → "Q3 _final_"), so navigating to the raw name
+              // would 404 and silently no-op — the very "can't see where it went" bug.
+              // Enter the top-level folder only when EVERY successful upload shares it
+              // (a single-folder drop). A multi-root drop — several folders, or a folder
+              // plus loose files — has no single destination, so land on the uploads
+              // root rather than hiding the rest of the upload inside one folder.
+              const seg = (uploaded[0] || "").split("/")[0];
+              const allShare = !!seg && uploaded.every((p) => p.includes("/") && p.split("/")[0] === seg);
+              navTarget = allShare ? `${uploadRoot}/${seg}` : uploadRoot;
+            } else {
+              navTarget = uploaded.length === 1 ? lastDir : uploadRoot;
+            }
+            if (navTarget) { this.fetchFiles(navTarget); }
+            else if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
           }
           if (failures.length) {
             this.fileUpload.error = `${failures.length} failed — ${failures.join("; ")}`;
@@ -1439,11 +1537,25 @@
         },
         async resolveCommsProposal(proposalId, status, userResponse) {
           try {
-            await fetchApi(`/api/genesis/comms/proposals/${proposalId}/resolve`, {
+            // Pin the resolve to the revision we rendered (optimistic-concurrency
+            // guard). Looked up from the same list the card renders; omit if not
+            // found → server resolves unguarded (as before this PR).
+            const prop = (this.commsProposals || []).find((p) => p.id === proposalId);
+            const payload = { status, user_response: userResponse || "" };
+            if (prop && prop.revision_num != null) payload.revision_num = prop.revision_num;
+            const resp = await fetchApi(`/api/genesis/comms/proposals/${proposalId}/resolve`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status, user_response: userResponse || "" }),
+              body: JSON.stringify(payload),
             });
+            if (resp && resp.status === 409) {
+              // Revised since rendered — surface a re-review prompt and refresh.
+              let msg = "This proposal was revised — re-review before resolving.";
+              try { const d = await resp.json(); if (d && d.message) msg = d.message; } catch {}
+              this.commsResolveError = msg;
+            } else {
+              this.commsResolveError = '';
+            }
             this.commsRejectingId = null;
             this.commsRejectReason = '';
             await this.fetchComms();
@@ -1468,6 +1580,12 @@
             const resp = await fetchApi("/api/genesis/memory/stats");
             if (resp && resp.ok) { this.memoryStats = await resp.json(); }
           } catch (e) { console.warn("Memory stats failed:", e); }
+        },
+        async fetchMemoryIntegrity() {
+          try {
+            const resp = await fetchApi("/api/genesis/memory/integrity");
+            if (resp && resp.ok) { this.memoryIntegrity = await resp.json(); }
+          } catch (e) { console.warn("Memory integrity failed:", e); }
         },
         async searchMemory() {
           if (!this.memorySearch.query.trim()) return;
@@ -1501,13 +1619,20 @@
 
         // ── Knowledge tab fetches ──────────────────────────────────
         async fetchKnowledgeRecent() {
+          this.startFetch("knowledgeRecent");
           try {
             const resp = await fetchApi("/api/genesis/knowledge/recent?limit=50");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.knowledgeRecent = data.units || [];
+              this.finishFetch("knowledgeRecent");
+            } else {
+              this.failFetch("knowledgeRecent", "Knowledge-recent endpoint returned an error");
             }
-          } catch (e) { console.warn("Knowledge recent failed:", e); }
+          } catch (e) {
+            console.warn("Knowledge recent failed:", e);
+            this.failFetch("knowledgeRecent", "Failed to fetch recent knowledge");
+          }
         },
         async fetchKnowledgeStats() {
           try {
@@ -1517,10 +1642,19 @@
         },
         // ── Tracked repositories (recon watchlist) ──────────────────
         async fetchWatchlist() {
+          this.startFetch("watchlist");
           try {
             const resp = await fetchApi("/api/genesis/recon/watchlist");
-            if (resp && resp.ok) { this.watchlistEntries = (await resp.json()).entries || []; }
-          } catch (e) { console.warn("Watchlist fetch failed:", e); }
+            if (resp && resp.ok) {
+              this.watchlistEntries = (await resp.json()).entries || [];
+              this.finishFetch("watchlist");
+            } else {
+              this.failFetch("watchlist", "Watchlist endpoint returned an error");
+            }
+          } catch (e) {
+            console.warn("Watchlist fetch failed:", e);
+            this.failFetch("watchlist", "Failed to fetch watchlist");
+          }
         },
         async addWatchlistRepo() {
           this.watchlistSaving = true; this.watchlistMsg = null;
@@ -1840,6 +1974,19 @@
           if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
           return { text: 'Active', color: '#81c784' };
         },
+        // Page-top banner: render the server-computed backup_health verdict. ALL
+        // health logic (precedence, staleness math, tier/backend resolution) lives
+        // server-side in routes/backup.py::_backup_health — the client only maps
+        // state → colour. Returns a styled {text,color,bg,border} for a warn/critical
+        // state, or null when healthy or backupStatus has not loaded yet.
+        backupBanner() {
+          const bh = this.backupStatus && this.backupStatus.backup_health;
+          if (!bh || bh.state === 'ok') return null;
+          const s = bh.state === 'critical'
+            ? { color: '#d9534f', bg: 'rgba(217,83,79,0.15)', border: '#d9534f' }
+            : { color: '#f0ad4e', bg: 'rgba(240,173,78,0.15)', border: '#f0ad4e' };
+          return { ...s, text: bh.reason };
+        },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
         backupScheduleLine() {
           const bs = this.backupStatus;
@@ -2131,11 +2278,56 @@
             const resp = await fetchApi("/api/genesis/settings");
             if (resp && resp.ok) { this.settingsDomains = await resp.json(); }
           } catch (e) { console.warn("Settings index failed:", e); }
-          // Also fetch the system timezone
+          // Also fetch the current timezone + the dropdown option list.
           try {
             const tzResp = await fetchApi("/api/genesis/settings/timezone");
-            if (tzResp && tzResp.ok) { this.systemTimezone = (await tzResp.json()).timezone; }
+            if (tzResp && tzResp.ok) {
+              const d = await tzResp.json();
+              this.systemTimezone = d.timezone;
+              this.timezoneOptions = Array.isArray(d.options) ? d.options : [];
+            }
           } catch (e) { /* ignore */ }
+        },
+        async saveTimezone(tz) {
+          // Write the chosen zone to genesis.yaml (the authoritative source) via
+          // the settings/timezone endpoint. Display updates immediately; scheduled
+          // jobs re-time on the next restart (hence the restart prompt).
+          if (!tz || tz === this.systemTimezone) { return; }
+          this.timezoneSaving = true;
+          try {
+            const resp = await fetchApi("/api/genesis/settings/timezone", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ timezone: tz }),
+            });
+            if (resp && resp.ok) {
+              const d = await resp.json();
+              this.systemTimezone = d.timezone || tz;
+              // A `warning` means the config file was malformed and has been REPLACED
+              // with a timezone-only file, with the original copied aside. Say so
+              // instead of the routine success line: the operator's network, GitHub
+              // and custom settings are no longer active, and the backup path is the
+              // only way back. Surfacing it in the restart banner is not enough on its
+              // own — an alert makes it impossible to miss, because the cost of
+              // missing it is silently running without the settings you configured.
+              if (d.warning) {
+                this.settingsRestartMessage = "\u26a0 " + d.warning;
+                alert(d.warning);
+              } else {
+                this.settingsRestartMessage =
+                  "Timezone set to " + this.systemTimezone +
+                  " — display updates now; most scheduled jobs re-time after a Genesis restart.";
+              }
+            } else {
+              const err = resp ? await resp.json().catch(() => ({})) : {};
+              alert("Timezone update failed: " + (err.error || "Unknown error"));
+            }
+          } catch (e) {
+            console.warn("saveTimezone failed:", e);
+            alert("Timezone update failed: network error");
+          } finally {
+            this.timezoneSaving = false;
+          }
         },
         async fetchSettingsData(domain) {
           try {
@@ -2146,14 +2338,27 @@
             }
           } catch (e) { console.warn(`Settings fetch ${domain} failed:`, e); }
         },
-        async saveSettings(domain) {
+        async saveSettings(domain, confirmGateDisable = false) {
           this.settingsSaving = true;
           try {
+            const payload = { ...this.settingsData[domain] };
+            if (confirmGateDisable) { payload.confirm_disable_approval_gate = true; }
             const resp = await fetchApi(`/api/genesis/settings/${domain}`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(this.settingsData[domain]),
+              body: JSON.stringify(payload),
             });
+            if (resp && resp.status === 409 && !confirmGateDisable) {
+              // Protected key: disabling the mandatory approval gate needs an
+              // explicit human confirmation, then a single retry with the flag.
+              const err = await resp.json().catch(() => ({}));
+              this.settingsSaving = false;
+              const detail = typeof err.details === "string" ? err.details : "This disables the mandatory approval gate for ALL autonomous sessions.";
+              if (window.confirm(detail + "\n\nProceed?")) {
+                return this.saveSettings(domain, true);
+              }
+              return;
+            }
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
@@ -2164,7 +2369,8 @@
               if (d.needs_restart) { this.settingsRestartMessage = "Settings saved. Restart Genesis server to apply."; }
             } else {
               const err = await resp.json().catch(() => ({}));
-              alert("Save failed: " + (err.details ? err.details.join(", ") : err.error || "Unknown error"));
+              const detail = Array.isArray(err.details) ? err.details.join(", ") : (err.details || err.error || "Unknown error");
+              alert("Save failed: " + detail);
             }
           } catch (e) { alert("Save failed: " + e.message); }
           this.settingsSaving = false;
@@ -2187,12 +2393,41 @@
           } catch (e) { console.warn("Secrets fetch failed:", e); }
         },
         toggleSecretEdit(keyName) {
-          this.secretsEditing = {...this.secretsEditing, [keyName]: !this.secretsEditing[keyName]};
-          if (!this.secretsEditing[keyName]) { delete this.secretsValues[keyName]; }
+          const opening = !this.secretsEditing[keyName];
+          this.secretsEditing = {...this.secretsEditing, [keyName]: opening};
+          if (!opening) { delete this.secretsValues[keyName]; return; }
+          // SEED the buffer from the current value. Without this it stays undefined
+          // until an `input` event, so opening a configured override and pressing
+          // Save WITHOUT TYPING reads as empty — and since empty now means "unset",
+          // that silently deleted the override. An untouched field must mean "no
+          // change", never "delete".
+          const def = (this.secretsGroups || []).flatMap(g => g.keys || [])
+            .find(k => k.key === keyName);
+          this.secretsValues = {...this.secretsValues, [keyName]: (def && def.value) || ''};
         },
         async saveSecret(keyName) {
           const val = (this.secretsValues[keyName] || '').trim();
-          if (!val) { this.secretsMessage = {type: 'error', text: 'Value cannot be empty'}; return; }
+          // An OPTIONAL OVERRIDE may be cleared — empty means "unset", which removes
+          // the assignment and hands the setting back to genesis.yaml or its default.
+          // Without this the editor is a one-way door: once set, the environment
+          // shadows the yaml permanently and later config edits appear to do nothing.
+          // A required credential still cannot be blanked.
+          const def = (this.secretsGroups || [])
+            .flatMap(g => g.keys || [])
+            .find(k => k.key === keyName);
+          const clearable = !!(def && def.is_optional_override);
+          if (!val && !clearable) {
+            this.secretsMessage = {type: 'error', text: 'Value cannot be empty'};
+            return;
+          }
+          // Clearing is destructive and easy to do by accident, and seeding the
+          // buffer cannot cover every case — a masked value is not readable, so it
+          // seeds empty. Make the deletion an explicit act.
+          if (!val && clearable && !confirm(
+                'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
+                'genesis.yaml or its built-in default.')) {
+            return;
+          }
           this.secretsSaving = true;
           try {
             const resp = await fetchApi("/api/genesis/secrets", {
@@ -2201,16 +2436,229 @@
             });
             const d = await resp.json();
             if (resp.ok) {
+              // Setting DASHBOARD_PASSWORD here activates the /api mutation gate
+              // immediately; authenticate the session so this editor path (an
+              // advertised password-setup route) doesn't 401 the user's next action.
+              if (keyName === 'DASHBOARD_PASSWORD') { await this._establishSession(val); }
               this.secretsEditing = {...this.secretsEditing, [keyName]: false};
               delete this.secretsValues[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
               this.fetchSecrets();
+              // Keep the readiness panel + password nudge in sync: a provider key
+              // (incl. DASHBOARD_PASSWORD) just changed the setup-status signals.
+              this.loadSetupStatus();
             } else {
               this.secretsMessage = {type: 'error', text: d.error || 'Save failed'};
             }
           } catch (e) { this.secretsMessage = {type: 'error', text: e.message}; }
           this.secretsSaving = false;
         },
+
+        // ── First-run onboarding wizard methods ──────────────────
+        async loadSetupStatus() {
+          try {
+            const resp = await fetchApi("/api/genesis/setup-status");
+            if (resp && resp.ok) {
+              this.setupStatus = await resp.json();
+              this.setupStatusStale = false;
+              // Smart default for the persistent readiness panel: expanded while there is
+              // still headroom to configure (tier < 3), auto-collapsed once fully Autonomous.
+              // Only until the user manually toggles it — then their choice is respected.
+              if (!this.readinessPanelTouched) {
+                this.readinessPanelOpen = (this.setupStatus?.tier ?? 0) < 3;
+              }
+            } else if (this.setupStatus) {
+              // A failed refresh must not keep presenting the previous snapshot as current
+              // (the panel now deliberately re-refreshes on return to Overview).
+              this.setupStatusStale = true;
+            }
+          } catch (e) {
+            if (this.setupStatus) { this.setupStatusStale = true; }
+          }
+        },
+        toggleReadinessPanel() {
+          this.readinessPanelTouched = true;
+          this.readinessPanelOpen = !this.readinessPanelOpen;
+        },
+        openReadinessPanel() {
+          // Header-nudge target: jump to Overview, force the panel open, scroll to it.
+          this.readinessPanelTouched = true;
+          this.readinessPanelOpen = true;
+          this.navigateTo("overview", "readiness-panel");
+        },
+        get readinessNextStep() {
+          // The single "what unlocks next" line, derived from the cumulative tier.
+          // Config-framed (never implies live behavior); null-safe before setupStatus loads.
+          const s = this.setupStatus;
+          if (!s) return { reached: false, text: "" };
+          const tier = s.tier ?? 0;
+          if (tier <= 0) {
+            // Name only the floor legs actually missing (all three booleans are in the payload).
+            const missing = [];
+            if (s.cc_oauth !== true) missing.push("Claude Code login");
+            if (s.llm_key_present !== true) missing.push("a chat-model key");
+            if (s.embedding_key_present !== true) missing.push("an embedding key");
+            const need = missing.length ? missing.join(", ") : "the functional floor";
+            return { reached: false, text: `Next: T1 Functional — add ${need}.` };
+          }
+          // The payload exposes Telegram reach as a single combined bool, so which of the
+          // token / allowed-user-id is missing isn't knowable — use generic wording.
+          if (tier === 1) return { reached: false, text: "Next: T2 Connected — finish Telegram configuration (a bot token + an allowed user id) so Genesis can reach you." };
+          if (tier === 2) {
+            // T3 needs BOTH ego_enabled AND onboarded; name only the prerequisite(s)
+            // actually missing (an install can have the ego loop on but no marker).
+            const egoOn = s.ego_enabled === true;
+            const onboarded = s.onboarded === true;
+            if (egoOn && !onboarded) return { reached: false, text: "Next: T3 Autonomous — complete bootstrap (the ego loop is on, but the setup-complete marker is missing)." };
+            if (!egoOn && onboarded) return { reached: false, text: "Next: T3 Autonomous — enable the ego / awareness loop." };
+            return { reached: false, text: "Next: T3 Autonomous — enable the ego / awareness loop and complete bootstrap." };
+          }
+          // Do NOT assert the approval gate here: the panel cannot see its effective
+          // state, and the shipped autonomous_cli_policy default is auto-approve.
+          // Config-framed ("configured on"), not a liveness claim: ego.enabled is
+          // persisted YAML that only takes effect on the next server restart.
+          return { reached: true, text: "Fully Autonomous — the ego / awareness loop is configured on." };
+        },
+        get showSetupCard() {
+          const s = this.setupStatus;
+          // Show while the install is not FUNCTIONAL (live floor unmet) and the user
+          // has not dismissed it this session. A functional box never sees it. The
+          // `setupStep>1` clause keeps the card visible once the user has started
+          // stepping through it, so it doesn't vanish mid-flow if the floor flips
+          // to met after they save the last key (they still see the Done summary).
+          return !!s && (!s.floor_met || this.setupStep > 1) && !this.setupCardDismissed;
+        },
+        get setupProvider() { return this.setupProviders[this.setupProviderIdx] || this.setupProviders[0]; },
+        dismissSetupCard() { this.setupCardDismissed = true; },
+        async _establishSession(password) {
+          // After DASHBOARD_PASSWORD is (re)set, os.environ updates immediately and
+          // the /api mutation gate activates THIS request — log the session in with
+          // the new password so the user isn't 401'd on their next action. Shared by
+          // the wizard and the Provider Keys editor.
+          try {
+            await fetchApi("/api/genesis/auth/login", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({password}),
+            });
+          } catch (e) { /* non-fatal: user can log in manually */ }
+        },
+        async setupSavePassword() {
+          const val = (this.setupPassword || "").trim();
+          if (!val) { this.setupMsg = {type: "error", text: "Enter a password"}; return; }
+          this.setupBusy = true; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/secrets", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({keys: {DASHBOARD_PASSWORD: val}}),
+            });
+            if (resp.ok) {
+              await this._establishSession(val);
+              this.setupPassword = "";
+              await this.loadSetupStatus();
+              this.setupMsg = {type: "ok", text: "Password saved — you're logged in, and the dashboard now requires this password."};
+              this.setupStep = 2;
+            } else {
+              const d = await resp.json().catch(() => ({}));
+              this.setupMsg = {type: "error", text: d.error || "Save failed"};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          this.setupBusy = false;
+        },
+        async setupTestKey() {
+          const key = (this.setupKeyValue || "").trim();
+          if (!key) { this.setupMsg = {type: "error", text: "Enter a key first"}; return; }
+          const prov = this.setupProvider;
+          if (!prov.testable) { this.setupKeyTest = {valid: null, error: "No live test for this provider — it is validated on next restart."}; return; }
+          this.setupKeyTest = "testing"; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/keys/test", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({provider_type: prov.providerType, key}),
+            });
+            this.setupKeyTest = await resp.json();
+          } catch (e) { this.setupKeyTest = {valid: false, error: e.message}; }
+        },
+        async setupSaveKey() {
+          const key = (this.setupKeyValue || "").trim();
+          if (!key) { this.setupMsg = {type: "error", text: "Enter a key"}; return; }
+          this.setupBusy = true; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/secrets", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({keys: {[this.setupProvider.keyName]: key}}),
+            });
+            if (resp.ok) {
+              const savedName = this.setupProvider.keyName;
+              this.setupKeyValue = ""; this.setupKeyTest = null;
+              await this.loadSetupStatus();
+              const s = this.setupStatus || {};
+              // The floor needs BOTH a chat/LLM key and an embedding key. Keep
+              // collecting on step 2 until both legs are satisfied, rather than
+              // advancing to identity after a single key (which left the wizard
+              // unable to complete the floor in one pass). Auto-select a provider
+              // of the still-missing kind so the next save is one click away.
+              if (s.llm_key_present && s.embedding_key_present) {
+                this.setupMsg = {type: "restart", text: `${savedName} saved — chat + embedding keys set. Active after the next server restart.`};
+                await this.setupEnterIdentity();
+              } else {
+                const needKind = !s.llm_key_present ? "chat" : "embedding";
+                const needLabel = needKind === "chat" ? "a chat / model key" : "an embedding key (DeepInfra or Qwen)";
+                const idx = this.setupProviders.findIndex(p => p.kind === needKind);
+                if (idx >= 0) { this.setupProviderIdx = idx; }
+                this.setupMsg = {type: "ok", text: `${savedName} saved. Now add ${needLabel} to finish the floor — or Skip.`};
+              }
+            } else {
+              const d = await resp.json().catch(() => ({}));
+              this.setupMsg = {type: "error", text: d.error || "Save failed"};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          this.setupBusy = false;
+        },
+        async setupEnterIdentity() {
+          this.setupStep = 3;
+          if (this.setupIdentityLoaded) return;
+          // Pre-fill from USER.md, falling back to its shipped .example seed.
+          try {
+            let resp = await fetchApi("/api/genesis/config-files/USER.md");
+            let data = (resp && resp.ok) ? await resp.json() : null;
+            let content = data && data.content;
+            if (!content || content === "(failed to read file)") {
+              resp = await fetchApi("/api/genesis/config-files/USER.md.example");
+              data = (resp && resp.ok) ? await resp.json() : null;
+              content = (data && data.content) || "";
+              if (content === "(failed to read file)") content = "";
+            }
+            this.setupIdentity = content;
+          } catch (e) { this.setupIdentity = ""; }
+          this.setupIdentityLoaded = true;
+        },
+        async setupSaveIdentity() {
+          this.setupBusy = true; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/config-files/USER.md", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({content: this.setupIdentity}),
+            });
+            if (resp.ok) { await this.setupFinish(); }
+            else {
+              const d = await resp.json().catch(() => ({}));
+              this.setupMsg = {type: "error", text: d.error || "Save failed"};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          this.setupBusy = false;
+        },
+        async setupFinish() {
+          // The wizard does NOT write the ~/.genesis/setup-complete marker — that
+          // marker means "bootstrap finished" and is owned by bootstrap.sh / the
+          // terminal onboarding skill. Completion here just advances to the Done
+          // step, which honestly reflects the LIVE floor (floor_met + its legs):
+          // if keys / CC login are still missing it shows "almost there — still
+          // needed …" rather than a false "you're all set". Re-read status first so
+          // the summary reflects anything just saved.
+          await this.loadSetupStatus();
+          this.setupStep = 4;
+        },
+
         // Map env var names → provider_type values from model_routing.yaml.
         // MAINTENANCE: update when adding new providers to config/model_routing.yaml.
         _KEY_TO_PROVIDER_TYPES: {
@@ -2233,7 +2681,6 @@
           if (keyEntry.status === 'not_set') return 'not_set';
           const provTypes = this._KEY_TO_PROVIDER_TYPES[keyEntry.key];
           if (!provTypes || !this.routingConfig) return keyEntry.status;
-          const cbStates = this.routingConfig.cb_states || {};
           const providers = this.routingConfig.providers || {};
           // Find all routing providers that match this key's provider types
           const matchedProviders = Object.keys(providers).filter(pname => {
@@ -2241,9 +2688,22 @@
             return provTypes.includes(prov.type);
           });
           if (matchedProviders.length === 0) return keyEntry.status;
-          const openCount = matchedProviders.filter(p => cbStates[p] === 'OPEN').length;
-          if (openCount === matchedProviders.length) return 'error';
-          if (openCount > 0) return 'degraded';
+          // HALF_OPEN counts as degraded, matching the backend's own rule
+          // (observability/snapshots/call_sites.py treats OPEN *or* HALF_OPEN as
+          // a degraded call site). This matters now that a probe no longer heals
+          // a permanent/quota failure: such a breaker can sit HALF_OPEN
+          // indefinitely on a low-traffic provider, and counting only 'open'
+          // would paint the key green for a provider that never completes a
+          // call — the same "degraded renders as healthy" bug this change fixes
+          // one layer down.
+          const verdicts = matchedProviders.map(p => this.breakerVerdict(p));
+          const failing = verdicts.filter(v => v === 'failing').length;
+          const unverified = verdicts.filter(v => v === 'unverified').length;
+          if (failing === matchedProviders.length) return 'error';
+          // Unverified still counts as degraded here: this indicator's
+          // vocabulary is healthy/degraded/error only, and 'not proven healthy'
+          // belongs on the cautious side of a two-way split.
+          if (failing + unverified > 0) return 'degraded';
           return 'healthy';
         },
         secretStatusColor(status) {
@@ -2297,7 +2757,7 @@
           // Inbox Monitor
           watch_path: 'Watch Path', response_dir: 'Response Dir Pattern',
           check_interval_seconds: 'Check Interval (sec)', batch_size: 'Batch Size',
-          effort: 'Effort Level', timeout_s: 'Timeout (sec)',
+          effort: 'Effort Level', model: 'Model', timeout_s: 'Timeout (sec)',
           // Outreach
           start: 'Start Time', end: 'End Time',
           default: 'Default Channel', blocker: 'Blocker Channel',
@@ -2433,7 +2893,7 @@
         },
         // Display order for settings domains — most important first
         _DOMAIN_ORDER: [
-          'channels', 'autonomous_cli_policy', 'ego', 'outreach', 'tts',
+          'channels', 'autonomous_cli_policy', 'ego', 'reflection_models', 'outreach', 'tts',
           'inbox_monitor', 'surplus', 'resilience', 'confidence_gates',
           'updates', 'contribution', 'recon_schedules', 'recon_watchlist', 'recon_sources',
           'autonomy', 'autonomy_rules', 'guardian',
@@ -2452,6 +2912,7 @@
           model_routing: 'Model Routing',
           content_sanitization: 'Content Sanitization',
           channels: 'Channels',
+          reflection_models: 'Reflection Models',
           contribution: 'Contribution Offers',
         },
         _sortedDomains(domains) {
@@ -3315,7 +3776,17 @@
         queuesSemantic() {
           const queues = this.health.queues;
           if (!queues) return { state: "unknown", reason: "queue data unavailable" };
-          if ((queues.dead_letters || 0) > 0 || (queues.discarded_items?.length || 0) > 0
+          // A failed section is replaced by `_or_error` with {status:"error"},
+          // which is TRUTHY and carries NO `errors` key — so without this check
+          // every depth field below reads 0 and the card falls through to
+          // "healthy - queues are clear", directly beside the panel's own
+          // "Queue data unavailable" banner, and feeds that false healthy into
+          // overallHealthSemantic(). Zeros we never measured are not a clean
+          // bill of health.
+          if (queues.status === "error") {
+            return { state: "unknown", reason: "queue data could not be collected" };
+          }
+          if ((queues.dead_letters || 0) > 0 || this.discarded.total > 0
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
           }
@@ -3345,9 +3816,35 @@
           if (pe > 100) {
             return { state: "degraded", reason: `embedding queue backed up (${pe} pending)` };
           }
-          if (Array.isArray(queues.errors) && queues.errors.length > 0) {
+          // `errors` is a DIAGNOSTIC channel, not a second answer to "is this
+          // counter known". A counter that publishes its own exactness has
+          // already answered, and letting a stale error string overrule it
+          // renders a precise number beside "some queue counters could not be
+          // collected" — the panel contradicting itself. That is the same
+          // two-independent-descriptions fork removed one level down (the two
+          // flat depth/list keys no surface reads any more), and it reappeared the
+          // moment `known` started recovering from whichever read completed:
+          // a failed COUNT beside a complete sample is now an EXACT depth.
+          //
+          // The diagnostics are not suppressed — they stay in the payload and
+          // the panel still shows them. They just stop deciding a verdict they
+          // no longer describe. Only `discarded` publishes a `known` flag
+          // today, so every other counter's error remains its only unknown
+          // signal and still decides this; one such error beside a recovered
+          // one is enough to keep the section unknown.
+          const unresolved = (Array.isArray(queues.errors) ? queues.errors : []).filter(
+            (e) => !(this.discarded.known && String(e).startsWith("discarded:")),
+          );
+          if (unresolved.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
+          // Queue honesty is DEPTH-based by design; a drain-liveness verdict is
+          // intentionally omitted. A dead drainer only harms once work backs up, and
+          // the depth checks above (dead_letters / deferred_recovery / deferred_stuck
+          // / deferred_processing / pending_embeddings) already catch exactly that.
+          // The only durable "drain job" pulse (deferred_work_prune) is a daily 45-day
+          // GC, not the drainer — keying liveness on it would measure the wrong thing
+          // with a ~4-day threshold, buying a false-red vector for zero coverage gain.
           const worklist = queues.deferred_worklist || 0;
           return { state: "healthy", reason: worklist > 0 ? `queues clear — ${worklist} worklist item(s) in flight` : "queues are clear" };
         },
@@ -3380,7 +3877,24 @@
 
         surplusSemantic() {
           const surplus = this.health.surplus;
-          if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          if (!surplus) return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          // Liveness (from the AUTHORITATIVE pulse) precedes the auxiliary activity
+          // `status`: the independent idle/activity probe can throw (status="unknown")
+          // while the pulse still CONFIRMS a stall — that confirmed stall must surface
+          // as an error, not be masked as merely unknown by an early status guard.
+          // Fail-LOUD (mirror egoSemantic): a liveness read error, or a scheduler that
+          // never recorded a completed cycle (crashed before its first pulse — NOT
+          // owned by the job_never_succeeded alarm), is unknown, never green.
+          if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness unavailable (read error or no completed cycle on record)" };
+          // Truthful wedged-detector: surplus_dispatch pulses success every ~5 min,
+          // so a stale last_success (past the conservative threshold, and not paused)
+          // means the dispatch loop stopped firing — a genuine fault the idle-proxy
+          // `status` hides (a wedged scheduler reads "idle" → green). Computed
+          // server-side from job_health (observability.liveness).
+          if (surplus.stalled) return { state: "error", reason: `surplus scheduler stalled — ${surplus.stall_reason || "no recent dispatch"}` };
+          // Only now defer to the auxiliary activity probe: liveness was readable and
+          // not stalled, so an unknown activity status is genuinely just unknown.
+          if (surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
           const failed = surplus.tasks_failed_24h || 0;
           const completed = surplus.tasks_completed_24h || 0;
           if (failed > 0 && completed > 0 && failed / (completed + failed) > 0.2) {
@@ -3401,11 +3915,48 @@
           const ge = ego.egos?.genesis_ego;
           const ueCad = ue?.cadence;
           const geCad = ge?.cadence;
+          // Total-cessation (scheduler death): the ego_heartbeat pulse went stale.
+          // The MOST authoritative ego signal — evaluate it BEFORE the auxiliary
+          // per-ego liveness/gated collectors below, so a CONFIRMED dead scheduler
+          // still turns the tile red even when an unrelated collector is degraded
+          // (otherwise a confirmed death gets masked as "unknown"). Fail-LOUD on a
+          // broken read (unknown), then flag a genuinely dead scheduler as error.
+          // Blind spot the per-ego intent-lag `stalled` below cannot see — on total
+          // cessation both ego timestamps freeze together, the lag never opens, and
+          // the tile would otherwise read green (the 3-day-dead-ego-shows-healthy
+          // bug). Scheduler-level: shared across both ego managers (see routes/ego.py).
+          if (ego.ego_heartbeat_error) {
+            return { state: "unknown", reason: "ego heartbeat data unavailable (read error)" };
+          }
+          if (ego.ego_heartbeat_stale) {
+            const hrs = ego.ego_heartbeat_age_s ? Math.round(ego.ego_heartbeat_age_s / 3600) : "?";
+            return { state: "error", reason: `ego scheduler stopped — no heartbeat in ${hrs}h` };
+          }
+          // Fail-LOUD, not fail-green: if the liveness/gated read itself errored,
+          // `stalled` defaulted to false — surfacing that as healthy would
+          // recreate the exact false-green this instrumentation exists to kill.
+          // Report unknown so a broken collector never reads as "all good".
+          if (ueCad?.liveness_error || geCad?.liveness_error ||
+              ueCad?.gated_error || geCad?.gated_error) {
+            return { state: "unknown", reason: "ego liveness data unavailable (read error)" };
+          }
           // Circuit breaker on either ego
           if (ueCad?.consecutive_failures >= 3 || geCad?.consecutive_failures >= 3) {
             const which = (ueCad?.consecutive_failures >= 3 ? "CEO" : "") +
                           (geCad?.consecutive_failures >= 3 ? (ueCad?.consecutive_failures >= 3 ? " + COO" : "COO") : "");
             return { state: "error", reason: `circuit open (${which})` };
+          }
+          // Truthful liveness: a STALLED ego (no completed cycle well past its
+          // cadence, and not gated/paused) is a genuine fault. It must never read
+          // healthy just because the consumer loop task is alive or next_fire_at
+          // keeps sliding — the exact 3-day-deadlock-shows-green bug. `stalled`
+          // is computed server-side from job_health.last_success (ego.liveness),
+          // conservative thresholds so a legitimate backoff never false-reds.
+          if (ueCad?.stalled || geCad?.stalled) {
+            const which = (ueCad?.stalled ? "CEO" : "") +
+                          (geCad?.stalled ? (ueCad?.stalled ? " + COO" : "COO") : "");
+            const reason = (ueCad?.stalled ? ueCad?.stall_reason : geCad?.stall_reason) || "no recent cycle";
+            return { state: "error", reason: `${which} stalled — ${reason}` };
           }
           // Fallback to modal cadence if per-ego data not available yet
           const cadence = this.egoModal.cadence;
@@ -3419,6 +3970,12 @@
           if (ueCad?.is_paused || geCad?.is_paused) {
             const which = ueCad?.is_paused ? "CEO" : "COO";
             return { state: "degraded", reason: `${which} paused` };
+          }
+          // Gated on a pending CLI approval: a legitimate wait on the user (gate
+          // ON), surfaced as a to-do, never healthy and never a fault.
+          if (ueCad?.gated || geCad?.gated) {
+            const which = ueCad?.gated ? "CEO" : "COO";
+            return { state: "needs action", reason: `${which} waiting on CLI approval` };
           }
           // Proposals piling up: this is a review queue awaiting the user, not
           // a fault. Surface it as "needs action" (distinct from degraded) so it
@@ -3539,9 +4096,19 @@
               + ((cpuFull60 >= 1) ? ", stall " + cpuFull60.toFixed(0) + "%" : "") + ")";
           }
 
-          // Worst-of — memory, disk, or CPU, whichever is worst.
+          // PID budget assessment (per-user slice TasksMax — the 'Cannot fork'
+          // guard). Status is computed server-side; report it when it drives.
+          let pidState = "healthy", pidReason = "";
+          const pids = this.health.infrastructure?.pids;
+          if (pids && (pids.status === "degraded" || pids.status === "error") && pids.pct != null) {
+            pidState = pids.status;
+            pidReason = "PID budget " + pids.status + " (" + (pids.scope ? pids.scope + " " : "")
+              + pids.pct.toFixed(0) + "%, " + pids.current + "/" + pids.max + " tasks)";
+          }
+
+          // Worst-of — memory, disk, CPU, or PID budget, whichever is worst.
           let worst = { state: memState, reason: memReason };
-          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }]) {
+          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }, { state: pidState, reason: pidReason }]) {
             if ((stateRank[c.state] || 0) > (stateRank[worst.state] || 0)) worst = c;
           }
           return worst;
@@ -3739,7 +4306,7 @@
           // cc_slots renders in its own dedicated "Claude Code Sessions" section
           // (it's an array, not a probe) and is excluded from the probe grid; the
           // label here is defensive in case infraLabel is ever called for it.
-          const labels = { ambient: "Voice Bridge", cc_slots: "Claude Code Sessions" };
+          const labels = { ambient: "Voice Bridge", cc_slots: "Claude Code Sessions", internet: "Internet" };
           return labels[name] || name;
         },
 
@@ -3820,6 +4387,15 @@
           })[src] || "Ego";
         },
 
+        // Provenance labels for the directives/goals visibility panels.
+        // ego_target = which ego a directive steers; origin = who owns a goal.
+        egoTargetLabel(t) {
+          return ({ genesis_ego: "Genesis", user_ego: "User" })[t] || t || "?";
+        },
+        goalOriginLabel(o) {
+          return ({ genesis_ego: "Genesis", user: "User" })[o] || o || "?";
+        },
+
         // Acknowledge-only eval rows (j9/gauntlet) — never approvable. Kept in
         // sync with ego/types.py::INFORMATIONAL_ACTION_TYPES.
         isInformationalProposal(p) {
@@ -3892,12 +4468,124 @@
           return this.groupQueueItems(this.health.queues?.deferred_items || []);
         },
 
+        // The ONE reader of the discarded-queue payload in this file.
+        //
+        // The backend reconciles the uncapped depth and the LIMIT-20 review
+        // sample into a single object, so nothing here chooses between two
+        // numbers that can disagree — that fork, spread across four render
+        // surfaces, generated three rounds of bugs (2026-08-30): a 148-deep
+        // queue displayed as 20, a populated backlog with its clear-all button
+        // hidden, an empty-state message above rows it was listing.
+        //
+        // This normalises only for TRANSPORT damage — an old server with no
+        // `discarded` object, a section replaced wholesale by an error marker,
+        // a non-numeric total — never to re-derive a value the backend already
+        // decided. `known` distinguishes a measured zero from an unmeasured one,
+        // which is what lets the panel avoid claiming "nothing awaiting review"
+        // for a state it never observed.
+        get discarded() {
+          const d = this.health?.queues?.discarded;
+          if (!d || typeof d !== "object") {
+            // Absent: an older server, or `_or_error` replaced the whole queues
+            // section. Either way this is "we do not know", never a clean zero.
+            return { known: false, total: 0, totalLabel: "0+", sample: [], truncated: false };
+          }
+          const sample = Array.isArray(d.sample) ? d.sample : [];
+          const known = d.known === true && Number.isFinite(d.total);
+          // A non-finite total would make `> 0` and `=== 0` BOTH false, so the
+          // panel would render neither the list nor the empty state while the
+          // button read "Clear all NaN". The max() floor keeps the printed
+          // number from falling below the rows actually on screen, which would
+          // put "no items awaiting review" directly above a populated list.
+          const reported = Number.isFinite(d.total) ? d.total : sample.length;
+          const total = Math.max(reported, sample.length);
+          // Prefer the producer's own truncation verdict: it knows the sample
+          // hit its cap, which is invisible here when a failed count leaves
+          // total === sample.length. Fall back to comparing only if the field
+          // is missing (an older server).
+          const truncated = d.sample_truncated === true || total > sample.length;
+          // `total` is a FLOOR when the depth could not be read: the count
+          // contributes nothing, so it collapses to the rows in hand. Render
+          // sites take `totalLabel`, never the raw number — the "of 20" half of
+          // "showing 20 of 20" for a 148-row queue came from printing a floor
+          // as though it were a measurement, and every new expression that
+          // printed it could make that mistake again.
+          const totalLabel = known ? String(total) : total + "+";
+          return { known, total, totalLabel, sample, truncated };
+        },
+
         get discardedQueueGroups() {
-          return this.groupQueueItems(this.health.queues?.discarded_items || []);
+          return this.groupQueueItems(this.discarded.sample);
         },
 
         get routingProviderList() {
           return Object.keys(this.routingConfig?.providers || {});
+        },
+
+        // The one place IN THIS STORE that reads breaker state. (The two
+        // neural-monitor pages parse `cb_states` in their own plain <script>
+        // blocks and are already lowercase-correct; they are not reachable from
+        // here, so this is not a global chokepoint.)
+        //
+        // `routes/routing.py` emits `cb.state.value`, and ProviderState is a
+        // StrEnum with LOWERCASE values ("closed"/"open"/"half_open"). Four
+        // consumers compared against an UPPERCASE literal, never equal —
+        // so the provider dot rendered green, the toggle button read "disable",
+        // and the Provider Keys dot stayed green no matter what the breaker was
+        // actually doing. The dashboard was structurally incapable of showing a
+        // tripped breaker, which is a likelier reason a 3-day provider outage
+        // went unnoticed than any missing alarm.
+        //
+        // Comparing case-insensitively in ONE helper makes that class of bug
+        // unrepresentable at the call sites, rather than fixing it four times
+        // and waiting for a fifth to be written.
+        breakerState(providerName) {
+          const raw = (this.routingConfig?.cb_states || {})[providerName];
+          return String(raw ?? "").toLowerCase();
+        },
+
+        breakerIsOpen(providerName) {
+          return this.breakerState(providerName) === "open";
+        },
+
+        // Three-state verdict for rendering. HALF_OPEN is PROBATION, not
+        // failure: any failure while half-open trips it straight back to open,
+        // so a half-open breaker has had no failure since it entered that
+        // state. Painting it the same amber as "failing right now" overstated
+        // the problem — and after the probe-heal change a provider can sit
+        // half-open indefinitely, so this stopped being a rare case.
+        //   failing    — open: real calls failing, not routed to at all
+        //   unverified — half-open: routable, awaiting its next trial
+        //   healthy    — closed
+        // Falls back to the 2-state reading when `cb_detail` is absent (an
+        // older server, or a cached payload), so it can never render worse
+        // than before.
+        breakerVerdict(providerName) {
+          const state = this.breakerState(providerName);
+          if (state === "open") return "failing";
+          if (state === "half_open") return "unverified";
+          return "healthy";
+        },
+
+        // WHY it is unverified — "call" (real calls failed) or "probe" (a health
+        // probe could not reach it). Null when not applicable or unknown.
+        breakerOpenedBy(providerName) {
+          const d = (this.routingConfig?.cb_detail || {})[providerName];
+          return d && typeof d === "object" ? (d.opened_by ?? null) : null;
+        },
+
+        breakerTooltip(providerName) {
+          const verdict = this.breakerVerdict(providerName);
+          if (verdict === "healthy") return "Circuit breaker closed — provider healthy";
+          const by = this.breakerOpenedBy(providerName);
+          if (verdict === "failing") {
+            return by === "probe"
+              ? "Circuit breaker OPEN — health probe could not reach this provider"
+              : "Circuit breaker OPEN — real calls are failing; not being routed to";
+          }
+          return by === "call"
+            ? "Unverified — real calls failed; still in rotation and will be retried on the next call"
+            : "Unverified — a health probe could not reach it; awaiting the next probe";
         },
 
         providerCbState(providerName) {
@@ -4000,11 +4688,17 @@
           if (activeGroups > 0) {
             items.push({ level: "warning", title: `${activeGroups} active error group${activeGroups === 1 ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
           }
+          if (this.errorSummary.partial) {
+            const failed = (this.errorSummary.sources_failed || []).join(", ");
+            items.push({ level: "warning", title: "Error data incomplete", detail: `some error sources did not load (${failed}); counts may understate reality`, href: "/genesis/errors" });
+          }
           if ((this.health.queues?.dead_letters || 0) > 0) {
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });
           }
-          if ((this.health.queues?.discarded_items?.length || 0) > 0) {
-            items.push({ level: "warning", title: `${this.health.queues.discarded_items.length} discarded item${this.health.queues.discarded_items.length === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
+          if (this.discarded.total > 0) {
+            // Singular only for a MEASURED one: "1+ discarded item" would be
+            // wrong, since a floor of 1 means one or more.
+            items.push({ level: "warning", title: `${this.discarded.totalLabel} discarded item${this.discarded.total === 1 && this.discarded.known ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
           }
           // Fallback call sites are already captured in the warningAlerts
           // bucket above (severity=WARNING from health_alerts). The dedicated
@@ -4153,6 +4847,8 @@
 
         async fetchEgoDetail() {
           this.startModalFetch("egoModal");
+          // Refresh the shared directives/goals panels alongside the modal open.
+          this.fetchEgoDirectivesGoals();
           try {
             const [statusR, cadenceR, cyclesR, proposalsR, followUpsR, vcrR] = await Promise.all([
               fetchApi("/api/genesis/ego/status"),
@@ -4176,17 +4872,64 @@
 
         async resolveEgoProposal(id, status, response) {
           try {
+            // Pin the resolve to the revision we rendered (optimistic-concurrency
+            // guard). Looked up from the same list the buttons render from; if
+            // absent, we omit it and the server resolves unguarded (as before).
+            const prop = (this.egoModal.proposals || []).find((p) => p.id === id);
+            const payload = { status, response: response || "" };
+            if (prop && prop.revision_num != null) payload.revision_num = prop.revision_num;
             const resp = await fetchApi("/api/genesis/ego/proposals/" + id + "/resolve", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status, response: response || "" }),
+              body: JSON.stringify(payload),
             });
             if (resp?.ok) {
               this.egoModal.rejectingId = null;
               this.egoModal.rejectReason = "";
+              this.egoModal.resolveError = "";
+              await this.fetchEgoDetail();
+            } else if (resp && resp.status === 409) {
+              // The proposal was revised since it was rendered — surface a
+              // re-review prompt and refresh so the user sees the new revision.
+              let msg = "This proposal was revised — re-review before resolving.";
+              try { const d = await resp.json(); if (d && d.message) msg = d.message; } catch {}
+              this.egoModal.resolveError = msg;
               await this.fetchEgoDetail();
             }
           } catch (e) { console.warn("Proposal resolve failed:", e); }
+        },
+
+        // Directives + own/user goals — populated on Chat-tab entry, on ego-modal
+        // open, and after a retire. Not polled: these change rarely, so a 15s
+        // loop would be wasted work.
+        async fetchEgoDirectivesGoals() {
+          try {
+            const [dR, gR] = await Promise.all([
+              fetchApi("/api/genesis/ego/directives"),
+              fetchApi("/api/genesis/ego/goals"),
+            ]);
+            // Normalize to the guaranteed {active,resolved} / {user,genesis_ego}
+            // shape so a drifted payload can never break the panel templates.
+            if (dR?.ok) { const d = await dR.json(); this.egoDirectives = { active: d.active || [], resolved: d.resolved || [] }; }
+            if (gR?.ok) { const g = await gR.json(); this.egoGoals = { user: g.user || [], genesis_ego: g.genesis_ego || [] }; }
+          } catch { /* silent — panels show empty */ }
+        },
+
+        // User-driven retire of a standing directive (marks it cancelled).
+        async retireDirective(id) {
+          this.retiringDirectiveId = id;
+          try {
+            const resp = await fetchApi("/api/genesis/ego/directives/" + id + "/resolve", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status: "cancelled" }),
+            });
+            if (resp?.ok) { await this.fetchEgoDirectivesGoals(); }
+          } catch (e) {
+            console.warn("Directive retire failed:", e);
+          } finally {
+            this.retiringDirectiveId = null;
+          }
         },
 
         async fetchOutreachMessages() {

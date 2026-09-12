@@ -141,7 +141,7 @@ The daily drivers for professional productivity and general intelligence.
 - **Intelligence Tier:** A/S (Thoughtful reasoning)
 - **SWE-Bench:** ~62%
 - **Cost:** $1.00/$4.00 per MTok (input/output)
-- **Free Tier:** Available on Nvidia NIM (5,000 credits, 40 RPM); OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) removed June 2026
+- **Free Tier:** None currently free — a 2026-08 routing probe found NIM's free Kimi (`moonshotai/kimi-k2.6`) returns 404-for-account and it was retired from Genesis routing; the OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) was removed June 2026. Paid access via OpenRouter (`kimi-k2.5` provider) remains a deep fallback.
 
 **Best At:**
 1. Needle in a Haystack: Specialized architecture for searching its own memory — king of long-context retrieval.
@@ -434,6 +434,10 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **Available models:** Kimi K2.5, Llama 4 Scout, DeepSeek V3.2, GLM-5
 - Best for testing and prototyping only. Not production-ready.
 - Once credits exhausted, must pay or create new account
+- **2026-08 routing probe:** DeepSeek V4-Pro EOL'd (HTTP 410) and free Kimi K2.6
+  404s for our account; Genesis now routes NIM to `deepseek-ai/deepseek-v4-flash-0731`
+  (fast, free, valid JSON on live probe). GLM-5.2 / MiniMax-M3 respond but are too
+  slow (~50-70s) for latency-sensitive primaries.
 
 ### Z.AI / BigModel (GLM-5)
 - **Endpoint:** api.z.ai (international) / open.bigmodel.cn (China)
@@ -460,14 +464,31 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Best for burst scenarios or when Mistral's 2 RPM limit is too slow
 
 ### OpenRouter Free Tier
-- ~26 models available as free variants (`:free` suffix) on OpenRouter
+- ~17 models available as free variants (`:free` suffix) on OpenRouter
+  (down from ~26 in mid-2026 — the free-variant pool contracted sharply, then kept
+  churning; automated inventory reported 17 free as of Aug 2026)
 - **Base rate limits:** 20 RPM, 200 RPD (shared across all free models)
 - **With $10 balance:** 1,000 RPD (5x increase, balance is not consumed by free models)
-- Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, Nemotron 3 Ultra 550B, various community models
+- Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Gemma 4 26B A4B,
+  Nemotron 3 Ultra 550B, OpenAI gpt-oss-20b, various community models
+- **Free Models Router** (`openrouter/free`, 200k context) — a meta-endpoint that
+  auto-routes across the current free pool. Useful as a churn-resistant free fallback:
+  it tracks whichever free variants are live, so it survives individual delistings.
 - Note: DeepSeek V4 Flash free variant removed as of June 2026; Kimi K2.6 and
   GLM-4.5-Air free variants removed June 2026; Nex-N2-Pro (`nex-agi/nex-n2-pro:free`)
-  removed June 2026; Poolside Laguna XS 2 (`poolside/laguna-xs.2:free`) removed July 2026
-- Use as overflow when other free sources are exhausted, or as primary diversity source
+  removed June 2026; Poolside Laguna XS 2 (`poolside/laguna-xs.2:free`) removed July 2026.
+  Seven more free variants delisted July 2026: Qwen3-Coder (`qwen/qwen3-coder:free`),
+  Tencent Hy3 (`tencent/hy3:free`), Qwen3-Next 80B (`qwen/qwen3-next-80b-a3b-instruct:free`),
+  Hermes 3 Llama 3.1 405B, Llama 3.3 70B and Llama 3.2 3B (`:free` OpenRouter variants —
+  Groq's Llama 3.3 70B is unaffected), and Dolphin-Mistral 24B Venice.
+- Recently-appeared free variants (Aug 2026 scan): Poolside Laguna S 2.1
+  (`poolside/laguna-s-2.1:free`) and Laguna XS 2.1 (`poolside/laguna-xs-2.1:free`), both
+  262k — Poolside variants churn weekly; Ling-3.0-flash (`inclusionai/ling-3.0-flash:free`,
+  262k); OpenAI gpt-oss-20b (`openai/gpt-oss-20b:free`, 131k — first free OpenAI-lineage
+  variant); and an expanded NVIDIA Nemotron 3 free family (Super 120B A12B, Nano 30B A3B,
+  Nano Omni 30B, Nano 12B V2 VL, Nano 9B V2, and the 3.5 Content Safety classifier).
+  Google's Lyria 3 music-generation previews also surfaced as free — out of scope for the
+  text-LLM roster.
 - Free models use `pricing.prompt == "0"` in API — detectable programmatically
 
 ### Cerebras Free Tier
@@ -512,7 +533,7 @@ routing decisions — eval harness (Phase 3) provides Genesis-specific validatio
 | o3-mini | GitHub Models | — | 74.9 | 96.3 (HE) | 97.3 | 50 RPD |
 | DeepSeek-R1 | OpenRouter | 84.0 | 71.5 | 65.9 | 87.5 | 1,000 RPD ($10 bal.) |
 | Qwen3-235B *(no thinking)* | Cerebras | ~75 | ~70 | ~62 | ~60 | 14,400 RPD |
-| Qwen3-Coder 480B | OpenRouter | — | — | SWE 69.6 | — | free `:free` |
+| Qwen3-Coder 480B | OpenRouter | — | — | SWE 69.6 | — | `:free` removed July 2026 (paid only) |
 | Llama 3.3 70B | Groq | 68.9 | 50.5 | 88.4 (HE) | ~30 | 1,000 RPD |
 | Mistral Large 3 | Mistral | ~75† | 43.9 | 90.2 (HE) | — | ~1,440 RPD (2 RPM) |
 | Mistral Small 3.2 | Mistral | 69.1 | — | 92.9 (HE+) | — | ~43,200 RPD (30 RPM) |
@@ -550,18 +571,24 @@ Models requiring benchmark or free-tier verification before routing decisions:
   reranking only. Evaluate for memory recall chain improvement.
 - **Cohere North Mini Code (free)** — `cohere/north-mini-code:free`, 256k context,
   free on OpenRouter (detected June 2026). Coding-focused small model from a major
-  provider. Benchmark scores unverified — evaluate as a free coding fallback against
-  Qwen3-Coder 480B before routing.
+  provider. Benchmark scores unverified — evaluate as a free coding fallback before
+  routing (its prior comparison target, Qwen3-Coder 480B `:free`, was delisted July 2026).
+- **OpenAI gpt-oss-20b (free)** — `openai/gpt-oss-20b:free`, 131k context, free on
+  OpenRouter (detected Aug 2026). OpenAI's open-weight 20B model — the first free
+  OpenAI-lineage option in the pool. Benchmark scores unverified. Evaluate as a free
+  reasoning/extraction fallback; its distinct-provider lineage also makes it a candidate
+  for disagreement-gate diversity where every other free option is Qwen/Llama/Nemotron.
+- **NVIDIA Nemotron Nano 12B V2 VL (free)** — `nvidia/nemotron-nano-12b-v2-vl:free`,
+  128k context, vision-language. A free small multimodal model — potential cheap
+  fallback for image/screenshot reasoning when Gemini free limits are exhausted.
+  Benchmark scores unverified.
 - **Voyage AI voyage-3** — 200M token one-time free embeddings. Evaluate for
   Qdrant embedding quality vs. current embeddings.
 - **NVIDIA Nemotron 3 Ultra 550B (free)** — 550B A55B MoE, 1M context, free on
   OpenRouter (`nvidia/nemotron-3-ultra-550b-a55b:free`). Largest free model
-  available. Benchmark scores unverified — needs evaluation against existing
-  heavy lifters for quality routing.
-- **Tencent Hy3 (free)** — `tencent/hy3:free`, 262k context, free on OpenRouter
-  (detected July 2026). New free model from a major provider (Tencent Hunyuan
-  line). Benchmark scores and capability profile unverified — evaluate before
-  routing; low priority given the roster already has ample free coverage.
+  available. A mid-size free sibling now also exists — Nemotron 3 Super 120B A12B
+  (`nvidia/nemotron-3-super-120b-a12b:free`, 262k) — benchmark both together against
+  existing heavy lifters for quality routing. Scores unverified.
 
 ---
 
@@ -662,7 +689,36 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
-**2026-07-12** — OpenRouter free model count held at 26 (automated inventory:
+**2026-08-19** — NIM routing repoint (live probe): DeepSeek V4-Pro EOL'd on NIM
+(HTTP 410) and free Kimi K2.6 404s for-account, so Genesis retired `nvidia-nim-kimi`
+and repointed `nvidia-nim-deepseek` from `deepseek-ai/deepseek-v4-pro` to
+`deepseek-ai/deepseek-v4-flash-0731` (fast, free, valid JSON). GLM-5.2 / MiniMax-M3
+respond on NIM but are too slow (~50-70s) to be primaries. Updated the Kimi 2.6 and
+Nvidia NIM entries to reflect the probe. No new tiered models this pass.
+**2026-08-02** — Automated free-model inventory now reports 17 OpenRouter free
+variants (scanner re-baselined this run, so it flags all 17 as "new" with 0 removed;
+effective trend ~18→17). Logged newly-visible free models from major providers:
+OpenAI gpt-oss-20b (`openai/gpt-oss-20b:free`, 131k — first free OpenAI-lineage
+variant) and NVIDIA Nemotron Nano 12B V2 VL (`nvidia/nemotron-nano-12b-v2-vl:free`,
+128k, vision-language) added to Pending Evaluation; noted the expanded NVIDIA Nemotron 3
+free family (Super 120B A12B, Nano 30B A3B, Nano Omni, Nano 9B V2, 3.5 Content Safety)
+on the existing Ultra entry; added the Free Models Router (`openrouter/free`) and
+Poolside Laguna XS 2.1 to OpenRouter Free Tier terms; added Gemma 4 26B A4B to the
+OpenRouter "Includes" list. No pricing, benchmark, or context changes to tiered models.
+Google Lyria 3 (music generation) and the Nemotron 3.5 Content Safety classifier were
+detected as free but left unrouted — out of scope for the text-LLM roster.
+**2026-07-26** — OpenRouter free model count dropped sharply ~26→18 (automated
+inventory: 18 free, +2 new, −7 removed). Seven free variants delisted July 2026:
+Qwen3-Coder (`qwen/qwen3-coder:free`), Tencent Hy3 (`tencent/hy3:free`), Qwen3-Next
+80B (`qwen/qwen3-next-80b-a3b-instruct:free`), Hermes 3 Llama 3.1 405B, Llama 3.3 70B
+and Llama 3.2 3B (`:free` OpenRouter variants — Groq's Llama 3.3 70B is unaffected),
+and Dolphin-Mistral 24B Venice. Retired the Tencent Hy3 Pending Evaluation entry
+(added 2026-07-12, delisted a week later before it could be benchmarked). Updated the
+Qwen3-Coder 480B benchmark-table row (`:free` removed, paid only) and the OpenRouter
+"Includes" list to drop it. Two new free variants detected (Poolside Laguna S 2.1,
+Ling-3.0-flash, both 262k) — not promoted to a tier (Poolside variants churn weekly,
+roster already well-covered on free tier); noted both in OpenRouter Free Tier terms.
+2026-07-12 — OpenRouter free model count held at 26 (automated inventory:
 26 free, +1 new, −1 removed); removed Poolside Laguna XS 2
 (`poolside/laguna-xs.2:free`, delisted July 2026) — was never promoted to a
 tier or Pending Evaluation, so no roster entry to retire; noted the removal in

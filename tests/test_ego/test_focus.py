@@ -236,6 +236,21 @@ def test_goal_review_weights_have_deep_goals():
     assert weights["execution_outcomes"] == "deep"
 
 
+def test_capability_improvement_category_has_weights():
+    """The advisory capability_improvement focus is fully wired with weights."""
+    from genesis.ego.types import FocusCategory
+
+    assert FocusCategory.CAPABILITY_IMPROVEMENT == "capability_improvement"
+    assert "capability_improvement" in FOCUS_CONTEXT_WEIGHTS
+    weights = FocusSelector.get_context_weights("capability_improvement")
+    # Self-model performance sections are deep so the ego can reason on the gap.
+    assert weights["capability_performance"] == "deep"
+    assert weights["capabilities"] == "deep"
+    assert weights["execution_outcomes"] == "deep"
+    # Always sections are still always.
+    assert weights["user_model"] == "always"
+
+
 # ── FocusResult dataclass ─────────────────────────────────────────────────
 
 

@@ -45,6 +45,15 @@ MODES = ("off", "propose_only", "live")
 
 _CONFIG_NAME = "repo_pulse.yaml"
 
+#: Hard ceiling on `open_pr_max_surface`, shared by the hook that CLAMPS to it and the
+#: settings validator that REJECTS above it. They were separate before: the
+#: validator accepted any positive int while the hook silently applied 20, so
+#: a config of 50 was accepted, reported back as 50, and had no effect. A
+#: settings surface that lies about what it accepted is worse than one that
+#: refuses -- the operator has no way to notice. One constant, two consumers,
+#: so they cannot drift apart again.
+OPEN_PR_MAX_SURFACE_CAP = 20
+
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "mode": "live",
@@ -54,7 +63,29 @@ DEFAULTS: dict[str, Any] = {
     "max_items": 40,  # open ledger rows fed to the fuzzy judge
     "max_proposals_per_run": 10,  # fuzzy annotations stored per run
     "inject_confidence_floor": 0.7,  # proposals below this never surface
+    # PR-verification lane (issue #1718 half B): one durable obligation row per
+    # merged PR; docs-only diffs auto-close. Master switch, open_pr_enabled's twin.
+    "verification_enabled": True,
+    # Open-PR lane (session-manager PR-4c): age-stale open-PR surface.
+    "open_pr_enabled": True,  # master switch for the open-PR lane (bool)
+    "open_pr_stale_days": 7,  # a PR idle >= this many days is "stale"
+    "max_open_prs": 50,  # gh --limit for the open-PR fetch
+    "open_pr_resurface_days": 7,  # keep surfacing a still-stale PR for this many days after first shown, then go quiet
+    "open_pr_max_surface": 5,  # max PRs shown inline per session
 }
+
+# Every BOOLEAN knob, in one place, for the same reason `_INT_KNOBS` exists:
+# the settings validator and this module must not each carry their own list.
+# They did, and a lane switch shipped that the settings API rejected as an
+# unknown key — advertised in the config file, reachable only by hand-editing
+# the yaml (Codex P2, PR #1836). Adding a bool knob to DEFAULTS without adding
+# it here is now the only way to repeat that, and the coverage test below
+# fails on exactly that.
+_BOOL_KNOBS = (
+    "enabled",
+    "open_pr_enabled",
+    "verification_enabled",
+)
 
 _INT_KNOBS = (
     "min_interval_minutes",
@@ -62,6 +93,10 @@ _INT_KNOBS = (
     "max_prs",
     "max_items",
     "max_proposals_per_run",
+    "open_pr_stale_days",
+    "max_open_prs",
+    "open_pr_resurface_days",
+    "open_pr_max_surface",
 )
 
 
@@ -100,7 +135,17 @@ def effective_mode() -> str:
     off, never a silent absorb).
     """
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    # `fallback=False` — the MASTER switch keeps its old fail direction, and
+    # this is the one knob where the module's "never a silent off" argument
+    # points the WRONG way. MEASURED: `load_config` does `merged.update(base)`,
+    # so a yaml key present with a falsy NON-bool value (bare `enabled:`,
+    # `enabled: ~`, `enabled: 0`, `enabled: ''`) overwrites the default. Before
+    # `knob_bool` those all produced mode `off`; taking DEFAULTS[key]=True would
+    # start the worker in LIVE mode — auto-absorbing ledger rows and completing
+    # follow-ups. That is a fail-OPEN widening of a write-authority switch,
+    # arriving as collateral of a refactor aimed at a different knob (audit,
+    # PR #1836). The warning still fires; only the direction changes.
+    if not knob_bool(cfg, "enabled", fallback=False):
         return "off"
     mode = cfg.get("mode")
     if mode is False:
@@ -120,6 +165,35 @@ def knob_int(cfg: dict[str, Any], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return int(DEFAULTS[key])
     return value
+
+
+def knob_bool(cfg: dict[str, Any], key: str, *, fallback: bool | None = None) -> bool:
+    """Master-switch knob: a REAL bool, or the default plus a WARNING.
+
+    The bare ``cfg.get(key, True)`` this replaces is a truthiness test, and the
+    values an operator actually mistypes are truthy strings — ``"false"``,
+    ``"no"``, ``"off"`` in quotes all read as ENABLED, so the switch silently
+    does the opposite of what was asked and says nothing. (Unquoted ``off`` is
+    the lucky case: YAML 1.1 parses it as a real ``False``.)
+
+    Degrades to the DEFAULT rather than to off, because this file's stated rule
+    is "never a silent off" — an unrecorded obligation is a worse failure than a
+    noisy one. What changes is the SILENCE: a mistyped switch now says so in the
+    log, which is the part that made this a defect rather than a preference.
+    """
+    value = cfg.get(key)
+    if isinstance(value, bool):
+        return value
+    default = DEFAULTS[key] if fallback is None else fallback
+    if key in cfg:
+        logger.warning(
+            "repo_pulse %s is %r, not a boolean — using the default %r "
+            "(quote-wrapped 'false'/'no'/'off' are truthy strings, not booleans)",
+            key,
+            value,
+            default,
+        )
+    return bool(default)
 
 
 def knob_float01(cfg: dict[str, Any], key: str) -> float:

@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 from genesis.autonomy.executor.types import StepResult, StepType
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -107,24 +108,26 @@ def validate_command(command: str) -> str | None:
 async def _read_limited(
     stream: asyncio.StreamReader,
     limit: int = _MAX_STREAM_BYTES,
-) -> bytes:
-    """Read up to *limit* bytes from *stream*, discarding the rest."""
+) -> tuple[bytes, int]:
+    """Retain up to *limit* bytes while counting and draining the full stream."""
     chunks: list[bytes] = []
-    total = 0
+    retained_size = 0
+    total_size = 0
     while True:
         chunk = await stream.read(8192)
         if not chunk:
             break
-        remaining = limit - total
+        total_size += len(chunk)
+        remaining = limit - retained_size
         if remaining <= 0:
             continue
         if len(chunk) > remaining:
             chunks.append(chunk[:remaining])
-            total = limit
+            retained_size = limit
         else:
             chunks.append(chunk)
-            total += len(chunk)
-    return b"".join(chunks)
+            retained_size += len(chunk)
+    return b"".join(chunks), total_size
 
 
 # ---------------------------------------------------------------------------
@@ -211,27 +214,36 @@ async def execute_deterministic_step(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
+            # Own session/group (setsid in the C helper) so the timeout kill
+            # can reap the WHOLE tree — step commands can fork (bash &, tox,
+            # pytest-xdist); killing only the direct child orphans those.
+            start_new_session=True,
         )
         # Read with stream limit to prevent memory exhaustion
         # Hard timeout prevents a hung subprocess from blocking the
         # executor semaphore indefinitely.
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                asyncio.gather(
-                    _read_limited(proc.stdout),
-                    _read_limited(proc.stderr),
-                ),
-                timeout=_HARD_TIMEOUT_S,
+            (stdout_bytes, stdout_total), (stderr_bytes, stderr_total) = (
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        _read_limited(proc.stdout),
+                        _read_limited(proc.stderr),
+                    ),
+                    timeout=_HARD_TIMEOUT_S,
+                )
             )
             await proc.wait()
+        except asyncio.CancelledError:
+            # Cancellation mid-step: the detached step tree sees no ambient
+            # signal — group-kill before propagating or it runs on.
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         except TimeoutError:
             duration = time.monotonic() - start
-            # Kill the hung process
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            # Group-kill the hung tree (guarded pid-as-pgid), bounded reap.
+            kill_process_group(proc)
+            await reap_bounded(proc)
             logger.warning(
                 "Deterministic step %d timed out after %.0fs",
                 idx, duration,
@@ -267,9 +279,9 @@ async def execute_deterministic_step(
     # Cap stored output for result_json
     max_output = 50_000
     if len(stdout) > max_output:
-        stdout = stdout[:max_output] + f"\n... (truncated, {len(stdout_bytes)} bytes total)"
+        stdout = stdout[:max_output] + f"\n... (truncated, {stdout_total} bytes total)"
     if len(stderr) > max_output:
-        stderr = stderr[:max_output] + f"\n... (truncated, {len(stderr_bytes)} bytes total)"
+        stderr = stderr[:max_output] + f"\n... (truncated, {stderr_total} bytes total)"
 
     result_text = ""
     if stdout:

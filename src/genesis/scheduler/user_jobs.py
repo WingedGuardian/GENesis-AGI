@@ -222,6 +222,6 @@ class UserJobScheduler:
             with contextlib.suppress(Exception):
                 from genesis.runtime import GenesisRuntime
                 rt = GenesisRuntime.instance()
-                rt.record_job_failure(f"user_job:{job_id[:8]}", str(exc))
+                rt.record_job_failure(f"user_job:{job_id[:8]}", exc=exc)
 
             return None

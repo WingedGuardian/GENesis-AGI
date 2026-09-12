@@ -1,22 +1,226 @@
 #!/bin/bash
 # Genesis commit-msg hook — block private infrastructure details in commit messages.
 #
-# Patterns match install-specific IPs, personal email, AWS account IDs,
-# and private hostnames. Covers the gap that gitleaks (file-content only)
-# does not scan commit messages.
+# Two layers, mirroring the contribution sanitizer:
+#   1. Generic RFC1918 / CGNAT / IPv6-ULA address CLASSES — never this install's
+#      literal values (a tracked scanner must not name what it redacts). Doc
+#      examples should use the RFC 5737 ranges (192.0.2.x / 198.51.100.x /
+#      203.0.113.x), which are deliberately NOT matched.
+#   2. This install's EXACT non-classable identifiers (private repo/host names,
+#      hardware, tokens) read from the local release-fingerprint file when
+#      present — zero private bytes are tracked in this file.
+#   3. ADVISORY (never blocks): security-INCIDENT framing — a past-tense claim
+#      that this system leaked/exposed/stored credentials. Layers 1-2 are about
+#      PRIVACY (who/where); this one is a different axis that those miss.
+#      SCOPE: the SUBJECT LINE only, and that is a measured choice, not an
+#      accident of the regex — see the scope note at layer 3.
+# Covers the gap that gitleaks (file-content only) does not scan commit messages.
+#
+# Why layer 3 lives HERE, at commit time, and only warns:
+#   * The scheduled leak review already catches this class — but it is a MERGE
+#     gate. It stops the text reaching `main`; it cannot stop it reaching the
+#     internet, which happens at `git push`.
+#   * On this repo the BRANCH COMMIT message is what lands on `main` (squash
+#     merges use COMMIT_MESSAGES), and a pushed public branch cannot be
+#     force-pushed (git_push_guard, deliberately) — so the commit message is
+#     both the artifact that matters and the one that is expensive to fix later.
+#   * Before push, `--amend` is free. A warning is therefore actionable, and a
+#     block would be an escalation with no measured reason behind it — it would
+#     also stop background sessions from committing at all.
+#
+# Deliberately NOT implemented: a second axis flagging descriptions of what
+# still EVADES a guard. MEASURED against 1,600 real commit messages here: it
+# fired 10 times, mostly false, because "bypass the gate" / "defeated the guard"
+# is core vocabulary in a repo whose job is building gates. A checker that cries
+# wolf on normal language gets muted, and takes the useful axis down with it.
+# That judgement stays with the LLM leak review, which made it correctly.
 
-PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
+MSG_FILE="$1"
 
-if grep -qE "$PATTERNS" "$1"; then
+# Layer 1 — address classes. Kept byte-identical to scripts/check_portability.sh
+# and sanitize.py _PORTABILITY_PATTERNS (a drift test asserts parity). Uses
+# [0-9] so it is valid ERE for grep -E.
+CLASS_PATTERNS='\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b|\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b[fF][cdCD][0-9a-fA-F]{2}:'
+
+blocked=0
+fingerprint_blocked=0
+
+if grep -qE "$CLASS_PATTERNS" "$MSG_FILE"; then
     echo ""
-    echo "BLOCKED: Commit message contains private infrastructure details."
+    echo "BLOCKED: Commit message contains a private-range network address."
+    grep -nE "$CLASS_PATTERNS" "$MSG_FILE"
+    blocked=1
+fi
+
+# Layer 2 — exact install fingerprints (local file; comment/blank lines stripped
+# so grep -E -f receives pure ERE patterns). Report line numbers only — never
+# echo which fingerprint matched (the matched text is the private value).
+FP_FILE="${GENESIS_RELEASE_FINGERPRINTS:-$HOME/.genesis/release-fingerprints.txt}"
+if [ -f "$FP_FILE" ]; then
+    FP_PATTERNS="$(grep -vE '^[[:space:]]*(#|$)' "$FP_FILE" || true)"
+    if [ -n "$FP_PATTERNS" ] && printf '%s\n' "$FP_PATTERNS" | grep -qE -f - "$MSG_FILE"; then
+        echo ""
+        echo "BLOCKED: Commit message contains an install-specific private identifier."
+        _fp_lines="$(printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1 | sort -un)"
+        printf '%s\n' "$_fp_lines" | sed 's/^/  line /'
+        blocked=1
+        # The advisory below withholds its subject only when the SUBJECT ITSELF
+        # matched. A fingerprint on a BODY line conceals nothing about line 1, so
+        # withholding there would suppress a clean subject and assert something
+        # untrue about it — over-broad in the safe direction, but it costs the
+        # advisory its clarity in a case where nothing was hidden.
+        if printf '%s\n' "$_fp_lines" | grep -qx '1'; then
+            fingerprint_blocked=1
+        fi
+    fi
+fi
+
+# Layer 3 — ADVISORY, subject line only.
+#
+# SCOPE, decided by measurement rather than by what the regex happened to do.
+# Against this repo's own history (1,756 commit messages, full bodies):
+#   * subject line only  ->  0 fires (0.00%)
+#   * every body line    -> 41 fires (2.33%), and reading them, ALL are ordinary
+#     engineering prose — "the key is ABSENT ... logged at ERROR", "no token
+#     ever persisted", "would be echoed verbatim into logs". A body is long
+#     enough that a credential noun and a leak verb land near each other by
+#     chance, and a checker that cries wolf at that rate gets muted by whoever
+#     hits it next — taking the useful axis down with it. Same reasoning that
+#     rejected the residual-gap axis below, and the same evidence shape.
+# The subject is also where this matters most: it is the PR title, the squash
+# commit subject, and the line that stays on the commits tab.
+#
+# RECALL is measured, not asserted — the first version of this check was tuned
+# for precision alone and caught 6 of 23 incident phrasings while reporting a
+# clean 0% false-positive rate, which is half a measurement wearing the
+# grammar of a whole one. Against a hand-built set of 23 incident-framing
+# subjects and 18 deliberately similar benign ones: 23/23 and 0/18.
+# The corpus, the labelled sets and both numbers are reproduced by
+# tests/test_scripts/test_commit_msg_framing.py, so a future pattern edit
+# re-measures instead of guessing.
+#
+# Two directions, because a claim can be phrased either way round:
+#   * a credential noun near an exposure STATE  ("tokens ... unredacted")
+#   * a past-tense or stopping LEAK VERB near a credential noun
+# Present tense alone must NOT fire: "store credentials in the reference store"
+# is a feature description, and requiring a past or stopping claim is what
+# separates the two. `(was|were) vulnerable` was dropped outright — it carried
+# no credential-noun requirement, had zero support in the corpus, and fires on
+# an ordinary CVE dependency bump.
+# EVERY group is BOUNDED on both sides — not only the two alternatives that were
+# caught firing. An atom short enough to live inside an ordinary word matches a
+# word with an unrelated or opposite meaning: `cred` in `sacred`, `key` in
+# `monkey`, but equally `stored` in `restored`, `recorded` in `prerecorded`, and
+# `recoverable` in `unrecoverable` — the last an outright INVERSION, firing on
+# the subject that says the tokens are gone. Bounding the offenders one at a time
+# leaves the same class alive in the next group, so the invariant is stated once,
+# structurally: an atom in this pattern is a WORD, never a substring.
+# `TestEveryAtomGroupIsWordBounded` fails on any group added unbounded later
+# (Codex P2 x2 + CodeRabbit, PR #1623).
+#
+# The stopping phrase is a `_FRAMING_*` variable for that reason and no other.
+# It was an inline literal in the alternation below, so the sweep that bounded
+# "every group" missed it — and it is the loosest branch in the pattern, so it
+# was the worst one to miss: `stop` matched inside `stopgap`, `backstop`,
+# `nonstop` and `stopwatch`, and `prevent` inside `preventive`. An invariant that
+# only covers the groups someone remembered to hoist is not structural, so the
+# test now also refuses an inline group in `FRAMING_PATTERNS` outright.
+#
+# TENSE. `_FRAMING_PAST` holds forms that are past tense on their own — a bare
+# `-ed` after a subject is simple past ("we leaked an API key"). `_FRAMING_PROG`
+# holds the progressive forms, which are not: `storing` is equally at home in
+# "was storing tokens" (an incident) and "support storing API keys" (a feature).
+# So the progressive branch now requires a past auxiliary, and a bare gerund no
+# longer fires on its own. Recall is unaffected — every incident phrasing here
+# that leans on a progressive form already carries `was`/`were`/`been`, and the
+# imperative case is the stopping-phrase branch below, not this one.
+#
+# KNOWN LIMIT, stated rather than chased: a past participle after a PRESENT
+# auxiliary — "API keys are now stored in the keyring" — still fires. Separating
+# `are stored` from `were stored` needs negative lookbehind, which ERE does not
+# have, and the alternative (dropping `stored`/`logged`/`exposed` from the bare
+# set) costs real recall on the simple-past phrasings that are the common shape.
+# On an ADVISORY axis measuring 0/1737 over this repo's own subjects, that
+# residue is cheaper than a hand-rolled tense classifier — an open-set claim
+# about English grammar, which is the shape that does not converge.
+#
+# SAME LIMIT, second face: PART OF SPEECH. In the stopping branch, `logs`,
+# `stores` and `writes` are verbs in "no longer logs the token" and nouns in
+# "stop the noisy logs in the key rotation job" — one spelling, and only a POS
+# tagger separates them. Dropping them kills the false fire and the true one
+# together ("no longer stores API keys" is exactly what this branch is for), so
+# they stay and the residue is declared. Bounding fixed the substring half of
+# this class; the POS half is not a regex's to fix.
+#
+# NOT COVERED, measured and recorded rather than quietly widened: a credential
+# noun spelled as a snake_case identifier. `\b` cannot match inside
+# `session_token`, because `_` is a word character — so `session_token was logged
+# in plaintext` does not fire, while `api_key` does, only because `api[ _-]?key`
+# spells the separator out. The labelled set contains no snake_case identifier,
+# so the 23/23 recall figure does not speak to this shape. Widening the bare
+# nouns to absorb it would need the whole false-positive side re-measured, which
+# is a change with its own evidence, not a line to slip in here.
+_FRAMING_NOUN='\b(credential|secret|token|api[ _-]?key|private[ _-]?key|signing[ _-]?key|password|passphrase|cred|cookie|key)s?\b'
+_FRAMING_STATE='\b(plaintext|cleartext|unencrypted|unredacted|verbatim|in the clear|recoverable)\b'
+_FRAMING_PAST='\b(leaked|exposed|persisted|stored|wrote|written|logged|printed|recorded|contained|revealed)\b'
+_FRAMING_PROG='\b(leaking|exposing|persisting|storing|writing|logging)\b'
+_FRAMING_PASTAUX='\b(was|were|been|being|had)\b'
+_FRAMING_STOPV='\b(leaking|exposing|persisting|storing|writing|logging|persists|leaks|exposes|stores|writes|logs|write|store|log|leak|expose)\b'
+_FRAMING_STOPPHRASE='\b(no longer|used to|stop|stops|stopped|prevent|prevents|prevented)\b'
+FRAMING_PATTERNS="${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_STATE}|${_FRAMING_STATE}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_PAST}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_PAST}|${_FRAMING_PASTAUX}[^.]{0,20}${_FRAMING_PROG}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_PASTAUX}[^.]{0,20}${_FRAMING_PROG}|${_FRAMING_STOPPHRASE}[^.]{0,30}${_FRAMING_STOPV}[^.]{0,45}${_FRAMING_NOUN}"
+
+framing_hit=""
+_subject=$(head -n 1 "$MSG_FILE")
+if printf '%s\n' "$_subject" | grep -qiE "$FRAMING_PATTERNS"; then
+    framing_hit="$_subject"
+fi
+
+_emit_framing_advisory() {
+    [ -n "$framing_hit" ] || return 0
     echo ""
-    grep -nE "$PATTERNS" "$1"
+    echo "ADVISORY (not blocking): possible security-incident framing in the subject."
+    # THE SUBJECT IS NOT PRINTED WHEN THE FINGERPRINT LAYER MATCHED. That layer
+    # deliberately reports line numbers only, because the matched text IS the
+    # private value — and echoing the whole subject here would have handed it
+    # straight back, into commit output and the session transcript, after the
+    # block above had just refused to name it (Codex P1, PR #1623).
+    #
+    # The advisory still fires: the framing is worth flagging either way, and
+    # the author is looking at the subject they just wrote. Only layer 1's
+    # matches stay quotable — it already echoes its own matching lines, so
+    # withholding the subject there would cost the advisory its clarity while
+    # concealing nothing.
+    if [ "$fingerprint_blocked" -eq 1 ]; then
+        echo "  (subject withheld — it matched an install fingerprint above)"
+    else
+        echo "  $framing_hit"
+    fi
+    echo ""
+    echo "  Public artifacts describe what the code NOW DOES; they do not assert"
+    echo "  in past tense that this system leaked or exposed anything. A fix does"
+    echo "  not need a confessed incident to justify it."
+    echo ""
+    echo "  This matters most for a COMMIT message: squash merges take their text"
+    echo "  from the branch commits, so this wording is what lands on main"
+    echo "  permanently — and a pushed public branch cannot be force-pushed, so"
+    echo "  amending is free NOW and expensive after the push."
+    echo ""
+    echo "  Rewrite forward, or ignore this if the wording is already neutral."
+    echo ""
+}
+
+if [ "$blocked" -eq 1 ]; then
     echo ""
     echo "Remove private IPs, hostnames, or account IDs from the commit message."
     echo "If this is a false positive, commit with --no-verify (but think twice)."
     echo ""
+    # AFTER the block's own remedy, never before it. Printed above, the advisory
+    # sat directly on top of the "--no-verify" escape hatch, which disarms every
+    # hook including the privacy gates — an advisory should not read as
+    # instructions for getting past a block it has nothing to do with.
+    _emit_framing_advisory
     exit 1
 fi
 
+_emit_framing_advisory
 exit 0

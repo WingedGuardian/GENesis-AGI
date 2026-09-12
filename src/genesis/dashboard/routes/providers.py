@@ -53,17 +53,18 @@ def provider_toggle(name: str):
     except KeyError:
         return jsonify({"status": "error", "message": f"provider '{name}' not found"}), 404
 
+    # The health snapshot reads breaker state (health_data.call_sites), and it
+    # is cached for up to 30s — so without invalidation the Call Sites card and
+    # the attention strip keep showing the pre-toggle status.
+    from genesis.dashboard.routes.health import invalidate_snapshot_cache
+
     if cb.state == ProviderState.OPEN:
-        cb._state = ProviderState.CLOSED
-        cb._consecutive_failures = 0
-        cb._trip_count = 0
-        breakers.save_state()
+        cb.force_close()  # persists via the breaker's own change hook
+        invalidate_snapshot_cache()
         logger.info("Provider '%s' re-enabled via dashboard (breaker reset to CLOSED)", name)
         return jsonify({"status": "ok", "name": name, "state": "closed", "enabled": True})
     else:
-        cb._state = ProviderState.OPEN
-        cb._opened_at = cb._clock()
-        cb._trip_count = 99
-        breakers.save_state()
+        cb.force_open()  # persists via the breaker's own change hook
+        invalidate_snapshot_cache()
         logger.info("Provider '%s' disabled via dashboard (breaker forced OPEN)", name)
         return jsonify({"status": "ok", "name": name, "state": "open", "enabled": False})

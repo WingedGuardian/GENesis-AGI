@@ -23,9 +23,9 @@ The fingerprint, if you're diagnosing it live:
 
 ## What Genesis sets up (and what it only warns about)
 
-`scripts/lib/memory_resilience.sh` runs from `bootstrap.sh` on fresh installs
-and from every `update.sh` (which re-runs bootstrap), so existing installs
-retrofit automatically. It is idempotent and **adaptive — every threshold is a
+`scripts/lib/memory_resilience.sh` runs from `install.sh` and `bootstrap.sh` on
+fresh installs and from every `update.sh` (which re-runs bootstrap), so existing
+installs retrofit automatically. It is idempotent and **adaptive — every threshold is a
 pressure percentage, never an absolute byte value**, so the same config
 right-sizes from a small VPS to a large workstation:
 
@@ -38,10 +38,21 @@ right-sizes from a small VPS to a large workstation:
   ships `auto` or nothing).
 - `/etc/systemd/oomd.conf.d/genesis.conf` — swap-use limit 90%, default
   pressure limit 60%, 20s duration.
-- `genesis-server.service` carries `ManagedOOMPreference=avoid` (plus the
-  kernel-side `OOMScoreAdjust=-500`), so oomd prefers killing the greedy
-  session tree over the cognitive core. `avoid` is honored by the per-user
-  monitor (same-UID cgroup ownership) — see systemd.resource-control(5).
+- `genesis-server.service` carries `ManagedOOMPreference=avoid`, so oomd prefers
+  killing the greedy session tree over the cognitive core. `avoid` is honored by
+  the per-user monitor (same-UID cgroup ownership) — see
+  systemd.resource-control(5).
+- Its kernel-side `OOMScoreAdjust` is **`100`, not a negative value**, and that
+  is a constraint rather than a preference. A user manager cannot lower
+  `oom_score_adj` below the `oom_score_adj_min` of 0 it inherits from init;
+  doing so needs `CAP_SYS_RESOURCE`, which the manager does not hold, and the
+  write fails **silently**. MEASURED 2026-09-08: the unit declared `-500` while
+  the live process ran at `100`, and had since the line was written. Raising
+  always works, lowering never does — so the kill order is built by pushing
+  sacrificial processes UP (CC subprocesses to 500), never by protecting the
+  server DOWN. Deleting the declaration would be worse than a wrong value:
+  unset units report systemd's default of **200**, which is more killable than
+  100.
 
 Graceful degradation: no systemd, no `systemd-oomd`, no kernel PSI, or no
 non-interactive sudo each produce a one-line skip note, never a failure.
@@ -95,6 +106,37 @@ mechanically instead of leaving the warning above as the only output.
 - The host-plane `swap_total_kb` fact (table above) picks the device up
   automatically, and `_memres_swap_check` stops warning once it's active.
 
+## The PID/task budget (fork-exhaustion guard)
+
+Memory isn't the only slice-level budget that wedges. systemd's stock
+`user-.slice.d/10-defaults.conf` caps every per-user slice at **`TasksMax=33%`**
+— a conservative multi-user-server default. On a single-user Genesis appliance
+running many concurrent Claude Code sessions (each spawns MCP subprocess trees:
+codebase-memory, serena, gitnexus, the codex broker), 33% of the box's PID
+budget is exhausted well before memory/CPU/disk, so new processes fail with
+**`Cannot fork`** while every other axis reads green.
+
+`pid_budget_apply` (in `scripts/lib/memory_resilience.sh`, run from
+`install.sh`/`bootstrap.sh`/`update.sh` alongside the oomd setup) lays down
+`/etc/systemd/system/user-.slice.d/90-genesis-tasksmax.conf` →
+**`TasksMax=60%`**. Like the pressure thresholds it is a **percentage, not an
+absolute count**, so it self-calibrates to each box's own budget. **60%, not
+unlimited, is deliberate:** reserving ~40% keeps `system.slice`
+(sshd/systemd/dbus/init) alive so a runaway in the user slice can never wedge
+the whole container — it stays recoverable. `90-` sorts after systemd's `10-`
+default so last-assignment-wins makes 60% the effective cap. Same graceful
+degradation as the oomd setup (no systemd / no non-interactive sudo → one-line
+skip); when it can't apply, the posture check below surfaces the un-raised
+ceiling rather than letting the box run silently capped.
+
+**Raising or lowering it.** 60% is the shipped default; adjust in consultation
+with your own Genesis if your box's resources or session count differ — drop a
+higher-numbered override (e.g. `/etc/systemd/system/user-.slice.d/95-local.conf`
+with a different `TasksMax=`), or `sudo systemctl set-property user-<uid>.slice
+TasksMax=<value>` for a runtime change. The live PID budget is on the dashboard
+Container panel (amber ≥ 80%, red ≥ 90%), and the awareness loop raises an
+explanatory alert on approach.
+
 ## How the body schema surfaces it
 
 The infrastructure profile (`INFRASTRUCTURE.md`, `infra_profile` package)
@@ -105,6 +147,7 @@ flags unprotected installs:
 |---|---|---|---|
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
+| `pid_ceiling_effective_ok` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
 | `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |
 
@@ -119,7 +162,11 @@ wedge-defect value in the table above raises one non-paging `high`
 protections and their remediation, auto-resolving when the profile shows them
 restored. Only *explicit* defect values alert — absent/`None` facts stay
 silent (no guardian host plane, cgroup v1, fresh install), so partial installs
-never false-alarm. A profile older than 3 days raises a distinct
+never false-alarm. The `pid_ceiling_unprovisioned` rule rides the same check:
+`pid_ceiling_effective_ok` reflects the *effective* slice `pids.max` (so a
+runtime `set-property` override is judged correctly, not just the drop-in file),
+and `false` — the ceiling still on systemd's 33% default — raises the alert with
+the remedy above. A profile older than 3 days raises a distinct
 "posture UNKNOWN — refresh broken" alert instead of asserting from dead facts.
 The same check also covers the **network plane** (KeepConfiguration + the
 networkd watchdog), gated so it only fires on networkd-managed boxes — see
@@ -157,7 +204,11 @@ tune anything:
   and was killed by the kernel within ~2 minutes (`memory.events` `oom_kill`
   is the counter to check — inside a container you cannot see the host's
   dmesg, and `journalctl -u systemd-oomd` staying empty does NOT mean nothing
-  fired). `genesis-server` survived on `OOMScoreAdjust=-500`.
+  fired). `genesis-server` survived that episode — but NOT because of
+  `OOMScoreAdjust=-500`, which this note originally credited. That value never
+  applied (see above); the server was running at an effective `100` throughout,
+  which still outranked the session tree the kernel chose instead. The outcome
+  was right; the stated reason was not.
 - **systemd-oomd thresholds against the *full* PSI metric** — the fraction of
   time ALL tasks in the cgroup were stalled simultaneously (see
   systemd.oomd(5)) — not the `some` line most dashboards show. A single

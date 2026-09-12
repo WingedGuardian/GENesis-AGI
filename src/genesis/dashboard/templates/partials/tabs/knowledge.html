@@ -45,7 +45,13 @@
               </template>
             </div>
           </template>
-          <template x-if="$store.genesisDashboard.watchlistEntries.length === 0">
+          <template x-if="$store.genesisDashboard.panelState('watchlist') === 'loading'">
+            <div style="font-size:0.74rem; color:var(--color-text-secondary); padding:0.5rem;">Loading…</div>
+          </template>
+          <template x-if="$store.genesisDashboard.panelState('watchlist') === 'error'">
+            <div style="font-size:0.74rem; color:#f0ad4e; padding:0.5rem;">Couldn't load tracked repositories — reload to retry.</div>
+          </template>
+          <template x-if="$store.genesisDashboard.watchlistEntries.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('watchlist'))">
             <div style="font-size:0.74rem; color:var(--color-text-secondary); padding:0.5rem;">No tracked repositories loaded.</div>
           </template>
         </div>
@@ -280,7 +286,13 @@
 
       <!-- Recent Units -->
       <h4 style="margin-bottom: .5rem;">Recent Knowledge Units</h4>
-      <template x-if="$store.genesisDashboard.knowledgeRecent.length === 0">
+      <template x-if="$store.genesisDashboard.panelState('knowledgeRecent') === 'loading'">
+        <p style="color: var(--color-text-secondary);">Loading…</p>
+      </template>
+      <template x-if="$store.genesisDashboard.panelState('knowledgeRecent') === 'error'">
+        <p style="color: #f0ad4e;">Couldn't load knowledge units — reload to retry.</p>
+      </template>
+      <template x-if="$store.genesisDashboard.knowledgeRecent.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('knowledgeRecent'))">
         <p style="color: var(--color-text-secondary);">No knowledge units ingested yet.</p>
       </template>
       <div style="display: flex; flex-direction: column; gap: .5rem;">

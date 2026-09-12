@@ -7,7 +7,7 @@ import math
 import time
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from qdrant_client import QdrantClient
@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
+from genesis.db.crud._fts import fts5_term
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
@@ -29,6 +30,10 @@ from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.provider_activity import track_operation
 from genesis.qdrant import collections as qdrant_ops
 from genesis.util.tasks import tracked_task
+
+if TYPE_CHECKING:
+    from genesis.routing.circuit_breaker import CircuitBreaker
+    from genesis.routing.rate_gate import ProviderRateGate
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +620,32 @@ async def _expired_candidate_ids(
     return {row[0] for row in rows}
 
 
+async def metadata_missing_ids(
+    db: aiosqlite.Connection,
+    candidate_ids: set[str],
+) -> set[str]:
+    """Return the subset of ``candidate_ids`` with NO ``memory_metadata`` row.
+
+    Ghost detector for the recall path: a Qdrant point whose metadata row is
+    gone is a deleted memory's leftover vector ("ghost" — e.g. the recovery
+    worker's upsert racing a cross-process delete). Its payload carries the
+    deleted content, so without a filter it flows straight back into recall
+    until the nightly reconcile sweep removes it. Callers must apply this ONLY
+    to vector-only candidates — legacy FTS rows without metadata are
+    deliberately kept (the long-standing fail-open for pre-metadata content).
+    """
+    if not candidate_ids:
+        return set()
+    placeholders = ",".join("?" * len(candidate_ids))
+    sql = (
+        f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - literal SQL fragments; values bound as parameters
+        f"WHERE memory_id IN ({placeholders})"
+    )
+    cursor = await db.execute(sql, tuple(candidate_ids))
+    rows = await cursor.fetchall()
+    return candidate_ids - {str(row[0]) for row in rows}
+
+
 class HybridRetriever:
     """Hybrid retrieval: Qdrant vectors + FTS5 text + activation scoring, fused via RRF."""
 
@@ -626,6 +657,8 @@ class HybridRetriever:
         db: aiosqlite.Connection,
         reranker: VoyageReranker | None = None,
         read_pool: ReadConnectionPool | None = None,
+        rerank_gate: ProviderRateGate | None = None,
+        rerank_breaker: CircuitBreaker | None = None,
     ) -> None:
         self._embeddings = embedding_provider
         self._qdrant = qdrant_client
@@ -636,6 +669,15 @@ class HybridRetriever:
         # connection off the shared write lock; None (eval, tests, other callers)
         # keeps every read on self._db — byte-identical to the pre-pool path.
         self._read_pool = read_pool
+        # Optional rate-gate + circuit-breaker guarding the Voyage rerank call
+        # (follow-up ac27b693, PR-3). Shared instances (one per process) enforce
+        # Voyage's account-global RPM across all concurrent recalls: gate-denied
+        # skips the rerank INSTANTLY to the RRF+graph floor instead of burning a
+        # 429, and the breaker skips after repeated hangs. None (eval, tests,
+        # other callers, or the GENESIS_RECALL_RERANK_GATE_OFF kill) = today's
+        # unguarded behavior.
+        self._rerank_gate = rerank_gate
+        self._rerank_breaker = rerank_breaker
 
     async def _ro_read(
         self,
@@ -1243,8 +1285,18 @@ class HybridRetriever:
         qdrant_results: list[dict] = []
         qdrant_by_id: dict[str, dict] = {}
         for coll in collections:
+            # Qdrant's client is SYNCHRONOUS (no AsyncQdrantClient exists in
+            # Genesis), so offload each blocking search to a worker thread — it
+            # must never block the shared event loop while other coroutines (other
+            # recalls, the rest of the server) are waiting, which matters under
+            # the user's 5-7 concurrent-session norm (ac27b693, PR-2). track_operation
+            # stays ON the event loop wrapping the await, so per-collection
+            # "qdrant.search" telemetry (the provider:qdrant_unreachable signal in
+            # mcp/health/errors.py) is byte-identical to the inline version, and
+            # asyncio.to_thread re-raises so a Qdrant error propagates unchanged.
             with track_operation(self._embeddings.tracker, "qdrant.search"):
-                hits = qdrant_ops.search(
+                hits = await asyncio.to_thread(
+                    qdrant_ops.search,
                     self._qdrant,
                     collection=coll,
                     query_vector=vector,
@@ -1313,11 +1365,19 @@ class HybridRetriever:
         ``extra_fts_terms`` (proactive hook's file-context keywords) are
         OR-appended so a memory can surface on a recent-file term alone —
         preserving the old subprocess hook's file-keyword lane. FTS-only:
-        they never touch the embedding or intent. Appended in boolean form;
-        ``search_ranked``'s ``_prepare_fts5(boolean=True)`` re-sanitizes, so
-        raw terms can't cause an FTS5 syntax error. When they're present the
-        result differs from ``query`` and the caller's ``fts_is_boolean`` flag
-        flips on automatically.
+        they never touch the embedding or intent. Appended in boolean form.
+        When they're present the result differs from ``query`` and the caller's
+        ``fts_is_boolean`` flag flips on automatically.
+
+        Each extra term is sanitised through ``fts5_term`` and dropped if nothing
+        survives. This docstring previously claimed that ``search_ranked``'s
+        ``_prepare_fts5(boolean=True)`` "re-sanitizes, so raw terms can't cause
+        an FTS5 syntax error" — that was FALSE. Sanitising the finished
+        expression reduces a punctuation-only term to whitespace and leaves
+        ``(retrieval py OR  )``, which is parenthesis-balanced (so it passes the
+        only structural check there) and then fails in FTS5 with ``syntax error
+        near ")"``. These terms are FILE keywords, so punctuation is routine and
+        the old ``if t`` filter caught only the empty string, not ``"---"``.
         """
         fts_query = query
         if expand_query_terms:
@@ -1331,7 +1391,8 @@ class HybridRetriever:
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
         if extra_fts_terms:
-            extra = " OR ".join(str(t) for t in extra_fts_terms if t)
+            safe_terms = [t for t in (fts5_term(t) for t in extra_fts_terms) if t]
+            extra = " OR ".join(safe_terms)
             if extra:
                 fts_query = f"({fts_query}) OR ({extra})"
         return fts_query
@@ -1412,6 +1473,33 @@ class HybridRetriever:
                 qdrant_by_id.pop(mid, None)
                 fts_by_id.pop(mid, None)
             event_memory_ids = [m for m in event_memory_ids if m not in expired]
+
+        # Ghost filter: a VECTOR-ONLY candidate (Qdrant hit, no FTS hit) with
+        # no memory_metadata row is a deleted memory's leftover point — its
+        # payload would resurface deleted content until the nightly reconcile
+        # sweep. Scoped to vector-only ids ON PURPOSE: an FTS row without
+        # metadata is legacy pre-metadata content and stays recallable (the
+        # long-standing fail-open). Same degrade-open posture as the expiry
+        # filter: a DB failure keeps candidates rather than crashing recall.
+        vector_only = {mid for mid in all_ids if mid in qdrant_by_id and mid not in fts_by_id}
+        if vector_only:
+            try:
+                ghost_ids = await self._ro_read(metadata_missing_ids, vector_only)
+            except Exception:
+                logger.warning(
+                    "ghost filter failed, returning unfiltered candidates",
+                    exc_info=True,
+                )
+                ghost_ids = set()
+            if ghost_ids:
+                logger.info(
+                    "recall: dropped %d ghost candidate(s) (vector without metadata row)",
+                    len(ghost_ids),
+                )
+                all_ids -= ghost_ids
+                for mid in ghost_ids:
+                    qdrant_by_id.pop(mid, None)
+                event_memory_ids = [m for m in event_memory_ids if m not in ghost_ids]
         return all_ids, event_memory_ids
 
     async def _compute_activations(
@@ -1529,6 +1617,21 @@ class HybridRetriever:
                 if content:
                     rerank_docs.append({"id": mid, "text": content})
             if rerank_docs:
+                # Rerank resilience (ac27b693, PR-3): skip straight to the
+                # RRF+graph floor rather than pay a doomed Voyage call. Breaker
+                # (open only after repeated genuine hangs) first, then the
+                # account-global rate gate — a denied gate means we'd exceed
+                # Voyage's RPM (free tier = 3 RPM), so skipping INSTANTLY beats
+                # burning a 429 round-trip. Both are optional; unset (eval/tests/
+                # kill switch) = today's unguarded behavior.
+                if self._rerank_breaker is not None and not self._rerank_breaker.is_available():
+                    if stats is not None:
+                        stats["rerank_skipped_breaker_open"] = True
+                    return fused
+                if self._rerank_gate is not None and not await self._rerank_gate.try_acquire():
+                    if stats is not None:
+                        stats["rerank_skipped_ratelimited"] = True
+                    return fused
                 t0 = time.monotonic()
                 coro = self._reranker.rerank(
                     query,
@@ -1545,6 +1648,14 @@ class HybridRetriever:
                         "Rerank exceeded %.1fs timebox — keeping RRF order",
                         timeout_s,
                     )
+                    # A timebox expiry is a genuine hang (NOT a 429) → feed the
+                    # breaker so a persistently-slow Voyage trips it OPEN and we
+                    # skip instantly during the cooldown. 429/empty returns never
+                    # reach here and never trip it — the rate gate is the RPM brake.
+                    if self._rerank_breaker is not None:
+                        from genesis.routing.types import ErrorCategory
+
+                        self._rerank_breaker.record_failure(ErrorCategory.TIMEOUT)
                     if stats is not None:
                         stats["rerank_timed_out"] = True
                         stats["rerank_ms"] = round((time.monotonic() - t0) * 1000, 1)
@@ -1552,6 +1663,11 @@ class HybridRetriever:
                 if stats is not None:
                     stats["rerank_ms"] = round((time.monotonic() - t0) * 1000, 1)
                 if reranked:
+                    # A real result set proves Voyage responsive → heal the breaker
+                    # (resets consecutive failures / closes a HALF_OPEN). An empty
+                    # return (429/5xx) is left as no-signal: RRF floor, no trip.
+                    if self._rerank_breaker is not None:
+                        self._rerank_breaker.record_success()
                     if stats is not None:
                         stats["rerank_executed"] = True
                     # Rebuild fused with only reranked candidates, using

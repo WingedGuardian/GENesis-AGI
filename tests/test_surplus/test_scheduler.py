@@ -14,10 +14,54 @@ from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.queue import SurplusQueue
-from genesis.surplus.scheduler import SurplusScheduler, _restart_safe_hourly
+from genesis.surplus.scheduler import (
+    SurplusScheduler,
+    _pump_surplus_heartbeat,
+    _restart_safe_hourly,
+)
 from genesis.surplus.types import ComputeTier, TaskType
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_pump_surplus_heartbeat_logs_on_failure(monkeypatch, caplog):
+    # A silently-failing heartbeat write would starve the 900s zombie watchdog while
+    # the loop runs fine (2026-09-01 incident candidate). It must LOG, not swallow.
+    import logging
+
+    import genesis.runtime as runtime_mod
+
+    class _BoomRt:
+        def record_job_success(self, name):
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr(runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: _BoomRt()))
+    with caplog.at_level(logging.WARNING):
+        _pump_surplus_heartbeat("loop-entry")
+
+    assert any(
+        "surplus heartbeat write failed" in r.getMessage() and "loop-entry" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_pump_surplus_heartbeat_silent_on_success(monkeypatch, caplog):
+    import logging
+
+    import genesis.runtime as runtime_mod
+
+    calls = []
+
+    class _OkRt:
+        def record_job_success(self, name):
+            calls.append(name)
+
+    monkeypatch.setattr(runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: _OkRt()))
+    with caplog.at_level(logging.WARNING):
+        _pump_surplus_heartbeat("pre-dispatch")
+
+    assert calls == ["surplus_dispatch"]  # the write actually happened
+    assert not any("surplus heartbeat write failed" in r.getMessage() for r in caplog.records)
 
 
 def _make_scheduler(db, *, idle=True, lmstudio_up=False):
@@ -511,6 +555,46 @@ async def test_alarm_db_integrity_writes_observation_and_emits(db):
     call = sched._event_bus.emit.await_args
     assert call.args[0] == Subsystem.SURPLUS
     assert call.args[1] == Severity.ERROR
+
+
+class _FailedEvent:
+    """Stand-in for an APScheduler EVENT_JOB_ERROR with an empty-str exception —
+    the live case: the TYPE is the only signal and str(exception) is blank."""
+
+    def __init__(self, exc):
+        self.job_id = "memory_extraction"
+        self.exception = exc
+
+
+async def test_emit_job_error_event_message_carries_type(db):
+    """Codex P2 (#1225): the emitted event MESSAGE — not just job_health — must
+    carry the exception type, because health_errors output and the grouped-error
+    UI key on the message, not the details dict."""
+    from genesis.observability.types import Subsystem
+
+    sched, _ = _make_scheduler(db)
+    sched._event_bus = AsyncMock()
+
+    rt = AsyncMock()
+    rt.event_bus = sched._event_bus
+    captured: dict = {}
+    rt.record_job_failure = lambda job_id, detail, error_type=None: captured.update(
+        job_id=job_id, detail=detail, error_type=error_type
+    )
+
+    with patch("genesis.runtime.GenesisRuntime.instance", return_value=rt):
+        await sched._emit_job_error_event("memory_extraction", _FailedEvent(ValueError()))
+
+    # Event message is diagnosable even though str(ValueError()) is empty.
+    call = sched._event_bus.emit.await_args
+    assert call.args[0] == Subsystem.SURPLUS
+    message = call.args[3]
+    assert "ValueError" in message
+    assert not message.rstrip().endswith("failed:"), "message must not be a bare 'failed:'"
+    # details still carry the structured type, and both sinks agree.
+    assert call.kwargs["error_type"] == "ValueError"
+    assert captured["error_type"] == "ValueError"
+    assert captured["detail"] in message
 
 
 async def test_run_db_integrity_check_healthy_db_no_alarm(db):

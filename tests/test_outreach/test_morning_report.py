@@ -1,6 +1,6 @@
 """Tests for morning report generator."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
@@ -69,6 +69,87 @@ async def test_generate_returns_outreach_request(db, mock_health, mock_drafter):
     assert req.signal_type == "morning_report"
     assert req.salience_score == 0.0
     assert "morning" in req.topic.lower() or "report" in req.topic.lower()
+
+
+@pytest.mark.asyncio
+async def test_critical_issues_dedupes_subsystem_stale(db, mock_health, mock_drafter):
+    """A subsystem already surfaced as a subsystem_stale:<name> alert is NOT listed
+    a second time by the heartbeat-staleness block (P2-6 dedup). A subsystem with a
+    heartbeat but NO alert (surplus) is still surfaced once."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    alerts = [
+        {
+            "id": "subsystem_stale:inbox",
+            "severity": "WARNING",
+            "message": "Subsystem 'inbox' heartbeat overdue — no pulse in 9000s",
+        },
+    ]
+    heartbeats = {
+        "inbox": {"status": "overdue", "age_seconds": 9000, "last_seen": "x"},
+        "surplus": {"status": "overdue", "age_seconds": 5000, "last_seen": "y"},
+    }
+    with (
+        patch(
+            "genesis.mcp.health_mcp._impl_health_alerts",
+            new=AsyncMock(return_value=alerts),
+        ),
+        patch(
+            "genesis.mcp.health.manifest._impl_subsystem_heartbeats",
+            new=AsyncMock(return_value=heartbeats),
+        ),
+    ):
+        text = await gen._get_critical_issues()
+
+    assert text is not None
+    # inbox appears exactly once — via its alert line, NOT duplicated by the hb block.
+    assert text.count("'inbox'") == 1
+    assert "subsystem_stale:inbox" in text
+    # surplus has a heartbeat but no alert → still surfaced once by the hb block.
+    assert "'surplus'" in text
+
+
+@pytest.mark.asyncio
+async def test_critical_issues_surfaces_and_dedupes_subsystem_never_started(
+    db, mock_health, mock_drafter
+):
+    """A subsystem_never_started:<name> alert (the new never-started liveness id) is
+    surfaced by the morning report (it passes the WARNING+ filter, it is not a
+    call_site: alert) and its name is captured into the dedup set so the
+    heartbeat-staleness block never lists it a SECOND time. A subsystem with a plain
+    overdue heartbeat but no alert is still surfaced once by the hb block."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    alerts = [
+        {
+            "id": "subsystem_never_started:inbox",
+            "severity": "WARNING",
+            "message": "Subsystem 'inbox' never started — enabled but no heartbeat since boot",
+        },
+    ]
+    # inbox's heartbeat verdict is "never_started" (mutually exclusive with overdue —
+    # never_started requires zero pulses). The hb block only renders "overdue", so the
+    # dedup capture is defensive here; assert inbox is NOT double-listed regardless.
+    heartbeats = {
+        "inbox": {"status": "never_started", "last_seen": None, "reason": "init-failed"},
+        "surplus": {"status": "overdue", "age_seconds": 5000, "last_seen": "y"},
+    }
+    with (
+        patch(
+            "genesis.mcp.health_mcp._impl_health_alerts",
+            new=AsyncMock(return_value=alerts),
+        ),
+        patch(
+            "genesis.mcp.health.manifest._impl_subsystem_heartbeats",
+            new=AsyncMock(return_value=heartbeats),
+        ),
+    ):
+        text = await gen._get_critical_issues()
+
+    assert text is not None
+    # inbox is surfaced exactly once — via its never_started alert line.
+    assert text.count("'inbox'") == 1
+    assert "subsystem_never_started:inbox" in text
+    # surplus has a heartbeat but no alert → still surfaced once by the hb block.
+    assert "'surplus'" in text
 
 
 @pytest.mark.asyncio
@@ -409,10 +490,17 @@ async def test_build_lane_section_renders(db, mock_health, mock_drafter, monkeyp
                     source_file="New Genesis Capabilities.md",
                     verdict="dont_build", verdict_reason="brain-not-body scope")
 
-    async def fake_ci(url):
+    async def fake_ci(url, *, actions_degraded=None):
         return "passing"
 
     monkeypatch.setattr(_mr_mod, "_pr_ci_status", fake_ci)
+
+    async def _not_degraded():
+        return False
+
+    # _get_build_lane_section resolves the incident state once before the gather;
+    # stub it so the test makes no real githubstatus network call.
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _not_degraded)
 
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     section = await gen._get_build_lane_section()
@@ -444,6 +532,196 @@ async def test_pr_ci_status_none_on_empty_or_no_url(monkeypatch):
     monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
     assert await _mr_mod._pr_ci_status("https://x/pull/1") is None
     assert await _mr_mod._pr_ci_status("") is None
+
+
+# --- GitHub Actions outage pre-flight (distinguish infra outage from real failure) ---
+
+
+class _FakeStatusResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeStatusClient:
+    """Async-context-manager stand-in for httpx.AsyncClient."""
+
+    def __init__(self, *, payload=None, exc=None):
+        self._payload = payload
+        self._exc = exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url):
+        if self._exc is not None:
+            raise self._exc
+        return _FakeStatusResp(self._payload)
+
+
+def _components(*entries):
+    return {"components": [dict(e) for e in entries]}
+
+
+@pytest.mark.asyncio
+async def test_github_actions_degraded_component_scoped(monkeypatch):
+    # Operational Actions → not degraded.
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Actions", "status": "operational"}),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+    # Degraded Actions → degraded.
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Actions", "status": "major_outage"}),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is True
+
+    # Scheduled maintenance stalls CI for infra reasons too (Codex P2).
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Actions", "status": "under_maintenance"}),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is True
+
+    # An UNRELATED component's outage must NOT trip the Actions preflight
+    # (the aggregate-indicator approach did — Codex P2).
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components(
+                {"name": "Packages", "status": "major_outage"},
+                {"name": "Actions", "status": "operational"},
+            ),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+
+@pytest.mark.asyncio
+async def test_github_actions_degraded_fails_open(monkeypatch):
+    # Unreachable / malformed status page must NOT report degraded — never mask
+    # a real CI failure as an infra outage.
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(exc=RuntimeError("boom")),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(payload={}),  # no 'components' key
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+    # Schema-invalid statuses (bool/int/object/unknown string) are NOT outages —
+    # the allowlist rejects them (Codex P2: `true`/`1` must not read as degraded).
+    for bad in (True, 1, {"level": "major"}, "weird_new_state", None):
+        monkeypatch.setattr(
+            _mr_mod.httpx, "AsyncClient",
+            lambda _bad=bad, **kw: _FakeStatusClient(
+                payload=_components({"name": "Actions", "status": _bad}),
+            ),
+        )
+        assert await _mr_mod._github_actions_degraded() is False, bad
+
+    # Actions component absent entirely → cannot confirm → fail open.
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Packages", "status": "operational"}),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_annotates_on_actions_incident(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "FAILURE"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _degraded():
+        return True
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _degraded)
+    out = await _mr_mod._pr_ci_status("https://x/pull/1")
+    assert out is not None and out.startswith("failing")
+    assert "GitHub Actions" in out  # incident annotation present
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_no_annotation_when_not_degraded(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "FAILURE"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _not_degraded():
+        return False
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _not_degraded)
+    assert await _mr_mod._pr_ci_status("https://x/pull/1") == "failing"
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_annotates_pending_branch(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"status": "IN_PROGRESS"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _degraded():
+        return True
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _degraded)
+    out = await _mr_mod._pr_ci_status("https://x/pull/1")
+    assert out is not None and out.startswith("pending")
+    assert "GitHub Actions" in out
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_honors_precomputed_degraded(monkeypatch):
+    # When actions_degraded is supplied by the caller, the per-call status check
+    # must NOT run (resolved once per report, not per PR).
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "FAILURE"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _boom():
+        raise AssertionError("must not resolve per-call when precomputed")
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _boom)
+
+    out = await _mr_mod._pr_ci_status("https://x/pull/1", actions_degraded=True)
+    assert out is not None and out.startswith("failing") and "GitHub Actions" in out
+    assert await _mr_mod._pr_ci_status("https://x/pull/1", actions_degraded=False) == "failing"
 
 
 # --- message_queue finding closure (confirm_delivery) ---

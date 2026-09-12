@@ -52,6 +52,42 @@ class TestLoadEgoConfig:
         # Falls back to defaults
         assert config.cadence_minutes == 60
 
+    def test_partial_revalidation_override_merges_over_defaults(self, tmp_config):
+        """Codex P2 regression: a partial revalidation_interval_hours override
+        must merge OVER the full defaults — omitted urgencies keep their
+        declared cadence instead of collapsing to the consumer-side 72h
+        fallback (critical 6→72, low 168→72)."""
+        tmp_config.write_text(yaml.dump({
+            "revalidation_interval_hours": {"high": 12},
+        }))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == {
+            "critical": 6,
+            "high": 12,
+            "normal": 72,
+            "low": 168,
+        }
+
+    def test_full_revalidation_override_respected(self, tmp_config):
+        """A complete override replaces every default value."""
+        full = {"critical": 1, "high": 2, "normal": 3, "low": 4}
+        tmp_config.write_text(yaml.dump({"revalidation_interval_hours": full}))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == full
+
+    def test_partial_auto_table_override_merges_over_defaults(self, tmp_config):
+        """A partial auto_table_ttl_hours override merges OVER the full defaults
+        — omitted urgencies keep their declared window (same defaults-complete
+        semantics as revalidation_interval_hours)."""
+        tmp_config.write_text(yaml.dump({"auto_table_ttl_hours": {"high": 24}}))
+        config = load_ego_config(tmp_config)
+        assert config.auto_table_ttl_hours == {
+            "critical": 240,
+            "high": 24,
+            "normal": 504,
+            "low": 720,
+        }
+
 
 class TestSaveEgoConfig:
     def test_roundtrip(self, tmp_config):
@@ -112,6 +148,19 @@ class TestValidateEgoConfig:
         errors = validate_ego_config({"proposal_expiry_minutes": 240})
         assert errors == []  # unknown key, ignored
 
+    def test_invalid_auto_table_ttl_unknown_urgency(self):
+        errors = validate_ego_config({"auto_table_ttl_hours": {"bogus": 12}})
+        assert len(errors) == 1
+        assert "auto_table_ttl_hours" in errors[0]
+
+    def test_invalid_auto_table_ttl_non_positive(self):
+        errors = validate_ego_config({"auto_table_ttl_hours": {"high": 0}})
+        assert len(errors) == 1
+        assert "auto_table_ttl_hours" in errors[0]
+
+    def test_valid_auto_table_ttl(self):
+        assert validate_ego_config({"auto_table_ttl_hours": {"high": 72}}) == []
+
     def test_outcome_bus_capability_feed_rejects_non_bool(self):
         for bad in ("yes", 1, 0, None):
             errors = validate_ego_config({"outcome_bus_capability_feed": bad})
@@ -169,6 +218,71 @@ class TestValidateEgoConfig:
         assert cfg.quiet_hours_end == 7
         assert cfg.quiet_hours_min_interval_minutes == 240
 
+    def test_capability_improvement_enabled_rejects_non_bool(self):
+        errors = validate_ego_config({"capability_improvement_enabled": "on"})
+        assert len(errors) == 1
+        assert "capability_improvement_enabled must be a boolean" in errors[0]
+
+    def test_capability_weakness_threshold_bounds(self):
+        assert validate_ego_config({"capability_weakness_threshold": 0.5}) == []
+        assert validate_ego_config({"capability_weakness_threshold": 0.0}) == []
+        assert validate_ego_config({"capability_weakness_threshold": 1.0}) == []
+        assert len(validate_ego_config({"capability_weakness_threshold": 1.5})) == 1
+        assert len(validate_ego_config({"capability_weakness_threshold": -0.1})) == 1
+        # bool must not sneak through the numeric check
+        assert len(validate_ego_config({"capability_weakness_threshold": True})) == 1
+
+    def test_capability_min_sample_size_rejects_bad(self):
+        assert validate_ego_config({"capability_improvement_min_sample_size": 3}) == []
+        # negative would defeat the fluke guard (sample_size >= -1 is always true)
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": 0})) == 1
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": -1})) == 1
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": 2.5})) == 1
+
+    def test_capability_max_signals_rejects_bad(self):
+        assert validate_ego_config({"capability_improvement_max_signals": 3}) == []
+        # negative LIMIT means "no limit" in SQLite — must be rejected
+        assert len(validate_ego_config({"capability_improvement_max_signals": 0})) == 1
+        assert len(validate_ego_config({"capability_improvement_max_signals": -1})) == 1
+
+    def test_capability_improvement_defaults(self):
+        cfg = EgoConfig()
+        assert cfg.capability_improvement_enabled is True
+        assert cfg.capability_weakness_threshold == 0.5
+        assert cfg.capability_improvement_min_sample_size == 3
+        assert cfg.capability_improvement_max_signals == 3
+
+
+class TestCapabilityImprovementSettingsWiring:
+    """The capability_improvement validators are reached by settings_update.
+
+    Proves the settings_update('ego', {...}) path dispatches to
+    validate_ego_config so an invalid capability field is rejected before it
+    can reach ego.yaml (where e.g. a negative max_signals would uncap the
+    SQLite LIMIT and silently disable the feature).
+    """
+
+    def test_ego_domain_dispatches_to_validate_ego_config(self):
+        from genesis.mcp.health.settings import _DOMAIN_VALIDATORS
+
+        assert "ego" in _DOMAIN_VALIDATORS
+        validator = _DOMAIN_VALIDATORS["ego"]
+        # Rejects a non-int max_signals (Codex's "many" case).
+        assert validator({"capability_improvement_max_signals": "many"})
+        # Rejects a negative max_signals (SQLite negative LIMIT = no limit).
+        assert validator({"capability_improvement_max_signals": -1})
+        # Rejects the truthy string "false" for the bool flag.
+        assert validator({"capability_improvement_enabled": "false"})
+        # Rejects an out-of-range threshold.
+        assert validator({"capability_weakness_threshold": 2.0})
+        # A fully-valid change set passes.
+        assert validator({
+            "capability_improvement_enabled": True,
+            "capability_weakness_threshold": 0.4,
+            "capability_improvement_min_sample_size": 5,
+            "capability_improvement_max_signals": 2,
+        }) == []
+
 
 class TestMaxActiveEgoGoalsValidation:
     def test_valid(self):
@@ -179,3 +293,49 @@ class TestMaxActiveEgoGoalsValidation:
         assert validate_ego_config({"max_active_ego_goals": -1})
         assert validate_ego_config({"max_active_ego_goals": 2.5})
         assert validate_ego_config({"max_active_ego_goals": "5"})
+
+
+class TestRevalidationIntervalValidation:
+    def test_default_present(self):
+        assert EgoConfig().revalidation_interval_hours == {
+            "critical": 6,
+            "high": 48,
+            "normal": 72,
+            "low": 168,
+        }
+
+    def test_valid_dict_accepted(self):
+        assert (
+            validate_ego_config({"revalidation_interval_hours": {"high": 12, "low": 200}})
+            == []
+        )
+
+    def test_non_dict_rejected(self):
+        assert validate_ego_config({"revalidation_interval_hours": [1, 2]})
+
+    def test_unknown_urgency_rejected(self):
+        errs = validate_ego_config({"revalidation_interval_hours": {"bogus": 5}})
+        assert any("unknown urgency" in e for e in errs)
+
+    def test_nonpositive_rejected(self):
+        assert validate_ego_config({"revalidation_interval_hours": {"high": 0}})
+        assert validate_ego_config({"revalidation_interval_hours": {"high": -3}})
+
+    def test_bool_rejected(self):
+        assert validate_ego_config({"revalidation_interval_hours": {"high": True}})
+
+    def test_scalar_dict_field_degrades_to_default(self, tmp_config):
+        # A hand-edited scalar for a dict field bypasses validate_ego_config;
+        # load must degrade it to the default, not persist a shape that
+        # crashes runtime .get() (e.g. in create_batch).
+        tmp_config.write_text(yaml.dump({"revalidation_interval_hours": 72}))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == {
+            "critical": 6,
+            "high": 48,
+            "normal": 72,
+            "low": 168,
+        }
+        # class-fix: same protection for the pre-existing dispatch_model_overrides
+        tmp_config.write_text(yaml.dump({"dispatch_model_overrides": "opus"}))
+        assert load_ego_config(tmp_config).dispatch_model_overrides == {}

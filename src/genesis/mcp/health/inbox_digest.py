@@ -66,14 +66,22 @@ async def _impl_inbox_digest(
         # 3. Recent completed evaluations
         evals = await inbox_crud.get_recent_completed(db, days=days)
 
+        # 4. Pending ideas (surplus-ideation review lane, WS-M PR-2). The same
+        # review spine as inbox follow-ups, filtered to the 'idea' kind.
+        ideas = await fu_crud.query_page(
+            db, kind="idea", source="surplus_ideation", status="pending", limit=25,
+        )
+
         # Build formatted output
-        formatted = _format_digest(pending, resolved, evals, days)
+        formatted = _format_digest(pending, resolved, evals, days, ideas)
 
         # Summary line
         parts = [f"{len(pending)} pending"]
         if resolved:
             parts.append(f"{len(resolved)} resolved")
         parts.append(f"{len(evals)} evaluated")
+        if ideas:
+            parts.append(f"{len(ideas)} ideas")
         summary = f"Inbox digest ({days}d): {', '.join(parts)}"
 
         return {
@@ -81,6 +89,7 @@ async def _impl_inbox_digest(
             "pending_follow_ups": pending,
             "resolved_follow_ups": resolved,
             "recent_evaluations": evals,
+            "pending_ideas": ideas,
             "formatted": formatted,
         }
     except Exception as exc:
@@ -88,13 +97,20 @@ async def _impl_inbox_digest(
         return {"error": f"Failed to generate inbox digest: {exc}"}
 
 
+def _cell(value: str) -> str:
+    """Escape a value so it stays inside one Markdown table cell."""
+    return value.replace("\n", " ").replace("|", "\\|")
+
+
 def _format_digest(
     pending: list[dict],
     resolved: list[dict],
     evals: list[dict],
     days: int,
+    ideas: list[dict] | None = None,
 ) -> str:
     """Format digest data into markdown tables."""
+    ideas = ideas or []
     lines = [f"## Inbox Digest — Last {days} Days", ""]
 
     # Pending action items
@@ -107,7 +123,19 @@ def _format_digest(
             priority = fu.get("priority", "medium")
             content = fu.get("content", "")[:120]
             strategy = fu.get("strategy", "")
-            lines.append(f"| {priority} | {content} | {strategy} |")
+            lines.append(f"| {priority} | {_cell(content)} | {_cell(strategy)} |")
+        lines.append("")
+
+    # Pending ideas (surplus-ideation review lane)
+    if ideas:
+        lines.append(f"### Pending Ideas ({len(ideas)} items)")
+        lines.append("")
+        lines.append("| Idea | Source |")
+        lines.append("|------|--------|")
+        for fu in ideas:
+            content = fu.get("content", "")[:120]
+            src = fu.get("source", "")
+            lines.append(f"| {_cell(content)} | {_cell(src)} |")
         lines.append("")
 
     # Resolved items
@@ -121,7 +149,7 @@ def _format_digest(
             notes = (fu.get("resolution_notes") or "—")[:80]
             completed_at = fu.get("completed_at", "")
             age = _relative_age(completed_at)
-            lines.append(f"| {content} | {notes} | {age} |")
+            lines.append(f"| {_cell(content)} | {_cell(notes)} | {age} |")
         lines.append("")
 
     # Recent evaluations
@@ -139,10 +167,10 @@ def _format_digest(
             date = (ev.get("processed_at") or ev.get("created_at") or "")[:10]
             source_file = Path(ev.get("file_path", "")).name
             response = Path(ev.get("response_path", "")).name if ev.get("response_path") else "—"
-            lines.append(f"| {date} | {source_file} | {response} |")
+            lines.append(f"| {date} | {_cell(source_file)} | {_cell(response)} |")
         lines.append("")
 
-    if not pending and not resolved and not evals:
+    if not pending and not resolved and not evals and not ideas:
         lines.append("No inbox activity in this period.")
         lines.append("")
 

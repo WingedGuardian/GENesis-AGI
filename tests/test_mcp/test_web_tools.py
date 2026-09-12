@@ -220,3 +220,143 @@ class TestWebSearch:
         result = await _impl_web_search("query", "nosuchbackend", 10)
         assert "error" in result
         assert "Unknown backend" in result["error"]
+
+
+class TestFirecrawlBackend:
+    """Firecrawl = PAID explicit-only escalation backend (never in auto)."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_firecrawl_fetch(self, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+
+        async def fake_scrape(url):
+            return {
+                "markdown": "Rendered paywalled content",
+                "metadata": {"title": "Hard Page", "sourceURL": url, "statusCode": 200},
+            }
+
+        import genesis.providers.firecrawl_client as fc
+
+        monkeypatch.setattr(fc, "scrape", fake_scrape)
+        result = await _impl_web_fetch("https://hard.example", "firecrawl", 50000)
+        assert result["backend_used"] == "firecrawl"
+        assert result["content"] == "Rendered paywalled content"
+        assert result["title"] == "Hard Page"
+        assert result["error"] is None
+
+    @pytest.mark.asyncio
+    async def test_firecrawl_fetch_without_key_errors(self, monkeypatch):
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        result = await _impl_web_fetch("https://hard.example", "firecrawl", 50000)
+        assert result["backend_used"] == "firecrawl"
+        assert "unavailable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_firecrawl_never_in_auto_chain(self, monkeypatch):
+        """Auto must NEVER touch the paid backend, even with the key set."""
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        called = []
+
+        async def fake_scrape(url):
+            called.append(url)
+            return {"markdown": "x", "metadata": {}}
+
+        import genesis.providers.firecrawl_client as fc
+
+        monkeypatch.setattr(fc, "scrape", fake_scrape)
+        with patch("genesis.mcp.health.web_tools._try_tinyfish_fetch") as tf:
+            tf.return_value = {
+                "url": "https://a.com", "title": "t", "content": "c",
+                "backend_used": "tinyfish", "status_code": 200,
+                "truncated": False, "error": None, "latency_ms": 1.0,
+            }
+            await _impl_web_fetch("https://a.com", "auto", 50000)
+        assert called == [], "auto chain must never burn Firecrawl credits"
+
+    @pytest.mark.asyncio
+    async def test_explicit_firecrawl_search(self, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+
+        async def fake_search(query, *, limit=10):
+            return [
+                {"title": "R1", "url": "https://r1.example", "description": "first"},
+                {"title": "R2", "url": "https://r2.example", "description": "second"},
+            ]
+
+        import genesis.providers.firecrawl_client as fc
+
+        monkeypatch.setattr(fc, "search", fake_search)
+        result = await _impl_web_search("hard query", "firecrawl", 10)
+        assert result["backend_used"] == "firecrawl"
+        assert [r["title"] for r in result["results"]] == ["R1", "R2"]
+        assert result["results"][0]["snippet"] == "first"
+
+    @pytest.mark.asyncio
+    async def test_auto_full_escalation_never_reaches_firecrawl(self, monkeypatch):
+        """Audit lock: even when EVERY free fetch rung fails/challenges, auto
+        must end at the free chain's last rung — never the paid backend."""
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        called = []
+
+        async def fake_scrape(url):
+            called.append(url)
+            return {"markdown": "x", "metadata": {}}
+
+        import genesis.providers.firecrawl_client as fc
+
+        monkeypatch.setattr(fc, "scrape", fake_scrape)
+
+        class _ChallengedFetcher:
+            async def fetch(self, url, max_chars=50000):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    url=url, title="", text="captcha challenge",
+                    status_code=403, truncated=False, error=None,
+                )
+
+        with (
+            patch("genesis.mcp.health.web_tools._try_tinyfish_fetch") as tf,
+            patch("genesis.mcp.health.web_tools._try_ladder_fetch") as lf,
+            patch("genesis.mcp.health.web_tools._try_crawl4ai") as cf,
+            patch("genesis.mcp.health.web_tools._get_fetcher") as gf,
+        ):
+            tf.return_value = None
+            lf.return_value = None
+            cf.return_value = None
+            gf.return_value = _ChallengedFetcher()
+            result = await _impl_web_fetch("https://hard.example", "auto", 50000)
+        assert called == [], "exhausted auto chain must not burn paid credits"
+        assert result["backend_used"] != "firecrawl"
+
+    @pytest.mark.asyncio
+    async def test_search_auto_never_reaches_firecrawl(self, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        called = []
+
+        async def fake_search(query, *, limit=10):
+            called.append(query)
+            return []
+
+        import genesis.providers.firecrawl_client as fc
+
+        monkeypatch.setattr(fc, "search", fake_search)
+
+        class _EmptySearcher:
+            async def search(self, query, max_results=10):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    query=query, results=[], backend_used=None,
+                    fallback_used=True, error="all free backends failed",
+                )
+
+        with (
+            patch("genesis.mcp.health.web_tools._try_tinyfish_search") as ts,
+            patch("genesis.mcp.health.web_tools._get_searcher") as gs,
+        ):
+            ts.return_value = None
+            gs.return_value = _EmptySearcher()
+            result = await _impl_web_search("hard query", "auto", 10)
+        assert called == [], "search auto chain must not burn paid credits"
+        assert result.get("backend_used") != "firecrawl"

@@ -8,6 +8,8 @@ from genesis.knowledge.processors.base import ProcessedContent
 from genesis.knowledge.processors.pdf import PDFProcessor
 from genesis.knowledge.processors.registry import build_default_registry
 from genesis.knowledge.processors.text import TextProcessor
+from genesis.knowledge.processors.web import WebProcessor
+from genesis.knowledge.processors.youtube import YouTubeProcessor
 
 # ─── TextProcessor ──────────────────────────────────────────────────────────
 
@@ -69,6 +71,30 @@ async def test_pdf_processor_can_handle():
     assert processor.can_handle("DOCUMENT.PDF")
     assert not processor.can_handle("document.txt")
 
+
+# ─── WebProcessor ───────────────────────────────────────────────────────────
+
+
+def test_web_processor_can_handle():
+    processor = WebProcessor()
+
+    assert processor.can_handle("https://example.com")
+    assert processor.can_handle("http://example.com")
+    assert not processor.can_handle("example.com")
+    assert not processor.can_handle("document.pdf")
+
+
+# ─── YouTubeProcessor ───────────────────────────────────────────────────────
+
+
+def test_youtube_processor_can_handle():
+    processor = YouTubeProcessor()
+
+    assert processor.can_handle("https://www.youtube.com/watch?v=abc123")
+    assert processor.can_handle("https://youtu.be/abc123")
+    assert processor.can_handle("https://youtube.com/shorts/abc123")
+    assert not processor.can_handle("https://example.com")
+    assert not processor.can_handle("video.mp4")
 
 # ─── Registry ───────────────────────────────────────────────────────────────
 

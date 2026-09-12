@@ -57,6 +57,97 @@ class TestCollectorReplacement:
         assert TaskQualityCollector(mock_db).signal_name == "task_completion_quality"
 
 
+class TestSteadyStateSignalParity:
+    """Guard the bootstrap→steady-state collector swap against silent drops.
+
+    ``AwarenessLoop.replace_collectors`` is a FULL replacement, so a collector
+    registered in the bootstrap set but omitted from the learning swap silently
+    stops being measured (the exact bug that dropped scheduled_job_health /
+    scheduler_liveness). These tests pin the invariant.
+    """
+
+    @staticmethod
+    def _names(collectors) -> set[str]:
+        return {c.signal_name for c in collectors}
+
+    def test_learning_builder_matches_steady_state_signals(self):
+        """The learning swap emits EXACTLY STEADY_STATE_SIGNALS (constant stays synced)."""
+        from genesis.awareness.types import STEADY_STATE_SIGNALS
+        from genesis.runtime.init.learning import build_learning_collectors
+
+        collectors = build_learning_collectors(MagicMock())
+        assert self._names(collectors) == STEADY_STATE_SIGNALS
+        # Count guard: a duplicate signal_name would collapse in the set and hide.
+        assert len(collectors) == len(STEADY_STATE_SIGNALS)
+
+    def test_restored_collectors_present_in_steady_state(self):
+        """The two restored collectors are in the steady-state swap."""
+        from genesis.runtime.init.learning import build_learning_collectors
+
+        names = self._names(build_learning_collectors(MagicMock()))
+        assert "scheduled_job_health" in names
+        assert "scheduler_liveness" in names
+
+    def test_bootstrap_signals_covered_by_steady_state(self):
+        """Every bootstrap signal is carried into steady state, except deferrals."""
+        from genesis.awareness.types import BOOTSTRAP_ONLY_SIGNALS
+        from genesis.runtime.init.awareness import build_bootstrap_collectors
+        from genesis.runtime.init.learning import build_learning_collectors
+
+        boot = self._names(build_bootstrap_collectors(MagicMock()))
+        steady = self._names(build_learning_collectors(MagicMock()))
+        assert (boot - BOOTSTRAP_ONLY_SIGNALS) <= steady
+
+    def test_bootstrap_only_signals_actually_in_bootstrap(self):
+        """Every declared exception is a real bootstrap signal (no phantom names)."""
+        from genesis.awareness.types import BOOTSTRAP_ONLY_SIGNALS
+        from genesis.runtime.init.awareness import build_bootstrap_collectors
+
+        boot = self._names(build_bootstrap_collectors(MagicMock()))
+        assert boot >= BOOTSTRAP_ONLY_SIGNALS
+
+    def test_bootstrap_only_disjoint_from_steady_state(self):
+        """A deferral must NOT also be a steady-state signal.
+
+        Without this, a name added to BOOTSTRAP_ONLY_SIGNALS that is also a real
+        steady-state signal would still pass the coverage check (subtraction only
+        loosens ``boot - BOOTSTRAP_ONLY_SIGNALS <= steady``), letting that
+        collector be silently dropped from the swap — the exact regression class
+        this guard exists to prevent.
+        """
+        from genesis.awareness.types import (
+            BOOTSTRAP_ONLY_SIGNALS,
+            STEADY_STATE_SIGNALS,
+        )
+
+        assert BOOTSTRAP_ONLY_SIGNALS.isdisjoint(STEADY_STATE_SIGNALS)
+
+    def test_event_loop_latency_deferred_not_in_steady_state(self):
+        """event_loop_latency is a documented deferral: in bootstrap, not steady state."""
+        from genesis.awareness.types import BOOTSTRAP_ONLY_SIGNALS
+        from genesis.runtime.init.learning import build_learning_collectors
+
+        assert "event_loop_latency" in BOOTSTRAP_ONLY_SIGNALS
+        steady = self._names(build_learning_collectors(MagicMock()))
+        assert "event_loop_latency" not in steady
+
+    def test_user_facing_signals_subset_of_steady_state(self):
+        """The other hand-maintained signal set stays within the steady-state set."""
+        from genesis.awareness.types import (
+            STEADY_STATE_SIGNALS,
+            USER_FACING_SIGNALS,
+        )
+
+        assert USER_FACING_SIGNALS <= STEADY_STATE_SIGNALS
+
+    def test_memory_backlog_collector_removed(self):
+        """The orphaned MemoryBacklogCollector module is deleted (deliberate 2026-04-11)."""
+        import importlib
+
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("genesis.learning.signals.memory_backlog")
+
+
 class TestPipelineAssembly:
     @pytest.mark.asyncio
     async def test_pipeline_callable_signature(self, db):

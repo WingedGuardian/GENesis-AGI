@@ -60,6 +60,13 @@ class ProbeTransitionTracker:
     Not thread/async-safe by itself, but `observe` is synchronous (no awaits),
     and its sole live caller runs it inside a single-flight `snapshot()` build,
     so no lock is needed there.
+
+    That promise is enforced by `HealthDataService`, which creates a compute
+    task only when `_inflight` is absent or finished and assigns the handle with
+    no await in between — so at most one `_compute_snapshot` is ever live on the
+    loop. It is worth naming because the failure is silent and remote from here:
+    two overlapping computes let the OLDER finish last and move this tracker
+    backwards, emitting a REVERSE health transition that never happened.
     """
 
     def __init__(

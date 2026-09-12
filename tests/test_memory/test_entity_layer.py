@@ -21,7 +21,13 @@ from genesis.memory.entity_seed import SEED_MENTIONS, apply_seed
 async def db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
-    for table in ("entities", "entity_mentions", "entity_links", "deferred_work_queue"):
+    for table in (
+        "entities",
+        "entity_mentions",
+        "entity_links",
+        "entity_merge_journal",
+        "deferred_work_queue",
+    ):
         await conn.execute(TABLES[table])
     await conn.commit()
     yield conn

@@ -134,16 +134,19 @@ class EgoContextBuilder:
         queues = snap.get("queues", {})
         if queues:
             lines.append("\n### Queues")
-            deferred = queues.get("deferred_work_queue", {})
-            dead_letter = queues.get("dead_letter_queue", {})
-            if isinstance(deferred, dict):
-                lines.append(
-                    f"- Deferred work: {deferred.get('pending', 0)} pending"
-                )
-            if isinstance(dead_letter, dict):
-                lines.append(
-                    f"- Dead letter: {dead_letter.get('count', 0)} items"
-                )
+            # A FAILED queue query leaves the producer's value None while the
+            # KEY stays present, so `.get(name, 0)` never defaults — rendering
+            # it raw puts the token "None" in this context, and defaulting it
+            # to 0 states "nothing pending" for a depth nobody measured. Say
+            # unknown; the snapshot's `errors` list carries the reason.
+            deferred = queues.get("deferred_work")
+            dead = queues.get("dead_letters")
+            lines.append(
+                f"- Deferred work: {'unknown' if deferred is None else deferred} pending"
+            )
+            lines.append(
+                f"- Dead letter: {'unknown' if dead is None else dead} items"
+            )
 
         # Surplus
         surplus = snap.get("surplus", {})
@@ -442,13 +445,34 @@ class EgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
-            entries = await cap_crud.get_all(self._db)
+            from genesis.ego import _capability_render as _cap_render
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
-            lines.append("*No capability data available yet.*\n")
+            # Distinguish a FAILURE from an empty map, and log it — rendering a
+            # query error as "no data yet" hides the error from both the ego and
+            # the operator.
+            logger.warning("Failed to query capability map", exc_info=True)
+            lines.append(
+                "*Capability data unavailable (query error — see logs).*\n"
+            )
             return "\n".join(lines)
 
         if not entries:
-            lines.append("*Capability map is empty — run aggregation to populate.*\n")
+            # Two DIFFERENT states reach here and must not produce the same
+            # sentence: a genuinely empty map, and a full map whose every row
+            # failed a bar. Each message is a false claim in the other's
+            # situation, so the count decides which is rendered.
+            total = await _cap_render.safe_count(self._db)
+            _unusable = await _cap_render.safe_count_unusable(self._db)
+            lines.append(_cap_render.empty_state_note(
+                total,
+                empty="*No capability data yet — the map is empty.*\n",
+                filtered="*No qualifying capability rows ({total} present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying capability rows (count unavailable — "
+                        "see logs).*\n",
+                unusable=_unusable,
+            ))
             return "\n".join(lines)
 
         lines.append("| Domain | Confidence | Trend | Evidence |")
@@ -459,6 +483,17 @@ class EgoContextBuilder:
             trend = entry.get("trend", "stable")
             evidence = (entry.get("evidence_summary") or "—")[:80].replace("|", "/")
             lines.append(f"| {domain} | {conf} | {trend} | {evidence} |")
+
+        # Rows that were dropped and cannot recover are reported HERE too, not
+        # only when the table comes back empty. A malformed row alongside
+        # healthy ones is exactly as invisible and exactly as permanent, and
+        # that is the commoner case — wiring this into the empty branch alone
+        # reported the rare state and stayed silent about the likely one.
+        _clause = _cap_render.unusable_note(
+            await _cap_render.safe_count_unusable(self._db)
+        )
+        if _clause:
+            lines.append(f"*{_clause.strip()}*")
 
         lines.append("")
         return "\n".join(lines)

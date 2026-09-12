@@ -348,6 +348,9 @@ def test_true_end_to_end_dry_run_happy_path(tmp_path, monkeypatch, capsys):
         return original_run(cmd, *a, **k)
 
     monkeypatch.setattr(sanitize.subprocess, "run", sanitize_fake_run)
+    # Floor now resolves the binary PATH-independently (absolute venv path), which
+    # would bypass the sanitize_fake_run guard — pin it to the bare name.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: "detect-secrets")
 
     # Mock the version-gate LLM path so no real network call is made.
     monkeypatch.setenv("GROQ_API_KEY", "fake-for-selection")

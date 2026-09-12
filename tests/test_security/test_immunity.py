@@ -222,3 +222,39 @@ def test_record_demotion_carries_repo_sibling_overlay_keys(config_dirs):
     assert written["autonomy"]["mode"] == "enforce"  # carried over
     assert written["injection"]["mode"] == "shadow"
     assert immunity.gate_mode("autonomy") == "enforce"  # still applies
+
+
+# ─── is_trusted_for_privileged_write (write-side trust predicate) ─────────────
+
+
+@pytest.mark.parametrize(
+    "origin,expected",
+    [
+        ("owner", True),
+        ("first_party", True),
+        ("external_untrusted", False),
+        (None, False),  # fail-closed: unstamped is NOT trusted "by omission"
+        ("garbage", False),  # unknown → external → not trusted
+        ("", False),
+    ],
+)
+def test_is_trusted_for_privileged_write(origin, expected):
+    """The write-side gate: only owner/first_party may auto-consume into
+    privileged state (user model, autonomy dispatch). Fail-closed on
+    NULL/unknown (NOT first-party 'by omission'). No config read, so no
+    config_dirs fixture needed."""
+    assert immunity.is_trusted_for_privileged_write(origin) is expected
+
+
+def test_trusted_write_is_a_distinct_predicate_from_blockable():
+    """For the current 3-class taxonomy the write-side gate is the logical
+    complement of is_blockable — but it is defined INDEPENDENTLY (owner/
+    first_party allow-list, not `not is_blockable`) so that a future
+    non-owner 'derived/provisional' origin would be kept-in-recall
+    (not blockable) yet barred-from-privileged-write. Today they agree on
+    every value; this pins that agreement so a taxonomy change is a conscious
+    diff."""
+    for origin in ("owner", "first_party", "external_untrusted", None, "garbage"):
+        assert immunity.is_trusted_for_privileged_write(origin) is (
+            not immunity.is_blockable(origin)
+        )

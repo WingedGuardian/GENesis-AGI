@@ -1,5 +1,170 @@
 
 
+    <!-- First-run onboarding wizard (Setup card). Shown on Overview until the
+         install is FUNCTIONAL (live floor_met: CC login + an LLM key + an embedding
+         key), NOT merely until the bootstrap marker exists. The wizard writes no
+         marker. Dismissible. Every step reuses an EXISTING route (secrets PUT,
+         keys/test, config-files PUT); this card changes no auth behavior. -->
+    <template x-if="$store.genesisDashboard.activeTab === 'overview' && $store.genesisDashboard.showSetupCard">
+      <div class="panel" x-data="{s: $store.genesisDashboard}" style="border:1px solid #2196F3;">
+        <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+          <span><span class="material-symbols-outlined">rocket_launch</span> Welcome — finish setting up Genesis</span>
+          <button @click="s.dismissSetupCard()" title="Dismiss" style="background:none;border:none;color:var(--color-text-secondary,#888);cursor:pointer;font-size:1rem;line-height:1;">✕</button>
+        </div>
+        <div style="padding:0.75rem 1rem;font-size:0.85rem;">
+          <!-- progress -->
+          <div style="display:flex;gap:0.75rem;margin-bottom:0.6rem;font-size:0.72rem;color:var(--color-text-secondary,#888);flex-wrap:wrap;">
+            <span :style="s.setupStep>=1?'color:#2196F3;font-weight:600':''">1 · Password</span>
+            <span :style="s.setupStep>=2?'color:#2196F3;font-weight:600':''">2 · Model key</span>
+            <span :style="s.setupStep>=3?'color:#2196F3;font-weight:600':''">3 · Identity</span>
+            <span :style="s.setupStep>=4?'color:#2196F3;font-weight:600':''">✓ Done</span>
+          </div>
+          <!-- status chips (from setup-status) -->
+          <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem;font-size:0.75rem;color:var(--color-text-secondary,#999);">
+            <span x-text="(s.setupStatus&&s.setupStatus.cc_oauth?'✓':'○')+' Claude Code login'" :style="s.setupStatus&&!s.setupStatus.cc_oauth?'color:#f0ad4e':''"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.llm_key_present?'✓':'○')+' chat model key'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.embedding_key_present?'✓':'○')+' embedding key'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.password_set?'✓':'○')+' dashboard password'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.identity_set?'✓':'○')+' identity (USER.md)'"></span>
+          </div>
+
+          <!-- Step 1: dashboard password -->
+          <div x-show="s.setupStep===1">
+            <p style="margin:0 0 0.5rem;">Set a dashboard password so only you can reach this UI. (Optional — you can skip.)</p>
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+              <input type="password" x-model="s.setupPassword" placeholder="New dashboard password" style="flex:1;min-width:180px;padding:0.4rem;">
+              <button class="btn" @click="s.setupSavePassword()" :disabled="s.setupBusy">Save</button>
+              <button class="btn-secondary" @click="s.setupStep=2">Skip</button>
+            </div>
+          </div>
+
+          <!-- Step 2: model / embedding key -->
+          <div x-show="s.setupStep===2">
+            <p style="margin:0 0 0.5rem;">Add an API key so Genesis can think. Pick a provider, paste the key, test it, save.</p>
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+              <select x-model.number="s.setupProviderIdx" @change="s.setupKeyTest=null" style="padding:0.4rem;">
+                <template x-for="(p, idx) in s.setupProviders" :key="p.keyName">
+                  <option :value="idx" x-text="p.label"></option>
+                </template>
+              </select>
+              <input type="password" x-model="s.setupKeyValue" placeholder="Paste API key" style="flex:1;min-width:180px;padding:0.4rem;">
+              <button class="btn-secondary" @click="s.setupTestKey()" :disabled="!!s.setupBusy || s.setupKeyTest==='testing'" x-show="s.setupProvider && s.setupProvider.testable">Test</button>
+              <button class="btn" @click="s.setupSaveKey()" :disabled="!!s.setupBusy">Save</button>
+            </div>
+            <div style="margin-top:0.4rem;font-size:0.75rem;">
+              <span x-show="s.setupKeyTest==='testing'">Testing…</span>
+              <span x-show="s.setupKeyTest && s.setupKeyTest!=='testing' && s.setupKeyTest.valid===true" style="color:#5cb85c;">✓ Key works</span>
+              <span x-show="s.setupKeyTest && s.setupKeyTest!=='testing' && s.setupKeyTest.valid===false" style="color:#d9534f;" x-text="'✗ '+((s.setupKeyTest&&s.setupKeyTest.error)||'invalid')"></span>
+              <span x-show="s.setupKeyTest && s.setupKeyTest.valid===null" style="color:#f0ad4e;" x-text="(s.setupKeyTest&&s.setupKeyTest.error)||''"></span>
+            </div>
+            <div style="margin-top:0.4rem;"><button class="btn-secondary" @click="s.setupEnterIdentity()">Skip</button></div>
+          </div>
+
+          <!-- Step 3: identity (USER.md) -->
+          <div x-show="s.setupStep===3">
+            <p style="margin:0 0 0.5rem;">Tell Genesis who you are — this seeds USER.md. Edit and save.</p>
+            <textarea x-model="s.setupIdentity" rows="6" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:0.78rem;padding:0.4rem;"></textarea>
+            <div style="margin-top:0.4rem;display:flex;gap:0.5rem;">
+              <button class="btn" @click="s.setupSaveIdentity()" :disabled="!!s.setupBusy">Save</button>
+              <button class="btn-secondary" @click="s.setupFinish()">Skip</button>
+            </div>
+          </div>
+
+          <!-- Step 4: done — honest summary keyed on the LIVE floor -->
+          <div x-show="s.setupStep===4">
+            <template x-if="s.setupStatus && s.setupStatus.floor_met">
+              <p style="margin:0;">🎉 Genesis has what it needs to run — a brain (Claude Code login), a chat model, and embeddings. Restart the server to apply any just-saved password/keys, then explore the tabs.</p>
+            </template>
+            <template x-if="s.setupStatus && !s.setupStatus.floor_met">
+              <div>
+                <p style="margin:0 0 0.4rem;">Almost there — Genesis isn't fully functional yet. Still needed:</p>
+                <ul style="margin:0 0 0.2rem 1.1rem;padding:0;">
+                  <li x-show="!s.setupStatus.cc_oauth">Log in to Claude Code — run <code>claude login</code> in a terminal (the wizard can't do this for you).</li>
+                  <li x-show="!s.setupStatus.llm_key_present">A chat / routing model key (step 2 — e.g. OpenRouter, Groq, Mistral).</li>
+                  <li x-show="!s.setupStatus.embedding_key_present">An embedding key for memory (step 2 — DeepInfra or Qwen).</li>
+                </ul>
+                <p style="margin:0.2rem 0 0;font-size:0.72rem;color:var(--color-text-secondary,#888);">This card stays until the floor is met. You can close it for now.</p>
+              </div>
+            </template>
+            <div style="margin-top:0.5rem;"><button class="btn" @click="s.dismissSetupCard()">Close</button></div>
+          </div>
+
+          <!-- inline message -->
+          <div x-show="s.setupMsg" style="margin-top:0.5rem;font-size:0.78rem;"
+               :style="s.setupMsg && s.setupMsg.type==='error' ? 'color:#d9534f' : 'color:#f0ad4e'"
+               x-text="s.setupMsg ? s.setupMsg.text : ''"></div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Persistent Readiness panel [Tab: overview]. Stays visible after floor_met (the
+         first-run Setup card does not), surfacing tier, next-tier guidance, and enrichment.
+         Renders the already-loaded setupStatus (no new fetch). Copy is config-framed: the
+         payload is presence-based, so chips describe configuration, not live behavior. -->
+    <div class="panel" id="readiness-panel" x-data="{s: $store.genesisDashboard}"
+         x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;"
+           @click="s.toggleReadinessPanel()">
+        <span style="display:flex;align-items:center;gap:0.3rem;">
+          <span class="material-symbols-outlined" :style="s.readinessPanelOpen ? 'transform:rotate(90deg)' : ''" style="transition:transform 0.2s">chevron_right</span>
+          <span class="material-symbols-outlined">insights</span> Readiness
+        </span>
+        <template x-if="s.setupStatus">
+          <span style="display:inline-flex;gap:0.3rem;align-items:center;">
+            <span class="chip chip--stale" x-show="s.setupStatusStale"
+                  title="The last setup-status refresh failed — this snapshot may be out of date.">stale</span>
+            <span class="chip" :class="'chip--' + (s.setupStatus.tier >= 3 ? 'ok' : (s.setupStatus.tier <= 0 ? 'warn' : 'info'))"
+                  x-text="'Tier ' + (s.setupStatus.tier ?? 0) + ' · ' + (s.setupStatus.tier_name ?? '—')"></span>
+          </span>
+        </template>
+      </div>
+      <div class="panel-body" x-show="s.readinessPanelOpen" x-transition>
+        <template x-if="!s.setupStatus">
+          <div class="empty-state">Readiness status not loaded yet.</div>
+        </template>
+        <template x-if="s.setupStatus">
+          <div style="font-size:0.82rem;">
+            <!-- Tier rail: cumulative T0→T3. Surpassed/ceiling = ✓ ok; current-below-ceiling
+                 = ◆ action (a real next step exists, matching the callout); ahead = ○ off.
+                 T3 is the ceiling (tier_names 0..3), so the current tier AT T3 reads as
+                 achieved, not "needs action". -->
+            <div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.6rem;">
+              <template x-for="seg in [{n:0,label:'Bootstrapped'},{n:1,label:'Functional'},{n:2,label:'Connected'},{n:3,label:'Autonomous'}]" :key="seg.n">
+                <span class="chip"
+                      :class="'chip--' + (((s.setupStatus.tier ?? 0) > seg.n || ((s.setupStatus.tier ?? 0) >= 3 && seg.n === 3)) ? 'ok' : ((s.setupStatus.tier ?? 0) === seg.n ? 'action' : 'off'))">
+                  <span x-text="(((s.setupStatus.tier ?? 0) > seg.n || ((s.setupStatus.tier ?? 0) >= 3 && seg.n === 3)) ? '✓' : ((s.setupStatus.tier ?? 0) === seg.n ? '◆' : '○')) + ' T' + seg.n + ' ' + seg.label"></span>
+                </span>
+              </template>
+            </div>
+            <!-- Next-step callout -->
+            <div style="margin-bottom:0.7rem;"
+                 :style="s.readinessNextStep.reached ? 'color:#5cb85c;' : 'color:var(--color-text-secondary,#aaa);'"
+                 x-text="(s.readinessNextStep.reached ? '✓ ' : '→ ') + s.readinessNextStep.text"></div>
+            <!-- Enrichment chips (config-framed, non-gating) -->
+            <div style="display:flex;flex-wrap:wrap;gap:0.4rem;">
+              <!-- Only keyed PREMIUM providers are knowable from the payload; the keyless
+                   SearXNG primary is not bootstrap-provisioned, so we do not assert it. -->
+              <span class="chip" :class="s.setupStatus.web_search_keyed_providers?.length ? 'chip--info' : 'chip--off'"
+                    x-text="'Web search premium: ' + ((s.setupStatus.web_search_keyed_providers?.length)
+                              ? s.setupStatus.web_search_keyed_providers.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(', ')
+                              : 'none keyed')"></span>
+              <span class="chip" :class="s.setupStatus.voice_configured ? 'chip--ok' : 'chip--off'"
+                    x-text="s.setupStatus.voice_configured ? 'Voice: configured' : 'Voice: not configured'"></span>
+              <span class="chip" :class="s.setupStatus.ego_enabled ? 'chip--ok' : 'chip--off'"
+                    x-text="s.setupStatus.ego_enabled ? ('Ego loop: on · ' + (s.setupStatus.ego_cadence_minutes ?? '—') + ' min (config)') : 'Ego loop: off (config)'"></span>
+              <span class="chip chip--info"
+                    x-text="'Autonomy default: L' + (s.setupStatus.autonomy_level ?? 1) + ' · direct_session'"
+                    title="The shipped config default for direct sessions — not a live earned autonomy level."></span>
+              <span class="chip" :class="s.setupStatus.password_set ? 'chip--ok' : 'chip--action'"
+                    :style="s.setupStatus.password_set ? '' : 'cursor:pointer;'"
+                    @click="!s.setupStatus.password_set && s.navigateTo('config', 'provider-keys')"
+                    x-text="s.setupStatus.password_set ? 'Dashboard password: set' : '◆ Set a dashboard password'"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">
@@ -44,6 +209,8 @@
                                ? $store.genesisDashboard.infraLabel(name) + ': ' + probe.total_points + ' total points across ' + (probe.collections?.length || 0) + ' collections'
                              : probe.cc_tier != null
                                ? $store.genesisDashboard.infraLabel(name) + ': CC ' + probe.cc_tier + ' (' + probe.cc_used_mb + '/' + probe.cc_budget_mb + 'MB)' + (probe.sys_tier ? ', /tmp ' + probe.sys_tier + ' (' + probe.sys_used_pct + '%)' : '')
+                             : probe.message
+                               ? $store.genesisDashboard.infraLabel(name) + ': ' + (probe.status || 'unknown') + ' — ' + probe.message
                              : $store.genesisDashboard.infraLabel(name) + ': ' + (probe.status || 'unknown')">
                     <span class="status-dot"
                           :style="`background: ${$store.genesisDashboard.probeStatusColor(probe)}`"></span>
@@ -223,9 +390,9 @@
                       </template>
                     </div>
                   </template>
-                  <template x-if="($store.genesisDashboard.health.queues.discarded_items?.length || 0) > 0">
+                  <template x-if="$store.genesisDashboard.discarded.total > 0">
                     <div style="margin-top: 0.3rem; font-size: 0.72rem; color: #d9534f; font-weight: 600;">
-                      <span x-text="$store.genesisDashboard.health.queues.discarded_items.length"></span> discarded — needs review
+                      <span x-text="$store.genesisDashboard.discarded.totalLabel"></span> discarded — needs review
                     </div>
                   </template>
                   <div style="font-size: 0.82rem; cursor: default;"
@@ -285,15 +452,23 @@
                   </template>
                   <div style="margin-top:0.55rem; border-top:1px solid rgba(255,255,255,0.06); padding-top:0.55rem;">
                     <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center; margin-bottom:0.35rem;">
-                      <div style="font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary);">Discarded review</div>
+                      <div style="font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary);">Discarded review<template x-if="$store.genesisDashboard.discarded.truncated"><span style="font-weight:400; text-transform:none; letter-spacing:0;" x-text="' — showing ' + $store.genesisDashboard.discarded.sample.length + ' of ' + $store.genesisDashboard.discarded.totalLabel"></span></template></div>
                       <button type="button"
                               style="font-size:0.68rem; padding:0.22rem 0.45rem; border-radius:4px; border:1px solid rgba(217,83,79,0.3); color:#d9534f; background:transparent; cursor:pointer;"
-                              :disabled="$store.genesisDashboard.queueReview.clearingAll || ($store.genesisDashboard.health.queues.discarded_items?.length || 0) === 0"
+                              :disabled="!!$store.genesisDashboard.queueReview.clearingAll || ($store.genesisDashboard.discarded.known && $store.genesisDashboard.discarded.total === 0)"
                               @click="$store.genesisDashboard.clearAllDiscardedItems()"
-                              x-text="$store.genesisDashboard.queueReview.clearingAll ? 'Clearing...' : 'Clear all reviewed'"></button>
+                              x-text="$store.genesisDashboard.queueReview.clearingAll ? 'Clearing...' : ('Clear all ' + $store.genesisDashboard.discarded.totalLabel)"
+                              :title="'Permanently deletes all ' + $store.genesisDashboard.discarded.totalLabel + ' discarded/expired rows, not just the ones shown' + ($store.genesisDashboard.discarded.known ? '' : '. The depth could not be read, so there may be more.')"></button>
                     </div>
-                    <template x-if="$store.genesisDashboard.discardedQueueGroups.length === 0">
+                    <template x-if="!$store.genesisDashboard.discarded.known">
+                      <div class="health-card-detail" style="margin-top:0; color:#f0ad4e;">Queue data unavailable — this is not a confirmed zero.</div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.discarded.known && $store.genesisDashboard.discarded.total === 0">
                       <div class="health-card-detail" style="margin-top:0;">No discarded or expired items awaiting review.</div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.discarded.known && $store.genesisDashboard.discarded.total > 0 && $store.genesisDashboard.discarded.sample.length === 0">
+                      <div class="health-card-detail" style="margin-top:0; color:#f0ad4e;"
+                           x-text="$store.genesisDashboard.discarded.totalLabel + ' discarded/expired rows exist, but the review sample could not be loaded. Clear all still applies to every one of them.'"></div>
                     </template>
                     <template x-for="group in $store.genesisDashboard.discardedQueueGroups" :key="group.key">
                       <div style="margin-bottom:0.5rem; padding:0.45rem 0.55rem; border-radius:6px; background:rgba(217,83,79,0.08); border:1px solid rgba(217,83,79,0.18);">
@@ -652,23 +827,39 @@
                         x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
                 </div>
               </template>
+              <!-- PID budget row (per-user systemd slice TasksMax — 'Cannot fork' guard) -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.pids?.pct != null">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;"
+                     :title="'PID/task budget for the BINDING cgroup level (' + ($store.genesisDashboard.health.infrastructure.pids.scope || 'user slice') + '): the walk reports whichever of the session scope, user slice, or shared container root is closest to its pids.max — that is what precedes \'Cannot fork\' while memory/CPU/disk read fine. Amber ≥ 80%, red ≥ 90%.'">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">PIDs</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="`color: ${$store.genesisDashboard.health.infrastructure.pids.pct >= 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct >= 80 ? '#f0ad4e' : '#4caf50'}`"
+                        x-text="$store.genesisDashboard.health.infrastructure.pids.pct.toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.health.infrastructure.pids.pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.pids.pct >= 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct >= 80 ? '#f0ad4e' : '#4caf50')"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="$store.genesisDashboard.health.infrastructure.pids.current + '/' + $store.genesisDashboard.health.infrastructure.pids.max + ($store.genesisDashboard.health.infrastructure.pids.scope ? ' · ' + $store.genesisDashboard.health.infrastructure.pids.scope : '')"></span>
+                </div>
+              </template>
               <!-- Claude Code sessions row (per-session RSS — leak detection) -->
               <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
                 <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.8rem;">
                   <span style="color:var(--color-text-secondary);"
                         title="Memory (RSS) used by each concurrent Claude Code worker session — leak detection. Green = healthy, amber ≥ 4 GB, red ≥ 6 GB.">Claude Code Sessions</span>
                   <div style="display:flex; flex-wrap:wrap; gap:0.35rem;">
-                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
+                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.pid">
                       <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
                             :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : '#4caf50'}`"
-                            :title="'Session ' + slot.slot + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
-                            x-text="'#' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                            :title="(slot.slot ? 'Session ' + slot.slot : 'Unregistered session') + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
+                            x-text="(slot.slot ? '#' + slot.slot : 'pid ' + slot.pid) + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
                     </template>
                   </div>
                 </div>
               </template>
               <!-- Fallback when no data -->
-              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk">
+              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk && $store.genesisDashboard.health.infrastructure?.pids?.pct == null">
                 <span style="color: #666; font-size: 0.82rem;">no data</span>
               </template>
             </div>
@@ -841,10 +1032,15 @@
                            :style="`color: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"
                            :title="info.error || info.cb_reason || ''">
                         <span class="status-dot" :style="`background: ${$store.genesisDashboard.keyHealthColor(info.key_health)}`"></span>
+                        <!-- cb_label comes from the backend (api_keys.py
+                             _CB_SHORT_LABEL), which is exhaustive over
+                             ErrorCategory and test-locked. This template used to
+                             re-derive it with its own quota_exhausted ternary —
+                             a second copy of the mapping that silently rendered
+                             every newly-added category as "API down". -->
                         <span x-text="name + ' (' + (
                           info.status === 'missing' ? 'key missing'
-                          : info.cb_reason === 'quota_exhausted' ? 'out of credits'
-                          : info.cb_state === 'open' ? 'API down'
+                          : info.cb_label ? info.cb_label
                           : info.error ? info.error.substring(0, 40)
                           : info.status
                         ) + ')'"></span>
@@ -1009,7 +1205,13 @@
 
         <!-- Capability Modules -->
         <h4 style="margin: 0 0 0.5rem 0; color: #ccc; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;">Capability Modules</h4>
-        <template x-if="$store.genesisDashboard.modules.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('modules') === 'loading'">
+          <div class="empty-state">Loading…</div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('modules') === 'error'">
+          <div class="empty-state" style="color:#f0ad4e;">Couldn't load modules — will keep retrying.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.modules.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('modules'))">
           <div class="empty-state">No modules loaded.</div>
         </template>
         <template x-for="mod in $store.genesisDashboard.modules" :key="mod.name">
@@ -1058,7 +1260,13 @@
 
         <!-- Tool Providers -->
         <h4 style="margin: 1rem 0 0.5rem 0; color: #ccc; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;">Tool Providers</h4>
-        <template x-if="$store.genesisDashboard.providersDetail.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('providersDetail') === 'loading'">
+          <div class="empty-state">Loading…</div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('providersDetail') === 'error'">
+          <div class="empty-state" style="color:#f0ad4e;">Couldn't load providers — will keep retrying.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.providersDetail.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('providersDetail'))">
           <div class="empty-state">No providers registered.</div>
         </template>
         <div style="display: grid; gap: 0.3rem;">
@@ -1071,12 +1279,13 @@
                     :style="`background: ${p.cost_tier === 'free' ? '#1b5e20' : p.cost_tier === 'cheap' ? '#1a237e' : p.cost_tier === 'moderate' ? '#4a3800' : '#4a0000'}; color: ${p.cost_tier === 'free' ? '#81c784' : p.cost_tier === 'cheap' ? '#90caf9' : p.cost_tier === 'moderate' ? '#ffd54f' : '#ef9a9a'}`"
                     x-text="p.cost_tier"></span>
               <span style="color: #666;" x-text="p.invocation_count > 0 ? p.invocation_count + ' calls' : ''"></span>
-              <button @click.stop="$store.genesisDashboard.toggleProvider(p.name)"
-                      style="margin-left: auto; font-size: 0.68rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; border: 1px solid; font-weight: 500;"
-                      :style="p.status !== 'disabled'
-                        ? 'background: transparent; color: #ef9a9a; border-color: #ef9a9a;'
-                        : 'background: transparent; color: #81c784; border-color: #81c784;'"
-                      x-text="p.status !== 'disabled' ? 'disable' : 'enable'"></button>
+              <!-- No toggle here by design. This card iterates the TOOL provider
+                   registry (names like `tavily`, `groq_stt`, `ollama_embedding`),
+                   while /api/genesis/providers/<name>/toggle resolves against the
+                   CIRCUIT BREAKER registry (`groq-free`, `mistral-large-free`).
+                   The namespaces are disjoint, so this button 404'd on every
+                   click. The working toggle is on the Internals tab, which
+                   iterates routingConfig.providers. -->
             </div>
           </template>
         </div>

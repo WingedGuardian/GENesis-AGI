@@ -215,6 +215,54 @@ def test_build_focused_prompt_reactive():
     assert "event(s)" in prompt
 
 
+def test_build_focused_prompt_capability_improvement_names_domain():
+    """Capability-improvement directive must NAME the specific weak domain.
+
+    The weak domain rides in focus_id; the capability table renders only the
+    top rows by confidence, so a generic "a capability" directive would leave
+    the ego unable to tell WHICH domain to consider. The directive interpolates
+    focus.focus_id so the target is always explicit.
+    """
+    from genesis.ego.focus import FocusResult
+    from genesis.ego.session import EgoSession
+
+    focus = FocusResult(
+        focus_type="capability_improvement",
+        focus_id="outreach",
+        rationale="advisory: weakest domain",
+    )
+    prompt = EgoSession._build_focused_prompt(
+        None,
+        dynamic_context="## Context",
+        focus=focus,
+    )
+    assert "CAPABILITY IMPROVEMENT" in prompt
+    assert "ADVISORY" in prompt
+    # The specific weak domain name must appear in the directive.
+    assert "outreach" in prompt
+    # Advisory invariant: never asks the ego to do less.
+    assert "propose fewer actions" in prompt
+
+
+def test_build_focused_prompt_capability_improvement_no_domain_fallback():
+    """A missing focus_id falls back to a generic phrase, never a crash."""
+    from genesis.ego.focus import FocusResult
+    from genesis.ego.session import EgoSession
+
+    focus = FocusResult(
+        focus_type="capability_improvement",
+        focus_id=None,
+        rationale="advisory",
+    )
+    prompt = EgoSession._build_focused_prompt(
+        None,
+        dynamic_context="## Context",
+        focus=focus,
+    )
+    assert "CAPABILITY IMPROVEMENT" in prompt
+    assert "one of your capabilities" in prompt
+
+
 # ── FocusCategory enum ────────────────────────────────────────────────────
 
 
@@ -228,6 +276,7 @@ def test_focus_category_values():
     assert FocusCategory.GOAL_REVIEW == "goal_review"
     assert FocusCategory.DISPATCH_OUTCOME == "dispatch_outcome"
     assert FocusCategory.ESCALATION == "escalation"
+    assert FocusCategory.CAPABILITY_IMPROVEMENT == "capability_improvement"
 
 
 # ── EgoConfig goal_review_staleness_days ──────────────────────────────────

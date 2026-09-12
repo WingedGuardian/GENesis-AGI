@@ -82,6 +82,12 @@ DAILY_SYNTHESIS_BUDGET: int = 100
 # Max top-value clusters the weekly pass persists. Kept under the deferred-work
 # overflow alarm (resilience queue_overflow_threshold=1000) with headroom.
 WORKLIST_CAP: int = 500
+# Max times a capacity-failed drain slice is reset to pending before it is
+# completed with a WARNING instead (no infinite retry). Bounds queue CLAIMS
+# (deferred_work_queue.attempts, ++ on each mark_processing), so ~3 daily drains
+# will re-attempt an outage-blocked slice before it is let go; the weekly
+# re-cluster re-surfaces its members regardless (staleness_policy=DRAIN).
+_SLICE_ATTEMPT_CAP: int = 3
 
 
 class ProvidersExhaustedError(Exception):
@@ -274,6 +280,50 @@ async def run(
         logger.warning("Cross-wing scan failed", exc_info=True)
         report["cross_wing_findings"] = []
 
+    # Phase 2c — Importance shield. Remove high-salience members (percentile
+    # activation / centrality, or a confidence floor) from clusters BEFORE they
+    # are enqueued, so the merge path never consolidates them away. Thresholds
+    # are computed over the true (non-deprecated) population in `buckets` here
+    # and frozen into each slice for the drain's live re-check. A shield failure
+    # must degrade toward LESS write authority — but pre-live (drain is SHADOW)
+    # the safe degradation is to enqueue UNSHIELDED and flag loudly: the drain's
+    # `shield_missing_thresholds` counter then stays non-zero, which is the
+    # explicit precondition gate on the future live-merge flip.
+    shield_thresholds: dict[str, Any] | None = None
+    try:
+        from genesis.memory import dream_shield
+
+        flat_points = [p for pts in buckets.values() for p in pts]
+        shield_state = await dream_shield.compute_shield_state(db, flat_points)
+        all_clusters, shield_stats = dream_shield.apply_shield_to_clusters(
+            all_clusters, shield_state,
+        )
+        if shield_state is not None:
+            shield_thresholds = {
+                "activation_threshold": shield_state.activation_threshold,
+                "centrality_threshold": shield_state.centrality_threshold,
+            }
+        report["shield"] = {
+            "enabled": shield_state is not None,
+            "activation_threshold": (
+                shield_state.activation_threshold if shield_state else None
+            ),
+            "centrality_threshold": (
+                shield_state.centrality_threshold if shield_state else None
+            ),
+            "population": shield_state.population if shield_state else 0,
+            **shield_stats,
+        }
+    except Exception as exc:
+        report["errors"].append({"phase": "shield", "error": str(exc)})
+        report["shield"] = {"enabled": False, "error": str(exc)}
+        logger.warning(
+            "Dream cycle %s: importance shield failed — enqueuing UNSHIELDED "
+            "(shadow-safe; the drain's shield_missing_thresholds gate blocks the "
+            "live flip): %s",
+            run_id[:8], exc, exc_info=True,
+        )
+
     # Phase 3 — Persist the value-ranked synthesis worklist for the daily drain.
     # Destructive synthesis/deprecate moved OUT of this weekly pass into
     # run_synthesis_drain (bounded daily slices). This enqueue runs in ALL modes:
@@ -283,6 +333,7 @@ async def run(
     try:
         worklist = await _persist_worklist(
             db, all_clusters, weekly_run_id=run_id, cap=WORKLIST_CAP,
+            shield_thresholds=shield_thresholds,
         )
         report["worklist_enqueued"] = worklist["enqueued"]
         report["oversize_flagged"] = worklist["oversize_flagged"]
@@ -376,10 +427,17 @@ async def _persist_worklist(
     *,
     weekly_run_id: str,
     cap: int = WORKLIST_CAP,
+    shield_thresholds: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """Persist the top-value clusters as the daily-drain worklist.
 
     Returns ``{"enqueued": n, "oversize_flagged": n, "superseded": n}``.
+
+    ``shield_thresholds`` (when set) is frozen into each slice payload as a
+    ``shield`` block, so the daily drain re-checks live members against the same
+    activation/centrality bar the weekly pass used (catching salience that rose
+    during the drain week). Absent it, slices carry no block — backward
+    compatible with pre-shield rows.
 
     Supersedes any prior ``dream_synthesis_slice`` rows (a fresh full re-cluster
     is authoritative) via an explicit synchronous supersede — NOT a staleness
@@ -406,13 +464,16 @@ async def _persist_worklist(
 
     enqueued = 0
     for cluster in ranked:
-        payload = json.dumps({
+        payload_dict: dict[str, Any] = {
             "member_ids": [item["id"] for item in cluster],
             "wing": cluster[0].get("wing", "general"),
             "room": cluster[0].get("room", "uncategorized"),
             "weekly_run_id": weekly_run_id,
             "value_score": len(cluster),
-        })
+        }
+        if shield_thresholds is not None:
+            payload_dict["shield"] = shield_thresholds
+        payload = json.dumps(payload_dict)
         item_id = await queue.enqueue(
             WORKLIST_WORK_TYPE, None, MEMORY_OPS, payload,
             "dream_cycle weekly synthesis worklist",
@@ -486,14 +547,24 @@ async def run_synthesis_drain(
       * LIVE — synthesizes+deprecates via the same capacity-breaker loop as the old
         weekly path (``_synthesize_clusters`` with ``max_merges=budget``).
 
-    Items attempted this slice are marked completed regardless of per-cluster
-    outcome — unmerged/blocked/aborted clusters simply re-surface in next week's
-    re-cluster (the design is value-ranked, not exhaustive). Exception: on an
-    infrastructure failure (Qdrant unreachable) the drain aborts WITHOUT
-    consuming items — a preflight ping guards the start, and a mid-drain
-    rehydrate error resets the in-flight item to pending (FM-2). A stale slice
-    (<2 live members) is completed as a no-op, not discarded — discard implies
-    failure on the dashboard errors view (FM-5).
+    Slice disposition after synthesis:
+      * merged / quality-blocked / non-capacity error / stale no-op → COMPLETED
+        (the design is value-ranked, not exhaustive — a merged slice is done, and
+        blocked/errored clusters re-surface in next week's re-cluster).
+      * CAPACITY failure (provider chain exhausted, adversarial review exhausted,
+        or a breaker-trip/budget cutoff that left the slice untried) → RESET to
+        pending so a future drain retries it. This is the recovery net for
+        cognition lost to a transient provider outage — the prior behavior
+        completed these unconditionally and dropped the work. The
+        ``_SLICE_ATTEMPT_CAP`` retry cap (complete-with-WARNING, no infinite
+        retry) is charged ONLY to a slice that exhausts its OWN synthesis in a
+        drain that did not abort on capacity — never to un-attempted slices, nor
+        to any slice during a provider-outage abort (see the disposition loop).
+      * infrastructure failure (Qdrant unreachable) aborts the drain WITHOUT
+        consuming items — a preflight ping guards the start, and a mid-drain
+        rehydrate error resets the in-flight item to pending (FM-2).
+      * stale slice (<2 live members) is completed as a no-op, not discarded —
+        discard implies failure on the dashboard errors view (FM-5).
     """
     from genesis.resilience.deferred_work import DeferredWorkQueue
 
@@ -502,9 +573,24 @@ async def run_synthesis_drain(
         "run_id": run_id, "dry_run": dry_run,
         "drained": 0, "stale_skipped": 0, "would_merge": 0,
         "clusters_merged": 0, "clusters_skipped_large": 0,
-        "memories_deprecated": 0, "adversarial_blocked": 0,
+        "memories_deprecated": 0, "links_copied": 0, "adversarial_blocked": 0,
         "shrink_gate_blocked": 0, "rollback_flagged": False,
         "aborted_capacity": False, "aborted_infra": False, "errors": [],
+        # Importance-shield drain re-check (see dream_shield.shield_filter_live):
+        #  - shield_members_skipped: individual members removed from clusters
+        #  - shield_skipped: clusters completed as no-op because shielding left
+        #    <2 mergeable members (distinct from stale_skipped)
+        #  - shield_missing_thresholds: slices with no frozen shield block while
+        #    the shield is enabled (pre-upgrade rows / enqueue-time shield
+        #    failure) — must reach 0 before the PR2 live-merge flip
+        "shield_members_skipped": 0, "shield_skipped": 0,
+        "shield_missing_thresholds": 0,
+        # Capacity-recovery lifecycle (see the per-slice completion loop below):
+        #  - slices_reset: capacity-failed/unattempted slices put back to pending
+        #    for a future drain (recoverable lost work — the FM this PR closes)
+        #  - slices_capped: slices that hit _SLICE_ATTEMPT_CAP and were completed
+        #    with a WARNING instead of retried again (no infinite retry)
+        "slices_reset": 0, "slices_capped": 0,
     }
 
     # Preflight: don't consume the worklist when Qdrant is unreachable — a dead
@@ -557,16 +643,46 @@ async def run_synthesis_drain(
             )
             break
         report["drained"] += 1
-        if len(cluster) < 2:
-            # Normal lifecycle outcome (members deprecated since Sunday), not a
-            # failure — completed, so it doesn't surface on the dashboard
-            # errors view via query_failed (FM-5).
-            await queue.mark_completed(item["id"])
-            report["stale_skipped"] += 1
-            logger.info(
-                "Dream drain %s: slice stale (<2 live members) — completed as "
-                "no-op", run_id[:8],
+
+        # Importance-shield re-check against the FROZEN thresholds in the slice.
+        # A member whose salience rose during the drain week (e.g. retrieved
+        # more) is removed here even though it passed at enqueue. Enable state
+        # is read LIVE inside shield_filter_live, so an operator can disable the
+        # shield mid-week. A slice with no shield block predates the shield (or
+        # its enqueue-time computation failed) — do NOT filter (no bar to filter
+        # against), but count it: this counter must be 0 before the live flip.
+        from genesis.memory import dream_shield, dream_shield_config
+
+        shield_block = payload.get("shield")
+        n_shielded = 0
+        if shield_block is not None:
+            cluster, n_shielded = await dream_shield.shield_filter_live(
+                db, cluster,
+                activation_threshold=shield_block.get("activation_threshold"),
+                centrality_threshold=shield_block.get("centrality_threshold"),
             )
+            report["shield_members_skipped"] += n_shielded
+        elif dream_shield_config.shield_enabled():
+            report["shield_missing_thresholds"] += 1
+
+        if len(cluster) < 2:
+            # <2 mergeable members: a normal lifecycle no-op — completed, so it
+            # doesn't surface on the dashboard errors view (FM-5). Attribute the
+            # skip to the shield when shielding caused the shrink, else to
+            # staleness (members deprecated since Sunday).
+            await queue.mark_completed(item["id"])
+            if n_shielded > 0:
+                report["shield_skipped"] += 1
+                logger.info(
+                    "Dream drain %s: slice shielded below 2 members — completed "
+                    "as no-op", run_id[:8],
+                )
+            else:
+                report["stale_skipped"] += 1
+                logger.info(
+                    "Dream drain %s: slice stale (<2 live members) — completed "
+                    "as no-op", run_id[:8],
+                )
             continue
         pending.append((item, cluster))
 
@@ -580,13 +696,57 @@ async def run_synthesis_drain(
             )
             await queue.mark_completed(item["id"])
     elif pending:
-        await _synthesize_clusters(
+        outcomes = await _synthesize_clusters(
             [c for _, c in pending],
             run_id=run_id, qdrant=qdrant, db=db, router=router, store=store,
             max_merges=budget, max_cluster_size=MAX_CLUSTER_SIZE, report=report,
         )
-        for item, _ in pending:
-            await queue.mark_completed(item["id"])
+        # Per-slice disposition. Capacity failures are RECOVERABLE — reset to
+        # pending so a future drain retries. Everything else — merged,
+        # quality-blocked, non-capacity error — is completed, matching the
+        # value-ranked "attempted once, then re-cluster" design.
+        #
+        # The retry cap is charged ONLY to a slice that genuinely got an LLM
+        # attempt and exhausted in a drain that did NOT hit a global capacity
+        # abort — i.e. a slice that keeps failing its OWN synthesis while the
+        # system is otherwise healthy (a poison slice). It is deliberately NOT
+        # charged to:
+        #   * "unattempted" slices — the breaker tripped (or budget cut off)
+        #     before they got an LLM call, yet the claim already bumped their
+        #     attempts; charging them would drop never-tried work (during an
+        #     outage the breaker lets only ~_CAPACITY_ABORT_THRESHOLD slices
+        #     through per drain, so the rest would hit the cap in 3 outage days
+        #     and recreate the cognition-loss this fix prevents), and
+        #   * ANY slice when the whole drain aborted on capacity — those
+        #     failures are systemic (provider outage), not slice-specific.
+        # Un-capped slices survive to the next drain; the weekly supersede()
+        # replaces the worklist wholesale, so they can't accumulate forever.
+        capacity_abort = report["aborted_capacity"]
+        for (item, _cluster), outcome in zip(pending, outcomes, strict=True):
+            if outcome not in ("exhausted", "unattempted"):
+                await queue.mark_completed(item["id"])
+                continue
+            # attempts was bumped by the mark_processing claim above, so
+            # item["attempts"] (pre-claim) + 1 is this drain's claim number.
+            attempt_no = item["attempts"] + 1
+            charge_cap = outcome == "exhausted" and not capacity_abort
+            if charge_cap and attempt_no >= _SLICE_ATTEMPT_CAP:
+                report["slices_capped"] += 1
+                logger.warning(
+                    "Dream drain %s: slice %s exhausted its own synthesis on "
+                    "attempt %d (cap %d) — completing without further retry; "
+                    "members re-surface in next week's re-cluster.",
+                    run_id[:8], item["id"][:8], attempt_no, _SLICE_ATTEMPT_CAP,
+                )
+                await queue.mark_completed(item["id"])
+            else:
+                report["slices_reset"] += 1
+                logger.info(
+                    "Dream drain %s: slice %s capacity-failed (%s) on attempt "
+                    "%d — reset to pending for retry.",
+                    run_id[:8], item["id"][:8], outcome, attempt_no,
+                )
+                await queue.reset_to_pending(item["id"])
 
     logger.info(
         "Dream drain %s (%s): drained=%d stale=%d would_merge=%d merged=%d deprecated=%d",
@@ -902,7 +1062,7 @@ async def _synthesize_clusters(
     max_merges: int,
     max_cluster_size: int,
     report: dict[str, Any],
-) -> None:
+) -> list[str]:
     """Synthesize/deprecate clusters with a capacity breaker (mutates report).
 
     Aborts early (``report['aborted_capacity']=True``) after
@@ -910,17 +1070,28 @@ async def _synthesize_clusters(
     run during a provider outage fails fast instead of grinding every cluster
     into a saturated chain. Genuine quality blocks reset the streak and never
     trip the breaker.
+
+    Returns a per-cluster outcome list ALIGNED TO ``all_clusters`` input order
+    (not attempt order) so the drain can decide each slice's queue disposition:
+    ``"merged"`` | ``"blocked"`` (quality gate — permanent for this cluster) |
+    ``"exhausted"`` (capacity failure — recoverable, reset for retry) |
+    ``"error"`` (non-capacity error — re-cluster next week) |
+    ``"skipped_large"`` (permanent) | ``"unattempted"`` (breaker trip or
+    max_merges cutoff left this cluster untried — recoverable, reset).
     """
-    # Deliberate re-sort: the worklist was value-ranked at enqueue, but
-    # rehydration can shrink clusters (members deprecated since Sunday) — the
-    # POST-rehydration size is the fresher value signal, so attempt order may
-    # diverge from queue order for shrunk clusters. PR2's per-item lifecycle
-    # supersedes this batch call.
-    all_clusters.sort(key=len, reverse=True)
+    # Attempt biggest-first (post-rehydration size is the fresher value signal
+    # than the enqueue-time rank), but record outcomes by ORIGINAL index so the
+    # caller can map each result back to its worklist slice — synthesis is not
+    # slice-aware, so the drain owns the queue disposition.
+    order = sorted(
+        range(len(all_clusters)), key=lambda i: len(all_clusters[i]), reverse=True
+    )
+    outcomes: list[str] = ["unattempted"] * len(all_clusters)
     merged = 0
     breaker = _CapacityBreaker(_CAPACITY_ABORT_THRESHOLD)
 
-    for cluster in all_clusters:
+    for idx in order:
+        cluster = all_clusters[idx]
         if merged >= max_merges:
             break
 
@@ -935,6 +1106,7 @@ async def _synthesize_clusters(
 
         if len(cluster) > max_cluster_size:
             report["clusters_skipped_large"] += 1
+            outcomes[idx] = "skipped_large"
             logger.info(
                 "Dream cycle %s: skipping cluster of %d in %s/%s (too large)",
                 run_id[:8], len(cluster),
@@ -953,20 +1125,29 @@ async def _synthesize_clusters(
             )
             merged += 1
             report["memories_deprecated"] += result["deprecated_count"]
+            report["links_copied"] = (
+                report.get("links_copied", 0) + result.get("links_copied", 0)
+            )
             breaker.record_progress()
+            outcomes[idx] = "merged"
         except SynthesisBlockedError as exc:
             # Adversarial review or shrink gate blocked this cluster.
             if exc.exhausted:
-                # Block caused by provider exhaustion (capacity), not quality.
+                # Block caused by provider exhaustion (capacity), not quality —
+                # recoverable, so the drain retries this slice.
                 report["adversarial_blocked"] += 1
                 breaker.record_exhaustion()
+                outcomes[idx] = "exhausted"
             else:
                 # Genuine quality gate working as intended — resets the breaker.
+                # Permanent for this cluster; the slice is completed (re-cluster
+                # next week may reshape it).
                 if "catastrophic shrink" in str(exc):
                     report["shrink_gate_blocked"] += 1
                 else:
                     report["adversarial_blocked"] += 1
                 breaker.record_progress()
+                outcomes[idx] = "blocked"
             logger.info(
                 "Dream cycle %s: cluster of %d blocked: %s",
                 run_id[:8], len(cluster), exc,
@@ -977,6 +1158,7 @@ async def _synthesize_clusters(
                 "error": str(exc),
             })
             breaker.record_exhaustion()
+            outcomes[idx] = "exhausted"
             logger.warning(
                 "Dream cycle %s: synthesis exhausted for cluster of %d: %s",
                 run_id[:8], len(cluster), exc,
@@ -988,6 +1170,7 @@ async def _synthesize_clusters(
                 "error": str(exc),
             })
             breaker.record_progress()
+            outcomes[idx] = "error"
             logger.warning(
                 "Dream cycle %s: synthesis failed for cluster of %d: %s",
                 run_id[:8], len(cluster), exc, exc_info=True,
@@ -1014,6 +1197,8 @@ async def _synthesize_clusters(
                 run_id[:8], (total_blocked / total_attempted) * 100,
                 total_blocked, total_attempted, run_id,
             )
+
+    return outcomes
 
 
 async def _synthesize_and_deprecate(
@@ -1131,6 +1316,7 @@ async def _synthesize_and_deprecate(
 
     # Deprecate originals
     deprecated_count = 0
+    deprecated_at = datetime.now(UTC).isoformat()
     for original_id in original_ids:
         try:
             # Qdrant: mark as deprecated
@@ -1143,11 +1329,13 @@ async def _synthesize_and_deprecate(
                     "synthesized_into": new_memory_id,
                 },
             )
-            # SQLite: mark as deprecated
+            # SQLite: mark as deprecated. deprecated_at is the authoritative
+            # deprecation time for link aging — the synthesis's created_at is
+            # unreliable (store()'s exact-dedup can return an old memory).
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 1, "
-                "dream_cycle_run_id = ? WHERE memory_id = ?",
-                (run_id, original_id),
+                "dream_cycle_run_id = ?, deprecated_at = ? WHERE memory_id = ?",
+                (run_id, deprecated_at, original_id),
             )
             deprecated_count += 1
         except Exception:
@@ -1155,6 +1343,25 @@ async def _synthesize_and_deprecate(
                 "Failed to deprecate memory %s", original_id, exc_info=True,
             )
     await db.commit()
+
+    # Rewire the originals' external edges onto the synthesis (COPY): without
+    # this, deprecating the originals leaves every external neighbour's edge
+    # dangling on a soft-deleted node. COPY (not MOVE) keeps the originals'
+    # edges in place so the dream rollback stays reversible — it hard-deletes
+    # the synthesis's links (including these copies); the originals' now-stale
+    # edges are pruned later, aged, by dream_link_repair. Best-effort: a rewire
+    # failure must not undo a completed merge.
+    links_copied = 0
+    try:
+        from genesis.db.crud import memory_links as links_crud
+        links_copied = await links_crud.copy_external_links(
+            db, from_ids=original_ids, to_id=new_memory_id,
+        )
+    except Exception:
+        logger.warning(
+            "Dream cycle: external link rewire failed for %s",
+            new_memory_id, exc_info=True,
+        )
 
     # Create links from synthesis to originals
     if store.linker:
@@ -1185,6 +1392,7 @@ async def _synthesize_and_deprecate(
         "new_memory_id": new_memory_id,
         "deprecated_count": deprecated_count,
         "original_ids": original_ids,
+        "links_copied": links_copied,
     }
 
 
@@ -1203,6 +1411,14 @@ async def rollback(
     2. Clear their deprecated flag (Qdrant + SQLite)
     3. Find synthesized memories created by this run (by tag)
     4. Hard-delete the syntheses (they're derived, not original data)
+
+    Link handling: the merge COPIES each original's external edges onto the
+    synthesis, so deleting the synthesis (step 4, which also removes all of its
+    ``memory_links`` rows) cleans up the copies — the restored originals keep
+    their own edges, which were never touched. This holds only INSIDE the
+    ``deprecated_edge_prune_days`` window: after it, ``dream_link_repair`` prunes
+    the aged originals' (non-``extends``) edges, and rollback cannot recreate
+    them. Run rollbacks within that window.
     """
     from genesis.qdrant.collections import update_payload
 
@@ -1225,7 +1441,7 @@ async def rollback(
         try:
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 0, "
-                "dream_cycle_run_id = NULL WHERE memory_id = ?",
+                "dream_cycle_run_id = NULL, deprecated_at = NULL WHERE memory_id = ?",
                 (mid,),
             )
             update_payload(
@@ -1361,7 +1577,7 @@ Output JSON (no markdown fences, just raw JSON):
   "tags": ["<merged relevant tags — deduplicated>"],
   "confidence": <float 0-1, max of inputs as baseline>,
   "memory_class": "<fact|reference|procedure|insight>",
-  "wing": "<wing>",
+  "wing": "<one of: {wing_choices}>",
   "room": "<room>",
   "synthesis_notes": "<why these were merged, what was dropped>"
 }}
@@ -1390,12 +1606,33 @@ def _build_synthesis_prompt(
             f"--- Memory {i} (confidence {confidence}, source {source}, "
             f"created {created}) ---\n{content}"
         )
+    from genesis.memory.taxonomy import WINGS
+
     return _SYNTHESIS_PROMPT.format(
         wing=wing,
         room=room,
         n=len(cluster),
+        # Enumerate the controlled vocabulary rather than asking for free text.
+        # The write-path guard is a backstop; the prompt is the root cause, and
+        # a schema that says "<wing>" invites a plausible invention.
+        wing_choices="|".join(sorted(WINGS)),
         memories="\n\n".join(memory_blocks),
     )
+
+
+def _valid_wing_or(candidate: object, fallback: str) -> str:
+    """The candidate wing if it is in the controlled vocabulary, else fallback.
+
+    `dict.get(key, default)` only falls back on a MISSING key, so a model that
+    emits an invalid wing beats the caller's known-good default. Here the
+    fallback is the cluster's own wing — derived from the memories being
+    merged — which is better information than re-classifying from content.
+    """
+    from genesis.memory.taxonomy import WINGS
+
+    if isinstance(candidate, str) and candidate.strip() in WINGS:
+        return candidate.strip()
+    return fallback
 
 
 def _parse_synthesis_response(
@@ -1427,7 +1664,12 @@ def _parse_synthesis_response(
             "tags": data.get("tags", []),
             "confidence": data.get("confidence", 0.8),
             "memory_class": data.get("memory_class", "fact"),
-            "wing": data.get("wing", default_wing),
+            # Fall back on an INVALID wing too, not only a missing one. The
+            # cluster's own wing is known-valid and derived from the very
+            # memories being merged — strictly better than letting store()
+            # discard a bad value and re-guess from content, whose terminal
+            # fallback is general/uncategorized.
+            "wing": _valid_wing_or(data.get("wing"), default_wing),
             "room": data.get("room", default_room),
             "synthesis_notes": data.get("synthesis_notes", ""),
         }

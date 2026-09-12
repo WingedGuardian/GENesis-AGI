@@ -49,31 +49,51 @@ def _safe_float(value: object, default: float) -> float:
         return default
 
 
+def extract_reflection_json(raw: str) -> dict | None:
+    """Recover the reflection JSON dict from raw CC output, returning None for
+    genuine prose. THE canonical extractor — the salvage-skip gate in
+    cc/reflection_bridge/_output.py delegates here so the gate and this parser
+    are provably the same algorithm (a divergence would let a deep reflection
+    silently lose its output when the gate believes routing will succeed).
+
+    Order matters: try the whole string as JSON, then a ```json-TAGGED block
+    (wherever it appears — a deep reflection often quotes a ```diff/```config
+    block BEFORE its real ```json block, so anchoring on the tag is required),
+    then any first fenced block as a lenient last resort.
+    """
+    if not raw:
+        return None
+    import re
+
+    def _as_dict(s: str) -> dict | None:
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    # 1. Whole string is JSON.
+    if (obj := _as_dict(raw)) is not None:
+        return obj
+    # 2. An explicitly ```json-tagged block, anywhere in the text.
+    m = re.search(r"```json\s*(.*?)\s*```", raw, re.DOTALL)
+    if m and (obj := _as_dict(m.group(1))) is not None:
+        return obj
+    # 3. Any first fenced block (lenient back-compat).
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
+    if m and (obj := _as_dict(m.group(1))) is not None:
+        return obj
+    return None
+
+
 def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
     """Parse raw CC output JSON into a DeepReflectionOutput.
 
     Tolerant of missing fields — returns defaults for anything absent.
     """
-    try:
-        data = json.loads(raw_json)
-    except (json.JSONDecodeError, TypeError):
-        # Try to extract JSON from markdown code block
-        if "```" in str(raw_json):
-            import re
-            match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", str(raw_json), re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to parse extracted JSON from CC output")
-                    return DeepReflectionOutput(parse_failed=True)
-            else:
-                return DeepReflectionOutput(parse_failed=True)
-        else:
-            logger.warning("Failed to parse CC reflection output as JSON")
-            return DeepReflectionOutput(parse_failed=True)
-
-    if not isinstance(data, dict):
+    data = extract_reflection_json(raw_json)
+    if data is None:
+        logger.warning("Failed to parse CC reflection output as JSON")
         return DeepReflectionOutput(parse_failed=True)
 
     # Parse memory operations

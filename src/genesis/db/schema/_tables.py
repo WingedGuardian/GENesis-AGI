@@ -245,7 +245,7 @@ TABLES = {
             topic               TEXT NOT NULL,
             category            TEXT NOT NULL CHECK (category IN (
                 'blocker', 'alert', 'finding', 'insight', 'opportunity',
-                'digest', 'surplus', 'approval', 'content', 'notification'
+                'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
             )),
             salience_score      REAL NOT NULL,
             channel             TEXT NOT NULL,
@@ -285,7 +285,12 @@ TABLES = {
             delivered           INTEGER NOT NULL DEFAULT 0,
             delivered_at        TEXT,
             thread_id           TEXT,
-            validated_recipient TEXT
+            validated_recipient TEXT,
+            labeled_surplus     INTEGER NOT NULL DEFAULT 0,
+            -- NULL = live; non-NULL = cancelled at that time. Deliberately ONE
+            -- column rather than a flag + timestamp like `delivered` above: this
+            -- way "cancelled with no timestamp" is unrepresentable.
+            cancelled_at        TEXT
         )
     """,
     "brainstorm_log": """
@@ -501,7 +506,11 @@ TABLES = {
             rate_limited_at  TEXT,
             rate_limit_resumes_at TEXT,
             origin_class     TEXT,
-            chat_id          TEXT
+            chat_id          TEXT,
+            -- when the TOPIC was written, as distinct from
+            -- last_extracted_at, which is a pass watermark the extraction
+            -- job advances even when it writes no topic.
+            topic_updated_at TEXT
         )
     """,
     "inbox_items": """
@@ -558,6 +567,16 @@ TABLES = {
             ),
             strength    REAL NOT NULL DEFAULT 0.5,
             created_at  TEXT NOT NULL,
+            -- MW-2 (0082) edge-metadata: classifier-verdict stamping location.
+            -- All NULLable, no backfill. NULL safe_for_boost = boost-eligible
+            -- (legacy default). proposed_type carries the classifier's verdict
+            -- label and is deliberately NOT constrained by the link_type CHECK.
+            -- GROUNDWORK(mw-5-merge-gate): MW-5 stamps verdicts here.
+            proposed_type   TEXT,
+            confidence      REAL,
+            classifier      TEXT,
+            review_state    TEXT,
+            safe_for_boost  INTEGER,
             -- link_type is part of the PK (audit DLI-04 / D15): distinct
             -- relationship types between the same pair (e.g. supports AND
             -- contradicts) must coexist, not silently overwrite. Migration
@@ -604,21 +623,6 @@ TABLES = {
             extraction_timestamp TEXT,
             source_pipeline     TEXT,
             source_subsystem    TEXT
-        )
-    """,
-    "predictions": """
-        CREATE TABLE IF NOT EXISTS predictions (
-            id                TEXT PRIMARY KEY,
-            action_id         TEXT NOT NULL,
-            timestamp         TEXT NOT NULL DEFAULT (datetime('now')),
-            prediction        TEXT NOT NULL,
-            confidence        REAL NOT NULL,
-            confidence_bucket TEXT NOT NULL,
-            domain            TEXT NOT NULL CHECK (domain IN ('outreach', 'triage', 'procedure', 'routing')),
-            reasoning         TEXT NOT NULL,
-            outcome           TEXT,
-            correct           INTEGER,
-            matched_at        TEXT
         )
     """,
     "outcome_events": """
@@ -669,19 +673,6 @@ TABLES = {
             details          TEXT,
             session_id       TEXT,
             created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """,
-    "calibration_curves": """
-        CREATE TABLE IF NOT EXISTS calibration_curves (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-            domain               TEXT NOT NULL,
-            confidence_bucket    TEXT NOT NULL,
-            predicted_confidence REAL NOT NULL,
-            actual_success_rate  REAL NOT NULL,
-            sample_count         INTEGER NOT NULL,
-            correction_factor    REAL NOT NULL,
-            computed_at          TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(domain, confidence_bucket)
         )
     """,
     "approval_requests": """
@@ -753,6 +744,55 @@ TABLES = {
             sent_at             TEXT,
             rejected_at         TEXT
         )
+    """,
+    # Contributor Work-Log hold store — a curator-drafted, sanitized public
+    # GitHub issue held for owner approval (paired with an approval_requests
+    # row); the resolution watcher posts it on approval. Mirrors
+    # pending_email_sends (WS-8). Migration 0079.
+    "pending_issue_posts": """
+        CREATE TABLE IF NOT EXISTS pending_issue_posts (
+            id                  TEXT PRIMARY KEY,
+            request_id          TEXT NOT NULL UNIQUE,
+            repo                TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            body                TEXT NOT NULL,
+            labels              TEXT,
+            source              TEXT NOT NULL,
+            source_ref          TEXT,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            held_at             TEXT NOT NULL,
+            mode                TEXT NOT NULL DEFAULT 'propose_only'
+                                    CHECK (mode IN ('propose_only', 'live')),
+            status              TEXT NOT NULL DEFAULT 'held'
+                                    CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
+            issue_number        INTEGER,
+            issue_url           TEXT,
+            posted_at           TEXT,
+            rejected_at         TEXT,
+            dry_run_at          TEXT,
+            adopted             INTEGER NOT NULL DEFAULT 0
+        )
+    """,
+    # Marketing cold-send substrate — owner-curated cold-outreach target inventory.
+    # Code-resolvable recipient (never the LLM), PERMANENT opt-out suppression, and
+    # status-queryable. See db/crud/marketing_prospects.py for the New-Store
+    # justification + retention (opted_out rows never pruned; owner-curated + bounded).
+    # DDL byte-identical to migration 0089.
+    "marketing_prospects": """
+    CREATE TABLE IF NOT EXISTS marketing_prospects (
+        id                TEXT PRIMARY KEY,
+        email             TEXT NOT NULL,
+        name              TEXT,
+        company           TEXT,
+        status            TEXT NOT NULL DEFAULT 'active',   -- active | contacted | replied
+        opted_out         INTEGER NOT NULL DEFAULT 0,       -- 1 = PERMANENT suppression (never pruned)
+        source            TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        last_contacted_at TEXT
+    )
     """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
     # under a GRANTED capability cell (i.e. the gate allowed it without holding
@@ -1029,7 +1069,33 @@ TABLES = {
             content_hash     TEXT,                    -- SHA-256 of content at creation time
             content_size     INTEGER,                 -- byte count of content at creation time
             original_content TEXT,                    -- pre-realist-amendment content (NULL if not amended)
-            expected_outputs TEXT                     -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
+            expected_outputs TEXT,                    -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
+            revision_num      INTEGER DEFAULT 1,      -- PR-4 dark: current revision number; PR-5 reconcile bumps on revise
+            revalidate_at     TEXT,                   -- PR-4 dark: when the premise is next due for re-validation (set in PR-6)
+            last_validated_at TEXT,                   -- PR-4 dark: when the premise was last reaffirmed (set in PR-5)
+            scope             TEXT,                   -- operate|develop (NULL=unjudged); realist/reconcile-stamped, genesis-ego only
+            scope_revision    INTEGER                 -- revision_num the scope was stamped against (staleness on re-revise)
+        )
+    """,
+    # PR-4 (ego proposal-lifecycle redesign): prior-value audit trail for
+    # versioned proposal revision. One row per superseded revision (surrogate
+    # id PK, no FK — mirrors calibration_cell_history; SQLite FK enforcement is
+    # PRAGMA-gated, so proposal_id is a documented soft reference). Dark in PR-4
+    # (no writer); the PR-5 reconcile stage writes prior values here on revise.
+    "ego_proposal_revisions": """
+        CREATE TABLE IF NOT EXISTS ego_proposal_revisions (
+            id               TEXT PRIMARY KEY,
+            proposal_id      TEXT NOT NULL,           -- ego_proposals.id this revision belongs to (soft ref)
+            revision_num     INTEGER NOT NULL,        -- the prior revision number these snapshotted values represent
+            content          TEXT,                    -- prior content
+            rationale        TEXT,                    -- prior rationale
+            confidence       REAL,                    -- prior confidence
+            execution_plan   TEXT,                    -- prior dispatch instructions (dispatch consumes these)
+            expected_outputs TEXT,                    -- prior post-dispatch verification criteria (JSON)
+            revised_at       TEXT NOT NULL,           -- when the superseding revision was made
+            revised_by       TEXT,                    -- ego_source / reconcile stage that made the revision
+            reason           TEXT,                    -- why the revision was made
+            scope            TEXT                     -- prior scope (operate|develop) snapshot at this revision
         )
     """,
     "ego_state": """
@@ -1073,12 +1139,15 @@ TABLES = {
                 CHECK (status IN ('active', 'fired', 'expired', 'withdrawn')),
             created_at        TEXT NOT NULL,
             fired_at          TEXT,
-            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire)
+            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire;
+                                                      -- system rows: source dispatch proposal, set at creation)
             cycle_count       INTEGER NOT NULL DEFAULT 0,
             max_cycles        INTEGER NOT NULL DEFAULT 20,
             reasoning         TEXT,
             priority          TEXT NOT NULL DEFAULT 'normal'
-                CHECK (priority IN ('low', 'normal', 'high'))
+                CHECK (priority IN ('low', 'normal', 'high')),
+            origin            TEXT NOT NULL DEFAULT 'ego'  -- 'ego' (LLM-created, capped) |
+                                                          -- 'system' (dispatch follow-through, uncapped)
         )
     """,
     # ── Intervention Journal ────────────────────────────────────────────────
@@ -1170,6 +1239,10 @@ TABLES = {
             source_subsystem TEXT,
             deprecated       INTEGER NOT NULL DEFAULT 0,
             dream_cycle_run_id TEXT,
+            -- When the dream merge soft-deleted this memory (ISO). The authoritative
+            -- deprecation time — used to age out the original's stale links after the
+            -- rollback window. NULL for non-dream deprecations (e.g. entity adjudication).
+            deprecated_at    TEXT,
             origin_class     TEXT,
             -- GROUNDWORK(voice-graduation-w2): provenance/trust columns for
             -- graduated overheard content — written by the W2 policy drainer,
@@ -1179,7 +1252,22 @@ TABLES = {
             trust_level      TEXT,
             attribution      TEXT,
             origin_ref       TEXT,
-            capture_clarity  REAL
+            capture_clarity  REAL,
+            -- GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl /
+            -- mw-5-speech-act-protection): MW-1 Tier-0 extraction judgment axes,
+            -- written WRITE-ONLY at extraction time — NOTHING reads them yet.
+            -- All NULLable with NO default: expiry is strictly opt-in
+            -- (durability='temporary' + an elapsed expires_at only), so an
+            -- unclassified row NEVER expires. Contract in memory/judgment.py;
+            -- added to existing DBs by migration 0081 (renumbered from 0079);
+            -- preference_domain by 20260906042425 (# GROUNDWORK(mw-4-preference-domain):
+            -- domain a preference is scoped to, open vocab, write-only).
+            speech_act            TEXT,
+            speech_act_confidence REAL,
+            assertion_provenance  TEXT,
+            durability            TEXT,
+            expires_at            TEXT,
+            preference_domain     TEXT
         )
     """,
     "graduation_events": """
@@ -1264,13 +1352,16 @@ TABLES = {
             verification_notes TEXT,
             pinned           INTEGER NOT NULL DEFAULT 0,
             kind             TEXT NOT NULL DEFAULT 'follow_up' CHECK (
-                kind IN ('follow_up', 'tabled')
+                kind IN ('follow_up', 'tabled', 'idea')
             ),
             domain           TEXT CHECK (
                 domain IN ('internal', 'user_world')
             ),
             goal_id          TEXT,
-            dedup_key        TEXT
+            dedup_key        TEXT,
+            -- Declared LAST so a fresh CREATE matches the migration 0075
+            -- ALTER ... ADD COLUMN (which appends) — fresh/migrated column-order parity.
+            revisit_condition TEXT
         )
     """,
     "file_modifications": """
@@ -1306,7 +1397,13 @@ TABLES = {
             file_path        TEXT,
             success          INTEGER NOT NULL DEFAULT 1,
             error_snippet    TEXT,
-            timestamp        TEXT NOT NULL
+            timestamp        TEXT NOT NULL,
+            -- LAST on purpose: ALTER TABLE ADD COLUMN appends, so declaring it
+            -- last keeps fresh-CREATE and legacy-ALTER column order identical.
+            -- Dedup key for the Stop-hook outcome scanner (#1597). Every row the
+            -- scanner writes carries a value; the pre-#1597 rows carry NULL
+            -- (SQLite allows multiple NULLs in a UNIQUE index).
+            tool_use_id      TEXT
         )
     """,
     "direct_session_queue": """
@@ -1320,6 +1417,28 @@ TABLES = {
             created_at      TEXT NOT NULL,
             claimed_at      TEXT,
             dispatched_at   TEXT
+        )
+    """,
+    "cc_rate_limit_parks": """
+        CREATE TABLE IF NOT EXISTS cc_rate_limit_parks (
+            id                TEXT PRIMARY KEY,
+            kind              TEXT NOT NULL
+                              CHECK (kind IN ('conversation', 'direct_session')),
+            dedup_key         TEXT NOT NULL,
+            payload_json      TEXT NOT NULL,
+            origin_session_id TEXT,
+            limit_kind        TEXT NOT NULL DEFAULT 'unknown'
+                              CHECK (limit_kind IN ('session', 'weekly', 'unknown')),
+            raw_signal        TEXT,
+            reset_at          TEXT,
+            status            TEXT NOT NULL DEFAULT 'parked'
+                              CHECK (status IN ('parked', 'resuming', 'resumed',
+                                                'needs_user', 'cancelled', 'expired')),
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at   TEXT,
+            claimed_at        TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
         )
     """,
     "eval_events": """
@@ -1655,9 +1774,16 @@ TABLES = {
             norm_name   TEXT NOT NULL,
             entity_type TEXT NOT NULL CHECK (entity_type IN (
                 'code_file','code_symbol','pr','commit',
-                'product','device','repo','subsystem','person','org','concept'
+                'product','device','repo','subsystem','person','org','concept',
+                -- MW-3 §6.4 first-card classes: host = a machine, install = a
+                -- Genesis deployment on a host, project = a user project.
+                'host','install','project'
             )),
             summary     TEXT,
+            -- MW-3 B3 card-materialization state (NULL/0 = never carded =
+            -- today's behavior; refresh job dirties + regenerates).
+            summary_updated_at TEXT,
+            summary_dirty INTEGER NOT NULL DEFAULT 0,
             source      TEXT NOT NULL DEFAULT 'extracted',
             status      TEXT NOT NULL DEFAULT 'active'
                             CHECK (status IN ('active','merged','gone')),
@@ -1730,7 +1856,30 @@ TABLES = {
             updated_a    TEXT,
             updated_b    TEXT,
             created_at   TEXT NOT NULL,
-            applied_at   TEXT
+            applied_at   TEXT,
+            -- Human review gate (PR-1): a proposed_merge is applied ONLY after a
+            -- human sets approved_at. NULL = unreviewed; the apply path filters
+            -- on approved_at IS NOT NULL so no merge is ever auto-applied.
+            approved_at  TEXT,
+            approved_by  TEXT
+        )
+    """,
+    # Reversibility journal (PR-1): a pre-delete snapshot of the loser's identity
+    # + mentions + links, written INSIDE merge_entity before the destructive
+    # DELETEs, so an applied merge can be undone (unmerge_entity — follow-up).
+    # merge_entity DELETEs the loser's mention/link rows, so without this snapshot
+    # a merge is irreversible. Retention: pruned by age in disk_hygiene.
+    "entity_merge_journal": """
+        CREATE TABLE IF NOT EXISTS entity_merge_journal (
+            id           TEXT PRIMARY KEY,
+            loser_id     TEXT NOT NULL,
+            survivor_id  TEXT NOT NULL,
+            loser_name   TEXT,
+            loser_norm   TEXT,
+            loser_type   TEXT,
+            mentions_json TEXT,
+            links_json   TEXT,
+            merged_at    TEXT NOT NULL
         )
     """,
     # Session-manager durable spine (PR-2a, migration 0058). session_id is the
@@ -1748,7 +1897,10 @@ TABLES = {
             pointers         TEXT NOT NULL DEFAULT '[]',
             compaction_count INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL,
-            updated_at       TEXT
+            updated_at       TEXT,
+            -- when the MISSION was last set, as distinct from updated_at, which
+            -- is a ROW timestamp bumped by pointer edits and the upsert too.
+            mission_updated_at TEXT
         )
     """,
     # Data-migration framework ledger (WS-C). Kept in LOCKSTEP with migration
@@ -1778,8 +1930,10 @@ TABLES = {
                         CHECK(status IN ('open','in_progress','done','absorbed','dropped')),
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
-                        CHECK(added_by IN ('foreground','ambient','pulse')),
+                        CHECK(added_by IN ('foreground','ambient','pulse',
+                                           'ambient_ledger_extractor')),
             evidence    TEXT,
+            source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,
             updated_at  TEXT
         )
@@ -1822,7 +1976,8 @@ TABLES = {
             matched_item_id TEXT,
             match_score     REAL,
             duplicate_of    TEXT,
-            mode            TEXT NOT NULL DEFAULT 'shadow'
+            mode            TEXT NOT NULL DEFAULT 'shadow',
+            promoted_item_id TEXT  -- session_ledger row this proposal became (live mode); NULL = unpromoted, retryable
         )
     """,
     # ── Repo-pulse annotator (session-manager PR-4a) ─────────────────────
@@ -1870,7 +2025,38 @@ TABLES = {
                             CHECK(status IN ('applied','proposed','confirmed',
                                              'rejected','superseded')),
             resolved_at     TEXT,
-            resolution_ref  TEXT
+            resolution_ref  TEXT,
+            -- 'ledger' | 'follow_up' — which store item_id addresses (a8a4f59e).
+            -- LAST column: ALTER appends here, so fresh/migrated order stays in parity.
+            target_kind     TEXT NOT NULL DEFAULT 'ledger'
+        )
+    """,
+    # ── PR-verification obligations (issue #1718 half B) ────────────────
+    # One row per MERGED PR: the durable record that its post-merge E2E
+    # decision survives the merge. Written only by the repo-pulse worker's
+    # verification lane; docs-only diffs arrive already closed with the
+    # reason (deterministic exemption by path — doc_paths.is_doc_path);
+    # the validator session closes the rest with evidence. Deliberately NOT
+    # follow_ups: these are a machine ledger for a validator, and follow_ups'
+    # readers (ego dispatch via get_actionable, morning report via
+    # get_pending) would surface them as actionable work — measured, see the
+    # 20260906234824 migration docstring. The (repo, pr_number) UNIQUE index
+    # (below) IS the dedup; INSERT OR IGNORE absorbs window re-coverage.
+    # This DDL and the migration are the sibling build-path pair — keep them
+    # identical (pinned by tests/test_session_awareness/test_pr_verifications.py).
+    "pr_verifications": """
+        CREATE TABLE IF NOT EXISTS pr_verifications (
+            id            TEXT PRIMARY KEY,
+            repo          TEXT NOT NULL,
+            pr_number     INTEGER NOT NULL,
+            pr_title      TEXT,
+            merged_at     TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'open'
+                          CHECK(status IN ('open', 'closed')),
+            closed_reason TEXT,
+            closed_at     TEXT,
+            evidence      TEXT,
+            created_at    TEXT NOT NULL
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2081,6 +2267,66 @@ TABLES = {
             created_at          TEXT NOT NULL
         )
     """,
+    # ── Memory integrity Phase 0 — "make silence loud" ───────────────────
+    # One row per read-only cross-backend consistency check. The episodic
+    # write path fans out to Qdrant + memory_metadata + memory_fts with no
+    # cross-store transaction; these snapshots turn silent drift (a memory
+    # marked embedded whose vector is gone, a ghost point, FTS drift) into a
+    # standing signal. status='unknown' when a dependency was unavailable — a
+    # dependency failure must never look like data corruption. 90-day prune.
+    "memory_consistency_reports": """
+        CREATE TABLE IF NOT EXISTS memory_consistency_reports (
+            id                   TEXT PRIMARY KEY,          -- uuid4 hex
+            created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+            status               TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unknown')),
+            sample_fraction      REAL,                      -- 0..1 fraction of rows scanned
+            sampled_rows         INTEGER,                   -- metadata rows actually checked
+            total_rows           INTEGER,                   -- total memory_metadata rows
+            truncated            INTEGER NOT NULL DEFAULT 0, -- 1 = a scan hit its budget cap
+            counts_json          TEXT NOT NULL,             -- {class: count} for all classes
+            offender_sample_json TEXT,                      -- {class: [ids...]} capped sample
+            unknown_reason       TEXT,                      -- set iff status='unknown'
+            duration_ms          INTEGER
+        )
+    """,
+    # One row per recall-health probe: an install-local golden query->expected
+    # -memory set run through the REAL recall pipeline. Records hit-rate + mean
+    # reciprocal rank + drift vs a trailing baseline. status='unknown' when the
+    # golden set is too small to judge. Golden set is a FILE (~/.genesis/eval/
+    # golden/), not a table (#1143 convention). 90-day prune.
+    "recall_probe_runs": """
+        CREATE TABLE IF NOT EXISTS recall_probe_runs (
+            id                TEXT PRIMARY KEY,             -- uuid4 hex
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            status            TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unknown')),
+            probes_total      INTEGER,                      -- golden cases attempted
+            probes_hit        INTEGER,                      -- cases where an expected id was retrieved
+            hit_rate          REAL,                         -- probes_hit / probes_total
+            mean_rr           REAL,                         -- mean reciprocal rank of first expected hit
+            baseline_hit_rate REAL,                         -- trailing-window mean, NULL during observation
+            drift             REAL,                         -- baseline_hit_rate - hit_rate, NULL if no baseline
+            details_json      TEXT,                         -- per-case {id, hit, rank}
+            unknown_reason    TEXT,                         -- set iff status='unknown'
+            duration_ms       INTEGER
+        )
+    """,
+    "memory_reconcile_runs": """
+        CREATE TABLE IF NOT EXISTS memory_reconcile_runs (
+            id                        TEXT PRIMARY KEY,          -- uuid4 hex
+            created_at                TEXT NOT NULL DEFAULT (datetime('now')),
+            status                    TEXT NOT NULL CHECK (status IN ('ok', 'partial', 'skipped', 'failed')),
+            ghosts_deleted            INTEGER NOT NULL DEFAULT 0,
+            ghost_delete_failed       INTEGER NOT NULL DEFAULT 0,
+            mirrors_requeued          INTEGER NOT NULL DEFAULT 0,
+            mirrors_skipped_no_content INTEGER NOT NULL DEFAULT 0,
+            tombstones_drained        INTEGER NOT NULL DEFAULT 0,
+            truncated                 INTEGER NOT NULL DEFAULT 0, -- 1 = point scroll hit budget (mirrors skipped)
+            capped                    INTEGER NOT NULL DEFAULT 0, -- 1 = per-run repair cap cut the work list
+            duration_ms               INTEGER,
+            details_json              TEXT,                       -- run detail (skipped-stale counts, samples)
+            unknown_reason            TEXT                        -- set iff status='skipped'/'failed' on dependency outage
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2209,6 +2455,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_entity_links_target ON entity_links(target_id)",
     # entity adjudication ledger — hot query is the propose_only→live backlog scan
     "CREATE INDEX IF NOT EXISTS idx_entity_adjud_verdict ON entity_adjudications(verdict)",
+    # Human-approved backlog scan: verdict='proposed_merge' AND approved_at IS NOT NULL.
+    "CREATE INDEX IF NOT EXISTS idx_entity_adjud_approved ON entity_adjudications(verdict, approved_at)",
+    # Merge journal: unmerge lookup by loser, and age-prune by merged_at.
+    "CREATE INDEX IF NOT EXISTS idx_entity_merge_journal_loser ON entity_merge_journal(loser_id)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_merge_journal_merged_at ON entity_merge_journal(merged_at)",
     # pending embeddings
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_status ON pending_embeddings(status)",
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_memory ON pending_embeddings(memory_id)",
@@ -2218,10 +2469,6 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)",
     "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
-    # calibration
-    "CREATE INDEX IF NOT EXISTS idx_predictions_domain ON predictions(domain)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_bucket ON predictions(confidence_bucket)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_unmatched ON predictions(outcome) WHERE outcome IS NULL",
     # outcome bus (self-improvement ledger)
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_domain ON outcome_events(domain)",
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_source ON outcome_events(source)",
@@ -2243,10 +2490,15 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
     # WS-8 email gate hold store (drain queries WHERE status='held')
     "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_issue_posts_status ON pending_issue_posts(status)",
     # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_sent ON autonomous_email_sends(sent_at)",
+    # Marketing cold-send prospect inventory — email lookup + active-set scan
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email COLLATE NOCASE)",
+    "CREATE INDEX IF NOT EXISTS idx_marketing_prospects_active "
+    "ON marketing_prospects(status, opted_out)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",
@@ -2333,6 +2585,12 @@ INDEXES = [
     # tool call outcomes (edit failure sensor)
     "CREATE INDEX IF NOT EXISTS idx_tco_tool_ts ON tool_call_outcomes(tool_name, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_tco_success ON tool_call_outcomes(success, timestamp)",
+    # UNIQUE dedup key for the Stop-hook transcript outcome scanner (INSERT OR
+    # IGNORE). tool_use_id is globally unique per CC; the pre-#1597 rows carry
+    # NULL, and SQLite treats each NULL as distinct so they never collide. #1597.
+    # (Column mirrored into _migrate_add_columns so this index is safe to build
+    # on a legacy DB before the numbered migration runs — #1123/#1127 class.)
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tco_tool_use_id ON tool_call_outcomes(tool_use_id)",
     # cognitive self-modification ledger (rollback)
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_target ON cognitive_file_modifications(target_path)",
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_actor ON cognitive_file_modifications(actor)",
@@ -2340,6 +2598,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_status ON cognitive_file_modifications(status)",
     # direct session queue
     "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
+    # cc rate-limit parks (durable park + reset-time resume) — partial-unique on
+    # OPEN parks makes concurrent same-work parks idempotent (upsert target).
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rlp_open_dedup ON cc_rate_limit_parks(dedup_key) WHERE status IN ('parked', 'resuming')",
+    "CREATE INDEX IF NOT EXISTS idx_rlp_status_next ON cc_rate_limit_parks(status, next_attempt_at)",
     # J-9 eval infrastructure
     "CREATE INDEX IF NOT EXISTS idx_eval_events_dimension ON eval_events(dimension, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_eval_events_type ON eval_events(event_type, timestamp)",
@@ -2388,10 +2650,14 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
-    "ON repo_pulse_annotations(tier, item_id, pr_number)",
+    "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_status ON repo_pulse_annotations(status, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_session ON repo_pulse_annotations(item_session_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_started ON repo_pulse_runs(started_at)",
+    # PR-verification obligations: (repo, pr_number) unique IS the dedup —
+    # window re-coverage is absorbed by INSERT OR IGNORE, never duplicated.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_prv_repo_pr ON pr_verifications(repo, pr_number)",
+    "CREATE INDEX IF NOT EXISTS idx_prv_status ON pr_verifications(status, merged_at)",
     # WS-2 sensor fabric (M9/M10)
     "CREATE INDEX IF NOT EXISTS idx_jre_job_time ON job_run_events(job_name, recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_recorded ON job_run_events(recorded_at)",
@@ -2414,6 +2680,14 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_reflex_signals_class ON reflex_signals(class_key)",
     "CREATE INDEX IF NOT EXISTS idx_reflex_diagnoses_signal ON reflex_diagnoses(signal_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_reflex_verdicts_signal ON reflex_verdicts(signal_id, created_at)",
+    # Memory integrity Phase 0 — latest-row-by-time and status filters
+    "CREATE INDEX IF NOT EXISTS idx_mcr_created ON memory_consistency_reports(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_mcr_status ON memory_consistency_reports(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rpr_created ON recall_probe_runs(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rpr_status ON recall_probe_runs(status, created_at)",
+    # Memory integrity Phase 1 — reconcile-run audit rows
+    "CREATE INDEX IF NOT EXISTS idx_mrr_created ON memory_reconcile_runs(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_mrr_status ON memory_reconcile_runs(status, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

@@ -12,9 +12,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# HOME may be unset in some container environments; derive from passwd
+# HOME may be unset in some container environments; derive from passwd (uid,
+# not whoami — robust when the name lookup is missing) and fail closed rather
+# than proceed with HOME="" (which `set -u` would not catch).
 if [[ -z "${HOME:-}" ]]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 
@@ -118,16 +121,30 @@ install_pkg() {
         echo "  ERROR: No package manager found. Install $pkg_apt manually."
         return 1
     fi
+    # `|| rc=$?` on every capture, NOT a bare assignment followed by `rc=$?`.
+    # Under `set -e` (line 10) an assignment whose value is a command substitution
+    # INHERITS that substitution's exit status and fires errexit, so a bare
+    # `output=$(...)` never reaches a following `rc=$?` when the install fails —
+    # the diagnostic block below would be dead code on the exact path it exists
+    # for. MEASURED: a bare call to this function with a failing install printed
+    # NOTHING and died; with `|| rc=$?` it prints the failure line and still
+    # returns non-zero. (Every current call site happens to use `|| …`, which
+    # disables errexit inside the function and hid this — so it was latent, not
+    # live. The next bare call site would have lost the diagnostics silently.)
+    rc=0
     if [[ "$PKG_MGR" == "apt" ]]; then
-        output=$(sudo apt-get install -y -qq "$pkg_apt" 2>&1)
+        output=$(sudo apt-get install -y -qq "$pkg_apt" 2>&1) || rc=$?
     else
-        output=$(sudo "$PKG_MGR" install -y -q "$pkg_dnf" 2>&1)
+        output=$(sudo "$PKG_MGR" install -y -q "$pkg_dnf" 2>&1) || rc=$?
     fi
-    rc=$?
     if [[ $rc -ne 0 ]]; then
-        # Show the last meaningful line of output for diagnostics
+        # Show the last meaningful line of output for diagnostics.
+        # The `|| last_line=""` matters: `set -o pipefail` is also on, so when the
+        # install produced only blank lines `grep -v` exits 1, the pipeline exits
+        # 1, and this assignment would abort the function BEFORE the echo — losing
+        # the very "no output" fallback written for that case.
         local last_line
-        last_line=$(echo "$output" | grep -v '^\s*$' | tail -1)
+        last_line=$(echo "$output" | grep -v '^\s*$' | tail -1) || last_line=""
         echo "  install failed (exit $rc): ${last_line:-no output}"
     fi
     return $rc
@@ -258,7 +275,11 @@ fi
 _node_version_ok() {
     command -v node &>/dev/null || return 1
     local ver
-    ver=$(node --version 2>/dev/null | sed 's/^v//')
+    # Guarded for the same reason as install_pkg: a broken `node` makes this
+    # pipeline non-zero under pipefail, and a bare assignment would abort the
+    # caller instead of returning "not ok". Latent today (every call site is
+    # `if _node_version_ok`), which is exactly how this class hides.
+    ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
     local major="${ver%%.*}"
     [[ "$major" -ge 20 ]] 2>/dev/null
 }
@@ -290,7 +311,21 @@ if [ -f "$_cc_env" ]; then
     echo "--- Aligning Claude Code to pinned version ---"
     # shellcheck source=/dev/null
     source "$_cc_env"
+    unset CC_SUPPRESSION_STATE
     cc_ensure_local || true
+    # bootstrap must not abort on a CC hiccup (set -e is live), but it also must
+    # not swallow the suppression outcome — this was the one caller with no
+    # signal at all: `|| true` discarded the return code AND nothing read the
+    # state, so bootstrap completed cleanly over a failed suppression check.
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|repaired) : ;;
+        *)
+            echo "  WARNING: CC auto-updater suppression not verified" \
+                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+                 "the pin; the daily genesis-cc-settings-align timer will retry" \
+                 "and its unit goes red if it cannot"
+            ;;
+    esac
     cc_shadow_scan || true
 fi
 
@@ -334,8 +369,19 @@ echo "--- Installing code intelligence tools ---"
 # in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
 # capped wrapper below via _register_mcp, so the installer must NOT self-register.
 echo "  codebase-memory-mcp: installing/upgrading..."
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config \
-    || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
+# Download-to-temp before executing: `curl … | bash` runs bytes as they stream,
+# so a mid-transfer connection drop executes a truncated script. -f fails the
+# download on a partial transfer; running from a file executes only a fully
+# downloaded installer. B9.
+_cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
+if [[ -n "$_cbm_installer" ]] \
+    && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh -o "$_cbm_installer" 2>/dev/null; then
+    bash "$_cbm_installer" --ui --skip-config \
+        || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
+else
+    echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)"
+fi
+[[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
 if command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
 fi
@@ -360,8 +406,16 @@ fi
 # Serena (Python LSP — symbols, references, rename)
 if ! command -v uv &>/dev/null; then
     echo "  uv not found — installing..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null \
-        || echo "  WARNING: uv install failed (non-critical)"
+    # Download-to-temp before executing (see B9 note above): avoids running a
+    # truncated installer if the transfer drops mid-stream.
+    _uv_installer=$(mktemp 2>/dev/null) || _uv_installer=""
+    if [[ -n "$_uv_installer" ]] \
+        && curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+        sh "$_uv_installer" 2>/dev/null || echo "  WARNING: uv install failed (non-critical)"
+    else
+        echo "  WARNING: uv installer download failed (non-critical)"
+    fi
+    [[ -n "$_uv_installer" ]] && rm -f "$_uv_installer"
     export PATH="$HOME/.local/bin:$PATH"
 fi
 if command -v uv &>/dev/null; then
@@ -383,18 +437,86 @@ SKILLSPECTOR_DIR="$HOME/.genesis/deps/skillspector"
 if [[ ! -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
     echo "  SkillSpector not found — installing..."
     mkdir -p "$HOME/.genesis/deps"
-    if [[ ! -d "$SKILLSPECTOR_DIR/.git" ]]; then
-        git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null \
+    # timeout guards a hung TCP connection (else bootstrap stalls indefinitely on
+    # this OPTIONAL dep); one retry rides out a transient blip. 300s ≈ 5x a normal
+    # --depth 1 clone / small pip install; on failure bootstrap continues. B8.
+    # A clone that dies mid-transfer leaves a PARTIAL .git, so clear the dir before
+    # each attempt and gate on a completion marker (pyproject.toml/setup.py — a
+    # populated worktree), NOT bare .git, else a partial clone wedges every future
+    # run (skip-because-.git-exists → pip against an incomplete tree, forever).
+    _ss_clone() { rm -rf "$SKILLSPECTOR_DIR"; timeout 300 git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null; }
+    if [[ ! -f "$SKILLSPECTOR_DIR/pyproject.toml" && ! -f "$SKILLSPECTOR_DIR/setup.py" ]]; then
+        _ss_clone || { sleep 2; _ss_clone; } \
             || echo "  WARNING: SkillSpector clone failed (skill-security scan will no-op until installed)"
     fi
-    if [[ -d "$SKILLSPECTOR_DIR" ]]; then
+    if [[ -f "$SKILLSPECTOR_DIR/pyproject.toml" || -f "$SKILLSPECTOR_DIR/setup.py" ]]; then
         "$PYTHON_BIN" -m venv "$SKILLSPECTOR_DIR/.venv" 2>/dev/null \
-            && "$SKILLSPECTOR_DIR/.venv/bin/pip" install -q "$SKILLSPECTOR_DIR" 2>/dev/null \
+            && timeout 300 "$SKILLSPECTOR_DIR/.venv/bin/pip" install -q "$SKILLSPECTOR_DIR" 2>/dev/null \
             || echo "  WARNING: SkillSpector install failed (non-critical)"
     fi
 fi
 if [[ -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
     echo "  SkillSpector: installed at $SKILLSPECTOR_DIR/.venv/bin/skillspector"
+fi
+
+# OfficeCLI (iOfficeAI — high-fidelity .xlsx/.pptx/.docx renderer for the
+# deliverable-builder skill; optional external binary, not vendored). The runtime
+# capability probe (_init_office_deliverables) resolves this pinned path; absent
+# → the skill falls back to pandoc/CSV and `office_deliverables` shows degraded.
+OCLI_VERSION="1.0.143"
+OCLI_DIR="$HOME/.genesis/deps/officecli"
+# Arch → release asset. OfficeCLI ships linux x64 + arm64; any other arch skips
+# (skill falls back to pandoc/CSV) — never fatal.
+case "$(uname -m)" in
+    x86_64)        OCLI_ARCH="x64" ;;
+    aarch64|arm64) OCLI_ARCH="arm64" ;;
+    *)             OCLI_ARCH="" ;;
+esac
+# Literal SHA256 pins — committed + review-gated. NOT fetched from the release's
+# SHA256SUMS: that is trust-on-first-use (a compromised release swaps binary AND
+# checksum in lockstep). Bump these deliberately whenever OCLI_VERSION changes.
+OCLI_SHA256_x64="6a29c598a789b57c92c03e560907d3f131a4bd0a068785b1d338a86fc31a58a7"  # pragma: allowlist secret  (public release checksum, not a secret)
+OCLI_SHA256_arm64="c50298e4698fcd1b15fe1a0f096405ad260b5c84d4440882582d0bba1e57bd49"  # pragma: allowlist secret  (public release checksum, not a secret)
+if [[ -z "$OCLI_ARCH" ]]; then
+    echo "  OfficeCLI: unsupported arch $(uname -m) — skipping (deliverable-builder uses pandoc/CSV)"
+else
+    OCLI_BIN="$OCLI_DIR/officecli-linux-$OCLI_ARCH"
+    _ocli_sha_var="OCLI_SHA256_$OCLI_ARCH"; OCLI_SHA256="${!_ocli_sha_var}"
+    # Trust the on-disk binary ONLY if it matches the committed literal hash.
+    # This is the idempotency guard AND the anti-tamper check in one: a matching
+    # hash means it's exactly the pinned version (skip), while a stale binary from
+    # an older pin, or a tampered one that merely reports the right --version,
+    # fails the hash and gets re-fetched. (Version-awareness falls out for free —
+    # a version bump changes the pinned hash, so the old binary no longer matches.)
+    _ocli_verify() { [[ -f "$OCLI_BIN" ]] && echo "${OCLI_SHA256}  ${OCLI_BIN}" | sha256sum -c - >/dev/null 2>&1; }
+    if _ocli_verify; then
+        chmod +x "$OCLI_BIN"  # ensure executable even on the already-verified path
+    else
+        echo "  OfficeCLI $OCLI_VERSION ($OCLI_ARCH) not present/verified — installing..."
+        mkdir -p "$OCLI_DIR"
+        OCLI_URL="https://github.com/iOfficeAI/OfficeCLI/releases/download/v${OCLI_VERSION}/officecli-linux-${OCLI_ARCH}"
+        # curl is PRIMARY: a public release asset needs no auth, so it works on a
+        # fresh install with no gh login. gh is the fallback. timeout guards a hung
+        # connection (~35MB binary; 300s is generous); one retry rides out a blip.
+        _ocli_fetch() {
+            rm -f "$OCLI_BIN"
+            timeout 300 curl -fSL "$OCLI_URL" -o "$OCLI_BIN" 2>/dev/null \
+                || ( cd "$OCLI_DIR" && timeout 300 gh release download "v${OCLI_VERSION}" \
+                        --repo iOfficeAI/OfficeCLI --pattern "officecli-linux-${OCLI_ARCH}" --clobber 2>/dev/null )
+        }
+        _ocli_fetch || { sleep 2; _ocli_fetch; } \
+            || echo "  WARNING: OfficeCLI download failed (deliverable-builder uses pandoc/CSV until installed)"
+        # Verify the freshly-downloaded binary against the committed pin; refuse on mismatch.
+        if _ocli_verify; then
+            chmod +x "$OCLI_BIN"
+        elif [[ -f "$OCLI_BIN" ]]; then
+            rm -f "$OCLI_BIN"
+            echo "  WARNING: OfficeCLI checksum mismatch — refusing binary (deliverable-builder uses pandoc/CSV)"
+        fi
+    fi
+    if [[ -x "$OCLI_BIN" ]]; then
+        echo "  OfficeCLI: installed at $OCLI_BIN ($OCLI_VERSION)"
+    fi
 fi
 echo
 
@@ -470,7 +592,7 @@ echo
 
 # --- Identity seed files (auto-generated at runtime, gitignored) ---
 echo "--- Checking identity seed files ---"
-for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md; do
+for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md USER.md; do
     if [[ ! -f "$GENESIS_ROOT/src/genesis/identity/$f" ]]; then
         if [[ -f "$GENESIS_ROOT/src/genesis/identity/$f.example" ]]; then
             cp "$GENESIS_ROOT/src/genesis/identity/$f.example" "$GENESIS_ROOT/src/genesis/identity/$f"
@@ -508,6 +630,29 @@ if "$VENV_DIR/bin/python" -c "from genesis.contribution.identity import get_inst
     echo "  Install identity present"
 else
     echo "  WARNING: could not materialize install identity (non-fatal)"
+fi
+echo
+
+# --- Release fingerprints (install-specific leak-detection patterns) ---
+# Generate ~/.genesis/release-fingerprints.txt from local config so the
+# contribution sanitizer + pre-push/commit-msg hooks match THIS install's
+# private strings — WITHOUT any private byte living in tracked source (the
+# public tree ships only generic CLASS patterns). Non-fatal: a fresh clone
+# with no local config produces a valid header-only file and never aborts
+# setup. Secret-sync (pushing the patterns to the public repo's
+# GENESIS_PRIVATE_PATTERNS Actions secret, which the CI private-scan reads) is
+# OPT-IN via GENESIS_SYNC_PRIVATE_PATTERNS=1 — pushing install-private data to
+# GitHub should be a deliberate choice, not an unconditional setup side effect.
+echo "--- Generating release fingerprints ---"
+if [[ "${GENESIS_SYNC_PRIVATE_PATTERNS:-0}" == "1" ]]; then
+    _fp_args="--sync-secret"
+else
+    _fp_args="--write"
+fi
+if "$VENV_DIR/bin/python" -m genesis.contribution.fingerprints "$_fp_args"; then
+    :
+else
+    echo "  WARNING: could not generate release fingerprints (non-fatal — generic class patterns still protect)"
 fi
 echo
 
@@ -563,7 +708,10 @@ if command -v codebase-memory-mcp &>/dev/null; then
     _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
 fi
 if command -v serena &>/dev/null; then
-    _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT"
+    # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
+    # flag overrides this), so register from the repo root regardless of the
+    # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
+    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
 fi
 echo
 
@@ -598,6 +746,16 @@ if [[ -z "$GENESIS_TIMEZONE" ]]; then
         echo "  Using timezone: $GENESIS_TIMEZONE (non-interactive)"
     fi
 fi
+# Validate the resolved timezone against the system's known zones — but only when
+# timedatectl can enumerate them (a minimal image may not), so we never force UTC
+# on a box we simply couldn't validate against. B6.
+if command -v timedatectl &>/dev/null; then
+    _tz_list=$(timedatectl list-timezones 2>/dev/null || true)
+    if [[ -n "$_tz_list" ]] && ! grep -qxF "$GENESIS_TIMEZONE" <<<"$_tz_list"; then
+        echo "  WARNING: '$GENESIS_TIMEZONE' is not a recognized timezone — falling back to UTC"
+        GENESIS_TIMEZONE="UTC"
+    fi
+fi
 if command -v timedatectl &>/dev/null; then
     sudo timedatectl set-timezone "$GENESIS_TIMEZONE" 2>/dev/null && \
         echo "  System timezone set to $GENESIS_TIMEZONE" || \
@@ -607,6 +765,9 @@ else
 fi
 # Persist to secrets.env for future runs
 if [[ -f "$SECRETS_FILE" ]] && ! grep -q "^GENESIS_TIMEZONE=" "$SECRETS_FILE" 2>/dev/null; then
+    # Ensure a trailing newline before appending, else a secrets.env that doesn't
+    # end in \n concatenates the new key onto the last existing line. B7.
+    [[ -s "$SECRETS_FILE" && -n "$(tail -c1 "$SECRETS_FILE")" ]] && printf '\n' >> "$SECRETS_FILE"
     echo "GENESIS_TIMEZONE=$GENESIS_TIMEZONE" >> "$SECRETS_FILE"
     echo "  Saved to secrets.env"
 fi
@@ -615,7 +776,10 @@ echo
 # --- Runtime state ---
 echo "--- Initializing runtime state ---"
 mkdir -p "$HOME/.genesis"
-touch "$HOME/.genesis/setup-complete"
+# The setup-complete marker is written at the VERY END (after "Bootstrap
+# complete"), NOT here: it gates the fresh-install onboarding prompt
+# (genesis_session_context.py) and ego cadence, so a bootstrap that crashes
+# mid-run must not leave the box looking fully onboarded. B1.
 
 # SQLite data dir — set nodatacow (chattr +C) at creation. On btrfs, CoW +
 # SQLite WAL means write-amplification and chronic fragmentation; the flag only
@@ -682,7 +846,15 @@ else
         sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
         # Verify the EFFECTIVE value — another drop-in sorting earlier would
         # silently win (first-value-wins), leaving dead-client detection off.
-        SSHD_EFFECTIVE=$(sudo sshd -T 2>/dev/null | grep -i '^clientaliveinterval ' | awk '{print $2}')
+        # `|| SSHD_EFFECTIVE=""` is load-bearing, and this site is worse than most:
+        # it is TOP LEVEL, so unlike a function there is no `|| …` call site to
+        # disable errexit. Under `set -o pipefail` a failing `sshd -T` (or a grep
+        # that matches nothing) makes the assignment non-zero and aborts bootstrap
+        # HERE — immediately after the sshd drop-in was written and sshd reloaded,
+        # skipping git hooks, unit rendering, timer enablement and the
+        # setup-complete marker, with no message. The else-branch below is written
+        # for exactly the empty/odd value that the abort prevents it from ever seeing.
+        SSHD_EFFECTIVE=$(sudo sshd -T 2>/dev/null | grep -i '^clientaliveinterval ' | awk '{print $2}') || SSHD_EFFECTIVE=""
         if [[ "$SSHD_EFFECTIVE" == "15" ]]; then
             echo "  ClientAlive configured (15s x 4 -> dead client HUP'd in ~60s)"
         else
@@ -829,6 +1001,12 @@ if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
     # shellcheck source=lib/memory_resilience.sh
     source "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot — many concurrent CC sessions
+    # spawn MCP subprocess trees and hit `Cannot fork` while memory/CPU read
+    # green). Same lib, same never-abort contract; surfaces via the posture check
+    # (pid_ceiling_effective_ok) when sudo/etc is unavailable.
+    pid_budget_apply
 else
     echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi
@@ -898,9 +1076,12 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
             SERVICES_UPDATED=1
         fi
     done
+    # Always reload before enabling — cheap + idempotent, and covers a prior run
+    # that wrote a unit then crashed before reloading (files unchanged this run,
+    # but systemd's in-memory view stale). B3.
+    systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
-        systemctl --user daemon-reload 2>/dev/null || true
-        echo "  systemd daemon reloaded"
+        echo "  systemd daemon reloaded (units changed)"
     fi
 
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a
@@ -921,6 +1102,16 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                 echo "  + $timer_name enabled + started" || true
         fi
     done
+
+    # Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+    # timer — the loop above only enables timers). Enable-only (not --now): it is
+    # meant to fire in the CC-quiet cold-start window before genesis-server, so
+    # arming it for the next boot is correct; the paired timer handles periodic
+    # attempts. Without this an existing install would render but never activate it.
+    if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+        systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+            echo "  + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+    fi
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
 fi
@@ -1054,6 +1245,11 @@ if [[ -z "$MISSING_CRITICAL" && -z "$MISSING_HELPFUL" ]]; then
     echo "  All recommended plugins installed."
 fi
 echo
+
+# setup-complete written only now that all bootstrap work has finished (B1) — the
+# marker gates the fresh-install onboarding prompt + ego cadence, so an interrupted
+# bootstrap must not have written it early.
+touch "$HOME/.genesis/setup-complete"
 
 echo "=== Bootstrap complete ==="
 echo "Start Claude Code: claude"

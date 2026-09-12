@@ -1,5 +1,6 @@
 """Tests for memory-mcp server — verify all tools are registered with correct signatures."""
 
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,6 +16,7 @@ async def test_all_tools_registered():
     tools = await _get_tools()
     expected = [
         "memory_recall", "memory_store", "memory_extract", "memory_proactive",
+        "memory_synthesize",
         "memory_core_facts", "memory_stats",
         "observation_write", "observation_query", "observation_resolve",
         "conversation_history",
@@ -182,7 +184,7 @@ async def test_knowledge_ingest_stores_with_correct_qdrant_id():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-uuid-123")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "test-embed-model"
 
@@ -267,7 +269,7 @@ async def test_knowledge_ingest_memory_class_override():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-xyz")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -372,7 +374,7 @@ async def test_reference_store_full_roundtrip():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-cred-1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "test-embed"
 
@@ -386,13 +388,13 @@ async def test_reference_store_full_roundtrip():
             tools = await _get_tools()
             unit_id = await tools["reference_store"].fn(
                 kind="credentials",
-                identifier="ScarletAndRage forum login",
-                value="614Buckeye / hunter2",
+                identifier="HobbyForum forum login",
+                value="ForumUser42 / hunter2",
                 description=(
-                    "Login for forum.thescarletandrage.com, used by the "
-                    "614Buckeye persona. Ohio State fan forum."
+                    "Login for forum.example-community.org, used by the "
+                    "ForumUser42 persona. hobby community forum."
                 ),
-                tags=["forum", "persona:614buckeye"],
+                tags=["forum", "persona:example"],
                 source={
                     "session_id": "sess-abc",
                     "captured_via": "user_paste",
@@ -405,11 +407,11 @@ async def test_reference_store_full_roundtrip():
             row = await mod.knowledge.get(real_db, unit_id)
             assert row["project_type"] == "reference"
             assert row["domain"] == "reference.credentials"
-            assert row["concept"] == "ScarletAndRage forum login"
-            assert "614Buckeye / hunter2" in row["body"]
-            assert "Ohio State fan forum" in row["body"]
+            assert row["concept"] == "HobbyForum forum login"
+            assert "ForumUser42 / hunter2" in row["body"]
+            assert "hobby community forum" in row["body"]
             assert "forum" in row["tags"]
-            assert "persona:614buckeye" in row["tags"]
+            assert "persona:example" in row["tags"]
             assert "reference" in row["tags"]
             assert "credentials" in row["tags"]
             assert row["qdrant_id"] == "qdrant-cred-1"
@@ -437,7 +439,7 @@ async def test_reference_store_upsert_preserves_id():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-a")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -507,7 +509,7 @@ async def test_reference_store_different_kinds_no_body_collision():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(side_effect=fake_store)
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -549,7 +551,7 @@ async def test_reference_lookup_logs_credential_access():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -605,7 +607,7 @@ async def test_reference_lookup_non_credentials_no_audit():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -638,11 +640,15 @@ async def test_reference_lookup_non_credentials_no_audit():
 
 
 async def test_reference_lookup_hybrid_vector_path():
-    """I1 regression: reference_lookup must also consult the vector retriever.
+    """Regression: a vector hit must hydrate by Qdrant point ID, not primary key.
 
-    Builds a reference entry via reference_store, then simulates a vector
-    hit that returns it (no FTS match for the semantic query), and verifies
-    the result surfaces.
+    Builds a reference entry via reference_store, then simulates a vector hit
+    that returns it (no FTS match for the semantic query), and verifies the
+    result surfaces. The retriever returns ``memory_id`` = the Qdrant point ID
+    (what ``store.store`` returns, stored as ``knowledge_units.qdrant_id``) —
+    NOT the primary key. Hydrating that via ``knowledge.get`` (primary-key
+    lookup) matched nothing and dropped every reference; this asserts the
+    qdrant_id-keyed hydration path returns the entry.
     """
     from types import SimpleNamespace
 
@@ -656,7 +662,7 @@ async def test_reference_lookup_hybrid_vector_path():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-vector-1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -676,20 +682,22 @@ async def test_reference_lookup_hybrid_vector_path():
             tools = await _get_tools()
             unit_id = await tools["reference_store"].fn(
                 kind="persona_pointer",
-                identifier="614Buckeye persona",
-                value="~/.claude/personas/614buckeye/persona.md",
+                identifier="ForumUser42 persona",
+                value="~/.claude/personas/example/persona.md",
                 description=(
-                    "Ohio State fan persona for low-key forum engagement"
+                    "hobby community persona for low-key forum engagement"
                 ),
             )
 
-            # Semantic query that does NOT match any FTS5 token in the body.
-            # "ohio buckeyes fan" vs body containing "Ohio State fan persona" —
-            # FTS5 matches "ohio" and "fan" so FTS would still return this;
-            # test that the vector path ALSO returns it when FTS misses by
-            # querying with tokens that aren't in the body.
+            # Anti-remasking guard: the Qdrant point ID and the primary key are
+            # different UUIDs. The prior test mocked memory_id=unit_id, which
+            # masked the bug. Production returns the Qdrant point ID.
+            assert unit_id != "q-vector-1"
+
+            # Retriever returns the Qdrant point ID (== store.store's return,
+            # stored as qdrant_id), NOT the primary key.
             mock_retriever.recall = AsyncMock(return_value=[
-                SimpleNamespace(memory_id=unit_id, score=0.87),
+                SimpleNamespace(memory_id="q-vector-1", score=0.87),
             ])
 
             results = await tools["reference_lookup"].fn(
@@ -705,7 +713,12 @@ async def test_reference_lookup_hybrid_vector_path():
 
 
 async def test_reference_lookup_hybrid_merges_both_paths():
-    """Vector and FTS hits for the same entry merge to origin='both'."""
+    """Vector and FTS hits for the same entry merge to origin='both'.
+
+    Genuinely exercises cross-id-space dedup: the vector hit carries the Qdrant
+    point ID while FTS carries the primary key, so the merge must resolve the
+    vector hit to its primary key to recognise them as the same entry.
+    """
     from types import SimpleNamespace
 
     import aiosqlite
@@ -718,7 +731,7 @@ async def test_reference_lookup_hybrid_merges_both_paths():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-both")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -740,8 +753,11 @@ async def test_reference_lookup_hybrid_merges_both_paths():
                 description="Public example forum for testing",
             )
 
+            # Vector hit carries the Qdrant point ID (store.store's return),
+            # FTS carries the primary key — dedup must still merge them.
+            assert uid != "q-both"
             mock_retriever.recall = AsyncMock(return_value=[
-                SimpleNamespace(memory_id=uid, score=0.9),
+                SimpleNamespace(memory_id="q-both", score=0.9),
             ])
 
             results = await tools["reference_lookup"].fn(
@@ -750,6 +766,112 @@ async def test_reference_lookup_hybrid_merges_both_paths():
             assert len(results) == 1
             assert results[0]["unit_id"] == uid
             assert results[0]["origin"] == "both"
+        finally:
+            mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_reference_lookup_vector_hit_without_knowledge_unit_skipped():
+    """A vector hit with no knowledge_units row is excluded, not an error.
+
+    The episodic collection holds plain memories alongside stored references;
+    a vector hit whose Qdrant point ID has no knowledge_units row is not a
+    reference and must be dropped cleanly (no exception, no bogus row).
+    """
+    from types import SimpleNamespace
+
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.schema import create_all_tables
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        await create_all_tables(real_db)
+
+        mock_store = AsyncMock()
+        mock_store.store = AsyncMock(return_value="q-orphan")
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
+        mock_store._embeddings = MagicMock()
+        mock_store._embeddings.model_name = "m"
+
+        mock_retriever = AsyncMock()
+        # Qdrant point ID with no matching knowledge_units.qdrant_id row.
+        mock_retriever.recall = AsyncMock(return_value=[
+            SimpleNamespace(memory_id="not-a-knowledge-unit", score=0.95),
+        ])
+
+        old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+        try:
+            mod._store = mock_store
+            mod._db = real_db
+            mod._retriever = mock_retriever
+            mod._qdrant = MagicMock()
+
+            tools = await _get_tools()
+            results = await tools["reference_lookup"].fn(
+                query="xyzzy-no-match-in-body",  # FTS returns nothing either
+            )
+            assert results == []
+        finally:
+            mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_reference_lookup_hydration_error_degrades_to_fts():
+    """A vector-hydration DB error degrades to FTS-only, never a total failure.
+
+    reference_lookup's vector-retriever and FTS paths are both fail-open; the
+    qdrant_id hydration step must be too, so a transient DB fault on that one
+    query can't sink an otherwise-successful lookup.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.schema import create_all_tables
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        await create_all_tables(real_db)
+
+        mock_store = AsyncMock()
+        mock_store.store = AsyncMock(return_value="q-degrade")
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
+        mock_store._embeddings = MagicMock()
+        mock_store._embeddings.model_name = "m"
+
+        mock_retriever = AsyncMock()
+        mock_retriever.recall = AsyncMock(return_value=[])
+
+        old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+        try:
+            mod._store = mock_store
+            mod._db = real_db
+            mod._retriever = mock_retriever
+            mod._qdrant = MagicMock()
+
+            tools = await _get_tools()
+            uid = await tools["reference_store"].fn(
+                kind="url",
+                identifier="degrade forum",
+                value="https://example.com/degrade",
+                description="Public example forum for degrade testing",
+            )
+
+            # Vector hydration raises; FTS still matches "degrade forum".
+            mock_retriever.recall = AsyncMock(return_value=[
+                SimpleNamespace(memory_id="q-degrade", score=0.9),
+            ])
+            with patch.object(
+                mod.knowledge, "get_by_qdrant_ids",
+                new_callable=AsyncMock, side_effect=RuntimeError("db locked"),
+            ):
+                results = await tools["reference_lookup"].fn(
+                    query="degrade forum", kind="url",
+                )
+            # FTS path still surfaces the entry — degraded, not empty, no raise.
+            assert len(results) == 1
+            assert results[0]["unit_id"] == uid
+            assert results[0]["origin"] == "fts"
         finally:
             mod._store, mod._db, mod._retriever, mod._qdrant = old
 
@@ -766,7 +888,7 @@ async def test_reference_delete_roundtrip():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-delete-me")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -814,7 +936,7 @@ async def test_reference_delete_survives_audit_rows_with_fk_on():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-fk-test")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -879,7 +1001,7 @@ async def test_reference_delete_refuses_non_reference_unit():
         )
 
         mock_store = AsyncMock()
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
 
         old = (mod._store, mod._db, mod._retriever, mod._qdrant)
         try:
@@ -907,7 +1029,7 @@ async def test_reference_export_returns_stats():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(side_effect=["q1", "q2", "q3"])
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -1036,6 +1158,60 @@ async def test_conversation_history_search():
             mod._store = old_store
             mod._db = old_db
             mod._retriever = old_retriever
+
+
+async def test_conversation_history_cc_before_filters_older(tmp_path, monkeypatch):
+    """The CC 'before' cursor must exclude records at/after the timestamp so
+    scroll-up pages further back. Previously the CC branch ignored 'before' and
+    returned the tail regardless — the advertised pagination silently no-oped
+    for CC. A record with no timestamp is excluded once 'before' is set (can't
+    prove it precedes the cursor)."""
+    import json as _json
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.mcp.memory import conversation as conv
+
+    proj = "proj-x"
+    proj_dir = tmp_path / ".claude" / "projects" / proj
+    proj_dir.mkdir(parents=True)
+    # Written OUT of chronological order — the tool must sort globally by
+    # timestamp before applying the cursor/limit (mirrors the real two-file
+    # concatenation scramble).
+    records = [
+        {"type": "assistant", "message": "middle", "timestamp": "2026-08-20T10:05:00Z"},
+        {"type": "user", "message": "oldest", "timestamp": "2026-08-20T10:00:00Z"},
+        {"type": "user", "message": "newest", "timestamp": "2026-08-20T10:10:00Z"},
+        {"type": "user", "message": "notime"},  # missing timestamp
+    ]
+    (proj_dir / "s.jsonl").write_text(
+        "\n".join(_json.dumps(r) for r in records) + "\n",
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conv, "cc_project_dir", lambda: proj)
+
+    old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = MagicMock()
+
+        tools = await _get_tools()
+        result = await tools["conversation_history"].fn(
+            channel="cc", limit=10, before="2026-08-20T10:10:00Z",
+        )
+        contents = [m["content"] for m in result]
+        # at/after the cursor (and undated) excluded; older kept.
+        assert "newest" not in contents
+        assert "notime" not in contents
+        assert "oldest" in contents
+        assert "middle" in contents
+        # Returned chronologically (oldest→newest), regardless of file order.
+        assert contents == ["oldest", "middle"]
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
 
 
 async def test_conversation_history_unknown_channel():
@@ -1699,6 +1875,13 @@ async def test_memory_core_facts_wraps_external_and_emits(monkeypatch):
         real_db.row_factory = aiosqlite.Row
         from genesis.db.schema import create_all_tables
         await create_all_tables(real_db)
+        # Scrolled points must have metadata rows — a point without one is a
+        # deleted memory's ghost and the core_facts ghost filter drops it.
+        for _mid in ("ext-1", "fp-1", "old-1"):
+            await real_db.execute(
+                "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+                (_mid, "2026-01-01T00:00:00+00:00"),
+            )
         await real_db.commit()
 
         qdrant = MagicMock()
@@ -1738,3 +1921,319 @@ async def test_memory_core_facts_wraps_external_and_emits(monkeypatch):
     assert kwargs["gate"] == "injection"
     assert kwargs["source_ref"] == "mcp/memory/core.py::memory_core_facts"
     assert kwargs["blockable_count"] == 1
+
+
+async def test_conversation_history_chat_scoped_and_paginated():
+    """chat_id scopes the telegram branch to ONE chat (a DM scroll-up must not
+    leak other chats); `before` pages further back; the unscoped default is
+    unchanged (reflection sessions rely on the cross-chat view)."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        from genesis.db.crud.telegram_messages import store
+        for i in range(4):
+            await store(
+                real_db, chat_id=100, message_id=i, sender="user",
+                content=f"dm-{i}", timestamp=f"2026-08-13T04:0{i}:00",
+            )
+        await store(
+            real_db, chat_id=200, message_id=90, sender="genesis",
+            content="group-noise", timestamp="2026-08-13T04:02:30",
+        )
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._retriever = MagicMock(), MagicMock()
+            mod._db = real_db
+
+            tools = await _get_tools()
+            fn = tools["conversation_history"].fn
+
+            scoped = await fn(channel="telegram", chat_id=100, limit=10)
+            assert [m["content"] for m in scoped] == [
+                "dm-0", "dm-1", "dm-2", "dm-3",
+            ]
+
+            paged = await fn(
+                channel="telegram", chat_id=100,
+                before="2026-08-13T04:02:00", limit=10,
+            )
+            assert [m["content"] for m in paged] == ["dm-0", "dm-1"]
+
+            unscoped = await fn(channel="telegram", limit=10)
+            assert any(m["content"] == "group-noise" for m in unscoped), (
+                "default must stay unscoped (cross-chat)"
+            )
+
+            sscoped = await fn(channel="telegram", chat_id=100, search="dm-2")
+            assert [m["content"] for m in sscoped] == ["dm-2"]
+            snoise = await fn(channel="telegram", chat_id=100, search="group-noise")
+            assert snoise == []
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+async def test_conversation_history_search_honors_scoping_and_cursor():
+    """Codex round-3 lock: the search branch must honor thread_id and before —
+    otherwise paged search repeats the newest matches forever and a topic
+    search leaks other topics."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        from genesis.db.crud.telegram_messages import store
+        for i in range(3):
+            await store(
+                real_db, chat_id=100, message_id=i, sender="user",
+                content=f"needle-{i}", thread_id=7,
+                timestamp=f"2026-08-13T04:0{i}:00",
+            )
+        await store(
+            real_db, chat_id=100, message_id=50, sender="user",
+            content="needle-other-topic", thread_id=8,
+            timestamp="2026-08-13T04:01:30",
+        )
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._retriever = MagicMock(), MagicMock()
+            mod._db = real_db
+            tools = await _get_tools()
+            fn = tools["conversation_history"].fn
+
+            scoped = await fn(
+                channel="telegram", chat_id=100, thread_id=7, search="needle",
+            )
+            assert [m["content"] for m in scoped] == [
+                "needle-0", "needle-1", "needle-2",
+            ], "topic search must not leak other topics"
+
+            paged = await fn(
+                channel="telegram", chat_id=100, thread_id=7, search="needle",
+                before="2026-08-13T04:01:00",
+            )
+            assert [m["content"] for m in paged] == ["needle-0"], (
+                "search must honor the before cursor"
+            )
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+# --- memory_store: `wing` is a controlled vocabulary at the agent boundary ---
+# The tool takes a `wing` parameter (it has since 2026-04-14), but nothing
+# validated it: any string was accepted and written through to the FTS5 tag,
+# the Qdrant payload and memory_metadata.wing. A background session once
+# reported that no memory tool exposed `wing` at all and encoded its intent as
+# a free-text tag instead — a caller that can be told the valid set should be.
+
+
+@pytest.mark.asyncio
+async def test_memory_store_rejects_unknown_wing():
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        with pytest.raises(ValueError) as exc:
+            await tools["memory_store"].fn("content", "src", wing="portfolio")
+
+    msg = str(exc.value)
+    assert "portfolio" in msg
+    # The error must TEACH the vocabulary, not merely refuse.
+    assert "career" in msg and "infrastructure" in msg, msg
+    # And it must refuse BEFORE writing anything.
+    mod.return_value._store.store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_memory_store_accepts_a_valid_wing():
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_store"].fn("content", "src", wing="career")
+
+    assert result == "mem-id"
+    assert mod.return_value._store.store.await_args.kwargs["wing"] == "career"
+
+
+@pytest.mark.asyncio
+async def test_memory_store_without_wing_is_unaffected():
+    """Omitting `wing` must still reach the store for auto-classification."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_store"].fn("content", "src")
+
+    assert result == "mem-id"
+    assert mod.return_value._store.store.await_args.kwargs["wing"] is None
+
+
+@pytest.mark.asyncio
+async def test_memory_synthesize_rejects_unknown_wing():
+    """The SECOND agent-facing door into the same boundary.
+
+    Provenance on the 18 out-of-vocabulary rows in the live store: 17 have
+    dream_cycle_run_id IS NULL, i.e. they came through the MCP boundary rather
+    than the LLM-internal synthesis path. Guarding memory_store while leaving
+    memory_synthesize open just moves the door.
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        with pytest.raises(ValueError) as exc:
+            await tools["memory_synthesize"].fn("content", wing="portfolio")
+
+    assert "portfolio" in str(exc.value)
+    assert "career" in str(exc.value), str(exc.value)
+    mod.return_value._store.store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_memory_synthesize_accepts_a_valid_wing():
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_synthesize"].fn("content", wing="memory")
+
+    assert result == "mem-id"
+
+
+# --- memory_recall: the THIRD door, and the only one that READS ---
+# Enumerated rather than spot-checked: exactly three MCP tools take a `wing`
+# (memory_recall, memory_store, memory_synthesize). The two writers above
+# validate; the reader did not. Qdrant applies wing as a hard `must` condition
+# and the FTS5 path post-filters on it, so a typo returns [] — which an agent
+# reads as "no such memories exist" rather than "no such wing".
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_reports_an_unknown_wing_instead_of_returning_empty():
+    """A bad wing must be DISTINGUISHABLE from an honest empty result."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        result = await tools["memory_recall"].fn(query="anything", wing="architecture")
+
+    assert len(result) == 1 and "error" in result[0], result
+    msg = result[0]["error"]
+    assert "architecture" in msg
+    # Must TEACH the vocabulary, exactly as the write path does.
+    assert "career" in msg and "infrastructure" in msg, msg
+    # And it must refuse BEFORE the expensive search, not filter afterwards.
+    mod.assert_not_called()
+
+
+def test_memory_recall_docstring_lists_exactly_the_wing_vocabulary():
+    """The docstring IS the agent-facing schema, so it must not rot.
+
+    This PR's thesis is "stop hand-copying a closed vocabulary" — and its own
+    fix to `memory_recall`'s docstring introduced a fresh hand-copied copy, in
+    the one place with the highest blast radius: the MCP tool schema every
+    agent reads to decide what to pass. The prompt copy 200 lines away is
+    derived AND locked; this one was neither.
+
+    Deriving it is not available here (the docstring is the schema, extracted
+    statically), so it gets the lock instead. `WINGS` has changed membership
+    twice in this repo's history, so "correct today" is not a guarantee.
+    """
+    import re
+
+    from genesis.mcp.memory import core
+    from genesis.memory.taxonomy import WINGS
+
+    doc = core.memory_recall.fn.__doc__
+    m = re.search(r"one of: (.*?)\. Enumerated", doc, re.S)
+    assert m, "the `wing` docstring entry no longer enumerates the vocabulary"
+    listed = {w.strip() for w in m.group(1).replace("\n", " ").split(",")}
+    assert listed == WINGS, f"docstring drifted from WINGS: {listed ^ WINGS}"
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_forwards_the_wing_it_validated_not_the_raw_one():
+    """A padded wing must not pass validation and then match zero rows.
+
+    `_validate_wing` tests `wing.strip()`, but Qdrant applies `wing` as a hard
+    `must` FieldCondition and the FTS5 path compares it verbatim. Forwarding the
+    RAW value would let `" memory "` clear the guard and still return [] — the
+    exact silent-empty-result this guard exists to eliminate, surviving on a
+    whitespace edge. Blank means "no filter", not "filter on empty".
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    seen = {}
+
+    with patch.object(core, "_memory_mod") as mod:
+
+        async def _capture(*args, **kwargs):
+            seen["wing"] = kwargs.get("wing")
+            raise RuntimeError("stop after the filter is decided")
+
+        mod.return_value._retriever.recall = _capture
+        with contextlib.suppress(RuntimeError):
+            await tools["memory_recall"].fn(query="q", wing="  memory  ")
+    assert seen.get("wing") == "memory", seen
+
+    seen.clear()
+    with patch.object(core, "_memory_mod") as mod:
+
+        async def _capture2(*args, **kwargs):
+            seen["wing"] = kwargs.get("wing")
+            raise RuntimeError("stop after the filter is decided")
+
+        mod.return_value._retriever.recall = _capture2
+        with contextlib.suppress(RuntimeError):
+            await tools["memory_recall"].fn(query="q", wing="   ")
+    assert seen.get("wing") is None, seen
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_wing_validation_shares_one_definition_with_the_writers():
+    """No second vocabulary. Every WINGS member is accepted by the reader.
+
+    A per-tool copy of the list is the defect this whole PR is about — the
+    WING_AUDIT prompt carried one and put `architecture` into 11 live rows.
+
+    Scope, stated because this test's green is narrower than its name: it
+    catches a NARROWED vocabulary (verified RED by validating against
+    ``WINGS - {"employment"}``), which is the copy-the-list defect. It does NOT
+    catch validation being deleted outright — with no check at all every wing
+    is trivially "accepted" and this still passes. The sibling test above is
+    the deletion guard; verify both when either changes.
+    """
+    from genesis.mcp.memory import core
+    from genesis.memory.taxonomy import WINGS
+
+    tools = await _get_tools()
+    for wing in sorted(WINGS):
+        with patch.object(core, "_memory_mod") as mod:
+            mod.side_effect = RuntimeError("reached the search path")
+            with pytest.raises(RuntimeError):
+                await tools["memory_recall"].fn(query="q", wing=wing)

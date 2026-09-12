@@ -408,20 +408,15 @@ async def extract_procedure(
         )
         return None
 
-    # Skip if an explicit-teach procedure already covers this task_type
-    try:
-        from genesis.db.crud.procedural import find_by_task_type
-
-        existing = await find_by_task_type(db, data["task_type"])
-        if existing and existing.get("draft") == 0:
-            logger.info(
-                "Skipped extraction for %s: explicit-teach %s exists",
-                data["task_type"],
-                existing["id"],
-            )
-            return None
-    except Exception:
-        pass  # Non-critical guard — continue with extraction if check fails
+    # NOTE: there is intentionally no "skip if an explicit-teach exists for this
+    # task_type" early guard. A slug is a coarse topic bucket that can hold many
+    # DISTINCT lessons, so skipping on any explicit sibling would discard a
+    # genuinely different lesson (the exact over-suppression the store-layer fix
+    # avoids). Same-PRINCIPLE dedup against explicit siblings is handled by the
+    # novelty gate below (it compares against every same-slug row, explicit
+    # included), and an auto-extraction can never overwrite a matched
+    # explicit-teach — store_procedure_checked skips that case. This is the
+    # principle-aware path both layers defer to.
 
     # ── Same-type novelty gate ───────────────────────────────────────────
     # Skip if a near-duplicate principle already exists for this task_type.
@@ -578,12 +573,15 @@ async def extract_procedure(
             gate_result.adjusted_confidence,
         )
 
-        # WS-3 B1 gate-1 (procedure): NOT gated here — this legacy path has no
-        # reliable source-session tool signal. The only origin candidates are
-        # data["tools_used"] (the extractor LLM's proposed REPLAY tools, not
-        # source provenance) and summary.tool_calls (a heuristic, hyphen-
-        # truncating prose scrape from the summarizer). Gating on either would
-        # undercount silently. Deferred with the path's own removal (follow-up
+        # WS-3 B1 gate-1 (procedure): NOT gated here. The premise USED to be
+        # that this legacy path has no reliable source-session tool signal —
+        # data["tools_used"] is the extractor LLM's proposed REPLAY tools
+        # rather than source provenance, and summary.tool_calls was a prose
+        # scrape. That is now only half true: `InteractionSummary` carries
+        # `tool_calls_from_runtime`, and where it is set the names come from the
+        # runtime's own tool_use events. It is NOT set on the non-streaming
+        # paths, so gating here would still undercount silently — the same
+        # conclusion, for a narrower reason. Deferred with the path's own removal (follow-up
         # 3558802740d5); the primary judge path (extraction_job) IS gated on the
         # real transcript spine.
 

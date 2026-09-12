@@ -102,6 +102,12 @@ _EGO_CYCLE_DISALLOWED_TOOLS = (
     # class as the goal tools above). Capture happens in user-facing
     # sessions (conversation, resolution paths), never inside a cycle.
     "mcp__genesis-health__ego_decision",
+    # Directives and proposal resolution are USER authority — both stamp
+    # source="user" on what they create (a directive; a withdrawn -> re-validation
+    # directive). The ego cycle must never forge either. Belt to the per-tool
+    # is_dispatched_session_env() gate's suspenders.
+    "mcp__genesis-health__ego_directive",
+    "mcp__genesis-health__ego_proposal_resolve",
 )
 
 # Per-cycle cap on autonomous own-goal creations (genesis ego). One per cycle
@@ -169,6 +175,10 @@ class EgoSession:
         self._autonomous_dispatcher = None
         self._proposal_gate = None
         self._outreach_pipeline = None
+        # Questions channel (ask-user): reply → reactive signal routing +
+        # strong refs for the in-flight delivery tasks.
+        self._reply_signal_sink = None
+        self._question_tasks: set[asyncio.Task] = set()
         self._mcp_config_path = mcp_config_path
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
@@ -177,6 +187,7 @@ class EgoSession:
         self._focus_selector = None  # Lazy-init in _perceive
         self._sweep_lock = asyncio.Lock()
         self._last_realist_cost_usd = 0.0  # accumulated by _filter_proposals
+        self._last_reconcile_cost_usd = 0.0  # accumulated by _reconcile_drafts
         # Cache the static system prompt (read once, not every cycle).
         # Fail loud: a missing per-ego prompt must never silently degrade
         # to a placeholder identity (the legacy identity/EGO_SESSION.md
@@ -994,31 +1005,29 @@ class EgoSession:
         # 9. Process proposals
         if parsed:
             proposals = parsed.get("proposals", [])
+            # PR-5 reconcile stage (observe-only): match drafts against the
+            # pending board + covered-work and LOG verdicts. Applies nothing
+            # (verdict application lands in PR-6); returns drafts unchanged.
+            proposals = await self._reconcile_drafts(proposals)
+            # Cost observability for the reconcile CC call (mirrors the
+            # realist cost line); tracked via logging since EgoCycle is frozen.
+            if self._last_reconcile_cost_usd > 0:
+                logger.info(
+                    "Reconcile cost: $%.4f (ego cycle: $%.4f)",
+                    self._last_reconcile_cost_usd,
+                    cycle.cost_usd,
+                )
             # communication_decision is intentionally per-cycle and NOT
             # persisted to ego_state. It controls THIS cycle's delivery only.
             comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
-                # Bypass realist gate when critical directives are active —
-                # the user explicitly told the ego to propose something.
-                # The realist's zombie detection would incorrectly block
-                # re-proposals that were rejected for fixable reasons.
-                has_critical_directive = False
-                try:
-                    active_dirs = await ego_crud.list_active_directives(
-                        self._db, self._source_tag.replace("_cycle", ""),
-                    )
-                    has_critical_directive = any(
-                        d.get("priority") == "critical"
-                        for d in active_dirs
-                    )
-                except Exception:
-                    pass
-                if has_critical_directive:
-                    logger.info(
-                        "Realist bypassed — active critical directive(s)",
-                    )
-                else:
-                    proposals = await self._filter_proposals(proposals)
+                # Realist ALWAYS runs — no blanket directive bypass. The
+                # directive-scoped exemption is applied INSIDE the realist:
+                # active critical/high directives are shown to it, and it
+                # suspends zombie/duplicate rejection only for drafts that
+                # actually address one (see _filter_proposals). Feasibility,
+                # actionability, and domain-boundary checks always apply.
+                proposals = await self._filter_proposals(proposals)
                 # Log realist cost for observability (cycle dataclass is frozen,
                 # so cost is tracked via logging; negligible vs ego cycle cost)
                 if self._last_realist_cost_usd > 0:
@@ -1032,6 +1041,10 @@ class EgoSession:
                 # (content, career, etc.) are rejected and auto-escalated.
                 if proposals and self._source_tag == "genesis_ego_cycle":
                     proposals = self._enforce_domain_boundary(proposals)
+                    # Operate-vs-develop scope was stamped on each proposal by
+                    # the realist (_realist_scope); _process_proposals enforces
+                    # it structurally at create (unstamped → dropped fail-closed;
+                    # develop + self-dev-disabled → created-then-tabled).
                 elif proposals and self._source_tag == "user_ego_cycle":
                     proposals = await self._enforce_user_domain_boundary(proposals)
 
@@ -1046,6 +1059,13 @@ class EgoSession:
             notifications = parsed.get("notifications", [])
             if isinstance(notifications, list) and notifications:
                 await self._process_notifications(notifications)
+
+            # 9a2. Process questions (ask-user channel — direct delivery with
+            # reply capture, NO approval gate; the reply returns as a reactive
+            # signal next cycle)
+            questions = parsed.get("questions", [])
+            if isinstance(questions, list) and questions:
+                await self._process_questions(questions)
 
             # 9b. Process tabled/withdrawn proposal IDs
             tabled_ids = parsed.get("tabled", [])
@@ -1166,10 +1186,14 @@ class EgoSession:
                                 rd.get("id"), exc_info=True,
                             )
 
-            # 10d. Process deferred intentions (both egos)
+            # 10d. Process deferred intentions (both egos). Called even when
+            # the output drops the intentions block — expiry and the
+            # implicit-keep aging sweep must run every cycle so max_cycles
+            # is a mechanical TTL, not one dependent on LLM compliance.
             intentions_data = parsed.get("intentions")
-            if intentions_data and isinstance(intentions_data, dict):
-                await self._process_intentions(intentions_data)
+            if not isinstance(intentions_data, dict):
+                intentions_data = {}
+            await self._process_intentions(intentions_data)
 
             # 10e. Additive ego autonomy — the genesis ego's OWN goal lane
             # (origin='genesis_ego'). Both handlers hard-gate on source_tag
@@ -1210,6 +1234,11 @@ class EgoSession:
                 "Ego output could not be parsed — cycle %s stored with no proposals",
                 cycle.id,
             )
+            # Age intentions on a parse-failure cycle too: expiry and the
+            # implicit-keep sweep must run EVERY cycle so max_cycles is a
+            # mechanical TTL, not one dependent on the LLM emitting parseable
+            # output. (The parsed path runs this at step 10d above.)
+            await self._process_intentions({})
 
         logger.info(
             "Ego cycle %s completed (cost=$%.4f, proposals=%d, tokens=%d+%d)",
@@ -1284,6 +1313,23 @@ class EgoSession:
                 "\n\nThis is an ESCALATION cycle. Assess the health issue "
                 "or system alert and propose remediation actions."
             )
+        elif focus.focus_type == "capability_improvement":
+            # Name the exact weak domain (focus.focus_id) — the capability map
+            # renders only the top rows BY CONFIDENCE, so the weakest (target)
+            # domain is otherwise absent from the context. The genesis context
+            # builder also surfaces its row via the "Focused deficiency" line.
+            target = focus.focus_id or "one of your capabilities"
+            directive += (
+                "\n\nThis is a CAPABILITY IMPROVEMENT cycle (ADVISORY). Your "
+                f"**{target}** capability is scoring low in your self-model "
+                "(see the Focused deficiency line under Capability Performance "
+                "for its confidence, trend, and evidence). You MAY consider — "
+                "but are not required to propose — a concrete improvement for "
+                f"{target}: a better procedure, a skill refinement, or a "
+                "targeted experiment. This is a nudge to reflect on a "
+                "deficiency, never a mandate to act, and NEVER a reason to do "
+                "less, lower your standards, or propose fewer actions elsewhere."
+            )
 
         return f"{directive}\n\n---\n\n{dynamic_context}"
 
@@ -1343,6 +1389,508 @@ class EgoSession:
 
     # -- Helpers -----------------------------------------------------------
 
+    async def _run_gate_cc(self, prompt: str, *, label: str):
+        """Run a lightweight in-cycle gate CC call (reconcile/realist), returning
+        the CC output or None on error. Mirrors the realist's fail-open envelope
+        (OPUS/MEDIUM, expect_output for silent-cap detection). PR-6 migrates the
+        realist call site onto this shared helper when it touches the realist for
+        the history widen.
+        """
+        try:
+            invocation = CCInvocation(
+                prompt=prompt,
+                expect_output=True,
+                model=CCModel.OPUS,
+                effort=EffortLevel.MEDIUM,
+                skip_permissions=True,
+                working_dir=background_session_dir(),
+            )
+            output = await self._invoker.run(invocation)
+            if output.is_error:
+                logger.warning("%s CC call failed: %s", label, output.error_message)
+                return None
+            return output
+        except Exception:
+            logger.warning("%s CC call raised, treating as unavailable", label, exc_info=True)
+            return None
+
+    async def _gather_covered_work(self) -> dict:
+        """Deterministic covered-work snapshot (NOT memory) for the reconcile
+        stage: active user_jobs, jobs running-but-not-succeeding, and recently
+        merged-PR coverage annotations. Each source is fail-soft to empty so a
+        missing table on a fresh install degrades cleanly to an empty snapshot.
+        """
+        from genesis.db.crud import job_health as job_health_crud
+        from genesis.db.crud import repo_pulse as repo_pulse_crud
+        from genesis.db.crud import user_jobs as user_jobs_crud
+
+        snapshot: dict = {"jobs": [], "stale_jobs": [], "merged_prs": []}
+        with contextlib.suppress(Exception):
+            jobs = await user_jobs_crud.list_jobs(self._db, status="active")
+            snapshot["jobs"] = [
+                {
+                    "title": j.get("title"),
+                    "status": j.get("last_status") or j.get("status"),
+                    "last_run": j.get("last_run_at"),
+                }
+                for j in jobs
+            ]
+        with contextlib.suppress(Exception):
+            snapshot["stale_jobs"] = await job_health_crud.get_stale_jobs(
+                self._db, threshold_days=3
+            )
+        with contextlib.suppress(Exception):
+            anns = await repo_pulse_crud.list_annotations(
+                self._db, status="confirmed", limit=50
+            )
+            snapshot["merged_prs"] = [
+                {
+                    "pr_number": a.get("pr_number"),
+                    "pr_title": a.get("pr_title"),
+                    "item_text": a.get("item_text"),
+                }
+                for a in anns
+            ]
+        return snapshot
+
+    async def _reconcile_drafts(self, proposals: list[dict]) -> list[dict]:
+        """Reconcile stage. Match this cycle's drafts against the ego-scoped
+        pending board + a deterministic covered-work snapshot, get a per-draft
+        verdict (new/reaffirm/revise/withdraw), and — in ``live`` mode — apply
+        the board verdicts, returning only the surviving drafts (those still to
+        be created). Fully fail-open: any error passes the drafts through
+        untouched.
+
+        Gated by the ego_reconcile settings lever:
+          - ``off``    — the stage does not run (no extra CC call).
+          - ``shadow`` — run + LOG the verdicts, apply NOTHING; drafts returned
+            unchanged (the default; the observation signal for the replay gate).
+          - ``live``   — apply verdicts via ``_apply_reconcile_verdicts``:
+            reaffirm/revise the matched board item, withdraw covered work, and
+            drop the reconciled drafts; only ``new``/unresolved drafts survive to
+            the realist → create. Live-``revise`` depends on the resolve-side
+            ``expected_revision`` guards (PR-6a) being deployed — the flip is
+            gated on that (see reconcile_config).
+        """
+        self._last_reconcile_cost_usd = 0.0
+        if not proposals:
+            return proposals
+        from genesis.ego import reconcile_config
+
+        mode = reconcile_config.effective_mode()
+        if mode == "off":
+            return proposals
+        try:
+            board = await ego_crud.list_pending_proposals(
+                self._db, ego_source=self._source_tag
+            )
+            covered = await self._gather_covered_work()
+            prompt = _build_reconcile_prompt(
+                proposals, board, covered, ego_source=self._source_tag
+            )
+            output = await self._run_gate_cc(prompt, label="Reconcile")
+            if output is None:
+                return proposals
+            self._last_reconcile_cost_usd = output.cost_usd
+            verdicts = _parse_reconcile_response(output.text, len(proposals))
+            self._log_reconcile_verdicts(mode, verdicts, proposals, board, covered)
+            if mode == "live":
+                # PR-6b: apply board verdicts and return ONLY the surviving
+                # drafts (those still to create). Everything before the apply
+                # loop is read-only, so an error here still fails open safely.
+                return await self._apply_reconcile_verdicts(
+                    proposals, verdicts, board
+                )
+        except Exception:
+            logger.warning(
+                "Reconcile stage failed, passing drafts through", exc_info=True
+            )
+        return proposals
+
+    def _log_reconcile_verdicts(
+        self,
+        mode: str,
+        verdicts: dict[int, dict],
+        proposals: list[dict],
+        board: list[dict],
+        covered: dict,
+    ) -> None:
+        """Structured observation log of reconcile verdicts — the PR-5 shadow
+        signal the replay gate reviews. Never mutates anything."""
+        counts: dict[str, int] = {}
+        for i in range(len(proposals)):
+            v = verdicts.get(i, {"verdict": "new"})
+            counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+        logger.info(
+            "Reconcile[%s] %s: %d drafts vs %d board items, "
+            "%d active jobs / %d stale / %d merged-PRs — verdicts=%s",
+            mode,
+            self._source_tag,
+            len(proposals),
+            len(board),
+            len(covered.get("jobs", [])),
+            len(covered.get("stale_jobs", [])),
+            len(covered.get("merged_prs", [])),
+            counts,
+        )
+        for i, prop in enumerate(proposals):
+            v = verdicts.get(i)
+            if not v or v["verdict"] == "new":
+                continue
+            logger.info(
+                "Reconcile[%s] draft[%d] -> %s target=%s :: %s | %s",
+                mode,
+                i,
+                v["verdict"],
+                (v.get("target_id") or "")[:12],
+                str(prop.get("content", ""))[:80].replace("\n", " "),
+                str(v.get("reason", ""))[:120],
+            )
+
+    async def _apply_reconcile_verdicts(
+        self,
+        proposals: list[dict],
+        verdicts: dict[int, dict],
+        board: list[dict],
+    ) -> list[dict]:
+        """PR-6b LIVE apply of reconcile verdicts. Returns the SURVIVING drafts
+        (those still to be created), which flow to the realist -> create_batch
+        exactly as today. Board verdicts (reaffirm/withdraw/revise) are applied
+        here and their drafts dropped from the returned list.
+
+        Per-draft fail-open: each draft is KEPT-as-new unless a mutation SUCCEEDS
+        and warrants dropping it. One draft's failure fails open THAT draft only
+        and never abandons an already-committed board decision — so a mid-loop
+        error cannot bubble to the caller's outer except and return the full
+        input list (which would double-create a draft whose board twin was
+        already mutated). All DB writes happen inside the per-draft try; the only
+        code before the loop (prefix_map build) is read-only.
+
+        target_id resolution: the reconcile prompt renders board ids truncated to
+        12 chars, so the model can only ever emit a 12-char prefix. We map that
+        prefix back to the FULL id from the exact board snapshot reconcile was
+        shown; an unmatched or ambiguous prefix downgrades the verdict to "new"
+        (fail-safe), so a hallucinated/mistranscribed id never mutates the wrong
+        proposal.
+        """
+        prefix_map: dict[str, list[tuple[str, dict]]] = {}
+        for b in board:
+            bid = str(b.get("id", "") or "")
+            if bid:
+                prefix_map.setdefault(bid[:12], []).append((bid, b))
+
+        survivors: list[dict] = []
+        for i, draft in enumerate(proposals):
+            try:
+                v = verdicts.get(i) or {}
+                verdict = v.get("verdict", "new")
+                raw_target = v.get("target_id")
+
+                if verdict == "new":
+                    survivors.append(draft)
+                    continue
+
+                # withdraw with NO board target = covered-work invalidated a
+                # FRESH draft that has no board twin -> DROP the draft (do not
+                # create it). This is NOT a board withdrawal, and is decoupled
+                # from the 24h guard: the draft is covered regardless of any
+                # board item's age.
+                if verdict == "withdraw" and not raw_target:
+                    logger.info(
+                        "Reconcile[live] draft[%d] dropped — covered-work, no board twin :: %s",
+                        i,
+                        str(draft.get("content", ""))[:80].replace("\n", " "),
+                    )
+                    continue
+
+                matches = (
+                    prefix_map.get(str(raw_target)[:12]) if raw_target else None
+                )
+                if not matches or len(matches) != 1:
+                    logger.info(
+                        "Reconcile[live] draft[%d] verdict=%s target=%r unresolved "
+                        "-> keep as new",
+                        i,
+                        verdict,
+                        raw_target,
+                    )
+                    survivors.append(draft)
+                    continue
+                full_id, board_row = matches[0]
+
+                if verdict == "reaffirm":
+                    from genesis.ego.config import next_revalidate_at
+
+                    ok = await ego_crud.reaffirm_proposal(
+                        self._db,
+                        full_id,
+                        revalidate_at=next_revalidate_at(
+                            board_row.get("urgency", "normal"),
+                        ),
+                    )
+                    logger.info(
+                        "Reconcile[live] draft[%d] reaffirm %s (ok=%s)",
+                        i,
+                        full_id[:12],
+                        ok,
+                    )
+                    # Board item covers it -> drop the fresh re-derivation. A
+                    # False ok means the board item is no longer pending
+                    # (approved/withdrawn/tabled) — re-creating it would either
+                    # duplicate approved work or resurrect a rejected one, so
+                    # dropping is correct in every case.
+                    continue
+
+                if verdict == "withdraw":
+                    retired = await self._reconcile_withdraw(
+                        full_id, board_row, v.get("reason")
+                    )
+                    logger.info(
+                        "Reconcile[live] draft[%d] withdraw %s (board_retired=%s)",
+                        i,
+                        full_id[:12],
+                        retired,
+                    )
+                    # Duplicate of an invalidated/covered item -> drop the draft
+                    # whether or not the board retire fired (24h guard may defer).
+                    continue
+
+                if verdict == "revise":
+                    # A revise mutates the board item's content + bumps
+                    # revision_num, which only stays TOCTOU-safe if every pending
+                    # digest for that item is revision-snapshot-protected (so a
+                    # stale reply refuses). A digest sent before #1257 shipped
+                    # snapshotting has none — resolve_proposals then falls back to
+                    # expected_revision=None (unguarded). For such an item, revise
+                    # would reopen the approve-time race; reaffirm instead (keep
+                    # the board item as-is, drop the duplicate draft) — no TOCTOU
+                    # and no duplicate. Only the sharpening is deferred until the
+                    # item is next re-digested (with a snapshot) or resolved.
+                    if not await self._revision_snapshot_exists(
+                        board_row.get("batch_id")
+                    ):
+                        from genesis.ego.config import next_revalidate_at
+
+                        ok = await ego_crud.reaffirm_proposal(
+                            self._db,
+                            full_id,
+                            revalidate_at=next_revalidate_at(
+                                board_row.get("urgency", "normal"),
+                            ),
+                        )
+                        logger.info(
+                            "Reconcile[live] draft[%d] revise->reaffirm %s "
+                            "(digest not snapshot-protected; TOCTOU-safe) ok=%s",
+                            i,
+                            full_id[:12],
+                            ok,
+                        )
+                        continue  # drop the duplicate draft
+                    applied = await self._reconcile_revise(
+                        full_id, board_row, draft, v.get("reason"),
+                        scope=v.get("scope"),
+                    )
+                    if applied:
+                        continue  # board item sharpened in place -> drop draft
+                    survivors.append(draft)  # race/dedup/non-pending -> keep new
+                    continue
+
+                survivors.append(draft)  # unknown verdict -> keep
+            except Exception:
+                logger.warning(
+                    "Reconcile[live] draft[%d] apply failed — keeping as new",
+                    i,
+                    exc_info=True,
+                )
+                survivors.append(draft)
+        return survivors
+
+    async def _reconcile_withdraw(
+        self, proposal_id: str, board_row: dict, reason: str | None
+    ) -> bool:
+        """Withdraw a board item invalidated by covered-work, honoring the 24h
+        user-protection guard (mirrors the ego-directed withdraw path,
+        session.py withdrawn-ids loop): no withdraw of an item delivered < 24h
+        ago. Returns True iff the board item was retired. The caller drops the
+        draft regardless (reconcile judged it a duplicate/covered)."""
+        created = str(board_row.get("created_at", "") or "")
+        if created:
+            try:
+                age = datetime.now(UTC) - datetime.fromisoformat(created)
+                if age.total_seconds() < 86400:
+                    logger.info(
+                        "Reconcile[live] withdraw of %s deferred (%.1fh old, <24h guard)",
+                        proposal_id[:12],
+                        age.total_seconds() / 3600,
+                    )
+                    return False
+            except (ValueError, TypeError):
+                pass  # unparseable timestamp — allow withdrawal
+        ok = await ego_crud.withdraw_proposal(
+            self._db,
+            proposal_id,
+            user_response=(reason or "reconcile: covered by shipped/active work"),
+        )
+        if ok:
+            with contextlib.suppress(Exception):
+                from genesis.db.crud import intervention_journal as journal_crud
+
+                await journal_crud.resolve(
+                    self._db, proposal_id, outcome_status="withdrawn"
+                )
+        return ok
+
+    async def _revision_snapshot_exists(self, batch_id: object) -> bool:
+        """True iff the proposal's delivery batch has a revision snapshot — i.e.
+        its digest was sent after #1257 shipped snapshotting, so a resolve of it
+        is revision-guarded. A missing snapshot (pre-#1257 digest, or never
+        digested) means a resolve would be unguarded, so a live revise of that
+        item is unsafe. Fail-closed (return False) on any error."""
+        if not batch_id:
+            return False
+        try:
+            snap = await ego_crud.get_state(
+                self._db, f"revision_snapshot:{batch_id}"
+            )
+            return bool(snap)
+        except Exception:
+            return False
+
+    async def _reconcile_revise(
+        self, proposal_id: str, board_row: dict, draft: dict, reason: str | None,
+        *, scope: str | None = None,
+    ) -> bool:
+        """Apply a reconcile 'revise' verdict: sharpen a pending board item in
+        place with the draft's content. Architect ruling A — apply directly; the
+        USER APPROVAL on the pending board is the safety gate, the realist is a
+        quality pre-filter only, and action_type is immutable in revise_proposal.
+
+        Guard-first via revise_proposal (pending + revision-num atomic guard, no
+        revert path). Hash-dedup pre-check (revise_proposal does NOT dedup): if
+        the sharpened content already exists on another pending/approved
+        proposal, skip the revise and keep the draft as new — create_batch's own
+        hash-dedup then collapses it. Returns True only if the revise applied.
+
+        Scope re-judgment (genesis-ego): reconcile runs BEFORE the realist, so a
+        revise's sharpened content is never realist-scoped — it must carry a
+        scope from the reconcile verdict, or an operate board item could be
+        mutated into develop work that then dispatches (the revise bypass).
+        Fail closed: if the scope is missing, or is develop while
+        self-development is disabled, do NOT apply the revise — return False so
+        the draft survives to the realist, which scopes it and routes it through
+        the normal create/table path. A valid operate (or develop-with-flag-on)
+        scope is written onto the revised row (pinned to the new revision)."""
+        from genesis.ego.integrity import content_hash as _content_hash
+
+        new_content = str(draft.get("content", "") or "")
+        if not new_content:
+            return False
+
+        _is_genesis = self._source_tag == "genesis_ego_cycle"
+        if _is_genesis:
+            # Scope the MERGED row, not just the draft. revise_proposal COALESCEs
+            # execution_plan, so a draft that omits it RETAINS the board item's
+            # existing plan — and a develop plan retained under an operate stamp
+            # would ride past the dispatch guard. Re-derive scope against the
+            # EFFECTIVE (post-COALESCE) plan: (1) the SELF_MODIFY fast-path on
+            # that plan forces develop (mirrors the realist apply-loop); (2) a
+            # board item already stamped develop cannot be silently downgraded
+            # to operate when its develop plan is being retained (draft supplies
+            # no replacement plan).
+            _draft_plan = str(draft.get("execution_plan") or "").strip()
+            _effective_plan = _draft_plan or str(
+                board_row.get("execution_plan") or ""
+            )
+            try:
+                from genesis.autonomy.classification import classify_domain
+                from genesis.autonomy.types import ActionDomain
+
+                if classify_domain(
+                    board_row.get("action_type", ""), _effective_plan,
+                ) in (ActionDomain.SELF_MODIFY, ActionDomain.AUTONOMOUS_BUILD):
+                    scope = "develop"
+            except Exception:
+                logger.warning(
+                    "reconcile revise scope fast-path failed", exc_info=True,
+                )
+            if board_row.get("scope") == "develop" and not _draft_plan:
+                scope = "develop"  # retained develop plan → no silent downgrade
+
+            if scope not in ("operate", "develop"):
+                logger.info(
+                    "Reconcile[live] revise of %s NOT applied — sharpened "
+                    "content unscoped; keeping draft for the realist to scope",
+                    proposal_id[:12],
+                )
+                return False
+            if scope == "develop" and not self._self_development_enabled():
+                logger.info(
+                    "Reconcile[live] revise of %s NOT applied — sharpened "
+                    "content is develop-scope and self-development is disabled; "
+                    "keeping draft (routed to tabled via the normal path)",
+                    proposal_id[:12],
+                )
+                return False
+        if await ego_crud.has_pending_proposal_with_hash(
+            self._db, _content_hash(new_content)
+        ):
+            logger.info(
+                "Reconcile[live] revise of %s skipped — content duplicates an "
+                "existing pending item",
+                proposal_id[:12],
+            )
+            return False
+        try:
+            expected = int(board_row.get("revision_num", 1) or 1)
+        except (ValueError, TypeError):
+            expected = 1
+        from genesis.ego.config import next_revalidate_at
+        from genesis.ego.proposals import ensure_deliverable_spec
+
+        new_rev = await ego_crud.revise_proposal(
+            self._db,
+            proposal_id,
+            expected_revision=expected,
+            content=new_content,
+            rationale=draft.get("rationale"),
+            confidence=draft.get("confidence"),
+            # Normalize a present-but-empty plan to None so COALESCE RETAINS the
+            # existing plan (an empty string is not SQL NULL and would overwrite
+            # it). Keeps the persisted plan consistent with the "no replacement
+            # plan → retain" judgment above; LLM drafts routinely emit "".
+            execution_plan=(str(draft.get("execution_plan") or "").strip() or None),
+            # Deliverable-floor parity with create_batch: serialize the draft's
+            # spec AND inject the default if it's unusable, so a live-revise
+            # never strips a valid deliverable down to an unverifiable one.
+            expected_outputs=ensure_deliverable_spec(
+                draft.get("expected_outputs"),
+                proposal_id=proposal_id,
+                action_type=board_row.get("action_type", "unknown"),
+                ego_source=self._source_tag,
+            ),
+            revised_by=self._source_tag,
+            reason=(reason or "reconcile: sharpened from a fresh blind draft"),
+            # A revise IS a premise re-validation — advance the cadence clock.
+            revalidate_at=next_revalidate_at(
+                board_row.get("urgency", "normal"),
+            ),
+            # Re-scope the sharpened content, pinned to the new revision (the
+            # genesis-ego fail-closed checks above guarantee a valid scope here).
+            scope=scope if _is_genesis else None,
+            scope_revision=(expected + 1) if (_is_genesis and scope) else None,
+        )
+        if new_rev is None:
+            logger.info(
+                "Reconcile[live] revise of %s not applied "
+                "(race/non-pending/rev-mismatch) -> keep draft",
+                proposal_id[:12],
+            )
+            return False
+        logger.info(
+            "Reconcile[live] revised %s -> rev %d", proposal_id[:12], new_rev
+        )
+        return True
+
     async def _filter_proposals(
         self,
         proposals: list[dict],
@@ -1364,20 +1912,76 @@ class EgoSession:
         if not proposals:
             return proposals
 
-        # Fetch recent history for zombie/duplicate detection
+        # Fetch recent history for zombie/duplicate detection.
+        #
+        # When blind drafting is active (reconcile mode != "off") the ego no
+        # longer sees the pending board while drafting, so the realist becomes
+        # the SOLE enforcing deduplicator. The legacy 2-day/LIMIT-20 GLOBAL
+        # window would let a pending item older than two days (or displaced by
+        # newer rows) slip past Rule #2 and be re-inserted (Codex P1). In that
+        # mode widen to the FULL ego-scoped board — all pending + approved, any
+        # age (the dedup targets that matter) — plus this ego's recently-resolved
+        # rows (7d, the zombie signal), board-first and bounded. In "off" mode
+        # keep the exact legacy query (pre-PR-5 behavior).
+        from genesis.ego import reconcile_config
+
+        blind = reconcile_config.effective_mode() != "off"
         try:
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-2 days') "
-                "ORDER BY created_at DESC LIMIT 20",
-            )
+            if blind:
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, created_at "
+                    "FROM ego_proposals "
+                    "WHERE (ego_source = ? OR ego_source IS NULL) "
+                    "AND (status IN ('pending', 'approved') "
+                    "     OR created_at >= datetime('now', '-7 days')) "
+                    "ORDER BY "
+                    "  CASE WHEN status IN ('pending', 'approved') THEN 0 ELSE 1 END, "
+                    "  created_at DESC "
+                    "LIMIT 35",
+                    (self._source_tag,),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-2 days') "
+                    "ORDER BY created_at DESC LIMIT 20",
+                )
             recent = [dict(r) for r in await cursor.fetchall()]
         except Exception:
             logger.warning("Realist: failed to fetch history, passing through")
             return proposals
 
-        prompt = _build_realist_prompt(proposals, recent, ego_source=self._source_tag)
+        # Directive-scoped exemption: fetch active critical/high directives for
+        # THIS ego so the realist can suspend zombie/duplicate rejection for
+        # drafts that address an explicit user directive. Fail-open to no
+        # exemption on any error.
+        active_directives: list[dict] = []
+        try:
+            # Generous limit: list_directives orders newest-first and the
+            # critical/high filter runs in Python, so a small limit could drop
+            # an older critical/high directive behind a burst of newer
+            # low/normal ones. Active directives per ego are realistically a
+            # handful; 50 is ample headroom on a tiny indexed table.
+            dirs = await ego_crud.list_directives(
+                self._db,
+                ego_target=self._source_tag.replace("_cycle", ""),
+                statuses=("active",),
+                limit=50,
+            )
+            active_directives = [
+                d for d in dirs if d.get("priority") in ("critical", "high")
+            ]
+        except Exception:
+            logger.warning("Realist: failed to fetch directives, no exemption")
+
+        prompt = _build_realist_prompt(
+            proposals,
+            recent,
+            ego_source=self._source_tag,
+            active_directives=active_directives,
+            widened=blind,
+        )
 
         try:
             invocation = CCInvocation(
@@ -1404,6 +2008,33 @@ class EgoSession:
                 verdict = verdicts.get(i, {"verdict": "pass", "reasoning": ""})
                 prop["_realist_verdict"] = verdict["verdict"]
                 prop["_realist_reasoning"] = verdict.get("reasoning", "")
+
+                # Scope stamp (genesis-ego only). The LLM's scope judgment,
+                # OVERRIDDEN by the deterministic SELF_MODIFY/AUTONOMOUS_BUILD
+                # fast-path — a structured code_change/refactor action-type (or
+                # a src/genesis path in the plan) is develop regardless of how
+                # the proposal is phrased. Left as None when neither fires;
+                # create_batch drops an unstamped genesis-ego draft (fail-closed).
+                if self._source_tag == "genesis_ego_cycle":
+                    _scope = verdict.get("scope")
+                    try:
+                        from genesis.autonomy.classification import classify_domain
+                        from genesis.autonomy.types import ActionDomain
+
+                        _dom = classify_domain(
+                            prop.get("action_type", ""),
+                            prop.get("execution_plan") or "",
+                        )
+                        if _dom in (
+                            ActionDomain.SELF_MODIFY,
+                            ActionDomain.AUTONOMOUS_BUILD,
+                        ):
+                            _scope = "develop"
+                    except Exception:
+                        logger.warning(
+                            "scope fast-path classify failed", exc_info=True,
+                        )
+                    prop["_realist_scope"] = _scope
 
                 if verdict["verdict"] == "amend" and verdict.get("amended_content"):
                     prop["_original_content"] = prop["content"]
@@ -1458,6 +2089,24 @@ class EgoSession:
         "maintenance", "security", "cost_protection",
         "system_monitoring", "genesis_maintenance",
     })
+
+    @staticmethod
+    def _self_development_enabled() -> bool:
+        """Read the roadmap self-development flag, fail-closed.
+
+        A config read failure returns False (LESS autonomy): develop proposals
+        stay tabled and undispatchable rather than shipping on a bad read.
+        """
+        try:
+            from genesis.ego.config import load_ego_config
+
+            return bool(load_ego_config().genesis_self_development_enabled)
+        except Exception:
+            logger.warning(
+                "self-development flag read failed — treating as disabled",
+                exc_info=True,
+            )
+            return False
 
     def _enforce_domain_boundary(
         self,
@@ -1569,20 +2218,41 @@ class EgoSession:
         try:
             # Auto-table oldest unranked proposals when queue exceeds cap.
             # Respects the 24h guard — proposals < 24h old are not tabled.
+            # The cap is TOTAL across both egos (one user-facing board of 15),
+            # so the count is global; eviction is global-oldest-unranked-first
+            # regardless of which ego authored the tabled item.
             try:
-                all_pending = await ego_crud.list_pending_proposals(
-                    self._db, ego_source=self._source_tag,
-                )
+                all_pending = await ego_crud.list_pending_proposals(self._db)
                 # Informational eval rows (j9/gauntlet) are acknowledge-only and
                 # must not consume the approval-queue cap — otherwise a burst of
                 # eval regressions could auto-table real, actionable proposals.
                 pending, _informational = partition_informational(all_pending)
                 max_pending = getattr(self._config, "max_pending_proposals", 15)
-                if len(pending) + len(proposals) > max_pending:
+                # Count only incoming that will REMAIN pending, so the cap never
+                # evicts a real row to make room for one that instantly leaves.
+                # Genesis-ego: 'operate' stays; unstamped is dropped at create
+                # (never counts); 'develop' is tabled when self-dev is disabled
+                # (doesn't count) but STAYS pending when enabled (counts, so an
+                # enabled install's develop proposals are subject to the cap like
+                # any other). All user-ego drafts count.
+                _self_dev_on = self._self_development_enabled()
+
+                def _stays_pending(p: dict) -> bool:
+                    if self._source_tag != "genesis_ego_cycle":
+                        return True
+                    sc = p.get("_realist_scope")
+                    if sc == "operate":
+                        return True
+                    if sc == "develop":
+                        return _self_dev_on
+                    return False  # unstamped → dropped at create
+
+                _incoming = sum(1 for p in proposals if _stays_pending(p))
+                if len(pending) + _incoming > max_pending:
                     unranked = [
                         p for p in pending if p.get("rank") is None
                     ]
-                    excess = len(pending) + len(proposals) - max_pending
+                    excess = len(pending) + _incoming - max_pending
                     oldest = sorted(
                         unranked, key=lambda x: x.get("created_at", ""),
                     )
@@ -1633,6 +2303,41 @@ class EgoSession:
                     )
             except Exception:
                 logger.warning("Failed to create intervention journal entries", exc_info=True)
+
+            # Develop-scope tabling (roadmap gate): a develop-stamped proposal
+            # created while self-development is disabled was created above (so
+            # it exists as a recoverable tabled record — never deleted) and is
+            # tabled here, BEFORE the digest send; send_digest ships only
+            # still-pending rows.
+            for pid, prop in zip(ids, created, strict=False):
+                if prop.get("_table_after_create"):
+                    try:
+                        await ego_crud.table_proposal(self._db, pid)
+                        logger.info(
+                            "Tabled develop-scope proposal %s — "
+                            "self-development disabled",
+                            pid[:12],
+                        )
+                        # Mirror every other tabling path: resolve the journal
+                        # row so it doesn't sit open forever.
+                        try:
+                            from genesis.db.crud import (
+                                intervention_journal as journal_crud,
+                            )
+
+                            await journal_crud.resolve(
+                                self._db,
+                                pid,
+                                outcome_status="tabled",
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        logger.warning(
+                            "Failed to table develop-scope proposal %s",
+                            pid,
+                            exc_info=True,
+                        )
 
             # Structural validation — annotates digest, doesn't block
             validation_issues = await self._proposals.validate_batch(proposals)
@@ -1715,6 +2420,16 @@ class EgoSession:
                     proposal_id, _brief_prop.get("action_type"),
                 )
                 continue
+
+            # The ego-authored brief prompt does not necessarily mention the
+            # proposal's expected_outputs — append the same required-files
+            # block _build_dispatch_prompt renders, or the dispatched session
+            # is never told the deliverable path that verification will check.
+            _eo_block = _required_outputs_block(
+                _brief_prop.get("expected_outputs") if _brief_prop else None,
+            )
+            if _eo_block:
+                prompt = f"{prompt}\n{_eo_block}"
 
             # Append content firewall rules to ego-authored dispatch prompt.
             # The ego writes the brief prompt directly — this safety net
@@ -1813,8 +2528,11 @@ class EgoSession:
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
+            # Scope last line: a develop-stamped row is unclaimable while
+            # self-development is disabled (both dispatch paths pass the flag).
             claimed = await ego_crud.claim_proposal_for_dispatch(
                 self._db, proposal_id,
+                allow_develop=self._self_development_enabled(),
             )
             if not claimed:
                 logger.info(
@@ -2042,6 +2760,305 @@ class EgoSession:
                 len(notifications),
             )
 
+    # -- Ego questions (ask-user channel) -----------------------------------
+
+    # User attention is the scarce resource this cap protects — an ego cycle
+    # that wants to ask more than this has an attention-budget problem, not a
+    # channel problem.
+    _MAX_QUESTIONS_PER_CYCLE = 2
+
+    def set_reply_signal_sink(self, sink) -> None:
+        """Wire the callable that routes a captured user reply back to this
+        ego as a reactive signal (init wires it to the cadence manager's
+        ``push_reactive_event``)."""
+        self._reply_signal_sink = sink
+
+    def _emit_question_signal(self, *, kind: str, summary: str, urgency: str) -> None:
+        """Wake THIS ego with the OUTCOME of a question it asked — answer,
+        no-reply, or not-delivered. The durable ego_question observation is the
+        record; this reactive signal ensures a cycle actually RUNS to see it,
+        because the 4h context section is opportunistic (a cycle may not fire
+        inside the window) and the failure outcomes have no other wake path
+        (Codex #1499 P1-c-3)."""
+        sink = self._reply_signal_sink
+        if sink is None:
+            return
+        priority = {"low": "low", "normal": "medium", "high": "high"}.get(urgency, "low")
+        try:
+            sink({
+                "type": kind,
+                "summary": summary,
+                "priority": priority,
+                "source": "ego_question",
+            })
+        except Exception:
+            logger.warning(
+                "Reply signal sink failed for ego question (%s)", kind, exc_info=True,
+            )
+
+    async def _process_questions(self, questions: list[dict]) -> None:
+        """Deliver ego questions to the user with reply capture.
+
+        Questions are direct asks — no approval gate (asking the user for
+        input is NOTIFY_USER-class, not an external effect). Validated
+        questions are handed to ONE background task that delivers them
+        SEQUENTIALLY through the outreach pipeline's send-and-wait path
+        (governance still applies: dedup, rate limit, quiet hours) so the
+        ego cycle never blocks. Sequential matters: two concurrent waiters
+        in the same chat/topic make a standalone (non-quote) reply
+        ambiguous — ``resolve_scoped_pending`` resolves only when exactly
+        one waiter is eligible, so parallel questions would BOTH time out
+        even though the user answered. A captured reply becomes an
+        observation + a reactive signal to THIS ego; a timeout or an
+        undelivered question becomes a low-priority observation.
+
+        Known limit (accepted): the reply waiter is in-memory — a server
+        restart mid-wait orphans the question, and a late reply falls
+        through to normal conversation triage.
+        """
+        if self._outreach_pipeline is None:
+            logger.warning(
+                "OutreachPipeline not available — skipping %d question(s)",
+                len(questions),
+            )
+            return
+        if not hasattr(self._outreach_pipeline, "submit_and_wait"):
+            logger.warning(
+                "Outreach pipeline lacks submit_and_wait — skipping questions"
+            )
+            return
+        # submit_and_wait silently degrades to fire-and-forget when no reply
+        # waiter is wired (returns immediately, reply always None) — a question
+        # would be "sent" yet unanswerable. Skip rather than mislead the ego with
+        # an instant no_reply (Codex #1499 P2#10).
+        _supports = getattr(self._outreach_pipeline, "supports_reply_wait", None)
+        if callable(_supports) and _supports() is False:
+            logger.warning(
+                "Outreach pipeline has no reply-wait infra — skipping %d question(s)",
+                len(questions),
+            )
+            return
+
+        accepted: list[tuple[str, str]] = []
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            raw = q.get("content")
+            # The output parser accepts any JSON value here — a non-string
+            # (dict/number/list) would blow up .strip(); skip it rather than raise.
+            if not isinstance(raw, str):
+                continue
+            content = raw.strip()
+            # Strip one layer of matched wrapping quotes (same LLM quirk as
+            # notifications).
+            if len(content) >= 2 and (content[0], content[-1]) in (
+                ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+            ):
+                content = content[1:-1].strip()
+            if not content:
+                continue
+            if len(content) > 1000:
+                content = content[:1000]
+            if len(accepted) >= self._MAX_QUESTIONS_PER_CYCLE:
+                logger.warning(
+                    "Question cap (%d/cycle) reached — dropping: %s",
+                    self._MAX_QUESTIONS_PER_CYCLE, content[:80],
+                )
+                continue
+            urgency = q.get("urgency", "normal")
+            if urgency not in ("low", "normal", "high"):
+                urgency = "normal"
+            accepted.append((content, urgency))
+
+        if not accepted:
+            return
+
+        from genesis.util.tasks import tracked_task
+
+        task = tracked_task(
+            self._deliver_questions_sequentially(accepted),
+            name=f"ego-questions-{self._source_tag}",
+            logger=logger,
+        )
+        # Strong refs until done: a bare task result can be GC'd mid-wait.
+        self._question_tasks.add(task)
+        task.add_done_callback(self._question_tasks.discard)
+        logger.info(
+            "Spawned question task for %d ego question(s)", len(accepted)
+        )
+
+    async def _deliver_questions_sequentially(
+        self, items: list[tuple[str, str]],
+    ) -> None:
+        """Deliver questions one at a time — question 2 goes out only after
+        question 1's reply arrived or timed out (standalone-reply ambiguity,
+        see ``_process_questions``)."""
+        for content, urgency in items:
+            await self._deliver_question_and_route(content, urgency)
+
+    async def _deliver_question_and_route(
+        self, content: str, urgency: str,
+    ) -> None:
+        """Deliver one question, await the reply, route the outcome.
+
+        Runs as a fire-and-forget task — every failure mode is contained
+        here (logged, never raised into the event loop).
+        """
+        import uuid
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import observations as obs_crud
+        from genesis.outreach.reply_waiter import DEFAULT_REPLY_TIMEOUT_S
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        try:
+            salience = {"low": 0.3, "normal": 0.6, "high": 0.9}.get(urgency, 0.6)
+            # Per-question correlation id → a UNIQUE outreach topic, so the
+            # pipeline in-flight de-dup guard (_awaited_dup_key keys on
+            # signal_type+topic) never collapses two DISTINCT questions that share
+            # a 100-char lead-in. Questions are never de-duped by design
+            # (governance _DEDUP_WINDOWS["ego_question"]=0); this closes the
+            # in-flight path too (Codex #1499 P2#7).
+            q_id = uuid.uuid4().hex[:8]
+            # The waiter is quote-reply-only (standalone_resolvable=False below),
+            # so the DELIVERED text must tell the user to reply-to-this-message —
+            # a plain next-DM answer would hit no waiter. `content` stays clean
+            # (it is what the outcome observations record); the instruction lives
+            # only in the outreach context (Codex #1499 P2#8).
+            delivered_text = f"{content}\n\n(Reply to this message to answer.)"
+            request = OutreachRequest(
+                category=OutreachCategory.NOTIFICATION,
+                # `topic` is an internal correlation/de-dup key, NOT display text
+                # (the user sees `context`); it only surfaces as a subject line on
+                # email-ish channels, and questions are telegram-only.
+                topic=f"{content[:80]} · {q_id}",
+                context=delivered_text,
+                salience_score=salience,
+                signal_type="ego_question",
+                channel="telegram",
+                # The ego composed the question — deliver it exactly.
+                verbatim=True,
+            )
+            result, reply = await self._outreach_pipeline.submit_and_wait(
+                request,
+                timeout_s=DEFAULT_REPLY_TIMEOUT_S,
+                # Quote-reply-only: the question is delivered into the owner's
+                # general DM, where an unrelated standalone message would
+                # otherwise be silently consumed as the answer (resolve_scoped_
+                # pending resolves the single pending waiter for ANY bare text in
+                # that chat). Requiring an explicit Telegram quote-reply also
+                # removes cross-cycle waiter ambiguity, so questions no longer
+                # need serialized delivery for correctness.
+                standalone_resolvable=False,
+            )
+            if result.status.value != "delivered":
+                # Not a silent drop: the contract promises delivery, so the
+                # ego must be able to SEE that governance (quiet hours,
+                # quota, dedup) held the question back and reason about a
+                # retry. Ego-authored content → first_party.
+                logger.info(
+                    "Ego question not delivered (%s): %s",
+                    result.status.value, content[:80],
+                )
+                await obs_crud.create(
+                    self._db,
+                    id=str(uuid.uuid4()),
+                    source="ego_question",
+                    type="not_delivered",
+                    origin_class="first_party",
+                    content=(
+                        f"Ego question NOT delivered "
+                        f"(status={result.status.value}"
+                        + (f", reason: {result.error}" if result.error else "")
+                        + f"): {content}"
+                    ),
+                    priority="low",
+                    category="ego_question",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+                self._emit_question_signal(
+                    kind="question_not_delivered",
+                    summary=(
+                        f"Your question was NOT delivered "
+                        f"(status={result.status.value}) — reconsider/retry: {content[:70]}"
+                    ),
+                    urgency=urgency,
+                )
+                return
+
+            if reply:
+                # origin_class="owner": the waiter resolves ONLY the owner's
+                # explicit Telegram quote-reply (standalone_resolvable=False
+                # above) — stamped explicitly at the write site, never
+                # allowlisted, because the content embeds user text. This
+                # observation is the DURABLE channel the asking ego reads the
+                # answer from (see UserEgoContextBuilder._ego_question_section /
+                # the genesis observations section).
+                try:
+                    await obs_crud.create(
+                        self._db,
+                        id=str(uuid.uuid4()),
+                        source="ego_question",
+                        type="user_reply",
+                        origin_class="owner",
+                        content=(
+                            f"Ego asked: {content}\nUser replied: {reply}"
+                        ),
+                        priority="high" if urgency == "high" else "medium",
+                        category="ego_question",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                except Exception:
+                    # The durable record failed (e.g. SQLite briefly
+                    # unavailable). The reactive signal below still fires, but its
+                    # summary is NOT rendered into the ego prompt (FocusResult
+                    # carries no summary field) — so on this rare path the answer
+                    # would otherwise be lost entirely. Log the FULL reply so it
+                    # is at least recoverable from the operational log, and the
+                    # ego is still woken (it can re-ask if it can't find it).
+                    logger.warning(
+                        "Failed to persist ego_question reply observation for "
+                        "%r — captured reply (recoverable here): %r",
+                        content[:120],
+                        reply[:500],
+                        exc_info=True,
+                    )
+                self._emit_question_signal(
+                    kind="user_reply",
+                    summary=(
+                        f"User answered your question "
+                        f"({content[:60]}): {reply[:120]}"
+                    ),
+                    urgency=urgency,
+                )
+            else:
+                await obs_crud.create(
+                    self._db,
+                    id=str(uuid.uuid4()),
+                    source="ego_question",
+                    type="no_reply",
+                    origin_class="first_party",
+                    content=(
+                        f"Ego question unanswered after "
+                        f"{int(DEFAULT_REPLY_TIMEOUT_S / 3600)}h: {content}"
+                    ),
+                    priority="low",
+                    category="ego_question",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+                self._emit_question_signal(
+                    kind="question_no_reply",
+                    summary=(
+                        f"Your question went unanswered after "
+                        f"{int(DEFAULT_REPLY_TIMEOUT_S / 3600)}h: {content[:70]}"
+                    ),
+                    urgency=urgency,
+                )
+        except Exception:
+            logger.warning(
+                "Ego question delivery failed: %s", content[:80], exc_info=True,
+            )
+
     # -- Deferred intentions ------------------------------------------------
 
     async def _process_intentions(
@@ -2069,6 +3086,7 @@ class EgoSession:
                 )
 
             # 2. Review existing intentions (filtered to this ego's source)
+            reviewed_ids: list[str] = []
             reviews = intentions_data.get("review", [])
             if isinstance(reviews, list):
                 for entry in reviews:
@@ -2078,6 +3096,7 @@ class EgoSession:
                     action = entry.get("action")
                     if not iid or action not in ("keep", "fire", "withdraw", "renew"):
                         continue
+                    reviewed_ids.append(iid)
 
                     if action == "keep":
                         new_count = await ego_intentions.increment_cycle_count(
@@ -2104,6 +3123,20 @@ class EgoSession:
                         )
                         if ok:
                             logger.info("Intention %s renewed (counter reset)", iid)
+
+            # 2b. Implicit-keep: age every active row the review output did
+            # NOT mention (kept rows were bumped explicitly; fired/withdrawn
+            # rows are no longer active; renewed rows are excluded so their
+            # reset sticks). Without this, an unmentioned row never ages and
+            # max_cycles depends on LLM compliance instead of mechanics.
+            bumped = await ego_intentions.increment_unreviewed(
+                self._db, self._source_tag, reviewed_ids,
+            )
+            if bumped:
+                logger.debug(
+                    "Implicit-keep aged %d unreviewed intention(s) for %s",
+                    bumped, self._source_tag,
+                )
 
             # 3. Create new intentions
             new_intentions = intentions_data.get("new", [])
@@ -2289,8 +3322,11 @@ class EgoSession:
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (_process_execution_briefs is a second path,
             # and sweep can be triggered from cadence, Telegram, and dashboard).
+            # Scope last line: a develop-stamped row is unclaimable while
+            # self-development is disabled.
             claimed = await ego_crud.claim_proposal_for_dispatch(
                 self._db, prop["id"],
+                allow_develop=self._self_development_enabled(),
             )
             if not claimed:
                 logger.debug(
@@ -2351,35 +3387,11 @@ class EgoSession:
             f"\nRationale: {prop.get('rationale') or ''}",
         ]
 
-        # Post-dispatch verification context
-        eo_raw = prop.get("expected_outputs")
-        if eo_raw:
-            try:
-                import json as _json
-
-                parsed_eo = _json.loads(eo_raw) if isinstance(eo_raw, str) else eo_raw
-                if isinstance(parsed_eo, dict) and parsed_eo.get("files"):
-                    eo_lines = [
-                        "\n## CRITICAL — Required Output Files",
-                        "You MUST save output to these EXACT file paths.",
-                        "The system auto-verifies these paths after completion.",
-                        "Do NOT rename, add suffixes, version numbers, or use",
-                        "different filenames.",
-                        "",
-                    ]
-                    for fpath in parsed_eo["files"]:
-                        eo_lines.append(f"  - {fpath}")
-                    if parsed_eo.get("min_size_bytes"):
-                        eo_lines.append(
-                            f"\nMin size: {parsed_eo['min_size_bytes']} bytes"
-                        )
-                    if parsed_eo.get("required_strings"):
-                        eo_lines.append(
-                            f"Required content: {', '.join(parsed_eo['required_strings'])}"
-                        )
-                    parts.append("\n".join(eo_lines))
-            except (ValueError, TypeError):
-                pass
+        # Post-dispatch verification context (shared renderer — the
+        # execution-brief path appends the same block).
+        eo_block = _required_outputs_block(prop.get("expected_outputs"))
+        if eo_block:
+            parts.append(eo_block)
 
         # World model context — ONLY for non-content dispatches.
         # Content dispatches get minimal context to prevent information
@@ -2478,6 +3490,49 @@ _CONTENT_DISPATCH_KEYWORDS = frozenset({
 # "content_hash", "content error rate"). Caught by action_type check.
 
 
+def _required_outputs_block(eo_raw: str | dict | None) -> str:
+    """Render ``expected_outputs`` as the "Required Output Files" prompt block.
+
+    Shared by ``_build_dispatch_prompt`` and the execution-brief path so every
+    dispatched session — whichever path built its prompt — is told the exact
+    deliverable paths that post-dispatch verification will check (file
+    existence is a hard verification signal; a session never told the path
+    would fail verification through no fault of its own). Returns ``""`` when
+    there is nothing valid to render.
+
+    Renders through ``parse_expected_outputs`` — the SAME validator the
+    post-dispatch verifier uses — so a structurally malformed spec
+    (``{"files": 123}``, non-string ``required_strings``) yields an empty
+    block rather than raising while iterating/joining, and the rendered block
+    can never disagree with what verification will actually check.
+    """
+    from genesis.ego.verification import parse_expected_outputs
+
+    raw = json.dumps(eo_raw) if isinstance(eo_raw, dict) else eo_raw
+    try:
+        parsed = parse_expected_outputs(raw)
+    except (ValueError, TypeError):
+        return ""
+    if parsed is None:
+        return ""
+    eo_lines = [
+        "\n## CRITICAL — Required Output Files",
+        "You MUST save output to these EXACT file paths.",
+        "The system auto-verifies these paths after completion.",
+        "Do NOT rename, add suffixes, version numbers, or use",
+        "different filenames.",
+        "",
+    ]
+    eo_lines.extend(f"  - {fpath}" for fpath in parsed.files)
+    if parsed.min_size_bytes:
+        eo_lines.append(f"\nMin size: {parsed.min_size_bytes} bytes")
+    if parsed.required_strings:
+        eo_lines.append(
+            f"Required content: {', '.join(parsed.required_strings)}"
+        )
+    return "\n".join(eo_lines)
+
+
 def _is_content_dispatch(prop: dict) -> bool:
     """Check if a proposal is a content/publishing dispatch.
 
@@ -2510,11 +3565,210 @@ Principle: release no more information than the task requires.
 _NEUTRAL_STATUS = NEUTRAL_STATUS  # re-export for backwards compat
 
 
+def _build_reconcile_prompt(
+    drafts: list[dict],
+    board: list[dict],
+    covered_work: dict,
+    *,
+    ego_source: str = "",
+) -> str:
+    """Prompt for the reconcile stage: classify each freshly-drafted proposal
+    against the existing pending board and a deterministic covered-work snapshot.
+
+    Verdicts (one per draft, index-aligned):
+      - new       — genuinely novel; nothing on the board or covered-work matches.
+      - reaffirm  — a board item already covers it; re-validate, do not duplicate.
+      - revise    — a board item covers it but this draft sharpens/updates it.
+      - withdraw  — a board item is INVALIDATED by covered-work evidence (a job
+                    already does it, or a merged PR closed it) and should retire.
+
+    PR-5 only LOGS these (applies nothing); PR-6 acts on them.
+    """
+
+    def _clip(text: object, n: int = 200) -> str:
+        return str(text or "")[:n].replace("\n", " ").replace("|", "/")
+
+    # A genesis-ego revise carries a scope judgment for the SHARPENED content,
+    # so the reconcile LLM must see the COMPLETE draft (content + execution_plan)
+    # — a scope stamp made on a clipped draft can mis-classify develop work that
+    # lives in the plan or past the clip. User-ego drafts keep the compact clip.
+    _genesis = ego_source == "genesis_ego_cycle"
+
+    def _draft_line(i: int, d: dict) -> str:
+        action = d.get("action_type", "")
+        if _genesis:
+            content = str(d.get("content", "") or "").replace("\n", " ").replace("|", "/")
+            plan = str(d.get("execution_plan", "") or "").replace("\n", " ").replace("|", "/")
+            line = f"[{i}] action={action} :: {content}"
+            if plan:
+                line += f"  || execution_plan: {plan}"
+            return line
+        return f'[{i}] action={action} :: {_clip(d.get("content", ""))}'
+
+    draft_lines = [_draft_line(i, d) for i, d in enumerate(drafts)]
+    _now_iso = datetime.now(UTC).isoformat()
+
+    def _due(b: dict) -> str:
+        # Revalidation-cadence flag (PR-6a): a pending proposal past its
+        # revalidate_at is overdue for a premise re-check. Advisory only —
+        # never a kill (locked decision #2). Both are isoformat() UTC
+        # strings (+00:00), so lexical compare == chronological (same basis
+        # as the created_at ordering used by list_pending_proposals).
+        rv = b.get("revalidate_at")
+        return " ⚠due" if rv and str(rv) < _now_iso else ""
+
+    board_lines = [
+        f'- id={str(b.get("id", ""))[:12]} rev={b.get("revision_num", 1)}{_due(b)} '
+        f'action={b.get("action_type", "")} :: {_clip(b.get("content", ""))}'
+        for b in board
+    ] or ["(board is empty)"]
+    job_lines = [
+        f'- {_clip(j.get("title"), 80)} [status={j.get("status")}] last_run={j.get("last_run")}'
+        for j in covered_work.get("jobs", [])
+    ] or ["(no active jobs)"]
+    stale_lines = [
+        f'- {s.get("job_name")}: running but not succeeded in '
+        f'{round(float(s.get("gap_days") or 0), 1)}d'
+        for s in covered_work.get("stale_jobs", [])
+    ]
+    pr_lines = [
+        f'- PR#{p.get("pr_number")} {_clip(p.get("pr_title"), 60)} — '
+        f'closed: {_clip(p.get("item_text"), 80)}'
+        for p in covered_work.get("merged_prs", [])
+    ] or ["(no recent merged-PR coverage)"]
+
+    ego_label = (
+        "operations (COO)" if ego_source == "genesis_ego_cycle" else "user-facing (CEO)"
+    )
+    nl = "\n"
+
+    return f"""You are the RECONCILE stage of Genesis's {ego_label} ego cycle.
+
+The ego just drafted the proposals below WITHOUT seeing its pending board (blind
+drafting). Match each draft against the existing pending board and the
+deterministic covered-work snapshot, and decide whether it is genuinely new or
+already handled.
+
+## Freshly drafted proposals (index-aligned)
+{nl.join(draft_lines) if draft_lines else "(none)"}
+
+## Pending board (already awaiting user decision)
+(A ⚠due flag = this pending item is overdue for premise re-validation;
+prefer a verdict that re-checks it against current reality.)
+{nl.join(board_lines)}
+
+## Covered work — deterministic ground truth (NOT memory)
+Active scheduled jobs:
+{nl.join(job_lines)}
+Jobs running but not succeeding:
+{nl.join(stale_lines) if stale_lines else "(none)"}
+Recently merged PRs (work already shipped):
+{nl.join(pr_lines)}
+
+## Your task
+For EACH draft (by index) output exactly one verdict:
+- "new": nothing above covers it — genuinely novel work.
+- "reaffirm": a pending board item ALREADY covers it — put the board id in target_id.
+- "revise": a board item covers it but this draft sharpens/updates it — target_id = board id.
+  For a genesis-ego revise, ALSO emit "scope" ("operate" | "develop") judging the
+  SHARPENED content: OPERATE = diagnose/pull a reversible lever/dispatch a
+  specific-defect investigation whose deliverable is escalated findings; DEVELOP =
+  write/refactor code, change a schema, edit an install script, alter a config
+  *value*, or dev-artifact work even read-only (PR review, tracing source to scope
+  a fix). When unsure, "develop".
+- "withdraw": the work is ALREADY COVERED by covered-work (an active job already does it,
+  or a merged PR closed it). If a pending board item covers the same work, set target_id =
+  that board id to retire it. If NO board item matches but the draft itself is already
+  covered by an active job or merged PR, still use "withdraw" with target_id = null — this
+  drops the redundant draft (there is nothing on the board to retire, but the work is
+  handled). Put the covering evidence in reason.
+
+Judge the SEMANTIC match yourself; do not require identical wording. When unsure, prefer "new".
+
+Output ONLY the JSON array — no preamble, no explanation, no code fence, no text
+before or after it. One object per draft, index-aligned:
+[{{"index": 0, "verdict": "new|reaffirm|revise|withdraw", "target_id": "<board id or null>", "reason": "<one line>", "scope": "operate|develop (genesis-ego revise only)"}}]
+"""
+
+
+def _parse_reconcile_response(
+    raw_text: str,
+    num_drafts: int,
+) -> dict[int, dict]:
+    """Parse the reconcile stage's JSON response into per-draft verdicts.
+
+    Returns {index: {"verdict": str, "target_id": str|None, "reason": str}}.
+    On parse failure returns empty dict (every draft treated as "new").
+    """
+    if not raw_text or not raw_text.strip():
+        return {}
+    text = raw_text.strip()
+
+    parsed = None
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(text)
+    if parsed is None:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(match.group(1).strip())
+    if parsed is None:
+        # Robust extraction: anchor on the real array-of-objects start "[{"
+        # (optional whitespace between), greedy to the last "}]". Immune to
+        # preamble prose containing stray brackets like "The draft [0] ...",
+        # which the naive find("[")/rfind("]") slice below mis-grabs → JSON
+        # error → every draft silently defaults to "new" (PR-6b replay gate
+        # measured this firing ~13% of the time, whenever the model preambles).
+        match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+        if match:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(match.group(0))
+    if parsed is None:
+        first = text.find("[")
+        last = text.rfind("]")
+        if first != -1 and last > first:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(text[first : last + 1])
+
+    if not isinstance(parsed, list):
+        logger.warning("Reconcile response is not a JSON array: %.200s", text)
+        return {}
+
+    verdicts: dict[int, dict] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("index", -1))
+        except (ValueError, TypeError):
+            continue
+        if idx < 0 or idx >= num_drafts:
+            continue
+        verdict = entry.get("verdict", "new")
+        if verdict not in ("new", "reaffirm", "revise", "withdraw"):
+            verdict = "new"
+        target = entry.get("target_id")
+        verdicts[idx] = {
+            "verdict": verdict,
+            "target_id": str(target) if target else None,
+            "reason": str(entry.get("reason", ""))[:500],
+        }
+        # Scope for a revise's sharpened content (genesis-ego). Invalid/absent
+        # stays absent → _reconcile_revise fails closed (keeps the draft as a
+        # survivor for the realist to scope, never mutates the board item).
+        _scope = entry.get("scope")
+        if _scope in ("operate", "develop"):
+            verdicts[idx]["scope"] = _scope
+    return verdicts
+
+
 def _build_realist_prompt(
     proposals: list[dict],
     recent_history: list[dict],
     *,
     ego_source: str = "",
+    active_directives: list[dict] | None = None,
+    widened: bool = False,
 ) -> str:
     """Build the realist evaluation prompt.
 
@@ -2535,11 +3789,27 @@ def _build_realist_prompt(
         history_lines.append("*No recent proposals.*")
 
     proposal_lines = []
+    # Genesis-ego proposals carry a scope judgment (rule 8), so the realist must
+    # see the COMPLETE proposal — develop intent can live in the execution_plan
+    # or past a truncation point, and a scope stamp made on partial input can
+    # mis-classify develop work as operate. User-ego keeps the compact form
+    # (no scope field, and cost matters more there).
+    _genesis = ego_source == "genesis_ego_cycle"
     for i, p in enumerate(proposals):
-        content = (p.get("content") or "")[:300].replace("\n", " ")
         action = p.get("action_type", "?")
         conf = p.get("confidence", 0.0)
-        proposal_lines.append(f"{i}. [{action}] (confidence: {conf:.2f}) {content}")
+        if _genesis:
+            content = (p.get("content") or "").replace("\n", " ")
+            plan = (p.get("execution_plan") or "").replace("\n", " ")
+            line = f"{i}. [{action}] (confidence: {conf:.2f}) {content}"
+            if plan:
+                line += f"  || execution_plan: {plan}"
+            proposal_lines.append(line)
+        else:
+            content = (p.get("content") or "")[:300].replace("\n", " ")
+            proposal_lines.append(
+                f"{i}. [{action}] (confidence: {conf:.2f}) {content}"
+            )
 
     # Domain boundary context — ego-specific jurisdiction framing.
     ego_section = ""
@@ -2585,6 +3855,46 @@ monitoring, or internal maintenance.
    maintenance. Those belong to the Genesis ego (COO).
 """
 
+    # Operate-vs-develop rubric (genesis/operations ego only). Second gate
+    # behind the identity doc's "Operate, Don't Develop" mandate — catches a
+    # develop-class proposal (code/schema/install/config-value change) if one
+    # slips through drafting. Err toward the doc: reject only CLEAR develop
+    # work; remediation of a specific operational defect is operate, not
+    # develop.
+    operate_rule = ""
+    if ego_source == "genesis_ego_cycle":
+        operate_rule = """
+8. **Scope stamp — operate vs develop (operations ego only).** For EACH
+   proposal, judge whether it OPERATES the running Genesis system or DEVELOPS
+   it, and emit a "scope" field ("operate" or "develop") on that proposal's
+   output entry. This field is REQUIRED on every genesis-ego proposal.
+   - OPERATE: diagnose health/performance/reliability, pull reversible
+     operational levers (restart, clear a queue, flush a cache, re-run a job),
+     or dispatch an investigation/remediation for a SPECIFIC operational defect
+     whose deliverable is findings escalated to the user.
+   - DEVELOP: write or refactor code, change a database schema, edit an install
+     script, alter a configuration *value* (threshold, interval, routing
+     weight, budget cap) — OR dev-artifact work even read-only: review/approve
+     a pull request, trace source code to scope a fix or refactor, audit code
+     quality or design. The test is the deliverable: a patch or patch-plan =
+     develop.
+   - Symptom carve-out: diagnosing a LIVE operational symptom (failing backup,
+     stuck breaker, silent emitter) is OPERATE even when the trail leads into
+     code, AS LONG AS the stated deliverable is an escalation of findings, not
+     a code change.
+   The scope field does NOT by itself reject a proposal — judge pass/amend/
+   reject on the other rules (feasibility, duplication, actionability). Scope
+   is enforced structurally downstream. When in doubt, stamp "develop" (the
+   safe default: it routes to review, never silently ships).
+"""
+
+    # Genesis-ego entries carry the required scope field; user-ego omits it.
+    scope_field = (
+        ', "scope": "operate|develop"'
+        if ego_source == "genesis_ego_cycle"
+        else ""
+    )
+
     # Build Rule #1 based on ego source — genesis ego is allowed to
     # propose investigation dispatches (background sessions for diagnosis),
     # while user ego should do read-only work in-cycle.
@@ -2596,7 +3906,11 @@ monitoring, or internal maintenance.
    checks, observation queries) should still be done in-cycle, but
    proposing a background session to diagnose a complex issue is a
    legitimate maintenance action. PASS these unless they are clearly
-   something the ego could resolve with a single MCP tool call."""
+   something the ego could resolve with a single MCP tool call. Every
+   dispatch/investigate proposal must name a concrete deliverable in
+   expected_outputs (the findings file the dispatched session will write);
+   when one is missing, AMEND the proposal to add it rather than
+   rejecting."""
     else:
         rule_1 = """
 1. **Read operations are NOT proposals.** Investigating, researching, reading,
@@ -2605,9 +3919,42 @@ monitoring, or internal maintenance.
    purely investigative with no write/action/outreach component, REJECT it:
    "Read operation — do this during your cycle, don't propose it.\""""
 
+    # Directive exemption block — only when active critical/high directives
+    # exist for this ego. The realist itself judges whether a draft addresses
+    # a directive; the ego cannot self-grant an exemption.
+    directive_section = ""
+    _dir_lines = []
+    for d in active_directives or []:
+        _prio = str(d.get("priority", "?")).upper()
+        _content = (d.get("content") or "")[:200].replace("\n", " ").replace("|", "/")
+        _did = d.get("id", "?")
+        _dir_lines.append(f"- [{_prio}] (id={_did}) {_content}")
+    if _dir_lines:
+        directive_section = (
+            "\n## Active User Directives\n"
+            "The user explicitly flagged these as important for this ego:\n"
+            + "\n".join(_dir_lines)
+            + "\n\n**Directive exemption:** If a proposal DIRECTLY ADDRESSES "
+            "one of the directives above, do NOT reject it as a Zombie or "
+            "Duplicate (Rule #2) — the user explicitly wants this work, even if "
+            "a similar proposal was tried before. Judge the match yourself. All "
+            "other rules (feasibility, actionability, domain boundary) still "
+            "apply.\n"
+        )
+
+    # Header describes the ACTUAL contents of the history table above, which
+    # widens to the full board when blind drafting is active (see
+    # _filter_proposals). Keeping it honest matters — the realist is told it
+    # "only knows what is in the history table" (Rule #6).
+    history_header = (
+        "## Full Pending Board + Recently Resolved (7d)"
+        if widened
+        else "## Recent Proposal History (48h)"
+    )
+
     return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
 proposal and return a JSON array of verdicts.
-{ego_section}
+{ego_section}{directive_section}
 ## Rules
 {rule_1}
 
@@ -2638,8 +3985,8 @@ proposal and return a JSON array of verdicts.
    patterns in the history. A proposal that failed before may succeed
    now — circumstances change. Judge the proposal on its own merits,
    not on inferred system state.
-{domain_rule}
-## Recent Proposal History (48h)
+{domain_rule}{operate_rule}
+{history_header}
 {chr(10).join(history_lines)}
 
 ## New Proposals to Evaluate
@@ -2647,7 +3994,7 @@ proposal and return a JSON array of verdicts.
 
 ## Output Format
 Return ONLY a JSON array, one entry per proposal (same order as input):
-[{{"index": 0, "verdict": "pass|amend|reject", "reasoning": "brief explanation", "amended_content": "only if verdict is amend"}}]"""
+[{{"index": 0, "verdict": "pass|amend|reject", "reasoning": "brief explanation", "amended_content": "only if verdict is amend"{scope_field}}}]"""
 
 
 def _parse_realist_response(
@@ -2709,6 +4056,12 @@ def _parse_realist_response(
         }
         if verdict == "amend" and entry.get("amended_content"):
             verdicts[idx]["amended_content"] = str(entry["amended_content"])[:2000]
+        # Scope stamp (genesis-ego only; user-ego entries omit it). An invalid
+        # or absent value stays absent → the create chokepoint treats an
+        # unstamped genesis-ego draft as fail-closed (dropped).
+        _scope = entry.get("scope")
+        if _scope in ("operate", "develop"):
+            verdicts[idx]["scope"] = _scope
 
     return verdicts
 

@@ -37,12 +37,12 @@ async def load_active_procedures(db_path: str | Path) -> str | None:
     Returns formatted markdown string, or None if no CORE procedures found.
     Budget: 200 words max.
     """
-    from genesis.db.connection import BUSY_TIMEOUT_MS
+    from genesis.env import db_busy_timeout_ms
 
     try:
         db = await aiosqlite.connect(str(db_path))
         db.row_factory = aiosqlite.Row
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
     except Exception:
         logger.debug("Could not open DB for procedure injection", exc_info=True)
         return None

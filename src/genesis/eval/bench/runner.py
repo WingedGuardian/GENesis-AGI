@@ -338,23 +338,17 @@ async def run_bench(
 
         if router is None:
             from genesis.experimentation.standalone_router import (
-                DEFAULT_JUDGE_PROVIDER,
                 StandaloneLiteLLMRouter,
+                default_judge_chain,
             )
 
-            # Mirror the runtime `judge` call site's chain (free NIM first,
-            # then paid OpenRouter) — one attempt per provider, so a hanging
-            # provider costs one timeout, not the whole judge budget.
-            # `judge_provider` reorders the chain to start elsewhere (user
+            # Mirror the runtime `judge` call site's chain — derived from config
+            # so it can't drift or duplicate the primary — one attempt per
+            # provider, so a hanging provider costs one timeout, not the whole
+            # judge budget. `judge_provider` reorders to start elsewhere (user
             # lever for a known-down primary; e.g. NIM hanging at 120s/call
             # would cost 2 minutes per judgment before failover).
-            chain = [
-                DEFAULT_JUDGE_PROVIDER,
-                "openrouter-deepseek-v4",
-                "openrouter-deepseek-v4-flash",
-            ]
-            if judge_provider:
-                chain = [judge_provider, *[p for p in chain if p != judge_provider]]
+            chain = default_judge_chain(judge_provider)
             router = StandaloneLiteLLMRouter(
                 chain[0],
                 fallback_providers=tuple(chain[1:]),

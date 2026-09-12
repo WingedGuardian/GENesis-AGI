@@ -60,4 +60,9 @@ async def set_budget():
         (str(uuid.uuid4()), budget_type, limit_usd, warning_pct, now, now),
     )
     await rt.db.commit()
+    # The cost snapshot reads `budgets` for budget_monthly_limit / budget_pct_used,
+    # which drive the cost card and the "budget pressure" attention item.
+    from genesis.dashboard.routes.health import invalidate_snapshot_cache
+
+    invalidate_snapshot_cache()
     return jsonify({"ok": True, "budget_type": budget_type, "limit_usd": limit_usd})

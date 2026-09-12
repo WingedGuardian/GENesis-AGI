@@ -472,7 +472,7 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
             )
         rt.record_job_success("process_reaper")
     except Exception as exc:  # noqa: BLE001 — job boundary
-        rt.record_job_failure("process_reaper", str(exc))
+        rt.record_job_failure("process_reaper", exc=exc)
         logger.exception("Process reaper failed")
 
 

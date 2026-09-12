@@ -348,10 +348,11 @@ async def direct_session_run(
         deliver_to_origin: Deliver the terminal outcome (success and failure)
             back to the conversation this tool was called from. Requires a
             foreground channel session as the caller.
-        roster_model: Optionally run this session on a specific roster model
-            (e.g. "glm-5.2") instead of the default — intentional model
-            selection. Omit/None to use the active default. Fails the session
-            if the named model is unknown or its API key is not configured.
+        roster_model: Optionally run this session on a specific roster model —
+            a peer from the cc_roster overlay — instead of the default,
+            i.e. intentional model selection. Omit/None to use the active
+            default. Fails the session if the named model is unknown or its
+            API key is not configured.
     """
     return await _impl_direct_session_run(
         prompt,

@@ -6,18 +6,51 @@
     <div class="config-modal" style="max-width: 900px;">
       <div class="config-modal-header">
         <span>Ego — Autonomous Decision Cycle</span>
+        <!-- Health verdict, NOT fetch-load state: the header dot/label/detail
+             render the SAME egoSemantic() verdict as the overview tile, so the
+             two surfaces can never disagree (a green "healthy" here used to mean
+             only "the modal's data loaded"). Load failures still surface in the
+             modal body's error placeholder below; egoSemantic() safely returns
+             "unknown" (gray) before egoStatus resolves — never a false green. -->
         <span class="panel-status">
-          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.egoModal)}`"></span>
-          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.egoModal)"></span>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"></span>
+          <span x-text="$store.genesisDashboard.egoSemantic().state"></span>
         </span>
         <button @click="$store.genesisDashboard.egoModal.open = false">&times;</button>
       </div>
       <div class="config-modal-body">
         <!-- Status detail -->
-        <template x-if="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.egoModal)">
+        <template x-if="$store.genesisDashboard.egoSemantic().reason">
           <div class="panel-status-detail" style="margin-bottom: 0.75rem;"
-               x-text="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.egoModal)"></div>
+               x-text="$store.genesisDashboard.egoSemantic().reason"></div>
         </template>
+        <!-- Stale-refresh warning: the header dot now shows egoSemantic() health
+             (last-known), NOT whether THIS modal's live refresh succeeded. When
+             the modal's own fetch fails AFTER egoStatus is already populated (the
+             normal path — the overview card loads it before the modal opens), the
+             body error placeholder below is suppressed by its !egoStatus guard, so
+             the refresh failure would otherwise be invisible. Surface it here.
+             A refresh failure AFTER a prior success sets fetch.state='stale' (only a
+             first-ever load failure is 'error'), so match BOTH — checking only
+             'error' let the common stale case slip through silently. -->
+        <template x-if="($store.genesisDashboard.egoModal.fetch.state === 'error' || $store.genesisDashboard.egoModal.fetch.state === 'stale') && $store.genesisDashboard.egoStatus">
+          <div class="inline-warning" style="margin-bottom: 0.75rem;">
+            ⚠ Live refresh failed — showing last known state.
+          </div>
+        </template>
+        <!-- In-flight cue over already-visible data: a re-open sets
+             fetch.state='refreshing' (a load with a prior success); a first open
+             sets 'loading' but egoStatus is already populated by the overview card,
+             so the 'loading' spinner below (gated on !egoStatus) stays hidden. Cover
+             BOTH so a slow live fetch over shown data isn't invisible — the header
+             dot shows last-known health, not refresh progress. Restores the progress
+             cue the semantic-verdict header replaced. The aria-live region is
+             PERMANENT and its TEXT toggles (empty when idle → no visual footprint):
+             a live region must stay in the DOM to announce a change; toggling the
+             node's display via x-show would not announce reliably. -->
+        <div aria-live="polite"
+             x-text="($store.genesisDashboard.egoModal.fetch.state === 'refreshing' || ($store.genesisDashboard.egoModal.fetch.state === 'loading' && $store.genesisDashboard.egoStatus)) ? '↻ Refreshing…' : ''"
+             style="text-align: right; font-size: 0.72rem; color: var(--color-text-secondary);"></div>
         <!-- Loading -->
         <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'loading' && !$store.genesisDashboard.egoStatus"
              style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
@@ -227,6 +260,29 @@
                   </div>
                 </div>
               </template>
+              <!-- Directives & Goals (read-only glance — act on the Chat tab) -->
+              <div style="margin-top: 1rem; padding: 0.6rem 0.8rem; background: rgba(255,255,255,0.03); border: 1px solid var(--color-border); border-radius: 6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.35rem;">
+                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600;">Directives &amp; Goals</div>
+                  <button style="font-size:0.62rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:transparent; color:var(--color-text-secondary); border:1px solid var(--color-border);"
+                          @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'chat'; $store.genesisDashboard.commsTab = 'proposals'">Manage in Chat</button>
+                </div>
+                <template x-if="$store.genesisDashboard.egoDirectives.active.length === 0">
+                  <div style="font-size:0.7rem; color:var(--color-text-secondary); font-style:italic;">No active directives.</div>
+                </template>
+                <template x-for="d in $store.genesisDashboard.egoDirectives.active" :key="d.id">
+                  <div style="display:flex; gap:0.35rem; align-items:baseline; margin-bottom:0.25rem;">
+                    <span style="font-size:0.6rem; padding:0.05rem 0.35rem; border-radius:3px; text-transform:uppercase; background:rgba(192,132,252,0.2); color:#e1bee7; white-space:nowrap;"
+                          x-text="$store.genesisDashboard.egoTargetLabel(d.ego_target)"></span>
+                    <span style="font-size:0.74rem; line-height:1.3; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" x-text="d.content"></span>
+                  </div>
+                </template>
+                <div style="font-size:0.66rem; color:var(--color-text-secondary); margin-top:0.4rem; padding-top:0.35rem; border-top:1px solid var(--color-border);">
+                  <span x-text="$store.genesisDashboard.egoGoals.user.length + ' user goal' + ($store.genesisDashboard.egoGoals.user.length === 1 ? '' : 's')"></span>
+                  ·
+                  <span x-text="$store.genesisDashboard.egoGoals.genesis_ego.length + ' own-goal' + ($store.genesisDashboard.egoGoals.genesis_ego.length === 1 ? '' : 's')"></span>
+                </div>
+              </div>
               <!-- Quick navigation links -->
               <div style="margin-top:1rem; display:flex; gap:0.5rem;">
                 <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(192,132,252,0.1); color:#c084fc; border:1px solid rgba(192,132,252,0.2);"
@@ -249,6 +305,14 @@
               </div>
               <!-- Proposal list -->
               <div style="max-height: 450px; overflow-y: auto;">
+                <!-- Stale-revision (409) notice: the proposal changed since it was rendered -->
+                <template x-if="$store.genesisDashboard.egoModal.resolveError">
+                  <div style="font-size: 0.72rem; padding: 0.4rem 0.6rem; margin-bottom: 0.5rem; border: 1px solid #f0ad4e; background: rgba(240,173,78,0.12); color: #f0ad4e; border-radius: 4px; display: flex; gap: 0.5rem; align-items: center;">
+                    <span x-text="$store.genesisDashboard.egoModal.resolveError"></span>
+                    <button style="margin-left: auto; border: none; background: none; color: var(--color-text-secondary); cursor: pointer;"
+                            @click="$store.genesisDashboard.egoModal.resolveError = ''">&times;</button>
+                  </div>
+                </template>
                 <template x-if="$store.genesisDashboard.egoModal.proposals.filter(p => !$store.genesisDashboard.egoModal.proposalFilter || p.status === $store.genesisDashboard.egoModal.proposalFilter).length === 0">
                   <div class="empty-state" style="font-size: 0.78rem;">No proposals match this filter.</div>
                 </template>
@@ -268,6 +332,11 @@
                       <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px;"
                             :style="`background: ${p.status === 'approved' ? 'rgba(76,175,80,0.15)' : p.status === 'rejected' ? 'rgba(217,83,79,0.15)' : p.status === 'expired' ? 'rgba(136,136,136,0.15)' : 'rgba(240,173,78,0.15)'}; color: ${p.status === 'approved' ? '#4caf50' : p.status === 'rejected' ? '#d9534f' : p.status === 'expired' ? '#888' : '#f0ad4e'}`"
                             x-text="p.status"></span>
+                      <!-- Revision badge (only once revised — dark until reconcile revise ships) -->
+                      <template x-if="p.revision_num > 1">
+                        <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px; background: rgba(156,39,176,0.15); color: #ce93d8;"
+                              x-text="'rev ' + p.revision_num"></span>
+                      </template>
                       <!-- Confidence bar -->
                       <div style="display: flex; align-items: center; gap: 0.3rem; margin-left: auto;">
                         <div style="width: 40px; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
@@ -293,12 +362,33 @@
                       <template x-if="p.resolved_at">
                         <span x-text="'Resolved: ' + $store.genesisDashboard.formatDateTime(p.resolved_at)"></span>
                       </template>
+                      <!-- Premise re-validation time — shown only after an actual reaffirm (differs from created) -->
+                      <template x-if="p.last_validated_at && p.last_validated_at !== p.created_at">
+                        <span x-text="'Verified: ' + $store.genesisDashboard.formatDateTime(p.last_validated_at)"></span>
+                      </template>
                     </div>
                     <!-- User response (if resolved) -->
                     <template x-if="p.user_response">
                       <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-top: 0.2rem;">
                         <span style="font-weight: 600;">Response:</span> <span x-text="p.user_response"></span>
                       </div>
+                    </template>
+                    <!-- Dispatch findings: the completed dispatch session's output, so the
+                         investigation is discoverable beyond the truncated response summary -->
+                    <template x-if="p.dispatch">
+                      <details style="margin-top: 0.3rem;">
+                        <summary style="font-size: 0.72rem; color: var(--color-text-secondary); cursor: pointer; font-weight: 600;">
+                          Dispatch output
+                        </summary>
+                        <pre style="font-size: 0.7rem; color: var(--color-text-secondary); white-space: pre-wrap; word-break: break-word; margin: 0.3rem 0; max-height: 22rem; overflow-y: auto; background: rgba(0,0,0,0.04); padding: 0.4rem; border-radius: 4px;"
+                             x-text="p.dispatch.output_excerpt"></pre>
+                        <div style="font-size: 0.66rem; color: var(--color-text-secondary); opacity: 0.8;">
+                          <span>session: </span><span x-text="p.dispatch.session_id"></span>
+                          <template x-if="p.dispatch.transcript_path">
+                            <span> · transcript: <span x-text="p.dispatch.transcript_path"></span></span>
+                          </template>
+                        </div>
+                      </details>
                     </template>
                     <!-- Approve/Reject buttons (pending, non-informational only) -->
                     <template x-if="p.status === 'pending' && !$store.genesisDashboard.isInformationalProposal(p)">

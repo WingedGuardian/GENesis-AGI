@@ -34,8 +34,8 @@ except ImportError:
 
 from genesis.channels.voice import config as voice_config
 from genesis.channels.voice.genesis_bridge import (
-    TOOL_DECLARATIONS,
     GenesisBridge,
+    get_tool_declarations,
 )
 
 if TYPE_CHECKING:
@@ -152,11 +152,20 @@ class S2SSessionManager:
         # Minimal config — defaults give us audio output (alloy voice),
         # server VAD, 24kHz PCM. We use conversation.item.create for audio
         # input so VAD doesn't interfere with bulk utterances from Wyoming.
-        system_prompt = self._bridge.get_system_prompt()
+        from genesis.channels.voice.transcript_writer import transcript_session_id
+
+        # get_system_prompt does blocking I/O (essential-knowledge + USER.md reads,
+        # and a sync sqlite recency lookup); offload it so a busy DB or slow read
+        # never stalls the runtime event loop mid-connect.
+        system_prompt = await asyncio.to_thread(
+            self._bridge.get_system_prompt,
+            current_session_id=transcript_session_id(session.session_id),
+            satellite_id=session.satellite_id,
+        )
         await conn.session.update(session={
             "type": "realtime",
             "instructions": system_prompt,
-            "tools": TOOL_DECLARATIONS,
+            "tools": get_tool_declarations(),
         })
 
         # Wait for session.updated confirmation (timeout: 10s)
@@ -335,6 +344,7 @@ class S2SSessionManager:
         try:
             await self._transcript_writer.append_message(
                 session.session_id, role, text,
+                satellite_id=session.satellite_id,
             )
         except Exception:
             logger.warning(

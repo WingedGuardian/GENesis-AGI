@@ -12,7 +12,7 @@ The charter tables are created with inline DDL matching migration 0058
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from flask import Flask
@@ -109,8 +109,40 @@ async def _seed_charter_tables(db, *, with_rows: bool = False):
     await db.commit()
 
 
-def _slot(slot: str, pid: int, rss_mb: float = 512.0, status: str = "healthy") -> dict:
-    return {"slot": slot, "pid": pid, "rss_mb": rss_mb, "status": status}
+def _slot(
+    slot: str,
+    pid: int,
+    rss_mb: float = 512.0,
+    status: str = "healthy",
+    started_at: str | None = None,
+) -> dict:
+    return {
+        "slot": slot,
+        "pid": pid,
+        "rss_mb": rss_mb,
+        "status": status,
+        "started_at": started_at,
+    }
+
+
+# Commit-identity + time staleness fixtures. deploy = (completed_at, new_commit).
+_DEPLOY = ("2026-07-14T11:00:00+00:00", "abc1234")
+# (spawn_commit, spawn_at):
+_SPAWN_BEHIND = ("0000000000000000000000000000000000000000", "2026-07-14T09:00:00+00:00")
+_SPAWN_FRESH = ("abc1234def5678", "2026-07-14T09:00:00+00:00")  # commit matches → not stale
+_SPAWN_AHEAD = ("ffffffffffffffffffffffffffffffffffffffff", "2026-07-14T13:00:00+00:00")
+#   ^ started AFTER the deploy (main tree advanced past it) → NOT stale despite differing.
+
+
+def _patch_spawn(monkeypatch, mapping: dict):
+    """Point the route's read_spawn_identity at a fake {(slot, pid): (commit,
+    spawn_at)} map; the dashboard cross-checks pid internally."""
+    import genesis.dashboard.routes.cc_sessions as mod
+
+    def fake(slot, live_pid, proc_start=None):
+        return mapping.get((slot, live_pid))
+
+    monkeypatch.setattr(mod, "read_spawn_identity", fake)
 
 
 # ── Route level ──────────────────────────────────────────────────────────────
@@ -132,15 +164,62 @@ def test_route_registered_on_dashboard_blueprint(app):
     assert "/api/genesis/cc-sessions/detail" in rules
 
 
+async def test_detail_route_offloads_slot_enumeration(app, db, monkeypatch):
+    """MW-0 A2: the detail route's ~1s /proc enumeration runs OFF the event loop
+    (asyncio.to_thread), never inline on the request/server loop."""
+    import genesis.dashboard.routes.cc_sessions as mod
+    import genesis.observability.cc_slots as cc_slots_mod
+
+    await _seed_charter_tables(db)
+    _patch_spawn(monkeypatch, {})  # hermetic — never read the real ~/.genesis
+
+    monkeypatch.setattr("genesis.runtime.GenesisRuntime", MagicMock(instance=lambda: _mock_rt(db)))
+    # Deploy resolution is orthogonal to this offload — stub it out.
+    monkeypatch.setattr(
+        "genesis.db.crud.update_history.last_successful_update",
+        AsyncMock(return_value=None),
+    )
+    enum = MagicMock(return_value=[])
+    monkeypatch.setattr(cc_slots_mod, "enumerate_cc_slots", enum)
+
+    dispatched = []
+    real_to_thread = mod.asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        dispatched.append(fn)
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(mod.asyncio, "to_thread", spy)
+
+    # The blueprint decorator wraps async views in a run_until_complete sync
+    # shim; await the raw coroutine (__wrapped__) directly on the test's loop so
+    # the aiosqlite db stays on one loop.
+    raw_view = mod.cc_sessions_detail.__wrapped__
+    with app.test_request_context():
+        await raw_view()
+
+    assert enum in dispatched  # enumeration dispatched through to_thread
+    enum.assert_called_once()
+
+
 # ── Helper level (real db fixture, injected slots) ───────────────────────────
 
 
-async def test_slot_merge_by_pid(db):
+async def test_slot_merge_by_pid(db, monkeypatch):
+    _patch_spawn(monkeypatch, {})  # hermetic: never read the real ~/.genesis
     await _seed_charter_tables(db)
     await _seed_session(db, sid="s1", pid=100)
     result = await _collect_detail(db, [_slot("1", 100), _slot("2", 200)], now=_NOW)
     (row,) = result["sessions"]
-    assert row["live"] == {"slot": "1", "pid": 100, "rss_mb": 512.0, "slot_status": "healthy"}
+    assert row["live"] == {
+        "slot": "1",
+        "pid": 100,
+        "rss_mb": 512.0,
+        "slot_status": "healthy",
+        "started_at": None,
+        "stale_code": False,
+        "deploy_commit": None,
+    }
     assert row["flags"] == []
     assert [s["pid"] for s in result["unmatched_slots"]] == [200]
     assert result["stats"]["live_procs"] == 2
@@ -227,6 +306,7 @@ async def test_empty_state(db):
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
+        "stale_code": 0,
     }
 
 
@@ -470,6 +550,76 @@ async def test_pulse_confirm_absorbs_item_with_pr_evidence(db):
     assert "PR #1081" in row["evidence"]
 
 
+async def _seed_followup_proposal(db, *, ann_id="af1", fu_id="fu0", status="proposed"):
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, reason, strategy, status, "
+        "priority, kind, created_at) VALUES (?, 'test', 'ship it', 'r', "
+        "'ego_judgment', 'pending', 'medium', 'follow_up', '2026-07-10T00:00:00+00:00')",
+        (fu_id,),
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_runs (run_id, started_at, trigger, status)"
+        " VALUES ('rf1', '2026-07-14T00:00:00+00:00', 'manual', 'ok')"
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier, item_id,"
+        " item_session_id, item_text, pr_number, pr_title, status, target_kind)"
+        " VALUES (?, 'rf1', '2026-07-14T00:00:00+00:00', 'exact', ?,"
+        " 'cc-xyz', 'ship it', 1305, 'feat: officecli', ?, 'follow_up')",
+        (ann_id, fu_id, status),
+    )
+    await db.commit()
+
+
+async def test_pulse_confirm_absorbs_followup_target(db):
+    """A follow_up-target annotation confirmed via the dashboard absorbs the
+    FOLLOW_UP (conditional open-only), not a nonexistent ledger row — the
+    reader-dispatch obligation from the foundation audit."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db)
+    payload, code = await _resolve_pulse(db, "af1", "confirmed")
+    assert code == 200
+    assert payload["ok"] is True and payload["item_absorbed"] is True
+    assert await _ann_status(db, "af1") == "confirmed"
+    cur = await db.execute("SELECT status, resolution_notes FROM follow_ups WHERE id = 'fu0'")
+    row = await cur.fetchone()
+    assert row[0] == "completed"
+    assert "PR #1305" in row[1]
+
+
+async def test_pulse_lookup_excludes_followup_proposals(db):
+    """The per-session pulse panel is ledger-only — a session-bound follow_up
+    annotation is NOT surfaced here (session-agnostic → separate global surface;
+    avoids the NULL-session gap + the ledger-only confirm command, Codex P2)."""
+    from genesis.dashboard.routes.cc_sessions import _pulse_lookup
+
+    await _seed_followup_proposal(db, ann_id="afx", fu_id="fux")  # item_session_id='cc-xyz'
+    out = await _pulse_lookup(db, "cc-xyz")
+    assert out["available"] is True
+    assert all(a["target_kind"] == "ledger" for a in out["annotations"])
+    assert not any(a["id"] == "afx" for a in out["annotations"])
+
+
+async def test_pulse_confirm_followup_not_open_absorb_missed(db):
+    """Resolve-first: confirming a follow_up whose row moved off-open (blocked)
+    confirms the annotation (the race arbiter) but the absorb misses — 200,
+    item_absorbed False, follow_up NOT force-completed. The confirmed-but-absorb-
+    missed residue is accepted (ledger-consistent); absorb-first was reverted as
+    it reopened the worse absorbed-under-a-rejected-annotation residue."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db, ann_id="af2", fu_id="fu2")
+    await db.execute("UPDATE follow_ups SET status='blocked' WHERE id='fu2'")
+    await db.commit()
+    payload, code = await _resolve_pulse(db, "af2", "confirmed")
+    assert code == 200
+    assert payload["item_absorbed"] is False
+    assert await _ann_status(db, "af2") == "confirmed"  # resolve-first: annotation is the arbiter
+    cur = await db.execute("SELECT status FROM follow_ups WHERE id='fu2'")
+    assert (await cur.fetchone())[0] == "blocked"  # follow_up untouched (never force-completed)
+
+
 async def test_pulse_reject_leaves_ledger_untouched(db):
     from genesis.dashboard.routes.cc_sessions import _resolve_pulse
 
@@ -545,3 +695,80 @@ async def test_pulse_confirm_resolves_annotation_before_ledger_write(db, monkeyp
     payload, code = await _resolve_pulse(db, "a1", "confirmed")
     assert code == 200 and payload["item_absorbed"] is True
     assert order == ["confirmed"]  # annotation resolved BEFORE the ledger mutate
+
+
+# ── Part B: stale-code visibility (spawn commit vs deployed commit, identity) ─
+
+
+@pytest.mark.asyncio
+async def test_live_stale_when_behind_deploy(db, monkeypatch):
+    # Spawn commit differs AND the session started before the deploy → behind.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_BEHIND})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
+    live = result["sessions"][0]["live"]
+    assert live["stale_code"] is True
+    assert live["deploy_commit"] == _DEPLOY[1]  # new_commit — what to restart TO
+    assert result["stats"]["stale_code"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_not_stale_when_spawn_matches_deploy_prefix(db, monkeypatch):
+    # Spawn (full SHA) shares the deploy's (short SHA) prefix → identity match.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_FRESH})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
+    live = result["sessions"][0]["live"]
+    assert live["stale_code"] is False
+    assert live["deploy_commit"] is None
+    assert result["stats"]["stale_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_live_not_stale_when_ahead_of_deploy(db, monkeypatch):
+    # Session started AFTER the last recorded deploy (main tree advanced past it
+    # via a manual git pull): commit differs but it is AHEAD, not behind → NOT
+    # stale. This is the case identity-alone would wrongly flag.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_AHEAD})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
+    assert result["sessions"][0]["live"]["stale_code"] is False
+    assert result["stats"]["stale_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_identity_not_stale(db, monkeypatch):
+    # Pre-feature session (no persisted identity) → read returns None → fail-open.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
+    assert result["sessions"][0]["live"]["stale_code"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_deploy_marker_never_stale(db, monkeypatch):
+    # Empty-state / fresh install → last_successful_update None → nothing flagged.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_BEHIND})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=None)
+    assert result["sessions"][0]["live"]["stale_code"] is False
+    assert result["stats"]["stale_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unmatched_slot_carries_identity_staleness(db, monkeypatch):
+    # A live proc with no matching cc_sessions row must not be a blind spot.
+    await _seed_charter_tables(db)
+    _patch_spawn(monkeypatch, {("7", 700): _SPAWN_BEHIND})
+    result = await _collect_detail(db, [_slot("7", 700)], now=_NOW, deploy=_DEPLOY)
+    assert result["sessions"] == []
+    unmatched = result["unmatched_slots"]
+    assert len(unmatched) == 1
+    assert unmatched[0]["stale_code"] is True
+    assert unmatched[0]["deploy_commit"] == _DEPLOY[1]
+    assert result["stats"]["stale_code"] == 1

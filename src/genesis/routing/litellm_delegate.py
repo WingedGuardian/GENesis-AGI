@@ -91,15 +91,9 @@ _CUSTOM_MODEL_COSTS: dict[str, dict] = {
         "mode": "chat",
         "litellm_provider": "openrouter",
     },
-    # DeepSeek V4 Pro via NVIDIA NIM — free tier
-    "nvidia_nim/deepseek-ai/deepseek-v4-pro": {
-        "input_cost_per_token": 0.0,
-        "output_cost_per_token": 0.0,
-        "max_input_tokens": 131072,
-        "max_output_tokens": 131072,
-        "mode": "chat",
-        "litellm_provider": "nvidia_nim",
-    },
+    # (NIM DeepSeek is free — is_free short-circuits cost lookup — so no NIM
+    # cost entry is needed; the retired deepseek-v4-pro NIM entry was removed
+    # with the pro->flash-0731 repoint, 2026-08.)
     # Response-model keys — OpenRouter's response.model omits the
     # provider prefix. Register these so litellm.completion_cost() can
     # look up costs even when it infers from response.model directly.

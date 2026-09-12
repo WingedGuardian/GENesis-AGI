@@ -3,9 +3,23 @@
 # Origin: 2026-03-15 — proposed hiding "unknown" resilience state instead
 # of wiring the actual state machine. User correctly identified this as
 # a trust-destroying anti-pattern.
+#
+# behavioral-lint: ignore no-hide-problems
+# ^ This rule-definition file necessarily contains the trigger patterns it
+#   matches, so it is exempt from self-linting (also enforced structurally by
+#   the linter skipping config/behavioral_rules/). The escape leaves an audit
+#   trail per the linter's own convention.
 
 name: no-hide-problems
 severity: block
+# Doc formats are excluded: a markdown/rst/txt file that merely QUOTES the
+# CSS/Alpine patterns (an audit report, a PR body, a code fence) must not be
+# hard-blocked for describing the anti-pattern. Real markup lives in
+# .css/.html/.js/.vue files, which stay in scope.
+excludes:
+  - "*.md"
+  - "*.rst"
+  - "*.txt"
 description: >
   Never hide, suppress, or work around broken things — fix them.
   This applies to code, UI, plans, and reasoning. When something
@@ -18,19 +32,34 @@ suggestion: >
   skip, suppress, or omit broken data. Never propose deferring the
   fix while hiding the symptom.
 
+# Severity model: the code-level patterns (display:none / x-show hiding an
+# error state) are unambiguous and stay `block` (the rule default). The
+# reasoning/prose patterns are inherently fuzzy — they match token adjacency,
+# not intent — so they are `warn`: they surface the concern without hard-
+# blocking legitimate prose (a commit message, a docstring, this audit). The
+# verbs and state-words are \b-anchored so identifier-embedded matches
+# (skip_writeback, _QDRANT_ERRORS) and most punctuation-joined tokens no longer
+# trip the rule.
 patterns:
-  # Code-level patterns
+  # Code-level patterns — hard block (unambiguous; require literal display:none
+  # or an Alpine x-show, which effectively never appear in prose)
   - regex: 'display:\s*none[^;]*(?:unknown|error|broken|stale|failed)'
     context: Hiding element based on error/unknown state
+  - regex: '(?:unknown|error|broken|stale|failed)[^;]{0,40}display:\s*none'
+    context: Hiding an error/unknown element via display:none
   - regex: 'x-show="[^"]*!\s*\S*(?:error|unknown|failed)'
     context: Alpine conditional hiding error/unknown states
 
-  # Reasoning-level patterns (plans, comments, proposals)
-  - regex: '(?:hide|skip|remove|suppress|omit).{0,40}(?:unknown|error|broken|stale|failed|placeholder|not.configured|not.available)'
+  # Reasoning-level patterns (plans, comments, proposals) — WARN only
+  - regex: '\b(?:hide|skip|remove|suppress|omit)\b.{0,40}\b(?:unknown|error|broken|stale|failed|placeholder|not.configured|not.available)'
+    severity: warn
     context: Proposing to hide/skip broken or unknown data
-  - regex: '(?:unknown|error|broken|stale|failed|placeholder).{0,40}(?:hide|skip|remove|suppress|omit|display:\s*none|don.?t show|do not show|not show)'
+  - regex: '\b(?:unknown|error|broken|stale|failed|placeholder).{0,40}\b(?:hide|skip|remove|suppress|omit)\b'
+    severity: warn
     context: Proposing to suppress display of broken state
-  - regex: '(?:don.?t|do not|never|avoid)\s+(?:show|display|render|expose).{0,40}(?:error|unknown|broken|stale|failed)'
+  - regex: '\b(?:don.?t|do not|never|avoid)\s+(?:show|display|render|expose)\b.{0,40}\b(?:error|unknown|broken|stale|failed)'
+    severity: warn
     context: Proposing to not show error/broken state
-  - regex: '(?:only show|skip showing).{0,40}(?:when|if|unless).{0,40}(?:available|configured|exists|ready|healthy)'
+  - regex: '\b(?:only show|skip showing)\b.{0,40}(?:when|if|unless).{0,40}\b(?:available|configured|exists|ready|healthy)'
+    severity: warn
     context: Conditional display that omits broken states instead of showing them honestly

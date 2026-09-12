@@ -19,8 +19,8 @@ def compute_ece(curves: list[dict]) -> float:
     Parameters
     ----------
     curves:
-        List of dicts from ``CalibrationCurveComputer.compute()``, each with
-        ``sample_count``, ``actual_success_rate``, ``predicted_confidence``.
+        List of per-bucket dicts, each with ``sample_count``,
+        ``actual_success_rate``, ``predicted_confidence``.
 
     Returns
     -------

@@ -14,7 +14,8 @@ Modes (``GENESIS_PROACTIVE_HOOK_MODE``, default ``server``):
   off    — session-local awareness only, no memory recall
 Endpoint base URL: ``GENESIS_PROACTIVE_HOOK_URL`` (default http://127.0.0.1:5000).
 
-Budget: <2.2s client (server times out first at 2.0s → clean fallback).
+Budget: <4.75s client (``_SERVER_TIMEOUT_S``) — the server's ~4.5s recall
+timeout fires first, so the client gets a clean 503 → FTS5 fallback.
 
 Reads hook input from stdin as JSON:
   {"session_id": "...", "prompt": "...", ...}
@@ -34,6 +35,16 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import session_path  # noqa: E402
+from session_heartbeat import (  # noqa: E402
+    cached_model,
+    resolve_topic,
+    sanitize_detail,
+)
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_DIR / "src"
@@ -280,14 +291,20 @@ _MAX_TRAIL_DISPLAY = 50  # Show up to this many pivots — the full session arc 
 _GENESIS_PREFIX = str(Path.home() / "genesis") + "/"
 
 
-def _trail_path(session_id: str) -> Path:
-    """Path to the intent trail file for a session."""
-    return _TRAIL_DIR / session_id / "intent_trail.json"
+def _trail_path(session_id: str) -> Path | None:
+    """Path to the intent trail file for a session, or None if the id is unsafe.
+
+    ``session_id`` is a path component here, so an id carrying ``/`` or ``..``
+    would escape the sessions dir (mirrors ``_ws_path``/``_load_recent_files``).
+    """
+    return session_path(_TRAIL_DIR, session_id, "intent_trail.json")
 
 
 def _load_trail(session_id: str) -> dict:
     """Load intent trail from disk. Returns empty structure if missing."""
     path = _trail_path(session_id)
+    if path is None:
+        return {"session_id": session_id, "pivots": [], "last_keywords": [], "msg_count": 0}
     try:
         if path.exists():
             return json.loads(path.read_text())
@@ -299,6 +316,8 @@ def _load_trail(session_id: str) -> dict:
 def _save_trail(session_id: str, trail: dict) -> None:
     """Atomic write of intent trail to disk."""
     path = _trail_path(session_id)
+    if path is None:
+        return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -357,6 +376,30 @@ def _is_harness_envelope(prompt: str) -> bool:
     return prompt.lstrip().startswith(_HARNESS_ENVELOPE_PREFIXES)
 
 
+# WS-3 observation provenance. Literals mirror memory.provenance.ORIGIN_* — kept
+# stdlib-only here so the never-block write path takes no genesis import.
+_VALID_ORIGIN_CLASSES = frozenset({"owner", "first_party", "external_untrusted"})
+
+
+def _pivot_origin_class() -> str:
+    """origin_class for a conversation_pivot row written by THIS hook.
+
+    This hook ``sys.exit(0)``s at the top of the module when
+    ``GENESIS_CC_SESSION == "1"``, so it only ever runs in a user-launched
+    INTERACTIVE terminal session — i.e. the owner. Every Genesis-dispatched or
+    external session sets ``GENESIS_CC_SESSION=1`` (cc/invoker.py:396,
+    session_awareness/headless.py:78) and never reaches here; and
+    ``GENESIS_SESSION_ORIGIN`` is only ever set ALONGSIDE that guard
+    (invoker.py:412), so it cannot be present past the exit. The origin is
+    therefore ``owner``. The env read below is belt-and-suspenders for a
+    hypothetical future spawn path that sets an origin without the CC_SESSION
+    guard; it cannot fire today (fail-closed to owner is safe — the read side
+    keeps owner/first_party and this surface is the owner's own pivot trail).
+    """
+    origin = os.environ.get("GENESIS_SESSION_ORIGIN")
+    return origin if origin in _VALID_ORIGIN_CLASSES else "owner"
+
+
 def _record_pivot_observation(
     db_path: Path,
     session_id: str,
@@ -373,8 +416,9 @@ def _record_pivot_observation(
         try:
             conn.execute(
                 "INSERT INTO observations"
-                " (id, source, type, content, priority, created_at, expires_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " (id, source, type, content, priority, created_at, expires_at,"
+                " origin_class)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _uuid.uuid4().hex,
                     f"session:{session_id}",
@@ -383,6 +427,7 @@ def _record_pivot_observation(
                     "low",
                     now.isoformat(),
                     expires_at,
+                    _pivot_origin_class(),
                 ),
             )
             conn.commit()
@@ -402,6 +447,13 @@ def _update_and_format_trail(
     Returns None if trail has fewer than 2 pivots (not useful yet).
     """
     if not session_id:
+        return None
+
+    # The trail workflow is persistence-backed end to end: without a safe trail
+    # path _save_trail discards every update, so EVERY turn would look like the
+    # first pivot and record a false conversation_pivot observation. Abort the
+    # workflow rather than run it against a trail that can never be saved.
+    if _trail_path(session_id) is None:
         return None
 
     # Skip harness-injected turns (task notifications, system reminders,
@@ -983,6 +1035,46 @@ def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
         pass  # Never block
 
 
+def _liveness_detail() -> str:
+    """Best-effort loop-health suffix for the degraded banner.
+
+    One quick GET to the OFF-loop liveness probe (a sync route that answers even
+    when the event loop is starved), returning e.g. ``" (loop lag 4200ms,
+    executor backlog 37)"`` or ``""`` on any failure. Never raises. Only called on
+    the "reachable but under load" branches — the connect-refused branch means the
+    server is down and there is nothing to probe. The tight budget is safe: the
+    server already answered (503) or is reachable-but-slow only on the LOOP, and
+    this route bypasses the loop, so it returns in milliseconds.
+    """
+    import httpx
+
+    try:
+        url = f"{_SERVER_BASE}/api/genesis/liveness"
+        with httpx.Client(timeout=httpx.Timeout(0.6, connect=0.2), trust_env=False) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            return ""
+        loop = resp.json().get("loop")
+        if not isinstance(loop, dict):
+            return ""
+        # A wedged loop (or a dead sampler) keeps returning the LAST sample with a
+        # growing sample_age_s — don't present stale drift/executor depth as current
+        # load. Past a freshness window, report the staleness instead of the number.
+        age = loop.get("sample_age_s")
+        if isinstance(age, (int, float)) and age > 30:
+            return f" (loop sample stale {age:.0f}s — possibly wedged)"
+        parts: list[str] = []
+        lag = loop.get("lag_ms")
+        if isinstance(lag, (int, float)):
+            parts.append(f"loop lag {lag:.0f}ms")
+        execu = loop.get("executor")
+        if isinstance(execu, dict) and isinstance(execu.get("pending"), int):
+            parts.append(f"executor backlog {execu['pending']}")
+        return f" ({', '.join(parts)})" if parts else ""
+    except Exception:
+        return ""
+
+
 def _server_failure_reason(
     *, status: int | None = None, detail: str = "", exc: BaseException | None = None
 ) -> str:
@@ -992,7 +1084,9 @@ def _server_failure_reason(
     timeout — e.g. mid-restart) from a server that IS reachable but whose recall
     call failed or ran past its 4.5s budget (a 503 / read-timeout). Calling the
     latter "unreachable" both misleads and masks the real latency story, so the
-    banner names the actual cause instead.
+    banner names the actual cause instead — and on the reachable-but-loaded
+    branches appends the live loop-lag / executor backlog so "under load" is a
+    number, not a guess.
     """
     import httpx
 
@@ -1003,14 +1097,18 @@ def _server_failure_reason(
         if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
             return "genesis-server unreachable (connection refused — likely restarting or down)"
         if isinstance(exc, httpx.TimeoutException):
-            return f"recall timed out after {_SERVER_TIMEOUT_S:g}s (server reachable, under load)"
+            return (
+                f"recall timed out after {_SERVER_TIMEOUT_S:g}s "
+                f"(server reachable, under load){_liveness_detail()}"
+            )
         return "recall call failed (server reachable)"
     if status is not None and status != 200:
         base = f"server returned HTTP {status} (reachable"
         if status == 503:
             base += ", over budget or still booting"
         base += ")"
-        return f"{base}: {detail}" if detail else base
+        base = f"{base}: {detail}" if detail else base
+        return f"{base}{_liveness_detail()}"
     return "genesis-server unavailable"
 
 
@@ -1044,8 +1142,19 @@ async def _call_server(
         # HTTP_PROXY/ALL_PROXY here would route the payload (the user's prompt)
         # through an external proxy when NO_PROXY doesn't cover 127.0.0.1 — a
         # data-leak / failure path. A localhost call must never use a proxy.
+        # Internal bearer so this POST passes the server's /api mutation gate when
+        # a dashboard password is set. Absent token → no header (gate inactive).
+        headers: dict[str, str] = {}
+        try:
+            from genesis.env import read_internal_api_token
+
+            _tok = read_internal_api_token()
+            if _tok:
+                headers["Authorization"] = f"Bearer {_tok}"
+        except Exception:
+            pass
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            resp = await client.post(_RECALL_ENDPOINT, json=payload)
+            resp = await client.post(_RECALL_ENDPOINT, json=payload, headers=headers)
         if resp.status_code != 200:
             detail = ""
             try:
@@ -1211,14 +1320,24 @@ def _extract_genesis_summary(session_id: str) -> str | None:
     and produces a compact summary like "Grep observations.py, Read
     essential_knowledge.py, Bash ran tests".
 
-    Returns None if file doesn't exist or is empty.
+    THREE-VALUED, matching resolve_topic, because the upsert COALESCEs on None:
+      * a string -- the digest.
+      * ""       -- read fine, nothing to report. OVERWRITES, clearing a stale
+                    digest. This is the ORDINARY state after the awareness
+                    processor renames + unlinks the file it just consumed
+                    (memory/session_observer.py:261-279, :372-375).
+      * None     -- could NOT read (path rejected, unreadable). PRESERVES.
+    Collapsing the middle case into None makes a consumed digest immortal: peers
+    keep seeing tools from a finished task while the liveness refresh keeps
+    stamping the row as current.
     """
-    if not session_id:
-        return None
-
-    obs_path = Path.home() / ".genesis" / "sessions" / session_id / "tool_observations.jsonl"
+    obs_path = session_path(
+        Path.home() / ".genesis" / "sessions", session_id, "tool_observations.jsonl"
+    )
+    if obs_path is None:
+        return None  # path REJECTED -- could not read -- preserve what is stored
     if not obs_path.exists():
-        return None
+        return ""  # consumed or never written -- nothing to report -- clear
 
     try:
         # Read last 5 lines efficiently
@@ -1237,7 +1356,7 @@ def _extract_genesis_summary(session_id: str) -> str | None:
                 return None
 
         if not lines:
-            return None
+            return ""  # present but empty -- nothing to report
 
         tools: list[str] = []
         for line in lines:
@@ -1264,7 +1383,8 @@ def _extract_genesis_summary(session_id: str) -> str | None:
             except (json.JSONDecodeError, AttributeError):
                 continue
 
-        return ", ".join(tools[-3:]) if tools else None
+        # "" not None: the file read fine, there was simply nothing summarizable
+        return ", ".join(tools[-3:]) if tools else ""
     except Exception:
         return None
 
@@ -1282,12 +1402,19 @@ def _heartbeat_write(
     try:
         user_summary = prompt[:120].replace("\n", " ").strip()
         genesis_summary = _extract_genesis_summary(session_id)
+        # Both resolve to None on any miss, and the upsert COALESCEs — so a cache
+        # eviction or an unreadable charter leaves the stored value alone rather
+        # than wiping it.
+        model = cached_model(session_id)
+        topic = resolve_topic(db_path, session_id)
 
         from genesis.db.crud.session_heartbeats import upsert_sync
 
         upsert_sync(
             str(db_path),
             cc_session_id=session_id,
+            model=model,
+            topic=topic,
             user_summary=user_summary,
             genesis_summary=genesis_summary,
         )
@@ -1313,22 +1440,48 @@ def _heartbeat_read_and_inject(
 
         for s in active:
             parts = []
-            src = s.get("source_tag", "")
+            # sanitized like every other rendered field: it sits in the SAME
+            # parts list, on the same line, before the closing bracket. Dead
+            # today (no writer sets it, so it is always "foreground"), which is
+            # exactly why it was missed -- the branch looks harmless until the
+            # first writer tags a row.
+            src = sanitize_detail(s.get("source_tag", ""), 30)
             if src and src != "foreground":
                 parts.append(src)
-            model = s.get("model", "")
+            # sanitize_detail HERE too, not only on topic/genesis_summary
+            # below: model is a peer-authored field rendered into the SAME line,
+            # so a newline in it forges a second "[Concurrent | ...]" tag exactly
+            # as it would there. Missed originally because the rule was applied
+            # field-by-field rather than to the rendered SET.
+            model = sanitize_detail(s.get("model", ""), 40)
             if model:
                 parts.append(model)
 
             detail = ""
-            genesis_summary = s.get("genesis_summary", "")
             # user_summary intentionally omitted — raw user messages from other
             # sessions are decontextualized noise and risk cross-session
             # contamination (Claude may treat them as input from this user).
-            if genesis_summary:
-                detail = genesis_summary[:80]
+            # model, topic and genesis_summary ARE rendered, and every one of
+            # them is written by another session, so all go through
+            # sanitize_detail (see the model call above): a
+            # newline plus a forged "[Concurrent | ...]" line would otherwise
+            # land verbatim in this session's context.
+            bits = []
+            topic = sanitize_detail(s.get("topic", ""), 90)
+            if topic:
+                bits.append(topic)
+            gs = sanitize_detail(s.get("genesis_summary", ""), 80)
+            if gs:
+                bits.append(gs)
+            detail = " · ".join(bits)
 
-            sid_short = s.get("cc_session_id", "")[:8]
+            # Sanitize generously, THEN slice: these are two different jobs.
+            # The sanitize handles a forged separator/newline; the slice is the
+            # display contract. Passing 8 as the LIMIT conflates them and gets
+            # both wrong -- sanitize_detail marks truncation, so it returns 7
+            # characters plus an ellipsis and silently regresses the 8-character
+            # prefix every peer line is identified by.
+            sid_short = sanitize_detail(s.get("cc_session_id", ""), 64)[:8]
             tag_parts = ["Concurrent"]
             if parts:
                 tag_parts.append(" ".join(parts))

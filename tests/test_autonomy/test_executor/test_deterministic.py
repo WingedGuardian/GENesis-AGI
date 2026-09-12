@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from genesis.autonomy.executor.deterministic import (
+    _read_limited,
     execute_deterministic_step,
     validate_command,
 )
@@ -115,6 +116,21 @@ class TestValidateCommand:
 
 
 @pytest.mark.asyncio
+async def test_read_limited_reports_discarded_bytes() -> None:
+    """The reader retains a prefix while counting the full drained stream."""
+    import asyncio
+
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"0123456789")
+    stream.feed_eof()
+
+    retained, total = await _read_limited(stream, limit=4)
+
+    assert retained == b"0123"
+    assert total == 10
+
+
+@pytest.mark.asyncio
 class TestExecuteDeterministicStep:
     """Test deterministic step execution."""
 
@@ -168,6 +184,15 @@ class TestExecuteDeterministicStep:
         assert result.status == "failed"
         assert "STDERR" in result.result
 
+    async def test_truncation_reports_full_stream_size(self) -> None:
+        step = {"idx": 0, "type": "bash", "command": "seq 1 400000"}
+
+        result = await execute_deterministic_step(step)
+
+        expected_size = sum(len(str(number)) + 1 for number in range(1, 400001))
+        assert result.status == "completed"
+        assert f"(truncated, {expected_size} bytes total)" in result.result
+
     async def test_worktree_path_used(self, tmp_path: Path) -> None:
         step = {"idx": 0, "type": "bash", "command": "pwd"}
         result = await execute_deterministic_step(
@@ -205,6 +230,38 @@ class TestExecuteDeterministicStep:
         finally:
             det._HARD_TIMEOUT_S = original
 
+    async def test_timeout_reaps_grandchildren(self, tmp_path: Path) -> None:
+        """A step command that FORKS (bash spawning a background child): the
+        timeout kill must reap the whole process group, not just the direct
+        child — otherwise the grandchild reparents to pid 1 and runs forever."""
+        import asyncio
+
+        from genesis.autonomy.executor import deterministic as det
+
+        marker = tmp_path / "grandchild_pid"
+        # A project-script step (validate_command allows executables that are
+        # not bare interpreter names) that forks a background child then hangs.
+        forker = tmp_path / "forker"
+        forker.write_text(
+            f"#!/bin/bash\nsleep 600 &\necho $! > {marker}\nsleep 600\n"
+        )
+        forker.chmod(0o755)
+        original = det._HARD_TIMEOUT_S
+        try:
+            det._HARD_TIMEOUT_S = 1
+            step = {"idx": 0, "type": "bash", "command": str(forker)}
+            result = await execute_deterministic_step(step)
+            assert result.status == "failed"
+            assert "timed out" in result.blocker_description.lower()
+            grandchild = int(marker.read_text().strip())
+            assert grandchild > 1  # explicit pid, never a default
+            await asyncio.sleep(0.3)  # let SIGKILL land
+            from tests.proc_asserts import process_terminated
+
+            assert process_terminated(grandchild)  # gone-or-zombie
+        finally:
+            det._HARD_TIMEOUT_S = original
+
 
 class TestStepTypeProperties:
     """Verify the new StepType properties."""
@@ -227,3 +284,30 @@ class TestStepTypeProperties:
     def test_deterministic_types_do_not_verify(self) -> None:
         for st in (StepType.BASH, StepType.TEST, StepType.GIT):
             assert st.verify_step is False, f"{st} should not require verification"
+
+
+@pytest.mark.asyncio
+async def test_cancel_reaps_tree_and_reraises(tmp_path: Path) -> None:
+    """Task cancellation mid-step must group-kill the step's tree before
+    propagating — with its own session, no ambient signal reaches it."""
+    import asyncio
+    import time
+
+    from tests.proc_asserts import process_terminated
+
+    marker = tmp_path / "gc_pid"
+    forker = tmp_path / "forker"
+    forker.write_text(f"#!/bin/bash\nsleep 600 &\necho $! > {marker}\nsleep 600\n")
+    forker.chmod(0o755)
+    step = {"idx": 0, "type": "bash", "command": str(forker)}
+    task = asyncio.get_running_loop().create_task(execute_deterministic_step(step))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (marker.exists() and marker.read_text().strip()):
+        await asyncio.sleep(0.05)
+    grandchild = int(marker.read_text().strip())
+    assert grandchild > 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.3)
+    assert process_terminated(grandchild)

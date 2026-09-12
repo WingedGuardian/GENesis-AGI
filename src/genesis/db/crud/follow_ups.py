@@ -7,6 +7,16 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from genesis.observability.session_context import get_session_id
+
+# Sentinel for ``create``'s source_session: distinguishes "caller said nothing"
+# (default from the ambient session scope) from an INTENDED NULL (store
+# nothing). Without it, a caller that resolved provenance and failed — e.g. the
+# MCP tool refusing to store a truncated id — could not express that refusal:
+# ``None`` would fall through to the ContextVar and store a substituted ambient
+# id, the exact outcome the contract forbids.
+_UNSET: object = object()
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -46,17 +56,49 @@ async def create(
     source: str,
     strategy: str,
     reason: str | None = None,
-    source_session: str | None = None,
+    source_session: str | None | object = _UNSET,
     scheduled_at: str | None = None,
     priority: str = "medium",
     pinned: bool = False,
     kind: str = "follow_up",
+    revisit_condition: str | None = None,
     domain: str | None = None,
     goal_id: str | None = None,
     dedup_key: str | None = None,
     id: str | None = None,
 ) -> str:
     """Create a follow-up and return its ID.
+
+    source_session: which session this work originated from — the CC TRANSCRIPT
+    session id, the namespace every live producer writes and every consumer
+    joins on (repo_pulse reads it as ``item_session_id``; charter/dashboard key
+    on transcript ids). Three-valued:
+      - a string: stored (empty normalizes to NULL — a degraded CC result can
+        carry ``session_id=""``, and "" is invisible to IS NULL consumers);
+      - None: an INTENDED NULL — the caller resolved provenance and refused to
+        substitute (e.g. an unresolvable prefix). Stored as NULL, never
+        defaulted away;
+      - omitted: defaults from the runtime session ContextVar
+        (``observability.session_context``). FORWARD-PROVISION, honestly: at
+        this writing NO ``create`` caller runs inside a scoped task tree, so
+        the branch has no live producer — and any future producer MUST set the
+        ContextVar to the CC transcript id, NOT ``cc_sessions.id`` (today's
+        setters store the internal row id, an indistinguishable-but-wrong
+        namespace for this column).
+
+    THIS FUNCTION DOES NOT VALIDATE THE ID'S SHAPE, BY CHOICE. The shape check
+    (``session_charters.is_full_session_id``) lives at the MCP tool boundary,
+    because that is the only place the value is TYPED by a model rather than
+    passed through from a store that already holds a full id — the inbox
+    evaluator, the task executor and the ledger escalator each forward an id
+    they read, and re-validating a value we ourselves stored would buy nothing.
+    The column is therefore NOT guaranteed canonical: it already carries four
+    16-hex ``ego_cycle`` rows (2026-05) that match no session in any store,
+    written before any of this existed. A new DIRECT caller that accepts a
+    model- or user-supplied id must apply the predicate itself.
+    NOTHING guesses: a wrong id is worse than none — measured 513/513 NULL
+    before this existed, while repo_pulse_worker read the column on every row
+    it ever annotated.
 
     kind:     'follow_up' (intended for action) or 'tabled' (tracked, not for action).
     domain:   'internal' | 'user_world' | None (None = not yet classified).
@@ -65,13 +107,20 @@ async def create(
               re-evaluation) pass a stable hash so the same recommendation does
               not create duplicate rows; a partial unique index backstops races.
     """
+    if source_session is _UNSET:
+        source_session = get_session_id()
+    # One chokepoint, every caller: "" is not provenance. A degraded CC result
+    # constructs CCOutput with session_id="" on three invoker paths, and a
+    # per-site `or None` convention would have to be REMEMBERED at each of the
+    # six call sites (one already forgot).
+    source_session = source_session or None
     fid = id or _new_id()
     await db.execute(
         """INSERT INTO follow_ups
            (id, source, source_session, content, reason, strategy,
-            scheduled_at, status, priority, pinned, kind, domain, goal_id,
-            dedup_key, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+            scheduled_at, status, priority, pinned, kind, revisit_condition,
+            domain, goal_id, dedup_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             fid,
             source,
@@ -83,6 +132,7 @@ async def create(
             priority,
             int(pinned),
             kind,
+            revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None,
             domain,
             goal_id,
             dedup_key,
@@ -115,6 +165,21 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     cursor = await db.execute("SELECT * FROM follow_ups WHERE id = ?", (id,))
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def resolve_id(db: aiosqlite.Connection, id_or_prefix: str) -> tuple[list[str], str]:
+    """Resolve a full id OR a short hex prefix to the follow_up row(s).
+
+    Thin wrapper over the shared resolver so ``follow_up_update`` accepts the
+    same short handles the proactive hook / memory_expand hand out. Returns
+    ``(matches, outcome)`` — see ``crud/_id_resolve``. follow_up ids are
+    ``uuid4().hex`` (32-char, no dashes).
+    """
+    from genesis.db.crud._id_resolve import resolve_unique_prefix
+
+    return await resolve_unique_prefix(
+        db, table="follow_ups", id_column="id", raw_id=id_or_prefix, full_len=32
+    )
 
 
 async def get_pending(
@@ -170,6 +235,21 @@ async def get_by_status(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def get_open_followups(db: aiosqlite.Connection) -> list[dict]:
+    """Hot follow_up rows still open (pending or in_progress), oldest first.
+
+    ONE statement, so it is a single consistent snapshot: a concurrent writer
+    moving a row in_progress<->pending can never make it fall between two
+    queries (the repo-pulse reconciler's loader must not silently drop such a
+    row and then advance its PR cursor past it). Cold ``tabled``/``idea`` rows
+    are excluded (kind='follow_up')."""
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups WHERE kind = 'follow_up' "
+        "AND status IN ('pending', 'in_progress') ORDER BY created_at ASC"
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_actionable(
     db: aiosqlite.Connection,
     *,
@@ -215,6 +295,50 @@ async def get_scheduled_due(
         "AND scheduled_at IS NOT NULL "
         "AND datetime(scheduled_at) <= datetime('now') "
         "ORDER BY scheduled_at ASC",
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_orphaned_scheduled(db: aiosqlite.Connection) -> list[dict]:
+    """Hot-lane rows stuck in status='scheduled' with NO linked_task_id.
+
+    status='scheduled' is only legitimate when set by ``link_task`` atomically
+    with a ``linked_task_id`` (so ``get_linked_active`` surfaces it). A scheduled
+    row missing the link is INVISIBLE to every surface — not in ``get_actionable``
+    (excludes 'scheduled'), not in ``get_scheduled_due`` (needs status='pending' +
+    scheduled_at), not in ``get_linked_active`` (needs linked_task_id). This is the
+    black hole the follow_up_update H2 gate now prevents; this reader catches any
+    that pre-date the gate or were written programmatically. Hot lane only.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups "
+        "WHERE status = 'scheduled' AND linked_task_id IS NULL AND kind = 'follow_up' "
+        "ORDER BY created_at ASC",
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_past_due_scheduled(db: aiosqlite.Connection, *, grace_hours: int) -> list[dict]:
+    """Hot-lane scheduled_task rows the dispatcher never actuated, >grace_hours past due.
+
+    The dispatcher consumes EXACTLY ``get_scheduled_due``'s set — strategy=
+    'scheduled_task' AND status='pending' AND scheduled_at<=now — and on dispatch
+    the row moves to in_progress then to status='scheduled' with a linked_task_id
+    (tracked thereafter by ``get_linked_active``). So the ONLY state that means
+    "never actuated" is a row STILL in status='pending' with no linked_task_id whose
+    scheduled_at is now >grace_hours old. Narrowing to that avoids false-positiving on
+    healthy dispatched rows simply waiting on idle-gated surplus compute (they are
+    status='scheduled'+linked with a frozen scheduled_at) and avoids double-counting
+    genuine orphans (status='scheduled', caught by get_orphaned_scheduled). Reuses the
+    ``datetime(scheduled_at) <= datetime('now', '-N hours')`` shape. Hot lane only.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups "
+        "WHERE strategy = 'scheduled_task' AND status = 'pending' AND linked_task_id IS NULL "
+        "AND kind = 'follow_up' AND scheduled_at IS NOT NULL "
+        "AND datetime(scheduled_at) <= datetime('now', ?) "
+        "ORDER BY scheduled_at ASC",
+        (f"-{int(grace_hours)} hours",),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
@@ -324,6 +448,52 @@ async def update_notes(
     return cursor.rowcount > 0
 
 
+async def absorb_followup(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    evidence: str,
+    require_unpinned: bool = False,
+    commit: bool = True,
+) -> bool:
+    """Mark a still-open HOT follow_up 'completed' with PR evidence (repo-pulse absorb).
+
+    Conditional by design — only a row still in ``('pending','in_progress')``
+    transitions. The detached repo-pulse worker races ego/foreground writers, so
+    an unconditional ``update_status`` would clobber a concurrent transition (e.g.
+    a user just set it 'blocked'); the WHERE guard makes the absorb
+    lost-update-safe and replay-idempotent (a re-covered enumeration window
+    matches nothing on the second run).
+
+    Lane invariants are enforced ATOMICALLY here, not from the caller's stale
+    load-time snapshot (a concurrent pin or ``kind``→``tabled`` between load and
+    this UPDATE could otherwise slip past them): ``kind='follow_up'`` is ALWAYS
+    required, so the cold ``tabled``/``idea`` lanes are never absorbed by either
+    caller. ``require_unpinned=True`` (the worker's auto-absorb) additionally
+    refuses pinned rows atomically — honouring "automation never auto-resolves a
+    pinned row"; the dashboard confirm passes ``False`` because a human
+    explicitly confirming a pinned proposal is an intended override. ``evidence``
+    is APPENDED to any existing ``resolution_notes`` (prior context is never
+    lost). Returns True iff a row changed.
+    """
+    where = "id = ? AND kind = 'follow_up' AND status IN ('pending', 'in_progress')"
+    if require_unpinned:
+        where += " AND pinned = 0"
+    cursor = await db.execute(
+        "UPDATE follow_ups SET status = 'completed', completed_at = ?, "
+        "resolution_notes = TRIM("
+        "COALESCE(resolution_notes || char(10) || char(10), '') || ?"
+        f") WHERE {where}",  # noqa: S608 — where is composed of string literals only
+        (_now_iso(), evidence, id),
+    )
+    # commit=False lets a caller stage this completion and commit it in the SAME
+    # transaction as a related write (the worker commits the absorb + its audit
+    # annotation together via repo_pulse.insert_annotation).
+    if commit:
+        await db.commit()
+    return cursor.rowcount > 0
+
+
 async def link_task(
     db: aiosqlite.Connection,
     id: str,
@@ -370,14 +540,24 @@ async def get_summary_counts(
     db: aiosqlite.Connection,
     *,
     include_tabled: bool = True,
+    kind: str | None = None,
 ) -> dict[str, int]:
     """Get counts by status for dashboard badges.
 
     include_tabled defaults True (existing callers unchanged); pass False to
-    count only the actionable ``follow_up`` lane."""
-    kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
+    count only the actionable ``follow_up`` lane. When ``kind`` is set, count
+    ONLY that specific kind (overrides include_tabled) — so a lane like
+    ``'tabled'`` or ``'idea'`` is counted directly rather than by subtraction,
+    which would conflate the non-follow_up kinds once a third kind exists."""
+    if kind is not None:
+        kind_where = "WHERE kind = ? "
+        params: tuple = (kind,)
+    else:
+        kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
+        params = ()
     cursor = await db.execute(
-        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status"
+        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status",
+        params,
     )
     return {row[0]: row[1] for row in await cursor.fetchall()}
 
@@ -521,6 +701,45 @@ async def purge_completed(
     return cursor.rowcount
 
 
+async def _decay_stale(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    kind: str,
+    older_than_days: int,
+) -> int:
+    """Soft-decay stale NON-TERMINAL follow_ups of a ``(source, kind)`` lane.
+
+    A status flip (not a DELETE): every non-terminal row (``pending`` and —
+    defensively — ``blocked``/``in_progress``/``scheduled``) older than
+    *older_than_days* is flipped to ``completed`` with a decay note, so the
+    retention sweep (``purge_completed``) can later hard-delete it. Terminal
+    ``completed``/``failed`` rows already carry a ``completed_at`` and are the
+    purge sweep's job — excluding them keeps the two sweeps' responsibilities
+    disjoint (without this breadth a ``blocked`` marker would be immortal, skipped
+    by both). Shared by the inbox-marker and idea-lane decays.
+    """
+    older_than_days = max(1, older_than_days)
+    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "UPDATE follow_ups "
+        "SET status = 'completed', completed_at = ?, resolution_notes = ? "
+        "WHERE source = ? "
+        "AND kind = ? "
+        "AND status NOT IN ('completed', 'failed') "
+        "AND created_at < ?",
+        (
+            _now_iso(),
+            f"decayed: not promoted within {older_than_days}d",
+            source,
+            kind,
+            cutoff,
+        ),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def decay_stale_inbox_markers(
     db: aiosqlite.Connection,
     *,
@@ -533,34 +752,30 @@ async def decay_stale_inbox_markers(
     ego judgment (the ego has no authority to discard a user-curated marker). A
     marker that is never promoted eventually goes stale; this sweep ages such
     markers out by marking them ``completed`` with a decay note after
-    *older_than_days*.
-
-    This is a SOFT transition (a status flip, not a DELETE): the row is retained
-    and could be reactivated before the retention sweep (``purge_completed``)
-    eventually hard-deletes it. It targets every NON-TERMINAL tabled inbox
-    marker (``pending`` and — defensively — ``blocked``/``in_progress``/
-    ``scheduled`` a marker could be moved into via the cockpit/ego): terminal
-    ``completed``/``failed`` rows already carry a ``completed_at`` and are reaped
-    by ``purge_completed``, so excluding them here keeps the two sweeps'
-    responsibilities disjoint. Without this breadth a ``blocked`` tabled marker
-    would be immortal — decay (pending-only) and purge (completed/failed-only)
-    would both skip it. Non-inbox / non-tabled follow-ups are left untouched.
+    *older_than_days*. Non-inbox / non-tabled follow-ups are left untouched.
 
     Returns the number of markers decayed.
     """
-    older_than_days = max(1, older_than_days)
-    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
-    cursor = await db.execute(
-        "UPDATE follow_ups "
-        "SET status = 'completed', completed_at = ?, resolution_notes = ? "
-        "WHERE source = 'inbox_evaluation' "
-        "AND kind = 'tabled' "
-        "AND status NOT IN ('completed', 'failed') "
-        "AND created_at < ?",
-        (_now_iso(), f"decayed: not promoted within {older_than_days}d", cutoff),
+    return await _decay_stale(
+        db, source="inbox_evaluation", kind="tabled", older_than_days=older_than_days
     )
-    await db.commit()
-    return cursor.rowcount
+
+
+async def decay_stale_ideas(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 45,
+) -> int:
+    """Soft-decay un-triaged staged-ideation ideas (``source='surplus_ideation'``,
+    ``kind='idea'``) never converted to an actionable follow-up or dismissed — so
+    the review lane doesn't grow unbounded. Same soft-flip → ``purge_completed``
+    reap lifecycle as the inbox marker decay.
+
+    Returns the number of ideas decayed.
+    """
+    return await _decay_stale(
+        db, source="surplus_ideation", kind="idea", older_than_days=older_than_days
+    )
 
 
 async def get_recently_completed(
@@ -600,7 +815,7 @@ async def get_recently_completed(
 # dashboard Follow-ups tab). Pure data layer; kept here alongside the table.
 # ---------------------------------------------------------------------------
 
-_VALID_KIND = {"follow_up", "tabled"}
+_VALID_KIND = {"follow_up", "tabled", "idea"}
 _VALID_DOMAIN = {"internal", "user_world"}
 _VALID_PRIORITY = {"low", "medium", "high", "critical"}
 _VALID_STATUS = {
@@ -611,6 +826,19 @@ _VALID_STATUS = {
     "failed",
     "blocked",
 }
+
+# Work-state → lane derivation. The MCP follow_up_create/update handlers take a
+# `work_state` (the item's actual state) and DERIVE `kind`, so priority can't leak
+# into the hot(follow_up)/cold(tabled) lane choice. `blocked_on_trigger` additionally
+# requires a `revisit_condition` (the trigger being waited on). See CC memory
+# followup_kind_conflation. Enforced at the MCP handler (judgment callers); rule-based
+# programmatic callers (e.g. inbox WATCH/BOOKMARK markers) set `kind` directly.
+WORK_STATE_TO_KIND = {
+    "ready": "follow_up",
+    "blocked_on_trigger": "follow_up",
+    "deferred_cold": "tabled",
+}
+VALID_WORK_STATE = frozenset(WORK_STATE_TO_KIND)
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
 # Every fragment floats pinned rows to the top (pinned is a "keep visible"
@@ -650,6 +878,24 @@ async def set_kind(db: aiosqlite.Connection, id: str, kind: str) -> bool:
     cursor = await db.execute(
         "UPDATE follow_ups SET kind = ? WHERE id = ?",
         (kind, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def set_revisit_condition(
+    db: aiosqlite.Connection, id: str, revisit_condition: str | None
+) -> bool:
+    """Set/clear a follow-up's revisit_condition — the trigger that resurfaces a
+    tabled item or the event a blocked follow_up waits on. None/whitespace clears it.
+
+    Targeted single-column write (mirrors set_kind/set_pinned): never a
+    read-modify-write of the row, so it can't reopen the #1198 lost-update race.
+    """
+    value = revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None
+    cursor = await db.execute(
+        "UPDATE follow_ups SET revisit_condition = ? WHERE id = ?",
+        (value, id),
     )
     await db.commit()
     return cursor.rowcount > 0

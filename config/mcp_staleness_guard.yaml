@@ -1,0 +1,20 @@
+# MCP stale-code guard — blocks overwrite/refine-class MCP tools when a session's
+# MCP subprocess is running code from before the most recent successful deploy.
+#
+# A Claude Code session spawns its MCP servers once at start; a later `git pull`
+# deploy restarts genesis-server but NOT these long-lived subprocesses, so they
+# keep running stale tool code until the whole session restarts. For a tool that
+# refines an existing row by SIMILARITY (procedure_store), stale match logic can
+# silently overwrite the wrong row — so we block it and tell the user to restart.
+#
+# mode:
+#   block  — (default) refuse the guarded tool with a clear "restart this session"
+#            error. Read tools and append-only/explicit-id writes are unaffected.
+#   warn   — log a loud warning, let the call through.
+#   off    — disable the guard entirely.
+# enabled: master switch; false ≡ off.
+#
+# Read live per guarded call (only when actually stale — cheap). Env kill switch
+# GENESIS_MCP_STALENESS_GUARD=1 forces off. Takes effect immediately, no restart.
+enabled: true
+mode: block

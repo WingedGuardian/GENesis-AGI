@@ -15,6 +15,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from genesis.observability.failure_details import failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.jobs._guard import record_failure, record_success
 
@@ -82,8 +83,147 @@ async def run_recon_gather(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "recon_gather.failed",
                 "Recon gather failed with exception",
+                **failure_details(exc=exc),
             )
         record_failure("recon_gather", str(exc))
+
+
+async def run_account_activity_monitor(sched: SchedulerContext) -> None:
+    """Poll owner repos for EXTERNAL GitHub activity; ping first-time contributors."""
+    if sched._account_activity_monitor is None:
+        record_failure("account_activity_monitor", "monitor not wired")
+        return
+    try:
+        result = await sched._account_activity_monitor.gather()
+        if result.new_events or result.pinged or result.errors:
+            logger.info(
+                "GitHub steward: mode=%s repos=%d new=%d pinged=%d errors=%d",
+                result.mode, result.checked_repos, result.new_events,
+                result.pinged, result.errors,
+            )
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.DEBUG,
+                "heartbeat", "account_activity_monitor completed",
+            )
+        record_success("account_activity_monitor")
+    except Exception as exc:
+        logger.exception("Account activity monitor failed")
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.ERROR,
+                "account_activity_monitor.failed",
+                "Account activity monitor failed with exception",
+                **failure_details(exc=exc),
+            )
+        record_failure("account_activity_monitor", str(exc))
+
+
+async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
+    """Drive the external career-agent engine to stage outreach drafts; nudge owner."""
+    if sched._career_outreach_monitor is None:
+        record_failure("career_outreach_monitor", "monitor not wired")
+        return
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        if GenesisRuntime.instance().paused:
+            logger.debug("Career outreach monitor skipped (Genesis paused)")
+            return
+    except Exception:
+        pass
+    try:
+        result = await sched._career_outreach_monitor.gather()
+        if result.mode == "off" and result.bite_mode == "off":
+            # BOTH levers disabled-by-config: record NOTHING (neither success nor
+            # failure) so the actuator stays invisible in job-health on installs that
+            # never enabled it (surplus convention — cf. _guard.SKIP). If EITHER
+            # sub-capability ran, its health is recorded below. An unreachable bridge is
+            # NOT this case — it surfaces errors=1 and is recorded as a failure below.
+            return
+        if (
+            result.auto_runs
+            or result.nudged
+            or result.verify_failed
+            or result.bites
+            or result.errors
+        ):
+            logger.info(
+                "Career outreach: mode=%s bite_mode=%s auto_runs=%d working=%d nudged=%d "
+                "verify_failed=%d bites=%d errors=%d",
+                result.mode, result.bite_mode, result.auto_runs, result.drafts_working,
+                result.nudged, result.verify_failed, result.bites, result.errors,
+            )
+        # No-progress visibility: the engine drafted but its own accuracy gate refused
+        # every attempt (verify_failed) and nothing staged/nudged. verify_failed is
+        # correctly NOT a job-health failure (the gate working), so a SINGLE such tick
+        # is normal; but a PERSISTENT run of them = a possibly-broken verifier that
+        # record_success would otherwise hide. Surface it loudly per-tick (WARNING).
+        # Gate on `not errors`: on a MIXED tick (a hard dispatch/read/nudge error also
+        # occurred) the failure is recorded below — a "verifier refused every attempt"
+        # warning would be a second, misleading diagnosis. Cross-tick threshold
+        # alerting (durable counters) is a tracked follow-up.
+        # NOTE: `result.bites` is deliberately EXCLUDED from this suppression. The
+        # bite-relay is an INDEPENDENT sub-capability (a pipeline read), unrelated to the
+        # auto-run's verifier; a successful bite must not mask a persistently-broken
+        # auto-run verifier. This warning is about auto-run progress only (auto_runs /
+        # nudged). Bites still appear in the info-log above.
+        if (
+            result.verify_failed
+            and not result.errors
+            and not (result.auto_runs or result.nudged)
+        ):
+            logger.warning(
+                "Career outreach: NO-PROGRESS tick — %d verify_failed, 0 staged/nudged "
+                "(engine drafted but its own gate refused all). Persistent recurrence "
+                "signals a possibly-broken verifier job-health cannot see.",
+                result.verify_failed,
+            )
+            if sched._event_bus:
+                await sched._event_bus.emit(
+                    Subsystem.RECON, Severity.WARNING,
+                    "career_outreach.no_progress",
+                    f"{result.verify_failed} verify_failed, 0 staged this tick",
+                )
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.DEBUG,
+                "heartbeat", "career_outreach_monitor completed",
+            )
+        # An adapter-level dispatch failure is surfaced as result.errors (NOT an
+        # exception — execute_operation returns an error dict), so a bare
+        # record_success would lie on every failed dispatch. Record failure when
+        # a dispatch errored; an unhealthy remote (health_ok=False, errors=0) is a
+        # clean skip and records success.
+        if result.errors:
+            # A sub-capability that RAISED was caught inside gather() so the sibling
+            # capability could still run — which also means it never reaches the `except`
+            # below, the only emitter of the ERROR-severity `career_outreach_monitor.failed`
+            # event carrying the traceback. Re-emit it here so an isolated crash is still
+            # visible in the ERROR stream (dashboard / health_errors), not just in
+            # job-health's last_error and the log.
+            if result.raised is not None and sched._event_bus:
+                await sched._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "career_outreach_monitor.failed",
+                    "Career outreach sub-capability raised (isolated from its sibling)",
+                    **failure_details(exc=result.raised),
+                )
+            record_failure(
+                "career_outreach_monitor", "; ".join(result.details) or "dispatch error"
+            )
+        else:
+            record_success("career_outreach_monitor")
+    except Exception as exc:
+        logger.exception("Career outreach monitor failed")
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.ERROR,
+                "career_outreach_monitor.failed",
+                "Career outreach monitor failed with exception",
+                **failure_details(exc=exc),
+            )
+        record_failure("career_outreach_monitor", str(exc))
 
 
 async def run_model_intelligence(sched: SchedulerContext) -> None:
@@ -108,6 +248,7 @@ async def run_model_intelligence(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "model_intelligence.failed",
                 "Model intelligence scan failed",
+                **failure_details(exc=exc),
             )
         record_failure("model_intelligence", str(exc))
 
@@ -134,6 +275,7 @@ async def run_skill_security_scan(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "skill_security_scan.failed",
                 "Skill-security scan failed",
+                **failure_details(exc=exc),
             )
         record_failure("skill_security_scan", str(exc))
 
@@ -167,6 +309,7 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "github_discovery.failed",
                 "GitHub Discovery failed",
+                **failure_details(exc=exc),
             )
         record_failure("github_discovery", str(exc))
 
@@ -174,9 +317,11 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
 async def run_models_md_synthesis(sched: SchedulerContext) -> None:
     """Run weekly models.md synthesis (Sunday 8am UTC).
 
-    Dispatches a CC background session to update docs/reference/models.md
-    from recent model intelligence findings.  Fire-and-forget: job health
-    records the dispatch outcome, not the session completion.
+    Dispatches a CC background session to refresh the LOCAL models.md overlay
+    (``~/.genesis/output/models.md``) from recent model intelligence findings —
+    no git commit, so a clone's weekly run never diverges tracked source.
+    Fire-and-forget: job health records the dispatch outcome, not the session
+    completion.
     """
     try:
         from genesis.runtime import GenesisRuntime
@@ -185,6 +330,10 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
             return
     except Exception:
         pass
+    from genesis.env import models_md_synthesis_enabled
+    if not models_md_synthesis_enabled():
+        logger.debug("Models.md synthesis skipped (disabled via lever)")
+        return
     if sched._models_md_synthesis_job is None:
         record_failure("models_md_synthesis", "job not wired")
         return
@@ -212,6 +361,7 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "models_md_synthesis.failed",
                 "Models.md synthesis failed",
+                **failure_details(exc=exc),
             )
         record_failure("models_md_synthesis", str(exc))
 
@@ -320,5 +470,6 @@ async def run_memory_extraction(sched: SchedulerContext) -> None:
                 Subsystem.SURPLUS, Severity.ERROR,
                 "memory_extraction.failed",
                 "Memory extraction failed with exception",
+                **failure_details(exc=exc),
             )
         record_failure("memory_extraction", str(exc))

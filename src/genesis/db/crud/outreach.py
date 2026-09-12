@@ -6,6 +6,7 @@ import sqlite3
 
 import aiosqlite
 
+from genesis.outreach.types import OWNER_FACING_CHANNELS_SQL_IN as _OWNER_CHANNELS
 from genesis.outreach.types import POSITIVE_ENGAGEMENT_SQL_IN as _POSITIVE_IN
 
 
@@ -140,6 +141,30 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     return cursor.rowcount > 0
 
 
+async def delivered_topic_exists(
+    db: aiosqlite.Connection, *, signal_type: str, topic: str
+) -> bool:
+    """Was this EXACT (signal_type, topic) ever DELIVERED — at any time?
+
+    The unwindowed twin of ``OutreachGovernance._is_duplicate``'s primary key. That
+    check is deliberately bounded (24h by default) so a recurring signal can re-alert;
+    this one is for a POINT EVENT that must be delivered at most once for its whole
+    lifetime, where a caller's own permanent marker may have failed to commit after a
+    successful send. ``outreach_history`` carries no retention prune (only an
+    id-scoped ``delete``), so a delivered row is a durable record of that send.
+
+    Deliberately NOT keyed on ``category``: the caller owns the ``topic`` namespace
+    (it embeds its own dedup key), so signal_type + topic is already exact, and adding
+    a column a caller could change would silently weaken the guarantee.
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM outreach_history "
+        "WHERE signal_type = ? AND topic = ? AND delivered_at IS NOT NULL LIMIT 1",
+        (signal_type, topic),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def find_by_delivery_id(
     db: aiosqlite.Connection, delivery_id: str
 ) -> dict | None:
@@ -153,7 +178,15 @@ async def find_by_delivery_id(
 
 
 async def get_engagement_stats(db: aiosqlite.Connection, *, days: int = 7) -> dict:
-    """Return engagement statistics for the last N days.
+    """Return EXTERNAL engagement statistics for the last N days.
+
+    Counts only external (non-owner) channels — owner-facing relay traffic
+    (Genesis→owner approvals/digests over Telegram/voice) is not outreach
+    engagement, and including it distorts every consumer: the owner ignoring
+    their own approval pings would inflate the ignore-rate and wrongly throttle
+    genuine external outreach (see governance._engagement_throttle) and mislead
+    the morning report. Channel — not category — is the reliable signal (see
+    genesis.outreach.types). Trusted module constant, not user input.
 
     Returns: {total, engaged, ignored, ambivalent, pending}
     """
@@ -165,7 +198,8 @@ async def get_engagement_stats(db: aiosqlite.Connection, *, days: int = 7) -> di
             SUM(CASE WHEN engagement_outcome = 'ambivalent' THEN 1 ELSE 0 END) AS ambivalent,
             SUM(CASE WHEN engagement_outcome IS NULL THEN 1 ELSE 0 END) AS pending
         FROM outreach_history
-        WHERE delivered_at >= datetime('now', ?)""",
+        WHERE delivered_at >= datetime('now', ?)
+          AND channel NOT IN ({_OWNER_CHANNELS})""",  # noqa: S608 - trusted module constant
         (f"-{days} days",),
     )
     row = await cursor.fetchone()

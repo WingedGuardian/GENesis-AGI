@@ -9,8 +9,22 @@ from genesis.memory.user_model import UserModelEvolver
 
 
 async def _create_delta(
-    db, *, id: str, field: str, value: str, confidence: float
+    db,
+    *,
+    id: str,
+    field: str,
+    value: str,
+    confidence: float,
+    origin_class: str | None = "first_party",
+    created_at: str = "2026-03-08T00:00:00",
+    resolved: bool = False,
 ) -> None:
+    # Default origin_class="first_party" mirrors the REAL writers
+    # (reflection_bridge/_output + perception/writer), which stamp
+    # reflection_window_origin — first_party in a quiet window. The pre-WS-3
+    # NULL default was unrealistic: no live writer produces NULL deltas, and the
+    # poisoning gate fail-closes NULL, so seeding NULL would misrepresent the
+    # legit pipeline. Gate tests pass origin_class explicitly.
     await observations.create(
         db,
         id=id,
@@ -23,8 +37,13 @@ async def _create_delta(
             "confidence": confidence,
         }),
         priority="medium",
-        created_at="2026-03-08T00:00:00",
+        created_at=created_at,
+        origin_class=origin_class,
     )
+    if resolved:
+        await observations.resolve(
+            db, id, resolved_at=created_at, resolution_notes="test-resolved"
+        )
 
 
 @pytest.mark.asyncio
@@ -303,3 +322,157 @@ async def test_accepted_ids_out_untouched_when_nothing_accepted(db):
     out: list[str] = []
     assert await evolver.process_pending_deltas(accepted_ids_out=out) is None
     assert out == []
+
+
+# ── WS-3 poisoning gate: only owner/first_party origins auto-accept ──────────
+
+
+@pytest.mark.asyncio
+async def test_external_origin_delta_barred_from_auto_accept(db):
+    """A high-confidence delta with an external origin (e.g. forged via
+    observation_write from the inbox judge) must NOT reach the user model."""
+    await _create_delta(
+        db, id="ext", field="risk_tolerance", value="maximal",
+        confidence=0.95, origin_class="external_untrusted",
+    )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is None  # nothing accepted
+
+
+@pytest.mark.asyncio
+async def test_null_origin_delta_barred_fail_closed(db):
+    """Fail-closed: a NULL origin (legacy/unstamped) is untrusted, not
+    first-party 'by omission'.
+
+    WS-3: create() now DERIVES origin (origin_class=None → source map →
+    first_party for source='reflection'), so a genuine NULL row can only exist as
+    a LEGACY pre-chokepoint row. Insert it raw to simulate that and prove the gate
+    still bars it. (Migration 0085 backfills such rows by source; this covers any
+    that remain NULL — unknown source — which stay barred.)"""
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, "
+        "created_at, resolved, origin_class) VALUES (?,?,?,?,?,?,0,NULL)",
+        (
+            "nul", "reflection", "user_model_delta",
+            json.dumps({
+                "field": "risk_tolerance", "value": "maximal",
+                "evidence": "test evidence", "confidence": 0.95,
+            }),
+            "medium", "2026-03-08T00:00:00",
+        ),
+    )
+    await db.commit()
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_barred_delta_left_unresolved_for_ttl(db):
+    """Barred deltas are NOT resolved — they stay pending for the 14-day TTL to
+    reap (never silently discarded, in case of a labeling error)."""
+    await _create_delta(
+        db, id="ext", field="editor", value="emacs",
+        confidence=0.95, origin_class="external_untrusted",
+    )
+    await UserModelEvolver(db=db).process_pending_deltas()
+    still_pending = await observations.query(
+        db, type="user_model_delta", resolved=False
+    )
+    assert any(r["id"] == "ext" for r in still_pending)
+
+
+@pytest.mark.asyncio
+async def test_first_party_accepted_external_barred_in_mixed_batch(db):
+    """Positive control + gate together: in a mixed batch only the trusted
+    (first_party) delta lands; the external one is barred. Proves the barred
+    tests above are not vacuously green (the accept path works)."""
+    await _create_delta(
+        db, id="fp", field="editor", value="vim",
+        confidence=0.9, origin_class="first_party",
+    )
+    await _create_delta(
+        db, id="ext", field="editor", value="emacs",
+        confidence=0.95, origin_class="external_untrusted",
+    )
+    out: list[str] = []
+    result = await UserModelEvolver(db=db).process_pending_deltas(accepted_ids_out=out)
+    assert result is not None
+    assert result.model["editor"] == "vim"  # only the trusted origin
+    assert out == ["fp"]
+
+
+@pytest.mark.asyncio
+async def test_owner_origin_accepted(db):
+    """owner is trusted-for-privileged-write (belt with first_party)."""
+    await _create_delta(
+        db, id="own", field="preferred_language", value="Rust",
+        confidence=0.9, origin_class="owner",
+    )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is not None
+    assert result.model["preferred_language"] == "Rust"
+
+
+@pytest.mark.asyncio
+async def test_barred_flood_does_not_starve_trusted_delta(db):
+    """P1 regression: a flood of NEWER barred deltas must NOT crowd an older
+    trusted delta out of the newest-N query window. Filtering origin in SQL (not
+    in Python after a LIMITed fetch) is what makes this hold — with a Python
+    post-filter and the default limit=50, the 60 barred rows below would fill the
+    window and the trusted delta would never be seen."""
+    await _create_delta(
+        db, id="trusted-old", field="preferred_language", value="Python",
+        confidence=0.95, origin_class="first_party",
+        created_at="2026-03-01T00:00:00",  # OLDER than the flood
+    )
+    for i in range(60):  # > default limit of 50, all NEWER, all barred
+        await _create_delta(
+            db, id=f"ext-{i}", field=f"forged_{i}", value="x",
+            confidence=0.99, origin_class="external_untrusted",
+            created_at=f"2026-03-09T00:{i // 60:02d}:{i % 60:02d}",
+        )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is not None
+    assert result.model["preferred_language"] == "Python"  # trusted still accepted
+    assert all(not k.startswith("forged_") for k in result.model)  # no barred value
+
+
+@pytest.mark.asyncio
+async def test_narrative_excludes_barred_resolved_deltas(db):
+    """P1 regression: synthesize_narrative pulls RESOLVED deltas as evidence. A
+    barred delta becomes resolved once its TTL fires, so without an origin filter
+    it would launder into the USER_KNOWLEDGE.md narrative prompt. Assert the
+    barred delta's content never reaches the prompt."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from genesis.db.crud import user_model as user_model_crud
+
+    # Seed a non-empty model so synthesize_narrative proceeds past its early return.
+    await user_model_crud.upsert(
+        db, model_json={"preferred_language": "Python"}, synthesized_at="2026-03-08T00:00:00",
+        synthesized_by="test", evidence_count=1, last_change_type="test",
+    )
+    await _create_delta(
+        db, id="tru", field="preferred_language", value="Python", confidence=0.9,
+        origin_class="first_party", resolved=True,
+    )
+    await _create_delta(
+        db, id="ext", field="INJECTED_SECRET", value="attacker_payload", confidence=0.99,
+        origin_class="external_untrusted", resolved=True,
+    )
+
+    captured = {}
+    result_obj = MagicMock(success=True, content="narrative", provider_used="x",
+                           input_tokens=1, output_tokens=1, cost_usd=0.0)
+
+    async def _route_call(call_site_id, messages, **kw):
+        captured["prompt"] = messages[0]["content"]
+        return result_obj
+
+    router = MagicMock()
+    router.route_call = AsyncMock(side_effect=_route_call)
+
+    out = await UserModelEvolver(db=db).synthesize_narrative(router)
+    assert out == "narrative"
+    assert "attacker_payload" not in captured["prompt"]  # barred delta excluded
+    assert "INJECTED_SECRET" not in captured["prompt"]

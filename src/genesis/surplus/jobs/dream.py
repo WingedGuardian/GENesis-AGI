@@ -30,6 +30,7 @@ async def run_dream_cycle() -> None:
     """
     try:
         from genesis.runtime import GenesisRuntime
+
         if GenesisRuntime.instance().paused:
             logger.debug("Dream cycle skipped (Genesis paused)")
             return
@@ -42,6 +43,7 @@ async def run_dream_cycle() -> None:
     # record_job_success nor record_job_failure was reached.
     try:
         from genesis.runtime import GenesisRuntime
+
         GenesisRuntime.instance().record_job_start("dream_cycle")
     except Exception:
         pass  # Don't let health tracking prevent the actual job
@@ -69,6 +71,7 @@ async def run_dream_cycle() -> None:
         # Default dry-run until user enables live mode.
         # Set GENESIS_DREAM_CYCLE_LIVE=1 to enable actual merges.
         import os
+
         dry_run = os.environ.get("GENESIS_DREAM_CYCLE_LIVE", "") not in ("1", "true")
 
         report = await dream_cycle.run(
@@ -84,6 +87,7 @@ async def run_dream_cycle() -> None:
             import uuid as _uuid  # noqa: PLC0415
 
             from genesis.db.crud import observations as obs_crud
+
             await obs_crud.create(
                 rt.db,
                 id=str(_uuid.uuid4()),
@@ -96,6 +100,8 @@ async def run_dream_cycle() -> None:
                     f"{report.get('worklist_enqueued', 0)} enqueued for "
                     f"daily drain, "
                     f"{report.get('oversize_flagged', 0)} oversize flagged, "
+                    f"{report.get('shield', {}).get('members_shielded', 0)} "
+                    f"members shielded, "
                     f"{len(report.get('errors', []))} errors"
                 ),
                 priority="low",
@@ -111,14 +117,16 @@ async def run_dream_cycle() -> None:
         logger.exception("Dream cycle failed: %s", exc)
         try:
             from genesis.runtime import GenesisRuntime
+
             GenesisRuntime.instance().record_job_failure(
-                "dream_cycle", str(exc)[:500],
+                "dream_cycle",
+                exc=exc,
             )
         except Exception as rec_err:
             logger.error(
-                "Failed to record dream_cycle failure: %s "
-                "(original error: %s)",
-                rec_err, exc,
+                "Failed to record dream_cycle failure: %s (original error: %s)",
+                rec_err,
+                exc,
             )
     finally:
         # Always clear heavy workload flag, even on failure — but ONLY if
@@ -148,6 +156,7 @@ async def run_dream_synthesis_drain() -> None:
     """
     try:
         from genesis.runtime import GenesisRuntime
+
         rt = GenesisRuntime.instance()
         if rt.paused:
             logger.debug("Dream synthesis drain skipped (Genesis paused)")
@@ -165,15 +174,11 @@ async def run_dream_synthesis_drain() -> None:
         # "started" in job_health (masks real stuck-job detection).
         store = rt.memory_store
         if rt.db is None or store is None or rt.router is None:
-            logger.warning(
-                "Dream synthesis drain skipped — missing runtime dependencies"
-            )
+            logger.warning("Dream synthesis drain skipped — missing runtime dependencies")
             return
         qdrant = store.qdrant_client
         if qdrant is None:
-            logger.warning(
-                "Dream synthesis drain skipped — MemoryStore has no Qdrant client"
-            )
+            logger.warning("Dream synthesis drain skipped — MemoryStore has no Qdrant client")
             return
     except Exception:
         logger.warning(
@@ -193,7 +198,10 @@ async def run_dream_synthesis_drain() -> None:
 
         # SHADOW hardwired: the live flip is a separate user-gated change.
         report = await dream_cycle.run_synthesis_drain(
-            qdrant=qdrant, db=rt.db, router=rt.router, store=store,
+            qdrant=qdrant,
+            db=rt.db,
+            router=rt.router,
+            store=store,
             dry_run=True,
         )
 
@@ -201,6 +209,7 @@ async def run_dream_synthesis_drain() -> None:
             import uuid as _uuid  # noqa: PLC0415
 
             from genesis.db.crud import observations as obs_crud
+
             await obs_crud.create(
                 rt.db,
                 id=str(_uuid.uuid4()),
@@ -212,6 +221,9 @@ async def run_dream_synthesis_drain() -> None:
                     f"{report.get('drained', 0)} drained, "
                     f"{report.get('would_merge', 0)} would merge, "
                     f"{report.get('stale_skipped', 0)} stale, "
+                    f"{report.get('shield_members_skipped', 0)} members shielded, "
+                    f"{report.get('shield_skipped', 0)} shield-skipped, "
+                    f"{report.get('shield_missing_thresholds', 0)} missing-thresholds, "
                     f"{len(report.get('errors', []))} errors"
                 ),
                 priority="low",
@@ -227,14 +239,16 @@ async def run_dream_synthesis_drain() -> None:
         logger.exception("Dream synthesis drain failed: %s", exc)
         try:
             from genesis.runtime import GenesisRuntime
+
             GenesisRuntime.instance().record_job_failure(
-                "dream_synthesis_drain", str(exc)[:500],
+                "dream_synthesis_drain",
+                exc=exc,
             )
         except Exception as rec_err:
             logger.error(
-                "Failed to record dream_synthesis_drain failure: %s "
-                "(original error: %s)",
-                rec_err, exc,
+                "Failed to record dream_synthesis_drain failure: %s (original error: %s)",
+                rec_err,
+                exc,
             )
     finally:
         # Clear only if this job set the flag (see run_dream_cycle note).

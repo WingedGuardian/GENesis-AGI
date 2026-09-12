@@ -240,7 +240,21 @@ def _check_git_deep_sync(repo: Path) -> GitHealthReport:
     # present loose blob (the outage pattern) that --connectivity-only would miss
     # (that flag only checks reachability, not content). Missing/corrupt objects →
     # non-zero. Dangling objects → exit 0 (benign, not a failure).
-    rc, out, err = _run_git(repo, "fsck", "--no-progress", "--full", timeout=_DEEP_TIMEOUT_S)
+    #
+    # --no-reflogs: this check exists to detect OBJECT-content corruption reachable
+    # from refs; reflog integrity is irrelevant to it (and to REVERT_CODE, which the
+    # guardian gates on a live cheap probe, not this verdict). Without it, routine
+    # branch/worktree churn + gc leaves a branch reflog referencing a pruned commit,
+    # so `git fsck --full` prints "invalid reflog entry" and exits non-zero — firing
+    # a recurring FALSE "objects corrupt" CRITICAL (verified 2026-08-25: the recorded
+    # stderr was reflog noise, not corruption). --no-reflogs drops that class while
+    # still rehashing every object, so a real zeroed/missing blob still fails.
+    # Narrowing (intended): an object referenced ONLY by a reflog and by no ref/
+    # index is no longer scanned — outside this check's ref-reachable-corruption
+    # and REVERT_CODE scope.
+    rc, out, err = _run_git(
+        repo, "fsck", "--no-progress", "--full", "--no-reflogs", timeout=_DEEP_TIMEOUT_S
+    )
     if rc == -1:
         failures.append("fsck_timeout")
     elif rc != 0:

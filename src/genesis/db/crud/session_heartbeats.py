@@ -18,6 +18,17 @@ logger = logging.getLogger(__name__)
 # Sessions not updated within this window are considered stale
 _STALE_THRESHOLD = timedelta(minutes=10)
 
+# Why the conflict clause COALESCEs almost everything (both upserts below): this
+# row has SEVERAL independent PARTIAL writers, each knowing a different subset --
+# the UserPromptSubmit hook knows the prompt and the tool digest, a tool-use
+# refresh knows only that the session is still alive, and `model` comes from a
+# cache a DIFFERENT hook fills at SessionStart. A writer that omits a column is
+# saying "I do not know this", never "clear it", and the model cache is bounded
+# at 24 entries with insertion-order eviction -- so an evicted long-lived session
+# would otherwise DESTROY its stored model on its next write. `source_tag` is the
+# deliberate exception: it has a NOT NULL default, so omitting it is meaningful.
+# Pinned by tests/test_db/test_session_heartbeats_upsert.py.
+
 
 # ---------------------------------------------------------------------------
 # Async versions (for runtime use)
@@ -43,10 +54,12 @@ async def upsert(
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(cc_session_id) DO UPDATE SET
              source_tag = excluded.source_tag,
-             model = excluded.model,
+             model = COALESCE(excluded.model, session_heartbeats.model),
              topic = COALESCE(excluded.topic, session_heartbeats.topic),
-             user_summary = excluded.user_summary,
-             genesis_summary = excluded.genesis_summary,
+             user_summary = COALESCE(excluded.user_summary,
+                                     session_heartbeats.user_summary),
+             genesis_summary = COALESCE(excluded.genesis_summary,
+                                        session_heartbeats.genesis_summary),
              updated_at = excluded.updated_at""",
         (cc_session_id, source_tag, model, topic, user_summary,
          genesis_summary, now),
@@ -115,10 +128,12 @@ def upsert_sync(
                    VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cc_session_id) DO UPDATE SET
                      source_tag = excluded.source_tag,
-                     model = excluded.model,
+                     model = COALESCE(excluded.model, session_heartbeats.model),
                      topic = COALESCE(excluded.topic, session_heartbeats.topic),
-                     user_summary = excluded.user_summary,
-                     genesis_summary = excluded.genesis_summary,
+                     user_summary = COALESCE(excluded.user_summary,
+                                             session_heartbeats.user_summary),
+                     genesis_summary = COALESCE(excluded.genesis_summary,
+                                                session_heartbeats.genesis_summary),
                      updated_at = excluded.updated_at""",
                 (cc_session_id, source_tag, model, topic, user_summary,
                  genesis_summary, now),
@@ -127,7 +142,12 @@ def upsert_sync(
         finally:
             conn.close()
     except Exception:
-        pass  # Best-effort — never block the hook
+        # Best-effort — never block the hook. But LOG it: every path in this
+        # feature swallows, and the only other observable is an elapsed-time
+        # metric, which looks healthy whether the write landed or not. Without
+        # this line a heartbeat that fails on every call is indistinguishable
+        # from one that works. debug-level so it costs nothing in normal runs.
+        logger.debug("session heartbeat upsert failed", exc_info=True)
 
 
 def get_active_sync(
@@ -158,4 +178,7 @@ def get_active_sync(
         finally:
             conn.close()
     except Exception:
+        # Same reasoning as the writer above: an empty peer list reads exactly
+        # like "no concurrent sessions", so a broken read is invisible.
+        logger.debug("session heartbeat read failed", exc_info=True)
         return []

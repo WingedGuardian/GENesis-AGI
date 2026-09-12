@@ -9,14 +9,10 @@ import re
 import shutil
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from genesis.awareness.types import SignalReading
-
-if TYPE_CHECKING:
-    from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
 
@@ -24,30 +20,35 @@ logger = logging.getLogger(__name__)
 class CCVersionCollector:
     """Detects CC version changes by comparing against last-known version.
 
-    When a version change is detected:
-    - Runs CCUpdateAnalyzer to fetch changelog and classify impact
-    - Stores analysis as a recon finding BEFORE returning the signal
+    DETECT-AND-RECORD ONLY — this collector deliberately does NO impact
+    analysis. When a version change is detected it:
+    - Stores a ``version_change`` observation and advances the baseline
     - Emits signal value=1.0 (triggers depth escalation in awareness loop)
 
-    On first run or no change: emits 0.0.
+    On first run or no change: emits 0.0, and (when unchanged) checks the npm
+    registry for an available newer version (``cc_version_available``).
+
+    **Why no impact analysis here.** Running ``CCUpdateAnalyzer`` from this
+    collector was removed deliberately: analysis is a variable-cost,
+    multi-LLM-call operation, and every way of driving it from a signal tick
+    was a reliability bug — awaited inline it blocks the awareness tick and a
+    fixed caller deadline cancels it (storing NO finding on exactly the large
+    multi-release jump it exists for), while dispatched as a background task it
+    is lost on shutdown (the baseline has already advanced, so it never
+    retries). CC updates on this system are DELIBERATE (the auto-updater is
+    disabled — the pin is the only mover), so impact analysis belongs to paths
+    that are idempotent and retryable, not to a hot detection tick:
+    - ``recon_cc_update_check`` MCP — on-demand analysis (alerts), and
+    - the daily pre-eval job — proactively caches per-version verdicts BEFORE
+      a version is adopted,
+    with the cc-update skill's mandatory full-changelog read at bump time.
+    Detection stays here because it must be cheap and always succeed.
     """
 
     signal_name = "cc_version_changed"
 
-    def __init__(
-        self,
-        db: aiosqlite.Connection,
-        router: Router | None = None,
-        pipeline_getter: object | None = None,
-        memory_store_getter: object | None = None,
-    ) -> None:
+    def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
-        self._router = router
-        # Accept callables that return dependencies (lazy resolution).
-        # This avoids init ordering issues — outreach/memory may not be
-        # ready yet when the learning subsystem is constructed.
-        self._pipeline_getter = pipeline_getter
-        self._memory_store_getter = memory_store_getter
 
     async def collect(self) -> SignalReading:
         now = datetime.now(UTC).isoformat()
@@ -81,12 +82,15 @@ class CCVersionCollector:
         if current != last_known:
             try:
                 await self._store_version_change(last_known, current)
-                await self._analyze_update(last_known, current)
             except Exception:
                 logger.warning(
-                    "Failed to store/analyze CC version change %s -> %s",
+                    "Failed to store CC version change %s -> %s",
                     last_known, current, exc_info=True,
                 )
+            # NO impact analysis here, by design — see the class docstring. The
+            # version_change observation above is the durable record; analysis
+            # belongs to the idempotent/retryable paths (recon_cc_update_check
+            # MCP, the daily pre-eval job), never to this detection tick.
             logger.info("CC version changed: %s -> %s", last_known, current)
             return SignalReading(
                 name=self.signal_name,
@@ -262,28 +266,3 @@ class CCVersionCollector:
             return tuple(int(x) for x in m.group().split(".")) if m else ()
 
         return _parse(candidate) > _parse(baseline)
-
-    async def _analyze_update(self, old: str, new: str) -> None:
-        """Run CCUpdateAnalyzer to fetch changelog and classify impact.
-
-        Best-effort: if analysis fails or times out, the version change
-        observation is already stored and the signal still fires.
-        """
-        try:
-            from genesis.recon.cc_update_analyzer import CCUpdateAnalyzer
-
-            pipeline = self._pipeline_getter() if callable(self._pipeline_getter) else None
-            memory_store = self._memory_store_getter() if callable(self._memory_store_getter) else None
-            analyzer = CCUpdateAnalyzer(
-                db=self._db, router=self._router,
-                pipeline=pipeline, memory_store=memory_store,
-            )
-            result = await asyncio.wait_for(analyzer.analyze(old, new), timeout=30)
-            logger.info(
-                "CC update analysis complete: %s → %s [%s]",
-                old, new, result.get("impact", "unknown"),
-            )
-        except TimeoutError:
-            logger.warning("CC update analysis timed out for %s → %s", old, new)
-        except Exception:
-            logger.warning("CC update analysis failed", exc_info=True)

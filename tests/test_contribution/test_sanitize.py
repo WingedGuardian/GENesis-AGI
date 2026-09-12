@@ -13,6 +13,13 @@ import pytest
 from genesis.contribution import sanitize
 from genesis.contribution.findings import FindingKind, Severity
 
+# Captured at import time — BEFORE the autouse stub below patches them — so a
+# test can restore the genuine binary lookup + subprocess runner and exercise
+# the REAL detect-secrets CLI. The `--string` argv bug lives in argparse and is
+# invisible to a mocked subprocess.
+_REAL_WHICH = sanitize.shutil.which
+_REAL_RUN = sanitize.subprocess.run
+
 
 @pytest.fixture(autouse=True)
 def no_external_scanners(monkeypatch):
@@ -46,6 +53,10 @@ def no_external_scanners(monkeypatch):
 
     monkeypatch.setattr(sanitize.shutil, "which", mock_which)
     monkeypatch.setattr(sanitize.subprocess, "run", mock_run)
+    # The floor now resolves the binary PATH-independently (venv-relative), so
+    # cmd[0] would be an absolute path and bypass the mock_run guard above. Pin
+    # the resolver to the bare name so the stub keeps intercepting.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: "detect-secrets")
 
 
 @pytest.fixture
@@ -103,9 +114,9 @@ def test_forbidden_secrets_env_blocks():
 
 def test_forbidden_research_profiles_blocks():
     diff = (
-        "diff --git a/config/research-profiles/jay.yaml b/config/research-profiles/jay.yaml\n"
-        "--- a/config/research-profiles/jay.yaml\n"
-        "+++ b/config/research-profiles/jay.yaml\n"
+        "diff --git a/config/research-profiles/example.yaml b/config/research-profiles/example.yaml\n"
+        "--- a/config/research-profiles/example.yaml\n"
+        "+++ b/config/research-profiles/example.yaml\n"
         "@@ -1 +1 @@\n+topic: foo\n"
     )
     r = sanitize.scan_diff(diff)
@@ -137,7 +148,7 @@ def test_portability_ip_blocks():
     diff = (
         "diff --git a/config.py b/config.py\n"
         "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n"
-        "+OLLAMA_URL = 'http://10.176.34.199:11434'\n"
+        "+OLLAMA_URL = 'http://10.0.0.1:11434'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -148,19 +159,24 @@ def test_portability_home_path_blocks():
     diff = (
         "diff --git a/x.py b/x.py\n"
         "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
-        "+path = '/home/ubuntu/genesis/data/genesis.db'\n"
+        "+path = '/home/alice/genesis/data/genesis.db'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
 
 
-def test_portability_timezone_blocks():
+def test_bare_timezone_not_a_portability_class():
+    """A timezone is NOT a generic portability class — it is an install-specific
+    EXACT value handled by the fingerprint layer, not hardcoded here (a public
+    scanner must not name this install's timezone). A bare IANA zone must pass
+    portability so contributions using ordinary timezones are not over-blocked."""
     diff = (
         "diff --git a/t.py b/t.py\n"
-        "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n+TZ = 'America/New_York'\n"
+        "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n+TZ = 'Europe/Berlin'\n"
     )
-    r = sanitize.scan_diff(diff)
-    assert r.ok is False
+    r = sanitize.scan_diff(diff, fingerprint_file=None)
+    # No fingerprint file present in the test env → no BLOCK from a bare zone.
+    assert not any(f.kind == FindingKind.PORTABILITY for f in r.findings)
 
 
 def test_portability_only_scans_added_lines():
@@ -168,8 +184,8 @@ def test_portability_only_scans_added_lines():
     diff = (
         "diff --git a/x.py b/x.py\n"
         "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
-        "-TZ = 'America/New_York'\n"
-        "+TZ = 'UTC'\n"
+        "-HOST = '10.0.0.1'\n"
+        "+HOST = 'localhost'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is True
@@ -179,7 +195,7 @@ def test_email_blocks_personal():
     diff = (
         "diff --git a/README.md b/README.md\n"
         "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n"
-        "+Contact: jay@somedomain.org\n"
+        "+Contact: someone@somedomain.org\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -240,7 +256,7 @@ def test_multi_file_diff_all_scanned():
     diff = (
         "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+ok_line\n"
         "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n"
-        "+IP = '10.176.34.199'\n"
+        "+IP = '10.0.0.1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -248,24 +264,26 @@ def test_multi_file_diff_all_scanned():
     assert any(f.file == "b.py" for f in blocking)
 
 
-def test_wingedguardian_blocks():
+def test_repo_name_caught_via_fingerprint_not_portability(tmp_path):
+    """Private repo names are EXACT install values handled by the fingerprint
+    layer, NOT a generic portability class. (A bounded pattern for a private
+    repo whose name is a prefix of the public repo would mass-false-positive on
+    the public one — so it must never be hardcoded here.) Without a fingerprint
+    the repo-name string passes portability; with one it blocks via fingerprint."""
     diff = (
         "diff --git a/x.md b/x.md\n"
-        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see WingedGuardian/Genesis for more\n"
+        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see ExampleOrg/PrivateThing for more\n"
     )
-    r = sanitize.scan_diff(diff)
-    assert r.ok is False
+    # No fingerprint → a repo-name string is not a portability class → allowed.
+    r = sanitize.scan_diff(diff, fingerprint_file=tmp_path / "none.txt")
+    assert not any(f.kind == FindingKind.PORTABILITY for f in r.findings)
 
-
-def test_wingedguardian_public_allowed():
-    # The public repo name (GENesis-AGI) shouldn't match the private regex
-    diff = (
-        "diff --git a/x.md b/x.md\n"
-        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see WingedGuardian/GENesis-AGI\n"
-    )
-    r = sanitize.scan_diff(diff)
-    # The portability regex specifically matches private repo names
-    assert r.ok is True
+    # With a fingerprint listing the private repo → blocked via the fingerprint.
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text(r"\bExampleOrg/PrivateThing\b" + "\n")
+    r2 = sanitize.scan_diff(diff, fingerprint_file=fp)
+    assert r2.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r2.blocking())
 
 
 def test_protected_paths_yaml_loaded(tmp_path, clean_diff):
@@ -300,7 +318,7 @@ def test_parse_diff_dev_null_target():
 def test_findings_include_severity():
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.176.34.199\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.0.0.1\n"
     )
     r = sanitize.scan_diff(diff)
     assert all(f.severity == Severity.BLOCK for f in r.blocking())
@@ -328,7 +346,8 @@ def test_detect_secrets_runs_when_available(clean_diff, monkeypatch):
 def test_detect_secrets_missing_is_blocking_p1_1(clean_diff, monkeypatch):
     """P1-1 regression: missing detect-secrets binary must fail CLOSED,
     not silently skip. This is the sanitizer's required floor."""
-    monkeypatch.setattr(sanitize.shutil, "which", lambda name: None)
+    # Resolution is now PATH-independent, so drive the resolver, not shutil.which.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: None)
     r = sanitize.scan_diff(clean_diff)
     assert r.ok is False
     blocking = r.blocking()
@@ -336,6 +355,47 @@ def test_detect_secrets_missing_is_blocking_p1_1(clean_diff, monkeypatch):
         f.scanner == "detect-secrets" and f.detail == "missing_binary"
         for f in blocking
     ), f"expected missing_binary block, got: {blocking}"
+
+
+def test_detect_secrets_oversized_line_fails_closed(clean_diff, monkeypatch):
+    """E2BIG regression: a single added line over Linux MAX_ARG_STRLEN (~128 KB)
+    makes `detect-secrets scan --string <text>` raise OSError from execve. The
+    required floor must fail CLOSED (scan_error BLOCK), not propagate an uncaught
+    OSError that would let the line pass unscanned. (Verify-RED: reverting the
+    OSError addition to the except tuple makes this raise instead of BLOCK.)"""
+
+    def raise_e2big(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise OSError(7, "Argument list too long")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    # autouse fixture pins _resolve_detect_secrets -> "detect-secrets", so
+    # cmd[0] == "detect-secrets" here.
+    monkeypatch.setattr(sanitize.subprocess, "run", raise_e2big)
+    r = sanitize.scan_diff(clean_diff)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    ), f"expected scan_error BLOCK on OSError, got: {r.blocking()}"
+
+
+def test_detect_secrets_nul_byte_line_fails_closed(clean_diff, monkeypatch):
+    """A NUL byte in an added line makes `subprocess.run(..., text=True)` raise
+    ValueError('embedded null byte') from execve — NOT an OSError. The required
+    floor must still fail CLOSED (scan_error BLOCK). (Verify-RED: an enumerated
+    OSError-only except tuple lets this ValueError propagate uncaught.)"""
+
+    def raise_nul(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise ValueError("embedded null byte")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", raise_nul)
+    r = sanitize.scan_diff(clean_diff)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    ), f"expected scan_error BLOCK on ValueError, got: {r.blocking()}"
 
 
 def test_rename_only_forbidden_path_blocks_codex_p1():
@@ -525,35 +585,311 @@ def test_portability_non_cgnat_100_allowed():
     assert r.ok is True
 
 
-def test_portability_tailscale_ipv6_blocks():
-    """Tailscale IPv6 (fd7a: ULA prefix) must be blocked pre-push."""
+def test_portability_ipv6_ula_blocks():
+    """Any IPv6 ULA (fc00::/7) prefix must be blocked pre-push — generic class,
+    not this install's specific fdXX: prefixes."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd7a:115c:a1e0::1'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd00::1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
     assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
 
 
-def test_portability_10_176_range_blocks():
-    """Any 10.176.x.x address (not just the two legacy literals) must block."""
+def test_portability_10_8_range_blocks():
+    """Any 10.0.0.0/8 address must block — the generic class, a strict superset
+    of the former install-specific 10.x literals."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.176.99.42'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.0.0.1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
     assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
 
 
-def test_portability_fd7a_requires_colon_no_false_positive():
-    r"""`\bfd7a:` should match Tailscale IPv6 (fd7a:...) but NOT an unrelated
-    hex token that merely contains 'fd7a' without the trailing colon (e.g. a
-    commit hash), so the floor doesn't over-block legitimate content."""
+def test_portability_ula_requires_colon_no_false_positive():
+    r"""The ULA class `[fF][cdCD][0-9a-fA-F]{2}:` should match an IPv6 ULA
+    (fd00:...) but NOT an unrelated hex token that merely starts with fdXX
+    without the trailing colon (e.g. a commit hash), so the floor doesn't
+    over-block legitimate content."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HASH = 'fd7abeefcafe0123'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HASH = 'fdcafe0123beef45'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is True
+
+
+# --- PR 2: generic-class parity + false-positive guards ---------------------
+
+def _portability_blocks(value: str, tmp_path) -> bool:
+    """True iff `value` triggers a PORTABILITY finding, with the fingerprint
+    layer disabled (nonexistent file) so ONLY the generic classes are exercised."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        f"--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+V = '{value}'\n"
+    )
+    r = sanitize.scan_diff(diff, fingerprint_file=tmp_path / "no-fp.txt")
+    return any(f.kind == FindingKind.PORTABILITY for f in r.findings)
+
+
+def test_class_sweep_rfc1918_and_ula_fully_covered(tmp_path):
+    """Every former install-specific literal is a member of its class — proven
+    by sweeping representative octets across the FULL range of each class
+    (endpoints + interior), so any specific subnet is trivially inside. Values
+    are generic sweep points, not this install's literals."""
+    for b in (0, 1, 128, 255):            # full 10.0.0.0/8 second-octet spread
+        assert _portability_blocks(f"10.{b}.3.4", tmp_path)
+    for b in (0, 128, 255):               # full 192.168.0.0/16 third-octet spread
+        assert _portability_blocks(f"192.168.{b}.9", tmp_path)
+    for b in (16, 24, 31):                # 172.16.0.0/12 valid second octet
+        assert _portability_blocks(f"172.{b}.0.1", tmp_path)
+    for pfx in ("fc00", "fcff", "fd00", "fdff"):   # fc00::/7 ULA endpoints
+        assert _portability_blocks(f"{pfx}::1", tmp_path)
+
+
+def test_class_false_positive_guards(tmp_path):
+    """Generic classes must NOT flag RFC 5737 doc ranges, public 172 outside
+    16..31, non-CGNAT 100.x, or a bare fdXX hex token without a colon."""
+    for v in ("192.0.2.1", "198.51.100.7", "203.0.113.9"):   # RFC 5737
+        assert not _portability_blocks(v, tmp_path)
+    for v in ("172.15.0.1", "172.32.0.1", "172.1.2.3"):      # public 172
+        assert not _portability_blocks(v, tmp_path)
+    assert not _portability_blocks("100.200.5.5", tmp_path)   # non-CGNAT 100.x
+    assert not _portability_blocks("fdcafe0123beef45", tmp_path)  # no colon
+
+
+def test_fingerprint_missing_file_warns(tmp_path, clean_diff):
+    """A missing fingerprint file surfaces a non-blocking WARN (provisioning
+    gap) rather than silently skipping — but never BLOCKs on that alone."""
+    r = sanitize.scan_diff(clean_diff, fingerprint_file=tmp_path / "absent.txt")
+    assert r.ok is True
+    assert any(
+        f.kind == FindingKind.FINGERPRINT and f.severity == Severity.WARN
+        for f in r.findings
+    )
+    # The scan did NOT run, so it must not be reported as executed.
+    assert "fingerprint" not in r.scanners_run
+
+
+# ── scan_prose: fail-closed sanitizer for free-text (issue bodies, etc.) ──────
+#
+# The Contributor Work-Log pipeline sanitizes PROSE (a drafted GitHub issue
+# title+body), not a unified diff. scan_diff() CANNOT be reused for that — it
+# routes everything through parse_diff(), which only keeps lines prefixed with
+# `+` under a `+++ b/<path>` header. Plain prose has neither, so parse_diff
+# yields ZERO added_lines → zero findings → ok=True: a FAIL-OPEN path through a
+# fail-CLOSED component. scan_prose() runs the raw-string detectors
+# (portability, emails, fingerprints, detect-secrets) directly on every line,
+# preserving the fail-closed `ok` contract.
+
+
+def test_scan_diff_fails_open_on_prose(tmp_path):
+    """Characterization: scan_diff() on plain prose sees no diff `+` lines, so
+    a private IP + home path sail through as ok=True. This is exactly the
+    fail-open hole scan_prose() exists to close — the paired proof below shows
+    scan_prose() BLOCKs the same text."""
+    prose = "Reach the box at 10.1.2.3 or look under /home/alice/genesis/data."
+    r = sanitize.scan_diff(prose, fingerprint_file=tmp_path / "no-fp.txt")
+    assert r.ok is True  # <-- the bug, pinned: prose is invisible to scan_diff
+
+
+def test_scan_prose_blocks_private_ip(tmp_path):
+    r = sanitize.scan_prose(
+        "Reach the box at 10.1.2.3 to reproduce.",
+        fingerprint_file=tmp_path / "no-fp.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_scan_prose_blocks_home_path(tmp_path):
+    r = sanitize.scan_prose(
+        "The config lives at /home/alice/genesis/config.yaml on the box.",
+        fingerprint_file=tmp_path / "no-fp.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_scan_prose_clean_ok(tmp_path):
+    """Genuinely portable technical prose — the kind a good-first-issue body
+    would contain — passes clean."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty: scan_prose fails closed on a MISSING file
+    r = sanitize.scan_prose(
+        "In `src/genesis/parser.py` the `chunk()` helper drops the last token "
+        "when the input has no trailing newline. Add a test and fix the "
+        "off-by-one. Good first issue.",
+        fingerprint_file=fp,
+    )
+    assert r.ok is True
+    assert r.blocking() == []
+
+
+def _use_real_detect_secrets(monkeypatch):
+    """Override the autouse stub so the REAL detect-secrets binary runs.
+
+    The `--string` argv bug lives in argparse's handling of the invocation, so
+    a mocked subprocess cannot exercise it — these tests must hit the real CLI.
+    detect-secrets is a core dependency (pyproject), so it is present in CI;
+    skip defensively if it is genuinely absent."""
+    real = _REAL_WHICH("detect-secrets")
+    if not real:
+        pytest.skip("detect-secrets binary not installed")
+    monkeypatch.setattr(
+        sanitize.shutil,
+        "which",
+        lambda name: real
+        if name == "detect-secrets"
+        else (None if name in ("gitleaks", "betterleaks") else _REAL_WHICH(name)),
+    )
+    monkeypatch.setattr(sanitize.subprocess, "run", _REAL_RUN)
+
+
+def test_scan_prose_markdown_dash_lines_not_falsely_blocked(tmp_path, monkeypatch):
+    """Regression: a Markdown horizontal rule (`---`) or a `--flag` line in a
+    contributor issue body must NOT trip a spurious detect-secrets fail-closed
+    BLOCK. Before the fix, `detect-secrets scan --string ---` made argparse read
+    `---` as an unknown option (exit 2), which the nonzero-exit path turned into
+    a BLOCK. Uses the real binary — the mocked subprocess hides this bug."""
+    _use_real_detect_secrets(monkeypatch)
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty (a MISSING file fails closed)
+    body = (
+        "Add a SQLite fallback to the loader.\n\n"
+        "---\n\n"
+        "Run the tool with `--verbose` to see the trace.\n"
+    )
+    r = sanitize.scan_prose(body, fingerprint_file=fp)
+    assert r.ok is True, [f"{f.scanner}:{f.message}" for f in r.blocking()]
+    assert r.blocking() == []
+
+
+def test_scan_prose_secret_on_dash_leading_token_still_detected(tmp_path, monkeypatch):
+    """Fail-open guard for the `--string=VALUE` fix. The secret sits on a SINGLE,
+    dash-LEADING token (`-AKIA…`) — exactly the shape argparse misread as an
+    option under the old `--string VALUE` form (exit 2 → crash). We assert the
+    genuine-detection finding ('Potential secret …'), NOT merely `ok is False`:
+    the crash path ALSO yields `ok is False` (fail-closed BLOCK, message
+    'exited N …'), so only the message distinguishes a real scan from the old
+    misparse. Under the old form this assertion fails (message is the crash
+    text); under the fix it passes (AWSKeyDetector genuinely fires)."""
+    _use_real_detect_secrets(monkeypatch)
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")
+    # Leading '-' → one argv token the pre-fix form rejected as an unknown option.
+    body = "Example (never paste real keys):\n\n-AKIAIOSFODNN7EXAMPLE\n"
+    r = sanitize.scan_prose(body, fingerprint_file=fp)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and "Potential secret" in f.message
+        for f in r.blocking()
+    ), [f"{f.scanner}:{f.message}" for f in r.blocking()]
+
+
+def test_scan_prose_blocks_personal_email(tmp_path):
+    r = sanitize.scan_prose(
+        "Ping alice.jones@gmail.com for context.",
+        fingerprint_file=tmp_path / "no-fp.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.EMAIL for f in r.blocking())
+
+
+def test_scan_prose_blocks_fingerprint(tmp_path):
+    """Install-specific literals (host names, private repo) are caught only by
+    the fingerprint layer — scan_prose must run it when the file is present."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("SecretHostName\n")
+    r = sanitize.scan_prose(
+        "The failure only reproduces on SecretHostName after a reboot.",
+        fingerprint_file=fp,
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking())
+
+
+def test_scan_prose_scans_all_lines_not_just_first(tmp_path):
+    """A multi-paragraph body must be scanned in full — a leak on line 3 (not
+    the first line) is still caught. This is the precise property scan_diff
+    loses on prose."""
+    body = (
+        "## Summary\n"
+        "The digest table renders wrong when a cell has a pipe.\n"
+        "Seen live on 192.168.1.50 during testing.\n"
+        "## Steps\n"
+        "1. Add an inbox item with a `|`.\n"
+    )
+    r = sanitize.scan_prose(body, fingerprint_file=tmp_path / "no-fp.txt")
+    assert r.ok is False
+    assert any(
+        f.kind == FindingKind.PORTABILITY and f.line == 3 for f in r.blocking()
+    )
+
+
+def test_scan_prose_detect_secrets_missing_fails_closed(tmp_path):
+    """detect-secrets is the required floor — if the binary is absent, the
+    prose scan fails CLOSED (ok=False), never open."""
+    # Resolution is PATH-independent now; force the resolver (not shutil.which) to
+    # None to simulate the absent binary, overriding the autouse fixture's pin.
+    with patch.object(sanitize, "_resolve_detect_secrets", return_value=None):
+        r = sanitize.scan_prose(
+            "totally benign text", fingerprint_file=tmp_path / "no-fp.txt"
+        )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.SECRET for f in r.blocking())
+
+
+def test_scan_prose_missing_fingerprint_fails_closed(tmp_path):
+    """scan_prose is the TERMINAL egress guard (no CI backstop like scan_diff,
+    whose PR output CI re-scans), so a MISSING fingerprint file fails CLOSED —
+    install-specific literals cannot be scanned, so the draft must not egress."""
+    r = sanitize.scan_prose(
+        "totally benign text",
+        fingerprint_file=tmp_path / "does-not-exist.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking())
+
+
+def test_scan_prose_detect_secrets_scan_error_fails_closed(tmp_path, monkeypatch):
+    """If the required detect-secrets floor ERRORS on a line (timeout / nonzero
+    exit), scan_prose fails CLOSED — the old `continue` was a fail-OPEN hole in
+    a fail-CLOSED component."""
+    import subprocess as _sp
+
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")
+
+    def boom(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise _sp.TimeoutExpired(cmd, 5)
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", boom)
+    r = sanitize.scan_prose("a line that cannot be scanned", fingerprint_file=fp)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    )
+
+
+def test_scan_prose_skips_diff_structural_scanners(tmp_path):
+    """scan_prose runs ONLY the raw-string detectors — the diff-structural
+    scanners (forbidden-path, gitignore, binary, size) are meaningless on prose
+    and must not run."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty (missing file fails closed)
+    r = sanitize.scan_prose(
+        "A clean sentence about `parser.py`.", fingerprint_file=fp
+    )
+    assert r.ok is True
+    for structural in ("forbidden_paths", "gitignored_paths", "binary_check", "size_cap"):
+        assert structural not in r.scanners_run
+    # ...but the raw-string detectors DID run.
+    assert "portability" in r.scanners_run
+    assert "email_allowlist" in r.scanners_run
+    assert "detect-secrets" in r.scanners_run

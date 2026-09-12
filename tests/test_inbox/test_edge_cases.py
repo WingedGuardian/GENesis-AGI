@@ -701,6 +701,43 @@ async def test_modified_file_only_sends_delta(
 
 
 @pytest.mark.asyncio
+async def test_bracket_directive_renders_on_second_delta_eval(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """Regression: a standing [ ... ] directive must reach the SECOND (delta)
+    evaluation even though the baseline union drops it, while the delta itself
+    still carries only the genuinely-new line.
+
+    The exact previously-broken case: the directive was seen on eval #1, folded
+    into the baseline, then stripped from every later delta so the evaluator
+    never saw the build intent again."""
+    f = inbox_dir / "New Genesis Capabilities.md"
+    f.write_text(
+        "[If it's in here, default to building it]\nhttps://example.com/first\n"
+    )
+    result1 = await monitor.check_once()
+    assert result1.batches_dispatched == 1
+
+    mock_invoker.run.reset_mock()
+    mock_invoker.run.return_value = _success_output("eval of second")
+    f.write_text(
+        "[If it's in here, default to building it]\n"
+        "https://example.com/first\n\n"
+        "https://example.com/second\n"
+    )
+    result2 = await monitor.check_once()
+    assert result2.batches_dispatched == 1
+
+    call_args = mock_invoker.run.call_args
+    prompt = call_args.args[0].prompt if call_args.args else call_args.kwargs.get("prompt", "")
+    # Delta behavior intact: only the new URL, not the old one.
+    assert "example.com/second" in prompt
+    assert "example.com/first" not in prompt
+    # The fix: the standing directive is re-injected on the delta eval.
+    assert "default to building it" in prompt
+    assert "Standing bracketed lines" in prompt
+
+@pytest.mark.asyncio
 async def test_modified_file_no_new_content_skipped(
     monitor, inbox_dir, mock_invoker, db,
 ):
@@ -779,6 +816,85 @@ async def test_no_triage_pipeline_still_works(
     result = await monitor.check_once()
     assert result.batches_dispatched == 1
     assert result.errors == []
+
+
+@pytest.mark.asyncio
+async def test_eval_memory_persistence_fired_after_evaluation(
+    db, mock_invoker, mock_session_manager, config, writer, tmp_path, inbox_dir,
+    monkeypatch,
+):
+    """With router+store wired, a successful batch fires deterministic
+    eval-memory persistence over the OUTPUT text (detached, fire-and-forget)."""
+    called = {}
+
+    async def _fake(**kwargs):
+        called.update(kwargs)
+        return 1
+
+    monkeypatch.setattr(
+        "genesis.inbox.eval_memory.extract_and_store_eval_memories", _fake
+    )
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer,
+        clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
+        prompt_dir=tmp_path, router=object(), memory_store=object(),
+    )
+    (inbox_dir / "test.md").write_text("https://example.com")
+    result = await mon.check_once()
+    assert result.batches_dispatched == 1
+
+    await asyncio.sleep(0.05)  # let the fire-and-forget task run
+    assert called, "eval-memory persistence was not fired"
+    assert called.get("evaluation_text")  # the curated output text
+    # Provenance: the CC-generated session id (output.session_id) is forwarded,
+    # not the internal cc_sessions.id — so memories link to the real transcript.
+    assert called.get("session_id") == "cc-sess-1"
+
+
+@pytest.mark.asyncio
+async def test_eval_memory_failure_does_not_crash_monitor(
+    db, mock_invoker, mock_session_manager, config, writer, tmp_path, inbox_dir,
+    monkeypatch,
+):
+    """Eval-memory persistence failure must never fail the batch or baseline."""
+
+    async def _boom(**kwargs):
+        raise RuntimeError("persist boom")
+
+    monkeypatch.setattr(
+        "genesis.inbox.eval_memory.extract_and_store_eval_memories", _boom
+    )
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer,
+        clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
+        prompt_dir=tmp_path, router=object(), memory_store=object(),
+    )
+    (inbox_dir / "test.md").write_text("some content")
+    result = await mon.check_once()
+    assert result.batches_dispatched == 1
+    assert result.errors == []
+    await asyncio.sleep(0.05)  # let the detached failing task run (must not raise)
+
+
+@pytest.mark.asyncio
+async def test_no_router_skips_eval_memory(monitor, inbox_dir, monkeypatch):
+    """The default monitor (no router/store wired) never attempts eval-memory."""
+    called = {"n": 0}
+
+    async def _fake(**kwargs):
+        called["n"] += 1
+        return 0
+
+    monkeypatch.setattr(
+        "genesis.inbox.eval_memory.extract_and_store_eval_memories", _fake
+    )
+    (inbox_dir / "test.md").write_text("content")
+    result = await monitor.check_once()
+    assert result.batches_dispatched == 1
+    await asyncio.sleep(0.05)
+    assert called["n"] == 0
 
 
 # ── Invoker stdin edge cases ──────────────────────────────────────────

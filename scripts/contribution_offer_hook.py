@@ -8,8 +8,9 @@ Runs on every user prompt via .claude/settings.json. Hot path:
    system-reminder to stdout, unlink the marker.
 3. Exit 0. Fail-open on all errors.
 
-Budget: 500ms hook timeout configured in .claude/settings.json. Real cost
-should be <5ms even when pending offers exist. No network, no heavy I/O.
+Budget: 10s hook timeout configured in .claude/settings.json (CC hook timeouts
+are in seconds). Real cost should be <5ms even when pending offers exist. No
+network, no heavy I/O.
 
 Stdlib only — no Genesis imports, no venv required.
 """
@@ -57,7 +58,9 @@ def _load_marker(marker: Path) -> dict | None:
 
 def _format_reminder(marker_data: dict) -> str:
     sha = str(marker_data.get("sha", "unknown"))[:12]
-    subject = str(marker_data.get("subject", "<unknown subject>"))
+    # Sliced: a git commit subject has no length limit, and this hook is exempt
+    # from the bounding gate on the claim that its output cannot reach the cap.
+    subject = str(marker_data.get("subject", "<unknown subject>"))[:200]
     return (
         f"[Contribution] A 'fix:' commit just landed ({sha} \"{subject}\"). "
         f"Per the contribution pipeline, proactively offer the user "

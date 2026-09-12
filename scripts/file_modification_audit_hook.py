@@ -15,13 +15,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-# genesis.db location — same as genesis.env.genesis_db_path()
-_DB_PATH = Path.home() / "genesis" / "data" / "genesis.db"
+# genesis.db location — same as genesis.env.genesis_db_path(). GENESIS_DB_PATH
+# override exists for tests/verification only (mirror of edit_failure_sensor.py);
+# production hooks rely on the default. Keep this script stdlib-only.
+_DB_PATH = Path(
+    os.environ.get("GENESIS_DB_PATH", "") or Path.home() / "genesis" / "data" / "genesis.db"
+).expanduser()  # honor ~/... overrides like genesis.env.genesis_db_path()
+
+# Cap the file read for the post-edit hash: a multi-MB Write/Edit target would
+# otherwise be slurped whole into memory on the PostToolUse path. Over the cap
+# the hash is left NULL (the column is nullable and has no readers — the table
+# is the dead CC-tool audit trail), so the audit row is still written.
+_MAX_HASH_BYTES = 5 * 1024 * 1024
 
 
 def main() -> None:
@@ -60,7 +71,7 @@ def _process(data: dict) -> None:
     file_hash = None
     try:
         p = Path(file_path)
-        if p.exists() and p.is_file():
+        if p.exists() and p.is_file() and p.stat().st_size <= _MAX_HASH_BYTES:
             file_hash = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
     except (OSError, PermissionError):
         pass

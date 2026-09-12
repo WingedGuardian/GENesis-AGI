@@ -52,6 +52,30 @@ def test_load_bridge_config_invalid_uids_returns_none(secrets_file):
     assert _load_bridge_config() is None
 
 
+def test_invalid_uid_is_not_logged_verbatim(caplog):
+    """A non-numeric TELEGRAM_ALLOWED_USERS entry (e.g. a bot token mis-pasted
+    into the field) must NOT be echoed to logs — only its position (CodeQL
+    py/clear-text-logging-sensitive-data, alert #160)."""
+    import logging
+
+    from genesis.channels.bridge_config import build_bridge_config
+
+    sensitive = "123456:AA_secret_bot_token_value"
+    with caplog.at_level(logging.WARNING):
+        result = build_bridge_config(
+            {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALLOWED_USERS": sensitive},
+            log=logging.getLogger("test.bridge_config"),
+        )
+    assert result is None  # no valid numeric users
+    # The raw (possibly-secret) entry must never appear in log output.
+    assert sensitive not in caplog.text
+    assert "secret_bot_token" not in caplog.text
+    # A position-based diagnostic is still emitted.
+    assert any(
+        "not a numeric user ID" in r.getMessage() for r in caplog.records
+    )
+
+
 def test_load_bridge_config_missing_token_returns_none(secrets_file):
     """Missing token → None (headless mode), not SystemExit."""
     secrets_file.write_text('SOME_KEY=value\n')

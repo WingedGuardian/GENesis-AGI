@@ -1,0 +1,54 @@
+# Career-outreach monitor — operator lever.
+# Semantics: src/genesis/recon/career_outreach_config.py
+#
+# This monitor drives a configured external career-agent module to run
+# job-outreach discovery and stage first-touch DRAFTS, then nudges the owner to
+# review + send. It NEVER sends mail itself — the external module stages drafts
+# into the owner's mail Drafts and the owner clicks Send (draft-and-hold).
+#
+# mode: off | observe | live
+#   off     — monitor does not run. SHIPPED DEFAULT (an actuator stays inert
+#             until the owner opts in).
+#   observe — resolve + seed state, NEVER dispatch a draft-staging run or nudge
+#             (flip off -> observe to seed silently, then observe -> live).
+#   live    — drive due discovery + up to max_auto_runs_per_tick draft-staging
+#             runs, then nudge the owner when NEW drafts were staged.
+#
+# Env kill switch: GENESIS_CAREER_OUTREACH_DISABLED=1 forces off.
+# Install-specific knobs (module names, targeting) belong in the gitignored
+# career_outreach.local.yaml overlay, never here.
+enabled: true
+mode: off
+reasoning_module: ""   # set your career-agent module's name in career_outreach.local.yaml
+max_auto_runs_per_tick: 3
+# Per-dispatch bridge timeout (seconds). The auto-run drives the engine's COMPLETE
+# gated flow (research -> draft -> verify -> stage), measured ~5.5 min live. Default
+# 900 covers it. Capped at 1800 here; the SSH adapter also clamps to a 3600 ceiling.
+dispatch_timeout_s: 900
+# Per-dispatch --max-turns for the agentic auto-run (the read dispatch keeps the ipc
+# default of 25). The gated flow needs >25 turns (measured 42). Capped at 200.
+dispatch_max_turns: 80
+# autorun_note: appended to the AUTO-RUN prompt only (never the read prompt). Ships
+# empty; put any install-specific gate guidance in career_outreach.local.yaml.
+autorun_note: ""
+
+# ── Bite-relay: an INDEPENDENT lever for a pure READ + owner-nudge when a company
+# advances through the external pipeline (in_conversation / interviewing / offer).
+# Decoupled from the auto-run above — no CLI dispatch, no outreach send — so it can run
+# `live` while `mode` stays gated.
+# bite_relay_mode: off | observe | live
+#   off     — the bite-relay does not run. SHIPPED DEFAULT.
+#   observe — READ the pipeline and SEED the dedup ledger (mark current advances as
+#             already-seen), but NEVER nudge (flip off -> observe to seed, then -> live).
+#   live    — read, diff against the ledger, nudge the owner on a NEW advance.
+bite_relay_mode: off
+# data_module: name of the external DATA module (a structured HTTP read exposing a
+# `pipeline` op — distinct from reasoning_module's SSH dispatch). Ships EMPTY; set the
+# install's module name in the gitignored career_outreach.local.yaml.
+#   While bite_relay_mode is `off` (the shipped default) an empty/absent data_module is a
+#   clean no-op — the relay never runs, and job health stays untouched.
+#   Once bite_relay_mode is `observe` or `live`, a data_module that is empty or does not
+#   resolve to a loaded module is a MISCONFIG: an enabled relay that can deliver nothing
+#   records a job-health FAILURE rather than a green no-op. Set data_module in the SAME
+#   step as enabling the lever.
+data_module: ""

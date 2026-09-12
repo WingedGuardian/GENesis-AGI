@@ -448,6 +448,52 @@ class TestWS10ContentLoss:
         assert kwargs.get("current_content") == "the full current SKILL.md content", \
             f"pipeline must pass current_content so the consistency check can run; kwargs={kwargs}"
 
+    @pytest.mark.asyncio
+    async def test_run_suppresses_when_unresolved_proposal_pending(self, db):
+        """Dampening: a skill with an unresolved proposal is not re-proposed."""
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import observations
+
+        await observations.create(
+            db, id="pend1", source="skill_evolution", type="skill_proposal",
+            category="s", content=json.dumps({"skill_name": "s"}),
+            priority="medium", created_at=datetime.now(UTC).isoformat(),
+        )
+        pipeline = SkillEvolutionPipeline(db=db, router=MagicMock())
+        report = SkillReport(skill_name="s", usage_count=5, success_count=2,
+                             failure_count=3, success_rate=0.4)
+        pipeline._analyzer.analyze_all = AsyncMock(return_value=[report])
+        pipeline._analyzer.needs_review = lambda r: True
+        pipeline._refiner.propose = AsyncMock(
+            side_effect=AssertionError("refiner must not run while a proposal is pending"))
+        import genesis.learning.skills.pipeline as pipeline_mod
+        original_load = pipeline_mod.load_skill
+        pipeline_mod.load_skill = lambda name: "content"
+        try:
+            summary = await pipeline.run()
+        finally:
+            pipeline_mod.load_skill = original_load
+        assert summary["suppressed"] == 1
+        assert summary["proposed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_dampening_uses_exact_category_not_like_wildcard(self, db):
+        """A pending proposal for `user_evaluate` must NOT suppress `user-evaluate`
+        (the `_` is a SQL LIKE wildcard — dampening must use exact match)."""
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import observations
+
+        await observations.create(
+            db, id="uw1", source="skill_evolution", type="skill_proposal",
+            category="user_evaluate", content=json.dumps({"skill_name": "user_evaluate"}),
+            priority="medium", created_at=datetime.now(UTC).isoformat(),
+        )
+        pipeline = SkillEvolutionPipeline(db=db, router=MagicMock())
+        assert await pipeline._has_pending_proposal("user_evaluate") is True
+        assert await pipeline._has_pending_proposal("user-evaluate") is False
+
 
 # ---------------------------------------------------------------------------
 # Applicator tests
@@ -455,11 +501,12 @@ class TestWS10ContentLoss:
 
 class TestApplicator:
     @pytest.mark.asyncio
-    async def test_apply_minor_auto_applies(self, db, tmp_path):
-        # Create a skill directory
+    async def test_apply_minor_stages(self, db, tmp_path):
+        """Propose-only: a MINOR proposal is STAGED, never written to the file."""
         skill_dir = tmp_path / "test-skill"
         skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("old content")
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text("old content")
 
         proposal = SkillProposal(
             skill_name="test-skill",
@@ -469,56 +516,112 @@ class TestApplicator:
         )
 
         applicator = SkillApplicator(autonomy_level=2)
-
-        # Mock validator to pass (this test is about applicator logic, not validation)
         from genesis.learning.skills.types import ValidationResult
         applicator._validator.validate = lambda *a, **kw: ValidationResult(
             passed=True, test_results={}, blocking_failures=[], warnings=[],
         )
 
-        # Patch get_skill_path to use tmp_path
-        import genesis.learning.skills.wiring as wiring_mod
-        original = wiring_mod.get_skill_path
+        result = await applicator.apply(proposal, db, current_content="old content")
 
-        def mock_get_path(name):
-            p = skill_dir / "SKILL.md"
-            return p if p.exists() else None
-
-        wiring_mod.get_skill_path = mock_get_path
-        try:
-            result = await applicator.apply(proposal, db)
-        finally:
-            wiring_mod.get_skill_path = original
-
-        assert result["action"] == "applied"
-        assert (skill_dir / "SKILL.md").read_text() == "new content"
+        assert result["action"] == "staged"
+        # The applicator NEVER writes a skill file.
+        assert skill_file.read_text() == "old content"
 
     @pytest.mark.asyncio
-    async def test_apply_minor_skill_not_found(self, db):
+    async def test_staged_proposal_persists_full_content_and_category(self, db):
+        """A staged proposal carries the FULL proposed content + category=skill_name."""
+        big = "x" * 4000  # larger than the old 500-char preview
+        proposal = SkillProposal(
+            skill_name="test-skill",
+            proposed_content=big,
+            rationale="r",
+            change_size=ChangeSize.MINOR,
+        )
+        applicator = SkillApplicator(autonomy_level=2)
+        from genesis.learning.skills.types import ValidationResult
+        applicator._validator.validate = lambda *a, **kw: ValidationResult(
+            passed=True, test_results={}, blocking_failures=[], warnings=[],
+        )
+        await applicator.apply(proposal, db)
+
+        cursor = await db.execute(
+            "SELECT content, category FROM observations WHERE type='skill_proposal' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        row = dict(await cursor.fetchone())
+        data = json.loads(row["content"])
+        assert data["proposed_content"] == big  # full body, not truncated
+        assert row["category"] == "test-skill"
+
+    @pytest.mark.asyncio
+    async def test_apply_stages_without_path_lookup(self, db):
+        """Regression: the old 'skill not found -> failed' branch is gone.
+
+        apply() never resolves the on-disk skill path or writes a file, so a
+        missing on-disk skill can no longer fail it — it just stages.
+        """
         proposal = SkillProposal(
             skill_name="nonexistent",
             proposed_content="x",
             rationale="r",
             change_size=ChangeSize.MINOR,
         )
-
         applicator = SkillApplicator(autonomy_level=2)
+        from genesis.learning.skills.types import ValidationResult
+        applicator._validator.validate = lambda *a, **kw: ValidationResult(
+            passed=True, test_results={}, blocking_failures=[], warnings=[],
+        )
+        result = await applicator.apply(proposal, db)
+        assert result["action"] == "staged"
 
-        # Mock validator to pass so we test the path-not-found logic
+    @pytest.mark.asyncio
+    async def test_critic_verdict_rides_staged_proposal(self, db, monkeypatch):
+        """A flagged Critic verdict is attached to the proposal + logged (WS1)."""
+        proposal = SkillProposal(
+            skill_name="test-skill",
+            proposed_content="new",
+            rationale="r",
+            change_size=ChangeSize.MINOR,
+        )
+        applicator = SkillApplicator(autonomy_level=2)
         from genesis.learning.skills.types import ValidationResult
         applicator._validator.validate = lambda *a, **kw: ValidationResult(
             passed=True, test_results={}, blocking_failures=[], warnings=[],
         )
 
-        import genesis.learning.skills.wiring as wiring_mod
-        original = wiring_mod.get_skill_path
-        wiring_mod.get_skill_path = lambda _: None
-        try:
-            result = await applicator.apply(proposal, db)
-        finally:
-            wiring_mod.get_skill_path = original
+        async def fake_critic(**kw):
+            return {
+                "verdict": "flagged",
+                "score": 0.15,
+                "rationale": "constraint-strip",
+                "pathologies": ["constraint_stripping"],
+                "change_size": "minor",
+            }
 
-        assert result["action"] == "failed"
+        monkeypatch.setattr(
+            "genesis.learning.skills.skill_edit_critic.run_critic", fake_critic
+        )
+
+        result = await applicator.apply(
+            proposal, db, router=MagicMock(), current_content="old"
+        )
+        assert result["critic_verdict"] == "flagged"
+
+        # verdict rides the proposal, and a flagged proposal is high priority
+        cursor = await db.execute(
+            "SELECT content, priority FROM observations WHERE type='skill_proposal' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        row = dict(await cursor.fetchone())
+        assert json.loads(row["content"])["critic"]["verdict"] == "flagged"
+        assert row["priority"] == "high"
+
+        # WS1 shadow observation also logged, stamped with the skill category
+        cursor = await db.execute(
+            "SELECT category FROM observations WHERE type='skill_edit_critic' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        assert dict(await cursor.fetchone())["category"] == "test-skill"
 
     @pytest.mark.asyncio
     async def test_apply_moderate_staged(self, db):

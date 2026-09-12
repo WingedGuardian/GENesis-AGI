@@ -9,8 +9,12 @@ Install-agnostic: no live retriever, Qdrant, network, or DB.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from genesis.memory import proactive as P
 from genesis.memory.intent import classify_stance
@@ -190,11 +194,6 @@ def test_render_procedure_line_dormant_labeled_unproven():
 # --- full engine wiring (faked deps) ----------------------------------------
 
 
-class _FakeRetriever:
-    async def _embed_query(self, _q):
-        return ([0.1] * 8, True)
-
-
 class _FakeDB:
     async def execute_fetchall(self, sql, params=()):
         s = sql.lower()
@@ -203,9 +202,27 @@ class _FakeDB:
         return []  # memory_links + procedural_memory → nothing
 
 
+# In production retriever._db IS memory_mod._db (same connection object); the fake
+# shares one instance so the invariant holds and _ro_read's no-pool fallback path
+# reads the same rows the engine's own db reads (procedure/bump).
+_FAKE_DB = _FakeDB()
+
+
+class _FakeRetriever:
+    _db = _FAKE_DB
+
+    async def _embed_query(self, _q):
+        return ([0.1] * 8, True)
+
+    async def _ro_read(self, fn, *args, **kwargs):
+        # Mirror HybridRetriever._ro_read's no-pool path (PR-4b): with no pool the
+        # read runs on the shared db, byte-identical to the pre-pool call.
+        return await fn(self._db, *args, **kwargs)
+
+
 class _FakeMod:
     _retriever = _FakeRetriever()
-    _db = _FakeDB()
+    _db = _FAKE_DB
 
     @staticmethod
     def _require_init():
@@ -278,6 +295,51 @@ async def test_proactive_context_end_to_end_faked():
     # Per-stage timings present (values are wall-clock, just assert shape).
     for key in ("embed", "recall", "enrich", "procedure", "total"):
         assert key in resp["timings_ms"]
+
+
+async def test_proactive_context_routes_enrich_breadcrumbs_through_ro_read():
+    """PR-4b: the post-recall ``_enrich`` + ``_breadcrumbs`` reads must run through
+    the retriever's ``_ro_read`` pool seam, not straight on the shared write
+    connection — otherwise they keep queuing behind server writes (the residual
+    PR-4b targets). Regression guard against reverting to bare ``_enrich(db, …)``.
+    """
+    routed: list[str] = []
+
+    class _SpyRetriever(_FakeRetriever):
+        async def _ro_read(self, fn, *args, **kwargs):
+            routed.append(fn.__name__)
+            return await fn(self._db, *args, **kwargs)
+
+    class _SpyMod:
+        _retriever = _SpyRetriever()
+        _db = _FAKE_DB
+
+        @staticmethod
+        def _require_init():
+            return None
+
+    delivered = [
+        {
+            "memory_id": "aaaaaaaa1111",
+            "content": "a delivered memory",
+            "collection": "episodic_memory",
+            "memory_class": "fact",
+            "origin_class": None,
+            "source_pipeline": None,
+            "score": 0.1,
+            "payload": {"wing": "voice"},
+            "via_graph": False,
+        }
+    ]
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_SpyMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
+    ):
+        resp = await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    assert resp["status"] == "ok"
+    # BOTH post-recall reads went through the pool seam (order: enrich then breadcrumbs).
+    assert routed == ["_enrich", "_breadcrumbs"], routed
 
 
 async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
@@ -660,3 +722,71 @@ def test_is_garbage_predicate():
     assert is_garbage("---\ntype: observation\n") is True
     assert is_garbage("{just braces, no json keys}") is False
     assert is_garbage("--- not frontmatter, just dashes") is False
+
+
+# --- cancellation observability (the 503 path) ------------------------------
+
+
+async def test_proactive_context_logs_partial_timings_on_cancellation(caplog):
+    """When the route budget expires mid-flight the coroutine is cancelled;
+    proactive_context must log WHICH phase was in flight + the partial timings
+    (the signal the 503 path previously discarded) and RE-RAISE CancelledError.
+
+    Embed completes on the fast fake retriever, so cancellation lands in the
+    recall phase — the log names phase=recall with embed already timed.
+    """
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch(
+            "genesis.mcp.memory.core._proactive_impl",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ),
+        caplog.at_level(logging.WARNING),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    warns = [r.getMessage() for r in caplog.records if "CANCELLED at phase" in r.getMessage()]
+    assert warns, "cancellation must emit a WARNING naming the in-flight phase"
+    assert "phase=recall" in warns[0]
+    # partial timings carry the completed embed phase but NOT recall (never finished)
+    assert "'embed'" in warns[0]
+    assert "'recall'" not in warns[0]
+    # PR-2c: the WARN now also carries the executor gauge, the wall time spent in the
+    # cancelled phase, and the total-since-start — the signals for attributing the ~4s.
+    assert "executor=" in warns[0]
+    assert "phase_wall_ms" in warns[0]
+    assert "cancelled_after_ms" in warns[0]
+
+
+async def test_proactive_context_cancellation_folds_completed_substages(caplog):
+    """PR-2c: recall sub-stage timers the engine wrote into ``stats`` BEFORE the
+    cancel must appear in the 503 WARN, so the log names the stage the coroutine
+    starved in. Simulate a recall that finished the vector + FTS stages (writing
+    their timers into the passed ``stats`` sink) and is then cancelled mid-flight.
+    """
+
+    async def _partial_then_cancel(prompt, **kwargs):
+        stats = kwargs.get("stats")
+        if stats is not None:
+            # Engine writes these incrementally as each stage completes; a cancel
+            # after FTS leaves vector+fts present but not the later stages.
+            stats["vector_ms"] = 210.5
+            stats["fts_ms"] = 44.2
+        raise asyncio.CancelledError
+
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=_partial_then_cancel),
+        caplog.at_level(logging.WARNING),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    warns = [r.getMessage() for r in caplog.records if "CANCELLED at phase" in r.getMessage()]
+    assert warns, "cancellation must emit a WARNING"
+    # Completed stages fold in (suffix stripped); never-reached stages stay absent.
+    assert "'vector'" in warns[0]
+    assert "'fts'" in warns[0]
+    assert "'activation'" not in warns[0]
+    assert "'assembly'" not in warns[0]

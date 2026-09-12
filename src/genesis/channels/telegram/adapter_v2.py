@@ -296,6 +296,7 @@ class TelegramAdapterV2(ChannelAdapter):
                     sender="genesis",
                     content=text,
                     thread_id=message_thread_id,
+                    direction="outbound",
                 )
         except Exception:
             log.warning("Failed to persist outreach message %s", msg.message_id, exc_info=True)

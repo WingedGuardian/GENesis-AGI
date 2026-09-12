@@ -16,6 +16,14 @@ from genesis.recon.cc_update_analyzer import (
 )
 
 
+def _llm(impact: str, summary: str, details: str) -> MagicMock:
+    """Build a mock router result carrying an analyzer JSON payload."""
+    r = MagicMock()
+    r.success = True
+    r.content = json.dumps({"impact": impact, "summary": summary, "details": details})
+    return r
+
+
 @pytest.fixture()
 async def db():
     """In-memory SQLite with the full production schema.
@@ -129,119 +137,338 @@ class TestAnalysis:
         assert result["impact"] == IMPACT_INFORMATIONAL
 
 
-class TestChangelogFetch:
-    """GitHub-based changelog fetching."""
+class TestChangelogRangeFetch:
+    """Range-aware fetch: CHANGELOG.md primary, releases-API single-version fallback."""
+
+    # Newest-first, mirroring the real CHANGELOG.md ordering.
+    _MULTI = (
+        "## 2.1.220\n\n- fix twenty\n\n"
+        "## 2.1.219\n\n- Added Opus 5\n- fix nineteen\n\n"
+        "## 2.1.218\n\n- old fix\n"
+    )
 
     @pytest.mark.asyncio
-    async def test_fetch_parses_matching_release(self, db) -> None:
-        """Fetches body from release matching the version tag."""
+    async def test_range_extracts_all_intervening_releases(self, db) -> None:
+        """A multi-release jump analyzes EVERY release in (old, new] — the bug fix."""
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch.object(analyzer, "_fetch_changelog_md",
+                          new_callable=AsyncMock, return_value=self._MULTI):
+            result = await analyzer._fetch_changelog("2.1.218", "2.1.220")
+        assert "2.1.220" in result
+        # The intervening release is NOT skipped (the whole point):
+        assert "2.1.219" in result and "Added Opus 5" in result
+        assert "2.1.218" not in result  # old bound is exclusive
+
+    @pytest.mark.asyncio
+    async def test_range_respects_claude_version_suffix(self, db) -> None:
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch.object(analyzer, "_fetch_changelog_md",
+                          new_callable=AsyncMock, return_value=self._MULTI):
+            result = await analyzer._fetch_changelog(
+                "2.1.218 (Claude Code)", "2.1.219 (Claude Code)",
+            )
+        assert "2.1.219" in result
+        assert "2.1.220" not in result  # above the new bound
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_release_body_marked_partial(self, db) -> None:
+        """CHANGELOG unavailable -> single-version body, LOUDLY marked PARTIAL."""
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch.object(analyzer, "_fetch_changelog_md",
+                          new_callable=AsyncMock, return_value=""), \
+             patch.object(analyzer, "_fetch_release_body",
+                          new_callable=AsyncMock, return_value="only new notes"):
+            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
+        assert "only new notes" in result
+        assert "[PARTIAL]" in result
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_range_empty(self, db) -> None:
+        """CHANGELOG fetched but no sections in range (equal/downgrade) -> fallback."""
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch.object(analyzer, "_fetch_changelog_md",
+                          new_callable=AsyncMock, return_value=self._MULTI), \
+             patch.object(analyzer, "_fetch_release_body",
+                          new_callable=AsyncMock, return_value="new only") as rb:
+            result = await analyzer._fetch_changelog("2.1.220", "2.1.220")
+        rb.assert_awaited_once()
+        assert "[PARTIAL]" in result
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_both_sources_fail(self, db) -> None:
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch.object(analyzer, "_fetch_changelog_md",
+                          new_callable=AsyncMock, return_value=""), \
+             patch.object(analyzer, "_fetch_release_body",
+                          new_callable=AsyncMock, return_value=""):
+            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
+        assert result == ""
+
+
+class TestChangelogMdFetch:
+    """The raw CHANGELOG.md fetch (curl)."""
+
+    @pytest.mark.asyncio
+    async def test_md_fetch_success(self, db) -> None:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"## 2.1.5\n- x", b""))
+        mock_proc.returncode = 0
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
+                   return_value=mock_proc):
+            result = await analyzer._fetch_changelog_md()
+        assert "2.1.5" in result
+
+    @pytest.mark.asyncio
+    async def test_md_fetch_empty_on_failure(self, db) -> None:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"404"))
+        mock_proc.returncode = 22
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
+                   return_value=mock_proc):
+            assert await analyzer._fetch_changelog_md() == ""
+
+    @pytest.mark.asyncio
+    async def test_md_fetch_empty_on_timeout(self, db) -> None:
+        mock_proc = AsyncMock()
+        mock_proc.kill = MagicMock()
+        analyzer = CCUpdateAnalyzer(db=db)
+        with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
+                   return_value=mock_proc), \
+             patch("genesis.recon.cc_update_analyzer.asyncio.wait_for",
+                   side_effect=TimeoutError):
+            assert await analyzer._fetch_changelog_md() == ""
+        mock_proc.kill.assert_called_once()
+
+
+class TestReleaseBodyFallback:
+    """The releases-API single-version fallback (_fetch_release_body)."""
+
+    @pytest.mark.asyncio
+    async def test_parses_matching_release(self, db) -> None:
         releases = json.dumps([
             {"tag_name": "v1.1.0", "body": "## What's changed\n\n- Added feature X"},
             {"tag_name": "v1.0.0", "body": "Old release"},
         ])
-
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(releases.encode(), b""))
         mock_proc.returncode = 0
-
         analyzer = CCUpdateAnalyzer(db=db)
-
         with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
-                    return_value=mock_proc):
-            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
-
+                   return_value=mock_proc):
+            result = await analyzer._fetch_release_body("1.1.0")
         assert "Added feature X" in result
 
     @pytest.mark.asyncio
-    async def test_fetch_handles_claude_version_format(self, db) -> None:
-        """Strips ' (Claude Code)' suffix from version when matching tags."""
-        releases = json.dumps([
-            {"tag_name": "v2.1.84", "body": "PowerShell tool added"},
-        ])
-
+    async def test_handles_claude_version_format(self, db) -> None:
+        releases = json.dumps([{"tag_name": "v2.1.84", "body": "PowerShell tool added"}])
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(releases.encode(), b""))
         mock_proc.returncode = 0
-
         analyzer = CCUpdateAnalyzer(db=db)
-
         with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
-                    return_value=mock_proc):
-            result = await analyzer._fetch_changelog("2.1.83 (Claude Code)", "2.1.84 (Claude Code)")
-
+                   return_value=mock_proc):
+            result = await analyzer._fetch_release_body("2.1.84 (Claude Code)")
         assert "PowerShell" in result
 
     @pytest.mark.asyncio
-    async def test_fetch_returns_empty_on_gh_failure(self, db) -> None:
-        """Returns empty string when gh CLI fails."""
+    async def test_empty_on_gh_failure(self, db) -> None:
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(b"", b"auth required"))
         mock_proc.returncode = 1
-
         analyzer = CCUpdateAnalyzer(db=db)
-
         with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
-                    return_value=mock_proc):
-            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
-
-        assert result == ""
+                   return_value=mock_proc):
+            assert await analyzer._fetch_release_body("1.1.0") == ""
 
     @pytest.mark.asyncio
-    async def test_fetch_returns_empty_on_timeout(self, db) -> None:
-        """Returns empty string on timeout."""
-        mock_proc = AsyncMock()
-        mock_proc.kill = MagicMock()
-
-        analyzer = CCUpdateAnalyzer(db=db)
-
-        with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
-                    return_value=mock_proc), \
-             patch("genesis.recon.cc_update_analyzer.asyncio.wait_for",
-                    side_effect=TimeoutError):
-            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
-
-        assert result == ""
-        mock_proc.kill.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_fetch_returns_empty_when_tag_not_found(self, db) -> None:
-        """Returns empty string when no release matches the version tag."""
-        releases = json.dumps([
-            {"tag_name": "v2.0.0", "body": "Different version"},
-        ])
-
+    async def test_empty_when_tag_not_found(self, db) -> None:
+        releases = json.dumps([{"tag_name": "v2.0.0", "body": "Different version"}])
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(releases.encode(), b""))
         mock_proc.returncode = 0
-
         analyzer = CCUpdateAnalyzer(db=db)
-
         with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
-                    return_value=mock_proc):
-            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
+                   return_value=mock_proc):
+            assert await analyzer._fetch_release_body("1.1.0") == ""
 
-        assert result == ""
+
+class TestSectionExtraction:
+    """Pure range extraction from CHANGELOG.md text (no I/O)."""
+
+    _MD = (
+        "# Changelog\n\n"
+        "## 2.1.245\n\n- glibc fix\n\n"
+        "## 2.1.243\n\n- Loops breakdown\n\n"
+        "## 2.1.233\n\n- Todo tools removed on newer models\n\n"
+        "## 2.1.218\n\n- baseline\n"
+    )
+
+    def test_range_is_old_exclusive_new_inclusive(self) -> None:
+        r = CCUpdateAnalyzer._extract_sections_in_range(self._MD, "2.1.218", "2.1.245")
+        assert "2.1.245" in r and "2.1.243" in r and "2.1.233" in r
+        assert "- baseline" not in r  # old (2.1.218) section excluded
+        assert "Todo tools removed" in r  # a middle release is present, not skipped
+
+    def test_upper_bound_inclusive_excludes_above(self) -> None:
+        r = CCUpdateAnalyzer._extract_sections_in_range(self._MD, "2.1.218", "2.1.233")
+        assert "2.1.233" in r
+        assert "2.1.243" not in r and "2.1.245" not in r
+
+    def test_skipped_version_numbers_handled(self) -> None:
+        # 2.1.244 does not exist; asking up to it still yields 2.1.243 (present).
+        r = CCUpdateAnalyzer._extract_sections_in_range(self._MD, "2.1.218", "2.1.244")
+        assert "2.1.243" in r and "2.1.245" not in r
+
+    def test_empty_when_no_sections_in_range(self) -> None:
+        assert CCUpdateAnalyzer._extract_sections_in_range(self._MD, "2.1.245", "2.1.245") == ""
+        assert CCUpdateAnalyzer._extract_sections_in_range(self._MD, "2.1.245", "2.1.243") == ""
+
+    def test_full_range_returned_uncapped(self) -> None:
+        # No size cap in extraction — the chunker covers everything downstream.
+        big = "".join(
+            f"## 2.1.{n}\n\n" + ("x" * 5000) + "\n\n"
+            for n in range(309, 299, -1)
+        )
+        r = CCUpdateAnalyzer._extract_sections_in_range(big, "2.1.299", "2.1.309")
+        # every in-range release present; nothing omitted at this layer
+        for n in range(300, 310):
+            assert f"## 2.1.{n}" in r
+        assert "omitted" not in r
+
+
+class TestChunking:
+    """Context-safe chunking of the concatenated changelog (map step)."""
+
+    def test_packs_sections_under_budget_into_one_chunk(self) -> None:
+        cl = "## 2.1.5\n\n- a\n\n## 2.1.4\n\n- b\n\n## 2.1.3\n\n- c"
+        chunks = CCUpdateAnalyzer._chunk_changelog(cl, budget=10000, max_chunks=12)
+        assert len(chunks) == 1
+        assert "2.1.5" in chunks[0] and "2.1.3" in chunks[0]
+
+    def test_splits_on_release_boundaries_when_over_budget(self) -> None:
+        cl = "".join(f"## 2.1.{n}\n\n" + ("x" * 5000) + "\n\n" for n in (7, 6, 5))
+        chunks = CCUpdateAnalyzer._chunk_changelog(cl, budget=8000, max_chunks=12)
+        assert len(chunks) >= 2
+        # every section is intact somewhere — no release dropped or split away
+        joined = "\n".join(chunks)
+        for n in (7, 6, 5):
+            assert f"## 2.1.{n}" in joined
+
+    def test_max_chunks_cap_keeps_newest_with_loud_marker(self) -> None:
+        cl = "".join(f"## 2.1.{n}\n\n" + ("x" * 5000) + "\n\n" for n in range(20, 0, -1))
+        chunks = CCUpdateAnalyzer._chunk_changelog(cl, budget=6000, max_chunks=3)
+        assert len(chunks) == 3
+        assert "## 2.1.20" in chunks[0]  # newest kept
+        assert "omitted" in chunks[-1]   # loud marker, never a silent cut
+
+    def test_no_headers_returns_single_chunk(self) -> None:
+        assert CCUpdateAnalyzer._chunk_changelog("[PARTIAL] just notes") == [
+            "[PARTIAL] just notes",
+        ]
+
+    def test_empty_returns_no_chunks(self) -> None:
+        assert CCUpdateAnalyzer._chunk_changelog("   ") == []
+
+
+class TestRangeAnalysis:
+    """Map-reduce analysis: per-chunk classification aggregated by severity."""
 
     @pytest.mark.asyncio
-    async def test_fetch_truncates_long_body(self, db) -> None:
-        """Release body over 1000 chars is truncated."""
-        long_body = "x" * 1500
-        releases = json.dumps([
-            {"tag_name": "v1.1.0", "body": long_body},
+    async def test_range_analysis_aggregates_max_severity(self, db) -> None:
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[
+            _llm(IMPACT_INFORMATIONAL, "chunk A", "details A"),
+            _llm(IMPACT_BREAKING, "chunk B removed --resume", "details B"),
         ])
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_chunk_changelog",
+                          return_value=["chunk1", "chunk2"]):
+            out = await analyzer._analyze_range("2.1.3", "2.1.5", "irrelevant")
+        assert out["impact"] == IMPACT_BREAKING          # worst chunk wins
+        assert router.route_call.await_count == 2        # one LLM call per chunk
+        assert "details B" in out["details"]             # merged details retained
 
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(return_value=(releases.encode(), b""))
-        mock_proc.returncode = 0
+    @pytest.mark.asyncio
+    async def test_analyze_multichunk_stores_high_priority(self, db) -> None:
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[
+            _llm(IMPACT_INFORMATIONAL, "A", "dA"),
+            _llm(IMPACT_BREAKING, "B", "dB"),
+        ])
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_fetch_changelog",
+                          new_callable=AsyncMock, return_value="## 2.1.5\n- x"), \
+             patch.object(analyzer, "_chunk_changelog",
+                          return_value=["c1", "c2"]):
+            result = await analyzer.analyze("2.1.3", "2.1.5")
+        assert result["impact"] == IMPACT_BREAKING
+        cursor = await db.execute(
+            "SELECT priority FROM observations WHERE id = ?", (result["finding_id"],),
+        )
+        assert (await cursor.fetchone())[0] == "high"
 
-        analyzer = CCUpdateAnalyzer(db=db)
+    @pytest.mark.asyncio
+    async def test_single_chunk_passthrough_verbatim(self, db) -> None:
+        """A small (single-chunk) bump keeps the prior single-call behaviour."""
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=_llm(IMPACT_ACTION_NEEDED, "solo", "d"))
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_fetch_changelog",
+                          new_callable=AsyncMock, return_value="## 2.1.5\n- x"):
+            result = await analyzer.analyze("2.1.4", "2.1.5")
+        assert result["impact"] == IMPACT_ACTION_NEEDED
+        assert result["summary"] == "solo"           # verbatim, not the rollup form
+        assert router.route_call.await_count == 1
 
-        with patch("genesis.recon.cc_update_analyzer.asyncio.create_subprocess_exec",
-                    return_value=mock_proc):
-            result = await analyzer._fetch_changelog("1.0.0", "1.1.0")
+    @pytest.mark.asyncio
+    async def test_non_dict_llm_payload_falls_back(self, db) -> None:
+        """A free model emitting bare-string/array JSON must not crash the reducer."""
+        router = AsyncMock()
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps("done")  # valid JSON, but a str — not an object
+        router.route_call = AsyncMock(return_value=bad)
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        # _llm_analyze must return the structured fallback dict, never the str
+        out = await analyzer._llm_analyze("2.1.4", "2.1.5", "Fixed a memory leak")
+        assert isinstance(out, dict)
+        assert out["impact"] == IMPACT_INFORMATIONAL
+        # and analyze() end-to-end does not raise on the non-dict payload
+        with patch.object(analyzer, "_fetch_changelog",
+                          new_callable=AsyncMock, return_value="## 2.1.5\n- x"):
+            result = await analyzer.analyze("2.1.4", "2.1.5")
+        assert result["impact"] == IMPACT_INFORMATIONAL
 
-        assert len(result) < 1500
-        assert result.endswith("(truncated)")
+    @pytest.mark.asyncio
+    async def test_multichunk_summary_rollup_format(self, db) -> None:
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[
+            _llm(IMPACT_INFORMATIONAL, "A", "dA"),
+            _llm(IMPACT_ACTION_NEEDED, "B needs care", "dB"),
+        ])
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_chunk_changelog", return_value=["c1", "c2"]):
+            out = await analyzer._analyze_range("2.1.3", "2.1.5", "x")
+        assert "analyzed across 2 changelog chunks" in out["summary"]
+        assert "Highest-severity item: B needs care" in out["summary"]
+
+
+class TestSemverTuple:
+    """Version-string -> numeric tuple."""
+
+    def test_plain(self) -> None:
+        assert CCUpdateAnalyzer._semver_tuple("2.1.84") == (2, 1, 84)
+
+    def test_suffix_and_prefix(self) -> None:
+        assert CCUpdateAnalyzer._semver_tuple("v2.1.84 (Claude Code)") == (2, 1, 84)
+
+    def test_ordering_numeric_not_lexical(self) -> None:
+        assert CCUpdateAnalyzer._semver_tuple("2.1.9") < CCUpdateAnalyzer._semver_tuple("2.1.10")
+
+    def test_empty_on_nonversion(self) -> None:
+        assert CCUpdateAnalyzer._semver_tuple("not a version") == ()
 
 
 class TestVersionToTag:
@@ -590,3 +817,124 @@ class TestKnowledgeIngestion:
         assert "Fixed --bare MCP bug" in body
         assert "## Raw changelog" in body
         assert "bare fix" in body
+
+
+class TestHardeningClassA_SizeBounding:
+    """Every chunk fed to an LLM call must fit the smallest provider's budget."""
+
+    def test_chunk_budget_fits_smallest_provider_tpm(self) -> None:
+        # groq-free (gpt-oss-120b) caps at 8000 TPM; a chunk must leave room for
+        # the ~600-token prompt + output + reasoning inflation. ~16k chars ~= 4k tokens.
+        from genesis.recon.cc_update_analyzer import _CHUNK_BUDGET
+
+        assert _CHUNK_BUDGET <= 20000
+
+    def test_headerless_body_over_budget_is_length_split(self) -> None:
+        # The [PARTIAL] fallback body has no `## X.Y.Z` headers; it must still be
+        # bounded, not returned as one oversized chunk.
+        body = "[PARTIAL] " + ("word " * 8000)  # ~40k chars, no headers
+        chunks = CCUpdateAnalyzer._chunk_changelog(body, budget=16000, max_chunks=12)
+        assert len(chunks) >= 2
+        assert all(len(c) <= 16000 for c in chunks)
+
+    def test_oversized_single_section_is_length_split(self) -> None:
+        # A single release section larger than budget must be split, not emitted whole.
+        big_section = "## 2.1.99\n\n" + ("x " * 12000)  # ~24k chars in one section
+        chunks = CCUpdateAnalyzer._chunk_changelog(big_section, budget=16000, max_chunks=12)
+        assert len(chunks) >= 2
+        assert all(len(c) <= 16000 for c in chunks)
+
+    def test_small_changelog_stays_single_chunk(self) -> None:
+        # Regression guard: a normal small bump must still be one chunk.
+        cl = "## 2.1.5\n\n- a\n\n## 2.1.4\n\n- b"
+        chunks = CCUpdateAnalyzer._chunk_changelog(cl, budget=16000, max_chunks=12)
+        assert len(chunks) == 1
+
+    def test_maxchunks_marker_keeps_last_chunk_within_budget(self) -> None:
+        # When the cap bites and the last kept chunk is already at budget, the loud
+        # omission marker must NOT push it over budget (invariant holds on the
+        # omission path too).
+        sections = "".join(f"## 2.1.{n}\n\n" + ("q" * 15980) + "\n\n" for n in range(30, 0, -1))
+        chunks = CCUpdateAnalyzer._chunk_changelog(sections, budget=16000, max_chunks=3)
+        assert len(chunks) == 3
+        assert "omitted" in chunks[-1]  # loud marker present
+        assert all(len(c) <= 16000 for c in chunks)  # and still within budget
+
+
+class TestHardeningClassB_ChainDistribution:
+    """N gathered route_calls must distribute across the chain, not serialize."""
+
+    @pytest.mark.asyncio
+    async def test_each_chunk_gets_distinct_chain_offset(self, db) -> None:
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=_llm(IMPACT_INFORMATIONAL, "s", "d"))
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_chunk_changelog", return_value=["c0", "c1", "c2"]):
+            await analyzer._analyze_range("2.1.3", "2.1.9", "irrelevant")
+        offsets = sorted(
+            call.kwargs.get("chain_offset", 0)
+            for call in router.route_call.await_args_list
+        )
+        assert offsets == [0, 1, 2]  # distributed across the chain, not all 0
+
+
+class TestHardeningClassC_OutputNormalization:
+    """Untrusted LLM JSON is normalized to the full contract at one boundary."""
+
+    @pytest.mark.asyncio
+    async def test_list_impact_dict_falls_back_no_crash(self, db) -> None:
+        # A dict with an unhashable (list) impact must NOT reach the reducer.
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps({"impact": ["breaking"], "summary": "s", "details": "d"})
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=bad)
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        out = await analyzer._llm_analyze("2.1.4", "2.1.5", "Fixed a leak")
+        assert isinstance(out, dict)
+        assert out["impact"] in (IMPACT_INFORMATIONAL, IMPACT_ACTION_NEEDED)
+        assert isinstance(out["summary"], str) and isinstance(out["details"], str)
+
+    @pytest.mark.asyncio
+    async def test_numeric_fields_coerced_to_str(self, db) -> None:
+        # Valid impact but non-str summary/details must be coerced, not passed through.
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps({"impact": IMPACT_BREAKING, "summary": 42, "details": 99})
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=bad)
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        out = await analyzer._llm_analyze("2.1.4", "2.1.5", "x")
+        assert out["impact"] == IMPACT_BREAKING
+        assert isinstance(out["summary"], str) and isinstance(out["details"], str)
+
+    @pytest.mark.asyncio
+    async def test_multichunk_malformed_payload_end_to_end_no_crash(self, db) -> None:
+        # The reducer/ingest/alert must survive a malformed chunk payload end to end.
+        good = _llm(IMPACT_INFORMATIONAL, "A", "dA")
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps({"impact": {"x": 1}, "details": [1, 2], "summary": None})
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[good, bad])
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_fetch_changelog", new_callable=AsyncMock,
+                          return_value="## 2.1.5\n- x"), \
+             patch.object(analyzer, "_chunk_changelog", return_value=["c1", "c2"]):
+            result = await analyzer.analyze("2.1.3", "2.1.5")
+        assert isinstance(result["impact"], str)
+        assert "finding_id" in result
+
+    def test_coerce_returns_none_on_unhashable_impact(self) -> None:
+        # An unhashable impact must return None (-> fallback), never raise on the
+        # `in frozenset` membership test.
+        assert CCUpdateAnalyzer._coerce_analysis({"impact": ["breaking"], "summary": "s"}) is None
+        assert CCUpdateAnalyzer._coerce_analysis({"impact": {"x": 1}}) is None
+        assert CCUpdateAnalyzer._coerce_analysis("not a dict") is None
+        assert CCUpdateAnalyzer._coerce_analysis({"summary": "no impact key"}) is None
+
+    def test_coerce_normalizes_valid_payload_to_str_fields(self) -> None:
+        out = CCUpdateAnalyzer._coerce_analysis(
+            {"impact": IMPACT_BREAKING, "summary": 42, "details": None},
+        )
+        assert out == {"impact": IMPACT_BREAKING, "summary": "42", "details": ""}

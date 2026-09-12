@@ -399,3 +399,61 @@ class TestWithdrawnHandling:
         with _patch_path(db_path):
             res = await RESOLVE(action="approve", proposal_ids="w1")
         assert "directive" in res["details"]["w1"]
+class TestRevisionGuard:
+    """PR-6a: the MCP resolve path pins the revision the caller SAW
+    (``prop['revision_num']``) so a concurrent revise cannot resolve a stale
+    version. On a guard miss it re-reads the row to distinguish a genuine
+    stale-revision race from a benign already-resolved / missing row."""
+
+    async def test_stale_revision_refused(self, db):
+        conn, db_path = db
+        await _mk(
+            conn, id="r1", content="pause goal", batch="b",
+            created_at="2026-07-15T00:00:00+00:00",
+        )
+        prop = await ego_crud.get_proposal(conn, "r1")
+        assert prop["revision_num"] == 1
+        # Simulate a concurrent revise bumping the row AFTER the board read
+        # (the exact TOCTOU the guard defends against).
+        await conn.execute(
+            "UPDATE ego_proposals SET revision_num = 2 WHERE id = ?", ("r1",)
+        )
+        await conn.commit()
+
+        res = await ego_tools._resolve_one_proposal(conn, prop, "approved", "looks good")
+
+        assert "stale revision" in res
+        assert "rev 1" in res and "rev 2" in res
+        # Refused — the row must remain pending, not silently resolved.
+        assert await _status(db_path, "r1") == "pending"
+
+    async def test_matching_revision_resolves(self, db):
+        conn, db_path = db
+        await _mk(
+            conn, id="r1", content="pause goal", batch="b",
+            created_at="2026-07-15T00:00:00+00:00",
+        )
+        prop = await ego_crud.get_proposal(conn, "r1")
+
+        res = await ego_tools._resolve_one_proposal(conn, prop, "approved", "ok")
+
+        assert res == "approved"
+        assert await _status(db_path, "r1") == "approved"
+
+    async def test_already_resolved_not_reported_as_stale(self, db):
+        """A guard miss where the revision still matches but the row was
+        resolved by another path reports ``already <status>`` — NOT a false
+        stale-revision re-review prompt."""
+        conn, db_path = db
+        await _mk(
+            conn, id="r1", content="pause goal", batch="b",
+            created_at="2026-07-15T00:00:00+00:00",
+        )
+        prop = await ego_crud.get_proposal(conn, "r1")
+        # Another path resolves it first; revision_num is unchanged (==1).
+        await ego_crud.resolve_proposal(conn, "r1", status="rejected")
+
+        res = await ego_tools._resolve_one_proposal(conn, prop, "approved", "ok")
+
+        assert res == "already rejected"
+        assert await _status(db_path, "r1") == "rejected"

@@ -24,6 +24,14 @@ class OutreachCategory(StrEnum):
     # Routed through the outreach pipeline with governance (dedup, rate limit,
     # quiet hours) but no approval gate. Added in PR #530.
     NOTIFICATION = "notification"
+    # Marketing campaign updates — the campaign's tick digest / reply pings.
+    # Routed to a dedicated "Marketing" supergroup topic (never the shared
+    # Morning Reports topic that 'digest' lands in). Must match the DB CHECK
+    # constraint on outreach_history (see db/schema/_migrations.py — the
+    # 'marketing' table-rebuild block) AND carry a delivery threshold (see
+    # config/outreach.yaml thresholds.marketing) so an owner-facing digest is
+    # never dropped by the default salience gate.
+    MARKETING = "marketing"
 
 
 class OutreachStatus(StrEnum):
@@ -73,6 +81,49 @@ ENGAGEMENT_OUTCOMES: frozenset[str] = POSITIVE_ENGAGEMENT_OUTCOMES | frozenset(
 # the canonical vocabulary ('replied' predates the signal column; lifecycle
 # values like 'delivered'/'opened' are NOT outcomes and are rejected).
 ENGAGEMENT_OUTCOME_ALIASES: dict[str, str] = {"replied": "useful"}
+
+# Signals stamped by AUTOMATION, not by a human judgment: the 24h timeout
+# verdict, the implicit-activity upgrade, and the morning-report auto-ack.
+# A real user reply is strictly stronger evidence than any of these, so the
+# reply→engagement bridge may overwrite them; human-set outcomes (Telegram
+# button presses → 'acted_on'/'acknowledged', manual MCP/dashboard sets)
+# are never overwritten.
+MECHANICAL_ENGAGEMENT_SIGNALS: frozenset[str] = frozenset(
+    {"timeout", "implicit_activity", "auto_digest"}
+)
+
+# SQL IN-list rendering (same trusted-constant rationale as
+# POSITIVE_ENGAGEMENT_SQL_IN above).
+MECHANICAL_ENGAGEMENT_SIGNALS_SQL_IN: str = ", ".join(
+    f"'{s}'" for s in sorted(MECHANICAL_ENGAGEMENT_SIGNALS)
+)
+
+# ── External-vs-owner outreach: which rows count toward engagement ───────────
+# Engagement metrics ("how much of our outreach got a reaction") must measure
+# EXTERNAL outreach only. If the denominator counts owner-facing housekeeping,
+# the ratio collapses toward zero (the 2026-08 strategic-reflection artifact:
+# ~71 of ~79 rows were relay housekeeping, so engagement read ~0% while real
+# external content had normal reactions).
+#
+# CHANNEL — not category — is the reliable signal. Category is overloaded:
+# 'notification' is an owner ping on Telegram but a genuine PROSPECT reply on
+# email (MAIL_REPLY.md); 'content' spans Discord posts (external) and Telegram
+# content-review drafts (owner-facing). But every message Genesis sends TO ITS
+# OWNER — approvals, digests, blockers, alerts, reflections, review drafts —
+# goes out over Telegram or voice (HA TTS spoken in the owner's home — the owner
+# IS the recipient; see pipeline.py egress-gate + shadow_gate.py), while genuine
+# external touches go to Discord / email / (future) other public channels. So the
+# owner surface is the Telegram and voice channels.
+#
+# We EXCLUDE the owner-facing channels (rather than allowlist external ones), so
+# a NEW external channel counts automatically. The tradeoff: a NEW OWNER-facing
+# delivery channel (e.g. a future owner-directed email digest) MUST be added
+# here, or its rows would be miscounted as external outreach.
+OWNER_FACING_CHANNELS: frozenset[str] = frozenset({"telegram", "voice"})
+
+# SQL IN-list rendering (same trusted-constant rationale as
+# POSITIVE_ENGAGEMENT_SQL_IN above). Trusted module constant — safe to inline.
+OWNER_FACING_CHANNELS_SQL_IN: str = ", ".join(f"'{c}'" for c in sorted(OWNER_FACING_CHANNELS))
 
 
 class GovernanceVerdict(StrEnum):

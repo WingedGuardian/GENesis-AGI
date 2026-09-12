@@ -21,6 +21,10 @@ class FocusCategory(StrEnum):
     GOAL_REVIEW = "goal_review"
     DISPATCH_OUTCOME = "dispatch_outcome"
     ESCALATION = "escalation"
+    # Advisory self-improvement: a scanned capability deficiency surfaced for
+    # the ego to CONSIDER. Never throttles/gates/auto-dispatches a loop, and
+    # never a mandate to "propose less" (hard quality-over-cost rule).
+    CAPABILITY_IMPROVEMENT = "capability_improvement"
 
 
 class ProposalStatus(StrEnum):
@@ -177,7 +181,36 @@ class EgoConfig:
     # Genesis ego (COO) independent scheduling — defaults match user ego
     genesis_cadence_minutes: int = 90  # base interval for genesis ego
     genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
-    max_pending_proposals: int = 15  # auto-table oldest unranked when exceeded
+    max_pending_proposals: int = 15  # TOTAL across both egos — auto-table oldest unranked when exceeded
+    # Roadmap flag: Genesis developing itself (writing/refactoring its own code,
+    # reviewing PRs, scoping refactors) is OFF until explicitly unlocked. While
+    # False, the genesis ego's develop-scope proposals are deterministically
+    # tabled (never deleted) by the domain-boundary gate. Flip to True to unlock
+    # self-development when that capability is earned; the gate then passes
+    # develop-class proposals through to normal approval.
+    genesis_self_development_enabled: bool = False
+    # Revalidation cadence (PR-6a): per-urgency hours after which a pending
+    # proposal's premises are flagged "due for re-check" by the reconcile
+    # stage. NEVER a kill path — overdue only queues verification (locked
+    # decision #2: user latency never kills a proposal). Config-derived.
+    revalidation_interval_hours: dict = field(
+        default_factory=lambda: {"critical": 6, "high": 48, "normal": 72, "low": 168}
+    )
+    # Auto-table staleness window, per-urgency HOURS (critical 240=10d, high
+    # 336=14d, normal 504=21d, low 720=30d): how long a pending proposal may sit
+    # before auto_table_stale_proposals moves it to the recoverable 'tabled'
+    # cold lane (NOT deleted — the ego can un-table, and a still-relevant
+    # proposal is re-derived fresh next cycle). This is a BACKSTOP behind the
+    # reconcile cycle (which already withdraws stale/invalid proposals each
+    # pass), NOT the primary staleness mechanism — so windows sit generously
+    # ABOVE observed user decision-latency (median ~1-2d, tail to ~12d;
+    # 2026-08-06 review) to catch only the truly-abandoned, never to amputate the
+    # normal-cadence tail. Defaults-COMPLETE mapping (merged over defaults on
+    # load). Unranked proposals (never boarded) age out via a shorter floor (see
+    # the sweep's unranked_cap_hours).
+    auto_table_ttl_hours: dict = field(
+        default_factory=lambda: {"critical": 240, "high": 336, "normal": 504, "low": 720}
+    )
     # Additive ego autonomy — cap on ACTIVE goals in the genesis ego's OWN
     # lane (origin='genesis_ego'). Pausing frees a slot; the paused tail is
     # deliberately unbounded (user decision 2026-07-16) and reported in the
@@ -199,6 +232,15 @@ class EgoConfig:
     # display-only (rendered into ego-context sections, no code gate), so even ON
     # only nudges the numbers the ego sees about itself. Live-read each refresh.
     outcome_bus_capability_feed: bool = False
+    # Capability-improvement scanner (advisory; genesis ego only). A twice-daily
+    # job reads the weakest domains from the capability map and pushes a
+    # priority=low FocusCategory.CAPABILITY_IMPROVEMENT signal for the ego to
+    # CONSIDER. ADVISORY ONLY — it never throttles, gates, or auto-dispatches a
+    # loop, and never proposes doing less. Set enabled=False to silence it.
+    capability_improvement_enabled: bool = True
+    capability_weakness_threshold: float = 0.5  # domains below this confidence are "weak"
+    capability_improvement_min_sample_size: int = 3  # ignore low-n flukes
+    capability_improvement_max_signals: int = 3  # cap advisory signals per scan
     # Quiet-hours floor (circadian model): during the overnight window, throttle
     # PROACTIVE ticks to at most one per quiet_hours_min_interval_minutes. Morning
     # report, reactive, and escalation paths are never gated by this. Local time

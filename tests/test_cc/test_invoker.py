@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -72,9 +73,29 @@ def test_build_args_strict_mcp_config(invoker):
     )
     args = invoker._build_args(inv)
     assert "--strict-mcp-config" in args
-    # Default stays additive: flag absent unless opted in.
-    default_args = invoker._build_args(CCInvocation(prompt="hello"))
-    assert "--strict-mcp-config" not in default_args
+
+
+def test_build_args_strict_is_default(invoker):
+    """Secure-by-default: a plain invocation emits --strict-mcp-config so
+    --mcp-config is authoritative and user-scoped ~/.claude.json servers can't
+    leak in. (Flipped from opt-in on 2026-08-09; see CCInvocation.strict_mcp_config.)"""
+    args = invoker._build_args(CCInvocation(prompt="hello"))
+    assert "--strict-mcp-config" in args
+
+
+def test_build_args_strict_opt_out(invoker):
+    """Foreground/interactive sites opt out to keep the full user-scoped toolset."""
+    args = invoker._build_args(CCInvocation(prompt="hello", strict_mcp_config=False))
+    assert "--strict-mcp-config" not in args
+
+
+def test_build_args_strict_suppressed_under_bare(invoker):
+    """--bare already disables all MCP; --bare + --strict-mcp-config makes CC exit
+    non-zero (probe-verified), so the invoker must NOT emit strict under bare even
+    when strict_mcp_config is True (which is the default)."""
+    args = invoker._build_args(CCInvocation(prompt="hello", bare=True, strict_mcp_config=True))
+    assert "--bare" in args
+    assert "--strict-mcp-config" not in args
 
 
 def test_build_args_safe_mode(invoker):
@@ -211,6 +232,288 @@ def test_build_env_strips_parent_anthropic_base_url(invoker):
     with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://leaked:8100"}):
         env = invoker._build_env(inv)
         assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_scope_args_empty_when_probe_fails(monkeypatch):
+    """An env-scrubbed spawner (some agent CLIs' shell tooling, CI runners) has
+    the systemd-run binary but no reachable user manager — the probe must fail
+    closed to 'no scope wrap' instead of letting systemd-run kill the CC
+    subprocess at 0.0s with 'Failed to connect to bus'."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_fails(*args, **kwargs):
+        return real_subprocess.CompletedProcess(args[0], 1, b"", b"Failed to connect to bus")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_fails)
+    assert inv_mod._build_scope_args() == []
+
+
+def test_scope_args_empty_when_probe_raises(monkeypatch):
+    """Probe timeout / spawn failure also degrades to no wrap, never raises."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_times_out(*args, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd="systemd-run", timeout=15)
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_times_out)
+    assert inv_mod._build_scope_args() == []
+
+
+def test_probe_raising_announces_the_lost_isolation(monkeypatch, caplog):
+    """A raising probe must degrade LOUDLY, like the non-zero-exit branch.
+
+    Silence here is indistinguishable from a scoped box: MemoryHigh/MemoryMax
+    are gone and nothing in the log says so. `announce=False` (a backoff
+    re-probe) still demotes to debug so a permanently-unscoped box does not
+    warn on every retry forever.
+    """
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_times_out(*args, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd="systemd-run", timeout=15)
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_times_out)
+
+    with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+        assert inv_mod._build_scope_args(announce=True) == []
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "probe raised and nothing warned — the degradation is silent"
+    assert "TimeoutExpired" in warnings[0].getMessage()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+        assert inv_mod._build_scope_args(announce=False) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "re-probe warned again — announce=False must demote to debug"
+    )
+
+
+def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
+    """The probe must carry the scope's properties, not just ask for a scope.
+
+    `systemd-run` exits non-zero on a property it cannot accept (measured on
+    systemd 255: "Unknown assignment: ..." and "Failed to parse MemoryMax=..."
+    both exit 1), and older systemd predates the ``N%`` syntax. A property-free
+    probe would SUCCEED on such a box, cache that verdict for the process
+    lifetime, and leave every real dispatch dying inside systemd-run before
+    Claude starts.
+    """
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    seen = []
+
+    def _probe_ok(*args, **kwargs):
+        seen.append(list(args[0]))
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+
+    assert len(seen) == 1
+    probe_argv = seen[0]
+    assert probe_argv[-1] == "/bin/true"
+    # Everything the real prefix passes, the probe passed too — compared as the
+    # whole argv so a future property added to one side and not the other fails
+    # here instead of at dispatch time.
+    assert probe_argv[:-1] == out
+    for prop in inv_mod._SCOPE_PROPERTIES:
+        assert ["-p", prop] == probe_argv[
+            probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1
+        ]
+        assert prop in out
+
+
+def test_scope_args_built_when_probe_succeeds(monkeypatch):
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_ok(*args, **kwargs):
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+    assert out[:3] == ["systemd-run", "--user", "--scope"]
+    assert "MemoryMax=75%" in out
+
+
+# --- _get_scope_args caching: success is permanent, FAILURE is not ------------
+# genesis-server is long-lived. Caching one transient probe failure for the
+# process lifetime silently drops MemoryHigh/MemoryMax from every later CC
+# subprocess, for days, on a swapless box — the exact thing the scope exists to
+# prevent. These pin the asymmetry in both directions.
+
+
+def _stub_probe(monkeypatch, results):
+    """Patch the probe to yield `results` in order; return the call counter."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    calls = []
+    seq = list(results)
+
+    def _probe(*args, **kwargs):
+        calls.append(args[0])
+        # NOT `next(iter(...))`. An exhausted iterator raises StopIteration,
+        # which is pathological across an `await` — the over-probing case this
+        # stub exists to catch HUNG the test run instead of failing it, so the
+        # mutation read as "no result" rather than RED. Fail loudly instead.
+        if len(calls) > len(seq):
+            raise AssertionError(
+                f"probe called {len(calls)}x but only {len(seq)} result(s) were "
+                "stubbed — the caller is probing more often than expected"
+            )
+        return real_subprocess.CompletedProcess(
+            args[0], seq[len(calls) - 1], b"", b"bus error"
+        )
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe)
+    # Reset the module cache through monkeypatch so it is restored for siblings.
+    monkeypatch.setattr(inv_mod, "_SCOPE_ARGS", None)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_FAILED_AT", None)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_FAILURES", 0)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_LOCK", None)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_failure_is_retried_after_the_cooldown(monkeypatch):
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [1, 0])  # fail, then succeed
+    now = [1000.0]
+    # Patch the module's own clock seam, NOT time.monotonic — `inv_mod.time` is
+    # the stdlib module object, so patching its attribute would replace the
+    # clock process-wide for the duration of this test.
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == 1
+
+    # Inside the first cooldown step: no re-probe, still degraded.
+    now[0] += inv_mod._SCOPE_RETRY_SCHEDULE_S[0] - 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == 1, "re-probed inside the cooldown — probes every dispatch"
+
+    # Past it: re-probe, and the recovered scope is used again.
+    now[0] += 2
+    out = await inv_mod._get_scope_args()
+    assert len(calls) == 2, "never re-probed — one transient failure is permanent"
+    assert "MemoryMax=75%" in out
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_backoff_escalates_on_repeated_failure(monkeypatch):
+    """A permanently-unscoped box must decay to hourly, not probe every 5min.
+
+    The no-reachable-bus case is a property of the machine, so a fixed retry
+    would spawn a subprocess 288x/day forever and log a warning each time.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [1, 1, 1, 1, 1])
+    now = [1000.0]
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+
+    schedule = inv_mod._SCOPE_RETRY_SCHEDULE_S
+    assert await inv_mod._get_scope_args() == []
+    for step, wait in enumerate(schedule, start=1):
+        # Just before this step elapses, still cooling down.
+        now[0] += wait - 1
+        assert await inv_mod._get_scope_args() == []
+        assert len(calls) == step, f"re-probed early at step {step}"
+        now[0] += 2
+        assert await inv_mod._get_scope_args() == []
+        assert len(calls) == step + 1, f"failed to re-probe at step {step}"
+
+    # The last interval is the cap — it must not keep growing past the table.
+    assert schedule[-1] == max(schedule)
+
+    # BEYOND the table: failures now outnumber the schedule, so the index has
+    # to CLAMP rather than walk off the end. Asserting the constant above only
+    # says the table is sorted; this exercises the clamp itself — an unclamped
+    # index raises IndexError inside the cooldown check, and a clamp to the
+    # WRONG end (first entry) would re-probe after 300s instead of the 3600s
+    # cap, restoring the 288-warnings-a-day behaviour the schedule prevents.
+    now[0] += schedule[0] + 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == len(schedule) + 1, (
+        "re-probed one short-interval after the cap — the backoff index clamped "
+        "to the wrong end of the schedule"
+    )
+    now[0] += schedule[-1] - schedule[0] + 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == len(schedule) + 2, "never re-probed past the capped interval"
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_probe_failure_warns(monkeypatch):
+    """Announce once, then demote — otherwise the retry turns a one-line
+    degradation notice into 288 warnings a day."""
+    import genesis.cc.invoker as inv_mod
+
+    _stub_probe(monkeypatch, [1, 1])
+    now = [1000.0]
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+    announced: list[bool] = []
+    real_build = inv_mod._build_scope_args
+    monkeypatch.setattr(
+        inv_mod,
+        "_build_scope_args",
+        lambda announce=True: (announced.append(announce), real_build(announce))[1],
+    )
+
+    await inv_mod._get_scope_args()
+    now[0] += inv_mod._SCOPE_RETRY_SCHEDULE_S[0] + 1
+    await inv_mod._get_scope_args()
+    assert announced == [True, False], announced
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatches_share_one_probe(monkeypatch):
+    """Single-flight: N dispatches during startup must not spawn N probes."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [0])
+    monkeypatch.setattr(inv_mod, "_now", lambda: 1000.0)
+
+    results = await asyncio.gather(*(inv_mod._get_scope_args() for _ in range(5)))
+    assert len(calls) == 1, f"{len(calls)} probes for 5 concurrent dispatches"
+    assert all("MemoryMax=75%" in r for r in results)
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_success_is_cached_for_the_process_lifetime(monkeypatch):
+    """The other direction: a working user manager must not be re-probed."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [0])
+    monkeypatch.setattr(inv_mod, "_now", lambda: 1e9)
+
+    first = await inv_mod._get_scope_args()
+    assert "MemoryMax=75%" in first
+    for _ in range(3):
+        assert await inv_mod._get_scope_args() == first
+    assert len(calls) == 1, "re-probed despite a cached success"
 
 
 def test_build_env_applies_env_overrides_last(invoker):
@@ -442,7 +745,14 @@ async def test_run_via_proxy_sets_flag(invoker):
 
 
 @pytest.mark.asyncio
-async def test_run_timeout(invoker):
+async def test_run_timeout(invoker, monkeypatch):
+    # Never let the migrated kill path issue a REAL killpg(99999) — pgid 99999
+    # can exist on a long-lived box and would SIGKILL an innocent group.
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
     mock_proc = AsyncMock()
     mock_proc.pid = (
         99999  # Must set — AsyncMock().pid int() == 1 → killpg(1) == kill(-1) == kill ALL
@@ -629,7 +939,10 @@ async def test_run_streaming_success(invoker):
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_timeout_returns_partial(invoker):
+async def test_run_streaming_timeout_returns_partial(invoker, monkeypatch):
+    # Spy killpg — never issue the real syscall against a mock pid (see
+    # test_run_timeout).
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", lambda *a: None)
     """On timeout, collected text is returned as partial output."""
     events = [
         {
@@ -756,6 +1069,87 @@ async def test_run_streaming_tool_use_events(invoker):
     tool_events = [e for e in collected if e.event_type == "tool_use"]
     assert len(tool_events) == 1
     assert tool_events[0].tool_name == "Read"
+    # ...and the runtime's own record of it survives onto the output. Without
+    # this the collector is unwired: deleting its append left 172 tests green.
+    assert output.tools_used == ("Read",)
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_records_tools_in_first_seen_order_without_repeats(invoker):
+    """`tools_used` exists so a consumer never has to scrape tool names out of
+    the response text, which cannot tell a tool that RAN from one the reply
+    merely discussed. So it must match the shape that fallback produces:
+    first-seen order, no duplicates — and it must stay EMPTY when nothing ran,
+    because a consumer reads emptiness as "fall back", not as "no tools"."""
+
+    def _tool(name):
+        return {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": name}]}}
+
+    def _result(text):
+        return {
+            "type": "result", "subtype": "success", "is_error": False, "result": text,
+            "session_id": "s9", "total_cost_usd": 0.0, "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "modelUsage": {},
+        }
+
+    async def _run(events):
+        mock_proc = AsyncMock()
+        mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+        mock_proc.stdin = _make_mock_stdin()
+        mock_proc.stderr = _make_mock_stderr()
+        mock_proc.wait = AsyncMock()
+        mock_proc.terminate = MagicMock()
+        mock_proc.returncode = 0
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            return await invoker.run_streaming(CCInvocation(prompt="go"))
+
+    out = await _run([_tool("Bash"), _tool("Read"), _tool("Bash"), _result("done")])
+    assert out.tools_used == ("Bash", "Read")
+
+    # A response that only TALKS about tools reports none — this is the whole
+    # point of the field, and the text here is exactly what defeats the regex.
+    # `()` not None: the runtime DID watch this one and saw nothing.
+    out2 = await _run([_result("I would run Tool: Bash, but I did not.")])
+    assert out2.tools_used == ()
+
+    # A tool_use block that is not FIRST in the message. StreamEvent.from_raw
+    # stops at the first recognised block, so parsing the event would drop this
+    # name — and a partial list marked runtime-sourced renders as authoritative
+    # while silently incomplete. MEASURED at 13 of 8655 real assistant messages.
+    buried = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "thinking", "thinking": "considering"},
+                {"type": "text", "text": "let me look"},
+                {"type": "tool_use", "name": "Grep"},
+            ]
+        },
+    }
+    out3 = await _run([buried, _result("done")])
+    assert out3.tools_used == ("Grep",)
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_attaches_tools_when_the_stream_has_no_result(invoker):
+    """The no-result exit is a SECOND attachment site, and mutating the shared
+    collector cannot distinguish the two — deleting this site alone left 173
+    tests green. Reachable whenever CC's stream ends without a result event."""
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Grep"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}},
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        out = await invoker.run_streaming(CCInvocation(prompt="go"))
+    assert out.text == "partial"
+    assert out.tools_used == ("Grep",)
 
 
 # --- Streaming rate-limit event tests ---
@@ -972,9 +1366,13 @@ def test_register_prunes_dead_entries():
 
 
 @pytest.mark.asyncio
-async def test_run_registers_under_session_key_and_clears(invoker):
+async def test_run_registers_under_session_key_and_clears(invoker, monkeypatch):
     """End-to-end: run() registers the proc under invocation.session_key while
     executing, and unregisters it in finally (cc-loop-01)."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     result_line = json.dumps(
         {
             "type": "result",
@@ -1010,8 +1408,12 @@ async def test_run_registers_under_session_key_and_clears(invoker):
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_registers_under_session_key_and_clears(invoker):
+async def test_run_streaming_registers_under_session_key_and_clears(invoker, monkeypatch):
     """run_streaming registers under session_key during streaming and clears in finally."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {
@@ -1156,6 +1558,40 @@ def test_classify_error_quota_from_stdout(invoker):
         stdout_text="usage limit exceeded for this billing period",
     )
     assert isinstance(err, CCQuotaExhaustedError)
+
+
+def test_classify_error_session_limit(invoker):
+    """The Max-plan session-limit wording must classify as a typed limit error,
+    not generic CCProcessError. Regression for the exact live-captured message
+    (reflex signal CCProcessError×cc): before the fix it matched NO pattern
+    ("hit your limit" is not a substring of "hit your session limit"), fell
+    through to CCProcessError, and the rate-limit park/resume layer never
+    engaged — background sessions died instead of parking.
+    """
+    from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError
+
+    # Exact live message (tz preserved; not private).
+    err = invoker._classify_error(
+        "", stdout_text="You've hit your session limit · resets 4:10am (America/Los_Angeles)"
+    )
+    assert isinstance(err, CCQuotaExhaustedError)
+    assert not isinstance(err, CCProcessError)
+    # raw_text must be carried so the park layer can parse the reset.
+    assert err.raw_text is not None and "session limit" in err.raw_text.lower()
+
+
+def test_classify_error_weekly_limit(invoker):
+    """Weekly-limit wording also classifies as a typed limit error (quota-side),
+    covering the message family, not just the session instance."""
+    from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError
+
+    for msg in [
+        "You've hit your weekly limit · resets Monday 9am",
+        "Weekly limit reached for your plan",
+    ]:
+        err = invoker._classify_error(msg)
+        assert isinstance(err, CCQuotaExhaustedError), f"Failed for: {msg}"
+        assert not isinstance(err, CCProcessError)
 
 
 @pytest.mark.asyncio
@@ -1666,7 +2102,9 @@ class TestEffortClamping:
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_cancelled_kills_subprocess(invoker):
+async def test_run_streaming_cancelled_kills_subprocess(invoker, monkeypatch):
+    # Spy killpg — never issue the real syscall against a mock pid.
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", lambda *a: None)
     """Cancellation mid-stream must terminate the CC child.
 
     The streaming loop's CancelledError path previously only unregistered
@@ -1699,8 +2137,12 @@ async def test_run_streaming_cancelled_kills_subprocess(invoker):
     ):
         await invoker.run_streaming(CCInvocation(prompt="hello"))
 
-    # getpgid(99999) raises ProcessLookupError -> falls back to proc.kill()
-    assert mock_proc.kill.called, "cancelled streaming run must kill the CC subprocess"
+    # kill_process_group signals pid-as-pgid; killpg(99999) raises
+    # ProcessLookupError (no such group) = already gone — treated as success,
+    # so the direct-kill fallback must NOT fire. The kill attempt itself is
+    # asserted by the group-kill tests; here we assert the run still raises
+    # CancelledError (above) without leaking an unhandled error.
+    assert not mock_proc.kill.called, "group-kill path must not fall back on a vanished group"
 
 
 # --- Background-wait ceiling ownership + truncation detection (D1) ---
@@ -1778,9 +2220,13 @@ def _bg_result_events():
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_sets_bg_truncated_on_ceiling_marker():
+async def test_run_streaming_sets_bg_truncated_on_ceiling_marker(monkeypatch):
     """The 'Background tasks still running...' stderr marker sets bg_truncated,
     and the partial result is still delivered (not dropped)."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     inv = CCInvoker(claude_path="claude")
     data = _make_stream_lines(*_bg_result_events())
     mock_proc = AsyncMock()
@@ -1802,7 +2248,11 @@ async def test_run_streaming_sets_bg_truncated_on_ceiling_marker():
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_no_bg_truncated_without_marker():
+async def test_run_streaming_no_bg_truncated_without_marker(monkeypatch):
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     inv = CCInvoker(claude_path="claude")
     data = _make_stream_lines(*_bg_result_events())
     mock_proc = AsyncMock()
@@ -1824,9 +2274,13 @@ async def test_run_streaming_no_bg_truncated_without_marker():
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_bg_truncated_on_no_result_branch():
+async def test_run_streaming_bg_truncated_on_no_result_branch(monkeypatch):
     """Whole-tree kill before a result line flushes: the no-result branch must
     still mark bg_truncated (review Finding 2)."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     inv = CCInvoker(claude_path="claude")
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
@@ -1874,3 +2328,376 @@ def test_build_env_bg_ceiling_just_above_margin(invoker):
         os.environ.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
         env = invoker._build_env(inv)
     assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == str(120 * 1000 - _BG_WAIT_HARD_MARGIN_MS)
+
+
+# --- Spawn-hardening migration: start_new_session + shared guarded group-kill ---
+# (PR #1415 pattern applied to the core CC spawner; follow-up 741c6c9c.)
+
+
+@pytest.mark.asyncio
+async def test_run_spawned_in_new_session(invoker):
+    """Both spawns must use start_new_session=True (setsid in the C helper —
+    never preexec_fn: arbitrary post-fork Python can deadlock in the threaded
+    server) so the kill paths can killpg the whole claude tree."""
+    captured: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured.update(kwargs)
+        raise FileNotFoundError  # short-circuit after capture
+
+    with (
+        patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        pytest.raises(CCProcessError),
+    ):
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert captured.get("start_new_session") is True
+    assert "preexec_fn" not in captured
+
+
+@pytest.mark.asyncio
+async def test_streaming_spawned_in_new_session(invoker):
+    captured: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured.update(kwargs)
+        raise FileNotFoundError
+
+    with (
+        patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        pytest.raises(CCProcessError),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    assert captured.get("start_new_session") is True
+    assert "preexec_fn" not in captured
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_group_kills_by_pid_when_leader_reaped(invoker, monkeypatch):
+    """The timeout kill must signal proc.pid AS the pgid, never via
+    os.getpgid — once asyncio reaps the leader (a descendant can keep
+    communicate() pending), getpgid raises and a bare proc.kill() no-ops,
+    leaking the very tree the kill exists to reap (the #1409 round-3 class)."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99998  # explicit — never a mock default (killpg(1) trap)
+    mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock()
+    mock_proc.returncode = -9
+    mock_proc.stderr = None
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCTimeoutError, match="Timeout"),
+    ):
+        await invoker.run(CCInvocation(prompt="hello", timeout_s=1))
+    assert killpg_calls and killpg_calls[0][0] == 99998
+    mock_proc.kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_group_kills_tree(invoker, monkeypatch):
+    """Cancellation mid-communicate: the abnormal-exit cleanup must GROUP-kill
+    the detached claude tree — a bare proc.kill() orphans its MCP children."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99997
+    mock_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock()
+    mock_proc.returncode = None  # still running at cleanup time
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert killpg_calls and killpg_calls[0][0] == 99997
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_reap_is_bounded(invoker, monkeypatch):
+    """The post-kill reap must be BOUNDED — a paused pipe transport can stall
+    an unbounded proc.wait() forever, turning timeout recovery into a hang."""
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", lambda *a: None)
+    monkeypatch.setattr("genesis.util.proc_kill.DEFAULT_REAP_TIMEOUT_S", 0.2)
+
+    async def _hang(*a, **k):
+        await asyncio.sleep(600)
+
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99996
+    mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = _hang  # unbounded reap would hang here forever
+    mock_proc.returncode = -9
+    mock_proc.stderr = None
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCTimeoutError, match="Timeout"),
+    ):
+        await asyncio.wait_for(
+            invoker.run(CCInvocation(prompt="hello", timeout_s=1)),
+            timeout=10,  # the test bound: recovery must not hang
+        )
+
+
+@pytest.mark.asyncio
+async def test_streaming_stdin_feed_failure_group_kills(invoker, monkeypatch):
+    """A failure between spawn and the stream loop (broken pipe on the stdin
+    feed) must GROUP-kill the tree, not just the direct child."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99995
+    mock_proc.kill = MagicMock()
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdin.write = MagicMock(side_effect=RuntimeError("broken pipe"))
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(RuntimeError, match="broken pipe"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    assert killpg_calls and killpg_calls[0][0] == 99995
+
+
+@pytest.mark.asyncio
+async def test_streaming_on_event_failure_group_kills(invoker, monkeypatch):
+    """Any non-timeout, non-cancel exception escaping the stream loop (an
+    on_event callback raising, an over-limit stream line) must group-kill the
+    live, already-unregistered tree — otherwise it leaks detached and even
+    /stop can't reach it (architect finding 1)."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    events = [{"type": "system", "subtype": "init", "session_id": "s1"}]
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99994
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.returncode = None
+
+    async def bad_on_event(ev):
+        raise RuntimeError("callback exploded")
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(RuntimeError, match="callback exploded"),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="hello"), on_event=bad_on_event)
+    assert killpg_calls and killpg_calls[0][0] == 99994
+
+
+@pytest.mark.asyncio
+async def test_streaming_terminate_ignored_escalates_to_group_kill(invoker, monkeypatch):
+    """The terminate-after-result reap must be BOUNDED: a CC that ignores the
+    graceful SIGTERM (wedged node/MCP teardown) previously hung the dispatch
+    forever AFTER the result was already obtained. Bounded reap → escalate to
+    the group kill → bounded reap again (architect finding 2)."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    monkeypatch.setattr("genesis.util.proc_kill.DEFAULT_REAP_TIMEOUT_S", 0.2)
+
+    events = [
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99993
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.terminate = MagicMock()  # graceful stop is IGNORED (no exit)
+    mock_proc.kill = MagicMock()
+
+    hang_then_exit = {"calls": 0}
+
+    async def _wait():
+        hang_then_exit["calls"] += 1
+        if hang_then_exit["calls"] == 1:
+            await asyncio.sleep(600)  # SIGTERM ignored — first reap must bound out
+        mock_proc.returncode = -9
+        return -9
+
+    mock_proc.wait = _wait
+    mock_proc.returncode = None
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await asyncio.wait_for(
+            invoker.run_streaming(CCInvocation(prompt="hello")),
+            timeout=10,  # the test bound: the reap must not hang the dispatch
+        )
+    assert output.text == "done"
+    assert killpg_calls and killpg_calls[0][0] == 99993  # escalation fired
+
+
+@pytest.mark.asyncio
+async def test_streaming_escalates_when_leader_exits_but_group_survives(
+    invoker, monkeypatch,
+):
+    """Codex P2 (PR #1417): after terminate(), the LEADER can exit (returncode
+    set, e.g. -15) while an MCP/helper child survives in the group. Escalation
+    gated on returncode-None alone would skip the group kill and leak the
+    descendant while Genesis reports completion — the gate must probe GROUP
+    liveness."""
+    calls = []
+
+    def _killpg(pgid, sig):
+        calls.append((pgid, sig))
+        # sig 0 probe: group still ALIVE (a descendant survives) → no raise
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg)
+    monkeypatch.setattr("genesis.cc.invoker._ESCALATION_GRACE_S", 0.01)
+
+    events = [
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99992
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock(return_value=-15)
+    mock_proc.returncode = -15  # leader ALREADY exited — the P2's trap
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="hello"))
+    assert output.text == "done"
+    # the SIGKILL escalation must have fired despite returncode being set
+    import signal as _signal
+
+    assert (99992, _signal.SIGKILL) in calls
+
+
+@pytest.mark.asyncio
+async def test_a_multi_block_assistant_line_warns_exactly_once(invoker, caplog):
+    """Pin the assumption the stream loop relies on, instead of coding around a
+    condition that does not occur.
+
+    MEASURED 2026-09-04 against the real surface (`claude -p --output-format
+    stream-json --verbose`, two probes): 8/8 `assistant` lines carried exactly
+    ONE content block, 0 multi-block — including a thinking→text→tool_use turn
+    and three PARALLEL tool calls, which the API packs into a single message and
+    the CLI splits across three lines. `StreamEvent.from_raw` keeps only the
+    first recognized block, which is therefore lossless here.
+
+    That is an external CLI's wire format, not a contract. If a future CC starts
+    batching, this fails LOUDLY rather than silently dropping tool calls and
+    answer text. Once per invocation, not once per line — the same flood shape
+    fixed on the peer-availability read path.
+    """
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "name": "Bash", "input": {}},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": "s9", "total_cost_usd": 0.01,
+            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
+    assert len(hits) == 1, f"two multi-block lines, {len(hits)} warnings (want 1)"
+
+
+@pytest.mark.asyncio
+async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog):
+    """A canary that cries wolf trains its reader to ignore it.
+
+    `from_raw` returns on the first RECOGNIZED block, so a line pairing an
+    unrecognized block (`redacted_thinking`, or any future type) with one
+    recognized block loses nothing. Counting raw list length would fire here and
+    devalue every real firing.
+    """
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "redacted_thinking", "data": "x"},
+            {"type": "text", "text": "hi"},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": "s10", "total_cost_usd": 0.01,
+            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "done"
+    hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
+    assert not hits, "canary fired on a line from_raw parses losslessly"

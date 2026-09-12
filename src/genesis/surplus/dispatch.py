@@ -19,8 +19,10 @@ seam and the import-cycle breaker; do not hoist them to module top.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING, Protocol
 
@@ -29,6 +31,7 @@ from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.types import (
     INSIGHT_PRODUCING_TASK_TYPES,
     KB_ROUTING_TASK_TYPES,
+    ComputeTier,
     TaskType,
 )
 
@@ -46,6 +49,32 @@ if TYPE_CHECKING:
     from genesis.surplus.types import SurplusExecutor
 
 logger = logging.getLogger(__name__)
+
+# A single dispatch_once phase (queue maintenance or task selection) is normally
+# sub-second. One this slow is abnormal and is the diagnostic surface for the
+# 2026-09-01 heartbeat-stall class (a phase blocking with NO task running). Observe
+# only — never a timeout: a legitimately long task lives inside `execute`, not these
+# phases, so this only LOGS to localize a stall the heavy_workload flag already forgives.
+_SLOW_PHASE_WARN_S = 120.0
+
+
+@contextlib.contextmanager
+def _timed_phase(name: str):
+    """Time a dispatch_once phase; WARN (never kill) if it runs abnormally long."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        dt = time.monotonic() - t0
+        if dt > _SLOW_PHASE_WARN_S:
+            logger.warning(
+                "surplus dispatch phase '%s' took %.0fs (>%ds) — possible "
+                "heartbeat-stall source; heavy_workload forgives the watchdog, this "
+                "log localizes the stalling phase",
+                name,
+                dt,
+                int(_SLOW_PHASE_WARN_S),
+            )
 
 
 class DispatchContext(Protocol):
@@ -171,6 +200,7 @@ async def _route_insights(
             else:
                 try:
                     from genesis.surplus.intake import (
+                        _valid_drive,
                         run_intake,
                         source_for_task_type,
                     )
@@ -180,19 +210,27 @@ async def _route_insights(
                         source=source,
                         source_task_type=str(task.task_type),
                         generating_model=insight.get("generating_model", "unknown"),
+                        drive_alignment=task.drive_alignment,
                         db=sched._db,
                     )
                     logger.info(
-                        "Intake routed %d findings (k=%d, o=%d, d=%d) for task %s",
+                        "Intake routed %d findings (k=%d, o=%d, d=%d, staged=%d) "
+                        "for task %s",
                         intake_stats.findings_count,
                         intake_stats.routed_knowledge,
                         intake_stats.routed_observation,
                         intake_stats.routed_discard,
+                        intake_stats.routed_staging,
                         task.id[:8],
                     )
-                    # Use a synthetic staging_id for tracking
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
-                    staging_id = f"{task.task_type.value}-{content_hash}"
+                    # Prefer the real staged row id (ideation → surplus_insights)
+                    # so a linked follow-up's result_staging_id resolves; else a
+                    # synthetic tracking id (KB-routed tasks stage no surplus row).
+                    if intake_stats.staged_ids:
+                        staging_id = intake_stats.staged_ids[0]
+                    else:
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                        staging_id = f"{task.task_type.value}-{content_hash}"
                 except Exception:
                     # Fallback: write to surplus_insights staging (old behavior)
                     logger.warning(
@@ -210,7 +248,7 @@ async def _route_insights(
                         content=content,
                         source_task_type=str(task.task_type),
                         generating_model=insight.get("generating_model", "unknown"),
-                        drive_alignment=task.drive_alignment,
+                        drive_alignment=_valid_drive(task.drive_alignment),
                         confidence=insight.get("confidence", 0.0),
                         created_at=now_iso,
                         ttl=ttl,
@@ -342,64 +380,163 @@ async def _signal_autonomy_success() -> None:
         logger.debug("Autonomy success signal failed (non-fatal)", exc_info=True)
 
 
+def _filter_tiers_for_network(tiers: list[ComputeTier]) -> list[ComputeTier]:
+    """Strip cloud compute tiers when the network is hard-OFFLINE (PR-3).
+
+    Keeps surplus outage-aware: during a detected outage, tasks that need the
+    internet stay ``pending`` (``next_task`` simply selects nothing for the
+    stripped tiers, and re-selects them the instant connectivity returns)
+    instead of dispatching into a dead network and churning ``failed`` /
+    dead-letter rows every cycle. LAN-local compute (``LOCAL_30B``) still runs.
+
+    This is dispatch-side *compute-availability* gating — the same mechanism as
+    the existing LM-Studio reachability check in ``get_available_tiers`` — NOT
+    generator alert-awareness (surplus generators stay deliberately blind to
+    infrastructure alerts). Fail-safe: the parking lever off, a non-fresh/absent
+    OFFLINE signal, or any error leaves the tier list untouched.
+    """
+    try:
+        from genesis.resilience import network_config
+
+        decision = network_config.parking_decision()
+        if decision in ("off", "normal"):
+            return tiers
+        local_only = [t for t in tiers if t == ComputeTier.LOCAL_30B]
+        if local_only == tiers:
+            return tiers  # already LAN-only (or empty) — nothing cloud to strip
+        if decision == "shadow":
+            logger.info(
+                "network OFFLINE: WOULD restrict surplus to LAN compute "
+                "(shadow mode) — proceeding",
+            )
+            return tiers
+        logger.info(
+            "network OFFLINE: surplus restricted to LAN compute (%d→%d tiers)",
+            len(tiers),
+            len(local_only),
+        )
+        return local_only
+    except Exception:
+        logger.debug(
+            "surplus network tier filter errored — leaving tiers intact",
+            exc_info=True,
+        )
+        return tiers
+
+
 async def dispatch_once(sched: DispatchContext) -> bool:
     """Single dispatch cycle. Returns True if a task was processed."""
-    # 0. Recover tasks stuck in 'running' state (crashed mid-execution)
-    await sched._queue.recover_stuck()
+    # Setup phases (recover/drain/reap/select) are TIMED but NOT heavy_workload-covered.
+    # `_timed_phase` logs a WARNING if any phase runs abnormally long — the diagnostic
+    # for the 2026-09-01 incident's still-unidentified "zombie restart with NO task
+    # running" mechanism (localizes a stalling setup phase). We deliberately do NOT
+    # forgive a setup-phase stall: (1) a genuine stall here is a real hang the 900s
+    # watchdog SHOULD catch, and (2) the heavy_workload flag cannot be reliably published
+    # while a setup phase holds the shared DB connection anyway — status_writer awaits
+    # DB-backed counts before reading the flag (Codex #1588 P1). heavy_workload is scoped
+    # to the EXECUTOR below, the one case it reliably covers (a long j9 executor that does
+    # not hold the DB lock). Robust setup-phase coverage waits on the instrumentation
+    # identifying the real mechanism (heavy_workload-hardening follow-up).
+    with _timed_phase("recover_stuck"):
+        await sched._queue.recover_stuck()
 
-    # 1. Drain expired pending tasks
-    await sched._queue.drain_expired(max_age_hours=sched._task_expiry_hours)
+    with _timed_phase("drain_expired"):
+        await sched._queue.drain_expired(max_age_hours=sched._task_expiry_hours)
 
-    # 1b. Age-cap terminal rows (completed/failed/cancelled) so they don't
-    # accumulate forever — drain_expired only touches pending.
-    await sched._queue.reap_terminal(older_than_days=sched._terminal_retention_days)
+    # Age-cap terminal rows (completed/failed/cancelled) so they don't accumulate
+    # forever — drain_expired only touches pending.
+    with _timed_phase("reap_terminal"):
+        await sched._queue.reap_terminal(older_than_days=sched._terminal_retention_days)
 
-    # 2. Check idle
+    # Check idle
     if not sched._idle_detector.is_idle():
         return False
 
-    # 3. Check compute availability
-    available_tiers = await sched._compute.get_available_tiers()
+    with _timed_phase("get_available_tiers"):
+        available_tiers = await sched._compute.get_available_tiers()
 
-    # 4. Get next task
-    task = await sched._queue.next_task(available_tiers)
+    # Outage awareness (PR-3): when the network is hard-OFFLINE, strip cloud tiers so
+    # internet-dependent tasks stay `pending` instead of churning into a dead network.
+    available_tiers = _filter_tiers_for_network(available_tiers)
+
+    with _timed_phase("next_task"):
+        task = await sched._queue.next_task(available_tiers)
     if task is None:
         return False
 
-    # 5. Execute
+    # Execute
     logger.info("Dispatching surplus task %s (%s)", task.id, task.task_type)
     await sched._queue.mark_running(task.id)
 
     executor = _select_executor(sched, task)
 
+    # Flag the EXECUTOR (+ intake routing + completion) as a heavy workload so the 900s
+    # zombie-scheduler watchdog FORGIVES a single long-running task (e.g. j9_eval_batch
+    # ~25 min) that would otherwise gap the dispatch-loop heartbeat and trigger a restart.
+    # Covers ALL long surplus executors (j9, model_eval, wing_audit, code_audit). The
+    # runtime flag auto-expires after 2h (runtime/_core.py), so a genuinely HUNG task is
+    # still caught — forgives long, not dead. (Mirrors the dream jobs; direct-attr writes
+    # match dream.py.) CLAIM ONLY A FREE SLOT (a single process-wide slot the dream jobs
+    # also use) and clear only what WE set.
+    #
+    # KNOWN LIMITATIONS (pre-existing to the single-slot flag; tracked in the
+    # heavy_workload-hardening follow-up, NOT fixed here): the slot is not ref-counted, so
+    # a concurrent dream that stomps+clears it can drop this dispatch's protection mid-run
+    # (rare: dream overlap + long dispatch + dream finishes first); and the flag reaches
+    # the watchdog only via status.json, which the status writer builds AFTER DB-backed
+    # counts, so a DB stall can hide it. Both need a ref-counted + DB-independent publish.
+    from datetime import UTC, datetime
+
+    from genesis.runtime import GenesisRuntime
+
+    _hw_label = f"surplus:{task.task_type}"
+    _hw_rt = None
+    _hw_did_set = False
+    with contextlib.suppress(Exception):
+        _rt = GenesisRuntime.instance()
+        if _rt._heavy_workload is None:  # free slot only — never stomp dream's flag
+            _rt._heavy_workload = _hw_label
+            _rt._heavy_workload_since = datetime.now(UTC)
+            _hw_rt, _hw_did_set = _rt, True
+
     try:
-        result = await executor.execute(task)
-    except Exception:
-        logger.exception("Surplus task %s failed with exception", task.id)
-        await _handle_failure(sched, task, "executor_exception", emit_event=True)
-        return False
+        try:
+            result = await executor.execute(task)
+        except Exception:
+            logger.exception("Surplus task %s failed with exception", task.id)
+            await _handle_failure(sched, task, "executor_exception", emit_event=True)
+            return False
 
-    if not result.success:
-        await _handle_failure(sched, task, result.error or "unknown", emit_event=False)
-        return False
+        if not result.success:
+            await _handle_failure(
+                sched, task, result.error or "unknown", emit_event=False
+            )
+            return False
 
-    # 6. Route through intake pipeline (atomize → score → route to knowledge)
-    staging_id, outcome_quality, judge_score, judge_detail = await _route_insights(
-        sched, task, result,
-    )
+        # Route through intake pipeline (atomize → score → route to knowledge)
+        staging_id, outcome_quality, judge_score, judge_detail = await _route_insights(
+            sched, task, result,
+        )
 
-    await sched._queue.mark_completed(
-        task.id, staging_id=staging_id, outcome_quality=outcome_quality,
-        judge_score=judge_score, judge_detail=judge_detail,
-    )
+        await sched._queue.mark_completed(
+            task.id, staging_id=staging_id, outcome_quality=outcome_quality,
+            judge_score=judge_score, judge_detail=judge_detail,
+        )
 
-    await _chain_pipeline(sched, task, result)
-    await _bridge_code_audit_findings(task, result)
-    await _log_brainstorm(sched, task, result, staging_id)
-    await _signal_autonomy_success()
+        await _chain_pipeline(sched, task, result)
+        await _bridge_code_audit_findings(task, result)
+        await _log_brainstorm(sched, task, result, staging_id)
+        await _signal_autonomy_success()
 
-    logger.info("Surplus task %s completed (staging=%s)", task.id, staging_id)
-    return True
+        logger.info("Surplus task %s completed (staging=%s)", task.id, staging_id)
+        return True
+    finally:
+        # Clear only what WE claimed, and only if still ours (label-guarded).
+        if _hw_did_set and _hw_rt is not None:
+            with contextlib.suppress(Exception):
+                if _hw_rt._heavy_workload == _hw_label:
+                    _hw_rt._heavy_workload = None
+                    _hw_rt._heavy_workload_since = None
 
 
 async def maybe_observe_failure(sched: DispatchContext, task, reason: str) -> None:

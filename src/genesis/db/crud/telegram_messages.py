@@ -49,22 +49,29 @@ async def query_recent(
     *,
     thread_id: int | None = None,
     limit: int = 20,
+    before: str | None = None,
 ) -> list[dict]:
-    """Return recent messages for a chat, newest first then reversed for readability."""
+    """Return recent messages for a chat, newest first then reversed for readability.
+
+    ``before`` (ISO timestamp, exclusive) pages further back — the scroll-up
+    cursor: pass the oldest timestamp from the previous page to get the next
+    older window.
+    """
+    clauses = ["chat_id = ?"]
+    params: list[object] = [chat_id]
     if thread_id is not None:
-        cursor = await db.execute(
-            """SELECT * FROM telegram_messages
-               WHERE chat_id = ? AND thread_id = ?
-               ORDER BY timestamp DESC LIMIT ?""",
-            (chat_id, thread_id, limit),
-        )
-    else:
-        cursor = await db.execute(
-            """SELECT * FROM telegram_messages
-               WHERE chat_id = ?
-               ORDER BY timestamp DESC LIMIT ?""",
-            (chat_id, limit),
-        )
+        clauses.append("thread_id = ?")
+        params.append(thread_id)
+    if before:
+        clauses.append("timestamp < ?")
+        params.append(before)
+    params.append(limit)
+    cursor = await db.execute(
+        f"""SELECT * FROM telegram_messages
+           WHERE {" AND ".join(clauses)}
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",  # noqa: S608 — clauses are literals
+        params,
+    )
     rows = await cursor.fetchall()
     # Return in chronological order (oldest first) for readability
     return [dict(r) for r in reversed(rows)]
@@ -74,13 +81,22 @@ async def query_all_recent(
     db: aiosqlite.Connection,
     *,
     limit: int = 20,
+    before: str | None = None,
 ) -> list[dict]:
     """Return recent messages across all chats, newest first then reversed."""
-    cursor = await db.execute(
-        """SELECT * FROM telegram_messages
-           ORDER BY timestamp DESC LIMIT ?""",
-        (limit,),
-    )
+    if before:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               WHERE timestamp < ?
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (before, limit),
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (limit,),
+        )
     rows = await cursor.fetchall()
     return [dict(r) for r in reversed(rows)]
 
@@ -91,14 +107,29 @@ async def search(
     query: str,
     *,
     limit: int = 10,
+    thread_id: int | None = None,
+    before: str | None = None,
 ) -> list[dict]:
-    """Search messages by keyword (LIKE match, wildcards escaped)."""
+    """Search messages by keyword (LIKE match, wildcards escaped).
+
+    ``thread_id`` scopes to one forum topic; ``before`` (ISO, exclusive)
+    pages older matches — the same scroll-up contract as query_recent.
+    """
     escaped = _escape_like(query)
+    clauses = ["chat_id = ?", "content LIKE ? ESCAPE '\\'"]
+    params: list[object] = [chat_id, f"%{escaped}%"]
+    if thread_id is not None:
+        clauses.append("thread_id = ?")
+        params.append(thread_id)
+    if before:
+        clauses.append("timestamp < ?")
+        params.append(before)
+    params.append(limit)
     cursor = await db.execute(
-        """SELECT * FROM telegram_messages
-           WHERE chat_id = ? AND content LIKE ? ESCAPE '\\'
-           ORDER BY timestamp DESC LIMIT ?""",
-        (chat_id, f"%{escaped}%", limit),
+        f"""SELECT * FROM telegram_messages
+           WHERE {" AND ".join(clauses)}
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",  # noqa: S608 — literal clauses
+        params,
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in reversed(rows)]
@@ -109,14 +140,23 @@ async def search_all(
     query: str,
     *,
     limit: int = 10,
+    before: str | None = None,
 ) -> list[dict]:
     """Search messages across all chats by keyword (LIKE match, wildcards escaped)."""
     escaped = _escape_like(query)
-    cursor = await db.execute(
-        """SELECT * FROM telegram_messages
-           WHERE content LIKE ? ESCAPE '\\'
-           ORDER BY timestamp DESC LIMIT ?""",
-        (f"%{escaped}%", limit),
-    )
+    if before:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               WHERE content LIKE ? ESCAPE '\\' AND timestamp < ?
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (f"%{escaped}%", before, limit),
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               WHERE content LIKE ? ESCAPE '\\'
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (f"%{escaped}%", limit),
+        )
     rows = await cursor.fetchall()
     return [dict(r) for r in reversed(rows)]

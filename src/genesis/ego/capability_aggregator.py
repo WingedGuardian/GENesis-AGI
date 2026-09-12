@@ -5,6 +5,10 @@ memory, and CC sessions to compute per-domain confidence scores. An optional
 6th source — Outcome Bus tier-1 execution ground truth (``source='surplus'``) —
 is folded in only when the ``outcome_bus_capability_feed`` ego flag is enabled
 (default OFF, the LC3-B go-live gate).
+
+Domains below ``MIN_SAMPLE_SIZE`` combined samples are not emitted: the map is
+rendered into ego prompts confidence-first, so a one-sample domain would present
+itself as a peer of one backed by dozens.
 """
 
 from __future__ import annotations
@@ -12,6 +16,13 @@ from __future__ import annotations
 import logging
 
 import aiosqlite
+
+from genesis.db.crud.capability_map import MIN_SAMPLE_SIZE
+
+# The ego_proposals lookback. Shared deliberately: source #1 (journal) excludes
+# proposals inside this window because source #2 counts them, and if the two
+# values drifted the overlap would silently return as a double-count.
+_PROPOSAL_WINDOW_DAYS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +35,9 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     6th source (Outcome Bus tier-1 ground truth) is gated behind the
     ``outcome_bus_capability_feed`` ego flag (default OFF); while disabled the
     output is identical to the original 5-source computation.
+
+    A domain is emitted only once its COMBINED evidence reaches
+    :data:`MIN_SAMPLE_SIZE`; below that it is noise rather than a capability.
     """
     domains: dict[str, _DomainAccumulator] = {}
 
@@ -32,7 +46,15 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     # events, not user decisions on proposal quality.
     try:
         from genesis.db.crud import intervention_journal as journal_crud
-        aggs = await journal_crud.aggregate_by_type(db)
+        # Exclude proposals the ego_proposals source below will count. Creating
+        # a proposal batch writes BOTH an ego_proposals row and a journal row per
+        # proposal (ego/session.py), so without this one observation counts twice
+        # — two proposals reach total_weight 4 and clear the three-sample floor
+        # while representing two observations. The journal still contributes
+        # everything OLDER than the window, which the other source cannot see.
+        aggs = await journal_crud.aggregate_by_type(
+            db, exclude_proposals_within_days=_PROPOSAL_WINDOW_DAYS
+        )
         for row in aggs:
             domain = row["action_type"]
             # Only count terminal user-decision states in denominator
@@ -44,6 +66,16 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
             rate = success / total
             acc = domains.setdefault(domain, _DomainAccumulator(domain))
             acc.add_signal("journal", rate, total)
+    except ValueError:
+        # A rejected window is a CALLER bug, not an unavailable source. Folded
+        # into the generic handler below it was logged at DEBUG, with no
+        # exc_info, under a false cause -- so source 1 of 6 would drop out of
+        # the map and every domain's sample size would shrink with no signal
+        # anywhere. That is quieter than the double-count the guard replaced.
+        logger.error(
+            "Capability aggregation: intervention_journal window rejected",
+            exc_info=True,
+        )
     except Exception:
         logger.debug("Capability aggregation: intervention_journal unavailable")
 
@@ -56,9 +88,10 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
                       SUM(CASE WHEN status IN ('approved', 'executed') THEN 1 ELSE 0 END) as success,
                       SUM(CASE WHEN status IN ('rejected', 'failed') THEN 1 ELSE 0 END) as rejected
                FROM ego_proposals
-               WHERE created_at >= datetime('now', '-30 days')
+               WHERE created_at >= datetime('now', ?)
                  AND status IN ('approved', 'executed', 'rejected', 'failed')
-               GROUP BY action_type"""
+               GROUP BY action_type""",
+            (f"-{_PROPOSAL_WINDOW_DAYS} days",),
         )
         for action_type, success, rejected in await cur.fetchall():
             total = success + rejected
@@ -221,7 +254,13 @@ class _DomainAccumulator:
             return None
 
         total_weight = sum(n for _, _, n in self.signals)
-        if total_weight == 0:
+        # Too little evidence to be a domain. Applied to the COMBINED weight,
+        # so thin evidence spread across sources still counts and no single
+        # source can be used to slip under the floor. Subsumes the old ``== 0``
+        # guard. The threshold is shared with the read side (one definition, in
+        # the CRUD module) — if the two drifted apart, reads would either hide
+        # rows the aggregator still writes or surface rows it refuses to.
+        if total_weight < MIN_SAMPLE_SIZE:
             return None
 
         # Inverse confidence weighting (Verified Autonomy L1): surfaces the

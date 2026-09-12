@@ -14,6 +14,16 @@
 #
 # All state isolated to ~/tmp throwaway dirs.
 set -u
+
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
 set -o pipefail
 
 PASS=0
@@ -86,7 +96,14 @@ EOF
 # Run cc_ensure_local under the sandbox PATH; capture rc.
 run_ensure() {
     local pfx="$1"
-    PATH="$pfx/bin" bash -c "source '$CC_ENV'; cc_ensure_local"
+    # HOME is overridden, not just PATH. cc_ensure_local now writes
+    # $HOME/.claude/settings.json as its first act, so this script's header
+    # claim ("the real system CC is NEVER touched") held only by accident: the
+    # sandbox PATH happens to omit mkdir and python3, so the reconciler bails
+    # in both branches. Adding either tool to new_prefix() would have made a
+    # "sandboxed unit test" start writing the developer's real settings file.
+    mkdir -p "$pfx/home"
+    PATH="$pfx/bin" HOME="$pfx/home" bash -c "source '$CC_ENV'; cc_ensure_local"
 }
 
 # ── A. npm absent → skip, rc 0, no install ────────────────────────────────

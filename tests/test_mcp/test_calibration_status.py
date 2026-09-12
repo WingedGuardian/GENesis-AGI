@@ -7,7 +7,7 @@ phrasing, NEVER a bare percentage (design §3.4/§4.3).
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import aiosqlite
@@ -196,18 +196,52 @@ async def _seed_autonomy(db, *, category="direct_session", current=2, earned=4):
     await db.commit()
 
 
-async def _seed_events(db, category, *, successes=0, corrections=0):
+def _ago(days: int) -> str:
+    """An ``occurred_at`` ``days`` before REAL now — never the frozen ``NOW``.
+
+    The earn-back surface reads its evidence through
+    ``crud.autonomy.windowed_counts``, which ages ``occurred_at`` against
+    ``datetime.now(UTC)``; ``calibration_status`` never injects a clock, so the
+    window always moves with the real calendar. Stamping events with the module's
+    frozen ``NOW`` therefore built a time bomb rather than a fixture: events dated
+    2026-07-19 sat inside the 45-day window when written and fell out of it on
+    2026-09-02, turning the suite red on every open PR at once.
+
+    The rest of this module may keep using ``NOW``, but for TWO different reasons,
+    and a new site is safe only if one of them holds:
+
+    * ``replace_cells`` / ``append_history`` take an explicit ``now=``, so their
+      timestamps are genuinely frozen rather than merely stamped.
+    * ``_seed_autonomy`` stamps ``autonomy_state.updated_at`` by raw INSERT with no
+      ``now=`` anywhere in the path — safe only because NOTHING AGES IT:
+      ``autonomy_crud.list_all`` is a bare SELECT with no time predicate, and
+      ``_earnback_evidence`` reads only category/current_level/earned_level/
+      ``last_regression_at`` off that row.
+
+    So "it takes a ``now=``" is NOT this file's invariant; "it is injected OR it is
+    never compared to a clock" is. ``autonomy_events.occurred_at`` is the one column
+    here that production does age against the live clock, and it is the only one this
+    helper stamps.
+
+    (A sibling ``_ago`` in ``tests/test_ledger/test_cells.py`` has the OPPOSITE
+    semantics — frozen-relative, ``NOW - delta``. Different module, but do not copy
+    one into the other.)
+    """
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
+async def _seed_events(db, category, *, successes=0, corrections=0, age_days=0, tag="a"):
     for i in range(successes):
         await db.execute(
             "INSERT INTO autonomy_events (id, category, kind, occurred_at)"
             " VALUES (?, ?, 'success', ?)",
-            (f"ev-s-{category}-{i}", category, NOW.isoformat()),
+            (f"ev-s-{category}-{tag}-{i}", category, _ago(age_days)),
         )
     for i in range(corrections):
         await db.execute(
             "INSERT INTO autonomy_events (id, category, kind, occurred_at)"
             " VALUES (?, ?, 'correction', ?)",
-            (f"ev-c-{category}-{i}", category, NOW.isoformat()),
+            (f"ev-c-{category}-{tag}-{i}", category, _ago(age_days)),
         )
     await db.commit()
 
@@ -234,6 +268,36 @@ async def test_earnback_surfaces_demoted_category_with_windowed_evidence(db):
     assert entry["window_corrections"] == 1
     assert 0.0 < entry["posterior"] <= 1.0
     assert isinstance(entry["evidence_supports_earned"], bool)
+
+
+@pytest.mark.asyncio
+async def test_earnback_counts_only_events_inside_the_window(db):
+    """Events older than the 45-day earn-back window must NOT be counted.
+
+    This direction was untested, which is why the frozen-``NOW`` bomb above was
+    invisible: with every event seeded at one timestamp, a suite that counted the
+    window correctly and one that ignored the window entirely produced the same
+    number, right up until the calendar moved the fixture outside the window and
+    the count went to zero. Seeding BOTH sides is what makes the window itself the
+    thing under test.
+    """
+    await cc_crud.replace_cells(db, [_cell()], now=NOW)
+    await _seed_autonomy(db, current=2, earned=4)
+    await _seed_events(db, "direct_session", successes=3, corrections=1, age_days=1, tag="in")
+    await _seed_events(db, "direct_session", successes=5, corrections=2, age_days=60, tag="out")
+
+    result = await _run(db)
+    (entry,) = result["earnback"]["demoted_categories"]
+    assert entry["window_successes"] == 3, "events outside the window were counted"
+    assert entry["window_corrections"] == 1, "events outside the window were counted"
+
+    # The 1d/60d fixture only discriminates a LARGE window change, so pin the
+    # width too — nothing else in the suite asserts it, and _EARNBACK_WINDOW_DAYS
+    # is documented as mirroring autonomy.yaml `earnback.window_days`. This locks
+    # the CONSTANT (drift becomes a red), not the mirror itself; the true 44d/46d
+    # boundary is pinned in test_state_machine.py, where a clock CAN be injected
+    # and a tight-margin fixture is therefore safe.
+    assert entry["window_days"] == 45
 
 
 @pytest.mark.asyncio

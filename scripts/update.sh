@@ -19,6 +19,17 @@
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use (here: the
+# copy-to-temp guard below, before any backup/update work). Fall back to the
+# passwd entry for the current uid (same source Path.home() uses); fail closed
+# if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # ── Copy-to-temp guard ──────────────────────────────────
 # The update script may update itself during git merge, which would corrupt
 # the running process. Industry standard (Chrome, Homebrew, Windows Update):
@@ -54,6 +65,28 @@ VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
 STATE_FILE="$HOME/.genesis/update_state.json"
 
+# Guardian pause across the deploy's server restart (PR-2). We pause the host
+# Guardian's gateway before the stop and resume on EXIT, so a deploy doesn't trip
+# it to confirmed_dead and fire false down/recovered alerts. Coords are resolved
+# lazily inside _guardian_pause and stashed here for resume (kept SEPARATE from the
+# HOST_IP/SSH_KEY globals _sync_deploy_targets owns).
+_GUARDIAN_PAUSED=""
+_GUARDIAN_HOST=""
+_GUARDIAN_KEY=""
+_GUARDIAN_RENEW_PID=""   # PID of the background lease-renewer (P2 #4), if running
+# Generous TTL: the EXIT-trap resume ends the pause early on success, so this only
+# matters if the deploy is SIGKILLed (the host's expires_at then self-heals after
+# this long). The bound is the server-DOWN window (~3-15 min), not the total pause
+# (the long host-sync runs server-up); capped at the guardian's 3600.
+GUARDIAN_PAUSE_TTL=1800
+# Bounded lease-renew (P2 #4): the stop→restart window has NO upper bound (the
+# bootstrap does unbounded network work — installer downloads, npm), so a fixed
+# TTL can expire mid-deploy and re-fire the very alerts the pause suppresses. A
+# background renewer re-issues `pause` every TTL/2 while the server is down. CAPPED
+# so an orphaned renewer (parent died before cleanup) self-terminates in
+# ~ RENEW_MAX * TTL/2 (here ~1h) instead of pausing the guardian forever.
+GUARDIAN_PAUSE_RENEW_MAX=4
+
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
 _write_state() {
@@ -71,6 +104,25 @@ _write_state() {
     "timestamp": "$(date -Iseconds)"
 }
 SEOF
+}
+
+# Clear this run's deploy state files. The state file is ours (we wrote it) so
+# always remove it. The PID marker is NOT necessarily ours to delete: only the
+# dashboard DIRECT path makes it our $$; the supervised orchestrator holds it
+# with ITS pid ACROSS tiers, and scripts/restore.sh holds it with its own pid
+# while it rebuilds the DB. So delete the marker ONLY if we own it ($$) OR its
+# holder PID is dead — never strip a LIVE foreign holder's watchdog inhibitor
+# (mirrors restore.sh's owner-check). The "dead" clause also cleans a stale
+# marker left by a prior direct run (its systemd-run parent PID is dead once
+# that run finished); env.update_in_progress() reads such a dead marker as "no
+# deploy", so the window before it is cleaned is harmless.
+_clear_deploy_state() {
+    rm -f "$STATE_FILE" 2>/dev/null || true
+    local _m="$HOME/.genesis/update_in_progress.pid" _pid
+    _pid="$(cat "$_m" 2>/dev/null || true)"
+    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; }; then
+        rm -f "$_m" 2>/dev/null || true
+    fi
 }
 
 # Signal handler for the PRE-STOP window: an interrupt before services are
@@ -100,9 +152,36 @@ _on_signal_prestop() {
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
     done
-    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid" 2>/dev/null || true
+    _clear_deploy_state
     exit 1
 }
+
+# ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
+# deploy can repair the keys.
+#
+# bootstrap.sh runs as a SUBPROCESS later in this script and calls
+# cc_ensure_local, which may repair CC's auto-updater suppression. That repair
+# sets CC_SUPPRESSION_STATE in the SUBPROCESS, where it dies; the in-process
+# call in _sync_deploy_targets then finds an already-correct file and reports
+# `ok`, so a real repair reaches neither update_history nor the deploy output —
+# and bootstrap's own message is usually cut by its `tail -10`.
+#
+# cc_ensure_updater_suppressed leaves a durable breadcrumb on any non-ok
+# outcome. CLEARING the file here is what lets the consumer tell "repaired
+# during THIS deploy" from a breadcrumb left weeks ago: anything present after
+# the subprocess was written by this deploy, BY CONSTRUCTION. This replaced an
+# epoch watermark compared with `-gt` — an ordering that rode on the wall
+# clock, so a clock rollback, a snapshot restore carrying a future-dated
+# breadcrumb, or a same-second overwrite each made a GENUINE repair read as a
+# clean deploy. Existence cannot be reordered. The epoch inside the file is
+# display data only, and no reader may compare it again.
+rm -f "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true
+if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
+    # The clear is load-bearing for attribution; a file that survives it would
+    # quietly restore the old weeks-ago-breadcrumb misattribution for one run.
+    echo "  WARNING: could not clear $HOME/.genesis/cc_suppression_outcome —" \
+         "a suppression outcome reported later in this deploy may predate it"
+fi
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
@@ -111,6 +190,23 @@ if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
     echo "ERROR: update.sh must not run from a worktree."
     echo "       GENESIS_ROOT=$GENESIS_ROOT"
     echo "       Run from the main checkout instead."
+    exit 1
+fi
+
+# ── Mutual exclusion: only one update.sh at a time ────────
+# CLI runs, the dashboard direct path, and the orchestrator all reach this
+# script; without a shared lock two could overlap (both stop the server, both
+# merge) and corrupt the deploy — observed live via a concurrent session. Held
+# whole-run on a dedicated FD (auto-released on any exit). `flock -n`: a second
+# run refuses immediately rather than queuing. Placed AFTER the worktree refusal
+# (worktree runs never take it) and BEFORE the rollback tag / backup and the
+# ERR/signal traps — a contention exit leaves the running server untouched.
+UPDATE_LOCK_FILE="$HOME/.genesis/locks/update.lock"
+mkdir -p "$(dirname "$UPDATE_LOCK_FILE")"
+exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"
+if ! flock -n "$_UPDATE_LOCK_FD"; then
+    echo "ERROR: another Genesis update is already in progress ($UPDATE_LOCK_FILE)."
+    echo "       Refusing to run a second update concurrently."
     exit 1
 fi
 
@@ -220,7 +316,10 @@ _sync_deploy_targets() {
         # into a function; test_update_host_sync.py guards the class.
         HOST_IP=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_ip', ''))" 2>/dev/null || true)
         HOST_USER=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_user', 'ubuntu'))" 2>/dev/null || echo "ubuntu")
-        SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
+        # Honor the configured ssh_key (single-line parse per the note above; expand
+        # a leading ~), falling back to the historical default when absent/empty.
+        SSH_KEY=$("$VENV_DIR/bin/python" -c "import yaml, pathlib, os; print(os.path.expanduser(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('ssh_key', '') or ''))" 2>/dev/null || true)
+        [ -n "$SSH_KEY" ] || SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 
         if [ -n "$HOST_IP" ] && [ -f "$SSH_KEY" ]; then
             # Check if Guardian-relevant paths changed in this update. Includes
@@ -434,13 +533,57 @@ _sync_deploy_targets() {
         # swallowing it — symmetric with the host-side pin failures accumulated
         # above, so a container left on a stale CC pin is surfaced in
         # update_history, not silently dropped.
+        # Clear any inherited value first: the `+set` probe below catches a
+        # LIBRARY that predates the state variable only if nothing else already
+        # put the name in scope — an exported CC_SUPPRESSION_STATE=ok from the
+        # parent environment, or an earlier in-process call, would defeat it.
+        # cc_settings_align.sh does the same, for the same reason.
+        unset CC_SUPPRESSION_STATE
         if ! cc_ensure_local; then
             echo "  WARNING: container Claude Code sync failed"
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
         fi
+        # cc_ensure_local also re-asserts auto-updater suppression (it sets
+        # CC_SUPPRESSION_STATE). Surface a non-ok outcome the same way as a version
+        # sync failure: an unsuppressed auto-updater makes the pin advisory, and a
+        # REPEATED repair means something on this box keeps rewriting settings.json
+        # — neither should live only as a line in a long deploy log.
+        # UNSET is not ok. `cc_ensure_local` sourced from a revision that predates
+        # the state variable — version skew across a partial deploy — would sail
+        # through a `${VAR:-ok}` default as a clean deploy that verified nothing.
+        # scripts/cc_settings_align.sh already refuses that read for the same
+        # reason; this is the sibling consumer of the same channel, so it refuses
+        # it too. The `+set` test distinguishes unset from empty; `:-` cannot.
+        if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
+        elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
+        else
+            # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier
+            # in this same deploy, as a subprocess, and may already have repaired
+            # the keys — leaving this call nothing to do and nothing to report.
+            # The breadcrumb is the only surviving evidence, and the file was
+            # CLEARED at the top of this script — so its mere existence now
+            # means "written during this deploy". No epoch comparison: that is
+            # the wall-clock ordering this channel used to ride on, and a clock
+            # rollback or restored snapshot made a genuine repair read as clean.
+            _supp_line="$(cat "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
+            _supp_state="${_supp_line%% *}"
+            if [ -n "$_supp_state" ]; then
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${_supp_state}"
+                echo "  NOTE: auto-updater suppression was '${_supp_state}' earlier in this" \
+                     "deploy (bootstrap) — recording it, since this later check found the" \
+                     "file already correct and would otherwise have reported a clean run"
+            fi
+        fi
         cc_shadow_scan || true
     else
+        # Without the marker, a deploy that never ran the container CC sync OR
+        # the suppression check recorded "success" with an empty degraded list —
+        # the whole block above is behind this file check, so its absence must
+        # be a first-class degraded cause, same as any failure inside it.
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
+        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_env_missing"
     fi
     echo ""
 }
@@ -470,7 +613,12 @@ _sync_deploy_targets() {
 # release de-tracks it (`.serena/` is already .gitignored); the entry below plus
 # its backup/restore pair carry the live copy through the upstream deletion.
 # Serena autogenerates the file when missing, so fresh clones need nothing.)
-EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$'
+# (`src/genesis/identity/USER.md` is the same failure mode: it shipped as a
+# TRACKED user-editable template, so installs that filled it in (as the file's
+# own comment instructed) go permanently dirty. This release de-tracks it — the
+# real per-install USER.md is now .gitignored and seeded from USER.md.example —
+# and the user-md backup/restore pair carries the filled copy through the rename.)
+EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$| src/genesis/identity/USER\.md$'
 if [[ "$POST_MERGE" == "false" ]]; then
     DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null \
         | grep -v "^??" \
@@ -548,7 +696,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
     if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
         echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
-        rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+        _clear_deploy_state
         exit 1
     fi
 fi
@@ -634,11 +782,115 @@ _start_genesis_server() {
     # This bypasses systemd monitoring, so health dashboard will show red.
     echo "  WARNING: systemctl --user restart failed — falling back to direct start (degraded)"
     echo "  Health monitoring will not work correctly. Run: systemctl --user restart genesis-server.service"
+    # Close the update-lock FD in this long-lived child: nohup'd, it OUTLIVES
+    # update.sh, and an inherited lock FD would keep the advisory lock held after
+    # we exit — deadlocking every future update until this degraded server dies.
+    # (systemd-started servers don't inherit our FDs; only this nohup path does.)
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
+        {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     echo "  Started genesis-server in degraded mode (pid $!)"
     # Write marker so dashboard can detect degraded mode
     echo "nohup" > "$HOME/.genesis/server-start-mode"
+}
+
+# ── Guardian pause / resume across the server restart (PR-2) ─────────────────
+# Pause the host Guardian's gateway before we stop genesis-server, so the deploy
+# restart doesn't trip it to confirmed_dead / fire false down+recovered alerts.
+# BEST-EFFORT ONLY: at the pause site `set -e` is live and the ERR trap is not yet
+# armed, so a bare SSH failure would ABORT the deploy — every SSH is
+# `timeout … || true` (version-verb style, NOT fetch style, which exit 1s). Host
+# coords are resolved lazily here (no hoisted resolver → nothing enters the
+# phase-order chain) into separate globals. The `pause` verb only stands the
+# Guardian down once PR-1's gateway is on the host; against an old gateway it
+# errors and we proceed unpaused (safe, dark). No-op when no host is configured.
+_guardian_pause() {
+    local cfg="$HOME/.genesis/guardian_remote.yaml"
+    [ -f "$cfg" ] || return 0
+    local hip hus key
+    hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
+    hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
+    # Honor the configured ssh_key (guardian_remote.yaml), expanding a leading ~,
+    # and fall back to the historical default when the field is absent/empty.
+    key=$("$VENV_DIR/bin/python" -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
+    [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
+    [ -n "$hip" ] && [ -f "$key" ] || return 0
+    _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
+    _GUARDIAN_KEY="$key"
+    # Don't clobber a pause we did not create (P2 #1): if the gateway already has an
+    # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
+    # proceed WITHOUT pausing and WITHOUT arming resume, so our EXIT never removes
+    # their pause (a pre-existing pause already covers our restart window). Against
+    # an OLD gateway with no `paused` verb the query errors/returns non-JSON → no
+    # match → we fall through and pause as before (backward-compatible). The pipe is
+    # in an `if` condition, so a failing ssh can't abort the deploy.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" paused 2>/dev/null | grep -q '"paused": true'; then
+        echo "  Guardian already paused (operator/other) — leaving it intact; not arming our resume"
+        return 0
+    fi
+    # Only mark paused (and arm the resume) if the gateway ACCEPTED the verb.
+    # Against an OLD gateway (no `pause <ttl>` grammar — needs PR-1 deployed) or an
+    # unreachable host this fails; we then proceed unpaused with a VISIBLE warning
+    # instead of a misleading "paused" + silence. The `if` is set -e-safe (a failing
+    # condition never aborts), so a denied/unreachable pause can't abort the deploy.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1; then
+        _GUARDIAN_PAUSED=1
+        echo "  Guardian paused across the restart (ttl ${GUARDIAN_PAUSE_TTL}s)"
+        # Resume on ANY exit, COMPOSED with the temp-copy self-delete (never
+        # replace it — a resume-only re-arm would leak the mktemp copy each deploy).
+        trap '_guardian_resume; rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
+        # Start the bounded lease renewer so an over-TTL downtime can't expire the
+        # pause mid-deploy (P2 #4). _guardian_resume (and the EXIT trap) kills it.
+        # Redirect its fds so it (and its `sleep` child) don't hold the deploy's
+        # stdout/stderr — otherwise a lingering sleep would keep the pipe open.
+        _guardian_renew_loop >/dev/null 2>&1 &
+        _GUARDIAN_RENEW_PID=$!
+    else
+        echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
+    fi
+}
+
+_guardian_resume() {
+    [ "${_GUARDIAN_PAUSED:-}" = 1 ] || return 0
+    # Stop the lease renewer FIRST so it cannot re-pause after we resume (P2 #4).
+    # We never `wait` the renewer before this point, so its PID stays held (running,
+    # or a zombie once the bounded loop self-exits) and CANNOT be reused — so kill -0
+    # reliably identifies our own process (no PID-reuse hazard, no fragile identity
+    # check). `wait` reaps the renewer bash, stopping further renewals. RESIDUAL: a
+    # `pause` ssh already in flight when the kill lands (~15s window, only if the
+    # kill hits mid-renew) is orphaned and may complete AFTER the resume below,
+    # re-asserting the pause — bounded + self-healing via the host-side TTL (≤ the
+    # pause TTL, ≤30min). All steps non-aborting under set -e.
+    if [ -n "${_GUARDIAN_RENEW_PID:-}" ]; then
+        if kill -0 "$_GUARDIAN_RENEW_PID" 2>/dev/null; then
+            kill "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
+        fi
+        wait "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
+        _GUARDIAN_RENEW_PID=""
+    fi
+    # Clear the flag ONLY after the gateway accepts `resume`. On a transient SSH
+    # failure the flag stays set so the EXIT-trap retries; if every retry fails the
+    # host-side TTL (expires_at) self-heals. Clearing first would no-op the retry.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" resume >/dev/null 2>&1; then
+        _GUARDIAN_PAUSED=""
+    fi
+    return 0
+}
+
+_guardian_renew_loop() {
+    # Re-issue `pause $TTL` every TTL/2 while the server is down, BOUNDED to
+    # GUARDIAN_PAUSE_RENEW_MAX iterations. Runs in the background (started by
+    # _guardian_pause); _guardian_resume — and thus the EXIT trap — kills it. A
+    # failed renew is swallowed (best-effort, like the pause itself).
+    local i=0
+    while [ "$i" -lt "$GUARDIAN_PAUSE_RENEW_MAX" ]; do
+        sleep "$((GUARDIAN_PAUSE_TTL / 2))"
+        timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
+        i=$((i + 1))
+    done
 }
 
 # ── Pre-update DB snapshot ────────────────────────────────
@@ -646,6 +898,12 @@ _start_genesis_server() {
 # If the server is killed mid-write during the update, this backup
 # enables recovery without data loss.
 DB_FILE="$GENESIS_ROOT/data/genesis.db"
+MIGRATIONS_RAN=0  # set to 1 once the migration runner is invoked; gates the
+                  # pre-update DB restore in _do_rollback (rollback the schema
+                  # only if this update actually migrated it).
+DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
+                  # restore trusts this, not mere file existence, so a stale
+                  # snapshot from a prior run is never restored as if current.
 if [ -f "$DB_FILE" ]; then
     echo "--- Snapshotting database ---"
     sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
@@ -656,13 +914,34 @@ if [ -f "$DB_FILE" ]; then
     # `.backup` takes a transactionally-consistent snapshot of a live database.
     if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
         echo "  DB snapshot: $DB_FILE.pre-update"
+        DB_SNAPSHOT_TAKEN=1
     else
+        # Leave any stale $DB_FILE.pre-update on disk untouched — DB_SNAPSHOT_TAKEN
+        # stays 0 so _do_rollback will NOT restore it (and will fail the rollback
+        # loudly if this run then migrates). Removing it would erase a prior valid
+        # snapshot for no gain.
         echo "  WARNING: DB snapshot failed (continuing anyway)"
     fi
 fi
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
+
+# Baseline for the post-restart subsystem delta (consumed in the health block far
+# below). Captured HERE, while the old server is still ALIVE, and NOT next to the
+# code that uses it: `systemctl show -p MainPID` returns "0" for a stopped unit, so
+# reading the pid any time after the stop below can never match the pid recorded in
+# the manifest on disk — the baseline would be silently rejected on every deploy and
+# the delta would degrade to a no-op that still looks healthy.
+#
+# Why a delta at all: a subsystem's own status is ambiguous. "degraded" means BOTH
+# "an optional dependency is absent" (normal, and permanent on many installs) and
+# "the initializer crashed and swallowed its own exception" — and 30 of the 33
+# modules under runtime/init/ do exactly that, so "failed:" almost never appears.
+# "Was working before this restart, is not working after it" is unambiguous.
+MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
+SERVER_PID_BEFORE="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+
 # Detect what is running BEFORE stopping anything, so the pre-stop signal handler
 # can restart exactly what was running if an interrupt lands mid-stop (the stop
 # polls up to ~10s) — otherwise a Ctrl-C / shutdown during the stop would leave
@@ -681,6 +960,9 @@ done
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+    # Pause the host Guardian BEFORE the stop so it never sees the restart as an
+    # outage. Best-effort; on success it arms the EXIT-trap resume.
+    _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -807,8 +1089,12 @@ _do_rollback() {
     # Stop any running services first. _ensure_server_down also disarms the
     # on-failure restart timer so a stale instance can't come back mid-rollback
     # (best-effort here — the rollback continues even if it can't fully stop).
+    local server_down=true
     _stop_genesis_server
-    _ensure_server_down || echo "  WARNING: genesis-server may still be running during rollback"
+    if ! _ensure_server_down; then
+        echo "  WARNING: genesis-server may still be running during rollback"
+        server_down=false
+    fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
 
     # Restore the original branch, then reset it to the rollback tag.
@@ -832,6 +1118,45 @@ _do_rollback() {
         pip_ok=false
     fi
 
+    # Restore the pre-update DB — but ONLY if migrations actually ran this update.
+    # Rolling back the code without the DB would leave the old code running
+    # against a migrated (newer) schema. If no migration ran, the DB is untouched.
+    local db_ok=true
+    if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then
+        if [ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]; then
+            # Migrations ran but THIS run took no valid snapshot (the `.backup`
+            # failed, or only a stale prior-run file exists). We cannot roll the
+            # schema back, so the rollback is NOT clean — the old code will run
+            # against a migrated DB. Flag it loudly for manual intervention rather
+            # than report success or restore a stale snapshot.
+            echo "  CRITICAL: migrations ran but no current DB snapshot exists — cannot restore; old code may run against a migrated schema"
+            db_ok=false
+        elif [ "$server_down" != "true" ]; then
+            # Refuse to overwrite a possibly-live database — a cp under a writing
+            # server corrupts it. Leave the migrated DB in place (schema mismatch,
+            # but recoverable) and flag for manual intervention.
+            echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
+            db_ok=false
+        elif cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1 \
+            && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
+            # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
+            # would replay them over the restored old DB on reopen, resurrecting
+            # the migration. The `.backup` snapshot is self-contained, so removing
+            # them is correct. (server_down guarantees no live handle here.)
+            echo "  Restored pre-migration database snapshot (stale WAL cleared)."
+        else
+            echo "  CRITICAL: failed to restore DB snapshot — old code may run against a migrated schema"
+            db_ok=false
+        fi
+    fi
+
+    # Reload systemd in case unit templates changed during the failed update's
+    # bootstrap. NOTE: rollback restores CODE, DEPS, and (if migrated) the DB —
+    # it does NOT re-render installed systemd units or hooks; those self-heal on
+    # the next successful update. daemon-reload picks up any unit-file drift left
+    # on disk so the restart below uses a consistent unit.
+    systemctl --user daemon-reload 2>/dev/null || true
+
     # Restart services with old code
     for svc in "${WERE_RUNNING[@]}"; do
         if [ "$svc" = "genesis-server" ]; then
@@ -842,12 +1167,14 @@ _do_rollback() {
         fi
     done
 
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ]; then
-        echo "  Rolled back to $ROLLBACK_TAG"
+    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+        echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
+        echo "  NOT reverted: installed systemd units and hooks (self-heal on the next update)."
         _record_update_history "rolled_back" "$reason" "$degraded"
     else
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
         echo "  Last known good state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
+        [ "$db_ok" = "true" ] || echo "  DB restore FAILED — old code may be running against a migrated schema."
         _record_update_history "failed" "$reason (rollback incomplete)" "$degraded"
     fi
 
@@ -887,7 +1214,7 @@ with open(sys.argv[11], 'w') as f:
     # leftover entry can't suppress the watchdog's deploy-restart guard after a
     # rollback. The server is back up (above); once this invocation exits its PID
     # dies anyway, but removing the files closes the PID-reuse window proactively.
-    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+    _clear_deploy_state
 
     echo ""
     echo "  ──────────────────────────────────────"
@@ -973,6 +1300,25 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SERENA_YML" &>/dev/null \
         && echo "  (backed up live $SERENA_YML; cleared local edits pre-merge)"
 fi
 # END serena-yml-premerge
+
+# Transitional (USER.md de-track): same pattern as the two above. USER.md shipped
+# as a TRACKED user-editable template; installs that filled it in go dirty and
+# would abort at the clean-tree gate. While it is still TRACKED (pre-de-track
+# install), back up the filled copy outside the repo and clear local edits so the
+# upstream rename (USER.md -> USER.md.example) merges clean. Restored (untracked;
+# now .gitignored) after the merge join point below. Steady state (already
+# untracked): ls-files fails -> no-op. Fresh installs seed from USER.md.example.
+# BEGIN user-md-premerge (extracted by tests/test_scripts/test_update_user_md_transition.py)
+USER_MD="src/genesis/identity/USER.md"
+USER_MD_BAK="$HOME/.genesis/USER.md.premerge"
+if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$USER_MD" &>/dev/null \
+   && [ -f "$GENESIS_ROOT/$USER_MD" ]; then
+    mkdir -p "$HOME/.genesis"
+    cp "$GENESIS_ROOT/$USER_MD" "$USER_MD_BAK"
+    git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
+        && echo "  (backed up live $USER_MD; cleared local edits pre-merge)"
+fi
+# END user-md-premerge
 
 for _eph in AGENTS.md config/procedure_triggers.yaml; do
     if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_eph" &>/dev/null \
@@ -1134,7 +1480,7 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     done
     # Nothing changed and no --post-merge continuation follows, so clear the
     # in-progress signals (like the success path) — a leftover must never linger.
-    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+    _clear_deploy_state
     # Transitional: the pre-merge step may have cleared live settings.local.json
     # or .serena/project.yml edits — put them back even though no merge landed.
     if [ -f "$SETTINGS_LOCAL_BAK" ]; then
@@ -1149,14 +1495,39 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         rm -f "$SERENA_YML_BAK"
         echo "  (restored live $SERENA_YML from pre-merge backup)"
     fi
+    if [ -f "$USER_MD_BAK" ]; then
+        mkdir -p "$(dirname "$GENESIS_ROOT/$USER_MD")"
+        cp "$USER_MD_BAK" "$GENESIS_ROOT/$USER_MD"
+        rm -f "$USER_MD_BAK"
+        echo "  (restored live $USER_MD from pre-merge backup)"
+    fi
+    # Resume the Guardian now the server is back up — BEFORE the multi-minute
+    # host-sync below — mirroring the success path (else this no-change path leaves
+    # it stood-down through the whole drift-heal, only resuming on EXIT). The
+    # EXIT-trap resume stays the backstop; idempotent (flag cleared on first resume).
+    _guardian_resume
     # Even with no repo delta, heal deploy-target drift (host/container CC + Node
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
-    # Persist any host-side degradation the drift healing just found — this
-    # path exits before the success-path recording, so without this the flag
-    # would only ever reach stdout on no-op runs.
-    if [ -n "$HOST_CC_DEGRADED" ]; then
+    # Clear stale recovery signals. If genesis-server was up when THIS run
+    # started (present in WERE_RUNNING), any prior update failure was already
+    # resolved — the server recovered. Leaving last_update_failure.json (and the
+    # rolled_back/failed update_history row that a rollback writes alongside it)
+    # in place would let P6's recovery detection later force-restart a server the
+    # operator has since deliberately stopped, on a long-dead failure. Recording
+    # a fresh success supersedes that stale status row too (both signals move
+    # together in normal flows). GATED on server-was-up: a still-down server may
+    # be an UNRESOLVED failure whose artifact must survive to drive recovery, so
+    # we must not erase it. This path also exits before the success-path
+    # recording, so it doubles as the place to persist any host-side degradation
+    # the drift healing just found.
+    if [ -f "$HOME/.genesis/last_update_failure.json" ] \
+        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        rm -f "$HOME/.genesis/last_update_failure.json"
+        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+        echo "  Cleared stale update-failure marker (server healthy, code current)."
+    elif [ -n "$HOST_CC_DEGRADED" ]; then
         echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
         _record_update_history "success" "" "$HOST_CC_DEGRADED"
     fi
@@ -1195,6 +1566,20 @@ if [ -f "$SERENA_YML_BAK" ]; then
 fi
 # END serena-yml-restore
 
+# Transitional (USER.md de-track): restore the pre-merge filled copy as an
+# UNTRACKED file (now .gitignored) after the upstream rename applied. See the
+# premerge block. No-op once installs are past the transition.
+# BEGIN user-md-restore (extracted by tests/test_scripts/test_update_user_md_transition.py)
+USER_MD="${USER_MD:-src/genesis/identity/USER.md}"
+USER_MD_BAK="${USER_MD_BAK:-$HOME/.genesis/USER.md.premerge}"
+if [ -f "$USER_MD_BAK" ]; then
+    mkdir -p "$(dirname "$GENESIS_ROOT/$USER_MD")"
+    cp "$USER_MD_BAK" "$GENESIS_ROOT/$USER_MD"
+    rm -f "$USER_MD_BAK"
+    echo "  (restored live $USER_MD from pre-merge backup)"
+fi
+# END user-md-restore
+
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
@@ -1229,6 +1614,8 @@ if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
     # shellcheck source=lib/memory_resilience.sh
     . "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
+    # Retrofit the raised PID/task ceiling on existing installs (idempotent).
+    pid_budget_apply
     echo ""
 fi
 
@@ -1284,6 +1671,9 @@ PYEOF
 case "$_mig_probe_rc" in
     0)
         echo "--- Running migrations ---"
+        # Set BEFORE the runner: even a partial failure has altered the schema,
+        # so a rollback must restore the pre-update DB (see _do_rollback).
+        MIGRATIONS_RAN=1
         if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
             _do_rollback "migration runner failed"
             exit 1
@@ -1342,6 +1732,48 @@ fi
 
 _write_state "health_check"
 
+# ── Recovery detection ────────────────────────────────────
+# An empty WERE_RUNNING means the server wasn't running when THIS update started.
+# Two very different causes: (a) a PRIOR failed update left it stopped and this is
+# a recovery re-run — the server SHOULD come back and be health-verified; or (b)
+# the operator deliberately stopped it before updating — respect that, don't
+# start what they stopped. Distinguish via failure artifacts: a leftover
+# last_update_failure.json, or a last update_history status of rolled_back/failed,
+# marks a recovery. Without the recovery push, the restart+health block below is
+# skipped and we'd record "success" with the server down and no health check.
+_OPERATOR_STOP=false
+if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
+    _recovery=false
+    if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
+        _recovery=true
+    else
+        _last_status="$("$VENV_DIR/bin/python" - <<'PYEOF' 2>/dev/null || true
+import os
+import sqlite3
+
+try:
+    con = sqlite3.connect(os.path.expanduser("~/genesis/data/genesis.db"), timeout=5)
+    row = con.execute(
+        "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    print(row[0] if row else "")
+except Exception:
+    print("")
+PYEOF
+)"
+        case "$_last_status" in
+            rolled_back | failed) _recovery=true ;;
+            *) : ;;
+        esac
+    fi
+    if [ "$_recovery" = "true" ]; then
+        echo "  Recovery run: a prior update did not complete cleanly — restoring genesis-server."
+        WERE_RUNNING+=("genesis-server")
+    else
+        _OPERATOR_STOP=true
+    fi
+fi
+
 # ── Restart services ──────────────────────────────────────
 # P5 GUARDRAIL: this final restart runs while the armed `_on_signal TERM` trap is
 # STILL live (disarmed only at the success `trap - ERR INT TERM` below). That is
@@ -1392,21 +1824,155 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     done
 
     if [ "$HEALTH_OK" = "true" ]; then
-        # Check for failed subsystems
-        DEGRADED=$(curl -sf --max-time 20 http://localhost:5000/api/genesis/health 2>/dev/null | \
-            "$VENV_DIR/bin/python" -c "
-import sys, json
+        # Which subsystems actually came up? The health ENDPOINT cannot answer
+        # that: its response carries no per-subsystem mapping. This check used to
+        # parse a `subsystems` key off it that has never existed, so DEGRADED was
+        # always empty and the branch below it had never fired on any install —
+        # a silent fail-open in a deploy gate.
+        #
+        # The bootstrap manifest is the authoritative record, written as the last
+        # statement of GenesisRuntime.bootstrap(). Statuses are exactly
+        # "ok" | "degraded" | "failed: <exc>" (runtime/_core.py _run_init_step).
+        #
+        # Two properties of that vocabulary drive the design, and testing a status
+        # in isolation gets BOTH of them wrong:
+        #
+        #   1. "failed:" is almost unreachable. _run_init_step only records it when
+        #      an exception ESCAPES the init function — and 30 of the 33 modules
+        #      under runtime/init/ catch their own (perception.py is the worked
+        #      example: `except Exception: logger.exception(...)`). A subsystem that
+        #      CRASHED therefore lands in the manifest as "degraded".
+        #   2. "degraded" is ambiguous. It is also the normal, PERMANENT state of an
+        #      optional dependency that is simply absent — no Ollama, no optional
+        #      API key — so reporting it outright cries wolf on every deploy of the
+        #      installs least able to act on it.
+        #
+        # So the check compares against a BASELINE taken before the restart instead.
+        # A delta is unambiguous where a status is not: a subsystem that was ok
+        # before this restart and is not ok after it regressed, whichever flavour of
+        # not-ok it is, while one that was already degraded stays quiet. Hard
+        # failures are reported regardless of baseline.
+        #
+        # ADVISORY, deliberately — it records, it does not revert. A CRITICAL
+        # subsystem (db/observability/router) never reaches here: the runtime
+        # refuses to report bootstrapped without all three, hosting/standalone.py
+        # then leaves no app and serve() exits, so the health wait above exhausts
+        # and rolls back on its own. What is left is the non-critical remainder,
+        # where reverting an otherwise-good deploy over one subsystem is the wrong
+        # trade. Surfaced like HOST_CC_DEGRADED below, via degraded_subsystems.
+        #
+        # python3, not "$VENV_DIR/bin/python": this needs stdlib only, and the
+        # venv may be mid-reinstall at this point in a deploy.
+        #
+        # Every read below fails CLOSED — an unowned, empty or unusable value
+        # reports `check:*` (unknown), never an empty string. Empty means "checked,
+        # nothing wrong", and handing that back for a check that did not happen is
+        # precisely the defect being fixed here: the old code trusted a key that was
+        # not there and therefore always said "clean".
+        SERVER_PID="$(systemctl --user show genesis-server.service -p MainPID --value 2>/dev/null || true)"
+        # Quoted heredoc, NOT `python3 -c '...'`: inside a single-quoted -c body an
+        # apostrophe in a comment silently terminates the shell string and breaks the
+        # script. Same form already used elsewhere in this file.
+        if ! DEGRADED=$(SERVER_PID="$SERVER_PID" SERVER_PID_BEFORE="$SERVER_PID_BEFORE" \
+                        MANIFEST_BEFORE="$MANIFEST_BEFORE" python3 - <<'PYEOF'
+import json, os, sys
+
+def rank(value):
+    """ok > degraded > everything else. Ordering only — never a pass/fail test."""
+    s = str(value)
+    return 2 if s == "ok" else 1 if s == "degraded" else 0
+
+def owner_ok(doc, pid_want):
+    """True IFF this document was written by pid_want.
+
+    Identity, not recency. The file is user-global and the server is not its only
+    writer (bridge, interactive terminal), so "written recently" cannot establish
+    whose it is — any writer can land at any moment. "Written by the process
+    systemd is running as genesis-server" is a yes/no fact.
+    """
+    return isinstance(doc, dict) and str(doc.get("pid")) == pid_want
+
+def payload(doc):
+    """The non-empty manifest mapping, or None. Kept SEPARATE from ownership so the
+    two failures get distinct sentinels — "someone else wrote this" and "this is
+    ours but says nothing" send a reader to completely different places."""
+    m = doc.get("manifest") if isinstance(doc, dict) else None
+    return m if isinstance(m, dict) and m else None
+
 try:
-    d = json.load(sys.stdin)
-    failed = [k for k,v in d.get('subsystems',{}).items() if v.get('status') == 'failed']
-    print(' '.join(failed))
-except Exception:
-    pass
-" 2>/dev/null || true)
+    pid_want = (os.environ.get("SERVER_PID") or "").strip()
+    if not pid_want or pid_want == "0":
+        print("check:no-server-pid")
+        sys.exit(0)
+    with open(os.path.expanduser("~/.genesis/bootstrap_manifest.json")) as fh:
+        doc = json.load(fh)
+    if not owner_ok(doc, pid_want):
+        # Written by the bridge, a terminal, or a previous boot. Unknown — and
+        # unknown is reported, never treated as a clean bill of health.
+        print("check:manifest-not-this-server")
+        sys.exit(0)
+    after = payload(doc)
+    if after is None:
+        print("check:manifest-empty")
+        sys.exit(0)
+
+    before, baseline_known = {}, False
+    raw = (os.environ.get("MANIFEST_BEFORE") or "").strip()
+    pid_before = (os.environ.get("SERVER_PID_BEFORE") or "").strip()
+    # `!= "0"` is load-bearing: "0" is what systemd reports for a STOPPED unit, and
+    # it is a TRUTHY string, so `raw and pid_before` alone would accept it and then
+    # fail the comparison silently — reporting "no baseline" (which reads like a
+    # first deploy) instead of "I read a stopped unit". Same falsy-check family that
+    # review already caught here once.
+    if raw and pid_before and pid_before != "0":
+        try:
+            d = json.loads(raw)
+            if owner_ok(d, pid_before):
+                b = payload(d)
+                if b is not None:
+                    before, baseline_known = b, True
+        except Exception:
+            pass
+
+    bad = []
+    if not baseline_known:
+        # First deploy on this install, or the pre-restart manifest was not the old
+        # server's. The check still runs, but it can only see hard failures — say so
+        # rather than emitting a confident-looking empty result.
+        bad.append("check:no-baseline")
+    for name, status in sorted(after.items()):
+        if rank(status) == 0:
+            bad.append(name)                          # hard failure, baseline or not
+        elif not baseline_known:
+            continue
+        elif name not in before:
+            # Arrived on THIS deploy already not-ok. The likeliest real regression:
+            # a newly added init step whose module swallows its own exception and
+            # so records "degraded" rather than "failed:".
+            if rank(status) < 2:
+                bad.append(name)
+        elif rank(status) < rank(before[name]):
+            bad.append(name)                          # regressed across the restart
+    if baseline_known:
+        # Present before, absent after. A manifest key is written on BOTH branches of
+        # _run_init_step, so an absent key means the step never ran at all — a
+        # deleted or newly-skipped subsystem. A legitimate rename costs one false
+        # positive, once; a silent drop costs the signal entirely.
+        for name in sorted(set(before) - set(after)):
+            if rank(before[name]) == 2:
+                bad.append(name + ":gone")
+    print(",".join(bad))
+except Exception as exc:
+    # Name the cause: this token is the only artefact the check leaves behind, and
+    # a bare "unreadable" makes the one signal it exists to emit undiagnosable.
+    print("check:manifest-unreadable(" + type(exc).__name__ + ")")
+PYEOF
+); then
+            # The interpreter itself failed (absent python3, OOM). Unknown, not clean.
+            DEGRADED="check:manifest-interpreter-failed"
+        fi
         if [ -n "$DEGRADED" ]; then
-            echo "  Degraded subsystems: $DEGRADED"
-            _do_rollback "subsystems failed after update: $DEGRADED" "$DEGRADED"
-            exit 1
+            echo "  NOTE: recording degraded subsystems after update: $DEGRADED"
         fi
     fi
 
@@ -1435,6 +2001,12 @@ fi
 
 # ── Success: disarm trap ──────────────────────────────────
 trap - ERR INT TERM
+
+# Resume the Guardian now — BEFORE the multi-minute host-sync below — not just on
+# EXIT, else it stays stood-down through the whole guardian/CC/Node sync (server
+# up + health-verified). The EXIT-trap resume stays the backstop; this is
+# idempotent (the flag is cleared on first resume).
+_guardian_resume
 
 _sync_deploy_targets
 
@@ -1504,7 +2076,21 @@ fi
 if [ -n "$HOST_CC_DEGRADED" ]; then
     echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
 fi
-_record_update_history "success" "" "$HOST_CC_DEGRADED"
+# If the server was operator-stopped (empty WERE_RUNNING, no recovery artifact),
+# it was intentionally NOT restarted or health-verified — record that in the
+# degraded column so this isn't a bare "success" that hides a down server.
+_p6_degraded="$HOST_CC_DEGRADED"
+if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
+    echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
+    _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
+fi
+# Subsystems that failed to initialise (or an unreadable/stale manifest). Advisory
+# by design — see the health-verification block — but it must reach the record,
+# or "surfaced, not silent" is only true of the console output of one run.
+if [ -n "${DEGRADED:-}" ]; then
+    _p6_degraded="${_p6_degraded:+$_p6_degraded,}$DEGRADED"
+fi
+_record_update_history "success" "" "$_p6_degraded"
 
 _write_state "done"
 
@@ -1513,7 +2099,7 @@ rm -f "$STATE_FILE"
 rm -f "$HOME/.genesis/update_conflicts.json"
 rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
-rm -f "$HOME/.genesis/update_in_progress.pid"
+_clear_deploy_state
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"

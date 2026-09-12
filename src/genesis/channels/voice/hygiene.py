@@ -130,7 +130,11 @@ async def sweep_blob_memories(
         if not content.startswith(_BLOB_CONTENT_PREFIX):
             continue
         memory_id = row["memory_id"]
-        await store.delete(memory_id)
+        res = await store.delete(memory_id)
+        if res.get("deferred"):
+            # Vector store unavailable → delete deferred (memory kept intact).
+            # Leave the memory_events row too and retry on the next sweep.
+            continue
         await db.execute(
             "DELETE FROM memory_events WHERE memory_id = ?",
             (memory_id,),

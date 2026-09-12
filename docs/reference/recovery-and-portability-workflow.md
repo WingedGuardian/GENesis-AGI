@@ -27,8 +27,70 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans). Releases are cut by tagging `vX.Y` on `main` and publishing a
-GitHub Release from the matching `CHANGELOG.md` section.
++ email scans).
+
+Releases are cut on a **release branch**, never on `main` — the pre-commit hook
+rejects direct commits there and branch discipline requires a PR, so the fold
+gets its own branch like any other change:
+
+1. **Branch.** `git checkout -b chore/release-vX.Y`.
+2. **Assemble the changelog.** Run `scripts/assemble_changelog.py`. It folds
+   every `changelog.d/` fragment into the `[Unreleased]` section and deletes
+   the fragments. Skipping this ships a release whose notes are missing every
+   entry merged since the last tag — silently, because the section still reads
+   as complete. `--dry-run` prints the result without touching anything.
+3. **Close the section.** Rename `## [Unreleased]` to `## [vX.Y] - YYYY-MM-DD`
+   and add a fresh empty `## [Unreleased]` above it. A tag does not rewrite
+   `CHANGELOG.md`, so without this there is no section named after the version
+   for step 6 to publish from. Read the section while you are in it — see the
+   `union` caveats below.
+4. **PR and merge.** This is the one PR that may edit `CHANGELOG.md`: its diff
+   there is produced by the assembler and the rename, not hand-written. The
+   fragment-validation CI job recognises the pairing — a fragment may only
+   disappear in a change whose `CHANGELOG.md` diff actually contains its entry.
+
+   **Merge this last, and if anything else landed while it was open: merge the
+   latest `main` into the release branch, re-run step 2, then MOVE the newly
+   folded entries out of `[Unreleased]` into the existing `[vX.Y]` section.**
+   All three, in that order — each alone is insufficient. Re-running the
+   assembler on a stale release branch reassembles the same old tree, because
+   the newly merged fragment only exists on `main`, and its arrival there does
+   not conflict with this branch's deletions, so nothing forces the sync. And
+   re-running step 2 alone is not enough either: the assembler always targets
+   `## [Unreleased]`, which step 3 re-created empty above the version section —
+   so the late entry folds under the NEXT release while `[vX.Y]` stays
+   incomplete, and CI cannot see it because the entry did arrive in the
+   changelog, just under the wrong heading. Do NOT run step 3's rename a second
+   time — a `[vX.Y]` heading already exists, and renaming the repopulated
+   `[Unreleased]` would create a duplicate; moving the entries is the whole
+   fix. Other PRs keep merging while the release PR sits in review; git
+   carries their fragments forward without touching the version section you
+   already generated. Nothing is lost — but misfiled is invisible to every
+   check, so: sync, reassemble, move, then merge is what makes the section
+   match the tag.
+5. **Tag** `vX.Y` on `main` once that PR has merged.
+6. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
+
+**Read the section before you publish it.** `CHANGELOG.md` merges with git's
+`union` driver (see `.gitattributes`), which resolves same-position insertions
+without a conflict when merging **locally**. GitHub ignores repository
+`.gitattributes` server-side, so a PR colliding on this file still shows as
+conflicting there and still has to have the base branch merged in locally.
+The tradeoff lands hardest here: union cannot express a *move* or a *removal*,
+so a release cut, which moves entries beneath a new version heading, can absorb
+another branch's later bullet into the section you are about to publish, and can
+restore an entry someone pruned. It does this with a zero exit code and no
+conflict to stop you. Union also makes no promise about ordering ("tends to
+leave the added lines in the resulting file in random order" —
+`gitattributes(5)`), so entries may need re-sorting.
+
+The release cut is the most exposed operation but not the only one: union merges
+lines, not records, so two entries sharing an identical aligned line can collapse
+into one even when both branches only added. Measured at 0 of the 18 real
+colliding PRs — it needs identical lines, and entries here are long distinctive
+prose — but it is why the check is **confirm every bullet is intact**, not merely
+"confirm nothing is missing". Diff the version section against the tag's commit
+range and read it.
 
 ## Current Recovery Anchors
 
@@ -99,18 +161,32 @@ Two mechanisms make this observable and survivable without host access:
    only booleans and an age.
 
 2. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
-   machine with `claude setup-token` and pipe it to `scripts/store_cc_token.sh`
-   in the container (stdin only — never an argument). The credential-bridge
-   awareness tick syncs it to the host shared mount
-   (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`), and
-   `diagnosis.py` injects it via `CLAUDE_CODE_OAUTH_TOKEN` **only** when a
-   pre-flight `claude auth status` confirms the host's own login is dead — a
-   working login is never overridden. Remove it with
-   `scripts/store_cc_token.sh --remove`.
+   machine with `claude setup-token` and give it to `scripts/store_cc_token.sh`
+   in the container — pipe it on stdin, or (the interactive `setup-token` makes
+   piping awkward) write it to a file and pass `--file /path/to/token`, never a
+   bare argument. Create that file `0600` — e.g. `(umask 077; claude setup-token
+   > tok)` — and `rm` it after storing; it holds the raw token in plaintext (the
+   script warns if the source is group/other-readable). The credential-bridge awareness tick
+   syncs it to the host shared mount
+   (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`). It is
+   a **shared fallback** read by several consumers, each of which injects it via
+   `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead: the
+   **host** Guardian recovery brain (`diagnosis.py`, gated on a pre-flight
+   `claude auth status`), the **container's own** CC sessions
+   (`cc/login_health.py`, wired at `cc/invoker.py`), and **interactive slots**
+   (`cc/login_gate.py`, wired at `scripts/cc-slot.sh`). A healthy login is never
+   overridden — except the interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever,
+   which deliberately injects over a live login (losing Remote Control / claude.ai
+   connectors until it is set back to `conditional` and the slot restarts). Remove
+   it with `scripts/store_cc_token.sh --remove`. The
+   authoritative consumer list is CI-enforced in
+   `docs/architecture/shared-artifacts.md`.
 
    The token lives in a **dedicated** file, never `secrets.env` (which is
-   `load_dotenv`'d with `override=True` and would hijack the *container's* own
-   CC auth). It is a subscription-OAuth token, **not** an `ANTHROPIC_API_KEY` —
+   `load_dotenv`'d with `override=True` and would *unconditionally* set
+   `CLAUDE_CODE_OAUTH_TOKEN` for every process that loads it, hijacking a
+   *healthy* container login; the dedicated file is injected conditionally
+   instead). It is a subscription-OAuth token, **not** an `ANTHROPIC_API_KEY` —
    the no-API-key posture is unchanged.
 
 You can mint the token proactively at install, or defer it entirely: the first

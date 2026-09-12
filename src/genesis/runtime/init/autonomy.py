@@ -172,7 +172,7 @@ async def init(rt: GenesisRuntime) -> None:
                     except asyncio.CancelledError:
                         break
                     except Exception as exc:
-                        rt.record_job_failure("approval_timeout_poll", str(exc))
+                        rt.record_job_failure("approval_timeout_poll", exc=exc)
                         logger.error("Approval timeout polling failed", exc_info=True)
 
             rt._approval_timeout_task = tracked_task(

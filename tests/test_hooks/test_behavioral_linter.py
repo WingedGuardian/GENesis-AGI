@@ -4,8 +4,15 @@ Runs the script as a subprocess with piped stdin JSON to test the actual
 invocation pattern used by the CC CLI. Checks exit code and stderr output.
 
 Exit codes:
-  0 — allow (no violations, empty content, parse failure)
-  2 — block (a rule with severity=block matched)
+  0 — allow (no violations, only warnings, empty content, parse failure)
+  2 — block (a pattern with severity=block matched)
+
+behavioral-lint: ignore no-hide-problems
+behavioral-lint: ignore no-unguarded-kill
+^ This is the linter's OWN test suite: its fixtures necessarily contain every
+  trigger pattern the linter matches, so it must be exempt from self-linting.
+  Post-deploy the linter also skips this by directory, but the escape tokens
+  keep the file editable under an older (still-blocking) hook.
 """
 
 import json
@@ -13,9 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_SCRIPT = str(
-    Path(__file__).resolve().parent.parent.parent / "scripts" / "behavioral_linter.py"
-)
+_SCRIPT = str(Path(__file__).resolve().parent.parent.parent / "scripts" / "behavioral_linter.py")
 _PYTHON = sys.executable
 
 
@@ -46,16 +51,20 @@ def _run_linter(
 
 
 # ---------------------------------------------------------------------------
-# no-hide-problems rule — should BLOCK (exit 2)
+# no-hide-problems — code-level patterns BLOCK (exit 2)
 # ---------------------------------------------------------------------------
 
 
-class TestNoHideProblemsBlocks:
-    """Content that violates no-hide-problems must produce exit 2."""
+class TestNoHideProblemsCodeBlocks:
+    """Code-level hiding (display:none / x-show on an error state) → exit 2.
+
+    These patterns require a literal ``display:none`` or an Alpine ``x-show``,
+    which effectively never appear in prose, so they remain hard blocks.
+    """
 
     def test_display_none_with_error_state(self):
-        """CSS display:none targeting an error/unknown element → blocked."""
-        content = '.error-widget { display: none; /* unknown state */ }'
+        """CSS display:none on an error-named element → blocked."""
+        content = ".error-widget { display: none; /* unknown state */ }"
         result = _run_linter({"content": content, "file_path": "dashboard.css"})
         assert result.returncode == 2
         assert "no-hide-problems" in result.stderr
@@ -89,92 +98,110 @@ class TestNoHideProblemsBlocks:
         assert result.returncode == 2
         assert "no-hide-problems" in result.stderr
 
+    def test_markdown_quoting_css_not_blocked(self):
+        """P2 regression: a .md/.rst doc quoting the CSS must not hard-block.
+
+        A doc merely describing the anti-pattern (an audit report, a PR body, a
+        code fence) is excluded; real markup lives in .css/.html/.js. Fixture is
+        concatenated so this file has no literal trigger.
+        behavioral-lint: ignore no-hide-problems
+        """
+        css = ".err" + "or { display: none; }"
+        content = "The anti-pattern to avoid:\n```css\n" + css + "\n```\n"
+        result = _run_linter({"content": content, "file_path": "docs/hooks-audit.md"})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
+# no-hide-problems — reasoning/prose patterns WARN (exit 0)
+# ---------------------------------------------------------------------------
+
+
+class TestNoHideProblemsProseWarns:
+    """Reasoning/prose proposals → WARN (exit 0), not a hard block.
+
+    The prose patterns match token adjacency, not intent, so they surface the
+    concern without blocking legitimate writing. Each still names the rule on
+    stderr so the nudge is visible.
+    """
+
+    def _assert_warns(self, result):
+        # Warn advisories ride hookSpecificOutput.additionalContext on STDOUT
+        # (exit-0 stderr is discarded by Claude Code), never a hard block.
+        assert result.returncode == 0, result.stderr
+        assert "additionalContext" in result.stdout
+        assert "WARNING" in result.stdout
+        assert "no-hide-problems" in result.stdout
+        assert "BLOCKED" not in result.stdout and "BLOCKED" not in result.stderr
+
     def test_propose_hide_broken_data(self):
-        """Comment proposing to hide broken data → blocked."""
         content = "# We should hide the broken data for now"
-        result = _run_linter({"content": content, "file_path": "plan.md"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "plan.py"}))
 
     def test_propose_skip_unknown(self):
-        """Comment proposing to skip unknown values → blocked."""
         content = "# skip the unknown values until we figure it out"
-        result = _run_linter({"content": content, "file_path": "notes.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "notes.py"}))
 
     def test_propose_suppress_failed(self):
-        """Comment proposing to suppress failed items → blocked."""
         content = "# suppress the failed items in the output"
-        result = _run_linter({"content": content, "file_path": "renderer.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "renderer.py"}))
 
     def test_propose_omit_stale(self):
-        """Comment proposing to omit stale entries → blocked."""
         content = "# omit any stale entries from the dashboard"
-        result = _run_linter({"content": content, "file_path": "dashboard.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "dashboard.py"}))
 
     def test_reverse_order_error_then_hide(self):
-        """'error' before 'hide' in same sentence → blocked."""
         content = "# error state — hide it from the user"
-        result = _run_linter({"content": content, "file_path": "view.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "view.py"}))
 
     def test_dont_show_error(self):
-        """'don't show the error' → blocked."""
         content = "# don't show the error state to users"
-        result = _run_linter({"content": content, "file_path": "handler.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "handler.py"}))
 
     def test_do_not_display_unknown(self):
-        """'do not display unknown' → blocked."""
         content = "# do not display unknown values in the table"
-        result = _run_linter({"content": content, "file_path": "table.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "table.py"}))
 
     def test_only_show_when_available(self):
-        """'only show when available' pattern → blocked."""
         content = "# only show the metric when the data is available"
-        result = _run_linter({"content": content, "file_path": "metrics.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "metrics.py"}))
 
     def test_only_show_when_healthy(self):
-        """'only show when healthy' → blocked."""
         content = "# only show the panel when the service is healthy"
-        result = _run_linter({"content": content, "file_path": "service.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "service.py"}))
 
     def test_skip_showing_unless_configured(self):
-        """'skip showing unless configured' → blocked."""
         content = "# skip showing the widget unless the source exists"
-        result = _run_linter({"content": content, "file_path": "widget.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "widget.py"}))
 
     def test_unknown_suppress_in_comment(self):
-        """'unknown data, just suppress it' → blocked."""
         content = "# unknown data, just suppress it for now"
-        result = _run_linter({"content": content, "file_path": "processor.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+        self._assert_warns(_run_linter({"content": content, "file_path": "processor.py"}))
 
-    def test_violation_in_new_string_field(self):
-        """Content in new_string (Edit tool) is also checked."""
-        result = _run_linter({
-            "new_string": "# hide the broken data for now",
-            "old_string": "# show the broken data",
-            "file_path": "editor.py",
-        })
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
+    def test_warns_in_new_string_field(self):
+        """Prose in new_string (Edit tool) is also checked — warns."""
+        result = _run_linter(
+            {
+                "new_string": "# hide the broken data for now",
+                "old_string": "# show the broken data",
+                "file_path": "editor.py",
+            }
+        )
+        self._assert_warns(result)
+
+    def test_identifier_embedded_not_flagged(self):
+        """Regression: word-boundary anchoring — identifiers must not trip.
+
+        The live false positives that motivated the warn downgrade + \\b anchors:
+        a removed error-tuple identifier and a skip_writeback param near 'drift'.
+        """
+        for content in (
+            "removed the now-dead _QDRANT_ERRORS tuple",
+            "skip_writeback asserted after the too-small-unknown drift",
+        ):
+            result = _run_linter({"content": content, "file_path": "notes.py"})
+            assert result.returncode == 0, f"{content!r} → {result.stderr}"
+            assert "no-hide-problems" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +271,22 @@ class TestNoUnguardedKillBlocks:
 
     def test_violation_in_new_string_field(self):
         """Kill pattern in new_string (Edit tool) → blocked."""
-        result = _run_linter({
-            "new_string": "os.kill(-1, signal.SIGKILL)",
-            "old_string": "pass",
-            "file_path": "edit.py",
-        })
+        result = _run_linter(
+            {
+                "new_string": "os.kill(-1, signal.SIGKILL)",
+                "old_string": "pass",
+                "file_path": "edit.py",
+            }
+        )
         assert result.returncode == 2
         assert "no-unguarded-kill" in result.stderr
+
+    def test_kill_literal_in_markdown_not_blocked(self):
+        """applies_to: *.py — the kill literal quoted in a .md doc must NOT block."""
+        content = "The audit flagged os.kill(-1, SIGKILL) as the dangerous call."
+        result = _run_linter({"content": content, "file_path": "docs/audit.md"})
+        assert result.returncode == 0, result.stderr
+        assert "no-unguarded-kill" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -263,16 +299,13 @@ class TestAllowCleanContent:
 
     def test_normal_python_code(self):
         """Plain Python with no anti-patterns → allowed."""
-        content = (
-            "def process_data(items):\n"
-            "    return [x for x in items if x.is_valid()]\n"
-        )
+        content = "def process_data(items):\n    return [x for x in items if x.is_valid()]\n"
         result = _run_linter({"content": content, "file_path": "processor.py"})
         assert result.returncode == 0
 
     def test_display_none_without_error_keyword(self):
         """CSS display:none without error/unknown keywords → allowed."""
-        content = '.sidebar { display: none; }'
+        content = ".sidebar { display: none; }"
         result = _run_linter({"content": content, "file_path": "style.css"})
         assert result.returncode == 0
 
@@ -284,10 +317,7 @@ class TestAllowCleanContent:
 
     def test_showing_error_state_honestly(self):
         """Code that SHOWS error state (not hiding it) → allowed."""
-        content = (
-            'if status == "error":\n'
-            '    render_error_banner(details)\n'
-        )
+        content = 'if status == "error":\n    render_error_banner(details)\n'
         result = _run_linter({"content": content, "file_path": "view.py"})
         assert result.returncode == 0
 
@@ -299,10 +329,7 @@ class TestAllowCleanContent:
 
     def test_os_killpg_with_guarded_variable(self):
         """os.killpg(pgid, ...) with a variable → allowed."""
-        content = (
-            "if pgid > 1:\n"
-            "    os.killpg(pgid, signal.SIGTERM)\n"
-        )
+        content = "if pgid > 1:\n    os.killpg(pgid, signal.SIGTERM)\n"
         result = _run_linter({"content": content, "file_path": "guard.py"})
         assert result.returncode == 0
 
@@ -347,28 +374,22 @@ class TestEscapeHatch:
 
     def test_escape_unguarded_kill(self):
         """behavioral-lint: ignore no-unguarded-kill → allows kill(-1)."""
-        content = (
-            "# behavioral-lint: ignore no-unguarded-kill\n"
-            "os.kill(-1, signal.SIGTERM)\n"
-        )
+        content = "# behavioral-lint: ignore no-unguarded-kill\nos.kill(-1, signal.SIGTERM)\n"
         result = _run_linter({"content": content, "file_path": "escape.py"})
         assert result.returncode == 0
 
     def test_escape_hide_problems(self):
-        """behavioral-lint: ignore no-hide-problems → allows hide pattern."""
+        """behavioral-lint: ignore no-hide-problems → allows the display:none block."""
         content = (
             "# behavioral-lint: ignore no-hide-problems\n"
-            "# hide the broken data temporarily\n"
+            ".error-box { display: none; /* failed */ }\n"
         )
-        result = _run_linter({"content": content, "file_path": "escape.py"})
+        result = _run_linter({"content": content, "file_path": "escape.css"})
         assert result.returncode == 0
 
     def test_escape_one_rule_still_blocks_other(self):
         """Escaping one rule doesn't escape a different rule."""
-        content = (
-            "# behavioral-lint: ignore no-hide-problems\n"
-            "os.kill(-1, signal.SIGKILL)\n"
-        )
+        content = "# behavioral-lint: ignore no-hide-problems\nos.kill(-1, signal.SIGKILL)\n"
         result = _run_linter({"content": content, "file_path": "partial.py"})
         assert result.returncode == 2
         assert "no-unguarded-kill" in result.stderr
@@ -380,7 +401,7 @@ class TestEscapeHatch:
         content = (
             "# behavioral-lint: ignore no-hide-problems\n"
             "# behavioral-lint: ignore no-unguarded-kill\n"
-            "# hide the broken data\n"
+            ".error-box { display: none; /* failed */ }\n"
             "os.kill(-1, signal.SIGKILL)\n"
         )
         result = _run_linter({"content": content, "file_path": "all_escaped.py"})
@@ -423,30 +444,36 @@ class TestEdgeCases:
 
     def test_content_field_used_for_write_tool(self):
         """Write tool sends content field — violations detected there."""
-        result = _run_linter({
-            "content": "os.kill(-1, signal.SIGKILL)",
-            "file_path": "write.py",
-        })
+        result = _run_linter(
+            {
+                "content": "os.kill(-1, signal.SIGKILL)",
+                "file_path": "write.py",
+            }
+        )
         assert result.returncode == 2
         assert "no-unguarded-kill" in result.stderr
 
     def test_new_string_field_used_for_edit_tool(self):
         """Edit tool sends new_string field — violations detected there."""
-        result = _run_linter({
-            "new_string": "os.killpg(1, signal.SIGTERM)",
-            "old_string": "pass",
-            "file_path": "edit.py",
-        })
+        result = _run_linter(
+            {
+                "new_string": "os.killpg(1, signal.SIGTERM)",
+                "old_string": "pass",
+                "file_path": "edit.py",
+            }
+        )
         assert result.returncode == 2
         assert "no-unguarded-kill" in result.stderr
 
     def test_old_string_not_checked(self):
         """old_string field should NOT be checked (it's existing code)."""
-        result = _run_linter({
-            "old_string": "os.kill(-1, signal.SIGKILL)",
-            "new_string": "os.kill(pid, signal.SIGTERM)",
-            "file_path": "fix.py",
-        })
+        result = _run_linter(
+            {
+                "old_string": "os.kill(-1, signal.SIGKILL)",
+                "new_string": "os.kill(pid, signal.SIGTERM)",
+                "file_path": "fix.py",
+            }
+        )
         assert result.returncode == 0
 
     def test_content_preferred_over_new_string(self):
@@ -455,20 +482,24 @@ class TestEdgeCases:
         The script uses `data.get("content", "") or data.get("new_string", "")`,
         so if content is non-empty it takes precedence.
         """
-        result = _run_linter({
-            "content": "normal safe code",
-            "new_string": "os.kill(-1, signal.SIGKILL)",
-            "file_path": "both.py",
-        })
+        result = _run_linter(
+            {
+                "content": "normal safe code",
+                "new_string": "os.kill(-1, signal.SIGKILL)",
+                "file_path": "both.py",
+            }
+        )
         # content is clean → allowed (new_string not checked)
         assert result.returncode == 0
 
     def test_file_path_in_error_message(self):
         """The file_path appears in the violation message."""
-        result = _run_linter({
-            "content": "os.kill(-1, signal.SIGTERM)",
-            "file_path": "src/genesis/danger_zone.py",
-        })
+        result = _run_linter(
+            {
+                "content": "os.kill(-1, signal.SIGTERM)",
+                "file_path": "src/genesis/danger_zone.py",
+            }
+        )
         assert result.returncode == 2
         assert "src/genesis/danger_zone.py" in result.stderr
 
@@ -489,20 +520,21 @@ class TestMultipleRules:
         assert "no-unguarded-kill" in result.stderr
         assert "no-hide-problems" not in result.stderr
 
-    def test_hide_violation_only(self):
-        """Hide violation without kill violation → only no-hide-problems."""
+    def test_hide_prose_warns_only(self):
+        """Prose hide proposal without kill → warn (exit 0), only no-hide-problems."""
         content = "# hide the broken dashboard widget"
         result = _run_linter({"content": content, "file_path": "hide_only.py"})
-        assert result.returncode == 2
-        assert "no-hide-problems" in result.stderr
-        assert "no-unguarded-kill" not in result.stderr
+        assert result.returncode == 0, result.stderr
+        assert "WARNING" in result.stdout  # warn rides additionalContext
+        assert "no-hide-problems" in result.stdout
+        assert "no-unguarded-kill" not in result.stdout
 
-    def test_both_violations(self):
-        """Content violating both rules → both reported, exit 2."""
-        content = (
-            "# hide the broken data\n"
-            "os.kill(-1, signal.SIGKILL)\n"
-        )
+    def test_prose_warn_and_kill_block(self):
+        """Prose hide (warn) + kill (block) → exit 2, both reported.
+
+        Verifies the warn pattern does not mask the block pattern (max-severity).
+        """
+        content = "# hide the broken data\nos.kill(-1, signal.SIGKILL)\n"
         result = _run_linter({"content": content, "file_path": "double.py"})
         assert result.returncode == 2
         assert "no-hide-problems" in result.stderr
@@ -518,12 +550,14 @@ class TestViolationMessages:
     """Verify the structure of violation messages on stderr."""
 
     def test_blocked_message_structure(self):
-        """Violation messages include BLOCKED, rule name, file, issue, fix, escape."""
+        """Block messages include BLOCKED, rule name, file, issue, fix, escape."""
         content = "os.killpg(0, signal.SIGTERM)"
-        result = _run_linter({
-            "content": content,
-            "file_path": "src/process.py",
-        })
+        result = _run_linter(
+            {
+                "content": content,
+                "file_path": "src/process.py",
+            }
+        )
         assert result.returncode == 2
         stderr = result.stderr
         assert "BLOCKED" in stderr
@@ -533,17 +567,79 @@ class TestViolationMessages:
         assert "Escape:" in stderr
         assert "behavioral-lint: ignore no-unguarded-kill" in stderr
 
-    def test_hide_problems_message_structure(self):
-        """no-hide-problems violation has proper message structure."""
+    def test_warn_rides_additional_context(self):
+        """A warn advisory is delivered via additionalContext (stdout), exit 0.
+
+        Regression: exit-0 stderr is discarded by Claude Code, so a warn printed
+        only to stderr would be invisible to the model. It must ride
+        hookSpecificOutput.additionalContext instead.
+        """
         content = "# suppress the failed records"
-        result = _run_linter({
-            "content": content,
-            "file_path": "src/data.py",
-        })
+        result = _run_linter({"content": content, "file_path": "src/data.py"})
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+        assert "WARNING" in ctx
+        assert "no-hide-problems" in ctx
+        assert "src/data.py" in ctx
+        assert "behavioral-lint: ignore no-hide-problems" in ctx
+
+    def test_block_plus_warn_all_on_stderr(self):
+        """When a block co-occurs with a warn, exit 2 and both ride stderr."""
+        kill = "os.kill(-" + "1, signal.SIGKILL)"  # avoid the literal in source
+        content = "# hide the broken data\n" + kill + "\n"
+        result = _run_linter({"content": content, "file_path": "mix.py"})
         assert result.returncode == 2
-        stderr = result.stderr
-        assert "BLOCKED" in stderr
-        assert "no-hide-problems" in stderr
-        assert "src/data.py" in stderr
-        assert "Fix:" in stderr
-        assert "behavioral-lint: ignore no-hide-problems" in stderr
+        assert "no-unguarded-kill" in result.stderr
+        assert "no-hide-problems" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# applies_to / excludes — the kill rule must fire on ALL code, not just *.py
+# behavioral-lint: ignore no-unguarded-kill
+# ---------------------------------------------------------------------------
+
+
+class TestKillRuleFileScope:
+    """no-unguarded-kill uses a docs exclude-list, not a *.py allow-list.
+
+    Regression for the review finding: a `*.py` allow-list silently un-guarded
+    the catastrophic call in extensionless CLI scripts, notebooks, and
+    templates. The rule must fire on every code file and only skip doc formats.
+    """
+
+    _KILL = "os.kill(-1, signal.SIGKILL)"
+
+    def test_extensionless_shebang_script_blocked(self):
+        """A real target: scripts/gmodel is an extensionless python CLI."""
+        result = _run_linter({"content": self._KILL, "file_path": "scripts/gmodel"})
+        assert result.returncode == 2
+        assert "no-unguarded-kill" in result.stderr
+
+    def test_notebook_blocked(self):
+        result = _run_linter({"content": self._KILL, "file_path": "explore.ipynb"})
+        assert result.returncode == 2
+
+    def test_template_blocked(self):
+        result = _run_linter({"content": self._KILL, "file_path": "unit.service.j2"})
+        assert result.returncode == 2
+
+    def test_markdown_doc_allowed(self):
+        result = _run_linter({"content": self._KILL, "file_path": "docs/audit.md"})
+        assert result.returncode == 0, result.stderr
+        assert "no-unguarded-kill" not in result.stderr
+
+    def test_rst_doc_allowed(self):
+        result = _run_linter({"content": self._KILL, "file_path": "docs/audit.rst"})
+        assert result.returncode == 0, result.stderr
+
+    def test_rules_dir_lookalike_path_still_linted(self):
+        """The rules-dir skip must match the REAL dir, not any path containing
+        the segment — a crafted src/.../config/behavioral_rules/ must still lint.
+        """
+        result = _run_linter(
+            {"content": self._KILL, "file_path": "src/genesis/config/behavioral_rules/evil.py"}
+        )
+        assert result.returncode == 2
+        assert "no-unguarded-kill" in result.stderr

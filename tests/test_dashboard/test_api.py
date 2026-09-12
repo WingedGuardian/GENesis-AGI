@@ -36,11 +36,18 @@ def test_dashboard_page_without_template(client):
 
 
 def test_dashboard_page_contains_operator_controls(client):
-    """Dashboard HTML includes the queue, routing, and budget controls."""
+    """Dashboard HTML includes the queue, routing, and budget controls.
+
+    These assert that each control is PRESENT, so they anchor on the handler or
+    the stable heading rather than on display text. The clear-all check used to
+    match the literal "Clear all reviewed" and broke when that button began
+    reporting how many rows it deletes — a label change, not a missing control,
+    but indistinguishable from one at the assertion.
+    """
     resp = client.get("/genesis")
     assert resp.status_code == 200
     page = resp.get_data(as_text=True)
-    assert "Clear all reviewed" in page
+    assert "clearAllDiscardedItems()" in page
     assert "Reload routing config" in page
     assert "Approval Queue" in page
     assert "Save budget" in page
@@ -490,6 +497,72 @@ def test_routing_config_read_includes_call_sites(client):
     assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
 
 
+def test_routing_config_read_reports_why_a_breaker_is_not_closed(client):
+    """WIRING: the route must actually emit `cb_detail.opened_by`.
+
+    The frontend tests drive `breakerVerdict`/`breakerTooltip` from synthetic
+    payloads, which proves the rendering and not that anything produces the
+    data. This drives REAL CircuitBreaker objects through the real route, so a
+    rename or a dropped key fails here rather than silently rendering every
+    provider as probe-suspected.
+
+    Uses real breakers rather than mocks deliberately: `opened_by` is derived
+    from `_opened_by_call`, and a MagicMock would answer truthy for it whatever
+    the production code did.
+    """
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+    from genesis.routing.types import ErrorCategory, ProviderConfig
+
+    def _p(name):
+        return ProviderConfig(
+            name=name, provider_type="openrouter", model_id="m",
+            is_free=True, rpm_limit=None, open_duration_s=120,
+        )
+
+    names = ["healthy-1", "call-dead", "probe-suspect"]
+    t = [0.0]
+    reg = CircuitBreakerRegistry(
+        {n: _p(n) for n in names}, clock=lambda: t[0], persist=False,
+    )
+    # call-dead: real calls failed → OPEN, opened_by == "call"
+    for _ in range(3):
+        reg.get("call-dead").record_failure(ErrorCategory.PERMANENT)
+    # probe-suspect: a probe blip only → HALF_OPEN, opened_by == "probe"
+    reg.get("probe-suspect").probe_suspect()
+
+    mock_cfg = SimpleNamespace()
+    mock_cfg.disabled_providers = {}
+    mock_cfg.providers = {
+        n: SimpleNamespace(name=n, provider_type="openrouter", model_id="m", is_free=True)
+        for n in names
+    }
+    mock_cfg.call_sites = {}
+    mock_router = MagicMock()
+    mock_router.config = mock_cfg
+    mock_router.breakers = reg
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/routing/config")
+
+    assert resp.status_code == 200
+    detail = resp.get_json()["cb_detail"]
+
+    assert detail["healthy-1"] == {"state": "closed", "opened_by": None}
+    assert detail["call-dead"] == {"state": "open", "opened_by": "call"}, (
+        "a call-tripped breaker must report opened_by='call' — the dashboard "
+        "uses it to say WHY, and defaulting to 'probe' understates a real outage"
+    )
+    assert detail["probe-suspect"] == {"state": "half_open", "opened_by": "probe"}
+
+    # cb_states must keep its plain-string shape — several consumers lowercase
+    # it directly, so widening it into an object would break them silently.
+    assert resp.get_json()["cb_states"]["call-dead"] == "open"
+
+
 def test_routing_config_update_endpoint(client):
     """Routing updates persist through the config helper and hot-reload the router."""
     from unittest.mock import AsyncMock
@@ -551,3 +624,118 @@ def test_routing_config_reload_endpoint(client):
     load_config.assert_called_once()
     mock_router.reload_config.assert_called_once_with(fake_config)
     mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
+
+
+def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):
+    """Dashboard PUT disabling the mandatory approval gate without the
+    confirm flag must 409 and write NOTHING; with the flag it applies
+    (2026-08-18: an unconfirmed PUT used to flip it silently)."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+        patch(
+            "genesis.dashboard.routes.settings._notify_gate_disabled",
+            new=AsyncMock(),
+        ) as notify,
+    ):
+        resp = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={"manual_approval_required": False},
+        )
+        assert resp.status_code == 409
+        assert "confirm_disable_approval_gate" in resp.get_json()["details"]
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+        notify.assert_not_awaited()
+
+        resp2 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert resp2.status_code == 200
+        written = (tmp_path / "autonomous_cli_policy.local.yaml").read_text()
+        assert "manual_approval_required: false" in written
+        assert written.startswith("# set-by: user via dashboard PUT")
+        notify.assert_awaited_once()
+
+
+def test_settings_put_gate_already_off_does_not_realert(client, tmp_path):
+    """Codex P2: the dashboard PUTs the WHOLE config, so a save that still
+    carries manual_approval_required=false while the gate was ALREADY off must
+    NOT re-fire the disable alert — only a genuine true→false transition
+    notifies (otherwise the 0-window path would spam on every autonomous-cli
+    settings save)."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+        patch(
+            "genesis.dashboard.routes.settings._notify_gate_disabled",
+            new=AsyncMock(),
+        ) as notify,
+    ):
+        # First PUT: a genuine disable (transition True→False) → notifies once.
+        r1 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert r1.status_code == 200
+        notify.assert_awaited_once()
+        notify.reset_mock()
+
+        # Second PUT: gate already off, save still carries false (+confirm) →
+        # NO transition → NO new alert.
+        r2 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert r2.status_code == 200
+        notify.assert_not_awaited()
+
+
+def test_surplus_put_actually_persists_merge(client, tmp_path):
+    """Deep-review SHOULD-FIX lock (pre-existing bug): the surplus PUT
+    discarded _deep_merge's return (it is PURE) and wrote the UNMERGED
+    overlay back while returning ok=True — user changes silently vanished."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+    ):
+        resp = client.put(
+            "/api/genesis/surplus/config",
+            json={"enabled": True},
+        )
+        if resp.status_code == 404:
+            import pytest as _pytest
+
+            _pytest.skip("surplus config route not registered in this blueprint")
+        assert resp.status_code == 200
+        import yaml as _yaml
+
+        written = _yaml.safe_load((tmp_path / "surplus.local.yaml").read_text())
+        assert written.get("enabled") is True
+
+
+def test_settings_put_string_false_does_not_confirm_gate_disable(client, tmp_path):
+    """Security lock: bool('false') is True — a stringly-typed confirm flag
+    must NOT satisfy the gate-disable confirmation."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+    ):
+        resp = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": "false",
+            },
+        )
+        assert resp.status_code == 409
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()

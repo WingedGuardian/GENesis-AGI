@@ -6,11 +6,16 @@ that supports hybrid search (Qdrant vectors + FTS5 + RRF fusion).
 
 from __future__ import annotations
 
+import logging
 import re
+import sqlite3  # noqa: F401 — used by search_ranked's FTS5 syntax-error backstop
 
 import aiosqlite
 
+from genesis.db.crud._fts import fetch_fts
 from genesis.db.timeutil import canonical_iso
+
+logger = logging.getLogger(__name__)
 
 
 def _prepare_fts5(query: str, *, boolean: bool = False) -> str | None:
@@ -137,6 +142,11 @@ async def search(
         params.append(collection)
     sql += " LIMIT ?"
     params.append(limit)
+    # DELIBERATELY no OR-fallback here (unlike search_ranked / knowledge.search_fts).
+    # memory.search's only callers are the entity-name resolver
+    # (linker._find_entity_by_name), which picks results[0] and must NOT be
+    # widened to single-term OR matches — that would bypass its difflib quality
+    # gate and create spurious graph links. Keep this path strict AND.
     rows = await db.execute_fetchall(sql, params)
     return [
         {"memory_id": r[0], "content": r[1], "source_type": r[2], "collection": r[3]} for r in rows
@@ -214,7 +224,40 @@ async def search_ranked(
         params.extend(include_only_subsystems)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
+    # AND-first, OR-fallback on zero rows (see _fts.fetch_fts). Skipped when the
+    # query is already a structured boolean expression (expand_query output),
+    # since re-tokenising a parenthesised OR/AND query would corrupt it.
+    try:
+        rows = await fetch_fts(db, sql, params, boolean=boolean)
+    except sqlite3.OperationalError as exc:
+        # BACKSTOP. A composed boolean expression that FTS5 will not parse used
+        # to escape as an exception and surface as HTTP 500 from the recall
+        # endpoint. Every known producer now sanitises its terms before joining
+        # (see _fts.fts5_term), so reaching here means a NEW producer emitted
+        # something malformed. Degrade to the always-valid bare-term form rather
+        # than fail the whole recall: expansion is an optimisation, and losing
+        # its precision beats losing the query.
+        #
+        # SQLite is the oracle on purpose. Validating the expression ourselves
+        # would mean hand-rolling an FTS5 grammar, and a grammar we maintain is
+        # one that disagrees with the engine on some input we never thought of.
+        # Narrow to the syntax error: any other OperationalError (a locked or
+        # corrupt database, a missing table) is a real failure and must raise.
+        if not (boolean and "fts5" in str(exc) and "syntax error" in str(exc)):
+            raise
+        safe = _prepare_fts5(query, boolean=False)
+        if not safe:
+            return []
+        logger.warning(
+            "FTS5 rejected a composed boolean query (%s); retrying with bare "
+            "terms. The expression was %r — a producer is emitting an invalid "
+            "structure and should sanitise its terms before joining them.",
+            exc,
+            escaped,
+        )
+        retry_params = list(params)
+        retry_params[0] = safe
+        rows = await fetch_fts(db, sql, retry_params, boolean=False)
     return [
         {
             "memory_id": r[0],
@@ -339,6 +382,12 @@ async def create_metadata(
     invalid_at: str | None = None,
     source_subsystem: str | None = None,
     origin_class: str | None = None,
+    speech_act: str | None = None,
+    speech_act_confidence: float | None = None,
+    assertion_provenance: str | None = None,
+    durability: str | None = None,
+    expires_at: str | None = None,
+    preference_domain: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
@@ -352,6 +401,14 @@ async def create_metadata(
     (owner/first_party/external_untrusted), derived in
     ``MemoryStore.store()``; NULL = legacy/unclassified (gates treat it
     fail-closed at gate time).
+    ``speech_act`` / ``speech_act_confidence`` / ``assertion_provenance`` /
+    ``durability`` / ``expires_at`` / ``preference_domain`` are the MW-1 Tier-0
+    (+ the MW-4 ``preference_domain`` satellite) extraction judgment
+    axes — WRITE-ONLY (no reader yet). NULL = unclassified; expiry is opt-in
+    (``durability='temporary'`` + an elapsed canonicalized ``expires_at``
+    only). Contract in ``memory/judgment.py``.
+    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-4-preference-domain
+    # / mw-5-speech-act-protection)
     """
     # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
     # at the write gate. Unparseable valid_at (LLM temporal strings like
@@ -363,8 +420,9 @@ async def create_metadata(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
-        "origin_class) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "origin_class, speech_act, speech_act_confidence, assertion_provenance, "
+        "durability, expires_at, preference_domain) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             memory_id,
             created_at,
@@ -378,6 +436,12 @@ async def create_metadata(
             canonical_iso(invalid_at),
             source_subsystem,
             origin_class,
+            speech_act,
+            speech_act_confidence,
+            assertion_provenance,
+            durability,
+            canonical_iso(expires_at),
+            preference_domain,
         ),
     )
     await db.commit()
@@ -517,7 +581,8 @@ async def get_taxonomy(
     db: aiosqlite.Connection,
     memory_id: str,
 ) -> dict[str, str | None] | None:
-    """Return ``{"wing", "room", "origin_class"}`` for a memory_id, or None.
+    """Return ``{"wing", "room", "origin_class", "memory_class",
+    "deprecated", "superseded_by"}`` for a memory_id, or None.
 
     The embedding-recovery worker uses this to restore metadata fields onto
     the reconstructed Qdrant payload (see ``resilience/embedding_recovery``)
@@ -527,15 +592,31 @@ async def get_taxonomy(
     store time, even on the FTS5-only/pending path) rather than the pending
     row, keeping ONE source of truth. ``life_domain`` is recovered from the
     ``life_domain:`` tag and ``project_type`` is not persisted on this path.
+    ``memory_class`` is likewise the authoritative store-time value (honoring
+    any explicit override); the worker restores it instead of recomputing
+    heuristically, which would silently downgrade an explicitly-set class.
     """
     rows = await db.execute_fetchall(
-        "SELECT wing, room, origin_class FROM memory_metadata WHERE memory_id = ?",
+        "SELECT wing, room, origin_class, memory_class, deprecated, superseded_by "
+        "FROM memory_metadata WHERE memory_id = ?",
         (memory_id,),
     )
     row = rows[0] if rows else None
     if not row:
         return None
-    return {"wing": row[0], "room": row[1], "origin_class": row[2]}
+    return {
+        "wing": row[0],
+        "room": row[1],
+        "origin_class": row[2],
+        "memory_class": row[3],
+        # deprecated/superseded_by let the recovery worker re-stamp a
+        # re-embedded point as excluded-from-recall (deprecated=True,
+        # merged_into=<successor>), matching MemoryStore._mark_superseded — so a
+        # memory superseded WHILE its embed was pending is not resurrected as a
+        # live vector on re-embed (the worker path is otherwise deprecation-blind).
+        "deprecated": row[4],
+        "superseded_by": row[5],
+    }
 
 
 async def batch_created_at(

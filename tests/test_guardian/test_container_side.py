@@ -35,6 +35,27 @@ class TestProbeGuardian:
         assert result.name == "guardian"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["gateway_pause", "maintenance"])
+    async def test_fresh_standdown_heartbeat_is_degraded(self, tmp_path: Path, reason: str) -> None:
+        """F5: a FRESH heartbeat carrying a `standdown` marker means the Guardian
+        is alive but intentionally not watching (deploy pause / maintenance) — so
+        probe_guardian must report DEGRADED, not HEALTHY, even though the heartbeat
+        is current. Otherwise health surfaces claim full monitoring for the whole
+        stand-down window while check cycles are being skipped."""
+        now = datetime.now(UTC)
+        hb_file = tmp_path / "guardian_heartbeat.json"
+        hb_file.write_text(json.dumps({
+            "guardian_alive": True,
+            "timestamp": now.isoformat(),  # FRESH — not stale
+            "standdown": reason,
+        }))
+
+        result = await probe_guardian(hb_file, clock=lambda: now)
+        assert result.status == ProbeStatus.DEGRADED
+        assert reason in result.message
+        assert result.details.get("standdown") == reason
+
+    @pytest.mark.asyncio
     async def test_degraded_heartbeat(self, tmp_path: Path) -> None:
         now = datetime.now(UTC)
         old = now - timedelta(seconds=150)

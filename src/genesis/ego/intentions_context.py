@@ -42,13 +42,18 @@ async def build_intentions_section(
         )
 
     cap = ego_intentions.MAX_ACTIVE_PER_SOURCE
-    remaining = max(0, cap - len(active))
+    # Only LLM-created ('ego' origin) rows consume the cap — system rows
+    # (dispatch follow-through) are mandatory-review but uncapped.
+    llm_count = sum(1 for item in active if item.get("origin", "ego") != "system")
+    remaining = max(0, cap - llm_count)
 
     lines = [
         "## Deferred Intentions (MANDATORY REVIEW)\n",
         f"**{len(active)} active intention(s).** You MUST review each "
         "one and include it in your `intentions.review` output — "
-        "action: `keep`, `fire`, `withdraw`, or `renew`.\n",
+        "action: `keep`, `fire`, `withdraw`, or `renew`. Items marked "
+        "[follow-through] are dispatch outcomes awaiting your judgment: "
+        "decide step-2, retry, or close (`withdraw` when nothing remains).\n",
     ]
 
     for item in active:
@@ -59,9 +64,14 @@ async def build_intentions_section(
         max_c = item["max_cycles"]
         priority = item["priority"]
         reasoning = (item.get("reasoning") or "")[:150]
+        tag = (
+            " [follow-through]"
+            if item.get("origin", "ego") == "system"
+            else ""
+        )
 
         lines.append(
-            f"- **[id:{iid}]** [{priority}] (cycle {cycles}/{max_c})"
+            f"- **[id:{iid}]**{tag} [{priority}] (cycle {cycles}/{max_c})"
         )
         lines.append(f"  Content: {content}")
         lines.append(f"  Trigger: {trigger}")

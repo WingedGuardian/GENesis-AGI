@@ -42,6 +42,25 @@ ruff check . && pytest -v
 
 **For features or larger changes** — use the standard open-source flow below.
 
+### Avoiding install-specific data
+
+Genesis scans contributions for machine-specific details so nothing personal
+reaches the public repo. Two things keep your PRs clean:
+
+- **Use RFC 5737 ranges for example IPs** — `192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24` (and `2001:db8::/32` for IPv6). These are reserved for
+  documentation and are never flagged. Real private-range addresses (any
+  `10.x`, `172.16–31.x`, `192.168.x`, `100.64–127.x`, or `fc00::/7` ULA) trigger
+  a **non-blocking CI warning** so you can swap them — they won't block your PR,
+  but please use the doc ranges.
+- **Keep home paths generic** — write `/home/<user>/…` or `~/…`, not a real
+  username. Absolute `/home/<user>/genesis` and CC project-dir slugs are flagged.
+
+Install-specific *exact* values (private hostnames, repo names, account IDs) are
+matched only from a per-install fingerprint file and a private CI secret — never
+from anything tracked in this repo — so forks and outside contributors are never
+gated on values they can't know.
+
 ### Standard flow (features, larger changes)
 
 1. **Open an issue or Discussion first** — describe what you want to change and why.
@@ -52,7 +71,10 @@ ruff check . && pytest -v
 4. **Make your changes** — target ~600 LOC per file, hard cap 1000
 5. **Run lint + tests**: `ruff check . && pytest -v`
 6. **Commit** with a conventional prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
-7. **Open a PR** against `main` — reference the issue/discussion in the description
+7. **Open a PR** against `main` — link the issue with a **closing keyword**:
+   `Closes #123` (or `Fixes`/`Resolves #123`) in the PR description. A bare `#123`
+   only cross-links; a closing keyword makes GitHub close the issue automatically
+   when the PR merges — and closing only fires on a merge to the **default branch**.
 
 PRs without a prior issue or discussion may be closed if the change wasn't
 discussed first. All PRs require a maintainer review before merging.
@@ -90,6 +112,10 @@ The architecture docs in [`docs/architecture/`](docs/architecture/) are the prim
 
 - Issues labeled [`good first issue`](https://github.com/WingedGuardian/GENesis-AGI/labels/good%20first%20issue) are scoped for new contributors
 - Issues labeled [`help wanted`](https://github.com/WingedGuardian/GENesis-AGI/labels/help%20wanted) are open for community contribution
+- Each issue carries an **`area:*`** label (memory, dashboard, runtime, guardian,
+  autonomy, channels, knowledge, eval) so you can find work in a domain you know,
+  and an environment label: **`needs-genesis-instance`** means you'll want a running
+  Genesis to reproduce/validate; without it you can generally start from a clone.
 - Check [Discussions](https://github.com/WingedGuardian/GENesis-AGI/discussions) for ideas and design conversations
 
 ## Questions?

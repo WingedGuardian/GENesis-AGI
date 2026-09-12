@@ -84,3 +84,9 @@ class TestStripMarkdown:
 
     def test_plain_unchanged(self):
         assert strip_markdown("plain text") == "plain text"
+
+    def test_image(self):
+        assert strip_markdown("![alt](http://url/x.png)") == "alt"
+
+    def test_strikethrough(self):
+        assert strip_markdown("~~struck~~") == "struck"

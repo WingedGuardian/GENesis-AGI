@@ -18,10 +18,21 @@ _CONFIG_PATH = _mod._CONFIG_PATH
 _FALLBACK_CRITICAL = _mod._FALLBACK_CRITICAL
 
 
-def _run_main(file_path: str) -> int:
-    """Run main() with a mock stdin containing the given file_path."""
+def _run_main(file_path: str, *, dispatched: bool = True) -> int:
+    """Run main() with a mock stdin containing the given file_path.
+
+    pretool_check blocks CRITICAL paths in a DISPATCHED session only (matches
+    the config's "direct sessions allowed" intent), so the block-behavior tests
+    run dispatched by default; interactive is exercised explicitly below.
+    """
+    import os
+    from unittest.mock import patch as _patch
+
     stdin_data = json.dumps({"file_path": file_path})
-    with patch("sys.stdin") as mock_stdin:
+    env_patch = {"GENESIS_CC_SESSION": "1"} if dispatched else {}
+    with patch("sys.stdin") as mock_stdin, _patch.dict(os.environ, env_patch, clear=False):
+        if not dispatched:
+            os.environ.pop("GENESIS_CC_SESSION", None)
         mock_stdin.read.return_value = stdin_data
         # Rebind the module's sys reference
         old_stdin = _mod.sys.stdin
@@ -33,9 +44,15 @@ def _run_main(file_path: str) -> int:
 
 
 def test_blocks_critical_path():
-    """Valid config + critical path → exit 2."""
+    """Valid config + critical path (dispatched session) → exit 2."""
     result = _run_main("usr/secrets.env")
     assert result == 2
+
+
+def test_interactive_session_allows_critical_path():
+    """A direct interactive session (no GENESIS_CC_SESSION) is allowed to edit a
+    CRITICAL path — the block targets dispatched/relay channels only."""
+    assert _run_main("usr/secrets.env", dispatched=False) == 0
 
 
 def test_allows_normal_path():

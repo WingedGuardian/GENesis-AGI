@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -18,6 +19,7 @@ from genesis.cc import roster
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
+    CCNetworkOfflineError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
@@ -34,6 +36,11 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.proc_kill import (
+    kill_process_group,
+    process_group_alive,
+    reap_bounded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +48,18 @@ logger = logging.getLogger(__name__)
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
     """Set OOM score adjustment for a process.
 
-    Higher scores make the process more likely to be OOM-killed.
-    CC subprocesses get +500 so the kernel kills them before genesis-server
-    (-500) or qdrant. This is the container-side complement to the
-    host VM's cgroup OOM scoring.
+    Higher scores make the process more likely to be OOM-killed. CC subprocesses
+    get +500 so the kernel kills them before genesis-server or qdrant. This is
+    the container-side complement to the host VM's cgroup OOM scoring.
+
+    This docstring used to say genesis-server sits at ``-500``. It never did.
+    MEASURED 2026-09-08: the unit declared ``-500`` while the live process ran at
+    ``100``, because a user manager cannot lower oom_score_adj below the inherited
+    ``oom_score_adj_min`` of 0 without CAP_SYS_RESOURCE — the write fails silently.
+    The unit now declares an achievable ``100``. Only the direction this function
+    uses is actually available to us: RAISING needs no privilege, LOWERING is
+    always refused, so every rung of the kill order has to be built by pushing
+    sacrificial processes UP rather than protecting important ones DOWN.
     """
     try:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
@@ -53,7 +68,38 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
         logger.warning("Could not set oom_score_adj for PID %d: %s", pid, exc)
 
 
-def _build_scope_args() -> list[str]:
+# The unit properties the scope actually carries. ONE tuple, consumed by BOTH
+# the probe and the real invocation, because a probe that omits them answers a
+# weaker question than the one that matters. systemd-run exits non-zero on a
+# property it cannot accept — MEASURED on systemd 255: an unknown assignment
+# ("Unknown assignment: BogusProperty=1") and an unparseable value ("Failed to
+# parse MemoryMax=...") both exit 1 — and older systemd predates the ``N%``
+# syntax these use. A property-free probe therefore SUCCEEDS on such a box, its
+# verdict is cached for the process lifetime, and every real dispatch then dies
+# inside systemd-run before Claude starts: the exact fail-closed-to-dead outcome
+# the probe was added to prevent, converted from "no isolation" to "no CC".
+# The sibling probe-then-commit sites (.claude/mcp/run-codebase-memory,
+# scripts/lib/code_intel_index.sh) already set their own properties at probe
+# time for this reason; this was the one that did not.
+_SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
+
+
+def _scope_argv(*trailing: str) -> list[str]:
+    """`systemd-run` argv carrying `_SCOPE_PROPERTIES`, then `trailing` after `--`.
+
+    With no `trailing` this is the prefix a caller prepends to its own command;
+    with `/bin/true` it is the probe. Sharing the builder is what keeps the two
+    from drifting apart again.
+    """
+    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    for prop in _SCOPE_PROPERTIES:
+        argv += ["-p", prop]
+    argv.append("--")
+    argv.extend(trailing)
+    return argv
+
+
+def _build_scope_args(announce: bool = True) -> list[str]:
     """Build systemd-run prefix for CC subprocess I/O isolation.
 
     Wraps the CC subprocess in a transient systemd scope with resource
@@ -66,34 +112,151 @@ def _build_scope_args() -> list[str]:
     a heavy CC build from OOM-ing the box while auto-scaling up on larger
     installs and down on the 8 GiB floor — no hardcoded ceiling to re-tune.
 
-    Returns an empty list if systemd-run is unavailable (graceful degradation).
+    Returns an empty list if systemd-run is unavailable (graceful degradation)
+    OR has no reachable user manager. The probe matters: ``which`` alone is not
+    enough — an env-scrubbed spawner (some agent CLIs' shell tooling, CI
+    runners, a stripped systemd context) has the binary but no
+    DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR, and ``systemd-run --user`` then
+    dies instantly with "Failed to connect to bus", taking the CC subprocess
+    down with it at 0.0s. Measured on a live install.
+    Same probe-then-commit pattern as .claude/mcp/run-codebase-memory, and the
+    probe sets the SAME properties as the real invocation (`_SCOPE_PROPERTIES`)
+    so a property the manager rejects fails at probe time rather than on every
+    dispatch afterwards.
+
+    Caching is asymmetric and lives in `_get_scope_args`: a SUCCESS is cached
+    for the process lifetime, a FAILURE only until a backoff elapses. Set
+    ``announce`` False on a retry so a permanently-unscoped box logs the
+    warning once rather than on every re-probe forever.
     """
     if not shutil.which("systemd-run"):
         return []
-    return [
-        "systemd-run",
-        "--user",
-        "--scope",
-        "--quiet",
-        "-p",
-        "IOWeight=100",
-        "-p",
-        "MemoryHigh=62%",
-        "-p",
-        "MemoryMax=75%",
-        "--",
-    ]
+    try:
+        probe = subprocess.run(
+            _scope_argv("/bin/true"),
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # Same announced degradation as the non-zero-exit branch below. Without
+        # it a timeout or a systemd-run that vanished between `shutil.which` and
+        # exec drops MemoryHigh/MemoryMax silently, and the operator has no way
+        # to tell an unscoped box from a scoped one.
+        _log = logger.warning if announce else logger.debug
+        _log(
+            "systemd-run --user probe raised (%s: %s) — CC subprocesses will run "
+            "WITHOUT the cgroup scope (no MemoryHigh/MemoryMax isolation)",
+            type(exc).__name__,
+            exc,
+        )
+        return []
+    if probe.returncode != 0:
+        _log = logger.warning if announce else logger.debug
+        _log(
+            "systemd-run --user probe failed (no user manager?) — CC subprocesses "
+            "will run WITHOUT the cgroup scope (no MemoryHigh/MemoryMax isolation): %s",
+            probe.stderr.decode(errors="replace").strip()[:200],
+        )
+        return []
+    return _scope_argv()
 
 
-# Cache the scope args — they don't change during a process's lifetime.
+# Cache the scope args. SUCCESS is cached for the process lifetime — a working
+# user manager does not stop working, and the probe costs a subprocess.
+#
+# FAILURE is not, and the difference is the whole point. The old comment here
+# ("they don't change during a process's lifetime") was written when this
+# guarded a deterministic `shutil.which` result. It now guards a PROBE, which
+# can fail transiently: a timeout under load, or `systemd --user` restarting
+# during an update. genesis-server is long-lived, so caching one such failure
+# forever silently drops MemoryHigh=62%/MemoryMax=75% from EVERY subsequent CC
+# subprocess, for days — on a swapless box, which is the exact scenario the
+# scope exists to prevent (see _build_scope_args). The degradation is announced
+# once in a log line and then never re-evaluated, so the fail-open outlives its
+# cause.
+#
+# The retry schedule ESCALATES rather than repeating at a fixed interval,
+# because the two documented failure causes have opposite lifetimes. A user
+# manager bouncing during a deploy resolves in seconds to minutes — worth
+# re-probing soon. An env-scrubbed spawner with no reachable bus
+# (_build_scope_args's docstring) is a PERMANENT property of that box, and a
+# fixed 300s retry would probe it forever and log a warning 288x/day, turning
+# a once-per-process announcement into noise. Escalating recovers fast from the
+# transient case and decays to hourly on the permanent one.
+_SCOPE_RETRY_SCHEDULE_S = (300.0, 900.0, 3600.0)
+
 _SCOPE_ARGS: list[str] | None = None
+_SCOPE_PROBE_FAILED_AT: float | None = None
+_SCOPE_PROBE_FAILURES = 0
+_SCOPE_PROBE_LOCK: asyncio.Lock | None = None
 
 
-def _get_scope_args() -> list[str]:
-    global _SCOPE_ARGS  # noqa: PLW0603
-    if _SCOPE_ARGS is None:
-        _SCOPE_ARGS = _build_scope_args()
-    return _SCOPE_ARGS
+def _now() -> float:
+    """Monotonic clock seam.
+
+    Tests patch THIS, not `time.monotonic`. `invoker.time` is the stdlib module
+    object, so monkeypatching its attribute replaces the clock for the whole
+    interpreter for the duration of the test — including anything else pytest
+    or a plugin is timing.
+    """
+    return time.monotonic()
+
+
+def reset_scope_cache() -> None:
+    """Test hook: clear the cached probe verdict and its backoff state."""
+    global _SCOPE_ARGS, _SCOPE_PROBE_FAILED_AT, _SCOPE_PROBE_FAILURES  # noqa: PLW0603
+    _SCOPE_ARGS = None
+    _SCOPE_PROBE_FAILED_AT = None
+    _SCOPE_PROBE_FAILURES = 0
+
+
+def _scope_probe_lock() -> asyncio.Lock:
+    """Single-flight guard: concurrent dispatches share one probe, not N."""
+    global _SCOPE_PROBE_LOCK  # noqa: PLW0603
+    if _SCOPE_PROBE_LOCK is None:
+        _SCOPE_PROBE_LOCK = asyncio.Lock()
+    return _SCOPE_PROBE_LOCK
+
+
+def _scope_cooldown_active() -> bool:
+    if _SCOPE_PROBE_FAILED_AT is None:
+        return False
+    idx = min(max(_SCOPE_PROBE_FAILURES - 1, 0), len(_SCOPE_RETRY_SCHEDULE_S) - 1)
+    return _now() - _SCOPE_PROBE_FAILED_AT < _SCOPE_RETRY_SCHEDULE_S[idx]
+
+
+async def _get_scope_args() -> list[str]:
+    """Cached scope args. Success is permanent; failure retries on a backoff.
+
+    ASYNC because the probe is a blocking `subprocess.run` with a 15s ceiling
+    and both callers sit on the event loop. Retrying a failed probe on a timer
+    — which is the whole point of the backoff — would otherwise reintroduce
+    that stall periodically instead of once per process, on exactly the path
+    (a probe that already failed, possibly by timing out) where it is most
+    likely to be slow.
+    """
+    global _SCOPE_ARGS, _SCOPE_PROBE_FAILED_AT, _SCOPE_PROBE_FAILURES  # noqa: PLW0603
+    if _SCOPE_ARGS:
+        return _SCOPE_ARGS
+    if _scope_cooldown_active():
+        return []
+    async with _scope_probe_lock():
+        # Re-check under the lock: a concurrent dispatch may have probed while
+        # this one waited, and its verdict is the one to honour.
+        if _SCOPE_ARGS:
+            return _SCOPE_ARGS
+        if _scope_cooldown_active():
+            return []
+        first_failure = _SCOPE_PROBE_FAILURES == 0
+        args = await asyncio.to_thread(_build_scope_args, first_failure)
+        if args:
+            _SCOPE_ARGS = args
+            _SCOPE_PROBE_FAILED_AT = None
+            _SCOPE_PROBE_FAILURES = 0
+        else:
+            _SCOPE_PROBE_FAILED_AT = _now()
+            _SCOPE_PROBE_FAILURES += 1
+        return _SCOPE_ARGS or []
 
 
 # A minimal, runtime-generated CC settings file that registers ONLY the span
@@ -106,6 +269,10 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # marker) BEFORE our asyncio watchdog kills the process group. One source of truth
 # for the "graceful truncation beats hard kill" invariant.
 _BG_WAIT_HARD_MARGIN_MS = 60_000
+# Grace granted to surviving DESCENDANTS after the leader exits post-terminate,
+# before the group-kill escalation (reap_bounded waits only on the leader, so
+# without this a still-flushing MCP child gets zero grace of its own).
+_ESCALATION_GRACE_S = 2.0
 # Stable prefix of the CLI's headless bg-ceiling message (the numeric duration
 # varies): "Background tasks still running after 600s; terminating." Matching the
 # prefix is version-drift-tolerant — a miss degrades to no truncation notice
@@ -342,7 +509,12 @@ class CCInvoker:
             args += ["--resume", inv.resume_session_id]
         if inv.mcp_config:
             args += ["--mcp-config", inv.mcp_config]
-        if inv.strict_mcp_config:
+        # --bare already disables ALL MCP discovery; combining it with
+        # --strict-mcp-config makes CC exit non-zero (probe-verified, CC 2.1.x),
+        # so skip strict under bare. strict is safe with any other config state:
+        # with a --mcp-config it pins to those servers; with none it yields zero
+        # servers cleanly (probe-verified) — the secure-by-default posture.
+        if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
         # Register the span-capture PostToolUse hook for this dispatched session.
         # Dispatched sessions run with a cwd outside any git repo, so CC never
@@ -456,6 +628,15 @@ class CCInvoker:
             (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
             or self._CC_SANDBOX_TMPDIR
         )
+        # Keep TMPDIR consistent with CLAUDE_CODE_TMPDIR (never inconsistent — the
+        # invariant util/tmp.py protects). This also completes the per-invocation
+        # sandbox isolation above: without it a headless session's *subprocess*
+        # temp (e.g. the gauntlet agent running the fixture's pytest, whose
+        # tmp_path defaults under $TMPDIR) still lands in the inherited cc-tmp and
+        # can trip genesis-tmp-watchgod. For the default sandbox both resolve to
+        # cc-tmp (unchanged); for an override (gauntlet) TMPDIR follows it off
+        # cc-tmp.
+        env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         # Prevent CC's alt-screen renderer from corrupting terminal scrollback
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
@@ -473,6 +654,11 @@ class CCInvoker:
         # cleanroom). Applied last by contract; see CCInvocation.env_overrides.
         if inv and inv.env_overrides:
             env.update(inv.env_overrides)
+            # Preserve the TMPDIR ≡ CLAUDE_CODE_TMPDIR invariant even if an
+            # override changed CLAUDE_CODE_TMPDIR but not TMPDIR (else the two
+            # silently desync). An explicit TMPDIR override still wins.
+            if "CLAUDE_CODE_TMPDIR" in inv.env_overrides and "TMPDIR" not in inv.env_overrides:
+                env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
@@ -525,7 +711,17 @@ class CCInvoker:
         # Session expiry
         if "session" in lower and ("not found" in lower or "expired" in lower):
             return CCSessionError(stderr_text or stdout_text)
-        # Hard quota exhaustion (usage limit hit for hours — distinct from 429)
+        # Hard quota exhaustion (usage limit hit for hours — distinct from 429).
+        # "session limit" / "weekly limit" are the Max-plan rolling-window and
+        # weekly ceilings: real multi-minute-to-hours lockouts that reset at a
+        # defined time, NOT transient 429s. The CLI wording varies ("You've hit
+        # your session limit · resets 4:10am", "weekly limit reached", "usage
+        # limit reached") — cover the family, not one instance. Before this,
+        # "hit your session limit" matched NO pattern (the RATE list has "hit
+        # your limit" but "session" splits the substring) and fell through to
+        # generic CCProcessError, so the rate-limit park/resume layer never
+        # engaged and background sessions died instead of parking (reflex signal
+        # CCProcessError×cc, 2026-07/08).
         _QUOTA_PATTERNS = (
             "usage limit",
             "quota exceeded",
@@ -533,9 +729,11 @@ class CCInvoker:
             "usage cap",
             "spending limit",
             "token limit exceeded",
+            "session limit",
+            "weekly limit",
         )
         if any(p in lower for p in _QUOTA_PATTERNS):
-            return CCQuotaExhaustedError(stderr_text or stdout_text)
+            return CCQuotaExhaustedError(stderr_text or stdout_text, raw_text=combined)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
@@ -546,7 +744,7 @@ class CCInvoker:
             "hit the limit",
         )
         if any(p in lower for p in _RATE_LIMIT_PATTERNS):
-            return CCRateLimitError(stderr_text or stdout_text)
+            return CCRateLimitError(stderr_text or stdout_text, raw_text=combined)
         # MCP server error
         source = stderr_text or stdout_text
         if "mcp" in lower or "mcp server" in lower:
@@ -609,6 +807,55 @@ class CCInvoker:
             except Exception:
                 logger.warning("CC status callback failed for %s", status, exc_info=True)
 
+    async def _network_preflight(self, invocation: CCInvocation) -> None:
+        """Fail fast pre-spawn when the network is hard-OFFLINE and WAN-bound.
+
+        PR-3 outage resilience. When the connectivity sentinel reports a fresh
+        OFFLINE state and the parking lever is ``live``, a CC dispatch whose
+        endpoint needs the internet raises :class:`CCNetworkOfflineError` here —
+        *before* the subprocess is spawned — so it fails in well under a second
+        instead of hanging up to ``timeout_s`` (7200s default; 45-55min hangs
+        were observed in the 2026-07-28 outage).
+
+        Fail-safe by construction: the lever off, an absent/stale/NORMAL/DEGRADED
+        snapshot, a LAN endpoint, or any error in the check itself all fall
+        through to a normal dispatch — identical to pre-sentinel behavior. Only
+        the precise (fresh-OFFLINE + live + WAN endpoint) case parks.
+        """
+        # Function-scope imports: cc.invoker is imported very early in runtime
+        # bootstrap; keep the resilience/util deps out of its module-load graph
+        # (cycle-proof, same rationale as surplus/dispatch.py's scoped imports).
+        try:
+            from genesis.resilience import network_config
+            from genesis.util import netclass
+
+            decision = network_config.parking_decision()
+            if decision in ("off", "normal"):
+                return
+            # Fresh OFFLINE (shadow or park). Only WAN endpoints are affected — a
+            # LAN CC peer (native mesh) stays reachable through a WAN outage. The
+            # native ``claude`` endpoint carries no base URL → WAN by rule, so a
+            # true outage correctly parks all CC here (api.anthropic.com is down).
+            endpoint_class = await netclass.default_classifier().classify_url_async(
+                invocation.anthropic_base_url
+            )
+            if endpoint_class != netclass.WAN:
+                return
+            if decision == "shadow":
+                logger.info(
+                    "network preflight: WOULD park WAN CC dispatch "
+                    "(network OFFLINE, shadow mode) — proceeding",
+                )
+                return
+            # decision == "park" (live mode)
+            raise CCNetworkOfflineError(
+                "network is OFFLINE — skipping WAN CC dispatch before subprocess spawn",
+            )
+        except CCNetworkOfflineError:
+            raise
+        except Exception:
+            logger.debug("network preflight check errored — proceeding", exc_info=True)
+
     async def run(self, invocation: CCInvocation) -> CCOutput:
         """Run a dispatched CC session (traced).
 
@@ -619,6 +866,7 @@ class CCInvoker:
         when capture is disabled.
         """
         invocation, roster_model = roster.apply_active(invocation)
+        await self._network_preflight(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
@@ -642,9 +890,52 @@ class CCInvoker:
                     span.set_status_error(output.error_message or "CC session error")
             return output
 
+    async def _apply_login_fallback(
+        self,
+        env: dict[str, str],
+        inv: CCInvocation | None,
+    ) -> dict[str, str]:
+        """Inject the stored 1-year setup-token ONLY when the interactive
+        login is hard-expired AND a live probe confirms logged-out
+        (login_health gates — never over a working login, never on
+        ambiguity). Skipped entirely for cleanroom/bare invocations whose
+        env_overrides manage their own auth (overrides win by contract).
+        """
+        if inv is not None and getattr(inv, "bare", False):
+            return env
+        # Peer-routed invocations (third-party ANTHROPIC_BASE_URL/AUTH_TOKEN)
+        # never use the claude.ai login — injecting the Anthropic OAuth
+        # setup-token there is useless at best and violates the roster's
+        # credential-isolation contract (the Anthropic credential must never
+        # travel toward a third-party endpoint).
+        if inv and (
+            getattr(inv, "anthropic_base_url", None) or getattr(inv, "anthropic_auth_token", None)
+        ):
+            return env
+        if (
+            inv
+            and inv.env_overrides
+            and (
+                "CLAUDE_CODE_OAUTH_TOKEN" in inv.env_overrides
+                or "CLAUDE_CONFIG_DIR" in inv.env_overrides
+                or "ANTHROPIC_API_KEY" in inv.env_overrides
+            )
+        ):
+            return env
+        try:
+            from genesis.cc.login_health import fallback_env_if_login_dead
+
+            fb = await fallback_env_if_login_dead(cc_path=self._claude_path)
+            if fb:
+                return {**env, **fb}
+        except Exception:
+            logger.debug("login fallback check failed", exc_info=True)
+        return env
+
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
         env = self._build_env(invocation)
+        env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -664,7 +955,7 @@ class CCInvoker:
         proc = None
         reg_key: str | None = None
         try:
-            scope_args = _get_scope_args()
+            scope_args = await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -673,7 +964,10 @@ class CCInvoker:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
-                preexec_fn=os.setpgrp,
+                # Own session/group (setsid in the C helper — never preexec_fn:
+                # post-fork Python can deadlock in the threaded server) so the
+                # kill paths can killpg the whole claude tree.
+                start_new_session=True,
             )
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
@@ -705,20 +999,25 @@ class CCInvoker:
             ) from None
         except TimeoutError:
             elapsed_s = time.monotonic() - start
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
-            await proc.wait()
+            if proc is None:
+                # Spawn-time TimeoutError (ETIMEDOUT is an OSError subclass —
+                # PEP 3151) misroutes here with nothing to kill.
+                raise CCTimeoutError(
+                    f"Timeout after {invocation.timeout_s}s (during spawn)"
+                ) from None
+            # Shared guarded group-kill: signals proc.pid AS the pgid (never
+            # os.getpgid — it raises once the leader is reaped, leaking the
+            # tree), pgid<=1 guard, direct-kill fallback; then a BOUNDED reap.
+            kill_process_group(proc)
+            await reap_bounded(proc)
 
             # Capture stderr for diagnostics (mirrors run_streaming pattern)
             stderr_text = ""
             if proc.stderr:
                 try:
-                    stderr_data = await proc.stderr.read()
+                    # Bounded: a setsid-escaping descendant holding stderr
+                    # could otherwise stall this read past the bounded reap.
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
                     if isinstance(stderr_data, bytes):
                         stderr_text = stderr_data.decode(errors="replace")[:1000]
                 except Exception:
@@ -738,8 +1037,9 @@ class CCInvoker:
                 # Don't leak a still-running proc on an abnormal exit (e.g. task
                 # cancellation); communicate() reaps it on the normal path.
                 if proc is not None and proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        proc.kill()
+                    # Group-kill: a bare proc.kill() would orphan the claude
+                    # tree's MCP/helper children on cancellation.
+                    kill_process_group(proc)
 
         elapsed = int((time.monotonic() - start) * 1000)
         logger.info(
@@ -793,6 +1093,7 @@ class CCInvoker:
     ) -> CCOutput:
         """Run CC with stream-json output (traced — see run() for span rationale)."""
         invocation, roster_model = roster.apply_active(invocation)
+        await self._network_preflight(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
@@ -832,6 +1133,7 @@ class CCInvoker:
         args.insert(1, "--verbose")
 
         env = self._build_env(invocation)
+        env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -849,7 +1151,7 @@ class CCInvoker:
         )
 
         try:
-            scope_args = _get_scope_args()
+            scope_args = await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -859,7 +1161,10 @@ class CCInvoker:
                 limit=1_048_576,  # 1MB — CC stream-json lines can exceed 64KB default
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
-                preexec_fn=os.setpgrp,
+                # Own session/group (setsid in the C helper — never preexec_fn:
+                # post-fork Python can deadlock in the threaded server) so the
+                # kill paths can killpg the whole claude tree.
+                start_new_session=True,
             )
         except FileNotFoundError:
             logger.error(
@@ -897,16 +1202,18 @@ class CCInvoker:
                 proc.stdin.close()
         except BaseException:
             self._unregister_proc(reg_key)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
+            kill_process_group(proc)
             raise
 
         result_data: dict | None = None
         collected_text: list[str] = []
         event_types: list[str] = []
+        tools_seen: list[str] = []
+        rate_limit_raw: dict | None = None
         timed_out = False
         terminated_after_result = False
         line_count = 0
+        multi_block_seen = False
 
         try:
             async with asyncio.timeout(invocation.timeout_s):
@@ -923,7 +1230,40 @@ class CCInvoker:
 
                     etype = event_raw.get("type", "?")
                     event_types.append(etype)
+                    if etype == "rate_limit_event":
+                        # Retain the raw payload (otherwise discarded) so the
+                        # durability layer can parse a reset time off it.
+                        rate_limit_raw = event_raw
                     logger.debug("CC stream event #%d: type=%s", line_count, etype)
+
+                    # `StreamEvent.from_raw` keeps only the FIRST recognized
+                    # content block, which is lossless only while CC emits one
+                    # block per line. MEASURED 2026-09-04 against CC 2.1.246 on
+                    # this exact surface (`claude -p --output-format stream-json
+                    # --verbose`, two probes): 8/8 assistant lines carried
+                    # exactly one block, 0 multi-block — including a
+                    # thinking→text→tool_use turn and three PARALLEL tool calls,
+                    # which the API packs into a single message and the CLI split
+                    # across three lines. The version matters: this is a property
+                    # of a CLI build, not of the protocol.
+                    #
+                    # So this RECORDS the assumption rather than defending
+                    # against it — it is a log line, and nothing polls it. It
+                    # earns its keep by making a future batching CC diagnosable
+                    # in one grep instead of a week of missing tool calls.
+                    # Invocation-scoped on purpose: cross-invocation de-dup
+                    # belongs to the log aggregator, and one line per affected
+                    # turn is what tells you WHICH turns were lossy.
+                    if etype == "assistant" and not multi_block_seen:
+                        n_blocks = StreamEvent.recognized_blocks(event_raw)
+                        if n_blocks > 1:
+                            multi_block_seen = True
+                            logger.warning(
+                                "CC assistant line carried %d recognized content "
+                                "blocks — StreamEvent.from_raw keeps only the "
+                                "first; tool calls and answer text may be dropped",
+                                n_blocks,
+                            )
 
                     event = StreamEvent.from_raw(event_raw)
 
@@ -934,6 +1274,27 @@ class CCInvoker:
 
                     if event.event_type == "text" and event.text:
                         collected_text.append(event.text)
+                    if etype == "assistant":
+                        # Read off the RAW content array, not the parsed
+                        # StreamEvent: `from_raw` returns ONE event per message
+                        # and stops at the first recognised block, so a message
+                        # shaped `thinking + text + tool_use` parses as "text"
+                        # and drops the tool name entirely. MEASURED on this
+                        # install's own transcripts: 13 of 8655 assistant
+                        # messages carrying a tool_use (0.15%) have it in a
+                        # non-first position. Rare, but the failure is
+                        # asymmetric — if OTHER tools were captured the list is
+                        # marked runtime-sourced and rendered as authoritative
+                        # while silently incomplete, which is the exact grammar
+                        # this change exists to remove.
+                        for block in event_raw.get("message", {}).get("content", []) or []:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name")
+                            # First-seen order, deduplicated — the same shape
+                            # the text-scraping fallback produces.
+                            if name and name not in tools_seen:
+                                tools_seen.append(name)
                     if event.event_type == "result":
                         result_data = event_raw
                         result_text = event_raw.get("result", "")
@@ -962,13 +1323,7 @@ class CCInvoker:
                 time.monotonic() - start,
                 proc.pid,
             )
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
+            kill_process_group(proc)
         except asyncio.CancelledError:
             # Task cancellation (runtime shutdown cancelling an in-flight
             # session) must not leak the CC child: without this handler the
@@ -981,25 +1336,50 @@ class CCInvoker:
                 "CC streaming cancelled (PID %s) — killing subprocess",
                 proc.pid,
             )
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
+            kill_process_group(proc)
+            raise
+        except BaseException:
+            # Any other failure mid-stream (an on_event callback raising, an
+            # over-limit stream-json line) must not leak the live, now-
+            # unregistered tree — it would run detached where even /stop
+            # can't reach it, then wedge when its unread stdout pipe fills.
+            kill_process_group(proc)
             raise
         finally:
             self._unregister_proc(reg_key)
 
-        await proc.wait()
+        # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
+        # the child can ignore (wedged node flush / MCP teardown) — an
+        # unbounded wait here would hang the dispatch AFTER the result was
+        # already obtained. Bound it; on expiry escalate to the group kill.
+        await reap_bounded(proc)
+        # Escalate on GROUP liveness, not the leader's returncode: after the
+        # graceful terminate the leader can exit (returncode set) while an
+        # MCP/helper child survives in the group — gating on returncode alone
+        # would leak that descendant while we report completion.
+        if process_group_alive(proc):
+            # The leader-only reap gives descendants no grace of their own —
+            # an MCP child mid-flush would be SIGKILLed instantly. Grant a
+            # short beat (stdio children normally exit sub-second on parent
+            # death); costs latency only when a survivor actually exists.
+            await asyncio.sleep(_ESCALATION_GRACE_S)
+        if proc.returncode is None or process_group_alive(proc):
+            logger.warning(
+                "CC streaming group survived graceful stop/kill "
+                "(PID %s, rc=%s) — group-killing",
+                proc.pid,
+                proc.returncode,
+            )
+            kill_process_group(proc)
+            await reap_bounded(proc)
         elapsed = int((time.monotonic() - start) * 1000)
 
         # Read stderr for diagnostics
         stderr_data = b""
         if proc.stderr:
-            stderr_data = await proc.stderr.read()
+            with contextlib.suppress(TimeoutError):
+                # Bounded for the same reason as the reap above.
+                stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
         stderr_str = stderr_data.decode(errors="replace") if stderr_data else ""
         if stderr_str:
             logger.warning("CC stderr: %s", stderr_str[:500])
@@ -1033,6 +1413,11 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            # Unconditional: () is now a real report ("the runtime watched and
+            # saw no tool_use"), distinct from None ("nothing watched"). A
+            # `if tools_seen:` guard here would silently downgrade the former
+            # to the latter on every tool-free streaming turn.
+            output = replace(output, tools_used=tuple(tools_seen))
             # When CC uses extended thinking, the result field can be empty
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
@@ -1060,12 +1445,17 @@ class CCInvoker:
                         "CC rate-limited but response has content (%d chars) — delivering",
                         len(output.text),
                     )
-                    err = CCRateLimitError("CC rate limited (stream event)")
+                    err = CCRateLimitError(
+                        "CC rate limited (stream event)", raw_event=rate_limit_raw
+                    )
                     await self._notify_status_change(err)
                     await self._fire_downgrade_callback(output)
                     return output
                 # Empty/no response — rate limit prevented a real answer
-                err = CCRateLimitError(output.text or "CC rate limited (stream event)")
+                err = CCRateLimitError(
+                    output.text or "CC rate limited (stream event)",
+                    raw_event=rate_limit_raw,
+                )
                 await self._notify_status_change(err)
                 raise err
 
@@ -1094,6 +1484,7 @@ class CCInvoker:
             model_requested=str(invocation.model),
             via_proxy=bool(invocation.anthropic_base_url),
             bg_truncated=bg_truncated,
+            tools_used=tuple(tools_seen),
         )
         if bg_truncated:
             await _emit_bg_truncation_event(output.session_id)

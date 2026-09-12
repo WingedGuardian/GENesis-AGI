@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -243,3 +244,250 @@ class TestEgoFollowUps:
             assert len(data) == 1
             assert data[0]["id"] == "f1"
             assert data[0]["strategy"] == "ego_judgment"
+
+
+# ── PR-6a: revision guard + surfacing ───────────────────────────────
+
+
+class TestEgoRevisionGuard:
+    def test_proposals_all_surfaces_revision_fields(self, client):
+        """The /all payload (what the resolve card reads) carries revision_num
+        + revalidate_at + last_validated_at; absent revision_num defaults to 1."""
+        rt = _mock_runtime()
+        proposals = [
+            {
+                "id": "p1", "action_type": "research", "action_category": "learning",
+                "content": "c", "rationale": "r", "confidence": 0.8,
+                "urgency": "normal", "alternatives": "", "status": "pending",
+                "user_response": None, "cycle_id": "c1", "batch_id": "b1",
+                "created_at": "2026-04-20T10:00:00Z", "resolved_at": None,
+                "expires_at": None, "revision_num": 3,
+                "revalidate_at": "2026-05-01T00:00:00Z",
+                "last_validated_at": "2026-04-25T00:00:00Z",
+            },
+            {
+                "id": "p2", "action_type": "research", "action_category": "learning",
+                "content": "c", "rationale": "r", "confidence": 0.8,
+                "urgency": "normal", "alternatives": "", "status": "pending",
+                "user_response": None, "cycle_id": "c1", "batch_id": "b1",
+                "created_at": "2026-04-20T10:00:00Z", "resolved_at": None,
+                "expires_at": None,  # no revision fields → defaults
+            },
+        ]
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.list_proposals", new_callable=AsyncMock, return_value=proposals),
+        ):
+            MockRT.instance.return_value = rt
+            data = client.get("/api/genesis/ego/proposals/all").get_json()
+        assert data[0]["revision_num"] == 3
+        assert data[0]["revalidate_at"] == "2026-05-01T00:00:00Z"
+        assert data[0]["last_validated_at"] == "2026-04-25T00:00:00Z"
+        # Absent → default 1 / None, never KeyError.
+        assert data[1]["revision_num"] == 1
+        assert data[1]["revalidate_at"] is None
+        assert data[1]["last_validated_at"] is None
+
+    def test_resolve_passes_expected_revision(self, client):
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=True) as mock_resolve,
+            patch("genesis.db.crud.ego.get_proposal", new_callable=AsyncMock, return_value=None),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved", "revision_num": 2},
+            )
+        assert resp.get_json()["ok"] is True
+        assert mock_resolve.call_args[1]["expected_revision"] == 2
+
+    def test_resolve_without_revision_is_unguarded(self, client):
+        """FOOTGUN GUARD: a body without revision_num maps to expected_revision
+        None (unguarded, as today) — NEVER a hardcoded 1."""
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=True) as mock_resolve,
+            patch("genesis.db.crud.ego.get_proposal", new_callable=AsyncMock, return_value=None),
+        ):
+            MockRT.instance.return_value = rt
+            client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved"},
+            )
+        assert mock_resolve.call_args[1]["expected_revision"] is None
+
+    def test_resolve_stale_revision_returns_409(self, client):
+        """resolve refused + row still pending at a different revision → 409
+        stale_revision with the fresh revision, so the client can re-review."""
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=False),
+            patch(
+                "genesis.db.crud.ego.get_proposal",
+                new_callable=AsyncMock,
+                return_value={"id": "p1", "status": "pending", "revision_num": 5},
+            ),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved", "revision_num": 2},
+            )
+        assert resp.status_code == 409
+        data = resp.get_json()
+        assert data["error"] == "stale_revision"
+        assert data["revision_num"] == 5
+
+    def test_resolve_already_resolved_stays_404(self, client):
+        """A guard miss where the row is no longer pending (already resolved)
+        is a 404, not a false stale-revision 409."""
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=False),
+            patch(
+                "genesis.db.crud.ego.get_proposal",
+                new_callable=AsyncMock,
+                return_value={"id": "p1", "status": "approved", "revision_num": 2},
+            ),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved", "revision_num": 2},
+            )
+        assert resp.status_code == 404
+
+
+# ── /api/genesis/ego/status — heartbeat total-cessation tile signal ──────────
+
+_EGO_CONFIG = SimpleNamespace(
+    enabled=True, model="opus", default_effort="high",
+    morning_report_effort="high", cadence_minutes=90, max_interval_minutes=4320,
+    morning_report_enabled=True, genesis_cadence_minutes=90,
+    genesis_max_interval_minutes=4320, shadow_morning_report=False, board_size=5,
+)
+
+
+def _status_response(client, *, hb_return=None, hb_side_effect=None, booted_ago_s=0.0):
+    """Hit /ego/status with the ego-heartbeat-staleness read stubbed.
+
+    Mirrors the full ego_status dependency surface so the endpoint returns 200
+    and we can assert the new top-level heartbeat fields are wired into the JSON.
+
+    ``booted_ago_s`` sets ``rt._bootstrap_completed_at`` that many seconds ago
+    (the P2-5 no_heartbeat boot-grace hook); ``None`` sets it to None (degraded
+    boot). Default 0.0 = just booted (within grace).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    rt = _mock_runtime()
+    rt._genesis_ego_cadence_manager = None  # keep the cadence snapshot JSON-safe
+    rt._bootstrap_completed_at = (
+        None if booted_ago_s is None else datetime.now(UTC) - timedelta(seconds=booted_ago_s)
+    )
+    hb_mock = (
+        AsyncMock(side_effect=hb_side_effect)
+        if hb_side_effect is not None
+        else AsyncMock(return_value=hb_return)
+    )
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.ego.config.load_ego_config", return_value=_EGO_CONFIG),
+        patch("genesis.db.crud.ego.daily_ego_cost", new=AsyncMock(return_value=0.0)),
+        patch("genesis.db.crud.ego.get_state", new=AsyncMock(return_value=None)),
+        patch("genesis.db.crud.ego.list_recent_cycles", new=AsyncMock(return_value=[])),
+        patch("genesis.db.crud.ego.list_pending_proposals", new=AsyncMock(return_value=[])),
+        patch("genesis.db.crud.ego.count_uncompacted", new=AsyncMock(return_value=0)),
+        patch("genesis.db.crud.ego.daily_dispatch_cost", new=AsyncMock(return_value=0.0)),
+        patch("genesis.db.crud.ego.rolling_daily_ego_cost", new=AsyncMock(return_value=0.0)),
+        patch("genesis.db.crud.ego.has_pending_cli_approval", new=AsyncMock(return_value=False)),
+        patch("genesis.mcp.health.manifest.compute_heartbeat_staleness", new=hb_mock),
+    ):
+        MockRT.instance.return_value = rt
+        return client.get("/api/genesis/ego/status")
+
+
+class TestEgoStatusHeartbeat:
+    """The ego tile flips red on scheduler-death (heartbeat staleness), fails
+    loud on a broken read, and never false-reds a fresh install."""
+
+    def test_alive_heartbeat_not_stale(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "alive", "age_seconds": 12.0, "last_seen": "x"}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is False
+        assert data["ego_heartbeat_age_s"] == 12.0
+
+    def test_overdue_heartbeat_is_stale(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "overdue", "age_seconds": 18000.0, "last_seen": "x"}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is True
+        assert data["ego_heartbeat_error"] is False
+
+    def test_no_heartbeat_within_boot_grace_not_error(self, client):
+        """Just after boot (ego's first pulse pending), no_heartbeat is benign —
+        not stale, not error (P2-5 grace)."""
+        resp = _status_response(
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}, booted_ago_s=5.0
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is False
+
+    def test_no_heartbeat_past_boot_grace_is_error(self, client):
+        """Long after boot with STILL no pulse on record → real absence, surfaced
+        as error (unknown), never a green tile (P2-5)."""
+        resp = _status_response(
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}, booted_ago_s=3600.0
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is True
+
+    def test_never_started_is_error(self, client):
+        """compute now owns the manifest-informed never_started verdict (#10); the
+        tile must flag it as error (not green) — the case the no_heartbeat boot-grace
+        block used to catch before compute owned it."""
+        resp = _status_response(
+            client,
+            hb_return={
+                "status": "never_started",
+                "last_seen": None,
+                "reason": "started-silent",
+            },
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is True
+
+    def test_no_heartbeat_degraded_boot_is_error(self, client):
+        """No boot stamp (degraded boot) → no grace → fail-loud to error (P2-5)."""
+        resp = _status_response(
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}, booted_ago_s=None
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_error"] is True
+
+    def test_unknown_status_is_error(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "unknown", "last_seen": "bad"}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_error"] is True
+        assert data["ego_heartbeat_stale"] is False
+
+    def test_read_exception_fails_loud(self, client):
+        resp = _status_response(client, hb_side_effect=RuntimeError("db down"))
+        data = resp.get_json()
+        assert data["ego_heartbeat_error"] is True
+        assert data["ego_heartbeat_stale"] is False
+

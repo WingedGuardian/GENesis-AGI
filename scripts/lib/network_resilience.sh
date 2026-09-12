@@ -123,14 +123,56 @@ _netres_install_watchdog() {
         return 0
     fi
     local dst="$NETRES_LIBEXEC_DIR/network-watchdog.sh"
+    # If the timer unit is MASKED, unmask FIRST (only when actually masked, so
+    # healthy runs stay churn-free). Two variants, both handled:
+    #  • "masked" (persistent): the /etc unit path is a symlink to /dev/null, and
+    #    the writes below use `tee` (follows symlinks) → they'd hit /dev/null and
+    #    never create the real unit; unmasking first lets the rewrite recreate it.
+    #  • "masked-runtime" (`mask --runtime`): a /run symlink shadows the unit so
+    #    enable/start fail until it's removed.
+    # `is-enabled` reports "masked" or "masked-runtime"; match both. NR1.
+    local _wd_state
+    _wd_state="$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)"
+    if [[ "$_wd_state" == masked* ]]; then
+        sudo systemctl unmask genesis-network-watchdog.timer 2>/dev/null || true
+    fi
     local before=$_NETRES_WROTE
     _netres_put_file "$dst" "$(cat "$NETRES_WATCHDOG_SRC")" "0755"
     _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst")" "0644"
     _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.timer" "$_NETRES_WATCHDOG_TIMER" "0644"
+    # Reload only when a unit file actually changed this run.
     if ((_NETRES_WROTE > before)); then
         sudo systemctl daemon-reload 2>/dev/null || true
+    fi
+    # ALWAYS ensure the timer is active AND enabled (self-heal), decoupled from
+    # whether a file changed: a re-run must re-establish a timer that was disabled/
+    # stopped/masked externally since install — not skip just because the units are
+    # unchanged. Both states matter: `is-active` alone misses an active-but-DISABLED
+    # timer (e.g. `systemctl disable` without --now), which would silently fail to
+    # persist across a reboot. Both probes are reads (no sudo) and silent, so a
+    # healthy timer causes ZERO churn; only a down/unpersisted timer heals. NR1.
+    # Heal unless the timer is active AND *persistently* enabled. `is-enabled`
+    # exits 0 for BOTH "enabled" and "enabled-runtime" — but the latter is
+    # transient (stored under /run, gone on reboot), exactly what persistence must
+    # prevent — so key on stdout being EXACTLY "enabled" (matching the posture
+    # collector's network_watchdog_enabled signal), not the exit status.
+    local _wd_enabled
+    _wd_enabled="$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)"
+    if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
+        || [ "$_wd_enabled" != "enabled" ]; then
+        # (A masked timer was already unmasked + its unit rewritten above, before
+        # these writes, so enable now has a real unit file to act on.) enable+start,
+        # then VERIFY — never claim a heal that didn't take: a still-down or
+        # not-persistently-enabled timer surfaces as WARNING + _NETRES_FAILED.
         sudo systemctl enable genesis-network-watchdog.timer 2>/dev/null || true
         sudo systemctl start genesis-network-watchdog.timer 2>/dev/null || true
+        if systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
+            && [ "$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)" = "enabled" ]; then
+            _NETRES_HEALED=1
+        else
+            echo "  WARNING: watchdog timer could not be re-enabled (may be masked or broken)."
+            _NETRES_FAILED=1
+        fi
     fi
 }
 
@@ -166,6 +208,7 @@ network_resilience_apply() {
 
     _NETRES_WROTE=0
     _NETRES_FAILED=""
+    _NETRES_HEALED=""
     _netres_apply_keepconfig
     _netres_install_watchdog
 
@@ -173,6 +216,8 @@ network_resilience_apply() {
         echo "  Network resilience NOT fully applied — see warnings above."
     elif ((_NETRES_WROTE > 0)); then
         echo "  Network resilience applied (KeepConfiguration + watchdog timer active)."
+    elif [[ -n "$_NETRES_HEALED" ]]; then
+        echo "  Network resilience: re-enabled a stopped/disabled watchdog timer."
     else
         echo "  Network resilience already in place."
     fi

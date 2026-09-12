@@ -170,6 +170,7 @@ async def unified_comms():
 
     # --- Pending approvals ---
     try:
+        from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.db.crud import approval_requests
 
         raw_pending = await approval_requests.list_pending(rt.db)
@@ -179,6 +180,26 @@ async def unified_comms():
                 pending_approvals.append(dict(row))
             elif isinstance(row, dict):
                 pending_approvals.append(row)
+        # Desktop-takeover rows are withheld here for the same reason the
+        # dashboard approvals queue withholds them: this feed renders a pending
+        # row as a generic approval card, and a card that cannot say it is
+        # handing over the operator's keyboard must not be the place that asks.
+        # Desktop consent has its own surface, which names the target window
+        # back to them.
+        #
+        # Found by enumerating every reader of `approval_requests` rather than
+        # by fixing the one that was reported: the exclusion is maintained by
+        # ENUMERATION, so a new surface that forgets it re-opens the path and
+        # no allowlist catches that. The other readers are safe for their own
+        # reasons — `hydrate_delivery_map` matches on a `delivery_id` a desktop
+        # row does not carry. The morning report is NOT one of them: it renders
+        # the oldest five descriptions, not just a count. It offers no button,
+        # so it is not an approval surface — but the row's own lifetime is what
+        # bounds it there, which is why desktop holds now carry a TTL.
+        pending_approvals = [
+            r for r in pending_approvals
+            if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE
+        ]
         counts["pending_approvals"] = len(pending_approvals)
     except Exception:
         logger.error("Failed to fetch approvals for comms view", exc_info=True)
@@ -210,14 +231,39 @@ async def comms_resolve_proposal(proposal_id: str):
         return jsonify({"error": "status must be 'approved' or 'rejected'"}), 400
 
     user_response = data.get("user_response", "")
+    # PR-6a resolve-side guard: pin the resolve to the revision the browser
+    # rendered (sent in the body). Absent → None → unguarded (as before); NEVER
+    # default to 1. Coerce a stringified body value defensively.
+    expected_revision = data.get("revision_num")
+    if isinstance(expected_revision, str):
+        expected_revision = int(expected_revision) if expected_revision.isdigit() else None
 
     ok = await ego.resolve_proposal(
         rt.db,
         proposal_id,
         status=status,
         user_response=user_response or None,
+        expected_revision=expected_revision,
     )
     if not ok:
+        # Distinguish a stale-revision refusal (revised since rendered) from a
+        # gone / already-resolved proposal so the client can prompt a re-review.
+        fresh = None
+        try:
+            fresh = await ego.get_proposal(rt.db, proposal_id)
+        except Exception:
+            fresh = None
+        if (
+            fresh is not None
+            and fresh.get("status") == "pending"
+            and expected_revision is not None
+            and fresh.get("revision_num") != expected_revision
+        ):
+            return jsonify({
+                "error": "stale_revision",
+                "message": "This proposal was revised — re-review before resolving.",
+                "revision_num": fresh.get("revision_num"),
+            }), 409
         return jsonify({"error": "Proposal not found or already resolved"}), 404
 
     # Shared post-resolution hook: journal + J-9 + decision capture +

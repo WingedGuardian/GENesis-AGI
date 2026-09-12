@@ -40,7 +40,7 @@ async def db(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_skill_applicator_records_ledger_row(db, tmp_path, monkeypatch):
+async def test_skill_applicator_stages_without_ledger_or_file_write(db, tmp_path, monkeypatch):
     from genesis.learning.skills.applicator import SkillApplicator
     from genesis.learning.skills.types import (
         ChangeSize,
@@ -68,15 +68,15 @@ async def test_skill_applicator_records_ledger_row(db, tmp_path, monkeypatch):
         wiring_mod, "get_skill_path", lambda name: skill_dir / "SKILL.md",
     )
 
-    result = await applicator.apply(proposal, db)
-    assert result["action"] == "applied"
-    assert (skill_dir / "SKILL.md").read_text() == "new content"
+    result = await applicator.apply(proposal, db, current_content="old content")
+    # Propose-only: the applicator STAGES the proposal — it must not write the
+    # skill file, nor a cognitive_file_modifications ledger row. Applying (and its
+    # ledger capture) moves to the future human-initiated apply/resolve path.
+    assert result["action"] == "staged"
+    assert (skill_dir / "SKILL.md").read_text() == "old content"
 
     rows = await cfm.recent(db, limit=10, actor="skill_evolution")
-    assert len(rows) == 1
-    assert rows[0]["prior_content"] == "old content"
-    assert rows[0]["applied_content"] == "new content"
-    assert rows[0]["metadata"]["skill_name"] == "test-skill"
+    assert len(rows) == 0
 
 
 @pytest.mark.asyncio

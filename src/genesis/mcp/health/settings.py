@@ -95,8 +95,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "Ambient session-ledger extractor (session-manager PR-3) — "
             "master `enabled` + `mode` off/shadow/live. Shadow logs "
-            "proposals only (live session_ledger never written); `live` is "
-            "reserved and coerced to shadow until the data-gated flip PR. "
+            "proposals only; `live` also promotes the qualifying ones "
+            "into the real ledger as added_by='ambient_ledger_extractor'. "
+            "Live requires BOTH mode=live and live_opt_in=true (renewed "
+            "opt-in — legacy overlays persisted `live` while it was "
+            "reserved). An invalid mode degrades to shadow, never to live. "
             "Read at worker startup — takes effect next compaction."
         ),
         config_filename="session_ledger_shadow.yaml",
@@ -132,6 +135,63 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "contributor_worklog": SettingsDomain(
+        name="contributor_worklog",
+        description=(
+            "Contributor Work-Log poster — master `enabled` + `mode` "
+            "off/propose_only/live plus `retention_days`/`max_held` knobs. "
+            "propose_only (default, shipped) proposes public GitHub issues + "
+            "holds each for owner approval but NEVER auto-posts (dry-run); "
+            "live posts approved issues via `gh issue create`. Invalid mode "
+            "degrades to propose_only. Read live by the drain each tick — "
+            "takes effect immediately, no restart."
+        ),
+        config_filename="contributor_worklog.yaml",
+        readonly=False,
+        needs_restart=False,  # drain re-reads each tick
+        # require_approval is overlay-only (the validator rejects it): strip it from
+        # the settings GET too, so a whole-config dashboard PUT can never echo it back
+        # and 422 the entire save. Disabling this approval gate must be a deliberate
+        # overlay-file edit, never a UI round-trip.
+        hidden_fields=frozenset({"require_approval"}),
+    ),
+    "marketing_outreach": SettingsDomain(
+        name="marketing_outreach",
+        description=(
+            "Autonomous COLD marketing-outreach substrate — master `enabled` + "
+            "`mode` off/observe/live. Gates the `marketing_send` tool, which "
+            "stages a cold email to a recipient resolved IN CODE from the "
+            "owner-curated marketing_prospects store (never the LLM). off "
+            "(default, shipped) refuses to stage any send; every staged send "
+            "still holds at the WS-8 email autonomy gate (BULK cell at ASK). "
+            "Invalid mode degrades to off (least authority). Read live per tool "
+            "call — no restart. Kill switch: GENESIS_MARKETING_OUTREACH_DISABLED=1."
+        ),
+        config_filename="marketing_outreach.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by marketing_config
+    ),
+    "memory_integrity": SettingsDomain(
+        name="memory_integrity",
+        description=(
+            "Memory integrity — master `enabled` + `mode` off/passive/active "
+            "plus checker/probe/repair knobs. Passive runs two read-only jobs: "
+            "a cross-backend consistency check (memory_metadata <-> Qdrant <-> "
+            "memory_fts) and a recall-health probe over an install-local golden "
+            "set, surfacing findings via a posture alert + dashboard tile. "
+            "Active (default) adds the Phase-1 nightly reconcile job that "
+            "drains delete-intent tombstones and repairs aged drift (ghost "
+            "vectors deleted with payload export; lying mirrors re-queued for "
+            "re-embed) — knobs repair_min_age_seconds / max_repairs_per_run. "
+            "Repair is serialized against deletes from every process (per-id "
+            "lock in-process; tombstones + atomic requeue guard "
+            "cross-process). Read live per run — takes effect next scheduled "
+            "run. Kill switch: GENESIS_MEMORY_INTEGRITY_DISABLED=1."
+        ),
+        config_filename="memory_integrity.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per scheduled run
+    ),
     "pr_watch": SettingsDomain(
         name="pr_watch",
         description=(
@@ -163,6 +223,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # read live per pass by skill_gate_config
     ),
+    "graphstore": SettingsDomain(
+        name="graphstore",
+        description=(
+            "Which backend answers memory-graph traversals — `enabled` plus "
+            "`mode` networkx/falkordb. networkx (default) is the in-process "
+            "projection and depends on nothing else; falkordb is a long-lived "
+            "server over a unix socket that needs the engine armed, the client "
+            "installed, and a projection built. Anything unreadable or "
+            "unrecognised degrades to networkx, and the facade falls back to it "
+            "at runtime rather than answering empty. Betweenness centrality "
+            "always stays on networkx — FalkorDB cannot compute it. Read live "
+            "on every traversal — takes effect immediately, no restart."
+        ),
+        config_filename="graphstore.yaml",
+        readonly=False,
+        needs_restart=False,  # load_config() is a fresh read per traversal
+    ),
     "entity_adjudication": SettingsDomain(
         name="entity_adjudication",
         description=(
@@ -176,6 +253,180 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="entity_adjudication.yaml",
         readonly=False,
         needs_restart=False,  # re-read every drain run
+    ),
+    "cc_rate_limit_resume": SettingsDomain(
+        name="cc_rate_limit_resume",
+        description=(
+            "Rate-limit park + auto-resume — master `enabled` + `mode` "
+            "off/propose_only/live, plus cadence/backoff/escalation knobs. "
+            "live (default) auto-resumes parked work at its reset time and "
+            "delivers to origin; propose_only pings to resume; off records only. "
+            "Read live each engine tick — takes effect next tick, no restart."
+        ),
+        config_filename="cc_rate_limit_resume.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every resume tick
+    ),
+    "cc_foreground_reaper": SettingsDomain(
+        name="cc_foreground_reaper",
+        description=(
+            "Foreground-session liveness reaper (D3) — master `enabled` + `mode` "
+            "off/observe/notify, plus idle_hours/max_per_tick. notify (default) "
+            "reaps abandoned foreground sessions to 'checkpointed' and tells the "
+            "origin user their request was interrupted (crisp unanswered-user "
+            "signal only); observe reaps + records without notifying; off does "
+            "nothing. Read live each reaper pass — takes effect next pass, no restart."
+        ),
+        config_filename="cc_foreground_reaper.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every reaper pass
+    ),
+    "mcp_staleness_guard": SettingsDomain(
+        name="mcp_staleness_guard",
+        description=(
+            "MCP stale-code guard — master `enabled` + `mode` block/warn/off. "
+            "A CC session's MCP subprocess runs code from its start commit and "
+            "never reloads; after a deploy it goes stale. block (default) refuses "
+            "overwrite/refine-class tools (procedure_store) on a stale subprocess "
+            "with a 'restart this session' error; warn logs and allows; off "
+            "disables. Read live per guarded call — takes effect immediately, no "
+            "restart. Env kill switch GENESIS_MCP_STALENESS_GUARD=1 forces off."
+        ),
+        config_filename="mcp_staleness_guard.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per guarded call
+    ),
+    "ego_reconcile": SettingsDomain(
+        name="ego_reconcile",
+        description=(
+            "Ego reconcile stage (PR-5) — master `enabled` + `mode` off/shadow/live, "
+            "plus revision_retention_days. After the ego drafts proposals it matches "
+            "them against the pending board (ego-scoped) + a deterministic covered-work "
+            "snapshot and emits verdicts (new/reaffirm/revise/withdraw). shadow "
+            "(default) logs verdicts and applies nothing (drafting goes blind, the "
+            "realist backstops); live applies verdicts + widens the realist history; "
+            "off disables the stage. Only flip to live once PR-6's resolve-side revision "
+            "guards are wired. Read live each cycle — takes effect next cycle, no restart."
+        ),
+        config_filename="ego_reconcile.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every ego cycle
+    ),
+    "surplus_ideation_promotion": SettingsDomain(
+        name="surplus_ideation_promotion",
+        description=(
+            "Surplus ideation → follow_ups 'idea' review lane promotion (WS-M PR-2). "
+            "master `enabled` + `cap_per_run`. When on, the surplus maintenance GC "
+            "graduates pending staged brainstorm ideas into the cockpit 'idea' lane, "
+            "capped per pass (FIFO). off (or env "
+            "GENESIS_SURPLUS_IDEATION_PROMOTION_DISABLED=1) stops promotion — staged "
+            "ideas just TTL-decay. Read live each GC pass — no restart."
+        ),
+        config_filename="surplus_ideation_promotion.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every GC pass
+    ),
+    "follow_up_watchdog": SettingsDomain(
+        name="follow_up_watchdog",
+        description=(
+            "Follow-up hygiene watchdog (awareness hourly band) — master `enabled` "
+            "+ `grace_hours` / `max_listed` / `alert_priority`. Flags hot-lane rows "
+            "stuck invisible (status='scheduled' with no linked task) or undispatched "
+            "(past-due scheduled_task) as one deduped, self-resolving "
+            "infrastructure_alert → morning report. Read-and-alert only (mutates "
+            "nothing). off (or env GENESIS_FOLLOW_UP_WATCHDOG_DISABLED=1) silences it. "
+            "Read live each hourly tick — no restart."
+        ),
+        config_filename="follow_up_watchdog.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "ledger_escalation": SettingsDomain(
+        name="ledger_escalation",
+        description=(
+            "Undisposed-ledger escalation sweep (learning scheduler, hourly) — "
+            "master `enabled` + `stale_days` / `quiet_days` / `max_per_run` / "
+            "`priority` / `escalate_added_by`. A session_ledger row untouched >= "
+            "stale_days whose owning session has been quiet >= quiet_days becomes "
+            "a `user_input_needed` follow-up asking for a disposition; disposing "
+            "the row auto-completes that follow-up. BOTH thresholds must pass — a "
+            "stale row in a LIVE session is that session's to dispose. WRITES "
+            "(creates follow-ups), never to session_ledger. `escalate_added_by` "
+            "is a provenance allow-list, foreground-only by default so the "
+            "ambient extractor's proposals cannot ask the owner to dispose of "
+            "something nobody committed to. off (or env "
+            "GENESIS_LEDGER_ESCALATION_DISABLED=1) silences it. Read live each "
+            "tick — no restart."
+        ),
+        config_filename="ledger_escalation.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "context_injection_watch": SettingsDomain(
+        name="context_injection_watch",
+        description=(
+            "Context-injection watcher (awareness hourly band) — master `enabled` + "
+            "`lookback_hours` / `max_listed` / `alert_priority`. Watches the GROUND "
+            "TRUTH of the silent-context-loss class: a hook-stdout file the Claude "
+            "Code harness persisted instead of injecting (the session then ran "
+            "without that hook's content, invisibly). Scoped to this install's "
+            "checkouts and attributed per producer, so another hook's filing is "
+            "reported too, with its own remedy. One deduped, self-resolving "
+            "infrastructure_alert; "
+            "default priority critical (~5-min Telegram path — this class ran "
+            "unnoticed for a month). Read-and-alert only. off (or env "
+            "GENESIS_CONTEXT_INJECTION_WATCH_DISABLED=1) silences it. Read live each "
+            "hourly tick — no restart."
+        ),
+        config_filename="context_injection_watch.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
+    "provider_outage_notify": SettingsDomain(
+        name="provider_outage_notify",
+        description=(
+            "Dead-provider notification sweep (awareness 5-min band) — master "
+            "`enabled` + `mode` off/propose_only/live. Once an unresolved "
+            "provider outage passes 1h: live (default) writes the ONE critical "
+            "observation that becomes a Telegram; propose_only writes it at "
+            "high (no immediate page; dashboard, ego and the next morning "
+            "report); off disables the sweep "
+            "AND resolves open notification rows — so off→on re-notifies a "
+            "still-dead provider, deliberately. Invalid mode degrades to "
+            "propose_only. Env kill switch GENESIS_PROVIDER_NOTIFY_DISABLED=1. "
+            "Read live each tick — no restart."
+        ),
+        config_filename="provider_outage_notify.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every 5-min tick
+    ),
+    "voice_act": SettingsDomain(
+        name="voice_act",
+        description=(
+            "Voice ACT — the s2s model's remember/remind tools. master `enabled` "
+            "+ `mode` off/live. live offers remember(fact) → episodic memory and "
+            "remind(text, when) → scheduled owner reminder; off (default) hides "
+            "the tools and refuses their handlers (ask_genesis recall unaffected). "
+            "Ship dark, arm after live E2E. Read live per tool call — no restart."
+        ),
+        config_filename="voice_act.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every tool call
+    ),
+    "voice_recency_resume": SettingsDomain(
+        name="voice_recency_resume",
+        description=(
+            "Voice cross-session recency resume — inject the tail of the user's "
+            "most-recent prior voice conversation into the S2S system prompt as "
+            "reference-only context (used only when the user explicitly asks about it or "
+            "says something directly related, never proactively resumed). master `enabled` + `mode` off/live "
+            "(off = no injection, the default). Tuning: `scope` global/per_device, "
+            "`max_turns`, `max_chars`, `max_age_hours` (null = no limit). Ship dark, "
+            "arm after live E2E. Read live at every voice session start — no restart."
+        ),
+        config_filename="voice_recency_resume.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read at every voice session start
     ),
     "resilience": SettingsDomain(
         name="resilience",
@@ -315,6 +566,21 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=True,
     ),
+    "reflection_models": SettingsDomain(
+        name="reflection_models",
+        description=(
+            "Reflection depth → model/effort (light/deep/strategic) for "
+            "reflections that run on the Claude Code CLI path. Deep and strategic "
+            "run on the CLI by design (dispatch: cli in model_routing.yaml), so "
+            "these are their PRIMARY model/effort; light runs primarily via the "
+            "API free-model chain and uses its value (Haiku) only on CLI fallback. "
+            "Read live per reflection (no restart). An effort control shows only "
+            "for effort-capable models — Haiku ignores --effort."
+        ),
+        config_filename="reflection_models.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per reflection by reflection_models_config
+    ),
     "contribution": SettingsDomain(
         name="contribution",
         description="Contribution offer pipeline (proactive upstream fix offers)",
@@ -389,26 +655,105 @@ def _load_yaml_merged(filename: str) -> dict:
 _USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
 
 
-def _atomic_yaml_write(filename: str, data: dict) -> Path:
+# Provenance header lines preserved across rewrites (newest last, capped so
+# the header can't grow unboundedly on a frequently-edited domain).
+_PROVENANCE_HISTORY_MAX = 5
+
+
+def _atomic_yaml_write(
+    filename: str,
+    data: dict,
+    *,
+    provenance: str | None = None,
+) -> Path:
     """Write YAML atomically to user config dir (~/.genesis/config/).
 
     Runtime config writes go to the user directory, not the repo tree,
     so git status stays clean and user settings don't leak into PRs.
+
+    ``provenance`` stamps a ``# set-by: <actor> @ <utc>`` header comment and
+    PRESERVES prior stamps (last ``_PROVENANCE_HISTORY_MAX``). This is the
+    durable answer to "is this user-set config an anomaly?": any future
+    session reading the overlay sees who set it and when, so a deliberate
+    user choice (e.g. disabling the approval gate from the dashboard) is
+    never mistaken for drift and "fixed" back. yaml.safe_load ignores the
+    comments, so readers are unaffected.
     """
+    from datetime import UTC, datetime
+
     _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     path = _USER_CONFIG_DIR / filename
+
+    # Preservation is UNCONDITIONAL — a caller that forgets `provenance` must
+    # never become a delete path for the hand-written operator rationale or
+    # prior stamps this feature exists to protect. Only the machine-stamped
+    # '# set-by:' history is capped; only the NEW stamp is conditional.
+    set_by: list[str] = []
+    other_comments: list[str] = []
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("# set-by: "):
+                set_by.append(line)
+            elif line.startswith("#"):
+                other_comments.append(line)
+            elif line.strip():
+                break
+    except OSError:
+        pass
+    if provenance:
+        # Defense-in-depth: a newline in the actor string would write raw
+        # lines BELOW the comment prefix — top-level YAML injected above the
+        # real mapping in the same document. All current callers pass fixed
+        # strings; sanitize anyway so a future caller can't become a vector.
+        clean = provenance.replace("\r", " ").replace("\n", " ")
+        set_by.append(
+            f"# set-by: {clean} @ {datetime.now(UTC).isoformat()}",
+        )
+    header_lines: list[str] = other_comments + set_by[-_PROVENANCE_HISTORY_MAX:]
+
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         suffix=".yaml.tmp",
     )
     try:
         with open(tmp_fd, "w") as f:
+            if header_lines:
+                f.write("\n".join(header_lines) + "\n")
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
         Path(tmp_path).replace(path)
     except Exception:
         Path(tmp_path).unlink(missing_ok=True)
         raise
     return path
+
+
+def gate_disable_error(
+    domain: str,
+    changes: dict,
+    *,
+    confirmed: bool,
+) -> str | None:
+    """Error message when disabling the mandatory approval gate unconfirmed.
+
+    ``manual_approval_required: false`` turns off the approval gate for ALL
+    autonomous CC sessions — a single unconfirmed API call must not do that
+    silently (2026-08-18: a dashboard PUT flipped it with zero friction and
+    zero notification). The user remains sovereign: with explicit
+    confirmation the write proceeds (and the caller sends a Telegram notice).
+    """
+    if domain != "autonomous_cli_policy":
+        return None
+    if changes.get("manual_approval_required") is not False:
+        return None
+    if confirmed:
+        return None
+    return (
+        "Disabling manual_approval_required turns OFF the mandatory approval "
+        "gate for ALL autonomous Claude Code sessions. If this is deliberate, "
+        "repeat the request with confirm_disable_approval_gate=true — the "
+        "change is then applied, provenance-stamped, and announced via "
+        "Telegram."
+    )
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -464,7 +809,7 @@ def _validate_tts(changes: dict) -> list[str]:
 def _validate_resilience(changes: dict) -> list[str]:
     """Validate resilience config changes."""
     errors: list[str] = []
-    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications"}
+    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications", "network"}
 
     for key in changes:
         if key not in valid_top_keys:
@@ -490,6 +835,28 @@ def _validate_resilience(changes: dict) -> list[str]:
     if isinstance(cc, dict):
         _validate_positive_int(cc, "max_sessions_per_hour", errors)
         _validate_float_range(cc, "throttle_threshold_pct", 0.0, 1.0, errors)
+
+    network = changes.get("network", {})
+    if isinstance(network, dict):
+        from genesis.resilience.network_config import BACKUP_RETRY_MODES, PARKING_MODES
+
+        pm = network.get("parking_mode")
+        if pm is not None and pm not in PARKING_MODES:
+            errors.append(f"network.parking_mode must be one of {PARKING_MODES}")
+        bpr = network.get("backup_push_retry")
+        if bpr is not None and bpr not in BACKUP_RETRY_MODES:
+            errors.append(f"network.backup_push_retry must be one of {BACKUP_RETRY_MODES}")
+        for field in (
+            "probe_port",
+            "probe_timeout_s",
+            "fast_cadence_s",
+            "steady_cadence_s",
+            "offline_all_fail_rounds",
+            "online_clean_rounds",
+            "stable_online_s",
+            "merge_gap_s",
+        ):
+            _validate_positive_int(network, field, errors)
 
     return errors
 
@@ -545,6 +912,7 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
         "autonomous_cli_fallback_enabled",
         "manual_approval_required",
         "reask_interval_hours",
+        "reask_overrides",
         "approval_channel",
         "shared_export_enabled",
     }
@@ -562,13 +930,40 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
         if key in changes and not isinstance(changes[key], bool):
             errors.append(f"{key} must be a boolean")
 
+    def _whole_hours(value: object) -> int | None:
+        """Strict whole-hours parse: bools and fractional values are invalid.
+
+        int(0.9) would silently truncate to the 0 = never-re-ask sentinel on
+        an approval-adjacent surface — reject instead of rounding.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
     if "reask_interval_hours" in changes:
-        try:
-            value = int(changes["reask_interval_hours"])
-            if value < 1 or value > 168:
-                errors.append("reask_interval_hours must be between 1 and 168")
-        except (TypeError, ValueError):
-            errors.append("reask_interval_hours must be an integer")
+        value = _whole_hours(changes["reask_interval_hours"])
+        if value is None:
+            errors.append("reask_interval_hours must be a whole number of hours")
+        elif value < 0 or value > 168:
+            errors.append(
+                "reask_interval_hours must be between 0 (never re-ask) and 168",
+            )
+
+    if "reask_overrides" in changes:
+        overrides = changes["reask_overrides"]
+        if not isinstance(overrides, dict):
+            errors.append("reask_overrides must be a mapping of policy_id -> hours")
+        else:
+            for pid, hours in overrides.items():
+                v = _whole_hours(hours)
+                if v is None:
+                    errors.append(
+                        f"reask_overrides.{pid} must be a whole number of hours",
+                    )
+                elif v < 0 or v > 168:
+                    errors.append(
+                        f"reask_overrides.{pid} must be between 0 (never) and 168",
+                    )
 
     if "approval_channel" in changes:
         channel = str(changes["approval_channel"] or "").strip().lower()
@@ -715,6 +1110,52 @@ def _validate_channels(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_reflection_models(changes: dict) -> list[str]:
+    """Validate reflection depth → model/effort config changes.
+
+    Keys must be depths (light/deep/strategic); each a mapping with model and/or
+    effort. Effort is additionally rejected when it exceeds the model's ceiling
+    (via clamp_effort), so a nonsensical pairing can't be saved.
+    """
+    from genesis.cc.reflection_bridge.reflection_models_config import VALID_DEPTH_KEYS
+    from genesis.cc.types import CCModel, EffortLevel, clamp_effort, model_supports_effort
+
+    errors: list[str] = []
+    valid_models = VALID_MODEL_NAMES
+    valid_efforts = VALID_EFFORT_NAMES
+
+    for depth_key, spec in changes.items():
+        if depth_key not in VALID_DEPTH_KEYS:
+            errors.append(
+                f"Unknown depth '{depth_key}'. Valid: {', '.join(sorted(VALID_DEPTH_KEYS))}"
+            )
+            continue
+        if not isinstance(spec, dict):
+            errors.append(f"{depth_key} must be a mapping")
+            continue
+        for key in spec:
+            if key not in ("model", "effort"):
+                errors.append(f"Unknown key '{depth_key}.{key}'. Valid: model, effort")
+        model = spec.get("model")
+        if model is not None and model not in valid_models:
+            errors.append(f"{depth_key}.model must be one of {sorted(valid_models)}, got '{model}'")
+        effort = spec.get("effort")
+        if effort is not None and effort not in valid_efforts:
+            errors.append(
+                f"{depth_key}.effort must be one of {sorted(valid_efforts)}, got '{effort}'"
+            )
+        # Ceiling check: reject an effort above the chosen model's supported max.
+        if model in valid_models and effort in valid_efforts:
+            m = CCModel(model)
+            if model_supports_effort(m):
+                clamped = clamp_effort(m, EffortLevel(effort))
+                if clamped != EffortLevel(effort):
+                    errors.append(
+                        f"{depth_key}.effort '{effort}' exceeds {model}'s max '{clamped.value}'"
+                    )
+    return errors
+
+
 def _validate_contribution(changes: dict) -> list[str]:
     """Validate contribution config changes."""
     errors: list[str] = []
@@ -848,6 +1289,23 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
 
     errors: list[str] = []
     for key, value in changes.items():
+        if key not in ("enabled", "mode", "live_opt_in"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode, live_opt_in")
+        elif key in ("enabled", "live_opt_in"):
+            if not isinstance(value, bool):
+                errors.append(f"'{key}' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
+def _validate_mcp_staleness_guard(changes: dict) -> list[str]:
+    """Validate MCP stale-code-guard lever changes (see
+    genesis.observability.mcp_staleness_guard_config)."""
+    from genesis.observability.mcp_staleness_guard_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
         if key not in ("enabled", "mode"):
             errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
         elif key == "enabled":
@@ -925,19 +1383,42 @@ def _validate_skill_evolution_gate(changes: dict) -> list[str]:
 def _validate_repo_pulse(changes: dict) -> list[str]:
     """Validate repo-pulse lever changes (see
     genesis.session_awareness.repo_pulse_config)."""
-    from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
+    from genesis.session_awareness.repo_pulse_config import (
+        _BOOL_KNOBS,
+        _INT_KNOBS,
+        MODES,
+    )
+    from genesis.session_awareness.repo_pulse_config import (
+        OPEN_PR_MAX_SURFACE_CAP as _OPEN_PR_CAP,
+    )
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
+    # Every BOOLEAN knob the config advertises must be listed here, or the
+    # settings API rejects the key and the switch is reachable only by hand
+    # editing the yaml — a lever that reads as operable and is not (Codex P2,
+    # PR #1836, on `verification_enabled`). `_BOOL_KNOBS` is the single source
+    # the config module already keeps, so a new knob cannot be added there and
+    # silently miss this validator.
+    valid_keys = ("mode", *_BOOL_KNOBS, *_INT_KNOBS, "inject_confidence_floor")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in _BOOL_KNOBS:
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "open_pr_max_surface" and (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value > _OPEN_PR_CAP
+        ):
+            # Same contract as pr_watch.max_surface — reject, never silently cap.
+            errors.append(
+                f"'open_pr_max_surface' must be <= {_OPEN_PR_CAP} (the surfacing "
+                "hook caps at that; a larger value would be accepted and ignored)"
+            )
         elif key == "inject_confidence_floor":
             if (
                 isinstance(value, bool)
@@ -950,10 +1431,77 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_contributor_worklog(changes: dict) -> list[str]:
+    """Validate Contributor Work-Log lever changes (see
+    genesis.autonomy.contributor_worklog_config)."""
+    from genesis.autonomy.contributor_worklog_config import _INT_KNOBS, MODES
+
+    errors: list[str] = []
+    _BOOL_KEYS = ("enabled",)
+    # NOTE: `require_approval` is DELIBERATELY not settings-writable. It disables an
+    # approval gate on irreversible public posting, so flipping it must be a
+    # conscious config-file edit (the gitignored ~/.genesis overlay), never a single
+    # unconfirmed settings_update() / dashboard PUT. Rejecting it here (as an unknown
+    # key) closes both mutation paths; the overlay is read directly by require_approval().
+    valid_keys = (*_BOOL_KEYS, "mode", *_INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key in _BOOL_KEYS:
+            if not isinstance(value, bool):
+                errors.append(f"'{key}' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_marketing_outreach(changes: dict) -> list[str]:
+    """Validate marketing-outreach lever changes (see
+    genesis.outreach.marketing_config).
+
+    ``mode`` accepts ``off``/``observe`` here, but ``live`` is REJECTED — arming
+    autonomous cold sending is deliberately overlay-file-only. A settings_update
+    (MCP tool or dashboard PUT) is reachable by a foreground/injected model, so
+    letting it flip ``mode`` to ``live`` would let the model self-elevate past the
+    observe gate. The owner arms live by editing
+    ``config/marketing_outreach.local.yaml`` directly (filesystem access, not
+    model-reachable); ``marketing_config.load_config`` still merges that overlay so
+    an owner-set ``live`` takes effect. Mirrors ``_validate_memory_recall``'s
+    reservation of ``entity_lane.mode: live``. (Rejecting the value unconditionally
+    is safe because ``marketing_outreach`` is not a dashboard FORM domain — there is
+    no whole-config PUT that would re-echo an already-set ``live`` and 422 the save;
+    if it is ever added to ``_FORM_DOMAINS``, make this transition-aware or hide
+    ``mode`` first.)
+    """
+    from genesis.outreach.marketing_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value == "live":
+                errors.append(
+                    "'mode' cannot be set to 'live' via settings — the live gate is "
+                    "overlay-file-only. Edit config/marketing_outreach.local.yaml "
+                    "directly to arm autonomous cold sending. 'off' and 'observe' "
+                    "are settable here."
+                )
+            elif value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_pr_watch(changes: dict) -> list[str]:
     """Validate pr-watch lever changes (see
     genesis.session_awareness.pr_watch_config)."""
-    from genesis.session_awareness.pr_watch_config import _INT_KNOBS
+    from genesis.session_awareness.pr_watch_config import _INT_KNOBS, MAX_SURFACE_CAP
 
     errors: list[str] = []
     valid_keys = ("enabled", *_INT_KNOBS)
@@ -965,6 +1513,16 @@ def _validate_pr_watch(changes: dict) -> list[str]:
                 errors.append("'enabled' must be a boolean")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
+        elif key == "max_surface" and value > MAX_SURFACE_CAP:
+            # REJECT rather than silently clamp. The surfacing hook applies
+            # MAX_SURFACE_CAP regardless, so accepting 50 here meant reporting
+            # 50 back to an operator whose config had no effect. A settings
+            # surface that lies about what it accepted is worse than one that
+            # refuses: the operator has no way to notice.
+            errors.append(
+                f"'max_surface' must be <= {MAX_SURFACE_CAP} (the surfacing hook "
+                f"caps at that; a larger value would be accepted and ignored)"
+            )
     return errors
 
 
@@ -1024,6 +1582,61 @@ def _validate_memory_recall(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_graphstore(changes: dict) -> list[str]:
+    """Validate graph-store lever changes (see genesis.memory.graphstore_config)."""
+    from genesis.memory.graphstore_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+
+    # Precondition, not just shape validation: moving the lever to falkordb when
+    # the engine is not armed points every memory-graph read at a store that
+    # cannot answer. The facade does degrade back to NetworkX, loudly — but a
+    # dashboard toggle whose real meaning is "log an error on every recall" is
+    # not a setting anyone intends to make, so refuse it where the operator can
+    # still see why.
+    #
+    # The socket is the SYNC-checkable half. An armed engine holding an EMPTY
+    # projection needs an async query to detect, and is caught one layer down:
+    # FalkorGraphStore.traverse raises rather than reporting every root as
+    # neighbourless.
+    #
+    # JUDGE THE EFFECTIVE POST-UPDATE STATE, not the incoming keys. Testing
+    # `changes` alone was wrong in BOTH directions, and the two callers hit one
+    # each. The dashboard submits the whole current config, so an operator
+    # turning `enabled` off while the stored mode is falkordb still sends
+    # `mode: falkordb` — and if the socket has since disappeared, the check
+    # refused the save, trapping the install in a mode it could no longer leave.
+    # The MCP sends partial updates, so flipping `enabled` to true against a
+    # stored `mode: falkordb` carried no `mode` key at all and skipped the check
+    # entirely. The precondition belongs to the state the update RESULTS IN:
+    # required only when the effective config both enables the lever and selects
+    # falkordb, which also mirrors `effective_mode()`'s own `is True` test.
+    from genesis.memory.graphstore_config import load_config
+
+    effective = {**load_config(), **changes}
+    if effective.get("enabled", True) is True and effective.get("mode") == "falkordb":
+        from genesis.env import falkordb_socket_path
+
+        socket_path = falkordb_socket_path()
+        if not Path(socket_path).exists():
+            errors.append(
+                "'mode' cannot be set to falkordb: the graph engine is not armed "
+                f"(no socket at {socket_path}). Start it with "
+                "`systemctl --user start genesis-falkordb`, build the projection with "
+                "`python -m genesis.memory.graphstore_project`, then set the mode."
+            )
+    return errors
+
+
 def _validate_entity_adjudication(changes: dict) -> list[str]:
     """Validate entity-adjudication lever changes (see
     genesis.memory.entity_adjudication_config)."""
@@ -1045,14 +1658,311 @@ def _validate_entity_adjudication(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_cc_rate_limit_resume(changes: dict) -> list[str]:
+    """Validate rate-limit resume lever changes (see
+    genesis.cc.rate_limit_resume_config)."""
+    from genesis.cc.rate_limit_resume_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "conversation_resume_profile", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "conversation_resume_profile":
+            if not isinstance(value, str) or not value.strip():
+                errors.append("'conversation_resume_profile' must be a non-empty string")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_cc_foreground_reaper(changes: dict) -> list[str]:
+    """Validate foreground-liveness reaper lever changes (see
+    genesis.cc.foreground_reaper_config)."""
+    from genesis.cc.foreground_reaper_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_ego_reconcile(changes: dict) -> list[str]:
+    """Validate ego reconcile-stage lever changes (see
+    genesis.ego.reconcile_config). Runtime already degrades to shadow on a bad
+    read; this rejects bad WRITES so settings_update reports the error instead of
+    silently persisting e.g. `enabled: "false"` (truthy) or an unknown mode."""
+    from genesis.ego.reconcile_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_voice_act(changes: dict) -> list[str]:
+    """Validate voice-ACT lever changes (see
+    genesis.channels.voice.voice_act_config). Rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy) or an unknown `mode`."""
+    from genesis.channels.voice.voice_act_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode" and value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
+def _validate_voice_recency_resume(changes: dict) -> list[str]:
+    """Validate voice recency-resume lever changes (see
+    genesis.channels.voice.voice_recency_resume_config). Rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy), an unknown `mode`/`scope`, or a non-positive
+    turn/char/age value."""
+    from genesis.channels.voice.voice_recency_resume_config import MODES, SCOPES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "scope", "max_turns", "max_chars", "max_age_hours")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode" and value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "scope" and value not in SCOPES:
+            errors.append(f"'scope' must be one of {', '.join(SCOPES)}; got {value!r}")
+        elif key in ("max_turns", "max_chars") and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            errors.append(f"'{key}' must be a positive integer; got {value!r}")
+        elif (
+            key == "max_age_hours"
+            and value is not None
+            and (isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0)
+        ):
+            errors.append("'max_age_hours' must be a positive number or null")
+    return errors
+
+
+def _validate_memory_integrity(changes: dict) -> list[str]:
+    """Validate memory-integrity lever changes (see
+    genesis.memory.integrity_config). Runtime already fail-safe-coerces at read
+    time; this rejects bad WRITES so settings_update reports the error instead of
+    silently persisting e.g. `enabled: "false"` (truthy) or `rerank: "false"`."""
+    from genesis.memory.integrity_config import _FLOAT01_KNOBS, _INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "rerank", "rerank_timeout_s", *_INT_KNOBS, *_FLOAT01_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key in ("enabled", "rerank"):
+            if not isinstance(value, bool):
+                errors.append(f"'{key}' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "rerank_timeout_s":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                errors.append("'rerank_timeout_s' must be a positive number")
+        elif key in _FLOAT01_KNOBS:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= value <= 1
+            ):
+                errors.append(f"'{key}' must be a number in 0..1")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_surplus_ideation_promotion(changes: dict) -> list[str]:
+    """Validate surplus ideation-promotion lever changes (see
+    genesis.surplus.promotion_config). Runtime already fails safe (disabled on a
+    bad `enabled`, default cap on a bad knob); this rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy) or a zero cap."""
+    from genesis.surplus.promotion_config import INT_KNOBS
+
+    errors: list[str] = []
+    valid_keys = ("enabled", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_follow_up_watchdog(changes: dict) -> list[str]:
+    """Validate follow-up watchdog lever changes (see
+    genesis.awareness.follow_up_watchdog_config)."""
+    from genesis.awareness.follow_up_watchdog_config import (
+        _VALID_ALERT_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_ledger_escalation(changes: dict) -> list[str]:
+    """Validate ledger-escalation lever changes (see
+    genesis.session_awareness.ledger_escalation_config)."""
+    from genesis.db.crud.session_charters import VALID_ADDED_BY
+    from genesis.session_awareness.ledger_escalation_config import (
+        _VALID_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "priority", "escalate_added_by", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "priority":
+            if value not in _VALID_PRIORITY:
+                errors.append(
+                    f"'priority' must be one of {', '.join(_VALID_PRIORITY)}; got {value!r}"
+                )
+        elif key == "escalate_added_by":
+            if not isinstance(value, list) or not value:
+                errors.append("'escalate_added_by' must be a non-empty list")
+            else:
+                unknown = [v for v in value if v not in VALID_ADDED_BY]
+                if unknown:
+                    errors.append(
+                        f"'escalate_added_by' has unknown provenance {unknown}; "
+                        f"valid: {', '.join(sorted(VALID_ADDED_BY))}"
+                    )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_context_injection_watch(changes: dict) -> list[str]:
+    """Validate context-injection watcher lever changes (see
+    genesis.awareness.context_injection_watch_config)."""
+    from genesis.awareness.context_injection_watch_config import (
+        _VALID_ALERT_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_provider_outage_notify(changes: dict) -> list[str]:
+    """Validate dead-provider notify lever changes (see
+    genesis.awareness.provider_notify_config)."""
+    from genesis.awareness.provider_notify_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "graphstore": _validate_graphstore,
+    "ego_reconcile": _validate_ego_reconcile,
+    "follow_up_watchdog": _validate_follow_up_watchdog,
+    "ledger_escalation": _validate_ledger_escalation,
+    "context_injection_watch": _validate_context_injection_watch,
+    "provider_outage_notify": _validate_provider_outage_notify,
+    "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
+    "memory_integrity": _validate_memory_integrity,
     "entity_adjudication": _validate_entity_adjudication,
+    "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
+    "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "mcp_staleness_guard": _validate_mcp_staleness_guard,
+    "voice_act": _validate_voice_act,
+    "voice_recency_resume": _validate_voice_recency_resume,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
+    "contributor_worklog": _validate_contributor_worklog,
+    "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,
@@ -1063,6 +1973,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "surplus": _validate_surplus,
     "ego": _validate_ego,
     "channels": _validate_channels,
+    "reflection_models": _validate_reflection_models,
     "contribution": _validate_contribution,
     "observability": _validate_observability,
 }
@@ -1155,6 +2066,8 @@ async def _impl_settings_update(
     domain: str,
     changes: dict,
     dry_run: bool = False,
+    confirm_disable_approval_gate: bool = False,
+    actor: str = "user via mcp settings_update",
 ) -> dict:
     entry = _DOMAIN_REGISTRY.get(domain)
     if entry is None:
@@ -1188,6 +2101,16 @@ async def _impl_settings_update(
                 "validation_errors": errors,
             }
 
+    # Protected key: disabling the mandatory approval gate needs explicit
+    # confirmation (see gate_disable_error).
+    gate_err = gate_disable_error(
+        domain,
+        changes,
+        confirmed=confirm_disable_approval_gate,
+    )
+    if gate_err:
+        return {"domain": domain, "error": gate_err}
+
     # Merge changes into the local overlay (NOT the base file).
     # The base file stays git-tracked and clean for upstream updates.
     local = _load_yaml_local(entry.config_filename)
@@ -1204,10 +2127,24 @@ async def _impl_settings_update(
             "needs_restart": entry.needs_restart,
         }
 
-    # Atomic write to .local.yaml
+    # Capture the gate's EFFECTIVE value BEFORE the write, so the disable alert
+    # fires only on a genuine true→false transition (a settings save that still
+    # carries manual_approval_required=false while the gate was already off must
+    # not re-page — especially now that critical_observation has a 0-window).
+    gate_was_off = (
+        domain == "autonomous_cli_policy"
+        and _load_yaml_merged(entry.config_filename).get(
+            "manual_approval_required",
+            True,
+        )
+        is False
+    )
+
+    # Atomic write to .local.yaml (provenance-stamped: user-set config must
+    # never read as an anomaly to a future session).
     local_file = _local_filename(entry.config_filename)
     try:
-        _atomic_yaml_write(local_file, new_local)
+        _atomic_yaml_write(local_file, new_local, provenance=actor)
     except Exception:
         logger.error(
             "Failed to write local settings for %s",
@@ -1225,8 +2162,92 @@ async def _impl_settings_update(
     }
     if entry.needs_restart:
         result["note"] = "Changes saved. Restart genesis-server for them to take effect."
+    if (
+        domain == "autonomous_cli_policy"
+        and changes.get("manual_approval_required") is False
+        and not gate_was_off  # only on a genuine true→false transition
+    ):
+        result["warning"] = (
+            "The mandatory approval gate is now DISABLED: autonomous Claude "
+            "Code sessions dispatch without per-run approval until "
+            "manual_approval_required is set back to true."
+        )
+        logger.warning(
+            "manual_approval_required disabled via %s (confirmed)",
+            actor,
+        )
+        # Owner-facing loudness from the MCP process (no live outreach
+        # pipeline here): a critical observation — the server's
+        # critical-observations job pages it to Telegram. Best-effort; the
+        # provenance stamp + warning above remain the durable record.
+        await write_gate_disable_alert(actor)
+    elif domain == "autonomous_cli_policy" and changes.get("manual_approval_required") is True:
+        # Gate restored: resolve the standing alert immediately so a stale
+        # "running without approval" critical cannot page after re-enable.
+        await resolve_gate_disable_alert(actor)
 
     return result
+
+
+async def write_gate_disable_alert(actor: str) -> None:
+    """Best-effort critical observation for a confirmed gate disable."""
+    try:
+        import hashlib as _hashlib
+        import uuid as _uuid
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        from genesis.db.connection import get_raw_db
+        from genesis.db.crud import observations as _observations
+        from genesis.env import genesis_db_path
+
+        async with get_raw_db(genesis_db_path()) as db:
+            await _observations.create(
+                db,
+                id=str(_uuid.uuid4()),
+                source="settings_guard",
+                type="infrastructure_alert",
+                content=(
+                    f"Approval gate DISABLED via {actor} (confirmed): "
+                    "manual_approval_required is now false — autonomous "
+                    "Claude Code sessions dispatch WITHOUT per-run "
+                    "approval until it is set back to true "
+                    "(Settings → autonomous_cli_policy)."
+                ),
+                priority="critical",
+                created_at=_datetime.now(_UTC).isoformat(),
+                content_hash=_hashlib.sha256(
+                    b"approval_gate_disabled_alert",
+                ).hexdigest(),
+                skip_if_duplicate=True,
+            )
+    except Exception:
+        logger.warning(
+            "Gate-disable critical observation write failed",
+            exc_info=True,
+        )
+
+
+async def resolve_gate_disable_alert(actor: str) -> None:
+    """Best-effort resolve of the gate-disabled alert when the gate returns."""
+    try:
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        from genesis.db.connection import get_raw_db
+        from genesis.db.crud import observations as _observations
+        from genesis.env import genesis_db_path
+
+        async with get_raw_db(genesis_db_path()) as db:
+            await _observations.resolve_by_source_and_type(
+                db,
+                source="settings_guard",
+                type="infrastructure_alert",
+                resolved_at=_datetime.now(_UTC).isoformat(),
+                resolution_notes=f"gate re-enabled via {actor}",
+            )
+    except Exception:
+        logger.warning("Gate-disable alert resolve failed", exc_info=True)
 
 
 # ── MCP tool wrappers ──────────────────────────────────────────────────
@@ -1259,6 +2280,7 @@ async def settings_update(
     domain: str,
     changes: dict,
     dry_run: bool = False,
+    confirm_disable_approval_gate: bool = False,
 ) -> dict:
     """Update configuration for a settings domain.
 
@@ -1266,6 +2288,15 @@ async def settings_update(
     keys change, existing keys are preserved). Set dry_run=True to
     validate without saving. Read-only domains are rejected.
 
+    Disabling autonomous_cli_policy.manual_approval_required (the mandatory
+    approval gate) additionally requires confirm_disable_approval_gate=True —
+    the change is then provenance-stamped and loudly warned in the result.
+
     Example: settings_update("tts", {"elevenlabs": {"stability": 0.9}})
     """
-    return await _impl_settings_update(domain, changes, dry_run=dry_run)
+    return await _impl_settings_update(
+        domain,
+        changes,
+        dry_run=dry_run,
+        confirm_disable_approval_gate=confirm_disable_approval_gate,
+    )

@@ -381,13 +381,16 @@ vm.min_free_kbytes = $_min_free_kb
 vm.watermark_scale_factor = 50
 vm.oom_kill_allocating_task = 1
 SYSCTL
-    sudo sysctl --system > /dev/null 2>&1
-    echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${host_mem_gb}GB host)"
+    if sudo sysctl --system > /dev/null 2>&1; then
+        echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${host_mem_gb}GB host)"
+    else
+        echo "  WARNING: OOM sysctl apply failed (non-fatal) — verify with 'sudo sysctl --system'"
+    fi
 fi
 
 # Find the managed bridge (not the host NIC). Column order: NAME,TYPE,MANAGED,...
 # Filter for MANAGED=YES to avoid trying to modify physical interfaces like ens4.
-_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1 || true)
 if [ -n "$_INCUS_BRIDGE" ]; then
     _NAT_STATUS=$(incus network get "$_INCUS_BRIDGE" ipv4.nat 2>/dev/null || echo "")
     if [ "$_NAT_STATUS" != "true" ]; then
@@ -405,7 +408,7 @@ fi
 # Rather than trying to detect which firewall is active and failing
 # silently, just run ALL commands unconditionally. They're idempotent
 # and fail harmlessly when the tool isn't installed.
-_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1 || true)
 if [ -n "$_INCUS_BRIDGE" ]; then
     echo "  Configuring firewall for container traffic on $_INCUS_BRIDGE..."
 
@@ -575,10 +578,19 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     # On LVM-backed pools, the default thin volume is only 10GB.
     # "device override" resizes the underlying LV + filesystem.
     incus config device override "$CONTAINER_NAME" root size="$DISK" 2>/dev/null || true
-    # I/O limits
-    incus config device set "$CONTAINER_NAME" root limits.read 190MB 2>/dev/null || true
-    incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || true
-    echo "  + Disk: $DISK, IOPS limits applied"
+    # I/O limits. Gate the success message on the IOPS sets, NOT the override: a
+    # storage pool that doesn't support device I/O limits rejects limits.read/write
+    # while the container is still created fine, so the echo must not claim limits
+    # that didn't apply. The override stays `|| true` — its failure is a
+    # pool-capability signal, not something the IOPS message should reflect.
+    _io_limits_ok=true
+    incus config device set "$CONTAINER_NAME" root limits.read 190MB 2>/dev/null || _io_limits_ok=false
+    incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || _io_limits_ok=false
+    if [ "$_io_limits_ok" = true ]; then
+        echo "  + Disk: $DISK, IOPS limits applied"
+    else
+        echo "  + Disk: $DISK (WARNING: IOPS limits not applied — pool may not support device limits)"
+    fi
 
     # Wait for container to be ready
     echo "  Waiting for container to initialize..."
@@ -729,7 +741,7 @@ _final_tz="UTC"
 
 # Try IP geolocation (the install requires internet, so this should work)
 _detected_tz=$(curl -sf --max-time 5 "http://ip-api.com/json?fields=timezone" 2>/dev/null | \
-    grep -o '"timezone":"[^"]*"' | cut -d'"' -f4)
+    grep -o '"timezone":"[^"]*"' | cut -d'"' -f4) || _detected_tz=""
 
 # Fallback: host system timezone (may be UTC on fresh cloud VMs)
 if [ -z "$_detected_tz" ]; then
@@ -1307,46 +1319,114 @@ mkdir -p "$_host_home/.claude"
 # CC can't write (it creates projects/todos/settings there). chown the DIR to the
 # operator, not just the files placed inside it.
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-    chown "$_host_user:" "$_host_home/.claude" 2>/dev/null || true
+    # Owner only, same class as the settings-file chown below: a trailing colon
+    # resets the group to the login group, wrong for a pre-existing directory
+    # with a deliberate group. A dir this run created stays group root — the
+    # operator-owner rwx is what CC needs to create files inside it.
+    chown "$_host_user" "$_host_home/.claude" 2>/dev/null || true
 fi
-if [ ! -f "$_host_settings_file" ]; then
-    cat > "$_host_settings_file" <<'CCSETTINGS'
-{
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_UPDATES": "1"
-  }
-}
-CCSETTINGS
-    chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
-    echo "  + Created $_host_settings_file with auto-updater suppression"
+# Same shared owner of these two keys as the container leg and the align path:
+# cc_ensure_updater_suppressed (scripts/lib/cc_version.sh, sourced above). One
+# implementation, so the host and container can't drift apart — and the host is
+# where an unsuppressed auto-updater bites hardest (it silently moved a host
+# several minor versions past the pin, running the Guardian recovery brain on an
+# unvetted CC). Creates the file when absent; never clobbers an unparseable one.
+if cc_ensure_updater_suppressed "$_host_settings_file"; then
+    echo "  + Auto-updater suppression set in $_host_settings_file"
 else
-    if python3 - "$_host_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(2)
-if not isinstance(data, dict):
-    sys.exit(2)
-env = data.setdefault("env", {})
-if not isinstance(env, dict):
-    sys.exit(2)
-changed = False
-for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
-    if env.get(key) != "1":
-        env[key] = "1"
-        changed = True
-if changed:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-PYEOF
-    then
-        echo "  + Auto-updater suppression set in $_host_settings_file"
-    else
-        echo "  WARNING: Could not merge auto-updater settings into $_host_settings_file"
+    echo "  WARNING: Could not set auto-updater suppression in $_host_settings_file"
+    echo "  Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+fi
+# Under sudo a file this run CREATED belongs to root — hand it back to the
+# operator so their CC can rewrite it.
+#
+# Guarded on `repaired`, i.e. ONLY when this run actually wrote. `ok` means the
+# file was already correct and untouched; `failed`/`contended` mean nothing was
+# written. In both of those a chown would be re-asserting ownership on a file
+# this script did not modify.
+#
+# On the `repaired` path the chown is usually redundant — for a PRE-EXISTING
+# file the write path carries uid/gid across the replacement inode itself — and
+# it is kept for the case that redundancy does not cover: a file this run
+# CREATED, which under sudo belongs to root and would otherwise be unwritable by
+# the operator's own CC.
+#
+# For a SYMLINK the link itself is never chowned — chown would follow it into a
+# dotfiles checkout and change ownership of files this script does not own.
+#
+# But skipping the symlink case ENTIRELY was wrong, and the failure it left is
+# the same one this block exists to prevent. When the link is DANGLING, the
+# reconciler CREATES the target, and under sudo that new file is root:root 0600
+# — unreadable by the operator's own CC. The `-L` guard then skipped the very
+# correction that case needs.
+#
+# So a symlink target IS chowned, under two conditions that keep it away from
+# anything this run did not create: the state must be `repaired` (this run
+# wrote), and the resolved target must live under the operator's own home. A
+# dotfiles checkout outside $HOME is still never touched.
+#
+# A FAILED chown is reported rather than swallowed — the failure mode is a
+# root-owned ~/.claude/settings.json that the operator's CC then cannot write,
+# which is worse than the drift this whole block exists to prevent, and silence
+# is how it would go unnoticed.
+# Resolve what actually needs the ownership fix: the file itself, or — when it
+# is a symlink — the target the reconciler just wrote through to.
+_chown_target="$_host_settings_file"
+if [ -L "$_host_settings_file" ]; then
+    _link="$(readlink "$_host_settings_file" 2>/dev/null || true)"
+    case "$_link" in
+        "")  _chown_target="" ;;                                        # unreadable link
+        /*)  _chown_target="$_link" ;;
+        *)   _chown_target="$(dirname "$_host_settings_file")/$_link" ;;
+    esac
+    # CANONICALIZE before the containment test. A LEXICAL prefix check is not a
+    # containment check: `$_host_home/.claude/../../outside/settings.json` starts
+    # with $_host_home and resolves outside it, and so does any path whose
+    # intermediate directory is itself a symlink. The chown that follows is
+    # PRIVILEGED and follows the resolved path, so a lexical pass here hands an
+    # external file to the operator.
+    #
+    # Fail closed if realpath is unavailable: skipping the chown costs a
+    # readable warning, while proceeding uncanonicalized costs an ownership
+    # change on a file this script cannot vouch for.
+    if [ -n "$_chown_target" ]; then
+        if command -v realpath >/dev/null 2>&1; then
+            _canon_target="$(realpath -- "$_chown_target" 2>/dev/null || true)"
+            _canon_home="$(realpath -- "$_host_home" 2>/dev/null || true)"
+        else
+            _canon_target=""; _canon_home=""
+        fi
+        if [ -z "$_canon_target" ] || [ -z "$_canon_home" ]; then
+            echo "  WARNING: cannot canonicalize $_chown_target — skipping the ownership" \
+                 "fix rather than chowning a path that may resolve outside" \
+                 "$_host_home"
+            _chown_target=""
+        else
+            case "$_canon_target" in
+                "$_canon_home"/*) _chown_target="$_canon_target" ;;
+                *) _chown_target="" ;;
+            esac
+        fi
+    fi
+fi
+
+# `repaired` is set for ANY successful modification, so it cannot answer "did we
+# make this file". CC_SUPPRESSION_CREATED can, and it is the right question: the
+# comments above promise to hand back only what this run created, and chowning a
+# pre-existing dotfiles-managed target breaks that promise.
+if [ "${CC_SUPPRESSION_CREATED:-0}" = "1" ] &&
+   [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] &&
+   [ -n "$_chown_target" ] && [ -e "$_chown_target" ]; then
+    # Owner ONLY — no trailing colon. MEASURED: `chown user:` resets the group
+    # to the user's LOGIN group (a file at ubuntu:sudo became ubuntu:ubuntu),
+    # which undoes the group preservation the reconciler's write path just
+    # performed. Owner alone is what the failure mode needs: the operator's CC
+    # must be able to write the file it owns.
+    if ! chown "$_host_user" "$_chown_target" 2>/dev/null; then
+        echo "  WARNING: could not chown $_chown_target to $_host_user —" \
+             "it may be root-owned, which will stop the operator's Claude Code from"
+        echo "           writing its own settings. Fix with:" \
+             "sudo chown $_host_user $_chown_target"
     fi
 fi
 
@@ -1404,7 +1484,10 @@ sed -i \
     -e "s|__CONTAINER_IP__|$_ctr_ip|g" \
     -e "s|__UBUNTU_UID__|$UBUNTU_UID|g" \
     "$_host_claude"
-chown "$_host_user:" "$_host_claude" 2>/dev/null || true
+# Owner only (no trailing colon — see the settings-file chown above): the
+# `>` truncate-write PRESERVES a pre-existing inode's group, and the colon
+# form would then reset it to the login group.
+chown "$_host_user" "$_host_claude" 2>/dev/null || true
 echo "  + Shared user-level CLAUDE.md written to $_host_claude"
 
 # ── Operator-project CLAUDE.md in the host SSH-landing dir (D16) ──
@@ -1416,7 +1499,7 @@ _operator_dst="$_host_home/CLAUDE.md"
 if [ -f "$_operator_src" ]; then
     if [ ! -f "$_operator_dst" ] || grep -q "Operator — You're on a Genesis Host VM" "$_operator_dst" 2>/dev/null; then
         sed -e "s|__CONTAINER_NAME__|$CONTAINER_NAME|g" -e "s|__UBUNTU_UID__|$UBUNTU_UID|g" "$_operator_src" > "$_operator_dst"
-        chown "$_host_user:" "$_operator_dst" 2>/dev/null || true
+        chown "$_host_user" "$_operator_dst" 2>/dev/null || true  # owner only, same class
         echo "  + Operator CLAUDE.md written to $_operator_dst"
     else
         echo "  . $_operator_dst exists and isn't ours — leaving it untouched"

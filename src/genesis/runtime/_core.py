@@ -208,6 +208,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._deferred_work_queue: DeferredWorkQueue | None = None
         self._cc_budget_tracker: CCBudgetTracker | None = None
         self._health_data: HealthDataService | None = None
+        # Optional external OfficeCLI binary (deliverable-builder render backend);
+        # resolved by _init_office_deliverables, None when not provisioned.
+        self._officecli_path: str | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
         self._span_writer: SpanWriter | None = None
         self._outreach_pipeline: OutreachPipeline | None = None
@@ -219,6 +222,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_verifier: object | None = None
         self._protected_paths: object | None = None
         self._resilience_state_machine: object | None = None
+        self._network_sentinel: object | None = None
         self._status_writer: object | None = None
         self._recovery_orchestrator: object | None = None
         self._result_writer: object | None = None
@@ -233,7 +237,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._surplus_queue: object | None = None
         self._model_profile_registry: object | None = None
         self._contingency_dispatcher: object | None = None
-        self._prediction_logger: object | None = None
         self._identity_loader: object | None = None
         self._output_router: object | None = None
         self._task_executor: object | None = None
@@ -303,8 +306,23 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
     def record_job_success(self, job_name: str) -> None:
         record_job_success(self, job_name)
 
-    def record_job_failure(self, job_name: str, error: str) -> None:
-        record_job_failure(self, job_name, error)
+    def record_job_failure(
+        self,
+        job_name: str,
+        error: str | None = None,
+        *,
+        exc: BaseException | None = None,
+        error_type: str | None = None,
+        emit_event: bool = True,
+    ) -> None:
+        record_job_failure(
+            self,
+            job_name,
+            error,
+            exc=exc,
+            error_type=error_type,
+            emit_event=emit_event,
+        )
 
     async def _load_persisted_job_health(self) -> None:
         # Thin wrapper: preserves the class-level patch surface for tests
@@ -466,6 +484,10 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         if _full:
             await self._run_init_step_async("reflex", self._init_reflex)
         self._run_init_step("guardian", self._probe_guardian_status)
+
+        # Unconditional (also in readonly probes): optional OfficeCLI render
+        # backend. Present → active; absent → degraded (never fatal).
+        self._run_init_step("office_deliverables", self._init_office_deliverables)
 
         if _full:
             await self._run_init_step_async(
@@ -641,6 +663,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("campaign_runner", self._campaign_runner),
             ("awareness_loop", self._awareness_loop),
             ("cc_fallback_probe", self._cc_fallback_probe_worker),
+            ("network_sentinel", self._network_sentinel),
             ("reflex_ingestor", self._reflex_ingestor),
         ]:
             if component is None:
@@ -727,6 +750,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "modules": "_module_registry",
         "pipeline": "_pipeline_orchestrator",
         "campaigns": "_campaign_runner",
+        "office_deliverables": "_officecli_path",
     }
 
     def _run_init_step(self, name: str, func) -> None:

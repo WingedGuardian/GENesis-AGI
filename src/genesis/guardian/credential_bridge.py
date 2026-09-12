@@ -26,12 +26,14 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "load_backup_passphrase",
     "load_cc_oauth_token",
+    "load_internal_api_token",
     "load_provisioning_credentials",
     "load_telegram_credentials",
     "mirror_credential_backup",
     "propagate_backup_passphrase",
     "propagate_cc_oauth_token",
     "propagate_guardian_credentials",
+    "propagate_internal_api_token",
     "propagate_provisioning_credentials",
     "propagate_telegram_credentials",
 ]
@@ -101,6 +103,23 @@ _MIRROR_SRC_SUBDIRS = ("creds", "secrets")  # subtrees of the Tier-1 clone to mi
 # load-bearing, not tidiness.
 _CC_TOKEN_FILENAME = "cc_oauth_token.env"  # noqa: S105 - filename constant, not a token
 _CC_TOKEN_SOURCE = Path("~/.genesis/cc_oauth_token.env").expanduser()
+# Internal API token: raw token file (written by the dashboard auth layer at boot),
+# escrowed to the shared mount so the host-side Guardian can bearer-auth its
+# /api/genesis/guardian-dialogue POST when the dashboard gates /api mutations.
+_INTERNAL_TOKEN_FILENAME = "internal_api_token.env"  # noqa: S105 - filename constant, not a token
+_INTERNAL_TOKEN_KEY = "GENESIS_INTERNAL_API_TOKEN"  # noqa: S105 - env-var name, not a token
+
+
+def _internal_token_source() -> Path:
+    """Container-side path of the raw internal token, honoring ``GENESIS_HOME``.
+
+    Must match where the dashboard writes it (``genesis.env.internal_api_token_path``
+    → ``genesis_home()/internal_api_token``); a hardcoded ``~/.genesis`` would miss
+    a customized home and leave the host Guardian without a bearer.
+    """
+    gh = os.environ.get("GENESIS_HOME")
+    base = Path(gh).expanduser() if gh else Path("~/.genesis").expanduser()
+    return base / "internal_api_token"
 _KEY_MAP_CC_TOKEN = {
     "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_OAUTH_TOKEN",
     "GENESIS_CC_TOKEN_CREATED_AT": "GENESIS_CC_TOKEN_CREATED_AT",
@@ -413,6 +432,55 @@ def load_cc_oauth_token(
         return {}
 
 
+def propagate_internal_api_token(
+    shared_dir: Path | None = None,
+    source_path: Path | None = None,
+    secrets_path: Path | None = None,
+) -> Path | None:
+    """Sync the internal API token → host shared mount, so the host-side Guardian
+    can bearer-authenticate its ``/api/genesis/guardian-dialogue`` POST when the
+    dashboard gates ``/api`` mutations (a dashboard password is set).
+
+    Reads the DEDICATED container file (``~/.genesis/internal_api_token``, a raw
+    token written by the dashboard auth layer at server boot), NEVER secrets.env.
+    Opt-in / lazy: absent file → returns None (nothing to propagate; the gate is
+    inactive on a box with no dashboard password). ``secrets_path`` is accepted
+    (and ignored) so the combined bridge can call every leg with one signature.
+    """
+    src = source_path or _internal_token_source()
+    out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
+    try:
+        token = src.read_text().strip()
+    except OSError:
+        logger.debug("No internal API token at %s — skipping propagation", src)
+        return None
+    if not token:
+        return None
+    out_path = _write_creds_atomic(out_dir, _INTERNAL_TOKEN_FILENAME, {_INTERNAL_TOKEN_KEY: token})
+    logger.debug("Internal API token propagated to %s", out_path)  # never logs the value
+    return out_path
+
+
+def load_internal_api_token(
+    state_dir: str = "~/.local/state/genesis-guardian",
+) -> str | None:
+    """Read the synced internal API token from the shared mount (host side).
+
+    Returns the token string, or ``None`` when absent/unreadable — the caller
+    then sends no bearer (correct when the dashboard ``/api`` gate is inactive).
+    """
+    creds_path = (
+        Path(state_dir).expanduser() / "shared" / _CREDS_SUBDIR / _INTERNAL_TOKEN_FILENAME
+    )
+    if not creds_path.exists():
+        return None
+    try:
+        return _read_dotenv(creds_path).get(_INTERNAL_TOKEN_KEY) or None
+    except OSError as exc:
+        logger.warning("Failed to read synced internal API token: %s", exc)
+        return None
+
+
 def propagate_guardian_credentials(
     shared_dir: Path | None = None,
     secrets_path: Path | None = None,
@@ -429,6 +497,7 @@ def propagate_guardian_credentials(
         propagate_provisioning_credentials,
         propagate_backup_passphrase,
         propagate_cc_oauth_token,
+        propagate_internal_api_token,
     ):
         try:
             path = fn(shared_dir=shared_dir, secrets_path=secrets_path)

@@ -24,11 +24,24 @@ async def enqueue(
     notify: bool = True,
     notify_on_failure_only: bool = False,
     caller_context: str | None = None,
+    origin_caller_context: str | None = None,
     roster_model: str | None = None,
     origin_session_id: str | None = None,
     delivery_mode: str | None = None,
+    system_prompt: str | None = None,
+    source_tag: str | None = None,
+    skills: list[str] | None = None,
+    tool_exceptions: list[str] | tuple[str, ...] | None = None,
+    planning_instruction: str | None = None,
 ) -> str:
-    """Insert a new queue item. Returns the queue_id."""
+    """Insert a new queue item. Returns the queue_id.
+
+    The optional execution-shape fields (system_prompt, source_tag, skills,
+    tool_exceptions, planning_instruction) exist so a rate-limit-parked
+    request round-trips VERBATIM — omitting them re-dispatches with defaults,
+    which silently changes behavior (a parked campaign once resumed without
+    its strategy doc).
+    """
     queue_id = f"dsq-{uuid.uuid4().hex[:12]}"
     payload = {
         "prompt": prompt,
@@ -39,9 +52,15 @@ async def enqueue(
         "notify": notify,
         "notify_on_failure_only": notify_on_failure_only,
         "caller_context": caller_context,
+        "origin_caller_context": origin_caller_context,
         "roster_model": roster_model,
         "origin_session_id": origin_session_id,
         "delivery_mode": delivery_mode,
+        "system_prompt": system_prompt,
+        "source_tag": source_tag,
+        "skills": list(skills) if skills is not None else None,
+        "tool_exceptions": (list(tool_exceptions) if tool_exceptions is not None else None),
+        "planning_instruction": planning_instruction,
     }
     await db.execute(
         """INSERT INTO direct_session_queue
@@ -110,7 +129,8 @@ async def mark_failed(
 async def get_by_id(db: aiosqlite.Connection, queue_id: str) -> dict | None:
     """Fetch a queue item by ID."""
     cursor = await db.execute(
-        "SELECT * FROM direct_session_queue WHERE id = ?", (queue_id,),
+        "SELECT * FROM direct_session_queue WHERE id = ?",
+        (queue_id,),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
@@ -142,3 +162,23 @@ async def count_pending(db: aiosqlite.Connection) -> int:
     )
     row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+async def has_open_for_origin(db: aiosqlite.Connection, origin_session_id: str) -> bool:
+    """True iff a not-yet-run queued session (pending/claimed) exists for this
+    origin — work that WILL deliver its outcome to the origin (delivery model)
+    but hasn't yet, so the foreground-liveness reaper (D3) must not also notify.
+
+    NOTE: 'dispatched' is deliberately EXCLUDED — a queue row is left in
+    'dispatched' permanently after its background session completes (there is no
+    terminal 'completed' status), so treating it as open would suppress the
+    dark-session notify FOREVER for any origin that ever dispatched work.
+    """
+    # origin_session_id is stored inside payload_json (not a column), so extract it.
+    cursor = await db.execute(
+        "SELECT 1 FROM direct_session_queue "
+        "WHERE json_extract(payload_json, '$.origin_session_id') = ? "
+        "AND status IN ('pending', 'claimed') LIMIT 1",
+        (origin_session_id,),
+    )
+    return await cursor.fetchone() is not None

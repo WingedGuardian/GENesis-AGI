@@ -10,6 +10,7 @@ import dataclasses
 import logging
 import os
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -51,11 +52,27 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
     for field_name, field_obj in EgoConfig.__dataclass_fields__.items():
         if field_name in raw:
             value = raw[field_name]
-            # Guard: YAML null → None for dict fields would crash .get()
-            # at runtime. Fall back to the field default instead.
-            if value is None and field_obj.default_factory is not dataclasses.MISSING:
+            # Guard: for factory (dict/list) fields, a YAML null OR a
+            # wrong-typed scalar would crash runtime .get()/.items(). Fall
+            # back to the field default instead of persisting a bad shape.
+            if field_obj.default_factory is not dataclasses.MISSING and not isinstance(
+                value, type(field_obj.default_factory())
+            ):
                 continue
             kwargs[field_name] = value
+    # revalidation_interval_hours and auto_table_ttl_hours are defaults-COMPLETE
+    # mappings: consumers .get(urgency) and fall back to normal only for
+    # MISSING keys, so a partial YAML override like {"high": 12} must merge
+    # OVER the declared defaults — wholesale replacement silently collapses
+    # omitted urgencies (critical 6→72, low 168→72). Other dict fields (e.g.
+    # dispatch_model_overrides) are empty-by-default override maps where
+    # wholesale assignment IS the semantics — do not blanket-merge those.
+    for _complete_field in ("revalidation_interval_hours", "auto_table_ttl_hours"):
+        if _complete_field in kwargs:
+            _defaults = EgoConfig.__dataclass_fields__[
+                _complete_field
+            ].default_factory()
+            kwargs[_complete_field] = {**_defaults, **kwargs[_complete_field]}
     return EgoConfig(**kwargs)
 
 
@@ -150,10 +167,46 @@ def validate_ego_config(changes: dict) -> list[str]:
             for action, model in v.items():
                 if model not in valid_models:
                     errors.append(f"dispatch_model_overrides[{action}]: model must be one of {valid_models}")
+    if "revalidation_interval_hours" in changes:
+        v = changes["revalidation_interval_hours"]
+        if not isinstance(v, dict):
+            errors.append("revalidation_interval_hours must be a dict")
+        else:
+            _valid_urg = {"critical", "high", "normal", "low"}
+            for _urg, _hours in v.items():
+                if _urg not in _valid_urg:
+                    errors.append(
+                        f"revalidation_interval_hours: unknown urgency {_urg!r} "
+                        f"(must be one of {sorted(_valid_urg)})"
+                    )
+                elif not isinstance(_hours, (int, float)) or isinstance(_hours, bool) or _hours <= 0:
+                    errors.append(
+                        f"revalidation_interval_hours[{_urg}] must be a positive number"
+                    )
+    if "auto_table_ttl_hours" in changes:
+        v = changes["auto_table_ttl_hours"]
+        if not isinstance(v, dict):
+            errors.append("auto_table_ttl_hours must be a dict")
+        else:
+            _valid_urg = {"critical", "high", "normal", "low"}
+            for _urg, _hours in v.items():
+                if _urg not in _valid_urg:
+                    errors.append(
+                        f"auto_table_ttl_hours: unknown urgency {_urg!r} "
+                        f"(must be one of {sorted(_valid_urg)})"
+                    )
+                elif not isinstance(_hours, (int, float)) or isinstance(_hours, bool) or _hours <= 0:
+                    errors.append(
+                        f"auto_table_ttl_hours[{_urg}] must be a positive number"
+                    )
     if "calibration_injection_enabled" in changes and not isinstance(
         changes["calibration_injection_enabled"], bool
     ):
         errors.append("calibration_injection_enabled must be a boolean")
+    if "genesis_self_development_enabled" in changes and not isinstance(
+        changes["genesis_self_development_enabled"], bool
+    ):
+        errors.append("genesis_self_development_enabled must be a boolean")
     if "outcome_bus_capability_feed" in changes and not isinstance(
         changes["outcome_bus_capability_feed"], bool
     ):
@@ -176,4 +229,45 @@ def validate_ego_config(changes: dict) -> list[str]:
         "suppress",
     ):
         errors.append("quiet_hours_mode must be 'floor' or 'suppress'")
+    # Capability-improvement scanner: invalid values must degrade toward LESS
+    # write authority, so reject the whole change rather than silently uncap.
+    # A negative LIMIT is "no limit" in SQLite and a negative min-sample defeats
+    # the fluke guard — both would widen advisory output, which is exactly what
+    # validation must prevent.
+    if "capability_improvement_enabled" in changes and not isinstance(
+        changes["capability_improvement_enabled"], bool
+    ):
+        errors.append("capability_improvement_enabled must be a boolean")
+    if "capability_weakness_threshold" in changes:
+        v = changes["capability_weakness_threshold"]
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0.0 <= v <= 1.0):
+            errors.append("capability_weakness_threshold must be a number in [0.0, 1.0]")
+    if "capability_improvement_min_sample_size" in changes:
+        # Scoped to the capability-improvement SCANNER (get_weakest). The
+        # rendered self-model uses the constant floor in db/crud/capability_map
+        # (MIN_SAMPLE_SIZE), so setting this below that value lets the scanner
+        # target a domain the rendered table omits. That domain still reaches
+        # the ego via the focused-deficiency line, which reads get_by_domain and
+        # is deliberately unfiltered.
+        v = changes["capability_improvement_min_sample_size"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errors.append("capability_improvement_min_sample_size must be integer >= 1")
+    if "capability_improvement_max_signals" in changes:
+        v = changes["capability_improvement_max_signals"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errors.append("capability_improvement_max_signals must be integer >= 1")
     return errors
+
+
+def next_revalidate_at(urgency: str, *, from_dt: datetime | None = None) -> str:
+    """Next premise-recheck timestamp for a proposal of *urgency*.
+
+    One home for the revalidation-cadence math: ``create_batch`` uses it for
+    the initial stamp and the reconcile live-apply uses it to advance the
+    clock on reaffirm/revise (a just-revalidated item must not stay ⚠due).
+    Config-derived; degrades to the EgoConfig defaults.
+    """
+    intervals = load_ego_config().revalidation_interval_hours
+    hours = intervals.get(urgency, intervals.get("normal", 72))
+    base = from_dt if from_dt is not None else datetime.now(UTC)
+    return (base + timedelta(hours=hours)).isoformat()

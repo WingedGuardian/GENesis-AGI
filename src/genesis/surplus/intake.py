@@ -12,12 +12,13 @@ Three-step pipeline:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -131,6 +132,8 @@ class IntakeStats:
     routed_knowledge: int = 0
     routed_observation: int = 0
     routed_discard: int = 0
+    routed_staging: int = 0
+    staged_ids: list[str] = field(default_factory=list)
     scoring_skipped: bool = False
     scoring_model: str = ""
     errors: list[str] = field(default_factory=list)
@@ -512,6 +515,7 @@ async def run_intake(
     source: IntakeSource,
     source_task_type: str = "",
     generating_model: str = "",
+    drive_alignment: str = "",
     *,
     db: aiosqlite.Connection,
     store: MemoryStore | None = None,
@@ -569,6 +573,58 @@ async def run_intake(
             for f in findings
         ]
         stats.scoring_skipped = True
+
+    # Step 3a: Ephemeral first-party ideation is kept OUT of the immortal
+    # knowledge_units KB (PR-1). WS-M PR-2 splits it by semantics, keyed on the
+    # TRUE task type (source_task_type), preserved distinct from the collapsed
+    # IntakeSource:
+    #   • IDEAS (brainstorm) → surplus_insights staging (later promoted into the
+    #     follow_ups 'idea' review lane).
+    #   • SELF-OBSERVATIONS (audits / gap-cluster / unblock / prompt-review) →
+    #     the observation lane (TTL + resolve + dashboard/morning-report
+    #     surfacing), at priority="low" so they never crowd the capped daily
+    #     digest while staying browsable in the observations panel.
+    from genesis.surplus.types import is_ephemeral_ideation, is_idea_ideation
+
+    if is_ephemeral_ideation(source_task_type):
+        route_ideas = is_idea_ideation(source_task_type)
+        drive = _valid_drive(drive_alignment)
+        routed = 0
+        for scored in scored_findings:
+            try:
+                if route_ideas:
+                    sid = await _route_to_staging(
+                        scored, db=db, drive_alignment=drive
+                    )
+                    stats.staged_ids.append(sid)
+                    stats.routed_staging += 1
+                else:
+                    await _route_to_observation(
+                        scored, db=db, priority="low", skip_if_duplicate=True
+                    )
+                    stats.routed_observation += 1
+                routed += 1
+            except Exception as exc:
+                logger.error(
+                    "Intake ideation routing failed for finding '%s': %s",
+                    scored.finding.title[:50], exc, exc_info=True,
+                )
+                stats.errors.append(f"{scored.finding.title[:50]}: {exc}")
+        logger.info(
+            "Intake(ideation): source=%s task=%s dest=%s findings=%d "
+            "routed=%d errors=%d",
+            stats.source, source_task_type,
+            "staging" if route_ideas else "observation",
+            stats.findings_count, routed, len(stats.errors),
+        )
+        # If EVERY write failed, raise so the caller falls back (dispatch
+        # re-stages into surplus_insights via its own path).
+        if stats.findings_count > 0 and routed == 0 and stats.errors:
+            raise RuntimeError(
+                f"Intake ideation routing failed for all "
+                f"{stats.findings_count} findings: {stats.errors[0]}"
+            )
+        return stats
 
     # Step 3: Route each finding.
     for scored in scored_findings:
@@ -682,16 +738,22 @@ async def _route_to_observation(
     scored: ScoredFinding,
     *,
     db: aiosqlite.Connection,
+    priority: str = "medium",
+    skip_if_duplicate: bool = False,
 ) -> None:
-    """Create an observation for pattern-level insights."""
+    """Create an observation for pattern-level insights.
+
+    ``skip_if_duplicate`` (used by the self-observation ideation path) keys on
+    source + content_hash so a re-emitted identical finding is idempotent —
+    matching the content-hash-id upsert idempotency of the staging path. The
+    legacy pattern-insight caller keeps the default (priority="medium", no
+    dedup) so its behaviour is unchanged.
+    """
     from genesis.db.crud import observations
 
     obs_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    content = (
-        f"{scored.finding.title}\n\n"
-        f"{scored.finding.content}"
-    )
+    content = f"{scored.finding.title}\n\n{scored.finding.content}"
     if scored.finding.relevance:
         content += f"\n\nRelevance: {scored.finding.relevance}"
 
@@ -701,9 +763,59 @@ async def _route_to_observation(
         source=f"intake:{scored.source.value}",
         type=scored.source_task_type or "intelligence_finding",
         content=content[:2000],
-        priority="medium",
+        priority=priority,
         created_at=now,
+        skip_if_duplicate=skip_if_duplicate,
     )
+
+
+_VALID_DRIVES = frozenset({"curiosity", "competence", "cooperation", "preservation"})
+
+
+def _valid_drive(drive_alignment: str) -> str:
+    """Coerce to a valid surplus_insights.drive_alignment (CHECK-constrained).
+
+    Empty/unknown → 'competence' (the default first-party drive) so the staging
+    INSERT never violates the drive_alignment CHECK constraint.
+    """
+    return drive_alignment if drive_alignment in _VALID_DRIVES else "competence"
+
+
+async def _route_to_staging(
+    scored: ScoredFinding,
+    *,
+    db: aiosqlite.Connection,
+    drive_alignment: str,
+) -> str:
+    """Stage an ephemeral-ideation finding in surplus_insights (pending, 7d TTL).
+
+    The ideas-review lifecycle: the row decays via purge_expired if never
+    promoted, instead of being immortalized as a knowledge_unit. The id is
+    content-hashed so a re-generated identical finding upserts in place (no dup
+    rows). NOTE: the upsert refreshes content/ttl/confidence but does NOT reset
+    promotion_status — an identical finding that already decayed to 'discarded'
+    stays discarded (not re-surfaced to pending). Whether recurring ideas should
+    re-surface is a PR-2 (ideas-review lane) policy decision, tracked separately.
+    """
+    from genesis.db.crud import surplus as surplus_crud
+
+    content = kb_content_for_finding(scored.finding)
+    task_type = scored.source_task_type or "ideation"
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    sid = f"{task_type}-{digest}"
+    now = datetime.now(UTC)
+    await surplus_crud.upsert(
+        db,
+        id=sid,
+        content=content,
+        source_task_type=task_type,
+        generating_model=scored.generating_model or "unknown",
+        drive_alignment=drive_alignment,
+        confidence=scored.confidence,
+        created_at=now.isoformat(),
+        ttl=(now + timedelta(days=7)).isoformat(),
+    )
+    return sid
 
 
 def _domain_for_source(source: IntakeSource, task_type: str) -> str:

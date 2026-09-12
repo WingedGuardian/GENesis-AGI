@@ -63,7 +63,7 @@ def _wire_build_lane(rt: GenesisRuntime, dispatcher: object) -> None:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                rt.record_job_failure("build_lane_poll", str(exc))
+                rt.record_job_failure("build_lane_poll", exc=exc)
                 logger.error("Build-lane polling failed", exc_info=True)
 
     rt._build_lane_poll = tracked_task(
@@ -194,7 +194,7 @@ async def init(rt: GenesisRuntime) -> None:
                             logger.info("Reaped %d stale dispatching claims", reaped)
                         rt.record_job_success("task_dispatch_reaper")
                     except Exception as exc:
-                        rt.record_job_failure("task_dispatch_reaper", str(exc))
+                        rt.record_job_failure("task_dispatch_reaper", exc=exc)
                         logger.error("Dispatch reaper failed", exc_info=True)
                     count = await dispatcher.dispatch_cycle()
                     if count:
@@ -203,7 +203,7 @@ async def init(rt: GenesisRuntime) -> None:
                 except asyncio.CancelledError:
                     break
                 except Exception as exc:
-                    rt.record_job_failure("task_dispatch_poll", str(exc))
+                    rt.record_job_failure("task_dispatch_poll", exc=exc)
                     logger.error("Task dispatch polling failed", exc_info=True)
 
         rt._task_dispatch_poll = tracked_task(

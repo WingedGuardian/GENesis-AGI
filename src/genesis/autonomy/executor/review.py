@@ -16,11 +16,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
     from genesis.cc import AgentProvider
@@ -37,6 +41,64 @@ _CALL_SITE_PLAN = "27_pre_execution_assessment"
 _CALL_SITE_EXECUTOR_REVIEW = "17_executor_review"
 _CALL_SITE_ADVERSARIAL = "20_adversarial_counterargument"
 _MAX_RETRIES = 2
+
+# Hard timeout (seconds) for the ``codex exec`` adversarial-verify subprocess.
+# _verify_via_codex runs under the autonomy executor semaphore (engine.py calls
+# verify_deliverable while dispatcher.py holds _exec_semaphore — a Semaphore(1)),
+# so a hung codex — e.g. the known upstream model-catalog refresh hang — would
+# block ALL autonomy task execution indefinitely, with no external watchdog to
+# recover it. This bounds that: on timeout the codex process *tree* is killed and
+# this link degrades to None (same as codex-not-installed), so verification falls
+# through to the CC-invoker / API links. The 2h default matches deterministic.py's
+# _HARD_TIMEOUT_S (the justified-exception case in the timeout policy — a raw
+# subprocess holding the executor semaphore). NOTE the *kill* deliberately differs
+# from deterministic.py's direct ``proc.kill()``: codex is a Node launcher that
+# spawns children, so we tree-kill via killpg (see _kill_codex_process_tree).
+# Override via GENESIS_CODEX_REVIEW_TIMEOUT_S for quicker recovery once codex
+# reviews are observed to complete well under it.
+_DEFAULT_CODEX_EXEC_TIMEOUT_S = 7200.0
+
+
+def _read_codex_timeout_s() -> float:
+    """Resolve the codex-exec timeout from env, failing safe to the 2h default.
+
+    Parsed at import time, so a malformed or non-positive override must NOT
+    raise (that would crash the import of the autonomy executor that imports
+    this module) — fall back to the default with a warning instead.
+    """
+    raw = os.environ.get("GENESIS_CODEX_REVIEW_TIMEOUT_S")
+    if raw is None:
+        return _DEFAULT_CODEX_EXEC_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "review: bad GENESIS_CODEX_REVIEW_TIMEOUT_S=%r -- using %ss",
+            raw, _DEFAULT_CODEX_EXEC_TIMEOUT_S,
+        )
+        return _DEFAULT_CODEX_EXEC_TIMEOUT_S
+    # Reject inf/nan too: inf would silently remove the hard bound (back to an
+    # unbounded hang), and nan corrupts asyncio's wait_for timer scheduling.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "review: non-finite/non-positive GENESIS_CODEX_REVIEW_TIMEOUT_S=%r "
+            "-- using %ss",
+            raw, _DEFAULT_CODEX_EXEC_TIMEOUT_S,
+        )
+        return _DEFAULT_CODEX_EXEC_TIMEOUT_S
+    return value
+
+
+_CODEX_EXEC_TIMEOUT_S = _read_codex_timeout_s()
+
+# Bound on the post-kill reap. After SIGKILL the process exits ~immediately, so
+# ``proc.wait()`` returns promptly — but the recovery path must not itself be
+# unbounded (a paused pipe transport with buffered data at cancel time is the
+# theoretical edge), or the timeout could re-create the executor wedge it exists
+# to prevent. The tree-kill + bounded-reap machinery itself lives in
+# genesis.util.proc_kill (extracted from this module after PR #1409 — the
+# pid-as-pgid rationale, the pgid<=1 guard, and the leader-reaped race are
+# documented there, and every launcher spawn site now shares one hardened copy).
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +467,14 @@ class TaskReviewer:
             # failed: Permission denied).  --full-auto also fails.
             # Verification is read-only in intent; the bypass only
             # affects the sandbox layer, not the prompt instructions.
+            # start_new_session=True puts codex in its own session/process group
+            # so a timeout can kill the whole tree via killpg (see
+            # _kill_codex_process_tree) without touching the server's group. We
+            # use start_new_session rather than preexec_fn=os.setpgrp because the
+            # C subprocess helper performs the setsid() async-signal-safely inside
+            # the child, avoiding the post-fork preexec_fn deadlock risk in this
+            # multi-threaded server (a deadlock there would hang before our
+            # wait_for timeout is even armed).
             proc = await asyncio.create_subprocess_exec(
                 "codex", "exec", "-",
                 "-c", 'model_reasoning_effort="medium"',
@@ -414,14 +484,48 @@ class TaskReviewer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-            )
-            stdout_bytes, stderr_bytes = await proc.communicate(
-                input=prompt.encode("utf-8"),
+                start_new_session=True,
             )
         except FileNotFoundError:
             return None
         except OSError:
-            logger.warning("review: codex exec OS error", exc_info=True)
+            # Spawn failure (incl. ETIMEDOUT, which Python raises as TimeoutError
+            # -- an OSError subclass -- from a failing execve/chdir). proc is
+            # unbound here, so this must NOT reach the timeout-kill path below;
+            # degrade to the next reviewer just like the pre-timeout code did.
+            logger.warning("review: codex exec spawn error", exc_info=True)
+            return None
+
+        # Separate try so the timeout-kill path only runs for a communicate()
+        # timeout (proc is guaranteed bound), never a spawn-time TimeoutError.
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode("utf-8")),
+                timeout=_CODEX_EXEC_TIMEOUT_S,
+            )
+        except TimeoutError:
+            # Known upstream codex hang (model-catalog refresh). Kill the tree
+            # and degrade — leaving it would wedge the executor semaphore.
+            logger.warning(
+                "review: codex exec exceeded %ss -- killing process tree and "
+                "skipping codex link",
+                _CODEX_EXEC_TIMEOUT_S,
+            )
+            kill_process_group(proc)
+            # Bounded reap: the process is SIGKILLed so this returns promptly;
+            # the bound guarantees the recovery path can't itself re-wedge on a
+            # paused pipe transport.
+            await reap_bounded(proc)
+            return None
+        except asyncio.CancelledError:
+            # Cancellation mid-verify: the detached codex tree sees no ambient
+            # signal — group-kill before propagating (final-audit F2; the
+            # eighth async site of the cancel sweep).
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
+        except OSError:
+            logger.warning("review: codex exec communicate error", exc_info=True)
             return None
 
         if proc.returncode != 0:

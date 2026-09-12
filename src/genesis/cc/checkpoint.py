@@ -38,6 +38,11 @@ class CheckpointManager:
             prompt=response_text, resume_session_id=session_id,
             skip_permissions=True,
             working_dir=background_session_dir(),
+            # This resumes a checkpointed owner-attended conversation (QUESTION/
+            # DECISION/ERROR the user answered). Opt OUT of secure-by-default
+            # strict MCP scoping so the resumed session keeps the same full
+            # toolset it had originally — the flip must not silently strip it.
+            strict_mcp_config=False,
         )
         output = await self._invoker.run(invocation)
         if output.is_error:

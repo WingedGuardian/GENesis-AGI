@@ -240,8 +240,13 @@ async def update_surplus_config():
 
     # Merge into local overlay — NEVER write to the base config
     local = _load_yaml_local("surplus.yaml")
-    _deep_merge(local, data)
-    _atomic_yaml_write(_local_filename("surplus.yaml"), local)
+    # _deep_merge is PURE — discarding its return wrote the UNMERGED overlay
+    # back for months (pre-existing bug surfaced by the 2026-08-18 review).
+    local = _deep_merge(local, data)
+    _atomic_yaml_write(
+        _local_filename("surplus.yaml"), local,
+        provenance="user via dashboard surplus PUT",
+    )
 
     merged = _load_yaml_merged("surplus.yaml")
     return jsonify({"ok": True, "config": merged})

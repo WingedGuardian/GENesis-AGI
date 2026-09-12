@@ -68,6 +68,7 @@ from genesis.mcp.health import calibration_status as _calibration_status  # noqa
 from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, F401
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import cognitive_ledger_tools as _cognitive_ledger_tools  # noqa: E402, F401
+from genesis.mcp.health import contributor_issue as _contributor_issue  # noqa: E402, F401
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import deliberation_tools as _deliberation_tools  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
@@ -84,6 +85,7 @@ from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402
+from genesis.mcp.health import reflex_resolve as _reflex_resolve  # noqa: E402, F401
 from genesis.mcp.health import reflex_status as _reflex_status  # noqa: E402, F401
 from genesis.mcp.health import session_charter_tools as _session_charter_tools  # noqa: E402
 from genesis.mcp.health import session_control as _session_control  # noqa: E402
@@ -144,6 +146,7 @@ _impl_follow_up_create = _follow_up_tools._impl_follow_up_create
 _impl_follow_up_list = _follow_up_tools._impl_follow_up_list
 _impl_inbox_digest = _inbox_digest._impl_inbox_digest
 _impl_ego_focus_reset = _ego_tools._impl_ego_focus_reset
+_impl_reflex_signal_resolve = _reflex_resolve._impl_reflex_signal_resolve
 
 # direct_session_tools wired here
 direct_session_tools = _direct_session_tools
@@ -214,6 +217,8 @@ __all__ = [
     "_impl_inbox_digest",
     "_ego_tools",
     "_impl_ego_focus_reset",
+    "_reflex_resolve",
+    "_impl_reflex_signal_resolve",
     "direct_session_tools",
     "_impl_direct_session_run",
     "_impl_direct_session_status",

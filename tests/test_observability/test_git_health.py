@@ -172,6 +172,37 @@ class TestDeepCheck:
         assert rep.ok is False
         assert "fsck_failed" in rep.failures
 
+    @pytest.mark.asyncio
+    async def test_invalid_reflog_entry_not_flagged(self, repo):
+        # Routine branch/worktree churn + gc can leave a branch reflog
+        # referencing a pruned commit; `git fsck --full` then prints "invalid
+        # reflog entry" and exits non-zero. That is NOT object corruption and is
+        # irrelevant to this check's object-integrity purpose (and to REVERT_CODE,
+        # which the guardian gates on a live cheap probe, not this verdict), so
+        # the deep scan runs with --no-reflogs and MUST NOT flag it. Root cause of
+        # the recurring false "objects corrupt" CRITICAL (verified 2026-08-25).
+        self._commit_file(repo)
+        subprocess.run(["git", "-C", str(repo), "branch", "feat"], check=True)
+        reflog = repo / ".git" / "logs" / "refs" / "heads" / "feat"
+        reflog.parent.mkdir(parents=True, exist_ok=True)
+        reflog.write_text(
+            "0000000000000000000000000000000000000000 "
+            "deadbeef00000000000000000000000000000000 t <t@t> 1600000000 +0000\tbogus\n"
+        )
+        # Lock WHY this test is meaningful: a reflog-CHECKING fsck DOES fail on this
+        # same repo, so the test goes red if --no-reflogs is ever dropped.
+        with_reflogs = subprocess.run(
+            ["git", "-C", str(repo), "fsck", "--no-progress", "--full"],
+            capture_output=True,
+            text=True,
+        )
+        assert with_reflogs.returncode != 0 and "invalid reflog entry" in with_reflogs.stderr, (
+            "precondition: the injected entry must make a reflog-checking fsck fail"
+        )
+        rep = await g.check_git_deep(repo)
+        assert rep.ok is True, f"reflog noise must not be flagged; failures={rep.failures}"
+        assert "fsck_failed" not in rep.failures
+
 
 class TestMountReadonly:
     def test_ro_and_rw_detection(self):

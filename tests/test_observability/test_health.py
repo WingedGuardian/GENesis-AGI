@@ -81,6 +81,46 @@ class TestProbeOllama:
         assert result.status == ProbeStatus.DOWN
 
 
+class TestProbeTimeoutFlag:
+    """A timeout-caused DOWN is tagged timed_out=True; a hard error is not.
+
+    critical_failure uses this to distinguish a loop-starvation artifact (probe
+    timed out because the event loop couldn't schedule it) from a real outage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_qdrant_timeout_sets_flag(self, aiohttp_mock):
+        # aiohttp's total ClientTimeout raises asyncio.TimeoutError (== builtin
+        # TimeoutError on 3.11+).
+        aiohttp_mock.get("http://localhost:6333/healthz", exception=TimeoutError())
+        result = await probe_qdrant(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_qdrant_hard_error_not_flagged(self, aiohttp_mock):
+        # Connection refused / unreachable surfaces as OSError (not a TimeoutError).
+        aiohttp_mock.get("http://localhost:6333/healthz", exception=OSError("refused"))
+        result = await probe_qdrant(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.timed_out is False
+
+    @pytest.mark.asyncio
+    async def test_ollama_timeout_sets_flag(self, aiohttp_mock):
+        url = "http://localhost:11434/api/tags"
+        aiohttp_mock.get(url, exception=TimeoutError())
+        result = await probe_ollama(url=url, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_probe_result_defaults_not_timed_out(self):
+        # Default is False so probe_db (no timeout) and healthy probes never
+        # accidentally read as timeout-caused.
+        r = ProbeResult(name="x", status=ProbeStatus.HEALTHY, latency_ms=0.0)
+        assert r.timed_out is False
+
+
 class TestProbeScheduler:
     @pytest.mark.asyncio
     async def test_running(self):
@@ -464,3 +504,165 @@ class TestProbeSchedulerHeartbeats:
         assert result.status == ProbeStatus.HEALTHY
         assert "no live runtime" in result.message
         inst.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_exception_emits_warning_but_stays_healthy(self):
+        """A genuine probe-eval error is SURFACED as a WARNING event (which lands
+        on the Errors tab via the event bus) but the ProbeResult stays HEALTHY:
+        remediation treats any non-HEALTHY status identically to DOWN and would
+        fire an hourly outreach storm on a 'can't evaluate' branch. Honest signal,
+        zero new pager noise."""
+        from genesis.observability.types import Severity, Subsystem
+
+        class _RaisingJH:
+            def get(self, *a, **k):
+                raise RuntimeError("job_health corrupt")
+
+        bus = MagicMock()
+        bus.emit = AsyncMock()
+        stub_rt = MagicMock()
+        stub_rt.event_bus = bus
+        with patch("genesis.runtime.GenesisRuntime.peek", return_value=stub_rt):
+            result = await probe_scheduler_heartbeats(_RaisingJH(), clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+        assert bus.emit.await_count == 1
+        # emit(subsystem, severity, event_type, message, **details) — positional
+        # or kw, so check the whole passed-value set.
+        args, kwargs = bus.emit.call_args
+        passed = {*args, *kwargs.values()}
+        assert Severity.WARNING in passed
+        assert Subsystem.HEALTH in passed
+
+
+class TestFalkordbProbeIsOptionalShaped:
+    """The graph-engine probe is the FIRST probe that can answer `None`.
+
+    `probe_ambient_health` can too, but it is only consumed by
+    `snapshots/infrastructure.py`, which checks. This one goes into
+    `collect_probe_results`, which declares `dict[str, ProbeResult]` — so the
+    None has to be dropped there or that annotation becomes a lie for every
+    install that has not armed the engine yet.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unarmed_engine_is_not_applicable_rather_than_down(self, tmp_path):
+        """No socket -> None. Not-yet-armed is the expected state during cutover,
+        and reporting DOWN would put every such install permanently unhealthy."""
+        from genesis.observability.health import probe_falkordb
+
+        result = await probe_falkordb(socket_path=str(tmp_path / "absent.sock"))
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_an_absent_socket_is_DOWN_once_the_lever_selects_falkordb(self, tmp_path):
+        """The same absence means something different once the mode moves.
+
+        Before the cutover an absent socket is a not-yet-provisioned install.
+        AFTER the lever selects falkordb it is the live backend gone — every
+        traversal falling back and logging, while this probe and the
+        infrastructure snapshot omitted the engine entirely. Health that goes
+        quiet exactly when the thing it watches breaks is worse than no probe.
+        """
+        from genesis.observability.health import probe_falkordb
+        from genesis.observability.types import ProbeStatus
+
+        absent = str(tmp_path / "absent.sock")
+
+        with patch(
+            "genesis.memory.graphstore_config.effective_mode", return_value="falkordb"
+        ):
+            result = await probe_falkordb(socket_path=absent)
+        assert result is not None, "a selected-but-missing engine must not read as n/a"
+        assert result.status is ProbeStatus.DOWN
+        assert "falkordb" in result.message and absent in result.message
+
+        # CONTROL: the default lever must still answer not-applicable, or this
+        # would pin every unprovisioned install permanently unhealthy.
+        with patch(
+            "genesis.memory.graphstore_config.effective_mode", return_value="networkx"
+        ):
+            assert await probe_falkordb(socket_path=absent) is None
+
+    @pytest.mark.asyncio
+    async def test_collect_probe_results_drops_a_none_instead_of_recording_it(self):
+        """`_safe` must DROP a None, which its call-site comment used to claim
+        while the code recorded it unconditionally.
+
+        MEASURED before the fix: `'falkordb' in results` was True with a value of
+        None, so a function annotated `dict[str, ProbeResult]` returned a dict
+        holding None. The one live consumer survives it by luck (`.get()` then
+        `is None`), which is exactly why this needs a test rather than a reader's
+        good intentions.
+        """
+        from genesis.observability import health as health_mod
+
+        ok = ProbeResult(
+            name="qdrant",
+            status=ProbeStatus.HEALTHY,
+            latency_ms=1,
+            message="",
+            checked_at=datetime.now(UTC).isoformat(),
+        )
+
+        async def _none():
+            return None
+
+        async def _ok():
+            return ok
+
+        with (
+            patch.object(health_mod, "probe_falkordb", _none),
+            patch.object(health_mod, "probe_qdrant", _ok),
+            patch.object(health_mod, "probe_disk", _ok),
+            patch.object(health_mod, "probe_guardian", lambda **kw: _ok()),
+            patch.object(health_mod, "probe_browser_processes", _ok),
+            patch.object(health_mod, "probe_scheduler_heartbeats", _ok),
+            # Imported INSIDE collect_probe_results, so it lives on genesis.env.
+            patch("genesis.env.ollama_enabled", lambda: False),
+        ):
+            results = await health_mod.collect_probe_results()
+
+        assert "falkordb" not in results, (
+            "an optional probe answering None must not become a dict entry"
+        )
+        assert all(v is not None for v in results.values()), (
+            "collect_probe_results is annotated dict[str, ProbeResult]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_armed_engine_that_will_not_answer_is_down_not_absent(self, tmp_path):
+        """Socket present but unreachable is a FAULT; socket absent is not.
+
+        Collapsing the two takes the health surface quiet on exactly the failure
+        it exists to report — the same silent-absence-vs-silent-failure confusion
+        that produced the traversal blocker, one layer up. Without this test the
+        DOWN branch can be mutated to `return None` and everything stays green.
+        """
+        from genesis.observability.health import probe_falkordb
+
+        fake_sock = tmp_path / "falkordb.sock"
+        fake_sock.write_text("")  # exists, but nothing is listening
+
+        result = await probe_falkordb(socket_path=str(fake_sock), timeout_s=1)
+
+        assert result is not None, "an armed-but-unreachable engine must not read as absent"
+        assert result.status is ProbeStatus.DOWN
+        assert result.message
+
+    def test_a_redis_socket_timeout_is_recognised_as_a_timeout(self):
+        """`redis.exceptions.TimeoutError` does NOT subclass the builtin.
+
+        MEASURED: its MRO is (TimeoutError, RedisError, Exception, BaseException)
+        — same name, unrelated type — so the obvious `isinstance(exc, TimeoutError)`
+        reports False for the most likely timeout on this path.
+        """
+        from genesis.observability.health import _is_timeout
+
+        assert _is_timeout(TimeoutError("builtin"))
+        assert not _is_timeout(ValueError("unrelated"))
+
+        redis_exc = pytest.importorskip("redis.exceptions")
+        assert not issubclass(redis_exc.TimeoutError, TimeoutError), (
+            "if redis ever makes this a builtin subclass, this guard is redundant"
+        )
+        assert _is_timeout(redis_exc.TimeoutError("socket timeout"))

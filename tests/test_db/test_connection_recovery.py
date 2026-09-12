@@ -1,11 +1,32 @@
-"""Tests for SerializedConnection lock error tracking and recovery (A3)."""
+"""Tests for SerializedConnection lock error tracking and recovery (A3).
+
+WS-1 PR-1 semantics: every SQL call retries lock errors in-place (bounded,
+jittered) before surfacing them, so the consecutive-error counter counts
+exhausted retry EPISODES — one per failed call — not raw underlying attempts.
+Reconnect-after-N still works, at episode granularity.
+"""
 
 import sqlite3
 
 import aiosqlite
 import pytest
 
-from genesis.db.connection import SerializedConnection
+from genesis.db import connection as connection_mod
+from genesis.db.connection import _WRITE_RETRY_DELAYS, SerializedConnection
+
+# One episode = the initial attempt + one retry per configured delay.
+ATTEMPTS_PER_EPISODE = len(_WRITE_RETRY_DELAYS) + 1
+
+
+@pytest.fixture(autouse=True)
+def instant_retry_sleep(monkeypatch):
+    """Make retry backoff instant — these tests assert counting/reconnect
+    semantics, not the schedule (test_write_retry.py covers delays/jitter)."""
+
+    async def _instant(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(connection_mod, "_async_sleep", _instant)
 
 
 @pytest.fixture
@@ -27,6 +48,7 @@ async def recovery_conn(tmp_path):
     sc = SerializedConnection(conn, reconnect_fn=_reconnect)
     yield sc
     import contextlib
+
     with contextlib.suppress(Exception):
         await sc.close()
 
@@ -38,55 +60,68 @@ async def test_error_counter_resets_on_success(recovery_conn):
     assert recovery_conn._consecutive_errors == 0
 
 
-async def test_error_counter_increments_on_lock(recovery_conn):
-    """Lock errors increment the counter and re-raise."""
-    # Patch the underlying execute to simulate lock error
+async def test_transient_lock_recovers_within_episode(recovery_conn):
+    """A lock that clears within the retry budget never surfaces to the caller
+    and leaves the counter at 0 — the convoy-loss case PR-1 exists for."""
     original = recovery_conn._conn.execute
 
     call_count = 0
 
-    async def fake_execute(sql, params=None):
+    async def flaky_execute(sql, params=None):
         nonlocal call_count
         call_count += 1
         if call_count <= 2:
             raise sqlite3.OperationalError("database is locked")
         return await original(sql, params)
 
-    recovery_conn._conn.execute = fake_execute
+    recovery_conn._conn.execute = flaky_execute
 
-    with pytest.raises(sqlite3.OperationalError, match="locked"):
-        await recovery_conn.execute("SELECT 1")
-
-    assert recovery_conn._consecutive_errors == 1
-
-    with pytest.raises(sqlite3.OperationalError, match="locked"):
-        await recovery_conn.execute("SELECT 1")
-
-    assert recovery_conn._consecutive_errors == 2
+    cur = await recovery_conn.execute("SELECT 1")
+    assert await cur.fetchone() is not None
+    assert call_count == 3  # 2 failures + the succeeding retry
+    assert recovery_conn._consecutive_errors == 0
 
 
-async def test_reconnect_after_threshold(recovery_conn):
-    """After _MAX_LOCK_ERRORS consecutive failures, reconnection is attempted."""
-    recovery_conn._max_errors = 3  # Lower threshold for testing
-    original_conn = recovery_conn._conn
-
-    fail_count = 0
+async def test_exhausted_episode_counts_once_and_reraises(recovery_conn):
+    """A lock that outlives every retry re-raises and counts ONE episode —
+    the counter tracks episodes now, not raw attempts."""
+    attempts = 0
 
     async def always_fail(sql, params=None):
-        nonlocal fail_count
-        fail_count += 1
+        nonlocal attempts
+        attempts += 1
         raise sqlite3.OperationalError("database is locked")
 
     recovery_conn._conn.execute = always_fail
 
-    # First 2 failures — just increment counter
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await recovery_conn.execute("SELECT 1")
+    assert attempts == ATTEMPTS_PER_EPISODE
+    assert recovery_conn._consecutive_errors == 1
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await recovery_conn.execute("SELECT 1")
+    assert recovery_conn._consecutive_errors == 2
+
+
+async def test_reconnect_after_threshold(recovery_conn):
+    """After _max_errors consecutive exhausted EPISODES, reconnection fires."""
+    recovery_conn._max_errors = 3  # Lower threshold for testing
+    original_conn = recovery_conn._conn
+
+    async def always_fail(sql, params=None):
+        raise sqlite3.OperationalError("database is locked")
+
+    recovery_conn._conn.execute = always_fail
+
+    # First 2 exhausted episodes — just increment counter
     for _ in range(2):
         with pytest.raises(sqlite3.OperationalError):
             await recovery_conn.execute("SELECT 1")
 
     assert recovery_conn._consecutive_errors == 2
 
-    # 3rd failure — triggers reconnect
+    # 3rd episode — triggers reconnect
     with pytest.raises(sqlite3.OperationalError):
         await recovery_conn.execute("SELECT 1")
 
@@ -96,10 +131,9 @@ async def test_reconnect_after_threshold(recovery_conn):
 
 
 async def test_no_reconnect_without_fn():
-    """Without reconnect_fn, lock errors just increment and re-raise."""
+    """Without reconnect_fn, exhausted episodes just increment and re-raise."""
     conn = await aiosqlite.connect(":memory:")
     sc = SerializedConnection(conn)  # No reconnect_fn
-
 
     async def fake_fail(sql, params=None):
         raise sqlite3.OperationalError("database is locked")
@@ -110,6 +144,6 @@ async def test_no_reconnect_without_fn():
         with pytest.raises(sqlite3.OperationalError):
             await sc.execute("SELECT 1")
 
-    # Counter goes up but no crash
+    # Counter goes up (one per episode) but no crash
     assert sc._consecutive_errors == 10
     await sc.close()

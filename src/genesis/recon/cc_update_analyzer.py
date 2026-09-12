@@ -1,8 +1,16 @@
 """CC Update Analyzer — fetch changelog, classify impact, alert if needed.
 
-Triggered when CCVersionCollector detects a version change. Two paths:
-1. Deep reflection context includes version_change observation, calls recon MCP tool
-2. Recon MCP tool `recon_cc_update_check` triggers directly
+Entry points (all on-demand or scheduled — NEVER a hot signal tick):
+1. Recon MCP tool ``recon_cc_update_check(old, new)`` — the on-demand path;
+   analyses a range and ALERTS on action_needed/breaking.
+2. The daily CC pre-eval job — composes this analyzer's fetch + LLM classify to
+   cache a per-version verdict BEFORE a version is adopted (no alert).
+3. Deep-reflection context surfaces the ``version_change`` observation and can
+   call the recon MCP tool.
+
+``CCVersionCollector`` deliberately does NOT call this: it is detect-and-record
+only, because driving a variable-cost multi-LLM analysis from a signal tick was
+a reliability bug in every form (see that class's docstring).
 """
 
 from __future__ import annotations
@@ -11,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -25,12 +34,39 @@ logger = logging.getLogger(__name__)
 
 _GH_TIMEOUT = 15  # seconds
 _CC_REPO = "anthropics/claude-code"
+_CHANGELOG_URL = (
+    "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md"
+)
+# Multi-release ranges are analyzed map-reduce: the changelog is split into
+# context-safe CHUNKS, each chunk is classified by one LLM call, and the
+# per-chunk verdicts are aggregated (max severity). This never drops a release —
+# a real CC bump spans ~20-35k tokens of changelog (measured), too large for one
+# call, and any release in the range can carry a regression.
+#
+# _CHUNK_BUDGET is per-chunk chars and is sized to the SMALLEST-capacity provider
+# in the `cc_update_analysis` chain so a chunk is servable by EVERY provider it
+# could route to (primary, fallback, or offset-distributed — see _analyze_range).
+# The binding limit is groq-free / gpt-oss-120b at 8000 TPM (config/
+# model_profiles.yaml, free-text `limits:` — not machine-readable), and its
+# reasoning tokens inflate TPM further; 16k chars ~= 4k input tokens leaves room
+# for the ~600-token prompt + output + reasoning under 8000 TPM. If the chain's
+# min-TPM provider changes, re-derive here. _MAX_CHUNKS bounds the LLM fan-out for
+# a pathological range; when it bites, the newest chunks are kept and a LOUD
+# marker names the omission (never a silent cut).
+_CHUNK_BUDGET = 16000
+_MAX_CHUNKS = 12
 
 # Impact levels for CC updates
 IMPACT_NONE = "none"
 IMPACT_INFORMATIONAL = "informational"
 IMPACT_ACTION_NEEDED = "action_needed"
 IMPACT_BREAKING = "breaking"
+# The closed set an LLM impact classification must belong to. Output outside this
+# set is untrustworthy — the boundary normalizer (_coerce_analysis) rejects it to
+# the keyword fallback rather than propagating an unvalidated severity.
+_VALID_IMPACTS = frozenset(
+    {IMPACT_NONE, IMPACT_INFORMATIONAL, IMPACT_ACTION_NEEDED, IMPACT_BREAKING}
+)
 
 _ANALYSIS_PROMPT = """\
 Analyze this Claude Code version change for impact on Genesis (an autonomous AI
@@ -117,16 +153,18 @@ class CCUpdateAnalyzer:
         self._memory_store = memory_store
 
     async def analyze(self, old_version: str, new_version: str) -> dict:
-        """Analyze a CC version change.
+        """Analyze a CC version change across the WHOLE ``(old, new]`` range.
 
-        Returns dict with: impact, summary, details, finding_id.
+        Returns dict with: impact, summary, details, finding_id. A multi-release
+        jump is analyzed map-reduce (chunk -> per-chunk LLM classification ->
+        aggregate by max severity) so no intervening release is missed.
         """
-        # 1. Fetch changelog
+        # 1. Fetch the full changelog range (all intervening releases).
         changelog = await self._fetch_changelog(old_version, new_version)
 
-        # 2. LLM analysis (if router available)
+        # 2. Map-reduce LLM analysis (if router available).
         if self._router and changelog:
-            analysis = await self._llm_analyze(old_version, new_version, changelog)
+            analysis = await self._analyze_range(old_version, new_version, changelog)
         else:
             analysis = {
                 "impact": IMPACT_INFORMATIONAL,
@@ -134,15 +172,89 @@ class CCUpdateAnalyzer:
                 "details": changelog or "Changelog not available",
             }
 
-        # 3. Store as recon finding (always include raw changelog)
-        finding_id = await self._store_finding(old_version, new_version, analysis, changelog)
+        # 3. Store as recon finding. The observation/KB keep a bounded changelog
+        #    preview (a full multi-release range can be ~100KB — the LLM-derived
+        #    `details` is the durable value); the observation truncates further.
+        stored_changelog = changelog[:8000] if changelog else ""
+        finding_id = await self._store_finding(
+            old_version, new_version, analysis, stored_changelog,
+        )
         analysis["finding_id"] = finding_id
 
-        # 4. Alert if action_needed or breaking
+        # 4. Alert if action_needed or breaking.
         if analysis.get("impact") in (IMPACT_ACTION_NEEDED, IMPACT_BREAKING):
             await self._alert(analysis, old_version, new_version)
 
         return analysis
+
+    async def _analyze_range(
+        self, old_version: str, new_version: str, changelog: str,
+    ) -> dict:
+        """Map-reduce the changelog: classify each chunk, aggregate by severity.
+
+        One LLM call per chunk (each within a safe context budget); the verdicts
+        are reduced to a single ``{impact, summary, details}`` with the overall
+        impact = highest severity across chunks. A single-chunk range (the common
+        small bump) returns that chunk's analysis verbatim, preserving the prior
+        single-call behaviour and contract.
+        """
+        chunks = self._chunk_changelog(changelog)
+        if not chunks:
+            return self._fallback_analysis(old_version, new_version, changelog)
+        # Fan the chunk classifications out CONCURRENTLY, and DISTRIBUTE them across
+        # the provider chain with a per-chunk ``chain_offset``. The router paces each
+        # provider by its RPM via a rate gate, so gathering N calls that all enter at
+        # the same first provider (mistral-large-free, 4 RPM = 15s apart) would
+        # serialize them and blow the caller's deadline on the exact multi-release
+        # jump this fix targets. ``chain_offset=i`` rotates chunk i to start at
+        # chain[i % len(chain)] (independent rate gates), so up to len(chain) chunks
+        # run truly concurrently. Mirrors the established pattern in
+        # knowledge/distillation.py and eval/j9_batch.py. _llm_analyze never raises
+        # (returns _fallback_analysis on any error), so no chunk can poison the gather.
+        analyses = list(await asyncio.gather(*(
+            self._llm_analyze(old_version, new_version, chunk, chain_offset=i)
+            for i, chunk in enumerate(chunks)
+        )))
+        return self._aggregate_analyses(analyses, old_version, new_version)
+
+    @classmethod
+    def _aggregate_analyses(
+        cls, analyses: list[dict], old_version: str, new_version: str,
+    ) -> dict:
+        """Reduce per-chunk analyses to one verdict. Pure.
+
+        Overall impact = the highest severity seen in any chunk. Details are the
+        per-chunk details, highest-severity first, each tagged with its impact so
+        the aggregate stays traceable. A single analysis is returned unchanged.
+        """
+        if len(analyses) == 1:
+            return dict(analyses[0])
+        rank = {
+            IMPACT_NONE: 0,
+            IMPACT_INFORMATIONAL: 1,
+            IMPACT_ACTION_NEEDED: 2,
+            IMPACT_BREAKING: 3,
+        }
+
+        def _rank(a: dict) -> int:
+            return rank.get(a.get("impact", IMPACT_INFORMATIONAL), 1)
+
+        overall = max(analyses, key=_rank).get("impact", IMPACT_INFORMATIONAL)
+        ordered = sorted(analyses, key=_rank, reverse=True)
+        parts: list[str] = []
+        for a in ordered:
+            detail = (a.get("details") or "").strip()
+            if detail:
+                parts.append(f"[{a.get('impact', '?')}] {a.get('summary', '')}\n{detail}")
+        details = "\n\n".join(parts)
+        top = ordered[0]
+        summary = (
+            f"CC {old_version} -> {new_version}: analyzed across {len(analyses)} "
+            f"changelog chunks; overall impact {overall}."
+        )
+        if top.get("summary"):
+            summary += f" Highest-severity item: {top['summary']}"
+        return {"impact": overall, "summary": summary, "details": details}
 
     @staticmethod
     def _version_to_tag(version: str) -> str:
@@ -155,10 +267,79 @@ class CCUpdateAnalyzer:
         return f"v{bare}" if not bare.startswith("v") else bare
 
     async def _fetch_changelog(self, old_version: str, new_version: str) -> str:
-        """Fetch release notes from GitHub via ``gh api``.
+        """Changelog covering ``(old_version, new_version]`` — the WHOLE range.
 
-        Uses create_subprocess_exec (no shell) with a timeout. Falls back to
-        empty string on any failure.
+        Primary source is the repo's raw ``CHANGELOG.md``, from which every
+        release section in the range is extracted, so a multi-release jump is
+        analyzed against ALL intervening releases (not just the newest — the
+        bug this replaces). Falls back to the GitHub releases API for the single
+        ``new_version`` body, LOUDLY marked ``[PARTIAL]``, when the CHANGELOG
+        cannot be fetched or yields no sections in range (downgrade, equal
+        versions, or an unpublished target) — so a degraded analysis is visible
+        rather than a silent regression to single-version behaviour. Returns
+        "" only when both sources fail.
+        """
+        md = await self._fetch_changelog_md()
+        if md:
+            sections = self._extract_sections_in_range(md, old_version, new_version)
+            if sections:
+                return sections
+            logger.info(
+                "CHANGELOG.md fetched but no release sections in range %s..%s "
+                "(downgrade, equal versions, or unpublished target) — "
+                "using single-version fallback",
+                old_version, new_version,
+            )
+        body = await self._fetch_release_body(new_version)
+        if body:
+            return (
+                f"[PARTIAL] Full {old_version} -> {new_version} changelog range "
+                f"was unavailable; showing only the {new_version} release "
+                f"notes:\n\n{body}"
+            )
+        return ""
+
+    async def _fetch_changelog_md(self) -> str:
+        """Fetch the raw ``CHANGELOG.md``. Empty string on any failure.
+
+        Uses ``curl`` via create_subprocess_exec (no shell) with a timeout;
+        curl is more universally present than ``gh`` and needs no auth for a
+        public raw file. Any failure degrades to the ``gh`` releases fallback.
+        """
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-fsSL", _CHANGELOG_URL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_GH_TIMEOUT,
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    "CHANGELOG.md fetch failed (rc=%s): %s",
+                    proc.returncode,
+                    stderr.decode("utf-8", errors="replace")[:200],
+                )
+                return ""
+            return stdout.decode("utf-8", errors="replace")
+        except TimeoutError:
+            logger.warning("CHANGELOG.md fetch timed out")
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            return ""
+        except Exception:
+            logger.debug("Failed to fetch CHANGELOG.md", exc_info=True)
+            return ""
+
+    async def _fetch_release_body(self, new_version: str) -> str:
+        """Single-version release body from the GitHub releases API (fallback).
+
+        The former primary path, retained as a loud fallback. Uses
+        create_subprocess_exec (no shell) with a timeout. Returns "" when no
+        release in the latest window matches ``new_version``.
         """
         tag = self._version_to_tag(new_version)
         proc = None
@@ -189,10 +370,7 @@ class CCUpdateAnalyzer:
                 if not isinstance(release, dict):
                     continue
                 if release.get("tag_name") == tag:
-                    body = release.get("body", "") or ""
-                    if len(body) > 1000:
-                        body = body[:1000] + "\n... (truncated)"
-                    return body
+                    return release.get("body", "") or ""
 
             logger.debug("No release matching tag %s in latest 5 releases", tag)
             return ""
@@ -203,13 +381,181 @@ class CCUpdateAnalyzer:
                     proc.kill()
             return ""
         except Exception:
-            logger.debug("Failed to fetch changelog from GitHub", exc_info=True)
+            logger.debug("Failed to fetch release body from GitHub", exc_info=True)
             return ""
+
+    @staticmethod
+    def _semver_tuple(version: str) -> tuple[int, ...]:
+        """Numeric ``(major, minor, patch, ...)`` tuple from a version string.
+
+        Strips a leading ``v`` and any ``" (Claude Code)"`` suffix. Returns
+        ``()`` when no numeric version is present (sorts lowest).
+        """
+        m = re.search(r"\d+(?:\.\d+)*", version)
+        return tuple(int(x) for x in m.group().split(".")) if m else ()
+
+    @classmethod
+    def _extract_sections_in_range(
+        cls, changelog_md: str, old_version: str, new_version: str,
+    ) -> str:
+        """Concatenate EVERY ``## X.Y.Z`` section with ``old < version <= new``.
+
+        Pure function (no I/O). Sections keep the CHANGELOG's own order (newest
+        first). Only ``## X.Y.Z`` headers actually present are matched, so
+        skipped version numbers are handled naturally. No size cap here — the
+        full range is returned so the analyzer's map-reduce chunker
+        (:meth:`_chunk_changelog`) can cover every release without dropping any.
+        Returns "" when the range contains no sections (equal versions,
+        downgrade, or unpublished target) — the caller then falls back to the
+        single-version path.
+        """
+        old_t = cls._semver_tuple(old_version)
+        new_t = cls._semver_tuple(new_version)
+        header_re = re.compile(r"^##\s+(\d+\.\d+\.\d+)\b.*$", re.MULTILINE)
+        matches = list(header_re.finditer(changelog_md))
+        selected: list[str] = []
+        for i, m in enumerate(matches):
+            ver_t = cls._semver_tuple(m.group(1))
+            if not (old_t < ver_t <= new_t):
+                continue
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(changelog_md)
+            selected.append(changelog_md[start:end].strip())
+        return "\n\n".join(selected)
+
+    @staticmethod
+    def _length_split(text: str, budget: int) -> list[str]:
+        """Split *text* into pieces of at most ``budget`` chars. Pure.
+
+        Prefers to break on a newline in the last fifth of the window so a piece
+        rarely cuts mid-line; falls back to a hard char cut when no boundary is
+        available (a single line longer than ``budget``). This is the size-bound
+        of last resort — it applies to any unit the section packer can't keep
+        whole (an oversized release section, or the header-less ``[PARTIAL]``
+        fallback body), so NO path escapes the budget.
+        """
+        text = text.strip()
+        if len(text) <= budget:
+            return [text] if text else []
+        pieces: list[str] = []
+        i, n = 0, len(text)
+        while i < n:
+            end = min(i + budget, n)
+            if end < n:
+                floor = i + (budget * 4 // 5)
+                nl = text.rfind("\n", floor, end)
+                if nl > i:
+                    end = nl
+            piece = text[i:end].strip()
+            if piece:
+                pieces.append(piece)
+            i = end  # end > i always (budget >= 1), so this makes progress
+        return pieces
+
+    @classmethod
+    def _chunk_changelog(
+        cls, changelog: str, budget: int = _CHUNK_BUDGET, max_chunks: int = _MAX_CHUNKS,
+    ) -> list[str]:
+        """Split a concatenated changelog into context-safe chunks.
+
+        Whole ``## X.Y.Z`` release sections are kept together where they fit — each
+        chunk holds as many consecutive sections as fit ``budget`` chars. Any single
+        unit larger than ``budget`` (an oversized release section, OR the header-less
+        ``[PARTIAL]`` fallback body) is length-split by :meth:`_length_split`, so NO
+        chunk ever exceeds the budget — the size bound holds on every path, not just
+        the header path. Chunks keep the changelog's order (newest first). Capped at
+        ``max_chunks``; when the cap bites, the newest chunks are kept and a LOUD
+        marker names the dropped chunk count (never a silent cut).
+        """
+        if not changelog.strip():
+            return []
+        header_re = re.compile(r"^##\s+\d+\.\d+\.\d+\b", re.MULTILINE)
+        starts = [m.start() for m in header_re.finditer(changelog)]
+        if starts:
+            raw_units = [
+                changelog[s:(starts[i + 1] if i + 1 < len(starts) else len(changelog))].strip()
+                for i, s in enumerate(starts)
+            ]
+        else:
+            # No release headers (e.g. the [PARTIAL] single-version fallback body):
+            # one unit, still length-bounded below.
+            raw_units = [changelog.strip()]
+        # Guarantee every unit fits the budget BEFORE packing (oversized section or
+        # header-less body -> split by the same mechanism).
+        units: list[str] = []
+        for u in raw_units:
+            units.extend(cls._length_split(u, budget) if len(u) > budget else [u])
+        chunks: list[str] = []
+        cur: list[str] = []
+        cur_len = 0
+        for unit in units:
+            if cur and cur_len + len(unit) > budget:
+                chunks.append("\n\n".join(cur))
+                cur, cur_len = [], 0
+            cur.append(unit)
+            cur_len += len(unit) + 2
+        if cur:
+            chunks.append("\n\n".join(cur))
+        if len(chunks) > max_chunks:
+            dropped = len(chunks) - max_chunks
+            chunks = chunks[:max_chunks]
+            marker = (
+                f"\n\n[... {dropped} older changelog chunk(s) omitted — range too "
+                f"large for a single analysis pass; review older releases manually]"
+            )
+            # Preserve the size-bound invariant: trim the last kept chunk so
+            # chunk+marker still fits budget (it is already the OLDEST kept chunk,
+            # so trimming its tail sheds the least-relevant content).
+            if len(chunks[-1]) + len(marker) > budget:
+                chunks[-1] = chunks[-1][: max(0, budget - len(marker))]
+            chunks[-1] += marker
+        return chunks
+
+    @staticmethod
+    def _coerce_analysis(parsed: object) -> dict | None:
+        """Normalize an untrusted LLM analysis payload, or None if unusable.
+
+        Returns ``{impact: <valid enum>, summary: str, details: str}`` when *parsed*
+        is a dict carrying an impact in the closed enum set; returns None when the
+        payload is not a dict OR the impact is outside the enum (the caller then
+        falls back to keyword heuristics rather than propagating an unvalidated
+        severity). Non-str ``summary``/``details`` are coerced to str — the reducer
+        (``_aggregate_analyses``), knowledge-ingest (``_ingest_to_knowledge``), and
+        ``_alert`` all index/``.strip()`` these fields, so a model that emits a
+        number/list/object there must be sanitized at THIS single boundary, not
+        crash three consumers downstream.
+        """
+        if not isinstance(parsed, dict):
+            return None
+        impact = parsed.get("impact")
+        # isinstance guard FIRST: an unhashable impact (list/dict from a malformed
+        # model) would raise TypeError on `in frozenset`; return None so the caller
+        # takes the intended keyword-fallback branch instead of the generic except.
+        if not isinstance(impact, str) or impact not in _VALID_IMPACTS:
+            return None
+
+        def _as_str(v: object) -> str:
+            return v if isinstance(v, str) else ("" if v is None else str(v))
+
+        return {
+            "impact": impact,
+            "summary": _as_str(parsed.get("summary")),
+            "details": _as_str(parsed.get("details")),
+        }
 
     async def _llm_analyze(
         self, old_version: str, new_version: str, changelog: str,
+        *, chain_offset: int = 0,
     ) -> dict:
-        """Use LLM to classify the update impact."""
+        """Use an LLM to classify the update impact.
+
+        ``chain_offset`` rotates the provider chain so concurrent chunk calls (see
+        :meth:`_analyze_range`) don't all serialize on the first provider's rate
+        gate. The return is ALWAYS the normalized contract
+        ``{impact: <enum>, summary: str, details: str}`` — untrusted LLM output is
+        coerced/rejected at this single boundary (:meth:`_coerce_analysis`) so every
+        downstream consumer is safe by construction.
+        """
         prompt = _ANALYSIS_PROMPT.format(
             old_version=old_version,
             new_version=new_version,
@@ -220,9 +566,17 @@ class CCUpdateAnalyzer:
         try:
             # cc_update_analysis — analyzes CC version changelogs for impact on
             # Genesis hooks/integrations. Non-numeric ID by intent.
-            result = await self._router.route_call("cc_update_analysis", messages)
+            result = await self._router.route_call(
+                "cc_update_analysis", messages, chain_offset=chain_offset,
+            )
             if result.success and result.content:
-                return json.loads(result.content)
+                normalized = self._coerce_analysis(json.loads(result.content))
+                if normalized is not None:
+                    return normalized
+                logger.warning(
+                    "LLM analysis payload not usable (non-dict or invalid impact) "
+                    "— using keyword fallback",
+                )
         except json.JSONDecodeError:
             logger.warning("LLM analysis returned non-JSON response", exc_info=True)
         except Exception:

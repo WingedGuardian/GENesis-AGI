@@ -12,9 +12,11 @@ from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
+from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
+from genesis.memory.taxonomy import WINGS
 from genesis.memory.taxonomy import classify as classify_taxonomy
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
@@ -126,6 +128,12 @@ class MemoryStore:
         project_type: str | None = None,
         supersedes: str | None = None,
         origin_class: str | None = None,
+        speech_act: str | None = None,
+        speech_act_confidence: float | None = None,
+        assertion_provenance: str | None = None,
+        durability: str | None = None,
+        expires_at: str | None = None,
+        preference_domain: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -226,6 +234,37 @@ class MemoryStore:
         # fans out to the FTS5 tag, the Qdrant payload, and memory_metadata.
         wing = _strip_kv_prefix(wing, "wing")
         room = _strip_kv_prefix(room, "room")
+
+        # An explicit wing outside the controlled vocabulary is DROPPED, not
+        # stored. Until now this branch only tested falsiness, so any string
+        # sailed through into the FTS5 `wing:` tag, the Qdrant payload and
+        # memory_metadata.wing — and classify_life_domain() silently returns
+        # "personal" for an unknown wing, so one bad value corrupted the life
+        # domain too. essential_knowledge.py filters junk wings on READ; that
+        # hid the problem instead of preventing it.
+        #
+        # COERCE rather than raise. NB the two sibling controlled-vocabulary
+        # fields in this same function RAISE — life_domain just above, and
+        # origin_class via derive_origin_class(). The divergence is deliberate:
+        # those two are effectively never passed by live callers (life_domain is
+        # DERIVED from wing; almost nothing sets it explicitly), whereas `wing`
+        # genuinely arrives from model output on live paths (dream_cycle), where
+        # raising would abort a whole synthesis run over one bad token. Falling
+        # back to auto-classification yields a VALID wing instead of a poisoned
+        # one. The agent-facing MCP tools raise instead — a caller that can be
+        # told the valid set should be. `room` is deliberately NOT enforced:
+        # measured, 18% of live rows have a room outside ROOMS[wing] and the
+        # shipped ego prompts instruct room="ego", so enforcing it symmetrically
+        # would coerce a fifth of writes and break the ego. It is descriptive,
+        # has no read-side filter, and gets no FTS tag — unlike wing, whose bad
+        # value also corrupts the derived life_domain.
+        if wing and wing not in WINGS:
+            logger.warning(
+                "Ignoring unknown wing %r (not in the controlled vocabulary); "
+                "falling back to auto-classification. Valid wings: %s",
+                wing, sorted(WINGS),
+            )
+            wing = None
 
         # Taxonomy classification — auto-classify if not explicitly provided
         if not wing or not room:
@@ -374,6 +413,20 @@ class MemoryStore:
             invalid_at=invalid_at,
             source_subsystem=source_subsystem,
             origin_class=resolved_origin,
+            # MW-1 Tier-0 judgment axes — write-only to memory_metadata
+            # (consumers MW-4/MW-5). NOT denormalized into the Qdrant payload:
+            # the field is reachable at recall via the search_ranked metadata
+            # join (as origin_class's FTS fallback is), and a consumer that
+            # needs vector-path parity owns adding it to the payload + the
+            # re-embed recovery path together.
+            # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl
+            # / mw-4-preference-domain / mw-5-speech-act-protection)
+            speech_act=speech_act,
+            speech_act_confidence=speech_act_confidence,
+            assertion_provenance=assertion_provenance,
+            durability=durability,
+            expires_at=expires_at,
+            preference_domain=preference_domain,
         )
 
         # Mechanical code anchors (entity layer) — regex-only, every write
@@ -492,39 +545,113 @@ class MemoryStore:
                     "Failed to create succeeded_by link %s → %s: %s",
                     old_id, new_id, link_exc,
                 )
+        else:
+            # The CRUD create does not invalidate (its callers do, by
+            # convention) — and this caller previously didn't either, so every
+            # supersede left the cached graph missing the succeeded_by edge
+            # until some unrelated write invalidated it. One of the two known
+            # invalidation gaps from the graph-store consumer map (issue #1641).
+            # Scope: this flips THIS process's projection (the MCP child, which
+            # hosts the traverse readers most affected); cross-process readers
+            # rebuild on their own invalidations — the DB-generation token that
+            # closes that fully is future seam work (#1641).
+            try:
+                from genesis.memory.graph import invalidate_graph_cache
+
+                invalidate_graph_cache()
+            except ImportError:
+                pass
 
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.
 
-        Tries all layers independently — partial failure is acceptable.
-        Qdrant deletes try both collections since the FTS5 collection column
-        is unreliable (documented in memory.py:72-73).
+        **Point-first, fail-closed, atomic on the point's real collection.** The
+        metadata ``collection`` column is unreliable (memory.py:72-73), so the
+        point is first LOCATED by a by-id retrieve against both collections, then
+        deleted only from the collection(s) that actually hold it — never a blind
+        delete against both (a transient failure on the collection that did NOT
+        hold the point would otherwise strand the one that did). A ``retrieve`` or
+        ``delete`` that raises means Qdrant is unreachable → **defer**: touch no
+        SQLite layer and return ``deferred=True`` so the memory stays coherent and
+        retryable rather than leaving an orphaned "ghost" point. A memory that
+        never had a vector (``fts5_only``/``pending``/``failed``) locates to
+        nothing and deletes cleanly.
+
+        Serialized per ``memory_id`` against the re-embed/reconcile-requeue paths
+        (``memory/_locks.py``): the whole locate→delete→cascade sequence holds the
+        id-lock, so a concurrent ``EmbeddingRecoveryWorker`` upsert or reconcile
+        requeue of the same memory cannot interleave and resurrect a vector the
+        user just deleted.
         """
+        async with memory_id_lock(memory_id):
+            return await self._delete_locked(memory_id)
+
+    async def _delete_locked(self, memory_id: str) -> dict:
         results: dict[str, bool | int] = {}
 
-        # 1. memory_metadata companion table
+        # 0. WRITE-AHEAD delete intent (Codex #1270 P1): record the tombstone
+        # BEFORE touching Qdrant, not just on the defer path. The intent stays
+        # open across the whole point-delete→cascade span, so the recovery
+        # worker's tombstone check (SQLite, cross-process) blocks a concurrent
+        # re-embed from resurrecting the vector even when THIS delete succeeds
+        # — the process-local id-lock cannot serialize the MCP process. Also
+        # crash-safe: a process dying mid-cascade leaves the intent for the
+        # nightly drain to complete. Best-effort — a failed write never blocks
+        # the delete itself. Step 7 closes it on success; a defer leaves it
+        # open as the durable retry record.
+        from genesis.memory.delete_tombstones import (
+            complete_open_tombstones,
+            enqueue_tombstone,
+        )
+
+        tombstoned = await enqueue_tombstone(
+            self._db, memory_id=memory_id, reason="delete_in_progress"
+        )
+
+        # 1. Locate the point (unreliable collection column → check both) and
+        # delete only where it lives. retrieve/delete raise on a real Qdrant error
+        # → defer; an empty locate means the point is absent (nothing to delete).
+        try:
+            present: list[str] = []
+            for coll in ("episodic_memory", "knowledge_base"):
+                got = await asyncio.to_thread(
+                    self._qdrant.retrieve,
+                    collection_name=coll,
+                    ids=[memory_id],
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if got:
+                    present.append(coll)
+            for coll in present:  # atomic on the point's real collection
+                await asyncio.to_thread(
+                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
+                )
+        except Exception:
+            logger.error(
+                "Qdrant unavailable during delete of %s — deferring to keep stores "
+                "consistent (no orphan)", memory_id, exc_info=True,
+            )
+            # The write-ahead tombstone (step 0) stays OPEN — it is the durable
+            # retry record: visible to every process, it blocks requeue/re-embed
+            # of this memory and is drained (delete re-attempted) by the nightly
+            # reconcile lane.
+            results["deferred"] = True
+            results["tombstoned"] = tombstoned
+            results["metadata"] = False
+            results["fts5"] = False
+            return results
+        results["qdrant_deleted"] = len(present)
+
+        # 2. memory_metadata companion table (point confirmed gone → safe)
         results["metadata"] = await memory_crud.delete_metadata(
             self._db, memory_id=memory_id,
         )
 
-        # 2. FTS5 text index
+        # 3. FTS5 text index
         results["fts5"] = await memory_crud.delete(
             self._db, memory_id=memory_id,
         )
-
-        # 3. Qdrant — try both collections (collection column unreliable)
-        for coll in ("episodic_memory", "knowledge_base"):
-            try:
-                await asyncio.to_thread(
-                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
-                )
-                results[f"qdrant_{coll}"] = True
-            except Exception:
-                logger.error(
-                    "Qdrant delete failed for %s in %s", memory_id, coll,
-                    exc_info=True,
-                )
-                results[f"qdrant_{coll}"] = False
 
         # 4. Cascade: memory_links
         results["links_deleted"] = await memory_links_crud.delete_by_memory(
@@ -551,5 +678,17 @@ class MemoryStore:
                 "entity_mentions delete failed for %s", memory_id, exc_info=True,
             )
             results["mentions_deleted"] = False
+
+        # 7. Close every open delete-intent tombstone: the cascade completed
+        # (this covers step 0's write-ahead intent, any earlier deferred
+        # attempt's row, and multi-process duplicates), so the recorded intent
+        # is satisfied — leaving it open would only make the reconcile lane
+        # re-attempt a no-op delete. Best-effort.
+        try:
+            await complete_open_tombstones(self._db, memory_id=memory_id)
+        except Exception:
+            logger.warning(
+                "tombstone close-out failed for %s", memory_id, exc_info=True,
+            )
 
         return results

@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import urllib.parse
+from datetime import UTC, datetime
 from pathlib import Path
 
 from flask import jsonify, request
@@ -91,6 +92,7 @@ _BACKENDS = {"none", "local", "smb"}
 _NAS_RE = re.compile(r"^//[^/\s]+/[^\s]+$")
 _REPO_RE = re.compile(r"^(https?://|git@|ssh://).+")
 _ONCALENDAR_RE = re.compile(r"OnCalendar=(.+?)\s*;")
+_SYSTEMD_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -162,7 +164,10 @@ def _timer_state() -> dict:
     """Backup schedule state read from the systemd user timer (source of truth).
 
     Best-effort: any systemctl failure degrades to a disabled/None reading rather
-    than raising — the status route must never 500 on a schedule probe.
+    than raising — the status route must never 500 on a schedule probe. That
+    degraded reading is indistinguishable from a genuinely-disabled timer UNLESS
+    a caller checks ``probe_ok`` first — ``False`` means "unknown", not
+    "disabled"/"overdue-by-the-loose-fallback"; see its use in `_backup_health`.
     """
     state = {
         "mechanism": "systemd-timer",
@@ -171,13 +176,18 @@ def _timer_state() -> dict:
         "next_run": None,
         "last_trigger": None,
         "interval": None,
+        "probe_ok": True,
     }
     r = _systemctl("is-enabled", _TIMER_UNIT)
     if r is not None:
         state["enabled"] = r.stdout.strip() == "enabled"
+    else:
+        state["probe_ok"] = False
     r = _systemctl("is-active", _TIMER_UNIT)
     if r is not None:
         state["active"] = r.stdout.strip() == "active"
+    else:
+        state["probe_ok"] = False
     r = _systemctl(
         "show",
         _TIMER_UNIT,
@@ -193,6 +203,8 @@ def _timer_state() -> dict:
         state["next_run"] = props.get("NextElapseUSecRealtime") or None
         state["last_trigger"] = props.get("LastTriggerUSec") or None
         state["interval"] = _interval_from_calendar(props.get("TimersCalendar"))
+    else:
+        state["probe_ok"] = False
     return state
 
 
@@ -258,7 +270,12 @@ def _resolved_backend() -> str:
 
     b = (_key_value("GENESIS_BACKUP_TIER2_BACKEND") or "").strip()
     if b:
-        return b
+        # Clamp to the allowlist even though the dashboard's own write path
+        # (backup_config_set) already validates it — secrets.env is an
+        # operator-editable file by design, so a value written any other way
+        # (hand edit, legacy install, future script) must not flow unvalidated
+        # into the unauthenticated /status and /config GET responses.
+        return b if b in _BACKENDS else "none"
     if (_key_value("GENESIS_BACKUP_NAS") or "").strip():
         return "smb"
     return "none"
@@ -281,7 +298,16 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
         "pushed": status.get("tier1_pushed"),
         "last": status.get("timestamp"),
     }
+    # `status` is backup_status.json — untrusted-by-construction (operator-
+    # editable/corruptible), same as the failure_reason field _scrub_reason
+    # guards. `_resolved_backend()` already clamps ITS OWN source
+    # (GENESIS_BACKUP_TIER2_BACKEND) to the allowlist, but that clamp doesn't
+    # cover THIS field — clamp again here so a malformed status file can't
+    # smuggle an arbitrary value into `tier2["backend"]` on the unauthenticated
+    # /status route.
     backend = status.get("tier2_backend") or _resolved_backend()
+    if backend not in _BACKENDS:
+        backend = "none"
     tier2 = {
         "backend": backend,
         "status": status.get("tier2_status"),
@@ -295,6 +321,254 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
         elif backend == "local":
             tier2["target"] = _key_value("GENESIS_BACKUP_LOCAL_PATH") or None
     return {"tier1": tier1, "tier2": tier2}
+
+
+# ── Health verdict (server-authoritative banner state) ────────────────
+
+_INTERVAL_HOURS = {"3h": 3, "6h": 6, "12h": 12, "daily": 24}
+
+
+def _scrub_reason(text: object) -> str | None:
+    """Sanitize a failure_reason for the UNAUTHENTICATED banner.
+
+    ``backup.sh`` only JSON-escapes the reason; it can still embed a home path
+    (which carries a username) or raw gpg output. Strip ``/home/<user>`` → ``~``
+    and cap the length before it is rendered on the unauth ``/status`` route.
+
+    Accepts ``object``, not just ``str | None``: ``backup_status.json`` is
+    untrusted-by-construction (operator-editable / corruptible), and a truthy
+    NON-STRING value (a list/dict/int from a malformed record) must degrade to
+    ``None`` rather than crash ``.replace()`` and 500 this unauthenticated route.
+    """
+    if not isinstance(text, str):
+        return None
+    if not text:
+        return text
+    scrubbed = text.replace(str(_HOME), "~")
+    scrubbed = re.sub(r"/home/[^/\s]+", "~", scrubbed)
+    if len(scrubbed) > 200:
+        scrubbed = scrubbed[:199] + "…"
+    return scrubbed
+
+
+def _parse_systemd_timestamp(value: str | None) -> datetime | None:
+    """Parse systemd's human-formatted timer timestamp into an aware UTC datetime.
+
+    ``systemctl show -p NextElapseUSecRealtime`` returns a LOCALE/TZ-formatted
+    string like ``"Fri 2026-07-10 18:10:00 EDT"`` — verified live against a real
+    ``systemctl --user show genesis-backup.timer`` and matching this file's own
+    test fixture — NEVER a raw epoch. Only the numeric ``YYYY-MM-DD HH:MM:SS``
+    portion is extracted (via ``_SYSTEMD_TS_RE``) — the weekday name and tz
+    abbreviation are both dropped rather than parsed: Python's ``%a``/``%Z``
+    strptime directives only recognize English tokens, but ``systemctl_env()``
+    copies this process's ``LC_TIME``/``LANG`` unmodified into the subprocess, so
+    a non-English-locale host could otherwise render a weekday `strptime` can't
+    match. The naive numeric timestamp is converted via ``.astimezone(UTC)``,
+    which treats a naive datetime as system-local.
+
+    KNOWN LIMITATION: dropping the tz abbreviation means the one hour/year a
+    local wall-clock time occurs TWICE (the DST fall-back fold) is ambiguous —
+    ``.astimezone()`` always resolves to the FIRST (pre-transition) occurrence,
+    which can be up to 1h off from what systemd meant (confirmed:
+    ``datetime.strptime("2026-11-01 01:30:00", ...).astimezone(UTC)`` picks
+    ``fold=0``/EDT even when systemd meant the EST occurrence). Deliberately
+    not fixed with a hardcoded abbreviation→offset map (abbreviations like
+    "IST" aren't globally unique across timezones, so a map would be both
+    incomplete and install-specific) — acceptable because the only consumer is
+    the ``next_run``-in-the-future check against a 7-DAY (168h) overdue floor,
+    where a 1h skew is immaterial, and the ambiguity self-corrects within the
+    hour on the next poll.
+    """
+    if not value:
+        return None
+    v = value.strip()
+    m = _SYSTEMD_TS_RE.search(v)
+    if not m:
+        return None
+    try:
+        naive = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return naive.astimezone(UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _backup_health(
+    last_backup: dict | None,
+    schedule: dict | None,
+    destinations: dict | None,
+    *,
+    configured: bool,
+    resolved_backend: str,
+) -> dict:
+    """One authoritative backup-health verdict for the page-top banner.
+
+    Returns ``{"state": "ok"|"warn"|"critical", "code": <slug>, "reason": <text>}``
+    — precedence, first match wins. Computed server-side so the banner has ZERO
+    client-side coordination: no dependency on a second config fetch (the client
+    ``backupConfig``), and no client-clock staleness math. ``state == "ok"`` means
+    the banner is hidden.
+    """
+    lb = last_backup if isinstance(last_backup, dict) else None
+    sch = schedule or {}
+
+    # 1. Recorded FAILURE (success explicitly False) — the most urgent state.
+    if lb is not None and lb.get("success") is False:
+        reason = "The last backup run failed"
+        fr = _scrub_reason(lb.get("failure_reason"))
+        if fr:
+            reason += f" ({fr})"
+        return {
+            "state": "critical",
+            "code": "failed",
+            "reason": reason + " — check the Backup tab.",
+        }
+
+    # 2. Not configured — CURRENT signals only (a saved repo setting or a real
+    #    clone), never a lingering prior run: a stale success record survives clone
+    #    or secrets removal, and backup.sh cannot recreate the clone without the
+    #    repo setting, so it must not mask the unconfigured state. Checked BEFORE the
+    #    malformed-record branch so an abandoned install carrying a leftover garbage
+    #    record still gets the more actionable "not configured" message.
+    if not configured:
+        return {
+            "state": "warn",
+            "code": "unconfigured",
+            "reason": "Backups are not configured — your data is not being backed up. "
+            "Set one up on the Backup tab.",
+        }
+
+    # 3. Configured, but no backup has ever run.
+    if lb is None:
+        return {
+            "state": "warn",
+            "code": "never_run",
+            "reason": "Backups are configured but have never run — check the Backup tab.",
+        }
+
+    # 4. A present-but-malformed record (valid JSON, no boolean `success`) must not
+    #    slip through to "healthy" — a `{}` or operator-repaired record reads as
+    #    unreadable, not clean. (lb is non-None here — branch 3 handled None.)
+    if not isinstance(lb.get("success"), bool):
+        return {
+            "state": "warn",
+            "code": "unreadable_status",
+            "reason": "The last backup status record is unreadable — check the Backup tab.",
+        }
+
+    # 5/6. Schedule-dependent checks (timer_stopped, overdue) — gated on the
+    #    schedule probe having actually succeeded. When `probe_ok` is False
+    #    (systemctl/D-Bus unreachable), `enabled`/`active`/`interval` all read as
+    #    their zero-value defaults, indistinguishable from a genuinely-disabled
+    #    timer — so these two checks must NOT run on unverified data (an active
+    #    timer's overdue-ness would otherwise silently fall through to the loose
+    #    7-day fallback for up to 7 days). tier1_unpushed/tier2_incomplete below
+    #    do NOT read `sch` at all, so they stay reachable regardless of probe_ok —
+    #    a transient systemctl outage must not mask an unrelated, already-known
+    #    push/off-site problem.
+    if sch.get("probe_ok") is not False:
+        # 5. Scheduled but the timer is not running (stopped out-of-band / failed
+        #    to start): unattended backups have silently stopped even though the
+        #    last run succeeded.
+        if sch.get("enabled") and not sch.get("active"):
+            return {
+                "state": "warn",
+                "code": "timer_stopped",
+                "reason": "Backups are scheduled but the timer is not running — unattended "
+                "backups have stopped. Check the Backup tab.",
+            }
+
+        # 6. Overdue — the last successful backup is too old. For a KNOWN enabled
+        #    interval use a pure age floor (interval*2 + 1h): an active timer can
+        #    silently SKIP runs, leaving a stale timestamp while `next_run` is
+        #    still in the future, so a future next_run does NOT prove recency
+        #    there. For a custom/unknown/disabled schedule use a 7-day floor but
+        #    suppress when a valid future `next_run` exists — a monthly custom
+        #    timer legitimately runs less often than weekly and is not overdue.
+        ts = lb.get("timestamp")
+        if ts:
+            try:
+                age_h = (datetime.now(UTC) - datetime.fromisoformat(ts)).total_seconds() / 3600
+            except (ValueError, TypeError):
+                age_h = None
+            if age_h is not None:
+                interval_h = (
+                    _INTERVAL_HOURS.get(sch.get("interval")) if sch.get("enabled") else None
+                )
+                if interval_h:
+                    floor_h: float = interval_h * 2 + 1
+                    overdue = age_h > floor_h
+                    detail = f", well past the {interval_h}h schedule"
+                else:
+                    floor_h = 24 * 7
+                    next_run = _parse_systemd_timestamp(sch.get("next_run"))
+                    next_run_future = next_run is not None and next_run > datetime.now(UTC)
+                    overdue = age_h > floor_h and not next_run_future
+                    detail = ""
+                if overdue:
+                    return {
+                        "state": "warn",
+                        "code": "overdue",
+                        "reason": "Backups are overdue — the last successful backup was about "
+                        f"{round(age_h)}h ago{detail}. Check the Backup tab.",
+                    }
+
+    # 7. Tier-1 (GitHub) push did not complete — the local backup succeeded but
+    #    commits are not replicated to the remote (a prior push failed and today's
+    #    run had nothing new to commit, so `success` stays True).
+    if lb.get("tier1_pushed") is False:
+        return {
+            "state": "warn",
+            "code": "tier1_unpushed",
+            "reason": "Backups are not fully replicated to GitHub — the last run succeeded "
+            "locally but commits are not pushed to the remote. Check the Backup tab.",
+        }
+
+    # 8. Off-site (Tier-2) copy configured but incomplete. Gate on the RESOLVED
+    #    backend (CURRENT config), not the last status record's `tier2_backend`: a
+    #    Tier-2 backend disabled after a partial run must not keep warning off a
+    #    stale record. Require an explicit incompleteness signal so an info-less
+    #    legacy record stays quiet.
+    if resolved_backend and resolved_backend != "none":
+        t2 = (destinations or {}).get("tier2") or {}
+        # 8a. The last CONFIRMED run was against a DIFFERENT backend than the one
+        #     currently resolved (e.g. switched smb → local via /config). Reusing
+        #     that stale confirmed/status would call the new, never-yet-run backend
+        #     healthy. A recorded backend that matches (or an old record with none
+        #     recorded at all) falls through to the normal incompleteness check.
+        recorded_backend = lb.get("tier2_backend")
+        if recorded_backend and recorded_backend != resolved_backend:
+            return {
+                "state": "warn",
+                "code": "tier2_incomplete",
+                "reason": "The off-site backend was changed to "
+                f"'{resolved_backend}' and has not been confirmed yet — the last "
+                "confirmed off-site copy was to a different backend. Check the "
+                "Backup tab.",
+            }
+        status = t2.get("status")
+        if (status is not None and status != "ok") or t2.get("confirmed") is False:
+            return {
+                "state": "warn",
+                "code": "tier2_incomplete",
+                "reason": "The off-site backup copy is incomplete — your local backup "
+                "succeeded but the off-site copy did not finish. Check the Backup tab.",
+            }
+
+    # 9. The schedule probe itself failed (systemctl/D-Bus unreachable) and
+    #    nothing more specific above already explained the banner — report the
+    #    probe failure itself as a LAST RESORT, rather than silently reading
+    #    healthy. Fail-closed: an unknown dependency state must never look
+    #    "healthy" — but a probe outage must also not MASK an unrelated,
+    #    already-known tier1/tier2 problem, hence this runs only after those.
+    if sch.get("probe_ok") is False:
+        return {
+            "state": "warn",
+            "code": "schedule_probe_failed",
+            "reason": "Could not verify the backup schedule (systemctl probe failed) — "
+            "check the Backup tab.",
+        }
+
+    return {"state": "ok", "code": "healthy", "reason": ""}
 
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -320,6 +594,12 @@ def backup_status():
                 # Allowlist projection — a future field in backup.sh's status
                 # line cannot auto-leak through this unauthenticated route.
                 last_backup = {k: v for k, v in raw.items() if k in _STATUS_SAFE_FIELDS}
+                # failure_reason can embed a home path (which carries a username) or
+                # raw gpg output; scrub it HERE so the sanitized value is the only one
+                # that ever reaches this unauthenticated response — the banner reason
+                # and this raw field must not disagree.
+                if last_backup.get("failure_reason"):
+                    last_backup["failure_reason"] = _scrub_reason(last_backup["failure_reason"])
         except (json.JSONDecodeError, OSError):
             last_backup = None
     result["last_backup"] = last_backup
@@ -327,6 +607,21 @@ def backup_status():
     result["repo"] = _backup_repo_url()
     result["schedule"] = _timer_state()
     result["destinations"] = _destinations(last_backup, result["repo"])
+
+    # Server-authoritative health verdict for the page-top banner. `configured`
+    # uses CURRENT signals only — a saved repo setting, a real clone (`.git`, not
+    # just the directory), or a resolvable origin — never a lingering prior run.
+    from genesis.dashboard.routes.secrets import _key_value
+
+    repo_setting = (_key_value("GENESIS_BACKUP_REPO") or "").strip()
+    configured = bool(repo_setting or (_BACKUP_DIR / ".git").is_dir() or result["repo"])
+    result["backup_health"] = _backup_health(
+        last_backup,
+        result["schedule"],
+        result["destinations"],
+        configured=configured,
+        resolved_backend=_resolved_backend(),
+    )
 
     return jsonify(result)
 

@@ -28,7 +28,7 @@ async def deliberate(
     backend: str = "fusion",
     mode: str = "synthesis",
     preset: str | None = None,
-    timeout_s: float = 240.0,
+    timeout_s: float | None = None,
     models: list[str] | None = None,
 ) -> DeliberationResult:
     """Run a question through a chorus of models and return verdict + dissent.

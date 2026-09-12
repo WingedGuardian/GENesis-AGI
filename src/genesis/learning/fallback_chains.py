@@ -8,10 +8,12 @@ and which fail, building procedural memory over time (Phase 6+).
 from __future__ import annotations
 
 CHAINS: dict[str, list[str]] = {
+    # NOTE: aspirational/static — the LIVE web_fetch chain is
+    # TinyFish → Scrapling → Ladder → Crawl4AI → httpx (mcp/health/web_tools.py),
+    # with Firecrawl as an EXPLICIT paid escalation backend, never first.
     "web_fetch": [
-        "firecrawl",
-        "playwright",
-        "requests_fallback",
+        "live_auto_chain",
+        "firecrawl_backend",
         "cache_lookup",
     ],
     "api_rate_limit": [

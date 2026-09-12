@@ -378,7 +378,7 @@ perception pipeline actually perceive.
     Draft after Phase 4 implementation. Pull from v2 USER.md: timezone (EST),
     communication preferences ("brief first, detailed as context deepens", "don't offer
     next steps by default"), philosophical/first-principles thinking style, "critic when
-    Jay locks onto one track" instruction. Omit: v2-specific tool references, v2 action
+    the user locks onto one track" instruction. Omit: v2-specific tool references, v2 action
     policy (superseded by L1-L4 autonomy), relationship section (superseded by SOUL.md).
   - Context assembly must position identity docs early (high attention region)
 - **Context assembly principles** (learned from v2 + design discussion):
@@ -502,7 +502,7 @@ LLM, you're testing the wrong thing.
 - **User model evolution**: v2 had a static USER.md (~300 tokens) injected every prompt.
   v3's user model is richer — it lives in the user model cache (Phase 0 schema) and gets
   synthesized by Light reflection (#11). Phase 5 builds the retrieval side: when Genesis
-  needs user preferences (e.g., "does Jay prefer brief or detailed here?"), it pulls from
+  needs user preferences (e.g., "does the user prefer brief or detailed here?"), it pulls from
   the user model store, not a static file. user.md is the seed; the user model is the
   living version. v2 items to seed: timezone, communication style, autonomy preferences,
   thinking style, relationship expectations.
@@ -1302,6 +1302,14 @@ a burn-in period. Rationale:
 Start prediction logging early so calibration data accumulates before Phase 9
 needs it. This is pure instrumentation — zero LLM cost.
 
+> **SUPERSEDED (WS-2 P5 sunset, migration 0090).** This entire legacy calibration
+> subsystem — the `predictions` logging table, the prediction→outcome reconciler,
+> and the per-domain `calibration_curves` computation — has been retired. The
+> unified `calibration_cells` table (WS-2 P3) is the live calibration surface
+> (perception reads it; the graded cognitive ledger computes it). `predictions` is
+> archived to `predictions_legacy_ws2`; `calibration_curves` is dropped. The
+> descriptions and the checklist below are the historical Phase-8 record.
+
 - **Prediction logging table** (`predictions`):
   - Schema: `{id, action_id, timestamp, prediction, confidence, confidence_bucket,
     domain, reasoning, outcome (nullable), correct (nullable), matched_at (nullable)}`
@@ -1399,6 +1407,9 @@ Phase 8 accumulates prediction data. Phase 9 uses it to inform autonomy decision
   you're historically right ~60% of the time. Adjust accordingly." Per-domain
   curves from Phase 8's `calibration_curves` table. This is the "symbolic +
   neural" pairing validated by Google's Bayesian Teaching research.
+  **SUPERSEDED (WS-2):** perception now reads the unified `calibration_cells`
+  table (P3); the legacy `calibration_curves` table was retired in the P5 sunset
+  (migration 0090).
 - **Hard disagreement gates** — when cross-vendor review (call sites #17/#20)
   disagrees with primary model, the action BLOCKS until resolved:
   - Third model tiebreaker, OR

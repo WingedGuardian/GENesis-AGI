@@ -366,6 +366,59 @@ async def test_drain_ages_out_perpetually_stuck_row(config, db):
 
 
 @pytest.mark.asyncio
+async def test_drain_preserves_future_scheduled_reminder_at_due_time(config, db):
+    """A reminder scheduled far ahead (enqueued 30h ago, deliver_after just now)
+    must NOT be aged out when it finally becomes due — the retry cap ages from
+    deliver_after, not created_at. Before the fix, "remind me next week" was
+    silently dropped at delivery time. (Voice remind, PR #1236.)"""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    created = (now - timedelta(hours=30)).isoformat()  # enqueued 30h ago
+    due = (now - timedelta(minutes=1)).isoformat()  # became due a minute ago
+    await db.execute(
+        "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
+        "created_at, deliver_after, delivered) VALUES ('sched1', 'Reminder: call', "
+        "'notification', 'telegram', 'high', ?, ?, 0)",
+        (created, due),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit_urgent.assert_called_once()  # delivered, NOT aged out
+    assert await _remaining(db) == []  # cleared as delivered (sent)
+
+
+@pytest.mark.asyncio
+async def test_drain_ages_out_row_stuck_past_its_deliver_after(config, db):
+    """The retry cap still fires for a genuinely stuck row: due 26h ago and
+    never delivered → dropped. Confirms the deliver_after age basis did not
+    disable the cap for overdue rows."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    created = (now - timedelta(hours=30)).isoformat()
+    due = (now - timedelta(hours=26)).isoformat()  # overdue 26h, still stuck
+    await db.execute(
+        "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
+        "created_at, deliver_after, delivered) VALUES ('sched2', 'x', "
+        "'notification', 'telegram', 'low', ?, ?, 0)",
+        (created, due),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.REJECTED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_not_called()  # aged out
+    assert await _remaining(db) == []  # dropped
+
+
+@pytest.mark.asyncio
 async def test_drain_null_id_row_is_cleared_not_looped(config, db):
     """A legacy NULL-id row must be cleared via the rowid fallback, not
     re-drained forever. Before the fix, mark_delivered(WHERE id=NULL) matched
@@ -524,3 +577,105 @@ async def test_ambient_rss_alert_text_names_leak_not_down(config, db):
     text = scheduler._pipeline.submit_raw.call_args[0][0]
     assert "down/hung" not in text  # the bridge is alive — don't misdiagnose
     assert "RSS" in text
+
+
+@pytest.mark.parametrize(
+    ("causes", "expected"),
+    [
+        (("bridge-dead",), "ambient-bridge.service"),
+        (("recovery-failing",), "auto-recovery exhausted"),
+        (("diar-worker",), "diarization worker"),
+        (("rss-total",), "leak regression"),
+        (("rss-diar-child",), "leak regression"),
+        ((), "journalctl"),  # default fallback when no known cause
+    ],
+)
+def test_ambient_remedy_hint_per_cause(causes, expected):
+    assert expected in OutreachScheduler._ambient_remedy_hint(causes)
+
+
+def test_ambient_remedy_hint_precedence():
+    # bridge-dead outranks recovery-failing; recovery-failing outranks diar/rss.
+    assert "ambient-bridge.service" in OutreachScheduler._ambient_remedy_hint(
+        ("bridge-dead", "recovery-failing")
+    )
+    assert "auto-recovery exhausted" in OutreachScheduler._ambient_remedy_hint(
+        ("recovery-failing", "diar-worker", "rss-total")
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambient_recovery_failing_alerts_with_remedy(config, db):
+    # End-to-end job path: a recovery_failing snapshot degrades and alerts, and the
+    # alert text carries both the reason and the recovery-failing remedy hint.
+    scheduler = _make_scheduler(config, db)
+    await _ambient_tick(
+        scheduler,
+        _ambient_snapshot(
+            active_connections=0,
+            recovery_failing=True,
+            failed_reboot_count=2,
+            device_dark_since="2026-06-18T06:00:00+00:00",
+            last_reboot_error="ConnectionError",
+        ),
+    )
+    scheduler._pipeline.submit_raw.assert_called_once()
+    text = scheduler._pipeline.submit_raw.call_args[0][0]
+    assert "auto-recovery exhausted" in text
+    assert "ESPHome API" in text  # the recovery-failing remedy hint
+
+
+@pytest.mark.asyncio
+async def test_drain_does_not_send_a_row_cancelled_after_the_snapshot(config, db):
+    """A cancel landing between drain and send must stop the send.
+
+    `drain` takes a snapshot of up to 20 rows and the loop then sends them one at a
+    time, each costing an LLM draft plus an adapter round-trip — so the snapshot is
+    stale by seconds to minutes. That is exactly when someone cancels: they cancel
+    because the message is about to go out. Without a re-read, cancel() reports
+    "cancelled", the message ships anyway, and the row ends up recorded as BOTH
+    cancelled and delivered — a contradiction no reader can resolve.
+
+    Simulated by cancelling from inside the pipeline's submit, which runs at the
+    same point in the sequence a concurrent cancel would.
+    """
+    from genesis.db.crud import pending_outreach
+
+    first = await pending_outreach.enqueue(
+        db, message="first", category="notification", channel="telegram"
+    )
+    second = await pending_outreach.enqueue(
+        db, message="second — cancelled while the first is in flight",
+        category="notification", channel="telegram",
+    )
+
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    original = pipeline.submit
+
+    async def _submit_then_cancel_the_next(req):
+        # Runs while row 1 is being sent — the real window.
+        await pending_outreach.cancel(db, second)
+        return await original(req)
+
+    pipeline.submit = AsyncMock(side_effect=_submit_then_cancel_the_next)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    sent = [c[0][0].context for c in pipeline.submit.call_args_list]
+    assert any("first" in m for m in sent), "the uncancelled row must still send"
+    assert not any("cancelled while" in m for m in sent), (
+        "the row cancelled after the drain snapshot was still sent — cancel() told "
+        "the caller it was cancelled and the recipient got it anyway"
+    )
+
+    cur = await db.execute(
+        "SELECT delivered, cancelled_at FROM pending_outreach WHERE id = ?", (second,)
+    )
+    row = await cur.fetchone()
+    assert row["cancelled_at"] is not None
+    assert row["delivered"] == 0, (
+        "a cancelled row must not also be marked delivered — that is the "
+        "contradictory record this guard exists to prevent"
+    )
+    assert first  # the id is used only to distinguish the two rows

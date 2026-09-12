@@ -1,0 +1,1540 @@
+"""AccountActivityMonitor — deterministic (no-LLM) watch for EXTERNAL GitHub
+activity on the owner's repos.
+
+Runs every ~2h from the surplus scheduler. It answers one question with `gh`
+calls and no LLM: did a real, external human (not the owner, not a bot/org) act
+on one of the owner's flagship repos — open a PR/issue, comment, post a
+discussion, or reply on one? Genuine external activity is recorded as a
+``github_account_activity`` observation (the 6h digest campaign consumes these);
+a FIRST-TIME external contributor additionally pushes an immediate Telegram ping.
+
+Design notes:
+- **SIBLING to ``ReconGatherer``**, not a method on it — that class has a
+  load-bearing no-push contract. This class pushes (like ``cc_update_analyzer``).
+- **Pipeline is lazy-resolved at tick time** (``GenesisRuntime.instance()``):
+  surplus init runs BEFORE outreach init, so the pipeline does not exist when
+  this monitor is constructed. Its first tick is hours after boot.
+- **run_gh_checked** (not ``run_gh``) so a failed poll is distinguishable from an
+  empty one — a rate-limited poll must NOT advance the cursor (or a contributor
+  who acted during the failed window is lost forever).
+- **created_at, not updated_at.** GitHub's ``?since=`` filters on *updated_at*, so
+  an old issue that is merely edited/closed/labeled re-surfaces and would be
+  mis-recorded as new activity by its ORIGINAL author. We key everything on the
+  immutable ``created_at`` and filter ``cursor < created_at <= watermark`` — so
+  only genuine new contributions count, each with the correct actor.
+- **Watermark cursor.** ``wm`` is captured BEFORE polling; the cursor advances to
+  ``wm`` (not the newest event's ts), so an event created mid-poll — after one
+  feed's request but before another's — is never skipped (it re-fetches next
+  tick; ``since`` is exclusive and event-dedup makes the overlap a no-op).
+- **State:** per-repo cursor in a home-anchored JSON sidecar (mutable,
+  must-never-expire — the ``pr_watch`` precedent); event-dedup + first-contact via
+  the observation-hash primitive (no new table). A non-delivered first-time ping
+  is held in a ``github_ping_pending`` marker and retried each tick until it
+  lands, so a failed delivery never silently burns the first-contact signal.
+- **Modes** (``github_steward_config``): ``off`` / ``observe`` (record, never
+  ping — first-deploy default, seeds the seen-actor set) / ``live`` (ping).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import aiosqlite
+
+from genesis.db.crud import observations
+from genesis.env import genesis_home
+from genesis.recon import github_steward_config as steward_cfg
+from genesis.recon.gh_cli import run_gh_checked
+
+logger = logging.getLogger(__name__)
+
+_SOURCE = "recon"
+_ACTIVITY_TYPE = "github_account_activity"
+_ACTOR_SEEN_TYPE = "github_actor_seen"
+_PENDING_TYPE = "github_ping_pending"
+_GH_TIMEOUT = 20
+_SIDECAR_VERSION = 1
+# Reserved sidecar cursor key for the account-level notifications lane. Safe as a
+# sibling of the per-repo cursors: a real repo key is always "owner/name" (has a
+# "/"), so this "/"-less sentinel can never collide with one, and gather() only
+# ever reads cursors for keys in the resolved repo list — never this one.
+_NOTIF_CURSOR_KEY = "__notifications__"
+
+
+def _now_z() -> str:
+    """UTC now as a ``Z``-suffixed second-precision ISO timestamp — the same
+    shape GitHub returns, so cursor/created_at lexical compares are chronological.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _norm_ts(v: str) -> str:
+    """Normalize a stored timestamp to ``Z`` form. Legacy cursors were written
+    via ``isoformat()`` (``+00:00`` suffix), which sorts WRONG against GitHub's
+    ``Z`` timestamps (``'Z' > '+'``); normalize so comparisons stay correct."""
+    if v.endswith("+00:00"):
+        return v[:-6] + "Z"
+    return v
+
+
+@dataclass(frozen=True)
+class ActivityResult:
+    """Summary of one monitor tick."""
+
+    mode: str = "off"
+    checked_repos: int = 0
+    new_events: int = 0
+    pinged: int = 0
+    errors: int = 0
+    seeded: bool = False
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ActivityEvent:
+    repo: str
+    kind: str  # "pr" | "issue" | "comment" | "discussion" | "discussion_comment"
+    node_id: str
+    actor: str
+    number: int | None
+    title: str
+    url: str
+    created_at: str
+
+
+def _event_hash(repo: str, kind: str, node_id: str) -> str:
+    return hashlib.sha256(f"{repo}:{kind}:{node_id}".encode()).hexdigest()[:32]
+
+
+def _actor_hash(login: str) -> str:
+    return hashlib.sha256(f"actor:{login.lower()}".encode()).hexdigest()[:32]
+
+
+def _pending_hash(login: str) -> str:
+    """Hash namespace for the retry marker — DISTINCT from ``_actor_hash`` so a
+    still-pending actor is never mistaken for an already-seen one (a shared hash
+    would make the first-contact check treat "ping owed" as "already told")."""
+    return hashlib.sha256(f"pending:{login.lower()}".encode()).hexdigest()[:32]
+
+
+class AccountActivityMonitor:
+    """Deterministic external-GitHub-activity watch. See module docstring."""
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        self._db = db
+        self._owner: str | None = None
+        # login(lower) -> is_automation (Bot/Organization or denylisted). Cached
+        # for the process lifetime so we hit users/{login} once per login ever.
+        self._automation_cache: dict[str, bool] = {}
+
+    # ── pipeline (lazy — outreach inits after surplus) ────────────────────
+    def _pipeline(self):
+        try:
+            from genesis.runtime._core import GenesisRuntime
+
+            return GenesisRuntime.instance().outreach_pipeline
+        except Exception:
+            logger.debug("github steward: outreach pipeline not resolvable", exc_info=True)
+            return None
+
+    # ── cursor sidecar (home-anchored; mutable, never-expiring state) ─────
+    def _sidecar_path(self) -> Path:
+        return genesis_home() / "github_steward" / "cursors.json"
+
+    def _load_cursors(self) -> dict[str, str]:
+        path = self._sidecar_path()
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                cur = data.get("cursors", {})
+                return {k: _norm_ts(v) for k, v in cur.items() if isinstance(v, str)}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.warning("github steward: cursor sidecar unreadable — treating as empty")
+        return {}
+
+    def _save_cursors(self, cursors: dict[str, str]) -> None:
+        path = self._sidecar_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"version": _SIDECAR_VERSION, "cursors": cursors}
+            # Atomic write (tmp + rename) — a torn cursor file would reprocess
+            # or skip activity.
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(path)
+        except Exception:
+            logger.warning("github steward: failed to persist cursors", exc_info=True)
+
+    # ── gh helpers ────────────────────────────────────────────────────────
+    async def _resolve_owner(self) -> str | None:
+        if self._owner:
+            return self._owner
+        ok, out = await run_gh_checked("gh", "api", "user", "--jq", ".login", timeout=_GH_TIMEOUT)
+        if ok and out:
+            self._owner = out.strip()
+        return self._owner
+
+    async def _resolve_flagship_repos(self, cfg: dict, owner: str) -> list[str]:
+        """Config list (full ``owner/name``), or auto-select the owner's active
+        public source repos, capped. No install-specific names ship in code."""
+        pinned = steward_cfg.str_list(cfg, "flagship_repos")
+        if pinned:
+            # Normalize bare names to owner/name.
+            return [r if "/" in r else f"{owner}/{r}" for r in pinned]
+        cap = steward_cfg.knob_int(cfg, "auto_select_cap")
+        days = steward_cfg.knob_int(cfg, "auto_select_days")
+        # Fetch more than cap so the recency filter can still yield up to cap.
+        ok, out = await run_gh_checked(
+            "gh",
+            "api",
+            f"users/{owner}/repos?type=owner&sort=pushed&per_page={cap * 2}",
+            "--jq",
+            '.[] | select(.fork==false and .private==false) | "\\(.full_name)\\t\\(.pushed_at)"',
+            timeout=_GH_TIMEOUT,
+        )
+        if not ok or not out:
+            return []
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        selected: list[str] = []
+        for line in out.splitlines():
+            name, _, pushed = line.partition("\t")
+            name, pushed = name.strip(), pushed.strip()
+            if not name or not pushed:
+                continue
+            try:
+                pushed_dt = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if pushed_dt >= cutoff:
+                selected.append(name)
+            if len(selected) >= cap:
+                break
+        return selected
+
+    async def _is_automation(self, login: str, denylist: set[str]) -> bool | None:
+        """True for bots/orgs/denylisted logins, False for confirmed humans, or
+        None when the human/bot verdict can't be resolved (the ``users/{login}``
+        lookup failed). The caller must NOT drop a None-verdict event — it holds
+        the cursor so a transient API failure never loses a possible human. Only
+        confirmed verdicts are cached (per login); an unresolved lookup retries
+        next tick."""
+        key = login.lower()
+        if key in self._automation_cache:
+            return self._automation_cache[key]
+        if login.endswith("[bot]") or key in denylist:
+            self._automation_cache[key] = True
+            return True
+        # run_gh_checked (not run_gh) so a FAILED lookup is distinguishable from a
+        # resolved-but-non-bot type — a rate-limited/timed-out classification must
+        # not masquerade as "confirmed automation" and silently drop the event.
+        ok, out = await run_gh_checked(
+            "gh", "api", f"users/{login}", "--jq", ".type", timeout=_GH_TIMEOUT
+        )
+        if not ok or not out.strip():
+            return None  # unresolved — do NOT cache, do NOT drop; retry next tick
+        verdict = out.strip() in ("Bot", "Organization")
+        self._automation_cache[key] = verdict
+        return verdict
+
+    # ── main tick ─────────────────────────────────────────────────────────
+    async def gather(self) -> ActivityResult:
+        mode = steward_cfg.effective_mode()
+        if mode == "off":
+            return ActivityResult(mode="off")
+
+        cfg = steward_cfg.load_config()
+        owner = await self._resolve_owner()
+        if not owner:
+            logger.warning("github steward: could not resolve owner login — skipping tick")
+            return ActivityResult(mode=mode, errors=1)
+
+        repos = await self._resolve_flagship_repos(cfg, owner)
+        if not repos:
+            # No flagship repos — the repo loop below no-ops, but the account-level
+            # notifications lane is INDEPENDENT of flagship repos and still runs.
+            logger.info("github steward: no flagship repos resolved — notifications-only tick")
+
+        denylist = {d.lower() for d in steward_cfg.str_list(cfg, "automation_denylist")}
+        max_events = steward_cfg.knob_int(cfg, "max_events_per_tick")
+        cursors = self._load_cursors()
+        # Watermark: captured BEFORE any poll. Every cursor advances to this, so
+        # an event created between two feeds' requests can't be skipped.
+        wm = _now_z()
+        result_errors = 0
+        new_events = 0
+        pinged = 0
+        baselined = 0
+        details: list[str] = []
+
+        # Deliver any owed retry pings first (live only) — actor-global, so this
+        # runs independent of which repo produced them.
+        if mode == "live":
+            try:
+                redelivered = await self._drain_pending(mode)
+                if redelivered:
+                    pinged += redelivered
+                    details.append(f"retry: delivered {redelivered} owed ping(s)")
+            except Exception:
+                logger.warning("github steward: pending-drain failed", exc_info=True)
+
+        for repo in repos:
+            since = cursors.get(repo)
+            ok, events = await self._poll_repo(repo, since, owner)
+            if not ok:
+                # Failed poll — do NOT advance the cursor (never lose a
+                # contributor to a rate-limited/timed-out window).
+                result_errors += 1
+                details.append(f"{repo}: poll error (cursor held)")
+                continue
+
+            # Per-repo first sight (no cursor yet) → baseline SILENTLY: seed
+            # seen-actors, no records/pings, cursor := wm. Per-repo, NOT global:
+            # a repo newly entering the auto-select set / newly pinned must
+            # baseline too, else its whole history replays as "new" (ping storm).
+            if since is None:
+                seeded = await self._seed_actors(events)
+                cursors[repo] = wm
+                baselined += 1
+                details.append(f"{repo}: baselined ({seeded} actors seeded)")
+                continue
+
+            # created_at watermark window: strictly after the cursor (exclusive,
+            # like GitHub's `since`), up to and including the watermark. This is
+            # what turns an edited-old-item (old created_at) into a no-op and
+            # defers a mid-poll event (created_at > wm) to the next tick.
+            window = [e for e in events if e.created_at and since < e.created_at <= wm]
+            window.sort(key=lambda e: e.created_at)
+            truncated = len(window) > max_events
+            if truncated:
+                logger.warning(
+                    "github steward: %s had %d in-window events (cap %d) — processing "
+                    "oldest %d; the rest are deferred to the next tick",
+                    repo,
+                    len(window),
+                    max_events,
+                    max_events,
+                )
+            processed = window[:max_events]
+            classify_failed = False
+            for ev in processed:
+                if ev.actor.lower() == owner.lower():
+                    continue
+                auto = await self._is_automation(ev.actor, denylist)
+                if auto is None:
+                    # Human/bot verdict unresolved (lookup failed) — NEVER drop a
+                    # possible human. Flag the repo so its cursor holds and this
+                    # event re-fetches next tick (dedup absorbs any overlap).
+                    classify_failed = True
+                    continue
+                if auto:
+                    continue
+                did_ping = await self._record_event(ev, mode)
+                new_events += 1
+                if did_ping:
+                    pinged += 1
+                    details.append(f"PING {repo}#{ev.number} by {ev.actor} ({ev.kind})")
+
+            # A repo with an unresolved classification holds its cursor entirely
+            # (like a poll error): re-poll next tick when the lookup may succeed.
+            # Already-recorded events dedup, already-pinged actors stay seen, so
+            # re-processing is idempotent.
+            if classify_failed:
+                details.append(f"{repo}: classify unresolved — cursor held")
+                continue
+
+            # Advance the cursor. No truncation → advance to the watermark (the
+            # whole window is done). Truncation → advance only to the newest
+            # PROCESSED created_at that is STRICTLY BEFORE the first deferred
+            # event's ts — because `since` is exclusive, landing ON a split
+            # same-second group would strand the deferred twin. If every
+            # processed event ties that boundary, hold the old cursor (re-fetch
+            # the window next tick — loud, never drops).
+            if not truncated:
+                cursors[repo] = wm
+            elif processed:
+                boundary = window[max_events].created_at
+                safe = [
+                    e.created_at
+                    for e in processed
+                    if e.created_at and boundary and e.created_at < boundary
+                ]
+                cursors[repo] = safe[-1] if safe else since
+
+        # ── Account-level notifications lane (repo-independent; shares wm) ──
+        # Surfaces activity BEYOND the flagship repos: @mentions of the owner
+        # anywhere + responses on the owner's OUTBOUND contributions (issues/PRs
+        # they filed on others' repos). Own cursor under _NOTIF_CURSOR_KEY.
+        notif = steward_cfg.notifications_cfg(cfg)
+        if notif["enabled"]:
+            n_since = cursors.get(_NOTIF_CURSOR_KEY)
+            if n_since is None:
+                # First run → baseline silently: adopt the watermark, do NOT
+                # replay the existing inbox as pings (storm guard, like repos).
+                cursors[_NOTIF_CURSOR_KEY] = wm
+                details.append("notifications: baselined")
+            else:
+                nc, items = await self._poll_notifications(
+                    owner,
+                    n_since,
+                    wm,
+                    notif["reasons"],
+                    denylist,
+                    steward_cfg.knob_int(cfg, "max_notifications_per_tick"),
+                )
+                for item in items:
+                    did = await self._record_notification(item, mode)
+                    new_events += 1
+                    if did:
+                        pinged += 1
+                        details.append(
+                            f"PING notif {item['repo']} ({item['reason']}) by {item['actor']}"
+                        )
+                # next_cursor: the watermark on a clean sweep, a boundary timestamp
+                # on truncation (the newer rest defer to next tick), or None to HOLD
+                # (a transient gh/classification error → re-poll the window next tick;
+                # already-recorded items dedup).
+                if nc is not None:
+                    cursors[_NOTIF_CURSOR_KEY] = nc
+                else:
+                    details.append("notifications: cursor held (error)")
+
+        self._save_cursors(cursors)
+        return ActivityResult(
+            mode=mode,
+            checked_repos=len(repos),
+            new_events=new_events,
+            pinged=pinged,
+            errors=result_errors,
+            seeded=baselined > 0,
+            details=details,
+        )
+
+    async def _poll_repo(
+        self, repo: str, since: str | None, owner: str
+    ) -> tuple[bool, list[ActivityEvent]]:
+        """Poll one repo's issues/PRs, comments, and discussions since the cursor.
+
+        Returns (ok, events). ok=False if ANY sub-poll errored (so the caller
+        holds the cursor). Events are unsorted and carry ``created_at``; the
+        caller applies the ``cursor < created_at <= wm`` window, sorts + caps.
+        Always ``--paginate``: the ``since`` window is usually one page, but a
+        stale cursor (post-downtime) or a busy repo must never silently drop a
+        second page of contributors.
+        """
+        events: list[ActivityEvent] = []
+        since_q = f"since={since}&" if since else ""
+
+        # 1. Issues + PRs (the /issues endpoint returns both; .pull_request marks PRs)
+        ok, out = await run_gh_checked(
+            "gh",
+            "api",
+            f"repos/{repo}/issues?{since_q}state=all&per_page=100&sort=updated&direction=desc",
+            "--paginate",
+            "--slurp",
+            timeout=_GH_TIMEOUT,
+        )
+        if not ok:
+            return False, []
+        for row in _parse_paged(out):
+            actor = (row.get("user") or {}).get("login", "")
+            if not actor:
+                continue
+            kind = "pr" if row.get("pull_request") else "issue"
+            events.append(
+                ActivityEvent(
+                    repo=repo,
+                    kind=kind,
+                    node_id=str(row.get("node_id") or row.get("id")),
+                    actor=actor,
+                    number=row.get("number"),
+                    title=(row.get("title") or "")[:120],
+                    url=row.get("html_url", ""),
+                    created_at=row.get("created_at", ""),
+                )
+            )
+
+        # 2. Issue + PR comments
+        ok, out = await run_gh_checked(
+            "gh",
+            "api",
+            f"repos/{repo}/issues/comments?{since_q}per_page=100&sort=updated&direction=desc",
+            "--paginate",
+            "--slurp",
+            timeout=_GH_TIMEOUT,
+        )
+        if not ok:
+            return False, []
+        for row in _parse_paged(out):
+            actor = (row.get("user") or {}).get("login", "")
+            if not actor:
+                continue
+            events.append(
+                ActivityEvent(
+                    repo=repo,
+                    kind="comment",
+                    node_id=str(row.get("node_id") or row.get("id")),
+                    actor=actor,
+                    number=_issue_num(row.get("issue_url", "")),
+                    title=(row.get("body") or "")[:120],
+                    url=row.get("html_url", ""),
+                    created_at=row.get("created_at", ""),
+                )
+            )
+
+        # 3. Discussions + their comments (GraphQL — REST doesn't cover them)
+        disc_ok, disc_events = await self._poll_discussions(repo, since is None)
+        if not disc_ok:
+            return False, []
+        events.extend(disc_events)
+
+        return True, events
+
+    async def _poll_discussions(
+        self, repo: str, baseline: bool
+    ) -> tuple[bool, list[ActivityEvent]]:
+        """Discussions AND their comments, each as its own event with its own
+        ``createdAt`` + author. The caller applies the created_at window, so a
+        new external REPLY on an old discussion surfaces while an old discussion
+        merely bumped by an owner reply does not.
+        """
+        owner, _, name = repo.partition("/")
+        first = 100 if baseline else 25
+        # Concatenate `first` (avoid f-string brace-escaping against GraphQL {}).
+        query = (
+            "query($o:String!,$n:String!){repository(owner:$o,name:$n){"
+            "discussions(first:" + str(first) + ",orderBy:{field:UPDATED_AT,direction:DESC}){"
+            "nodes{number title createdAt url id author{login} "
+            "comments(last:20){nodes{id createdAt url author{login}}}}}}}"
+        )
+        ok, out = await run_gh_checked(
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"o={owner}",
+            "-F",
+            f"n={name}",
+            timeout=_GH_TIMEOUT,
+        )
+        if not ok:
+            return False, []
+        events: list[ActivityEvent] = []
+        try:
+            nodes = (
+                json.loads(out)
+                .get("data", {})
+                .get("repository", {})
+                .get("discussions", {})
+                .get("nodes", [])
+            ) or []
+        except Exception:
+            return True, []  # malformed graphql payload — treat as no discussions
+        for node in nodes:
+            number = node.get("number")
+            title = (node.get("title") or "")[:120]
+            d_actor = (node.get("author") or {}).get("login", "")
+            if d_actor:
+                events.append(
+                    ActivityEvent(
+                        repo=repo,
+                        kind="discussion",
+                        node_id=str(node.get("id")),
+                        actor=d_actor,
+                        number=number,
+                        title=title,
+                        url=node.get("url", ""),
+                        created_at=node.get("createdAt", ""),
+                    )
+                )
+            for c in (node.get("comments") or {}).get("nodes", []) or []:
+                c_actor = (c.get("author") or {}).get("login", "")
+                if not c_actor:
+                    continue
+                events.append(
+                    ActivityEvent(
+                        repo=repo,
+                        kind="discussion_comment",
+                        node_id=str(c.get("id")),
+                        actor=c_actor,
+                        number=number,
+                        title=title,
+                        url=c.get("url", ""),
+                        created_at=c.get("createdAt", ""),
+                    )
+                )
+        return True, events
+
+    async def _seed_actors(self, events: list[ActivityEvent]) -> int:
+        """First-run baseline: mark every actor seen (no pings, no records)."""
+        seeded = 0
+        for ev in events:
+            h = _actor_hash(ev.actor)
+            if not await observations.exists_by_hash(self._db, source=_SOURCE, content_hash=h):
+                await observations.create(
+                    self._db,
+                    id=uuid.uuid4().hex,
+                    source=_SOURCE,
+                    type=_ACTOR_SEEN_TYPE,
+                    content=f"seen:{ev.actor}",
+                    priority="low",
+                    created_at=_now_z(),
+                    content_hash=h,
+                    skip_if_duplicate=True,
+                )
+                seeded += 1
+        return seeded
+
+    async def _record_event(self, ev: ActivityEvent, mode: str) -> bool:
+        """Record an external-activity observation; ping iff first-contact + live.
+
+        First-contact is collapsed to the ACTOR across both the seen-marker and
+        the pending-marker: a returning contributor OR a still-pending one never
+        re-pings. Returns True iff a ping was DELIVERED this call.
+        """
+        ev_hash = _event_hash(ev.repo, ev.kind, ev.node_id)
+        # Dedup: already processed this exact event → nothing to do.
+        if await observations.exists_by_hash(self._db, source=_SOURCE, content_hash=ev_hash):
+            return False
+
+        actor_h = _actor_hash(ev.actor)
+        pending_h = _pending_hash(ev.actor)
+        # Contact owed unless we have already told them (seen) or currently have a
+        # retry queued for them (pending). The seen-marker is checked across ALL
+        # rows (permanent — a contributor never decays back to first-time, even
+        # after its 90d row is TTL-resolved). The pending-marker is checked
+        # UNRESOLVED-ONLY: once the daily TTL sweep resolves an abandoned (never
+        # delivered) pending row, it must STOP suppressing — otherwise a resolved
+        # row would read as "already contacted" forever and the contributor could
+        # never be pinged again. An expired pending re-arms first-contact.
+        seen = await observations.exists_by_hash(self._db, source=_SOURCE, content_hash=actor_h)
+        pending = await observations.exists_by_hash(
+            self._db, source=_SOURCE, content_hash=pending_h, unresolved_only=True
+        )
+        first_time = not (seen or pending)
+
+        now = _now_z()
+        summary = json.dumps(
+            {
+                "repo": ev.repo,
+                "kind": ev.kind,
+                "actor": ev.actor,
+                "number": ev.number,
+                "title": ev.title,
+                "url": ev.url,
+                "first_time": first_time,
+            }
+        )
+        # Always record the activity observation — the durable record the 6h
+        # digest consumes (dedup by event hash).
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_ACTIVITY_TYPE,
+            content=summary,
+            priority="medium" if first_time else "low",
+            created_at=now,
+            content_hash=ev_hash,
+            skip_if_duplicate=True,
+        )
+
+        if not first_time:
+            return False
+
+        if mode != "live":
+            # Observe: seed the seen-marker (no ping expected), so the eventual
+            # live flip does not treat this actor as first-time.
+            await self._mark_seen(ev.actor, now)
+            return False
+
+        # Live first-contact: attempt the ping.
+        if await self._ping(ev):
+            await self._mark_seen(ev.actor, now)
+            return True
+
+        # Not delivered — queue a durable retry (do NOT mark seen; the actor
+        # stays owed a ping until one lands). Keyed by actor, so a second event
+        # by the same actor while pending neither re-pings nor duplicates this.
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_PENDING_TYPE,
+            content=json.dumps(self._ping_payload(ev)),
+            priority="medium",
+            created_at=now,
+            content_hash=pending_h,
+            skip_if_duplicate=True,
+        )
+        return False
+
+    async def _mark_seen(self, actor: str, now: str) -> None:
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_ACTOR_SEEN_TYPE,
+            content=f"seen:{actor}",
+            priority="low",
+            created_at=now,
+            content_hash=_actor_hash(actor),
+            skip_if_duplicate=True,
+        )
+
+    @staticmethod
+    def _ping_payload(ev: ActivityEvent) -> dict:
+        return {
+            "repo": ev.repo,
+            "kind": ev.kind,
+            "node_id": ev.node_id,
+            "actor": ev.actor,
+            "number": ev.number,
+            "title": ev.title,
+            "url": ev.url,
+        }
+
+    async def _drain_pending(self, mode: str) -> int:
+        """Re-attempt owed first-time pings. On delivery, mark the actor seen and
+        resolve the pending marker; otherwise leave it for the next tick. Returns
+        the count delivered this call."""
+        rows = await observations.query(
+            self._db, source=_SOURCE, type=_PENDING_TYPE, resolved=False, limit=100
+        )
+        delivered = 0
+        for row in rows:
+            try:
+                payload = json.loads(row["content"])
+            except Exception:
+                continue
+            actor = payload.get("actor", "")
+            if not actor:
+                continue
+            pending_h = _pending_hash(actor)
+            # Defensive: an actor seen via another path → resolve the stale
+            # pending WITHOUT a duplicate ping.
+            if await observations.exists_by_hash(
+                self._db, source=_SOURCE, content_hash=_actor_hash(actor)
+            ):
+                await observations.resolve_by_content_hash(
+                    self._db,
+                    source=_SOURCE,
+                    content_hash=pending_h,
+                    resolved_at=_now_z(),
+                    resolution_notes="actor already seen",
+                )
+                continue
+            ev = ActivityEvent(
+                repo=payload.get("repo", ""),
+                kind=payload.get("kind", ""),
+                node_id=str(payload.get("node_id", "")),
+                actor=actor,
+                number=payload.get("number"),
+                title=payload.get("title", ""),
+                url=payload.get("url", ""),
+                created_at="",
+            )
+            if await self._ping(ev):
+                await self._mark_seen(actor, _now_z())
+                await observations.resolve_by_content_hash(
+                    self._db,
+                    source=_SOURCE,
+                    content_hash=pending_h,
+                    resolved_at=_now_z(),
+                    resolution_notes="retry delivered",
+                )
+                delivered += 1
+            # else: leave the pending row unresolved — retried next tick.
+        return delivered
+
+    async def _ping(self, ev: ActivityEvent) -> bool:
+        """Send the first-time-contributor ping. Returns True ONLY on a confirmed
+        DELIVERED result — a FAILED/IGNORED/REJECTED verdict (submit_raw does not
+        raise on these) must not count as delivered."""
+        pipeline = self._pipeline()
+        if pipeline is None:
+            logger.warning("github steward: pipeline unavailable — cannot ping %s", ev.actor)
+            return False
+        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+
+        verb = {
+            "pr": "opened PR",
+            "issue": "opened issue",
+            "comment": "commented on",
+            "discussion": "started discussion",
+            "discussion_comment": "replied on discussion",
+        }.get(ev.kind, "acted on")
+        num = f"#{ev.number}" if ev.number else ""
+        text = f"👋 First-time contributor: {ev.actor} {verb} {ev.repo}{num}\n{ev.title}".strip()
+        if ev.url:
+            text += f"\n{ev.url}"
+        request = OutreachRequest(
+            category=OutreachCategory.NOTIFICATION,
+            channel="telegram",
+            # Unique per event so two distinct contributors don't dedup to one ping.
+            topic=f"GitHub steward: {ev.actor} {ev.kind} {ev.repo}{num}",
+            context=text,
+            signal_type="github_account_activity",
+            salience_score=0.9,
+            verbatim=True,
+        )
+        try:
+            result = await pipeline.submit_raw(text, request)
+        except Exception:
+            logger.error("github steward: ping failed for %s", ev.actor, exc_info=True)
+            return False
+        if result is not None and result.status == OutreachStatus.DELIVERED:
+            logger.info("github steward: pinged first-time contributor %s on %s", ev.actor, ev.repo)
+            return True
+        logger.warning(
+            "github steward: ping to %s not delivered (status=%s) — will retry",
+            ev.actor,
+            getattr(result, "status", None),
+        )
+        return False
+
+    # ── account-level notifications lane ──────────────────────────────────
+    async def _poll_notifications(
+        self,
+        owner: str,
+        since: str,
+        wm: str,
+        reasons: set[str],
+        denylist: set[str],
+        max_events: int,
+    ) -> tuple[str | None, list[dict]]:
+        """Poll the account notifications feed for the configured ``reason``s.
+
+        Returns ``(next_cursor, items)``. ``next_cursor`` is the value to store:
+        the watermark ``wm`` on a clean full sweep; the last-examined item's
+        timestamp on truncation (the newer rest defer to the next tick); or
+        ``None`` to HOLD the cursor (a transient gh/classification error — the
+        window re-polls next tick and already-recorded ``items`` dedup by hash).
+        ``items`` are the external-human notifications to record — owner/bot
+        actors, out-of-window items, and (unsupported) Discussion subjects are
+        filtered out here.
+        """
+        ok, out = await run_gh_checked(
+            "gh",
+            "api",
+            f"notifications?all=true&since={since}&per_page=100",
+            "--paginate",
+            "--slurp",
+            timeout=_GH_TIMEOUT,
+        )
+        if not ok:
+            return None, []  # feed poll failed → hold the cursor
+
+        # Candidate window: reason + updated_at window + owner-repo filter for
+        # author/subscribed. Sorted OLDEST-first so a truncating cap makes forward
+        # progress (process the oldest, advance to that boundary, defer the newer).
+        candidates: list[dict] = []
+        for n in _parse_paged(out):
+            reason = n.get("reason", "")
+            if reason not in reasons:
+                continue
+            updated = n.get("updated_at", "")
+            # updated_at window: strictly after the cursor (exclusive), up to wm.
+            if not (updated and since < updated <= wm):
+                continue
+            repo_obj = n.get("repository") or {}
+            repo = repo_obj.get("full_name", "")
+            if not repo:
+                continue
+            repo_owner = (repo_obj.get("owner") or {}).get("login", "")
+            # author/subscribed are only interesting on repos the owner does NOT
+            # own — an owner-repo one is self-activity the deep-poll already has.
+            if (
+                reason in steward_cfg.OWNED_ONLY_NOTIFICATION_REASONS
+                and repo_owner.lower() == owner.lower()
+            ):
+                continue
+            candidates.append(
+                {
+                    "reason": reason,
+                    "repo": repo,
+                    "updated": updated,
+                    "thread_id": str(n.get("id", "")),
+                    "subject": n.get("subject") or {},
+                }
+            )
+        candidates.sort(key=lambda c: c["updated"])
+        truncated = len(candidates) > max_events
+        if truncated:
+            logger.warning(
+                "github steward: %d in-window notifications (cap %d) — processing the "
+                "oldest %d, deferring the newer rest to the next tick",
+                len(candidates),
+                max_events,
+                max_events,
+            )
+        work = candidates[:max_events]
+        over_cap_tie = False
+        if truncated:
+            # Extend through the WHOLE tie group at the boundary. `since` is
+            # exclusive and these timestamps are second-precision, so a cursor can
+            # only advance to a value strictly below the first deferred item; if
+            # every processed item ties that value there is nowhere to advance to,
+            # the cursor holds, and the same slice is re-selected every tick while
+            # dedup hides the repetition — the later tied items never processed at
+            # all. Taking the whole tie group costs a bounded overrun (one second
+            # of notifications) and guarantees forward progress. Reachable in
+            # practice because this lane's cap is deliberately small.
+            boundary_ts = candidates[max_events]["updated"]
+            if all(c["updated"] == boundary_ts for c in work):
+                tie = [c for c in candidates if c["updated"] <= boundary_ts]
+                # Bounded: the extension exists to let the cursor move, not to
+                # let one tick process an unbounded batch. Past the hard cap the
+                # cursor advances PAST the tied second anyway and the remainder
+                # is skipped LOUDLY — a declared loss beats a silent stall, and
+                # beats a tick that outruns its own cadence.
+                hard_cap = max_events * 4
+                if len(tie) > hard_cap:
+                    logger.error(
+                        "github steward: %d notifications tie at %s (hard cap %d) — "
+                        "processing %d and ADVANCING PAST that second; %d tied "
+                        "notifications are skipped and will not be retried",
+                        len(tie),
+                        boundary_ts,
+                        hard_cap,
+                        hard_cap,
+                        len(tie) - hard_cap,
+                    )
+                    tie = tie[:hard_cap]
+                    over_cap_tie = True
+                else:
+                    logger.warning(
+                        "github steward: %d notifications tie at %s across the cap — "
+                        "processing the whole tie group so the cursor can advance",
+                        len(tie),
+                        boundary_ts,
+                    )
+                work = tie
+
+        # Per-item failures NEVER hold the account-level cursor (one bad item — a
+        # deleted comment, a discussion, a malformed payload — must not freeze the
+        # whole lane). Unresolvable/unsupported items are recorded digest-only
+        # (ping=False) so nothing is silently lost; the cursor always advances.
+        items: list[dict] = []
+        for c in work:
+            subject = c["subject"]
+            base = {
+                "repo": c["repo"],
+                "reason": c["reason"],
+                "thread_id": c["thread_id"],
+                "updated_at": c["updated"],
+                "number": _issue_num(subject.get("url", "")),
+                "title": (subject.get("title") or "")[:120],
+                "url": _api_to_html_url(subject.get("url", "")),
+            }
+            if subject.get("type") == "Discussion":
+                # GraphQL-only actor — record for the digest, no ping (follow-up).
+                items.append({**base, "actor": "", "ping": False})
+                continue
+            actor, complete = await self._window_actor(
+                subject, owner, denylist, since=since, until=c["updated"]
+            )
+            if actor:
+                items.append({**base, "actor": actor, "ping": True})
+            elif not complete:
+                # A surface could not be read, so "nobody else acted" is UNPROVEN.
+                # Keep it as a digest row rather than dropping on missing evidence.
+                items.append({**base, "actor": "", "ping": False})
+            else:
+                # Nobody but the owner and/or automation acted in this window.
+                # This is the reported defect: the steward notifying its owner
+                # about the owner's own traffic on their own threads.
+                logger.debug("github steward: dropping self/bot-only update on %s", c["repo"])
+
+        # Advance the cursor. Clean sweep → wm. Truncation → the newest processed
+        # timestamp STRICTLY BEFORE the first deferred item (tie-safe: advancing to
+        # a same-second boundary would strand the deferred twin, since `since` is
+        # exclusive); if the whole batch ties the boundary, hold at `since` and
+        # re-poll next tick.
+        if not truncated:
+            return wm, items
+        # `work` may have been extended through the boundary tie above, so derive
+        # the deferred boundary from what was actually processed rather than from
+        # the cap index.
+        if over_cap_tie:
+            # The tie was cut short, so nothing before or at that second will be
+            # retried. Advance to it rather than holding: holding re-selects the
+            # same slice forever, which is the stall this block exists to avoid.
+            return work[-1]["updated"], items
+        deferred = [c["updated"] for c in candidates if c not in work]
+        if not deferred:
+            return wm, items  # the extension consumed everything after all
+        # min, not max: `since` is exclusive, so advancing past a deferred item's
+        # timestamp strands it permanently.
+        boundary = min(deferred)
+        safe = [c["updated"] for c in work if c["updated"] < boundary]
+        return (safe[-1] if safe else since), items
+
+    async def _window_actor(
+        self,
+        subject: dict,
+        owner: str,
+        denylist: set[str],
+        *,
+        since: str,
+        until: str,
+    ) -> tuple[str | None, bool]:
+        """Who, other than the owner and automation, acted on this thread this window.
+
+        This deliberately does NOT ask who wrote the ``@`` text. Attributing a
+        mention means reconstructing GitHub's own rendering rules from raw
+        Markdown, against an API that exposes no mention events and no edit
+        history — escaped literals, code fences, ``@org/team`` handles and edited
+        bodies each defeat it, and every fix for one of those opened another. The
+        question the owner actually asked is narrower and directly answerable:
+        did somebody ELSE do something here.
+
+        Returns ``(login, complete)``:
+        * ``(login, True)``  — a real external human acted; ping-worthy.
+        * ``(None, True)``   — nobody but the owner and/or bots acted; the caller
+          drops it as self-activity, which is the whole point of the change.
+        * ``(None, False)``  — a surface could not be read, so ABSENCE is not
+          established. The caller keeps it as a digest row rather than dropping on
+          missing evidence.
+
+        An event counts as in-window at ``max(created_at, updated_at)``: editing a
+        comment IS acting on the thread, and GitHub bumps the notification for it,
+        so keying on creation alone would silently drop a whole class of update.
+        Capped at ``until`` so an edit landing after this notification cannot
+        retroactively change what the notification was about.
+        """
+        rows, certain = await self._thread_comments(subject)
+        # Scan BEFORE consulting `certain`: certainty is required only for the
+        # NEGATIVE conclusion. Evidence already in hand still proves someone
+        # acted, and returning early would let one flaky call out of five
+        # suppress a real contributor's ping.
+        # A row we cannot place in time is INVISIBLE to the filter below — it can
+        # neither prove nor disprove that somebody acted. Silently vanishing is
+        # how a commit-message mention got dropped, so an unreadable timestamp
+        # becomes uncertainty here rather than an absence downstream.
+        if any(not _has_readable_time(r) and not _is_understood_shape(r) for r in rows):
+            certain = False
+
+        in_window = [(t, r) for r in rows if (t := _in_window_time(r, since, until))]
+        # A commit's only timestamp says when it was AUTHORED, never when it was
+        # PUSHED, and the push is what raised this notification. A cherry-pick, a
+        # rebase or a long-held local branch keeps a date from well before it. So
+        # a commit row landing outside the window has answered nothing, and
+        # dropping on it would assert a negative from a timestamp that never
+        # addressed the question. Digest instead.
+        if any(r.get(_COMMIT_DATE_FLAG) and not _in_window_time(r, since, until) for r in rows):
+            certain = False
+
+        # Newest first, by the timestamp that actually falls inside the window.
+        in_window.sort(key=lambda pair: pair[0], reverse=True)
+        for _, row in in_window:
+            login, understood = _row_actor(row)
+            if not understood:
+                # A shape we have not modelled. Every payload this code has been
+                # wrong about was wrong by reading an unrecognised row as one that
+                # did not happen; unrecognised now means we do not know.
+                certain = False
+                continue
+            if not login:
+                continue  # positively known to testify to nobody acting
+            if login.lower() == owner.lower():
+                continue
+            auto = await self._is_automation(login, denylist)
+            if auto is True:
+                continue
+            # auto is None → the human/bot lookup failed. Surface rather than
+            # drop: a classification blip must never silence a contributor.
+            logger.debug("github steward: window actor %s (automation=%s)", login, auto)
+            return login, True
+        # Nothing found. Claiming ABSENCE means asserting a negative, so it is
+        # allowed only when EVERY input was interpretable: every surface read,
+        # every payload parsed, every in-window row attributed. Anything else is
+        # ignorance, and ignorance keeps the digest row.
+        logger.debug("github steward: no external actor in window (certain=%s)", certain)
+        return None, certain
+
+    async def _thread_comments(self, subject: dict) -> tuple[list[dict], bool]:
+        """Every comment on a notification's thread, and whether the read is WHOLE.
+
+        Surfaces are chosen by ``subject.type``, NOT by matching substrings in the
+        URL: a repository (or owner) named ``pulls`` or ``issues`` makes a
+        substring test pick the wrong branch, request an endpoint that does not
+        exist, and mark the whole read incomplete. The type field is what GitHub
+        actually promises.
+
+        A pull request carries THREE disjoint text surfaces — inline review
+        comments under ``/pulls/{n}/comments``, conversation comments under
+        ``/issues/{n}/comments``, and review SUMMARY bodies under
+        ``/pulls/{n}/reviews``. The flagship deep-poll reads only the second
+        (VERIFIED: those two id spaces do not intersect). A commit carries its own
+        ``/commits/{sha}/comments``. Discussions are GraphQL-only and are handled
+        by the caller before reaching here.
+
+        Always ``--paginate``, matching ``_poll_repo``'s own rule: these endpoints
+        return OLDEST first and the conversation surface ignores ``direction``, so
+        a single-page read of a busy thread would silently return the oldest 100.
+
+        Returns ``(rows, complete)``. ``complete`` is False when any surface failed
+        to read, so the caller can decline to conclude ABSENCE from a partial read.
+        The thread itself is included as an event: opening a pull request is an
+        action by its author, and on a freshly-opened thread it is the only one.
+        """
+        subject_url = subject.get("url") or ""
+        stype = subject.get("type") or ""
+        urls: list[str] = []
+        issue_url = _pull_url_to_issue_url(subject_url)
+        if stype == "PullRequest":
+            urls.append(f"{subject_url}/comments")  # inline review comments
+            urls.append(f"{issue_url}/comments")  # conversation comments
+            urls.append(f"{subject_url}/reviews")  # review SUMMARY bodies
+            urls.append(f"{issue_url}/timeline")  # merges, closes, pushes, assigns
+        elif stype == "Issue":
+            urls.append(f"{issue_url}/comments")
+            urls.append(f"{issue_url}/timeline")
+        elif stype == "Commit":
+            urls.append(f"{subject_url}/comments")
+        if not subject_url or not urls:
+            # An unmodelled subject type: we cannot enumerate its surfaces, so we
+            # cannot claim nobody acted. Incomplete, not empty — never "absent".
+            return [], False
+
+        rows: list[dict] = []
+        complete = True
+        # ACCEPTED COST (Codex round 4, P2): `--paginate` walks every page of
+        # every surface before the window filter runs, so a thread with a very
+        # long history costs pages proportional to its whole life rather than to
+        # this window. Not fixed here, for two reasons. It fails SAFE: the shared
+        # timeout returns `ok=False`, which sets `complete=False` and yields a
+        # digest row, never a drop. And the server-side remedy is partial —
+        # `issues/{n}/comments` and `pulls/{n}/comments` accept `since`, but the
+        # timeline and reviews endpoints do not, so two of four surfaces stay
+        # unbounded and the change would buy an inconsistent read for no change
+        # in the failure mode.
+        # Bounded meanwhile by `max_notifications_per_tick` (25) threads a tick.
+        for url in urls:
+            ok, out = await run_gh_checked(
+                "gh", "api", f"{url}?per_page=100", "--paginate", "--slurp", timeout=_GH_TIMEOUT
+            )
+            if not ok:
+                complete = False  # never holds the cursor; only withholds a verdict
+                continue
+            page_rows, parsed = _parse_paged_checked(out)
+            if not parsed:
+                # Exit zero with an unreadable body. An empty list here would be
+                # indistinguishable from a surface that genuinely had nothing.
+                logger.warning("github steward: unreadable payload from %s", url)
+                complete = False
+            rows.extend(page_rows)
+
+        # The thread itself — its author acted when they opened it.
+        ok, out = await run_gh_checked("gh", "api", subject_url, timeout=_GH_TIMEOUT)
+        if not ok:
+            return rows, False
+        try:
+            thread = json.loads(out)
+        except Exception:
+            logger.warning(
+                "github steward: thread object unreadable for %s", subject_url, exc_info=True
+            )
+            return rows, False
+        if isinstance(thread, dict) and stype == "Commit" and not _has_readable_time(thread):
+            # A commit object carries no top-level created_at/updated_at — its
+            # date is at commit.author.date (VERIFIED live). Without this the row
+            # can never enter the window, and an @-mention in a commit MESSAGE is
+            # dropped as though nobody acted.
+            meta = thread.get("commit") or {}
+            # COMMITTER first, author second. A cherry-pick and a rebase both
+            # RESET the committer date to the rewrite, while the author date
+            # survives from the original — so the committer date is wrong in
+            # strictly fewer cases. MEASURED on this repo: the two differ on 6
+            # of the last 200 commits. Neither IS the push time, which the
+            # payload does not carry at all; hence the flag, read by
+            # `_window_actor`. Inside the window it attributes. Outside it, it
+            # testifies to nothing.
+            for field in ("committer", "author"):
+                stamp = (meta.get(field) or {}).get("date")
+                if isinstance(stamp, str) and stamp:
+                    thread = {**thread, "created_at": stamp, _COMMIT_DATE_FLAG: True}
+                    break
+        if not isinstance(thread, dict):
+            # `null` parses fine and is not a dict. Without the author row we
+            # cannot claim nobody acted, so this is incomplete, not empty.
+            logger.warning("github steward: thread object was not an object: %s", subject_url)
+            return rows, False
+        rows.append({**thread, _THREAD_ROW_FLAG: True})
+        return rows, complete
+
+    async def _record_notification(self, item: dict, mode: str) -> bool:
+        """Record a notification observation; ping immediately in ``live`` mode.
+
+        Unlike :meth:`_record_event` this is NOT first-contact-gated — every
+        distinct notification update (deduped by thread id + updated_at) is
+        signal, and BOTH mentions and author-responses ping. A failed ping is not
+        retried durably: the observation is always recorded, so the 6h digest is
+        the fallback surface. Returns True iff a ping was DELIVERED this call.
+        """
+        ev_hash = _event_hash(
+            item["repo"], "notification", f"{item['thread_id']}:{item['updated_at']}"
+        )
+        if await observations.exists_by_hash(self._db, source=_SOURCE, content_hash=ev_hash):
+            return False
+        content = json.dumps(
+            {
+                "repo": item["repo"],
+                "kind": f"notification_{item['reason']}",
+                "reason": item["reason"],
+                "actor": item["actor"],
+                "number": item["number"],
+                "title": item["title"],
+                "url": item["url"],
+                "first_time": False,
+            }
+        )
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_ACTIVITY_TYPE,
+            content=content,
+            priority="medium",
+            created_at=_now_z(),
+            content_hash=ev_hash,
+            skip_if_duplicate=True,
+        )
+        # Ping only externally-attributable items (item["ping"]); Discussion /
+        # unresolved-actor / owner-latest items are recorded digest-only.
+        if mode == "live" and item.get("ping"):
+            return await self._ping_notification(item)
+        return False
+
+    async def _ping_notification(self, item: dict) -> bool:
+        """Immediate Telegram ping for a mention / outbound-contribution response.
+        Returns True ONLY on a confirmed DELIVERED result."""
+        pipeline = self._pipeline()
+        if pipeline is None:
+            logger.warning("github steward: pipeline unavailable — cannot ping notification")
+            return False
+        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+
+        num = f"#{item['number']}" if item["number"] else ""
+        # `actor` is the newest non-owner human who ACTED in this notification's
+        # window, and knowably NOT whoever wrote the @-mention: the resolver was
+        # rewritten to ask the answerable question. GitHub's `reason` is sticky,
+        # so a thread Alice mentioned the owner in still reports `mention` when
+        # Bob merges it a week later. "Bob mentioned you" is then a claim this
+        # lane cannot support; what it measured is that Bob acted.
+        if item["reason"] in ("mention", "team_mention"):
+            lead = f"💬 {item['actor']} acted on a thread that mentions you in {item['repo']}{num}"
+        elif item["reason"] == "author":
+            lead = f"📨 {item['actor']} acted on your {item['repo']}{num}"
+        else:
+            # `reasons` is an operator-editable allowlist, so a reason this lane
+            # has no wording for can reach here. A bare `else` would claim the
+            # thread is the owner's, which only `author` establishes. Say what
+            # the feed said and name the reason rather than inventing a relation.
+            lead = f"📨 {item['actor']} acted on {item['repo']}{num} ({item['reason']})"
+        text = lead
+        if item["title"]:
+            text += f"\n{item['title']}"
+        if item["url"]:
+            text += f"\n{item['url']}"
+        request = OutreachRequest(
+            category=OutreachCategory.NOTIFICATION,
+            channel="telegram",
+            topic=f"GitHub steward: {item['actor']} {item['reason']} {item['repo']}{num}",
+            context=text,
+            signal_type="github_account_activity",
+            salience_score=0.9,
+            verbatim=True,
+        )
+        try:
+            result = await pipeline.submit_raw(text, request)
+        except Exception:
+            logger.error("github steward: notification ping failed", exc_info=True)
+            return False
+        if result is not None and result.status == OutreachStatus.DELIVERED:
+            logger.info(
+                "github steward: pinged notification (%s) by %s on %s",
+                item["reason"],
+                item["actor"],
+                item["repo"],
+            )
+            return True
+        logger.warning(
+            "github steward: notification ping not delivered (status=%s)",
+            getattr(result, "status", None),
+        )
+        return False
+
+
+# ── module helpers ────────────────────────────────────────────────────────
+def _parse_json_list(out: str) -> list[dict]:
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _parse_paged(out: str) -> list[dict]:
+    """Flatten a ``gh api --paginate --slurp`` payload into a flat list of rows.
+
+    Kept for callers that only want the rows. Where the difference between "this
+    page was empty" and "this payload could not be read" matters, use
+    :func:`_parse_paged_checked` — conflating the two lets a malformed response
+    that exited zero pass for a successfully-read empty surface.
+    """
+    return _parse_paged_checked(out)[0]
+
+
+def _parse_paged_checked(out: str) -> tuple[list[dict], bool]:
+    """``(rows, ok)``. ``ok`` is False when the payload could not be interpreted.
+
+    An empty string is a legitimately empty read (ok). Anything that fails to
+    parse, or parses to something that is not an array of rows/pages, is NOT —
+    and on the notifications path a silently-empty surface would be read as
+    proof that nobody acted.
+    """
+    if not out:
+        return [], True
+    try:
+        data = json.loads(out)
+    except Exception:
+        return [], False
+    if not isinstance(data, list):
+        return [], False
+    flat: list[dict] = []
+    for item in data:
+        if isinstance(item, list):
+            flat.extend(x for x in item if isinstance(x, dict))
+        elif isinstance(item, dict):
+            flat.append(item)
+    return flat, True
+
+
+# The timestamps a thread event may carry, by surface: comments and the thread
+# object use created_at/updated_at, a review uses submitted_at, a timeline event
+# uses created_at only.
+_EVENT_TIME_KEYS = ("created_at", "updated_at", "submitted_at")
+# Marks the appended thread object so its `updated_at` — which moves whenever
+# ANYBODY touches the thread — is never credited to the thread's author.
+_THREAD_ROW_FLAG = "__genesis_thread_row__"
+# Marks a thread row whose `created_at` we substituted from the commit's own
+# committer/author date, because a commit object carries no timestamp of its own.
+_COMMIT_DATE_FLAG = "__genesis_commit_date__"
+
+# Timeline events whose `.actor` is the person the event happened TO, not the
+# person who did anything. GitHub emits one per recipient the instant somebody
+# else writes an @-mention, so reading `.actor` here reports the mentioned user
+# as having acted — the owner mentioning a third party would ping that third
+# party about the owner's own comment. MEASURED on a live timeline: a comment by
+# one login at :55, three `mentioned` rows naming three OTHER logins at :56.
+_RECIPIENT_ACTOR_EVENTS = frozenset({"mentioned", "subscribed", "unsubscribed"})
+
+# Timeline events whose `.actor` DID the thing — the closed set we are willing to
+# attribute. Anything outside both sets is a shape we have not modelled, and the
+# rule for an unmodelled shape is uncertainty, never a confident reading.
+# Timeline events we UNDERSTAND and which carry no attributable identity. A
+# `committed` row is a push: MEASURED live it has no `.actor`, no `.created_at`,
+# and an `author` of {name, email, date} carrying no login. Knowing a shape has
+# no identity is NOT the same as never having seen it, and conflating the two is
+# what made the drop unreachable — every one of this install's 9 sampled pull
+# requests carries 2-16 `committed` rows, so treating them as unknown made every
+# pull request permanently uncertain.
+#
+# COST, stated because it is real: an external contributor whose ONLY action in a
+# window is pushing commits is not attributable from this surface, and that
+# window reads as empty. A force-push emits `head_ref_force_pushed`, which does
+# carry `.actor`, so the exposed case is an ordinary push with no comment, review
+# or thread-open in the same window.
+#
+# The SIBLING cost, ruled the other way on purpose. A `Commit` SUBJECT carries an
+# identity but no push time, so `_thread_comments` substitutes the committer date
+# and `_window_actor` treats a substituted date outside the window as UNCERTAIN
+# rather than absent. The two rulings differ because the evidence differs: a
+# `committed` row is positively known to name nobody, whereas a commit subject
+# whose every readable surface falls outside the window leaves the notification
+# itself unexplained, and an unexplained notification is not an empty one.
+# Ruling both UNCERTAIN would make every pull request carrying a `committed` row
+# permanently uncertain and put the drop out of reach, which is the failure this
+# frozenset exists to prevent. Residual exposure: a commit held locally long
+# enough that BOTH its dates predate the window still reads as uncertain, so it
+# yields a digest row rather than a drop. MEASURED 2026-09-10: 0 of 1488
+# notifications in this account's readable feed carry a `Commit` subject at all
+# (`all=true`, 30 pages; GitHub prunes old read rows, so that is the readable
+# feed and not all history).
+_IDENTITY_FREE_EVENTS = frozenset({"committed"})
+
+_DOER_ACTOR_EVENTS = frozenset(
+    {
+        "commented",
+        "reviewed",
+        "merged",
+        "closed",
+        "reopened",
+        "assigned",
+        "unassigned",
+        "labeled",
+        "unlabeled",
+        "milestoned",
+        "demilestoned",
+        "renamed",
+        "locked",
+        "unlocked",
+        "pinned",
+        "unpinned",
+        "transferred",
+        "head_ref_force_pushed",
+        "head_ref_deleted",
+        "head_ref_restored",
+        "base_ref_changed",
+        "ready_for_review",
+        "convert_to_draft",
+        "review_requested",
+        "review_request_removed",
+        "review_dismissed",
+        "referenced",
+        "cross-referenced",
+        "connected",
+        "disconnected",
+        "added_to_project",
+        "removed_from_project",
+        "moved_columns_in_project",
+        "converted_note_to_issue",
+        "marked_as_duplicate",
+        "unmarked_as_duplicate",
+        "user_blocked",
+        "deployed",
+        "auto_merge_enabled",
+        "auto_merge_disabled",
+    }
+)
+
+
+def _row_actor(row: dict) -> tuple[str, bool]:
+    """``(login, understood)`` — who acted, and whether we know that we know.
+
+    Not one field: a comment or review nests the login under ``user``, a timeline
+    event under ``actor``, and a commit or release under ``author`` — with
+    ``user`` present but ``null``. Reading only ``user`` silently scores a real
+    external action as nobody.
+
+    ``understood`` is False whenever the row is a shape we have not modelled: a
+    timeline event outside both the recipient-actor and doer-actor sets, or any
+    row from which no login is readable at all (a deleted account nulls every
+    field). The caller must turn that into UNCERTAINTY rather than treating an
+    unrecognised row as one that did not happen — every payload shape this code
+    has been wrong about so far was wrong in exactly that direction.
+
+    A recipient-actor event returns ``("", True)``: it is positively known to
+    testify to nobody acting, which is different from not being understood.
+    """
+    event = row.get("event")
+    if event is not None:
+        if not isinstance(event, str) or (
+            event not in _DOER_ACTOR_EVENTS
+            and event not in _RECIPIENT_ACTOR_EVENTS
+            and event not in _IDENTITY_FREE_EVENTS
+        ):
+            return "", False  # unmodelled timeline shape
+        if event in _RECIPIENT_ACTOR_EVENTS or event in _IDENTITY_FREE_EVENTS:
+            # Understood, and carrying no login we can attribute. Not uncertainty.
+            return "", True
+    for key in ("user", "actor", "author"):
+        value = row.get(key)
+        if not isinstance(value, dict):
+            continue
+        login = value.get("login")
+        if isinstance(login, str) and login:
+            return login, True
+    return "", False
+
+
+def _event_keys(row: dict) -> tuple[str, ...]:
+    """Which timestamps on this row testify that its actor DID something.
+
+    For a comment, review or timeline event, all of them: creating it and editing
+    it are both acting. For the THREAD object it is ``created_at`` alone — a
+    thread's ``updated_at`` moves whenever anybody touches it, and crediting that
+    to the thread's author would report the person who opened a pull request as
+    the actor behind somebody else's activity on it. That is the original defect
+    wearing a new hat.
+    """
+    return ("created_at",) if row.get(_THREAD_ROW_FLAG) else _EVENT_TIME_KEYS
+
+
+def _in_window_time(row: dict, since: str, until: str) -> str:
+    """The row's newest testifying timestamp INSIDE ``(since, until]``, or "".
+
+    Bounded on purpose, and used for ordering as well as membership: a comment
+    created in-window but edited after ``until`` is still in-window, and must not
+    then outrank someone who genuinely acted later within the window.
+    """
+    inside = [
+        t for k in _event_keys(row) if isinstance(t := row.get(k), str) and since < t <= until
+    ]
+    return max(inside) if inside else ""
+
+
+def _is_understood_shape(row: dict) -> bool:
+    """Is this a row whose shape we have positively classified?
+
+    Distinguishes "we know this carries no timestamp or login" from "we have
+    never seen this". Only the second is uncertainty. Without the distinction a
+    `committed` row — present on every real pull request timeline on this
+    install — makes every pull request permanently uncertain and the self/bot-only
+    drop unreachable, which is the entire behaviour this lane exists to provide.
+    """
+    event = row.get("event")
+    return isinstance(event, str) and (
+        event in _IDENTITY_FREE_EVENTS or event in _RECIPIENT_ACTOR_EVENTS
+    )
+
+
+def _has_readable_time(row: dict) -> bool:
+    """Does this row carry ANY string timestamp we know how to read?
+
+    A row with none is INVISIBLE to the window filter — it can neither prove nor
+    disprove that somebody acted, and silently vanishing is the failure mode that
+    let a commit-message mention be dropped (a commit payload's date lives at
+    ``commit.author.date``, and none of the keys read here exist on it).
+    """
+    return any(isinstance(row.get(k), str) and row.get(k) for k in _EVENT_TIME_KEYS)
+
+
+def _pull_url_to_issue_url(pull_url: str) -> str:
+    """`.../pulls/7` -> `.../issues/7`.
+
+    A pull request's CONVERSATION comments are served from the issues
+    spelling; only its inline REVIEW comments live under `/pulls/`. Anchored
+    to the trailing segment so a repo or owner containing "pulls" is untouched.
+    """
+    return re.sub(r"/pulls/(\d+)$", r"/issues/\1", pull_url)
+
+
+def _issue_num(issue_url: str) -> int | None:
+    tail = issue_url.rstrip("/").rsplit("/", 1)[-1] if issue_url else ""
+    return int(tail) if tail.isdigit() else None
+
+
+def _api_to_html_url(api_url: str) -> str:
+    """Convert a notification subject's API URL to a browser URL. A PR subject's
+    API URL uses ``/pulls/<n>`` where the browser path is ``/pull/<n>``; issues
+    map straight through. Non-``/repos/`` shapes (e.g. discussions) degrade to the
+    API URL unchanged."""
+    if not api_url:
+        return ""
+    url = api_url.replace("https://api.github.com/repos/", "https://github.com/", 1)
+    return url.replace("/pulls/", "/pull/", 1)

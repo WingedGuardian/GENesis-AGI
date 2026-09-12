@@ -134,6 +134,24 @@ def test_only_this_sessions_proposals_and_only_proposed(tmp_path):
     assert "Pulse" not in _block(db_file)
 
 
+def test_followup_target_proposal_not_injected(tmp_path):
+    """A follow_up-target proposal is ledger-filtered out of the session pulse
+    injection — the rendered confirm command is session_ledger_update(...), which
+    can't resolve a follow_up id, so it must never surface here (Codex P2)."""
+    db_file = _make_db(tmp_path)
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier, item_id,"
+        " item_session_id, item_text, pr_number, pr_title, confidence, status, target_kind)"
+        " VALUES ('afu', 'r1', '2026-07-16T00:00:00+00:00', 'exact', 'fu-1', ?,"
+        " 'a follow up', 1305, 'feat: x', NULL, 'proposed', 'follow_up')",
+        (SID,),
+    )
+    conn.commit()
+    conn.close()
+    assert "Pulse" not in _block(db_file)  # the only proposal is follow_up → filtered
+
+
 def test_clear_emits_nothing(tmp_path):
     db_file = _make_db(tmp_path)
     _seed_proposal(db_file, "a1")

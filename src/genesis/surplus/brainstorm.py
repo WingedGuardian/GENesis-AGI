@@ -129,6 +129,7 @@ class BrainstormRunner:
                 source=source,
                 source_task_type=str(task_type),
                 generating_model=insight.get("generating_model", "stub"),
+                drive_alignment=drive_alignment,
                 db=self._db,
             )
         except Exception:

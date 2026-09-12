@@ -191,7 +191,8 @@ def scrub(text: str, *, is_voiced: bool = True) -> ScrubResult:
         findings = detect(cleaned)
         for key in (
             "spaced_ambiguous_dash", "banned_words", "banned_phrases",
-            "filler_openers", "contrast_structures", "uniform_sentence_length",
+            "filler_openers", "contrast_structures",
+            "uniform_sentence_length",
         ):
             if key in findings:
                 flags.append(f"{key}: {findings[key]}")

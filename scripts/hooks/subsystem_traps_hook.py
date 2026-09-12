@@ -29,6 +29,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hook_input import is_safe_session_id  # noqa: E402
+
 # Same fence pattern the CI guard (scripts/check_subsystem_map.py) enforces,
 # so the modules->entry mapping this hook relies on is guaranteed complete.
 _BLOCK_RE = re.compile(r"^```yaml[ \t]+subsystem-map[ \t]*$")
@@ -36,7 +39,6 @@ _SECTION_RE = re.compile(r"^## ", re.MULTILINE)
 
 _MAX_BULLETS = 6
 _MAX_CHARS = 1200
-_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _repo_root() -> Path:
@@ -140,7 +142,7 @@ def _top_module(file_path: str) -> str | None:
 
 
 def _already_nudged(session_id: str, entry: str) -> bool:
-    if not _SESSION_ID_RE.match(session_id):
+    if not is_safe_session_id(session_id):
         return True  # refuse traversal-shaped ids: stay silent
     dedup = _sessions_dir() / session_id / "subsystem_nudges.json"
     seen: list[str] = []

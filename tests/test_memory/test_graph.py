@@ -28,6 +28,16 @@ async def graph_db(tmp_path):
             PRIMARY KEY (source_id, target_id)
         )
     """)
+    await db.execute("""
+        -- The graph loader applies recall's visibility predicate, so every
+        -- fixture that builds a projection needs this table. Empty here:
+        -- no invalid rows, so these tests' expectations are unchanged.
+        CREATE TABLE memory_metadata (
+            memory_id  TEXT PRIMARY KEY,
+            invalid_at TEXT,
+            deprecated INTEGER
+        )
+    """)
     await db.execute(
         "CREATE INDEX idx_ml_source ON memory_links(source_id)"
     )
@@ -174,3 +184,16 @@ class TestCentrality:
         score_by_id = dict(scores)
         # B connects to C and E — should have non-zero centrality
         assert score_by_id.get("B", 0.0) > 0.0
+
+    @pytest.mark.asyncio
+    async def test_centrality_top_n_none_returns_all_nodes(self, graph_db):
+        """top_n=None returns every graph node, not a truncated slice."""
+        invalidate_graph_cache()
+        capped = await centrality_scores(graph_db, top_n=1)
+        invalidate_graph_cache()
+        full = await centrality_scores(graph_db, top_n=None)
+        assert len(capped) == 1
+        # The fixture graph has more than one node → full is strictly larger.
+        assert len(full) > len(capped)
+        # And the capped top-1 id is present in the full set.
+        assert capped[0][0] in dict(full)

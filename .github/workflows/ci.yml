@@ -9,6 +9,14 @@ on:
   schedule:
     - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
 
+# One in-flight CI run per branch: a new push cancels the superseded run so it
+# stops holding runner slots. Many active branches fanning out full CI with no
+# cancellation was saturating the shared runner budget (queue starvation). Never
+# cancel main's post-merge run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 
@@ -17,23 +25,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install ruff
-        run: pip install ruff
+        # PINNED. `lint` is a required status check with no bypass actor, so a
+        # new default rule in an unpinned release turns it red on a diff that
+        # touched nothing and blocks every merge in the repository — recoverable
+        # only by disabling the ruleset in the UI. See .github/rulesets/README.md.
+        # Pinned to the version this repo is developed against locally.
+        run: pip install 'ruff==0.15.10'
       - name: Lint
         run: ruff check src/ tests/ scripts/
 
   dependency-audit:
-    # Fail on any KNOWN-vulnerable dependency in the resolved runtime tree,
-    # except the triaged IDs below. A red run is a SIGNAL to bump the dep or
-    # add a triaged ignore — not a hard freeze (the ruleset has no required
-    # checks). Complements GitHub's already-enabled Dependabot security alerts.
+    # REPORTS known-vulnerable dependencies in the resolved runtime tree. It no
+    # longer FAILS — see the step-level continue-on-error below, which is the whole
+    # point of this job's current shape.
+    #
+    # It used to be a blocking check whose red run was "a SIGNAL to bump the dep
+    # or add a triaged ignore". In practice the signal arrived as a repo-wide
+    # outage: pip-audit queries a LIVE advisory database, so an unchanged
+    # dependency tree passes at one hour and fails the next, on every open PR at
+    # once, with nobody having changed a line. MEASURED 2026-09-10/11: main's CI
+    # passed this job at 18:41 EDT; by 23:30 the same tree failed it on four
+    # different branches simultaneously. The four new IDs were litellm
+    # CVE-2026-12771/12772/12773/12795, every one of them in `litellm/proxy/` —
+    # the same proxy-server class as the 28 already triaged below, and Genesis
+    # imports acompletion / completion_cost / model_cost / the exception types
+    # and references the proxy NOWHERE (verified across src/, scripts/, config/
+    # and pyproject.toml).
+    #
+    # So the blocking behaviour was not catching reachable vulnerabilities; it
+    # was converting third-party disclosure timing into an unplanned freeze of
+    # everyone's queue, repaired each time by appending another ignore. The
+    # advisories are still printed in the log, and GitHub's Dependabot security
+    # alerts — enabled on this repo — remain the mechanism that actually raises a
+    # vulnerability to a human. This job is the convenience view of the same
+    # data, and a convenience view must not hold the merge queue.
+    #
+    # NOTE the triaged --ignore-vuln list below is deliberately KEPT rather than
+    # deleted. It is the written record of which advisories were examined and why
+    # they were judged unreachable; deleting it would discard that reasoning.
+    # This reporting-policy change adds no new ignores: the four IDs discussed
+    # above remain visible, along with any other ID outside the existing baseline.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install runtime deps + pip-audit
@@ -42,12 +81,39 @@ jobs:
           pip install -e .
           pip install pip-audit
       - name: Audit dependencies for known CVEs
+        # STEP level, not job level, and the difference is the whole mechanism.
+        # MEASURED on this PR's own first run: with `continue-on-error` on the
+        # JOB, the workflow no longer fails but the job's own check-run
+        # conclusion is still `failure`, so `gh pr checks` and the merge gate
+        # both still read it red — the block was unchanged. On the STEP, a
+        # failing pip-audit does not fail the job, so the rollup entry is green
+        # and the advisories are still printed in the log above it.
+        continue-on-error: true
         run: |
           # Triaged --ignore-vuln IDs (rationale of record: pyproject.toml pins).
-          # A NEW / untriaged advisory is NOT in this list and so fails the job.
-          #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI vuln;
-          #     Genesis uses acompletion/completion_cost only (no proxy server),
-          #     so none are reachable. Pinned <1.83 also dodges 1.82.x malware.
+          # A NEW / untriaged advisory is NOT in this list, so it is REPORTED here —
+          # it no longer fails the job (see continue-on-error above). Existing
+          # ignores reduce log noise; all IDs outside that baseline stay visible.
+          #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI /
+          #     MCP-gateway vuln; Genesis uses acompletion/completion_cost only
+          #     (no proxy server), so none are reachable. Pinned <1.83 also dodges
+          #     1.82.x malware. The 2026-11 batch is the same class, each gated on
+          #     running the proxy Genesis never starts (advisory-verified):
+          #       CVE-2026-59819 — /health/test_connection OIDC file-read (proxy).
+          #       CVE-2026-59820 — /v1/skills archive path-traversal (proxy route).
+          #       CVE-2026-59821 — Guardrails create/update code-exec (proxy).
+          #       CVE-2026-59822 — MCP Streamable-HTTP OAuth2 auth bypass (proxy MCP
+          #         gateway; Genesis's own MCP servers are fastmcp, not litellm's).
+          #       CVE-2026-37004 — SSTI to OS command execution via the
+          #         dotprompt_content parameter of the /prompts/test endpoint, from
+          #         an unsandboxed jinja2.Environment. CVSS 9.8, and unreachable for
+          #         the same structural reason as the four above: the sink is
+          #         litellm/proxy/prompts/prompt_endpoints.py, served only by the
+          #         proxy. pip-audit names 1.83.7 as the fix, which is past the
+          #         1.82.x malware the pin exists to avoid — so the pin stays and
+          #         the reachability argument, not the version, is what holds here.
+          #     grep-verified: only litellm.acompletion / completion_cost /
+          #     model_cost + exception types are imported — no proxy surface.
           #   diskcache 5.6.3 (CVE-2025-69872) — pickle-by-default RCE, no fixed
           #     release. Genesis's only diskcache use (memory/embeddings.py) is a
           #     JSON-only _SafeDisk subclass, so the vulnerable pickle path is unused.
@@ -72,8 +138,13 @@ jobs:
             --ignore-vuln CVE-2026-42271 \
             --ignore-vuln CVE-2026-47102 \
             --ignore-vuln CVE-2026-47101 \
+            --ignore-vuln CVE-2026-59819 \
+            --ignore-vuln CVE-2026-59820 \
+            --ignore-vuln CVE-2026-59821 \
+            --ignore-vuln CVE-2026-59822 \
             --ignore-vuln CVE-2025-69872 \
             --ignore-vuln PYSEC-2026-2475 \
+            --ignore-vuln CVE-2026-37004 \
             --ignore-vuln PYSEC-2026-2476
 
   leak-detector:
@@ -82,14 +153,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history so the private-pattern exact scan can diff the PR/push
+          # against its base (added lines only — pre-existing legit content like
+          # /home/<user> in provisioning scripts is never re-flagged).
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Install tools
+        # `detect-secrets` PINNED for the same reason `ruff` is: `leak-detector`
+        # is a required check with no bypass actor, it scans the WHOLE tree, and
+        # a new detector in an unpinned release would fire on pre-existing
+        # content and block every merge. See .github/rulesets/README.md.
         run: |
-          pip install detect-secrets
+          pip install 'detect-secrets==1.5.0'
           sudo apt-get install -y ripgrep
 
       - name: Secret scan (detect-secrets)
@@ -133,45 +213,38 @@ jobs:
           /tmp/gitleaks detect --no-git --redact -c .gitleaks.toml --source .
           echo "Leak scan (gitleaks): CLEAN"
 
-      - name: Portability scan (user-specific content)
+      - name: Class scan (advisory — non-gating)
+        # Broad RFC1918 / CGNAT / IPv6-ULA and /home/<user> CLASSES, surfaced as
+        # GitHub warnings and NEVER gating. Rationale: CI must not hard-block an
+        # external contributor for a legitimate private-range example (e.g.
+        # 10.0.0.1 in a docker-compose). This install's EXACT values are
+        # hard-gated by the private-pattern exact scan below. Doc examples should
+        # use the RFC 5737 ranges (192.0.2.x / 198.51.100.x / 203.0.113.x), which
+        # are deliberately not matched. Network-address class vocabulary comes
+        # from scripts/check_portability.sh --warn (single source of truth).
         run: |
           set -euo pipefail
-          # Exclude files that legitimately contain machine-specific
-          # patterns as data (scanner definitions, install scripts, etc.).
-          SCAN_EXCLUDES=(
-            --glob '!**/.git/**'
-            --glob '!**/src/genesis/contribution/sanitize.py'
-            --glob '!**/tests/test_contribution/test_sanitize.py'
-            --glob '!**/host-setup.sh'
-            --glob '!**/install.sh'
-            --glob '!**/install_guardian.sh'
-            --glob '!**/uninstall.sh'
-            --glob '!**/src/genesis/util/tz.py'
-            --glob '!**/src/genesis/dashboard/templates/genesis_dashboard.html'
-            --glob '!**/config/modules/career-agent.yaml'
-            --glob '!**/config/external-modules/**'
-            --glob '!**/tests/**'
-            --glob '!**/.github/workflows/ci.yml'
-          )
-          hits=$(
-            rg -n --hidden "${SCAN_EXCLUDES[@]}" \
-              -e 'America/New_York' \
-              -e '/home/[a-z][a-z0-9_-]*/genesis' \
-              src/ config/ scripts/ .github/ \
-              2>/dev/null || true
-          )
-          if [[ -n "$hits" ]]; then
-            echo "::error::Portability scan found user-specific content:"
-            printf '%s\n' "$hits"
-            exit 1
+          net="$(bash scripts/check_portability.sh --warn 2>/dev/null || true)"
+          # Home-path + CC-slug classes (check_portability owns network only).
+          # Exclude scanner-definition files that embed these patterns as data.
+          paths="$(rg -n --hidden \
+            --glob '!**/.git/**' \
+            --glob '!**/src/genesis/contribution/sanitize.py' \
+            --glob '!**/scripts/hooks/commit-msg' \
+            --glob '!**/scripts/check_portability.sh' \
+            --glob '!**/.github/workflows/ci.yml' \
+            -e '/home/[a-z_][a-z0-9_-]*/genesis' \
+            -e '/home/[a-z_][a-z0-9_-]*/\.[A-Za-z]' \
+            -e '-home-[a-z0-9-]+-genesis' \
+            . 2>/dev/null || true)"
+          findings="$(printf '%s\n%s\n' "$net" "$paths" | grep -vE '^[[:space:]]*$' || true)"
+          if [[ -n "$findings" ]]; then
+            printf '%s\n' "$findings" | sed 's/^/::warning::/'
+            n="$(printf '%s\n' "$findings" | wc -l)"
+            echo "Class scan: $n advisory finding(s) — non-gating."
+          else
+            echo "Class scan: CLEAN"
           fi
-          echo "Portability scan: CLEAN"
-
-      - name: Portability scan (network-address classes)
-        run: |
-          set -euo pipefail
-          bash scripts/check_portability.sh
-          echo "Portability scan (address classes): CLEAN"
 
       - name: Email scan
         run: |
@@ -224,43 +297,197 @@ jobs:
           fi
           echo "Binary/data artifact scan: CLEAN"
 
-      - name: PR description scan
-        if: github.event_name == 'pull_request'
+      - name: Private-pattern exact scan (hard gate)
+        # The REAL install identifiers (private repo/host names, subnets,
+        # hardware, tokens) come from the GENESIS_PRIVATE_PATTERNS repo secret —
+        # ZERO such values are tracked in this repo. Scans the PR/push ADDED
+        # lines + PR body (NOT the whole tree: pre-existing legit content such as
+        # /home/<user> in provisioning scripts must not be re-flagged). Never
+        # echoes matched content — counts only. Hard-fails on the canonical repo
+        # for non-fork PRs and pushes; SKIPS on forks / other installs (no secret,
+        # and they cannot know these values — the class scan above is their floor).
+        # Secrets are NOT readable in `if:`, so the empty check is done in-shell
+        # after env-mapping; an `if:` keyed on secrets.* would be silently empty
+        # (never runs = false green).
+        # Skip Dependabot too: its PRs are same-repo (non-fork) so they'd enter
+        # this step, but Dependabot-triggered workflows receive Dependabot
+        # secrets, not ordinary Actions secrets, so GENESIS_PRIVATE_PATTERNS is
+        # empty and the fail-loud check would break every dependency-bump PR.
+        # Dependency bumps never introduce install identifiers; the class-warn
+        # scan remains their floor.
+        if: >-
+          github.repository == 'WingedGuardian/GENesis-AGI' &&
+          github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.fork == false)
         env:
+          PRIV: ${{ secrets.GENESIS_PRIVATE_PATTERNS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          body=$(gh pr view ${{ github.event.pull_request.number }} --json body -q .body 2>/dev/null || echo "")
-          PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
-          if echo "$body" | grep -qE "$PATTERNS"; then
-            echo "::error::PR description contains private infrastructure details"
-            echo "$body" | grep -nE "$PATTERNS" || true
-            exit 1
+          # Write the raw secret; scripts/ci/private_pattern_scan.py does ALL
+          # filtering + validation (blank/comment lines, empty set, malformed
+          # ERE) in tested Python — the fragile parts that repeatedly bit the
+          # former inline-shell gate. It exits 0=clean, 1=leak (counts only,
+          # never content), 3=fail-loud (unprovisioned/corrupt secret); set -e
+          # propagates a nonzero exit as the gate's failure.
+          pf="$(mktemp)"
+          printf '%s' "$PRIV" > "$pf"
+
+          # Collect the ADDED lines across EVERY commit's patch in range — NOT
+          # the net tree-to-tree diff (a value added then removed within the same
+          # PR/push leaves the net diff clean yet stays in published history).
+          # RANGE SELECTION is security-critical and lives in tested Python:
+          # scripts/ci/leak_scan_added_lines.py. For a pull_request it anchors on
+          # the merge ref's first parent (HEAD^1 = main@ci), NOT the stale
+          # github.event.pull_request.base.sha — base.sha lags main, so
+          # base.sha..HEAD used to re-sweep (and re-flag) values main itself
+          # added-then-removed since the PR was opened. The helper keeps every
+          # '^+' line incl. '+++ b/path' headers, and fails CLOSED (nonzero exit)
+          # on an unresolvable range rather than emitting empty (a fail-OPEN).
+          # See tests/test_scripts/test_leak_scan_added_lines.py.
+          added="$(python3 scripts/ci/leak_scan_added_lines.py)"
+          body=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
           fi
-          echo "PR description scan: CLEAN"
+
+          printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
-    # Catch duplicate migration prefixes before merge — two PRs creating
-    # the same NNNN_*.py prefix will collide at runtime.
+    # Migration ids, three rules: every file in a migrations directory is a
+    # legal migration (the residue is a violation, because a name that matches
+    # nothing is discovered by nothing and NEVER RUNS), no duplicate id in
+    # either namespace, and every frozen legacy file is still present under its
+    # own name (deleting or renaming one leaves the id set identical while
+    # existing installs skip the replacement forever).
+    #
+    # The legacy namespace is frozen as an ENUMERATED set, not a range: 0092
+    # lies between the endpoints and does not exist, so a range check admitted
+    # a brand-new hand-allocated 0092_*.py. New migrations use a UTC timestamp,
+    # which nobody has to allocate and two branches therefore cannot both claim.
+    #
+    # The check moved out of shell deliberately. The old glob+grep restated the
+    # runners' filename semantics in a second language and could not survive
+    # mixed-width ids in EITHER direction (both measured 2026-09-03): its
+    # 4-digit glob made timestamp migrations invisible to the guard, and
+    # widening the glob while keeping `grep -oP '^\d{4}'` truncated every
+    # 20260903… id to "2026", reporting two distinct migrations as duplicates.
+    # scripts/check_migration_prefixes.py imports the runners' own patterns, so
+    # the guard cannot drift from what actually runs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check migration prefix uniqueness
+        with:
+          # The immutability rule asks git what was ALREADY MERGED — the one
+          # question a list in the repo cannot answer for an unbounded id space.
+          # A shallow clone has no base commit to compare against, and the guard
+          # treats an unreadable --base as a violation rather than a pass.
+          fetch-depth: 0
+      - name: Check migration ids (uniqueness + immutability)
+        env:
+          # Passed via env, not interpolated into `run` — same handling the
+          # leak-detector job uses for PR_BASE_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is USELESS there — it IS the
+          # just-pushed checkout, so `--base origin/main` compares the tree with
+          # itself and the immutability rule silently checks nothing. The push
+          # event's `before` SHA is the pre-push state, which is the base that
+          # makes the post-merge run able to see a deletion that reached main
+          # outside the PR check. All-zero on branch creation, hence the guards
+          # below.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          dir="src/genesis/db/migrations"
-          dupes=$(ls "$dir"/[0-9][0-9][0-9][0-9]_*.py 2>/dev/null \
-            | xargs -I{} basename {} \
-            | grep -oP '^\d{4}' \
-            | sort | uniq -d || true)
-          if [[ -n "$dupes" ]]; then
-            echo "::error::Duplicate migration prefixes found: $dupes"
-            for p in $dupes; do
-              echo "  Files: $(ls "$dir"/${p}_*.py)"
-            done
-            exit 1
+          # Base resolution, most-specific first:
+          #   PR build        -> the PR base (what "already merged" means there);
+          #   push build      -> the pre-push SHA (see PUSH_BEFORE_SHA above);
+          #   schedule/manual -> origin/main IF it differs from the checkout.
+          # `--base` is passed only when a ref was resolved, exists, AND is not
+          # the checkout itself. A base equal to HEAD is a self-comparison: the
+          # rule would examine nothing while the log claimed "immutable against
+          # origin/main" — a verified-grammar claim that is false, and the exact
+          # silent pass the guard's own doctrine forbids. So schedule/dispatch
+          # runs on main (and any degraded push case whose `before` is
+          # unreachable) drop --base and honestly print best-effort scope; the
+          # PR and push runs are the enforcement points for immutability.
+          # Known fail-NOISY edge, accepted: a re-run of an OLD build compares
+          # its old checkout against origin/main fetched NOW and can go red on
+          # migrations that merged since — loud and explainable, never silent.
+          base="${PR_BASE_SHA:-}"
+          if [[ -z "$base" && -n "${PUSH_BEFORE_SHA:-}" && "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
           fi
-          echo "Migration prefix check: CLEAN"
+          if [[ -z "$base" ]] && git rev-parse --verify -q origin/main >/dev/null \
+             && [[ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]]; then
+            base="origin/main"
+          fi
+          if [[ -n "$base" ]]; then
+            python3 scripts/check_migration_prefixes.py --base "$base"
+          else
+            python3 scripts/check_migration_prefixes.py
+          fi
+
+  changelog-fragments:
+    # Every file in changelog.d/ is a legal fragment — the residue is a
+    # violation, for the same reason the migration-id check treats it that way:
+    # a fragment nobody recognises is a changelog entry that never ships, and
+    # nothing notices, because the release section still looks complete.
+    #
+    # Validated on every PR rather than at release, because collect_fragments is
+    # all-or-nothing: one malformed fragment from any merged PR blocks assembly
+    # of EVERY fragment, and discovering that on release day means discovering
+    # it from the wrong person at the wrong time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # --base asks git what the base branch ALREADY has, which is the one
+          # question the checked-out tree cannot answer. A shallow clone has no
+          # base commit, and the check treats an unreadable base as a violation
+          # rather than a pass.
+          fetch-depth: 0
+          # This job only READS the tree, so it has no use for a credential
+          # left behind in .git/config where every later step can reach it.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Validate changelog.d fragments
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is useless there — it IS the
+          # just-pushed checkout — but the push event's `before` SHA is the
+          # pre-push state, which is what lets the post-merge run see a fragment
+          # that vanished outside the PR check (a direct push, an admin merge, a
+          # PR whose base was unreadable). Same resolution the migration-id job
+          # uses, for the same reason. All-zero on branch creation.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE_SHA:-}"
+          if [ -z "$base" ] && [ -n "${PUSH_BEFORE_SHA:-}" ] \
+             && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          fi
+          if [ -n "$base" ]; then
+            # Deliberately NOT guarded by `git cat-file`: the deletion rule fails
+            # CLOSED on a base it cannot read, and swallowing that here would
+            # turn its refusal into a silent pass — the one outcome its own
+            # docstring says must never happen.
+            python scripts/assemble_changelog.py --check --base "$base"
+          else
+            # schedule/dispatch only. Say what is NOT being enforced rather than
+            # reporting a green that covers less than it appears to.
+            echo "note: no base ref on this event; the deletion rule is not enforced"
+            python scripts/assemble_changelog.py --check
+          fi
 
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress
@@ -269,11 +496,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
+
+  atomic-write-check:
+    # An atomic write that orphans its temp on the exception path leaks a file
+    # into a directory nothing sweeps. MEASURED 2026-09-09: 60 sites, 30 dirty --
+    # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
+    # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
+    # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
+    # -- a second unprotected write inside an already-baselined function, with
+    # the same temp name, collides with that row and passes. The guard docstring
+    # states that exception; this comment used to assert the claim unqualified.
+    # See scripts/check_atomic_writes.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job only READS sources. Persisted credentials stay
+          # available to every later step in the job for no benefit.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Atomic-write temp-file guard
+        run: python scripts/check_atomic_writes.py
+
+  frozen-clock-check:
+    # A test that captures a wall clock at IMPORT time gives the whole suite's
+    # runtime to burn its safety margin, then fails on slow runners as an
+    # unreproducible "flake". Measured instance: a 25-minute margin that passed
+    # at 16m into a run and failed at 27m (~3% of runs). Runs as its own fast
+    # job so the finding reads as a lint error in seconds rather than surfacing
+    # 16 minutes into the suite. Escape hatch is
+    # '# frozen-clock-ok: <why, with the measured margin>'.
+    # See scripts/check_frozen_clock.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Frozen-clock guard
+        run: python scripts/check_frozen_clock.py
 
   subsystem-map-check:
     # Judgment-layer map guard: docs/architecture/CURRENT.md must claim every
@@ -287,13 +555,45 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install checker dependency
         run: pip install pyyaml
       - name: Subsystem-map drift guard
         run: python scripts/check_subsystem_map.py
+
+  shared-artifact-consumer-check:
+    # Shared-artifact registry guard: docs/architecture/shared-artifacts.md must
+    # declare every code consumer of each registered artifact — a NEW consumer a
+    # documenting file never learned about is a doc that lies → error. The reader
+    # diff is a fixed-string content scan of src/ + scripts/, so no git history is
+    # needed (no fetch-depth: 0). See scripts/check_shared_artifact_consumers.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install checker dependency
+        run: pip install pyyaml
+      - name: Shared-artifact consumer drift guard
+        run: python scripts/check_shared_artifact_consumers.py
+
+  hook-versions-check:
+    # Completeness backstop for .genesis-hook-versions: every version of a
+    # tracked git hook that ever shipped on main must be recorded, or a
+    # community install still carrying it gets wedged (sync-hooks.sh treats an
+    # unrecorded hash as "user-modified" and never updates it). The checker
+    # walks FULL hook history, so this job checks out fetch-depth: 0; it skips
+    # gracefully on a shallow clone. See scripts/check_hook_versions_complete.sh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Hook-version ledger completeness guard
+        run: bash scripts/check_hook_versions_complete.sh
 
   cc-node-lockstep:
     # Enforce the CC↔Node pin lockstep: NODE_MAJOR in scripts/lib/cc_version.sh
@@ -305,19 +605,94 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: CC↔Node pin-lockstep guard
         run: python scripts/check_cc_node_lockstep.py
 
+  review-depth-check:
+    # Advisory review-DEPTH visibility: recompute substantiality on the PR range
+    # (base...HEAD, so it needs full history — fetch-depth: 0) and emit a LOUD
+    # ::warning:: annotation when the change is substantial, so the human reviewer
+    # + the independent cloud reviewer apply an adversarial /review-level audit
+    # rather than a lean pass. Advisory BY DESIGN (exit 0 always): a committed audit
+    # artifact is forgeable and the local hook is editable by the same author, so
+    # the enforcing teeth are the independent reviewer + a required human approval
+    # (branch protection), not this check. Stdlib-only. See scripts/check_review_depth.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Review-depth advisory
+        env:
+          # Event base SHA (trusted-format) — robust vs origin/* ref materialization,
+          # matching the leak-detector job. Passed via env (not interpolated into run).
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/check_review_depth.py
+
+  cc-pin-receipts:
+    # Advisory early warning that a pin bump is missing its gate receipts (the
+    # full changelog read, and the local-first soak — docs/reference/
+    # cc-compatibility.md §Updating). Advisory BY DESIGN (exit 0 always), for a
+    # reason specific to this check rather than inherited from the job above: it
+    # reads the PR BODY, which stays mutable after a run completes. A completed
+    # check run is immutable and the merge gate treats a stale FAILURE as red on
+    # purpose (PR #1424 — the gate forces `--admin`, so letting a later SUCCESS
+    # clear an earlier FAILURE would make re-running a job until green enough to
+    # merge). A BLOCKING status over a mutable input therefore could not be
+    # cleared by fixing the input; the author would have to push a commit to get
+    # a fresh head. The enforcing teeth are the merge gate, which re-reads the
+    # body at merge time from main's copy of the checker.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # merge-base needs history on both sides.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: CC pin-receipt advisory
+        env:
+          # Attacker-controlled text: passed via env, NEVER interpolated into
+          # `run`. Same handling the leak-detector job uses for PR_BASE_SHA.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # merge-base, NOT HEAD^1: parent count is not a reliable "this is the
+          # merge ref" signal, and scripts/ci/leak_scan_added_lines.py rejects
+          # that inference for the same reason.
+          #
+          # BOTH commands are guarded. Under `set -e` an unresolvable origin/main
+          # (or no common ancestor) would kill the step and turn this job RED —
+          # in a job whose entire justification is that it cannot fail. An empty
+          # base is handled by the checker itself: advisory mode reports "no base
+          # SHA to compare against" and exits 0.
+          git fetch --no-tags --quiet origin main || true
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
+
   test:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
+    #
+    # fetch-depth: 0 because measurement tests derive a rate from this
+    # repository's own commit history and SKIP on a shallow clone rather than
+    # lie. A skipped gate is an unevaluated gate: the commit-msg framing
+    # advisory asserts a 0.1% fire-rate bar over real subjects, and under the
+    # default depth-1 checkout that assertion never ran at all, so a later
+    # pattern change with a bad rate would have passed CI (Codex P2, PR #1623).
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -326,10 +701,56 @@ jobs:
           pip install -e ".[test]"
       - name: Run tests
         run: |
+          # Never measure a stale report: if pytest dies before writing
+          # one, the checker must find nothing rather than yesterday's.
+          rm -f junit.xml
           # Ignore preserved AZ-era test files that import removed modules
           pytest -v \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
-            --ignore=tests/test_ui/
+            --ignore=tests/test_ui/ \
+            --junit-xml=junit.xml
         env:
           GENESIS_TESTING: "1"
+      # A test that stops running is invisible: it makes the suite SMALLER,
+      # not red. Two axes, because dormancy moves both ways — a broken
+      # skipif RAISES the skip count, while a lost marker or a dropped
+      # directory LOWERS it and is only visible in the collected count.
+      # REPORT ONLY until both bounds, measured on these runners, are
+      # recorded here — a threshold invented rather than measured is one
+      # nobody trusts. The step still has teeth meanwhile: a missing or
+      # unreadable report exits 2.
+      - name: Suite dormancy guard
+        # NOT always(): that also fires on cancellation, and this workflow
+        # sets cancel-in-progress for every non-main ref — so a re-push
+        # would kill pytest mid-suite, leave no report, and the step would
+        # refuse with a cause that is not the cause.
+        if: ${{ !cancelled() }}
+        # Baseline MEASURED on this PR's own green run (job 101515129147, head
+        # bbd11ad1): "95 skipped of 23164 collected". Exact-fit on both axes, not
+        # a padded guess — headroom would be a number nobody measured, and the
+        # whole point of shipping report-only first was to avoid inventing one.
+        # Raising either bound is a deliberate act that belongs in the same commit
+        # as the change that moves it; both failure messages say so.
+        #
+        # RAISED 95 -> 99 and 23164 -> 23217 by the FalkorDB store, both counted
+        # rather than padded. The skip axis: four engine-gated tests, which skip
+        # wherever the engine is not provisioned — CI included, by design, since
+        # no runner has a socket. MEASURED by running the file: "32 passed, 4
+        # skipped".
+        #
+        # The collected axis: +53. MEASURED by COLLECTION rather than by grepping
+        # for a test-function definition, because a parametrised case collects as
+        # many as it has params and reads as one. Collecting the three files that
+        # differ from main gives 94; main collects 41 from the one of the three
+        # that already existed.
+        #
+        # RE-COUNT AFTER THE LAST EDIT THAT ADDS A TEST. This line was wrong twice
+        # before it was right: first at 48, counted before a review round added
+        # four tests, then at 52, counted before that round's own audit added a
+        # fifth. Both times the skip axis WAS re-derived and this one was not,
+        # because a new skip announces itself by turning CI red while a new test
+        # does not. That asymmetry is the trap: an under-set floor still passes,
+        # so the guard quietly forfeits the exact fit it exists to hold and
+        # nothing says a word.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217

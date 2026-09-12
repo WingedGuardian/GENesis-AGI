@@ -117,6 +117,11 @@ async def ego_directive(
     to its reasoning but decides what to propose. Use this when you want
     the ego to pay attention to something specific.
 
+    **User-only.** Directives are recorded as user instructions
+    (source="user"). This tool is REFUSED from autonomous/dispatched sessions
+    — an autonomous session must surface intent through a proposal, observation,
+    or report, never by writing a directive to itself.
+
     Args:
         content: What you want the ego to consider (e.g., "Retry the
             Medium article publish — VNC bypass is fixed now")
@@ -127,6 +132,25 @@ async def ego_directive(
         return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_DIRECTIVE_PRIORITIES)}"}
     if ego_target not in _VALID_EGO_TARGETS:
         return {"status": "error", "reason": f"Invalid ego_target: {ego_target!r}. Must be one of: {sorted(_VALID_EGO_TARGETS)}"}
+
+    # User-only: this tool stamps source="user", so an autonomous/dispatched
+    # session calling it would forge a user directive (the exact mechanism
+    # behind a mis-attributed directive, 2026-07). Refuse unless the caller is
+    # a foreground human terminal (no dispatch marker) or an owner-attended
+    # conversation (supervised). Fail direction is safe: env absent = human
+    # terminal = allowed.
+    from genesis.security.immunity_shadow import is_dispatched_session_env
+
+    if is_dispatched_session_env():
+        return {
+            "status": "refused",
+            "reason": (
+                "ego_directive is user-only — it records a directive as a user "
+                "instruction (source='user'). An autonomous/dispatched session "
+                "must not call it; surface this through your session's normal "
+                "output (a proposal, observation, or report) instead."
+            ),
+        }
 
     from genesis.db.connection import get_raw_db
     from genesis.db.crud import ego as ego_crud
@@ -147,7 +171,11 @@ async def ego_directive(
         "content": content[:100],
         "priority": priority,
         "ego_target": ego_target,
-        "note": "The ego will see this in its next thinking cycle.",
+        "note": (
+            f"The {ego_target} will see this directive in its next thinking "
+            "cycle (rendered into its context) and can act on it, resolve it, "
+            "or disagree with reasoning."
+        ),
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -496,13 +524,37 @@ async def _resolve_one_proposal(
     if prop.get("status") != "pending":
         return f"already {prop.get('status')}"
 
+    # PR-6a resolve-side guard: this resolves over a SEPARATE non-serialized
+    # get_raw_db connection after reading `prop`, so a concurrent revise
+    # (PR-6b reconcile) could move the proposal's revision between that read and
+    # this write. Passing expected_revision=prop["revision_num"] makes the UPDATE
+    # atomic (resolve_proposal appends `AND revision_num = ?`), so a stale resolve
+    # refuses instead of clobbering a newer revision. A no-op match today — every
+    # row is revision_num=1 until PR-6b introduces revise. With the guard set, a
+    # False return conflates stale-revision, already-resolved and missing-id, so
+    # we re-read the row below to distinguish a genuine race refusal (re-surface
+    # the fresh revision) from a benign already-resolved / missing row.
     updated = await ego_crud.resolve_proposal(
         db,
         prop["id"],
         status=status,
         user_response=reason or None,
+        expected_revision=prop.get("revision_num"),
     )
     if not updated:
+        # expected_revision set → a False return conflates three cases. Re-read the
+        # row to distinguish a stale-revision race (proposal revised between our
+        # read and this write) from a benign already-resolved / missing-id.
+        fresh = await ego_crud.get_proposal(db, prop["id"])
+        if fresh is None:
+            return "not updated (proposal no longer exists)"
+        if fresh.get("status") != "pending":
+            return f"already {fresh.get('status')}"
+        if fresh.get("revision_num") != prop.get("revision_num"):
+            return (
+                f"stale revision (you saw rev {prop.get('revision_num')}, "
+                f"now rev {fresh.get('revision_num')}) — re-review before resolving"
+            )
         return "not updated"
 
     # Shared post-resolution hook: J-9, journal, decision capture,
@@ -577,6 +629,24 @@ async def ego_proposal_resolve(
         return {
             "status": "error",
             "reason": f"action must be 'approve' or 'reject', got {action!r}",
+        }
+
+    # User-only authority: approving/rejecting a proposal is a user action,
+    # and the withdrawn-proposal path creates a source="user" re-validation
+    # directive — an autonomous/dispatched session must not resolve the board
+    # or forge such a directive. Refuse unless foreground/supervised (same
+    # provenance class as ego_directive).
+    from genesis.security.immunity_shadow import is_dispatched_session_env
+
+    if is_dispatched_session_env():
+        return {
+            "status": "refused",
+            "reason": (
+                "ego_proposal_resolve is user-only — approving or rejecting "
+                "proposals is a user authority. An autonomous/dispatched session "
+                "must not resolve proposals; surface your assessment as an "
+                "observation or report instead."
+            ),
         }
 
     from genesis.db.connection import get_raw_db

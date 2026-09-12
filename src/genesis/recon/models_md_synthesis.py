@@ -1,8 +1,17 @@
 """Weekly models.md synthesis — updates the model catalog from recon findings.
 
 Reads recent model intelligence findings from knowledge_units, builds a
-prompt, and dispatches a CC background session to update
-docs/reference/models.md with a git commit.
+prompt, and dispatches a CC background session to refresh the LOCAL models.md
+overlay (``~/.genesis/output/models.md``). The overlay is seeded once from the
+tracked reference doc (``docs/reference/models.md``) and thereafter updated in
+place with NO git commit — so every clone's weekly run stops diverging tracked
+source (which used to make every ``git pull`` conflict on models.md). The
+tracked doc stays a maintainer-curated reference; ``scripts/promote_models_md.sh``
+copies a reviewed overlay back onto it for a deliberate public refresh.
+
+The overlay is a per-install FORK, not a mirror: it seeds once and later
+upstream edits to the tracked doc do NOT re-seed it. Delete the overlay to
+re-seed from the current tracked doc.
 
 Scheduled via SurplusScheduler: Sunday 8am UTC, 2h after model intelligence.
 """
@@ -12,10 +21,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from genesis.env import repo_root
+from genesis.env import output_dir, repo_root
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -34,7 +44,8 @@ _ACTIONABLE_TYPES = frozenset({
     "stale_profile",
 })
 
-# Path to the models.md file (relative to repo root, for the CC session prompt).
+# Tracked reference doc (relative to repo root) — the one-time seed source for
+# the local overlay; not written by this job.
 _MODELS_MD_REL = "docs/reference/models.md"
 
 _SESSION_PROMPT_TEMPLATE = """\
@@ -43,7 +54,7 @@ You are updating the Genesis model catalog.
 ## Task
 
 Read the file `{models_md_path}`, apply the intelligence findings below,
-and write the updated file back. Then git commit the change.
+and write the updated file back.
 
 ## Rules
 
@@ -79,9 +90,8 @@ and write the updated file back. Then git commit the change.
 2. Apply the findings below to produce the updated content
 3. Verify your output meets the validation rules above
 4. Write the updated file with the Write tool
-5. Run: `cd {repo_root} && git add {models_md_rel} && git commit -m "docs(models): weekly synthesis update"`
 
-If the file is unchanged (no material findings to apply), skip steps 3-5
+If the file is unchanged (no material findings to apply), skip steps 3-4
 and report "no changes needed."
 
 ## Intelligence Findings (last 7 days)
@@ -91,12 +101,12 @@ and report "no changes needed."
 
 
 class ModelsMdSynthesisJob:
-    """Weekly job: synthesize recon findings into docs/reference/models.md.
+    """Weekly job: synthesize recon findings into the local models.md overlay.
 
     Dispatches a CC background session to perform the update, rather than
     calling the LLM router directly.  This gives natural resilience (no
-    single-provider dependency) and lets the session use tools for file
-    I/O and git operations.
+    single-provider dependency) and lets the session use the Write tool for
+    file I/O.  The session writes the local overlay only — no git commit.
     """
 
     def __init__(self, *, db: aiosqlite.Connection):
@@ -110,18 +120,24 @@ class ModelsMdSynthesisJob:
             logger.info("Models.md synthesis: no actionable findings in last 7 days")
             return {"skipped": True, "reason": "no_findings"}
 
-        # 2. Build session prompt
+        # 2. Resolve the LOCAL overlay target, seeding it once from the tracked
+        #    reference doc. The session edits the overlay in place (no git), so a
+        #    clone's weekly run never diverges tracked source. Seed idiom mirrors
+        #    scripts/setup-local-config.sh (copy shipped default if absent).
         serialized = self._serialize_findings(findings)
-        root = repo_root()
-        models_md_path = root / _MODELS_MD_REL
-        if not models_md_path.exists():
-            logger.error("Models.md not found at %s", models_md_path)
-            return {"skipped": True, "reason": "file_not_found"}
+        overlay = output_dir() / "models.md"
+        if not overlay.exists():
+            tracked_seed = repo_root() / _MODELS_MD_REL
+            if not tracked_seed.exists():
+                logger.error("Models.md seed not found at %s", tracked_seed)
+                return {"skipped": True, "reason": "no_seed"}
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(tracked_seed, overlay)
+            logger.info("Seeded models.md overlay from %s", tracked_seed)
+        models_md_path = overlay
 
         prompt = _SESSION_PROMPT_TEMPLATE.format(
             models_md_path=str(models_md_path),
-            models_md_rel=_MODELS_MD_REL,
-            repo_root=str(root),
             findings=serialized,
         )
 
@@ -148,7 +164,7 @@ class ModelsMdSynthesisJob:
             notify_on_failure_only=True,
             source_tag="models_md_synthesis",
             caller_context="schedule:models_md_synthesis",
-            tool_exceptions=("Write", "Bash"),
+            tool_exceptions=("Write",),
         )
 
         session_id = await runner.spawn(request)

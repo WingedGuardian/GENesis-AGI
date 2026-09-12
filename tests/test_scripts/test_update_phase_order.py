@@ -103,7 +103,9 @@ def test_fetch_failure_cleans_up_and_exits_without_rollback(text):
     # The fetch block ends at the first standalone `fi` after the fetch.
     block = text[f : text.index("\nfi\n", f)]
     assert 'tag -d "$ROLLBACK_TAG"' in block, "fetch-failure must delete the rollback tag"
-    assert 'rm -f "$STATE_FILE"' in block, "fetch-failure must clear the state file"
+    assert "_clear_deploy_state" in block, (
+        "fetch-failure must clear the state (via _clear_deploy_state)"
+    )
     assert "exit 1" in block, "fetch-failure must exit 1"
     # Check CODE lines only — a comment may legitimately mention _do_rollback.
     code = "\n".join(ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))

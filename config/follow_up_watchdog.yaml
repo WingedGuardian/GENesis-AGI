@@ -1,0 +1,23 @@
+# Follow-up hygiene watchdog (awareness hourly band) — read-and-alert only.
+#
+# Flags hot-lane follow_ups rows that fell into an invisible/stuck state:
+#   - orphaned_scheduled: status='scheduled' with no linked_task_id (invisible to
+#     every surface — the black hole the follow_up_update H2 gate now prevents;
+#     this catches pre-gate / programmatic strays).
+#   - past_due_scheduled: a scheduled_task whose scheduled_at passed but the
+#     dispatcher never actuated it.
+# Emits one deduped, self-resolving infrastructure_alert (→ morning report).
+#
+# Env kill switch: GENESIS_FOLLOW_UP_WATCHDOG_DISABLED=1 forces it off.
+
+enabled: true
+
+# A row must be this old (created_at) / this far past scheduled_at before it's
+# flagged — avoids alerting on a row a concurrent writer is mid-transition on.
+grace_hours: 6
+
+# Max offender ids listed inside the single alert (for the morning session).
+max_listed: 10
+
+# Base alert severity; escalated to 'critical' if any flagged row is critical.
+alert_priority: high

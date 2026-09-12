@@ -37,26 +37,151 @@ def main() -> None:
     if is_review_current():
         sys.exit(0)
 
-    # Unreviewed changes exist — inject warning
-    print(
-        "MANDATORY: Unreviewed code changes detected. "
-        "You MUST run /review and dispatch the superpowers:code-reviewer agent "
-        "before doing any other work or committing. "
-        "Commits will be blocked until review is complete.\n\n"
-        "ADVERSARIAL REVIEW ORDER: Use Codex (OpenAI) FIRST for adversarial review, "
-        "Claude subagent as FALLBACK only. The purpose of adversarial review is a "
-        "genuinely independent perspective from a different model — another Claude "
-        "instance reviewing Claude's work has blind-spot overlap. Codex catches "
-        "things you are architecturally blind to. Do not skip Codex because you are "
-        "'already in the flow' — that is exactly when independent review matters most.\n\n"
+    # The bounded writer lives in scripts/hooks/, a different dir from this
+    # script's own. Imported AFTER the silent-exit guards above so a healthy
+    # no-op prompt never pays for it, and UNGUARDED on purpose: a missing helper
+    # is a broken checkout and must be loud, not silently unbounded.
+    # APPEND, not insert(0): scripts/ went on at :26 and `review_scope` is
+    # imported from it below. Prepending scripts/hooks/ would let a same-named
+    # module there shadow it. hook_output is the only import from this dir.
+    sys.path.append(os.path.join(script_dir, "hooks"))
+    from hook_output import BoundedStdout  # noqa: PLC0415
+
+    _out = BoundedStdout(label="review-enforcement")
+
+    # Unreviewed changes exist — inject the base reminder UNCONDITIONALLY first.
+    # The deterministic review-scope manifest below is strictly ADDITIVE: it is
+    # built and appended behind its own guards so a manifest error can never
+    # truncate or suppress this core reminder.
+    _out.emit(
+        "MANDATORY: Unreviewed code changes detected. Review the BRANCH CHANGESET — "
+        "`git diff $(git merge-base HEAD <your default branch>)`, which covers committed, "
+        "staged and unstaged work (but NOT untracked files — `git status` for those). "
+        "Do not hardcode `origin/main`: where the default branch is named otherwise the "
+        "substitution collapses and `git diff` silently reviews UNSTAGED work only, exit "
+        "0. The scope manifest below, when present, names the base it resolved. Reviewing "
+        "only the index leaves earlier commits on this branch uncovered. The MARKER, "
+        "separately, binds to what is STAGED at mark time: review the branch, mark after "
+        "staging.\n"
+        "A docs/config-only staged set needs NO review and NO marker — but the exemption "
+        "is NARROWER than it sounds and this reminder cannot tell (it hashes the staged "
+        "diff without classifying it). It does NOT apply when: the commit command itself "
+        "stages (`git add …&& git commit`, `git commit -am`, a pathspec, `-a/-i/-o/-p`); "
+        "you are at review round 2 or 3, where the round caps are evaluated FIRST; the "
+        "set touches anything under a `.github/` directory (workflows are executable CI "
+        "config with repo secrets); or it touches a prompt / agent / skill SURFACE under "
+        "`.claude/{agents,commands,skills}/` or `src/genesis/{skills,identity,**/prompts}/` "
+        "even when `.md`. Note `docs/config` is an EXTENSION allowlist (.md .rst .txt "
+        ".yaml .yml .toml .ini .cfg) — `.json`, `Makefile`, `.sh` and extensionless files "
+        "are code. Root SOUL.md / CLAUDE.md / USER.md are deliberately exempt.\n\n"
+        "HOW TO CLEAR IT — PLUGIN ROUTES, where this install has them: `/review`, "
+        "`/code-review`, or the `superpowers` skills `superpowers:requesting-code-review` "
+        "/ `superpowers:receiving-code-review`. Plugin availability is PER INSTALL and "
+        "varies between machines, so CHECK what resolves here rather than assuming either "
+        "way; an absent name simply does not resolve and you use the built-ins below. "
+        "ALWAYS AVAILABLE: `/deep-review` does the whole flow, review through marker; or "
+        "by hand, write findings to `python3 scripts/review_state.py evidence-path`, then "
+        "`python3 scripts/review_state.py mark --agent-output <that file>` — a plain "
+        "mark is an INTERNAL (same-model) review: it satisfies this gate and NEVER "
+        "counts toward the escalation streak, so no outcome flag is needed. That is the "
+        "common case (a genesis-architect / genesis-security / subagent audit — free, "
+        "and it shares this model's blind spots, so it must not penalize you). EXTERNAL is "
+        "judged by the reviewing MODEL, not the gateway: only a review by a non-ANTHROPIC "
+        "model counts. Anthropic Claude via ANY route (incl. an OpenRouter Claude route) is "
+        "INTERNAL, and Genesis's own cognitive/routing systems are never reviewers (they are "
+        "infrastructure, not a review service). The approved methods are Codex plus whatever "
+        "this install names as its secondary reviewer; OpenRouter is NOT an approved method "
+        "today. Mark such a review "
+        "`--source external`, and that one alone MOVES the streak, so it requires an "
+        "outcome: `--defects` for a NEW should-fix-or-worse finding, or `--clean` for "
+        "none (which RESETS the streak). An internal self-review can never reset a "
+        "standing cross-model streak — only an external `--clean` round does. "
+        "Should-fix-or-worse is PER REVIEWER VOCABULARY: genesis-architect -> "
+        "BLOCKER/SHOULD-FIX; genesis-security-reviewer -> CRITICAL/WARNING (WARNING is "
+        "its should-address tier, NOT a note); Codex -> P1/P2. WRITING the evidence is a "
+        "SEPARATE vocabulary: the validator recognises only BLOCKER / SHOULD-FIX / "
+        "CRITICAL / HIGH / MEDIUM / LOW / P1-P3, uppercase — `WARNING` and Title-Case "
+        "tiers like `Important` are NOT recognised, so render them as SHOULD-FIX in the "
+        "text or the depth gate rejects the evidence as non-adversarial. "
+        "RUN BOTH FROM THE WORKTREE THE CHANGES ARE IN — the marker is keyed "
+        "by process cwd, not by how you spell the path.\n"
+        "The marker binds to what is staged AT MARK TIME and sees STAGED changes only. "
+        "So mark AFTER staging, and if a reviewer's finding made you edit, re-inspect "
+        "and make the evidence describe the FINAL staged state — otherwise evidence "
+        "written before the fix authorises code nobody reviewed.\n"
+        "A SUBSTANTIAL change (>=50 reviewable lines, >1 code file, or any auth / API / "
+        "migration / prompt / agent / skill surface) additionally needs evidence that is "
+        "adversarial in STRUCTURE — a severity ladder, `file:line` references, and real "
+        "substance — or the depth gate blocks the commit whatever you ran.\n"
+        "ONE REVIEWER AT A TIME on a given diff — almost never two at once (standing "
+        "user directive). The second should see the FIXED code, not the same unfixed "
+        "diff. SEQUENTIAL MEANS WAIT, never kill: if a review is already running when "
+        "another is named, let it finish — terminating it destroys the findings the "
+        "next reviewer builds on. Exception: an ORPHAN (its session gone, or wedged "
+        "holding a slot) is ordinary cleanup — establish it is orphaned first. "
+        "Different diffs in parallel are fine.\n"
+        "ROUNDS ARE CAPPED IN TWO TIERS, and the one you hit FIRST is the one sessions "
+        "forget: at round 2 a MODE-SWITCH block demands you stop patching the named "
+        "instance, audit the ENTIRE diff with a fresh-context reviewer, and fix the "
+        "whole CLASS in one commit (`# audit-ack`; the counter does NOT reset). At "
+        "round 3 it is a HARD STOP needing a fresh decision from the user "
+        "(`# escalation-ack`), which DOES reset the streak — so that cycle repeats. "
+        "A second counter does not reset: at 7 EXTERNAL rounds over the branch's "
+        "whole life the gate reaches its TERMINAL, where `# escalation-ack` no "
+        "longer helps and the only ways out are to accept the outstanding findings "
+        "and merge (`# final-round-accept`, which clears ONE commit and then blocks "
+        "again) or to abandon the branch and restart.\n\n"
+        "THE CROSS-MODEL GATE IS A DIFFERENT THING, and it lives on the PR AFTER you "
+        "push — nothing about it is actionable here. Its point is a perspective from a "
+        "different model: another Claude reviewing Claude's work shares its blind "
+        "spots. Codex is that gate; ANY other agent standing in for it needs the "
+        "user's explicit approval EVERY time, and identifying the right route is not "
+        "permission to take it. Do not request an at-head review before the head you "
+        "want reviewed is pushed. Details, and the rest of the merge gate (CI, base, "
+        "Codex freshness, scheduled review, hook-surface evidence), are in the "
+        "genesis-development skill — consult it there rather than from memory.\n\n"
         "MANDATORY: Before committing, you MUST verify the end-to-end OUTCOME — "
         "not just unit tests. Unit tests prove the code works in isolation. "
         "You must also verify that the actual runtime path delivers the intended "
         "result (e.g., if you wired a notification, confirm it actually sends; "
         "if you fixed a data path, confirm the data actually flows). "
         "Ask: 'If the system restarts now, will this actually work?' "
-        "If you cannot answer yes WITH EVIDENCE, you are not done."
+        "If you cannot answer yes WITH EVIDENCE, you are not done.",
+        block="reminder",
     )
+    # BoundedStdout._write flushes on every write, which preserves the reason the
+    # old `flush=True` was here: hook stdout is block-buffered (piped), so if the
+    # manifest's git work below overruns the 10s hook timeout and Python is
+    # killed, the base reminder must already be out.
+
+    # Additive: deterministic per-file review-scope manifest. Fully fail-open —
+    # any import/build error is swallowed so the base reminder above stands alone.
+    # build_manifest self-bounds its total git time under the hook timeout.
+    try:
+        from review_scope import build_manifest, render_reminder_block
+
+        block = render_reminder_block(build_manifest())
+        if block:
+            # The base reminder above is 6,436 chars — 64% of the harness's
+            # 10,000-char cap before a single file is listed — and
+            # _MAX_LISTED_FILES caps the manifest's COUNT, not its characters.
+            # MEASURED against real tracked paths: 50 median-length paths lands
+            # at 9,030 total and 50 of the longest at 10,961, i.e. over by 961. Over the
+            # cap the harness files the WHOLE block and shows a ~2 KB preview, so
+            # an unbounded manifest costs the mandatory reminder, not just itself.
+            # The writer decides what survives; the manifest is what degrades.
+            _out.emit_or_degrade(
+                "\n" + block,
+                block="scope-manifest",
+                notice=(
+                    "\n[review-scope manifest: {kept} chars kept — the rest was "
+                    "omitted to stay under the hook output cap. Run "
+                    "`git diff --stat $(git merge-base HEAD <default-branch>)` "
+                    "for the full file list.]"
+                ),
+            )
+    except Exception:  # noqa: BLE001 - manifest is best-effort, never load-bearing
+        pass
 
 
 if __name__ == "__main__":

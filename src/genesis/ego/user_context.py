@@ -109,6 +109,11 @@ class UserEgoContextBuilder:
         from genesis.ego.focus import _ALWAYS_SECTIONS
 
         self._current_focus_id = focus_id
+        # Blind drafting (see genesis_context.build): withhold the pending board
+        # from drafting context when the reconcile stage is active (shadow/live).
+        from genesis.ego import reconcile_config
+
+        self._blind_drafting = reconcile_config.effective_mode() != "off"
         weights = dict(context_weights) if context_weights else {}
         # Primary enforcement is in compaction.assemble_context(). This
         # is a defense-in-depth guard for direct build() callers.
@@ -144,12 +149,16 @@ class UserEgoContextBuilder:
             ("proposal_history", self._proposal_history_section),
             ("proposal_board", self._proposal_board_section),
             ("execution_outcomes", self._execution_outcomes_section),
+            ("ego_qa", self._ego_question_section),
             ("goal_progress", self._goal_progress_section),
             ("goal_deep_dive", self._goal_deep_dive_section),
             ("capability_performance", self._capability_performance_section),
             ("recurring_patterns", self._recurring_patterns_section),
             ("output_contract", self._output_contract_section),
         ]
+
+        if self._blind_drafting:
+            section_map = [(k, m) for k, m in section_map if k != "proposal_board"]
 
         import asyncio
 
@@ -425,59 +434,21 @@ class UserEgoContextBuilder:
     async def _user_directives_section(self, *, depth: str = "deep") -> str:
         """User directives — explicit user instructions for the ego.
 
-        Only rendered if there are active directives. Returns empty string
-        otherwise to avoid polluting context with empty sections.
+        Renders active user_ego directives (empty string when none). The query
+        + age computation + render live in the shared build_directives_section
+        helper.
         """
-        try:
-            from genesis.db.crud import ego as ego_crud
+        from genesis.ego.directives_context import build_directives_section
 
-            directives = await ego_crud.list_active_directives(
-                self._db,
-                ego_target="user_ego",
-                limit=5,
-            )
-        except Exception:
-            logger.warning("Failed to query ego directives", exc_info=True)
-            return (
-                "## User Directives\n\n"
-                "*User directives unavailable (query error — see logs).*\n"
-            )
-
-        if not directives:
-            return ""
-
-        lines = ["## User Directives\n"]
-        lines.append(
-            "*The user flagged these as important. Factor them into your "
-            "thinking — but you decide what to propose.*\n"
+        return await build_directives_section(
+            self._db,
+            "user_ego",
+            framing=(
+                "*The user flagged these as important. Factor them into your "
+                "thinking — but you decide what to propose.*\n"
+            ),
+            error_body="*User directives unavailable (query error — see logs).*",
         )
-
-        from datetime import UTC, datetime
-
-        now = datetime.now(UTC)
-        for d in directives:
-            priority = d.get("priority", "normal").upper()
-            content = d.get("content", "?")[:200]
-            directive_id = d.get("id", "?")
-            created_at = d.get("created_at", "")
-            # Compute age
-            age_str = ""
-            if created_at:
-                try:
-                    created = datetime.fromisoformat(created_at)
-                    delta = now - created
-                    if delta.days > 0:
-                        age_str = f"{delta.days}d ago"
-                    else:
-                        hours = int(delta.total_seconds() / 3600)
-                        age_str = f"{hours}h ago" if hours > 0 else "just now"
-                except (ValueError, TypeError):
-                    pass
-            age_part = f", {age_str}" if age_str else ""
-            lines.append(f"- [{priority}] {content}\n  (id={directive_id}{age_part})")
-
-        lines.append("")
-        return "\n".join(lines)
 
     async def _settled_decisions_section(self, *, depth: str = "deep") -> str:
         """Settled user decisions — durable rulings from proposal rejections
@@ -981,15 +952,18 @@ class UserEgoContextBuilder:
         when available. No aggregate scores, no user_response text —
         those trigger deference bias.
         """
+        blind = getattr(self, "_blind_drafting", False)
         if depth == "light":
             try:
-                cursor = await self._db.execute(
-                    "SELECT COUNT(*) FROM ego_proposals "
-                    "WHERE created_at >= datetime('now', '-7 days') "
-                    "AND status IN ('pending', 'approved', 'executed') "
-                    "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
-                )
-                active = (await cursor.fetchone())[0]
+                active = 0
+                if not blind:
+                    cursor = await self._db.execute(
+                        "SELECT COUNT(*) FROM ego_proposals "
+                        "WHERE created_at >= datetime('now', '-7 days') "
+                        "AND status IN ('pending', 'approved', 'executed') "
+                        "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
+                    )
+                    active = (await cursor.fetchone())[0]
                 cursor2 = await self._db.execute(
                     "SELECT COUNT(*) FROM ego_proposals "
                     "WHERE created_at >= datetime('now', '-7 days') "
@@ -998,11 +972,13 @@ class UserEgoContextBuilder:
                     "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
                 )
                 tried = (await cursor2.fetchone())[0]
+                if blind:
+                    return f"## Proposals\nRecently tried: {tried}\n"
                 return f"## Proposals\nActive: {active} | Recently tried: {tried}\n"
             except Exception:
                 return "## Proposals\n*Not available.*\n"
 
-        lines = ["## Active Proposals\n"]
+        lines: list[str] = []
         table_header = (
             "| Action | Topic | Outcome | Realist |\n|--------|-------|---------|---------|"
         )
@@ -1023,26 +999,28 @@ class UserEgoContextBuilder:
             return f"| {action_type} | {short} | {status} | {realist} |"
 
         try:
-            # Section 1: Active proposals (user ego only)
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, realist_verdict, "
-                "realist_reasoning, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-7 days') "
-                "AND status IN ('pending', 'approved', 'executed') "
-                "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL) "
-                "ORDER BY created_at DESC "
-                "LIMIT 15",
-            )
-            active_rows = await cursor.fetchall()
+            # Section 1: Active (pending) proposals — WITHHELD under blind drafting.
+            if not blind:
+                lines.append("## Active Proposals\n")
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, realist_verdict, "
+                    "realist_reasoning, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-7 days') "
+                    "AND status IN ('pending', 'approved', 'executed') "
+                    "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL) "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 15",
+                )
+                active_rows = await cursor.fetchall()
 
-            if not active_rows:
-                lines.append("*No active proposals.*\n")
-            else:
-                lines.append(table_header)
-                for row in active_rows:
-                    lines.append(_format_row(row))
-                lines.append("")
+                if not active_rows:
+                    lines.append("*No active proposals.*\n")
+                else:
+                    lines.append(table_header)
+                    for row in active_rows:
+                        lines.append(_format_row(row))
+                    lines.append("")
 
             # Section 2: Recently tried (user ego only)
             lines.append("## Recently Tried (do not re-propose)\n")
@@ -1226,6 +1204,60 @@ class UserEgoContextBuilder:
             ts = (created_at or "?")[:16]
             lines.append(f"- [{ts}] [{priority}] {short}")
 
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _ego_question_section(self, *, depth: str = "deep") -> str:
+        """Answers to questions THIS ego asked the user via the B3 questions
+        channel (last 4h).
+
+        Without this, the asking user ego never SEES the answer: the reply comes
+        back as a reactive signal that only WAKES the cycle (its summary is not
+        rendered into the focused prompt), and the durable answer lives only in
+        an ego_question observation the user-ego context otherwise never reads.
+        Surfaces every outcome — user_reply (the answer), no_reply/timeout, and
+        not_delivered — so the ego can act on the answer or decide to re-ask.
+        (Both egos may see these; questions are role-shared, not a security
+        boundary. The genesis ego already surfaces them via its observations
+        section.)
+        """
+        try:
+            # Short window (4h ≈ 2-3 cycles): the reply also arrives as a
+            # reactive signal that wakes the asking ego on the SAME cycle — this
+            # durable section is the backup for that one cycle, not a standing
+            # to-do. A long window would re-inject the same answer ~16× over 24h,
+            # inviting duplicate action. (These observations are shared with the
+            # genesis reader and carry no asker identity, so a per-asker
+            # resolve-on-read would steal the other ego's answer — the bounded
+            # window avoids that coupling.)
+            cursor = await self._db.execute(
+                "SELECT content, created_at FROM observations "
+                "WHERE source = 'ego_question' AND resolved = 0 "
+                # datetime() normalizes the stored ISO-8601 'T' separator to
+                # SQLite's space form; a raw text compare treats every same-day
+                # 'T' row as newer than the space-formatted cutoff ('T' > ' '),
+                # so the 4h window would never actually bound (Codex #1499 P2#6).
+                "AND datetime(created_at) >= datetime('now', '-4 hours') "
+                "ORDER BY created_at DESC LIMIT 8"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            logger.error("Failed to query ego question outcomes", exc_info=True)
+            # Fail-soft: a query error must not blank the whole context.
+            return ""
+
+        if not rows:
+            return ""  # rare — omit the section entirely rather than add noise
+
+        header = "## Answers To Your Questions (4h)\n"
+        if depth == "light":
+            return f"{header}{len(rows)} update(s).\n"
+
+        lines = [header, f"**{len(rows)} update(s)**:\n"]
+        for content, created_at in rows:
+            short = (content or "")[:400].replace("\n", " · ")
+            ts = (created_at or "?")[:16]
+            lines.append(f"- [{ts}] {short}")
         lines.append("")
         return "\n".join(lines)
 
@@ -1476,8 +1508,9 @@ class UserEgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
+            from genesis.ego import _capability_render as _cap_render
 
-            entries = await cap_crud.get_all(self._db)
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
             logger.warning("Failed to query capability performance", exc_info=True)
             lines.append(
@@ -1486,14 +1519,44 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         if not entries:
-            lines.append("*No performance data yet.*\n")
+            # Two DIFFERENT states reach here and must not produce the same
+            # sentence: a genuinely empty map, and a full map whose every row
+            # failed a bar. Each message is a false claim in the other's
+            # situation, so the count decides which is rendered.
+            total = await _cap_render.safe_count(self._db)
+            _unusable = await _cap_render.safe_count_unusable(self._db)
+            lines.append(_cap_render.empty_state_note(
+                total,
+                empty="*No track record yet — the map is empty.*\n",
+                filtered="*No qualifying track record ({total} domains present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying track record (count unavailable — "
+                        "see logs).*\n",
+                unusable=_unusable,
+            ))
             return "\n".join(lines)
 
         if depth == "light":
-            avg_conf = sum(e.get("confidence", 0) for e in entries) / len(entries)
-            return (
-                f"## Your Track Record\n"
-                f"{len(entries)} domains tracked (avg confidence: {avg_conf:.0%}).\n"
+            # The dropped-row report belongs on THIS branch too, not only on
+            # the empty and deep ones. A corrupt or future-dated row is just as
+            # excluded here, and this branch renders no table -- so nothing else
+            # on the page hints that anything went missing. `unusable_note` is
+            # also what LOGS, so omitting it left the operator with no signal on
+            # this path at all.
+            #
+            # The sentence itself is SHARED with genesis_context's light branch:
+            # it is the entire claim on a branch that renders no table, so the
+            # two must not drift into wording one qualifies and the other does
+            # not.
+            _light_clause = _cap_render.unusable_note(
+                await _cap_render.safe_count_unusable(self._db)
+            )
+            # Built from `lines`, which already holds the header. Writing the
+            # header a second time here is the same duplication this change
+            # removed one level down for the sentence -- rename one copy and
+            # the two depths emit different headers for the same section.
+            return "\n".join(
+                [*lines, _cap_render.qualifying_subset_line(entries, _light_clause) + "\n"]
             )
 
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
@@ -1507,6 +1570,12 @@ class UserEgoContextBuilder:
             evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
             icon = _TREND_ICONS.get(trend, "=")
             lines.append(f"| {domain} | {conf:.0%} | {icon} | {evidence} |")
+
+        _clause = _cap_render.unusable_note(
+            await _cap_render.safe_count_unusable(self._db)
+        )
+        if _clause:
+            lines.append(f"*{_clause.strip()}*")
 
         lines.append(
             "\nUse this to calibrate confidence on proposals. High-confidence "
@@ -1601,6 +1670,12 @@ class UserEgoContextBuilder:
             '  "notifications": [\n'
             "    {\n"
             '      "content": "what to tell the user (informational, no approval needed)",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "content": "a direct question when you need the user\'s input or a decision — sent without approval; the reply comes back to you as a signal, and you\'ll see an observation if delivery or reply fails",\n'
             '      "urgency": "low|normal|high"\n'
             "    }\n"
             "  ],\n"

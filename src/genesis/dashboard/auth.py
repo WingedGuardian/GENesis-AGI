@@ -15,6 +15,7 @@ import os
 import secrets
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import jsonify, redirect, request, session
 
@@ -73,6 +74,43 @@ def get_or_create_secret_key() -> str:
     except OSError:
         logger.warning("Could not persist flask secret key", exc_info=True)
     return key
+
+
+_internal_token_cache: str | None = None
+
+
+def get_or_create_internal_api_token() -> str:
+    """Return the persistent internal API token, generating it once if absent.
+
+    Trusted loopback/host callers send this as a bearer to authenticate to
+    ``/api`` mutation endpoints when a dashboard password is set. Generated at
+    server boot (mode 0600), cached in-process. INDEPENDENT of the optional
+    ``GENESIS_MCP_HTTP_TOKEN`` (unset on typical installs), so the gate always has
+    a working token. Mirrors :func:`get_or_create_secret_key`.
+    """
+    global _internal_token_cache
+    if _internal_token_cache:
+        return _internal_token_cache
+    from genesis.env import internal_api_token_path
+
+    token_file = internal_api_token_path()
+    if token_file.exists():
+        try:
+            tok = token_file.read_text().strip()
+            if tok:
+                _internal_token_cache = tok
+                return tok
+        except OSError:
+            logger.warning("Could not read internal API token", exc_info=True)
+    tok = secrets.token_hex(32)
+    try:
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(tok)
+        token_file.chmod(0o600)
+    except OSError:
+        logger.warning("Could not persist internal API token", exc_info=True)
+    _internal_token_cache = tok
+    return tok
 
 
 def is_authenticated() -> bool:
@@ -138,6 +176,139 @@ def _check_auth():
 
     # Unauthenticated page request → redirect to login
     return redirect("/genesis/login")
+
+
+# ── App-level /api mutation gate (registered in standalone.py) ────────
+
+# Env kill switch: an operator can disable the /api mutation gate WITHOUT
+# unsetting the dashboard password, if an unforeseen machine caller breaks.
+_API_AUTH_OFF = ("off", "0", "false", "no")
+
+# Genesis-OWNED API route prefixes the gate protects. Scoped deliberately: in Agent
+# Zero hosting mode the gate is installed on AZ's host-owned Flask app, so a broad
+# "/api/" match would also reject AZ's OWN native /api/* routes. Every Genesis
+# mutation route lives under one of these (dashboard + outreach are /api/genesis/*;
+# the tool API is /api/t/*), so this covers all of ours and none of the host's.
+_GENESIS_API_PREFIXES = ("/api/genesis/", "/api/t/")
+
+
+# CSRF: Sec-Fetch-Site values that indicate a request is NOT a cross-origin ride.
+# ``same-origin`` = our own page's fetch; ``none`` = a direct user action (typed
+# URL / bookmark). ``same-site`` and ``cross-site`` are the CSRF-risky values.
+_SAFE_FETCH_SITES = frozenset({"same-origin", "none"})
+
+
+def _origin_matches_host(url: str) -> bool:
+    """True when ``url``'s host[:port] equals the request's ``Host`` header.
+
+    Host comparison is case-insensitive (hostnames are per RFC; browsers already
+    lowercase, this covers hand-crafted same-origin tooling) — a case mismatch can
+    only make the check stricter (fail-closed), never open a bypass.
+    """
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return False
+    return bool(netloc) and netloc.lower() == (request.host or "").lower()
+
+
+def _is_same_origin_request() -> bool:
+    """Whether a state-changing request is same-origin — the CSRF check for the
+    cookie auth path.
+
+    ``SameSite=Lax`` attaches the session cookie on same-*site* requests too (a
+    sibling origin on another port/subdomain of the dashboard host), so a valid
+    cookie is not proof of same-origin intent. Primary signal is ``Sec-Fetch-Site``
+    (browser-set, unforgeable by page JS, present on every current browser): safe
+    iff ``same-origin`` or ``none``. When it is absent (older browser / non-browser
+    client) fall back to matching the ``Origin`` (then ``Referer``) host against the
+    request ``Host``. When NO same-origin signal is present at all, **fail closed** —
+    a legitimate machine caller authenticates with the internal bearer, not the
+    cookie, so a cookie-only request with no origin signal is refused (per the OWASP
+    CSRF Fetch-Metadata guidance: treat absent Sec-Fetch-* as unknown, do not fail
+    open).
+    """
+    sec_fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if sec_fetch_site:
+        return sec_fetch_site in _SAFE_FETCH_SITES
+    origin = request.headers.get("Origin", "").strip()
+    if origin:
+        return _origin_matches_host(origin)
+    referer = request.headers.get("Referer", "").strip()
+    if referer:
+        return _origin_matches_host(referer)
+    return False
+
+
+def check_api_mutation_auth():
+    """App-level gate: require auth for ``/api/**`` STATE-CHANGING requests when a
+    dashboard password is set.
+
+    Registered as an app-level ``before_request`` (NOT blueprint-level) so it
+    covers every blueprint uniformly — the main dashboard blueprint AND the
+    separate ``outreach_api`` blueprint, whose mutation routes a blueprint-scoped
+    hook would miss.
+
+    Open (returns None): everything when no password is set; when the kill switch
+    ``GENESIS_DASHBOARD_API_AUTH=off`` is set; any path outside the Genesis-owned
+    API prefixes ``_GENESIS_API_PREFIXES`` (HTML is handled by the blueprint gate;
+    ``/v1/*`` enforces its own bearer; a co-hosting framework's own ``/api/*`` routes
+    are left alone); GET/HEAD/OPTIONS (non-mutating — guardian/health probes and
+    dashboard polling stay open); and the ``/api/genesis/auth/*`` login/logout
+    endpoints. A mutation passes with a valid internal bearer token, OR a valid
+    session cookie on a same-origin request (Sec-Fetch-Site / Origin — CSRF guard).
+    A cookie-authed cross-origin/originless mutation is rejected 403; a request with
+    no credential at all is rejected 401.
+    """
+    if not get_dashboard_password():
+        return None
+    if os.environ.get("GENESIS_DASHBOARD_API_AUTH", "on").strip().lower() in _API_AUTH_OFF:
+        return None
+
+    path = request.path
+    if not path.startswith(_GENESIS_API_PREFIXES):
+        return None
+    if path.startswith("/api/genesis/auth/"):
+        return None
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+
+    # Trusted machine caller (internal bearer token) — CSRF-immune (an attacker
+    # cannot read the 0600 token file), so it is checked FIRST and is
+    # origin-independent.
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        expected = get_or_create_internal_api_token()
+        if expected and hmac.compare_digest(auth_header[7:], expected):
+            return None
+
+    # Trusted browser session (session cookie). A cookie is NOT proof of
+    # same-origin intent (``SameSite=Lax`` still attaches it on a same-site sibling
+    # origin), so a cookie-authed mutation must ALSO be same-origin — CSRF
+    # defense-in-depth. Fail-closed on a cross-origin/originless cookie request.
+    if is_authenticated():
+        if _is_same_origin_request():
+            return None
+        return jsonify({"error": "cross-origin request refused"}), 403
+
+    return jsonify({"error": "authentication required"}), 401
+
+
+def apply_api_mutation_gate(app) -> None:
+    """Mint the internal API token and register the app-level ``/api`` mutation gate.
+
+    EVERY supported host that mounts the dashboard/outreach blueprints must call
+    this, or setting ``DASHBOARD_PASSWORD`` would leave ``/api`` mutations
+    unauthenticated in that mode (the blueprint-level auth hook deliberately exempts
+    ``/api/*``). Idempotent — guarded by a flag on the app so a double-call (or a
+    host that both creates the app and re-registers blueprints) can't stack the
+    hook.
+    """
+    if getattr(app, "_genesis_api_mutation_gate_applied", False):
+        return
+    get_or_create_internal_api_token()  # mint once (0600) before the gate needs it
+    app.before_request(check_api_mutation_auth)
+    app._genesis_api_mutation_gate_applied = True
 
 
 # ── Routes ────────────────────────────────────────────────────────────

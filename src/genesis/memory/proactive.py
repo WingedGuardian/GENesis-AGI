@@ -25,6 +25,7 @@ fallback for when the server is unreachable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -34,8 +35,42 @@ from typing import Any
 
 from genesis.memory import graph_expansion
 from genesis.memory.intent import classify_intent, classify_stance
+from genesis.util.loop_diag import default_executor_pending
 
 logger = logging.getLogger(__name__)
+
+# Recall sub-stage timers written incrementally into the engine ``stats`` dict by
+# ``retrieval._proactive_impl`` as each stage completes (vector/FTS/expand/…). Folded
+# into ``timings_ms`` on BOTH the success path and the cancellation path, so a 503 that
+# dies mid-recall still names the last stage that finished (the stage AFTER the last
+# present key is where the coroutine was starved). ``rerank_ms`` is folded separately
+# because its ``timings`` key drops the ``_ms`` suffix like the rest but is set on its
+# own stage. Keep in sync with the writers in ``retrieval.py``.
+_RECALL_SUBSTAGE_KEYS: tuple[str, ...] = (
+    "vector_ms",
+    "event_ms",
+    "expand_ms",
+    "fts_ms",
+    "expired_ms",
+    "activation_ms",
+    "breadcrumbs_ms",
+    "assembly_ms",
+)
+
+
+def _fold_engine_substages(timings: dict[str, Any], engine_stats: dict[str, Any]) -> None:
+    """Copy whatever recall sub-stage timers have been populated into ``timings``.
+
+    ``engine_stats`` is mutated in place by the engine as each stage finishes, so on a
+    mid-recall cancellation the completed stages are already present — this surfaces
+    them (minus the ``_ms`` suffix) so the 503 log attributes the stall to a stage.
+    """
+    for key in _RECALL_SUBSTAGE_KEYS:
+        if key in engine_stats:
+            timings[key.removesuffix("_ms")] = engine_stats[key]
+    if "rerank_ms" in engine_stats:
+        timings["rerank"] = engine_stats["rerank_ms"]
+
 
 # ---------------------------------------------------------------------------
 # Config — intent-aware budget + rerank posture, live-read from
@@ -401,7 +436,14 @@ def _render_procedure_line(proc: dict) -> str:
 
 
 async def _enrich(db: Any, dicts: list[dict]) -> None:
-    """Backfill ``_created_at`` + ``_wing`` from memory_metadata (in place)."""
+    """Backfill ``_created_at`` + ``_wing`` from memory_metadata (in place).
+
+    Lets a DB read error PROPAGATE — the caller routes this through
+    ``HybridRetriever._ro_read``, whose fallback retries on the shared connection,
+    and guards the whole enrichment step best-effort. Swallowing here would defeat
+    that fallback on a transient pooled-read failure (Codex #1197 P2). Idempotent,
+    so a fallback re-run is safe.
+    """
     ids = [
         d["memory_id"]
         for d in dicts
@@ -409,46 +451,44 @@ async def _enrich(db: Any, dicts: list[dict]) -> None:
     ]
     if not ids:
         return
-    try:
-        placeholders = ",".join("?" for _ in ids)
-        rows = await db.execute_fetchall(
-            f"SELECT memory_id, created_at, wing FROM memory_metadata "  # noqa: S608
-            f"WHERE memory_id IN ({placeholders})",
-            ids,
-        )
-        meta = {row[0]: (row[1], row[2]) for row in rows}
-        for d in dicts:
-            created_at, wing = meta.get(d.get("memory_id"), (None, None))
-            d["_created_at"] = created_at
-            # Prefer a wing already on the recall payload; fall back to metadata.
-            payload_wing = (d.get("payload") or {}).get("wing")
-            d["_wing"] = payload_wing or wing
-    except Exception:
-        logger.debug("proactive metadata enrichment failed", exc_info=True)
+    placeholders = ",".join("?" for _ in ids)
+    rows = await db.execute_fetchall(
+        f"SELECT memory_id, created_at, wing FROM memory_metadata "  # noqa: S608
+        f"WHERE memory_id IN ({placeholders})",
+        ids,
+    )
+    meta = {row[0]: (row[1], row[2]) for row in rows}
+    for d in dicts:
+        created_at, wing = meta.get(d.get("memory_id"), (None, None))
+        d["_created_at"] = created_at
+        # Prefer a wing already on the recall payload; fall back to metadata.
+        payload_wing = (d.get("payload") or {}).get("wing")
+        d["_wing"] = payload_wing or wing
 
 
 async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
     """Attach up to 2 strongly-linked neighbor id-prefixes to the top 3
-    delivered memories (``related_ids``), for memory_expand follow-up."""
+    delivered memories (``related_ids``), for memory_expand follow-up.
+
+    Lets a DB read error PROPAGATE (see :func:`_enrich`): the caller's ``_ro_read``
+    fallback + best-effort guard handle it, and the writes are idempotent.
+    """
     if not dicts:
         return
     seen = {d.get("memory_id") for d in dicts}
-    try:
-        for d in dicts[:3]:
-            mid = d.get("memory_id")
-            if not mid:
-                continue
-            rows = await db.execute_fetchall(
-                "SELECT target_id FROM memory_links "
-                "WHERE source_id = ? AND strength >= 0.5 "
-                "ORDER BY strength DESC LIMIT 2",
-                (mid,),
-            )
-            related = [row[0][:8] for row in rows if row[0] not in seen]
-            if related:
-                d["related_ids"] = related
-    except Exception:
-        logger.debug("proactive breadcrumbs failed", exc_info=True)
+    for d in dicts[:3]:
+        mid = d.get("memory_id")
+        if not mid:
+            continue
+        rows = await db.execute_fetchall(
+            "SELECT target_id FROM memory_links "
+            "WHERE source_id = ? AND strength >= 0.5 "
+            "ORDER BY strength DESC LIMIT 2",
+            (mid,),
+        )
+        related = [row[0][:8] for row in rows if row[0] not in seen]
+        if related:
+            d["related_ids"] = related
 
 
 # ---------------------------------------------------------------------------
@@ -568,129 +608,181 @@ async def proactive_context(
     retriever = memory_mod._retriever
     db = memory_mod._db
 
-    # Embed once (cache-shared with recall's internal embed of the same text →
-    # a warm hit) — reused for procedure cosine + returned for the ambient fold.
-    t_embed = time.monotonic()
+    # The whole awaited phase sequence runs inside a try/except CancelledError.
+    # When the dashboard route's budget expires it cancels this coroutine
+    # (dashboard/_blueprint.py `_async_route` calls future.cancel(), which
+    # schedules a thread-safe task-cancel on the loop) and CancelledError is
+    # raised HERE at whatever await is in flight. Without this catch the
+    # accumulated phase timings die with the frame and the 503 logs nothing —
+    # the exact observability gap behind the #1169 timeout hunt (the completion
+    # path below only logs when the coroutine finishes). We record each phase
+    # into `timings` as it completes and track the in-flight `phase`, then on
+    # cancellation WARN with the phase + partials and RE-RAISE so the task still
+    # completes as cancelled. CancelledError is a BaseException, so the inner
+    # best-effort `except Exception` blocks never swallow it.
+    timings: dict[str, Any] = {}
+    phase = "embed"
+    # Monotonic clock at the start of the in-flight `phase`, so on cancellation we can
+    # report how long the coroutine was stuck in the phase that got cancelled
+    # (`phase_wall_ms`) — the recall phase completes in ~0.5s but a 503 burns ~4s in it,
+    # and that gap is the whole question PR-2c answers. Updated at each phase transition.
+    phase_started_at = time.monotonic()
     vector: list[float] | None = None
-    try:
-        vector, _available = await retriever._embed_query(prompt)
-    except Exception:
-        logger.debug("proactive embed failed — degrading", exc_info=True)
-    embed_ms = (time.monotonic() - t_embed) * 1000
-
-    # Rerank posture is read LIVE from config (proactive.profiles.<p>.rerank) so
-    # the documented ``rerank: off`` latency/cost kill switch takes effect
-    # without a restart — _PROFILES only supplies the default when config is
-    # silent, and reranking still no-ops downstream without API_KEY_VOYAGE.
-    rerank_live = _rerank_for(profile)
-
-    # The shared security pipeline (recall + filters + wrap + enforce + graph
-    # expansion + immunity emit + retrieved_count write-back).
-    # filter_noise + kb_slots restore the pre-flip hook's content guards (garbage
-    # rows + non-intentional knowledge_base + the KB slot budget) INSIDE the
-    # engine's backfill loop and BEFORE external-content wrapping — so a dropped
-    # noisy/over-cap hit is backfilled from the deeper safe pool (not left as a
-    # hole), the garbage check sees raw content, and dropped items skip
-    # retrieved_count write-backs (Codex on #1169). memory_proactive (the MCP
-    # tool) passes neither, so it is byte-for-byte unchanged.
-    kb_slots = max(1, budget // 3)
     engine_stats: dict[str, Any] = {}
-    t_recall = time.monotonic()
-    dicts = await _core._proactive_impl(
-        prompt,
-        limit=budget,
-        rerank=rerank_live,
-        extra_fts_terms=[k for k in (file_keywords or []) if k] or None,
-        filter_noise=True,
-        kb_slots=kb_slots,
-        rerank_timeout_s=_RERANK_TIMEOUT_S,
-        stats=engine_stats,
-        # This is THE latency-budgeted per-prompt path: push recall's
-        # write-backs/emits + the immunity emit off the request path so the
-        # 4.5s route budget isn't spent on post-result DB writes (ac27b693).
-        defer_side_effects=True,
-    )
-    recall_ms = (time.monotonic() - t_recall) * 1000
+    try:
+        # Embed once (cache-shared with recall's internal embed of the same text
+        # → a warm hit) — reused for procedure cosine + returned for the ambient
+        # fold.
+        t_embed = time.monotonic()
+        try:
+            vector, _available = await retriever._embed_query(prompt)
+        except Exception:
+            logger.debug("proactive embed failed — degrading", exc_info=True)
+        timings["embed"] = round((time.monotonic() - t_embed) * 1000, 1)
 
-    t_enrich = time.monotonic()
-    await _enrich(db, dicts)
-    await _breadcrumbs(db, dicts)
-    enrich_ms = (time.monotonic() - t_enrich) * 1000
+        # Rerank posture is read LIVE from config (proactive.profiles.<p>.rerank)
+        # so the documented ``rerank: off`` latency/cost kill switch takes effect
+        # without a restart — _PROFILES only supplies the default when config is
+        # silent, and reranking still no-ops downstream without API_KEY_VOYAGE.
+        rerank_live = _rerank_for(profile)
 
-    lines = prof.renderer(dicts)
+        # The shared security pipeline (recall + filters + wrap + enforce + graph
+        # expansion + immunity emit + retrieved_count write-back).
+        # filter_noise + kb_slots restore the pre-flip hook's content guards
+        # (garbage rows + non-intentional knowledge_base + the KB slot budget)
+        # INSIDE the engine's backfill loop and BEFORE external-content wrapping —
+        # so a dropped noisy/over-cap hit is backfilled from the deeper safe pool
+        # (not left as a hole), the garbage check sees raw content, and dropped
+        # items skip retrieved_count write-backs (Codex on #1169). memory_proactive
+        # (the MCP tool) passes neither, so it is byte-for-byte unchanged.
+        kb_slots = max(1, budget // 3)
+        phase = "recall"
+        t_recall = time.monotonic()
+        phase_started_at = t_recall
+        dicts = await _core._proactive_impl(
+            prompt,
+            limit=budget,
+            rerank=rerank_live,
+            extra_fts_terms=[k for k in (file_keywords or []) if k] or None,
+            filter_noise=True,
+            kb_slots=kb_slots,
+            rerank_timeout_s=_RERANK_TIMEOUT_S,
+            stats=engine_stats,
+            # This is THE latency-budgeted per-prompt path: push recall's
+            # write-backs/emits + the immunity emit off the request path so the
+            # 4.5s route budget isn't spent on post-result DB writes (ac27b693).
+            defer_side_effects=True,
+        )
+        timings["recall"] = round((time.monotonic() - t_recall) * 1000, 1)
 
-    t_proc = time.monotonic()
-    procedure = None
-    if vector:
-        procedure = await _surface_procedure(db, vector)
-        if procedure:
-            lines.append(_render_procedure_line(procedure))
-            # HONEST funnel signal: bump surfaced_count (NOT invocation_count —
-            # passive surfacing must never feed the promoter, which reads
-            # invocation_count). This lives server-side so EVERY profile records
-            # it in one place; the pre-flip fork bumped it in the hook
-            # (_record_procedure_surfaced), which the thin-client flip removes.
-            # SEMANTIC: counts "the engine included this procedure in a RETURNED
-            # recall response." Under the split client/server model this can
-            # marginally over-count vs "the user saw it": if this response is slow
-            # enough that the client times out (past its budget, see the hook's
-            # _SERVER_TIMEOUT_S) and
-            # falls back to the degraded path, the bump already committed but the
-            # line was never injected. Accepted — surfaced_count is advisory (never
-            # feeds promotion) and the window is a narrow race; a perfect fix would
-            # need the client to report surfaced-shown back (tracked follow-up).
-            # Best-effort: a bump failure must never fail recall. Deferred off
-            # the latency path (ac27b693) — this is an advisory funnel counter,
-            # never read synchronously, so a background write is strictly safe.
-            _proc_id = procedure["id"]
+        phase = "enrich"
+        t_enrich = time.monotonic()
+        phase_started_at = t_enrich
+        # PR-4b (ac27b693): route these post-recall reads off the shared write
+        # lock onto recall's read-only pool via the same _ro_read seam recall's
+        # own reads use. Both are pure indexed SELECTs (memory_metadata PK /
+        # memory_links source_id), so under concurrency they were queuing behind
+        # server writes, not query cost. _ro_read runs fn(pooled_conn, *args) and,
+        # on any pool miss/error, retries on the shared connection — so the
+        # helpers deliberately do NOT swallow their own DB errors (that would hide
+        # a transient pooled-read failure from the fallback; Codex #1197 P2). The
+        # best-effort catch lives HERE so that if BOTH the pooled and shared reads
+        # fail, enrichment degrades to nothing rather than failing recall (the
+        # pre-pool best-effort contract). retriever is genesis.mcp.memory._retriever
+        # (see CC memory two_retriever_wiring) — the same instance the pool was
+        # wired into in PR-4.
+        try:
+            await retriever._ro_read(_enrich, dicts)
+            await retriever._ro_read(_breadcrumbs, dicts)
+        except Exception:
+            logger.debug("post-recall enrichment/breadcrumbs failed", exc_info=True)
+        timings["enrich"] = round((time.monotonic() - t_enrich) * 1000, 1)
 
-            async def _bump_surfaced(proc_id: str = _proc_id) -> None:
-                try:
-                    await db.execute(
-                        "UPDATE procedural_memory SET surfaced_count = surfaced_count + 1 WHERE id = ?",
-                        (proc_id,),
-                    )
-                    await db.commit()
-                except Exception:
-                    logger.debug("surfaced_count bump failed", exc_info=True)
+        lines = prof.renderer(dicts)
 
-            from genesis.util.tasks import tracked_task
+        phase = "procedure"
+        t_proc = time.monotonic()
+        phase_started_at = t_proc
+        procedure = None
+        if vector:
+            procedure = await _surface_procedure(db, vector)
+            if procedure:
+                lines.append(_render_procedure_line(procedure))
+                # HONEST funnel signal: bump surfaced_count (NOT invocation_count
+                # — passive surfacing must never feed the promoter, which reads
+                # invocation_count). This lives server-side so EVERY profile
+                # records it in one place; the pre-flip fork bumped it in the hook
+                # (_record_procedure_surfaced), which the thin-client flip removes.
+                # SEMANTIC: counts "the engine included this procedure in a
+                # RETURNED recall response." Under the split client/server model
+                # this can marginally over-count vs "the user saw it": if this
+                # response is slow enough that the client times out (past its
+                # budget, see the hook's _SERVER_TIMEOUT_S) and falls back to the
+                # degraded path, the bump already committed but the line was never
+                # injected. Accepted — surfaced_count is advisory (never feeds
+                # promotion) and the window is a narrow race; a perfect fix would
+                # need the client to report surfaced-shown back (tracked follow-up).
+                # Best-effort: a bump failure must never fail recall. Deferred off
+                # the latency path (ac27b693) — this is an advisory funnel counter,
+                # never read synchronously, so a background write is strictly safe.
+                _proc_id = procedure["id"]
 
-            tracked_task(_bump_surfaced(), name="proactive_surfaced_count")
+                async def _bump_surfaced(proc_id: str = _proc_id) -> None:
+                    try:
+                        await db.execute(
+                            "UPDATE procedural_memory SET surfaced_count = surfaced_count + 1 WHERE id = ?",
+                            (proc_id,),
+                        )
+                        await db.commit()
+                    except Exception:
+                        logger.debug("surfaced_count bump failed", exc_info=True)
 
-    procedure_ms = (time.monotonic() - t_proc) * 1000
+                from genesis.util.tasks import tracked_task
+
+                tracked_task(_bump_surfaced(), name="proactive_surfaced_count")
+
+        timings["procedure"] = round((time.monotonic() - t_proc) * 1000, 1)
+    except asyncio.CancelledError:
+        # Dominant cause is the route's 4.5s budget expiring mid-flight (the 503
+        # path); the route logs its own "exceeded timeout" line at the same
+        # timestamp to correlate against. Surface which phase was in flight + the
+        # timings gathered so far — the signal the 503 previously discarded —
+        # rather than assert a cause, then re-raise so the task completes as
+        # cancelled.
+        #
+        # PR-2c: the ~4s that a cancelled recall burns is the open question, so pull in
+        # three signals the bare phase name lacked. (1) Fold the recall sub-stage timers
+        # the engine already wrote into `engine_stats` before the cancel — the stage
+        # after the last present key is where it starved (an EMPTY fold ⇒ died in the
+        # first stage, the Qdrant `to_thread` vector search). (2) `phase_wall_ms` — how
+        # long we sat in the cancelled phase, so recall's ~0.5s success cost vs the ~4s
+        # cancel is explicit. (3) The default-executor pending depth: a deep queue with
+        # low loop-lag means `to_thread` (Qdrant/git) saturation, NOT loop starvation —
+        # the alternative the lag sampler can't see. All best-effort, log-only.
+        _fold_engine_substages(timings, engine_stats)
+        timings["phase_wall_ms"] = round((time.monotonic() - phase_started_at) * 1000, 1)
+        timings["cancelled_after_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        logger.warning(
+            "proactive recall CANCELLED at phase=%s; executor=%s; partial timings=%s",
+            phase,
+            default_executor_pending(),
+            timings,
+        )
+        raise
 
     shadow = _shadow_projection(dicts, suppress)
     results = [_result_row(d) for d in dicts]
 
-    total_ms = (time.monotonic() - t0) * 1000
-    timings = {
-        "embed": round(embed_ms, 1),
-        "recall": round(recall_ms, 1),
-        "enrich": round(enrich_ms, 1),
-        "procedure": round(procedure_ms, 1),
-        "total": round(total_ms, 1),
-    }
-    if "rerank_ms" in engine_stats:
-        timings["rerank"] = engine_stats["rerank_ms"]
+    timings["total"] = round((time.monotonic() - t0) * 1000, 1)
+    total_ms = timings["total"]
     # Sub-stage breakdown of the `recall` bucket (ac27b693): surfaced so a slow
     # recall can be attributed to a specific stage from the journal alone,
     # instead of guessed. PR-4 added the read-stage timers (event/expired/
     # breadcrumbs) + assembly so the previously-unaccounted recall residual
     # (read-lock contention) is now attributable. Present only when recall
-    # populated them.
-    for _k in (
-        "vector_ms",
-        "event_ms",
-        "expand_ms",
-        "fts_ms",
-        "expired_ms",
-        "activation_ms",
-        "breadcrumbs_ms",
-        "assembly_ms",
-    ):
-        if _k in engine_stats:
-            timings[_k.removesuffix("_ms")] = engine_stats[_k]
+    # populated them. Same fold the cancellation path uses (PR-2c) so both the
+    # success and 503 logs carry an identical sub-stage vocabulary.
+    _fold_engine_substages(timings, engine_stats)
     if total_ms > _SLOW_RECALL_LOG_MS:
         # One INFO line per slow call so a latency regression is diagnosable
         # from the journal alone (the 503 path discards timings_ms entirely —

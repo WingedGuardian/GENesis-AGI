@@ -15,8 +15,7 @@ async def init(rt: GenesisRuntime) -> None:
     """Initialize inbox monitor for watching ~/inbox/ for markdown files with URLs."""
     if rt._db is None or rt._cc_invoker is None or rt._session_manager is None:
         logger.warning(
-            "Inbox skipped — missing prerequisites "
-            "(db=%s, invoker=%s, session_mgr=%s)",
+            "Inbox skipped — missing prerequisites (db=%s, invoker=%s, session_mgr=%s)",
             rt._db is not None,
             rt._cc_invoker is not None,
             rt._session_manager is not None,
@@ -55,6 +54,11 @@ async def init(rt: GenesisRuntime) -> None:
             writer=writer,
             event_bus=rt._event_bus,
             triage_pipeline=rt._triage_pipeline,
+            # Deterministic inbox-eval memory persistence. The "router" and
+            # "memory" init steps run before "inbox" (runtime/_core.py), so both
+            # are available; getattr-guarded so a degraded init just no-ops.
+            router=getattr(rt, "_router", None),
+            memory_store=getattr(rt, "_memory_store", None),
         )
 
         await rt._inbox_monitor.start()

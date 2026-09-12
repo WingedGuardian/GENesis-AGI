@@ -1,7 +1,44 @@
 """Migration runner — discovers and applies versioned schema migrations.
 
-Each migration is a Python file in this directory named NNNN_description.py
-(e.g., 0001_add_update_history.py). Files must define:
+Each migration is a Python file in this directory. **New migrations use a UTC
+timestamp id** — ``YYYYMMDDHHMMSS_description.py``, e.g.
+``20260903200000_add_widget_table.py``; generate it with
+``date -u +%Y%m%d%H%M%S``. The legacy hand-allocated 4-digit ids are FROZEN as
+an ENUMERATED set (``_migration_ids.FROZEN_LEGACY_FILES``): they still run, and
+nothing adds to, deletes from, or renames within that set. A range could not
+express it — ``0092`` lies between the endpoints and does not exist, so an
+endpoint check admitted a brand-new hand-allocated ``0092_*.py``.
+
+Discovery is a TOTAL function over filenames: a name is a frozen legacy
+migration, a well-formed timestamp migration, or not a migration at all — and
+anything left over raises rather than being skipped. The skip is what made this
+dangerous: a mistyped ``2026090320000_x.py`` (13 digits) matched nothing, so it
+was discovered by nothing and NEVER RAN, and the code needing it deployed
+against a schema that never got the change. CI enforces the same contract via
+``scripts/check_migration_prefixes.py``, plus one rule that is only true of the
+default branch: every frozen file is still present under its own name.
+
+Why: a hand-allocated id has to be CHOSEN, so two branches routinely choose
+the same one — measured 2026-09-03, one PR was renumbered twice in a single
+day and four open PRs held live collisions. A duplicate prefix is not cosmetic
+(see the pre-flight below), so the contention was worth removing at the root
+rather than detecting later. Nobody allocates a timestamp; the clock does.
+
+Ordering is unchanged in practice: ids sort lexicographically, every legacy id
+begins with ``0`` and every timestamp with ``2``, so the frozen history always
+precedes new work.
+
+The one property to know: the id encodes CREATION time, not merge time. A
+fresh install replays creation order; an existing install only runs what is
+still pending, i.e. merge order. They agree unless a migration is authored
+before, but merged after, one it depends on — so if that happens, RENAME IT AT
+MERGE TIME to a later id rather than at creation. CI replays the full sequence
+against an empty database on every PR (``tests/test_db/test_migrations_runner``
+and the security suites), so an ordering that breaks at the SQL level fails
+loudly there; a purely semantic dependency (A backfills what B adds) would
+not, which is why the rename rule is stated rather than left to the tests.
+
+Files must define:
 
     async def up(db: aiosqlite.Connection) -> None:
         '''Apply the migration. MUST NOT call db.commit() or db.rollback()
@@ -29,7 +66,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
-import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -38,10 +74,24 @@ from pathlib import Path
 
 import aiosqlite
 
+from genesis.db._migration_ids import SCHEMA, SCHEMA_MIGRATION_PATTERN
+
 logger = logging.getLogger(__name__)
 
 _MIGRATIONS_DIR = Path(__file__).parent
-_MIGRATION_PATTERN = re.compile(r"^(\d{4})_\w+\.py$")
+#: A 4-digit legacy id OR a 14-digit UTC timestamp id. Both widths are ASCII
+#: digits, so they sort together, and '0' < '2' keeps every legacy id ahead of
+#: every timestamp one — which is why a timestamp must validate as a real
+#: calendar date at/after ``TIMESTAMP_EPOCH_YEAR`` and not merely be 14 digits.
+#: Defined in ``db/_migration_ids`` (stdlib-only) so CI's guard can bind to the
+#: REAL contract without importing this module's aiosqlite dependency; aliased
+#: here because the name is part of this module's established surface.
+#:
+#: MATCHING IS NOT SUFFICIENT: the pattern says a name is well-FORMED, never
+#: that it is ALLOWED. A legacy-width id must also be in the frozen set. Use
+#: ``_migration_ids.classify`` for the verdict; conflating the two is what let
+#: a fresh ``0092_new.py`` past an endpoint check.
+_MIGRATION_PATTERN = SCHEMA_MIGRATION_PATTERN
 
 # SQL statements that would escape the runner's outer BEGIN IMMEDIATE /
 # COMMIT / ROLLBACK envelope. Matched case-insensitively against the
@@ -231,10 +281,12 @@ class MigrationRunner:
     async def get_available(self) -> list[tuple[str, str, Path]]:
         """Return ordered list of (id, name, path) for all migration files."""
         # Shared file-discovery with the data-migration runner (only the
-        # filename pattern differs; execution semantics are deliberately not).
+        # namespace differs; execution semantics are deliberately not). Raises
+        # if any file presents as a migration but cannot run — see the note on
+        # _MIGRATION_PATTERN for why silence there was the dangerous case.
         from genesis.db._migration_discovery import discover_numbered_modules
 
-        return discover_numbered_modules(_MIGRATIONS_DIR, _MIGRATION_PATTERN)
+        return discover_numbered_modules(_MIGRATIONS_DIR, SCHEMA)
 
     async def get_pending(self) -> list[tuple[str, str, Path]]:
         """Return ordered list of migrations not yet applied."""
@@ -260,7 +312,8 @@ class MigrationRunner:
                 raise RuntimeError(
                     f"Duplicate migration prefix '{mid}': "
                     f"'{seen[mid]}' and '{name}'. "
-                    f"Rename one file to use the next available prefix."
+                    f"Rename one file to a fresh UTC timestamp id "
+                    f"(`date -u +%Y%m%d%H%M%S`)."
                 )
             seen[mid] = name
 

@@ -172,6 +172,7 @@ Architecture Decision Records — load-bearing choices with context and rational
 - [Lessons Learned](reference/genesis-lessons-learned.md) — Hard-won project wisdom
 - [Project Rules](reference/genesis-project-rules.md) — Development conventions
 - [CC Compatibility](reference/cc-compatibility.md) — Claude Code integration notes
+- [Tailscale SSH Access](reference/tailscale-ssh-access.md) — Reaching your fleet's tmux slots over Tailscale; IP-keyed aliases + Windows after-reboot troubleshooting
 - [Portability & Recovery](reference/recovery-and-portability-workflow.md) — Backup and restore
 
 ---

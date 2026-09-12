@@ -28,7 +28,20 @@ Do these IN ORDER:
    Portable checks: PDF starts with `%PDF` (`head -c4`), or `pdfinfo <path>` / Python
    `import fitz; fitz.open(path).page_count`; DOCX/PPTX/XLSX are ZIP (`PK` magic). If the
    bytes don't match the claimed format, that alone is a FAIL:render.
-4. Open and read {spec.rendered_path} in full.
+3b. For an OFFICE file (.xlsx/.pptx/.docx) — LibreOffice is NOT installed, so verify
+   two ways (both LibreOffice-free): (i) STRUCTURAL validity with the stdlib —
+   `python3 -c "import zipfile,sys,os; z=zipfile.ZipFile(sys.argv[1]); req={'.xlsx':'xl/workbook.xml','.pptx':'ppt/presentation.xml','.docx':'word/document.xml'}; part=req[os.path.splitext(sys.argv[1])[1]]; assert '[Content_Types].xml' in z.namelist() and part in z.namelist()" {spec.rendered_path}`
+   (a missing required part = FAIL:render); (ii) if OfficeCLI produced it (audit_trail.render.tool
+   == "officecli"), SEMANTIC validity. OfficeCLI is NOT on PATH — resolve the pinned binary first:
+   `OCLI="$HOME/.genesis/deps/officecli/officecli-linux-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')"`.
+   If `test -x "$OCLI"`, run `"$OCLI" view {spec.rendered_path} issues --json` — it must report
+   `count: 0`; a nonzero count (broken/stale formula, missing-sheet ref, low-contrast slide) is a
+   FAIL:render even though `"$OCLI" validate` (schema-only) may pass. If `$OCLI` is absent (the
+   file was rendered elsewhere), skip (ii) and rely on (i). The file must have been `save`/`close`d
+   before any non-OfficeCLI read.
+4. Open and read {spec.rendered_path} in full. For .xlsx, if `test -x "$OCLI"`, use
+   `"$OCLI" view {spec.rendered_path} text` (shows evaluated cell values); else unzip and read the
+   XML parts.
 
 Then judge, with EVIDENCE (a quote/line ref from the artifact) for every verdict:
 

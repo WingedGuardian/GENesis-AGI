@@ -98,6 +98,17 @@ class AgentZeroAdapter:
         except Exception:
             logger.exception("Failed to register outreach blueprint")
 
+        # /api mutation auth gate — MUST be applied wherever the dashboard/outreach
+        # blueprints are mounted, or setting DASHBOARD_PASSWORD would leave /api
+        # mutations unauthenticated in Agent Zero hosting mode (the blueprint auth
+        # hook exempts /api/*). Idempotent.
+        try:
+            from genesis.dashboard.auth import apply_api_mutation_gate
+
+            apply_api_mutation_gate(app)
+        except Exception:
+            logger.exception("Failed to apply /api mutation auth gate")
+
     def register_overlay(self, app: Flask) -> None:
         """Register AZ-specific UI overlay (skip in standalone mode).
 
