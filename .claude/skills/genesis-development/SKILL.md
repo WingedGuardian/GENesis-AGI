@@ -1638,6 +1638,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   * The user may ask for both, in their own words naming the running one. A
     preference for a different tool is NOT that ask; that misreading is the
     incident above.
+  * ROUND 1 of a hook-surface PR runs two reviewers in parallel BY STANDING
+    RULE — see the gate-fix lane below. The rationale above does not bind
+    there: both reviewers see the same unfixed head, so neither could have
+    seen "the fixed code" whatever the order. This carve-out is scoped to
+    round 1 of that lane and to nothing else; rounds after it are sequential
+    like everywhere else.
 
   **If you are about to terminate a running reviewer in order to satisfy this
   rule, that is the tell that you are misreading it.** Wait, or ask.
@@ -1665,6 +1671,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   usage-limits ISSUE comment can sit there while a later trigger delivers real INLINE
   findings (MEASURED on #1484 — see the inline-findings section below). So: re-trigger,
   let time pass, and check the INLINE endpoint before concluding unavailable.
+  A second shape carries the same weight and the same caveat: an explicit
+  REVIEW-FAILURE reply that REPRODUCES. The bot answering `Codex Review: Something went
+  wrong` names its own cause, and a cause you can DISPROVE locally is the strongest
+  reading available — MEASURED 2026-09-09 on two PRs, twice each 43 minutes apart,
+  `Provided git ref <sha> does not exist` while `git ls-remote origin refs/heads/<branch>`
+  returned that exact sha, and two other PRs on the same account reviewed normally in the
+  same window. Reproduces + refuted locally + not account-wide = a defect on their side,
+  not a quota and not something a further retry fixes. One such reply is an incident, not
+  yet evidence: retry once, let time pass, and check the INLINE endpoint first, exactly
+  as the usage-limits case demands.
   Everything weaker is not evidence at all — silence is not, and neither is
   `--check-pr` reporting no review, which says the same thing whether the reviewer is
   down or was simply never triggered at this head. Nor is a
@@ -1679,7 +1695,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   rounds — they never move the machine counter (see "THE COUNTER IS CROSS-MODEL ONLY"
   below) and must not be counted in the visible tally either, or a session re-creates the
   very false-stop this is meant to remove. A cloud-bot (Codex) re-review round counts; a
-  local non-Anthropic reviewer (Kimi on .123) counts. The cap is enforced by three
+  locally-run non-Anthropic reviewer (the install's configured secondary) counts. The
+  cap is enforced by three
   mechanics, not by vibes:
   1. **Visible round counter.** From the first EXTERNAL round, the plan file (or task
      list) carries `Cross-model rounds: N (cap 3)`, updated every external cycle. Rounds
@@ -1687,8 +1704,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      the rationalization the counter exists to kill (for a repeat EXTERNAL round).
   2. **The block point is BEFORE dispatching the next review.** The check is
      "am I about to trigger round 4+?" — evaluated at the mechanical moment
-     (the `@codex review` comment, the re-push, the reviewer dispatch), never
-     after reading the next batch of findings.
+     (the `@codex review` comment, the reviewer dispatch — NOT the push itself,
+     which triggers nothing TODAY — an owner-tunable
+     setting, so verify at the PR rather than trusting this clause), never after
+     reading the next batch of findings.
   3. **The cap CONSUMES standing approval.** A prior "proceed", "merge when
      clean", or "keep going until Codex is green" is VOID once the cap fires.
      Continuing a round-4+ loop on an earlier instruction is a violation, not
@@ -1791,7 +1810,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   button. Note the fresh-context subagent this tier mandates is INTERNAL — mark it
   plainly (`--source internal`, the default); it satisfies the depth gate and does
   NOT advance the counter, so it can never be the round that hard-blocks you. Only a
-  repeat EXTERNAL (Codex/Kimi/…) non-convergence moves the streak toward the cap.
+  repeat EXTERNAL (Codex, the configured secondary, …) non-convergence moves the streak
+  toward the cap.
   (Origin, 2026-09-01: under the old model the audit this very tier demanded counted
   as round 3 and tripped the HARD cap — the gate penalized the remedy it mandated.)
 
@@ -1821,9 +1841,30 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `openrouter-haiku/sonnet/opus` routes are Claude), so "it went through OpenRouter" NEVER
   makes a review external. And Genesis's OWN cognitive/routing systems are never reviewers:
   they are cognitive infrastructure, not a review service, so no internal Genesis model call
-  is ever `--source external`. Approved external-review methods TODAY are **Codex** and
-  **Kimi (on .123)**; **OpenRouter is NOT an approved method today** (a future option, not a
-  current one). The rule below keys on this:
+  is ever `--source external`. The approved methods are **Codex** plus whatever the
+  install names as its SECONDARY reviewer — `merge_gate.secondary_reviewer` in local
+  `genesis.yaml` — one value, the model or CLI to invoke; **absent means there is no
+  standing secondary**,
+  and round 1 of the gate-fix lane below runs Codex-only. It is named in config rather
+  than here because which model an install can reach is install-local, and a version
+  frozen into this file goes stale the day the model does. **OpenRouter is NOT an
+  approved method** (a future option, not a current one).
+
+  Two mechanics for that key, because it is unlike its neighbours: it is read by
+  SESSIONS, not by the gate — no code consults it, so a typo degrades to "no
+  secondary" rather than failing a check. And add it under the EXISTING `merge_gate:`
+  block: a SECOND `merge_gate:` block trips the duplicate-key scan that
+  `_required_ci_workflows` / `_required_scheduled_review_kinds` / `_doc_findings_mode`
+  all share, and all three then discard your configured value and take their DEFAULT.
+  Say "default", not "fail closed" — the directions differ, which is the whole reason
+  it matters, and they differ two-to-one rather than the other way round. Only
+  `_required_scheduled_review_kinds` defaults to its MAXIMAL set, so a discard there
+  TIGHTENS. The other two can LOOSEN: `_doc_findings_mode` defaults to `skip`
+  (`git_push_guard.py:1143`), scoring fewer findings and saying nothing about it; and
+  `_required_ci_workflows` falls back to the shipped `("CI",)`, which is NARROWER than
+  any larger required set an install declared — it does print a NOTE, so that one is
+  loud rather than silent, but it is still a relaxation (Codex P2, #1903). The rule below
+  keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
     blind spots (rubber-stamp risk), so it **NEVER moves the streak** — not an
@@ -1842,7 +1883,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
       self-rubber-stamp reset).
 
   `--source` describes the REVIEW THAT PRODUCED THE FINDINGS, not who typed the
-  evidence file: a mark recording "verified + fixed Codex's (or Kimi's) findings" is
+  evidence file: a mark recording "verified + fixed Codex's (or the secondary's) findings" is
   `external`; a mark of your own architect/security audit is `internal`. A round is
   CLEAN iff the external review found no BLOCKER/SHOULD-FIX/P1/P2 (and no security
   CRITICAL/WARNING). NOTEs, nitpicks, and dispositioned optional-hardening do NOT make
@@ -1879,6 +1920,204 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the user with a minimize-change recommendation. The ack asserts that
   step-back happened — appending it without doing the work is the same
   violation as falsifying `--clean`.
+- **GATE-FIX LANE — a hook-surface PR gets a wider round 1 and a hard stop at 2
+  (standing user rule, 2026-09-09).** "Two" counts DISCOVERY rounds — reviews run
+  to find defects. The confirming review of a terminal push (rule 4) is a gate
+  requirement rather than a discovery round and never counts toward it; without that
+  exemption stated HERE, where the cap is, the two rules read as a contradiction and
+  a session fixing a floor-class finding cannot satisfy both (Codex P2, #1903).
+  **The exemption is DOCTRINE ONLY — no code knows about it, and you will feel that.**
+  This lane's "two" is a rule for the session; the MACHINE counters underneath are
+  unchanged (3 / 7) and are deliberately not being touched. So when a confirming review
+  finds a floor-class defect and you stage the correction, `bump_review_round` sees a
+  distinct staged hash and makes it machine round 3, and the commit gate blocks until a
+  trailing `# escalation-ack` (`review_state.py:850-860`,
+  `review_enforcement_commit.py:1072-1088`). That block is CORRECT and expected: acking
+  it means doing the step-back the block prints, on a PR whose fix-code just produced a
+  floor finding — which is exactly the moment that step-back is worth most. It is not
+  the lane contradicting itself, and a session that has not been told will read it that
+  way (Codex P2, #1903). The gate's strictest path points at the gate
+  itself: a PR changing the rules must pass the rules it is changing, every fix moves
+  the head, and each moved head costs another manual review request. READ (#1824): four review PASSES to relax a gate — architect,
+  security, a cross-model reviewer, and a mandated fresh audit — of which the EXTERNAL
+  streak was 2. The count is stated that way deliberately: an earlier draft here said
+  "four rounds", which is the wrong denominator by this very file's definition, since
+  internal reviews are never rounds. The public record shows 3 review objects and 2
+  review requests; anyone re-deriving "four" from the PR alone will not find it. Meanwhile the fixes those PRs carry are what unblock
+  everything behind them, so a slow lane here is not a safe lane — it is a queue that
+  stops fixing itself.
+
+  **Scope: any PR whose diff touches the enforcement-hook surface** —
+  `_HOOK_SURFACE_PREFIXES` + `_HOOK_SURFACE_FILES` in `scripts/hooks/git_push_guard.py`.
+  Read those constants; do not copy them here — a hand-copied list is wrong the moment
+  a hook is wired. `TestWiredHooksFenceGuardrail` keeps the WIRED-HOOK half
+  self-maintaining FOR THE SPELLINGS IT RECOGNISES, by parsing
+  `.claude/settings.json` (measured 2026-09-10: **54** wired command entries, **49**
+  of them matched, **5** unmatched, yielding **42** unique paths — an earlier draft
+  said "42 of 54", which divides a path count by an entry count and so implies twelve
+  misses where there are five. The five are `.claude/hooks/*.sh` and inline blobs
+  already covered by the prefixes, so no live gap — but a `python3 -u scripts/foo.py`
+  or `node …` wiring would slip past it); it cannot do the same for the tracked CONFIGS the
+  hooks read, because settings.json lists hooks and not the files they consume. Those
+  entries are maintained by hand, so adding a config a hook's behaviour depends on means
+  adding it to `_HOOK_SURFACE_FILES` deliberately (Codex P2, #1903). This lane is a STRICTER-REVIEW, FEWER-ROUNDS trade on that surface. It does
+  not apply anywhere else, and applying it to an ordinary PR doubles review spend for
+  nothing. The test is MECHANICAL and deliberately wider than the rationale — the
+  surface includes hook wiring and the tracked configs the hooks read, so a PR that only
+  incidentally edits one is still in the lane. That is the intended trade: a mechanical
+  test nobody has to adjudicate beats a judgement call about whether an edit "really"
+  changes the gate. Throughout this block "gate PR" means exactly "hook-surface PR".
+
+  1. **Round 1 is DUAL and immediate.** CONFIRM Codex has fired (it auto-reviews when
+     the PR opens). `--check-pr <N>` shows whether a review EXISTS at this head; it
+     CANNOT distinguish "never requested" from "still running", so if you did not
+     request one yourself, request one rather than reading a blank line as proof
+     nobody did. Then
+     run the secondary reviewer (`merge_gate.secondary_reviewer`) alongside it — two
+     sets of blind spots in one calendar round, which is the scarce resource here. No
+     secondary configured → Codex-only, and say so in the PR. Nothing validates that
+     key, so a TYPO looks exactly like "absent" — read the value before concluding
+     there is none, or the lane quietly runs at half strength while the PR truthfully
+     reports Codex-only.
+     **This lane carries STANDING approval for the secondary, and it is the ONE place
+     that overrides the per-use rule above.** The general rule — an alternate reviewer
+     needs explicit per-use approval, and only when Codex is UNAVAILABLE — still governs
+     everywhere else; here the secondary runs alongside a healthy Codex, at PR open,
+     without asking (owner decision, 2026-09-09). Do not generalise this to any other PR.
+     **One head = one round on every counter, however many reviewers saw it**; write the
+     local mark ONCE with combined evidence. That single mark is `--defects` if EITHER
+     reviewer raised a new BLOCKER/SHOULD-FIX/P1/P2 — a clean secondary does not launder
+     a defect-bearing Codex round.
+     **Two separate marks do NOT halve the budget; they can DISARM it, which is worse.**
+     An earlier draft said "halves", and the code says otherwise: `bump_review_round`
+     increments only on a DISTINCT staged hash, so a second defect mark on the same diff
+     is idempotent and costs nothing (`review_state.py:850-865`). But `--clean` resets
+     the streak to 0 **regardless of whether the staged diff changed** (`:780-784`), and
+     an idempotent same-hash `--defects` cannot restore the round it just erased. So on
+     one staged diff, in EITHER order, a mixed clean/defect pair records as CLEAN — the
+     defect-bearing round vanishes and the cap it was arming goes back to zero. That is
+     the failure the one-mark rule prevents (Codex P2, #1903).
+  2. **Triage before touching code — and here it OUTRANKS "fixing is usually free".**
+     That rule (below, and right for ordinary PRs) says a cheap finding costs nothing to
+     fix so just fix it. On this surface the cost is not the edit, it is the PUSH: it
+     invalidates the review, and a push whose DELTA touches the hook surface is never
+     classed review-trivial (`_classify_post_review_delta` tests the DELTA's files, not
+     the PR's), so a one-line courtesy fix to guard code buys a whole extra review
+     cycle. A push of ORDINARY PROSE can still ride the existing
+     review — that is the one cheap fix this rule does not charge you for, and note
+     how narrow it is: `_is_docs_or_config` DELIBERATELY excludes prompt surfaces
+     even when they are `.md` (`review_enforcement_commit.py:114-127`), so a skill,
+     command or agent file is SUBSTANTIAL and buys the full cycle
+     (`review_scope.classify_compare_substantiality`). Since a gate PR's docs are
+     usually exactly those files, assume you are paying (Codex P2, #1903). A cheap NON-floor finding gets a reply,
+     not a commit. Merge both reviewers' findings into ONE table,
+     then classify each: {live bug | latent trap | hardening | observation}. Only live
+     bugs and cheaper-now-than-later traps change code. The rest get a maintainer reply
+     carrying the evidence — IN-THREAD on the inline comment, from a maintainer
+     account: that is the ONLY shape the gate scores as engagement (it reads
+     `in_reply_to_id` on `pulls/N/comments`, so a top-level PR comment engages
+     nothing). Two findings therefore have no thread to reply into and must be
+     documented in the PR body instead: anything the SECONDARY reviewer raised, which
+     runs locally, and anything living in a review BODY rather than an inline comment.
+     Engagement costs ZERO rounds. Most findings never needed to become a diff.
+  3. **One batched fix push per round, self-audited first.** Not two, not three: every
+     push invalidates the review, so three pushes turn one round into three review
+     requests. (A compliant run has at most two CODE pushes total — the free
+     ordinary-prose push of rule 2 does not count against it — one answering round 1,
+     and rule 4's terminal push if the floor demands one.)
+     Before pushing, run the adversarial pass over your own FIX-CODE — reviewing your
+     own work needs no approval and is the specific gap that keeps biting. READ, three
+     instances (#1856, #1686, e7ae445a5): each a fail-open introduced BY fix-code
+     written under review pressure, and each caught only by a later round. The danger is the fixing, not the
+     reviewing.
+  4. **Round 2 is the TERMINAL.** Treat it as the round-7 menu arriving early —
+     the same two branches, but WITHOUT that tier's take-it-to-the-user
+     requirement, because here it is the FLOOR that routes to the owner (rule 5): accept
+     and merge with every outstanding finding documented in the PR body, or abandon and
+     re-cut from a design that does not need a third round. **The always-fix floor is
+     never accepted** — a P1, a security defect, anything destructive or fail-open gets
+     FIXED in the terminal push. "Accept and document" covers everything that is NOT
+     floor-class, so a round 2 carrying floor findings has only two branches: fix them,
+     or abandon.
+     **A terminal push whose delta touches the hook surface needs a fresh review at that
+     head** — that delta is never review-trivial, by design (a docs-only terminal push
+     is the exception, and may ride the existing review — ORDINARY PROSE only, the
+     same narrowness rule 2 spells out: a skill, command or agent file is a PROMPT
+     SURFACE, classifies SUBSTANTIAL, and needs the fresh review even though it is
+     `.md`. That is the identical claim rule 2 already corrects, and it survived here
+     for a round because the fix was applied to the sentence that was flagged instead
+     of to every sentence making the claim). That confirming review
+     is a GATE REQUIREMENT, not a discovery round: if it is clean you merge. If it
+     surfaces something new, the SEVERITY routes it, exactly as it does anywhere
+     else in this rule — a non-floor finding is accepted and documented like any
+     other, and only a FLOOR-CLASS one (P1, security, destructive, fail-open) goes
+     to the owner under rule 5. An earlier draft sent everything to rule 5, which
+     contradicted the accept-and-document branch two sentences above and left one
+     confirmation result with two required actions (Codex P2, #1903). A round 2 with NO
+     floor findings needs no push at all, so there is nothing to re-review.
+  5. **A NEW P1 on the fix-code at round 2 is an owner decision, not round 3.** That is
+     the measured tripwire: a PR whose fix introduced a P1 is the kind that introduces
+     another. Stop and ask. The P1 itself is NOT optional (rule 4's floor) — what the
+     owner is deciding is fix-and-merge versus abandon-and-re-cut, never accept-and-ship.
+     **With no user to ask** (a dispatched session): do not merge and do not open round
+     3 — comment on the PR naming the tripwire and the P1, apply the
+     `needs-architecture-session` label, and open a `ready` follow-up, the same
+     unattended route the architecture-session rule below uses.
+  6. **After round 1 the diff SHRINKS in SCOPE, never grows.** Line count is not the
+     measure — a floor fix under rule 4 may add lines and is mandatory. What may not
+     grow is what the PR is FOR. A revert is fine; new capability is a new PR. This is what actually kills whack-a-mole — the loop is sustained by
+     the diff expanding under review, not by the reviews themselves. (Composes with
+     "Keep the PR the PR" below: adjacent findings become issues.) Against
+     enumerate-the-CLASS above: fixing every instance of ONE defect inside the files
+     this PR already changes is the same fix, not growth — that is the shape the class
+     rule asks for. Reaching into files the PR does not touch, or adding capability to
+     make a class fixable, is growth: that is an issue or a follow-on PR. Ask "Keep the
+     PR the PR" FIRST — a PRE-EXISTING sibling instance the PR works fine without is an
+     issue even when it sits in a file you already touch; this rule governs the reach of
+     a fix you have already decided to make.
+
+  **This is DOCTRINE, not a gate change.** No edit to `git_push_guard.py`, and stopping
+  at 2 DISCOVERY rounds normally keeps you clear of the round-3 cap and the lifetime
+  terminal. "Normally" is doing work there, so say the exception out loud: the machine
+  counter is CLASS-BLIND. `bump_review_round` increments on a distinct staged diff and
+  records no notion of "confirming" versus "discovery" (`review_state.py`), so if the
+  confirming review returns a floor finding and you stage its fix as an external
+  defect-bearing round, that IS machine round 3 and the commit blocks pending
+  `# escalation-ack`. The doctrine's exemption is about which rounds you CHOOSE to run;
+  it cannot exempt you from a counter that cannot see the distinction. Ack it honestly
+  — the step-back it demands has by then genuinely happened — rather than being
+  surprised by it (Codex P2, #1903). Be precise about ONE tier though: the
+  machine layer's FIRST stop is the round-2 MODE-SWITCH block, and a run that takes two
+  defect-bearing external rounds DOES reach it, so the terminal commit may need
+  `# audit-ack`. That is honest rather than a bypass — the block demands a
+  fresh-context audit of the whole diff before the class-fix commit, which is exactly
+  what rule 3 already makes you do. That matters: a lane that required changing the
+  gate could only ship by passing the gate it changes, which is the trap this exists to
+  escape. Do NOT confuse this cap with `genesis-architect.md`'s "escalate after 3 failed
+  attempts" — same number, different rule, different subject.
+
+  **Queue priority:** gate PRs get reviewed and driven before ordinary ones — read this
+  as a THIRD standing justification alongside the two in "When to DRIVE a Merge" below,
+  granted for the same reason those two are: a gate fix is what unblocks the PRs stacked
+  behind it, so leaving one to bake is the queue declining to repair itself.
+
+  **On the word "round" here:** these are CALENDAR rounds — one head, sent out and come
+  back, however many reviewers saw it. That is deliberately not the same denominator as
+  the escalation counter (which counts marks) or `_check_codex_round_escalation` (which
+  counts Codex reviews via the API). A DEFECT-BEARING dual round 1 is one round in all
+  three. A CLEAN one is NOT: `--clean` writes the local streak to 0 while the API count
+  still reads 1, and a mark run before the fix is staged counts nothing locally at all.
+  So never infer one counter's value from another — read the counter you care about.
+  (Pushing between reviewers, which rule 3 forbids, is a further way to diverge them,
+  not the only one.)
+
+  **A note for anyone reading only CLAUDE.md:** "hard stop at 2" is a rule you keep, not
+  a gate that stops you: nothing mechanical stops you REQUESTING a third round until
+  the machine cap at 3. A mechanical block DOES land earlier — the round-2 MODE-SWITCH
+  block on the COMMIT, four paragraphs up — which is a different thing acting on a
+  different verb, and is exactly why the stop has to be honoured deliberately rather
+  than waited for.
+
 - **Some PRs are not a review problem — hand them to an architecture session.**
   When you ARE driving a PR toward green (per "When to DRIVE a Merge" below),
   asking a few clarifying questions is not a substitute for the design
@@ -1992,6 +2231,26 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   the whole command from `--check-pr` output rather than reconstructing it.
 
 **Traps with a real cost, each one measured:**
+
+- **ANSWERING A FINDING TAKES AN IN-THREAD REPLY. A top-level PR comment
+  engages NOTHING.** The gate clears a finding from the score only when a
+  MAINTAINER account replied IN ITS THREAD: it reads `in_reply_to_id` from
+  `pulls/N/comments`, so a reply is matched to the inline comment it answers.
+  `gh pr comment N --body ...` creates an ISSUE comment, which has no
+  `in_reply_to_id` and answers nothing however thorough it is. Use:
+
+      gh api repos/<owner>/<repo>/pulls/<N>/comments \
+        -f body='verified and fixed at <sha>: …' -F in_reply_to=<comment_id>
+
+  (comment ids from `gh api repos/<owner>/<repo>/pulls/<N>/comments`.)
+  MEASURED 2026-09-09: switching to this form took two PRs from
+  `inline-findings: BLOCK` to `ok` with NO code change — 4 findings on #1847 and
+  5 on #1836 had been fixed for hours and still scored, because every reply was
+  top-level. The symptom is a score that will not fall while you are certain
+  you fixed everything; reach for this before you reach for an override.
+  TWO FINDINGS HAVE NO THREAD AT ALL and cannot be engaged this way: one
+  delivered in a review BODY rather than as an inline comment, and anything a
+  locally-run secondary reviewer raised. Document those in the PR body.
 
 - **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
   heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
@@ -2123,6 +2382,48 @@ Verify before any commit:
   chokepoint the callers cannot bypass, then LOCK the chokepoint with a test
   that fails when someone routes around it. A chokepoint nobody is forced
   through is a convention with better documentation.
+
+## Never reinvent what GitHub already does natively
+
+**Standing user rule, 2026-09-09.** Before writing repo-local code that decides
+something about a pull request, branch or merge, check whether GitHub already
+enforces it: rulesets and required status checks, CODEOWNERS, review-thread
+resolution, stale-review dismissal on push, path-based labelling, issue and PR
+templates. If it does, use that — and only depart from it for a specific,
+concrete reason GitHub cannot meet, stated where the code lives.
+
+**Why this is a rule and not a preference.** Enforcement written here is a
+script that every install must have wired, correctly, forever; enforcement
+written as GitHub config is one versioned thing that binds identically for
+everyone and cannot drift between installs. MEASURED on this repo: hook WIRING
+had silently diverged between two installs in a security hook, which is
+invisible to CI because the scripts are tracked and the wiring is not.
+`git_push_guard.py` is 8,222 lines (measured 2026-09-09), and the fraction of it that only reads GitHub
+state is the fraction that never needed to be local.
+
+**How the layers actually split** — this is a division of labour, not a
+migration, and the third layer is not a consolation prize:
+
+- **GitHub config** takes what is a FACT ABOUT GITHUB STATE: is this check
+  green, is this branch behind, was this thread resolved, who owns this path.
+- **A required check run** (issue #1670) takes composite judgements that still
+  read only GitHub state — CI rollup identity, review freshness, finding
+  scores. Port these one at a time, and DELETE each ported check from the local
+  guard in the same PR. Two enforcers of one rule is replica drift with extra
+  steps, and the copy nobody is watching is the one that goes wrong.
+- **Local hooks** keep everything reading THIS BOX or shaping THIS SESSION:
+  review evidence and markers under `~/.genesis/`, override sigils, the
+  bash-safety and destructive-command guards, the round caps. These are not
+  merge conditions at all — a PreToolUse guard runs before a command executes,
+  which is a place GitHub has no presence. Round caps in particular: a research
+  pass across production OSS review tooling found no implementation of them, so
+  that machinery is ahead of the field rather than behind it.
+
+**The check before you build:** name the GitHub feature you considered and why
+it does not fit. "I did not think to look" is the failure this rule exists to
+catch, and it is invisible afterwards — a hand-rolled implementation of a
+platform feature looks exactly like a hand-rolled implementation of something
+novel.
 
 ## Generalizability Gate — build for ANY install, not this one
 
