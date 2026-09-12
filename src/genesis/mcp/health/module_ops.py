@@ -47,7 +47,7 @@ def _get_adapters() -> dict:
     if _adapters is not None:
         return _adapters
 
-    from genesis.modules.external.adapter import ExternalProgramAdapter
+    from genesis.modules.external.adapters import build_adapter
     from genesis.modules.external.config import ProgramConfig
 
     _adapters = {}
@@ -66,7 +66,12 @@ def _get_adapters() -> dict:
             if not data or data.get("type") != "external":
                 continue
             config = ProgramConfig.from_dict(data)
-            adapter = ExternalProgramAdapter(config)
+            # Same selection the runtime loader makes. Skipping these instead
+            # would omit an endpoint module from module_list entirely, which
+            # reads as "not configured" rather than "not available here".
+            adapter = build_adapter(data, yaml_path.name, config)
+            if adapter is None:
+                continue
             _adapters[config.name] = adapter
         except Exception:
             logger.warning("Failed to load module config from %s", yaml_path.name, exc_info=True)

@@ -53,6 +53,13 @@ class TestSshIPCAdapterBuildArgs:
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=15",
             "-o", "BatchMode=yes",
+            # ConnectTimeout bounds an UNREACHABLE host; these bound one that
+            # accepted the connection and then went silent (a machine that slept
+            # mid-session), which would otherwise ride TCP retransmit. ~60s, not
+            # tighter: this path also carries long `claude -p` runs, where a WiFi
+            # roam or a relay switch must not discard an expensive session.
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4",
             "-i", "/home/test/.ssh/key",
             "user@host",
             "echo hello",
@@ -438,3 +445,117 @@ class TestSshIPCAdapterCommandInjection:
         toks = shlex.split(remote_cmd)
         assert toks[0] == payload  # whole path stays a single token
         assert toks[1] == "--version"
+
+
+class TestShellTimeoutAndEncoding:
+    """The SHELL path's own budget and its tolerance of a non-UTF-8 remote.
+
+    Both were untested: a mutation reverting the timeout to the old hardcoded 30
+    left the whole suite green, and the bare `.decode()` could take the process
+    down from inside the one function every caller expects an error dict from.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shell_honours_the_configured_timeout(self):
+        """It used to hardcode 30s, silently overriding a module's `timeout:`."""
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h", timeout=300))
+        seen = {}
+
+        async def fake_wait_for(coro, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+            raise TimeoutError
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                   return_value=AsyncMock()), \
+             patch("genesis.modules.external.ipc.asyncio.wait_for", fake_wait_for):
+            result = await adapter.send("echo hi", method="SHELL")
+
+        assert seen["timeout"] == 300
+        assert "300" in result["error"], "the timeout error must name its duration"
+
+    @pytest.mark.asyncio
+    async def test_the_work_timeout_is_clamped_to_the_adapter_ceiling(self):
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h", timeout=999_999))
+        seen = {}
+
+        async def fake_wait_for(coro, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+            raise TimeoutError
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                   return_value=AsyncMock()), \
+             patch("genesis.modules.external.ipc.asyncio.wait_for", fake_wait_for):
+            await adapter.send("echo hi", method="SHELL")
+
+        assert seen["timeout"] == 3600
+
+    @pytest.mark.asyncio
+    async def test_the_health_probe_does_not_inherit_the_work_timeout(self):
+        """A hung health check would otherwise stall the dashboard for the full
+        work budget — it awaits check_health_cached serially, per module."""
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h", timeout=300))
+        seen = {}
+
+        async def fake_wait_for(coro, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+            raise TimeoutError
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                   return_value=AsyncMock()), \
+             patch("genesis.modules.external.ipc.asyncio.wait_for", fake_wait_for):
+            await adapter.health_check("version", 200)
+
+        assert seen["timeout"] == 30, "the health probe gets its own short budget"
+
+    @pytest.mark.asyncio
+    async def test_ssh_args_carry_keepalives(self):
+        """ConnectTimeout bounds an UNREACHABLE host; these bound a HUNG one."""
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h"))
+        args = adapter._build_ssh_args("echo hi")
+        assert "ServerAliveInterval=15" in args
+        assert "ServerAliveCountMax=4" in args
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_output_does_not_raise_out_of_the_transport(self):
+        """MEASURED against a real Windows endpoint: console-codepage bytes made
+        the bare .decode() raise straight through send(), past every error path.
+        """
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h"))
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"caf\x81 latte", b"warn\xfb")
+        mock_proc.returncode = 0
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                   return_value=mock_proc):
+            result = await adapter.send("type file", method="SHELL")
+
+        assert result["exit_code"] == 0
+        assert "caf" in result["output"]
+        assert result["stderr"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_shell_caller_can_pass_its_own_budget(self):
+        """The transport must HONOUR data["timeout_s"], not merely accept it.
+
+        Found by a mutation sweep: cutting the parameter out of send() left the
+        whole suite green, because the only coverage asserted that the CALLER
+        passed a budget — never that the transport used it. The health probe
+        depends on this end to end.
+        """
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="u@h", timeout=300))
+        seen = {}
+
+        async def fake_wait_for(coro, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+            raise TimeoutError
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                   return_value=AsyncMock()), \
+             patch("genesis.modules.external.ipc.asyncio.wait_for", fake_wait_for):
+            await adapter.send("echo hi", data={"timeout_s": 7}, method="SHELL")
+
+        assert seen["timeout"] == 7, "the caller's budget was ignored"

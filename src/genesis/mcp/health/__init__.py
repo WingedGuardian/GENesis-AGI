@@ -94,6 +94,7 @@ from genesis.mcp.health import skill_replay_run as _skill_replay_run  # noqa: E4
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
+from genesis.mcp.health import user_job_tools as _user_job_tools  # noqa: E402, F401
 from genesis.mcp.health import web_tools as _web_tools  # noqa: E402, F401
 
 campaign_tools = _campaign_tools
