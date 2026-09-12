@@ -641,6 +641,18 @@ async def test_query_with_total_reports_zero_for_an_empty_match(db):
     assert total == 0
 
 
+@pytest.mark.asyncio
+async def test_query_with_total_keeps_the_denominator_for_a_zero_size_page(db):
+    """A count-only caller must not mistake LIMIT 0 for an empty population."""
+    await observations.create(db, id="count-1", **{**_COMMON, "content": "one"})
+    await observations.create(db, id="count-2", **{**_COMMON, "content": "two"})
+
+    rows, total = await observations.query_with_total(db, source="sensor", limit=0)
+
+    assert rows == []
+    assert total == 2
+
+
 async def test_query_with_total_does_not_leak_its_counter_column(db):
     """`COUNT(*) OVER ()` needs a name in the SELECT, and callers spread these
     rows into dicts that reach a briefing and the dashboard. The column must not
@@ -680,4 +692,5 @@ async def test_query_with_total_issues_exactly_one_statement():
     assert len(conn.statements) == 1, (
         f"page and total came from {len(conn.statements)} snapshots: {conn.statements}"
     )
-    assert "COUNT(*) OVER ()" in conn.statements[0]
+    assert "WITH matched AS MATERIALIZED" in conn.statements[0]
+    assert "CROSS JOIN total" in conn.statements[0]

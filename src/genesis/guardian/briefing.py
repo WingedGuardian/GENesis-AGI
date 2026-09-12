@@ -187,7 +187,7 @@ async def build_dynamic_briefing(db) -> BriefingContent:
             content.active_observations.append(
                 f"(showing the {len(obs_rows)} NEWEST of "
                 f"{total_unresolved} unresolved observations — "
-                f"{total_unresolved - len(obs_rows)} older ones exist "
+                f"{total_unresolved - len(obs_rows)} additional observations exist "
                 "beyond this digest)"
             )
     except Exception:

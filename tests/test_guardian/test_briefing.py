@@ -434,7 +434,7 @@ class TestObservationDigestMarker:
         assert len(content.active_observations) == 16
         marker = content.active_observations[-1]
         assert "15 NEWEST of 42" in marker
-        assert "27 older" in marker
+        assert "27 additional" in marker
 
     @pytest.mark.asyncio
     async def test_a_short_read_gets_no_marker_and_costs_no_second_query(self) -> None:
@@ -561,4 +561,4 @@ class TestTheDigestReadsOneSnapshot:
         ):
             content = await build_dynamic_briefing(db)
         assert len(content.active_observations) == 15
-        assert not any("older ones exist" in line for line in content.active_observations)
+        assert not any("additional observations exist" in line for line in content.active_observations)

@@ -580,9 +580,26 @@ async def query_with_total(
         exclude_types=exclude_types,
         origin_class_in=origin_class_in,
     )
+    if limit <= 0:
+        # A caller can request a denominator without a page. A window count
+        # attached to page rows disappears when LIMIT 0 returns none, so retain
+        # the same one-statement snapshot with a count-only shape.
+        rows = await db.execute_fetchall(
+            f"SELECT COUNT(*) AS _total FROM observations {where}", params,
+        )
+        return [], int(rows[0]["_total"])
+
+    # Materialise only matching ids before counting. ``COUNT(*) OVER ()`` on
+    # ``SELECT *`` makes SQLite carry every matching content payload through its
+    # window/sort coroutine before the page limit applies. This keeps one
+    # statement (and therefore one WAL snapshot) while limiting payload reads to
+    # the requested page.
     rows = await db.execute_fetchall(
-        f"SELECT *, COUNT(*) OVER () AS _total FROM observations {where} "
-        "ORDER BY created_at DESC LIMIT ?",
+        f"WITH matched AS MATERIALIZED (SELECT id FROM observations {where}), "
+        "total AS (SELECT COUNT(*) AS _total FROM matched) "
+        "SELECT observations.*, total._total FROM observations "
+        "JOIN matched ON matched.id = observations.id CROSS JOIN total "
+        "ORDER BY observations.created_at DESC LIMIT ?",
         [*params, limit],
     )
     if not rows:
