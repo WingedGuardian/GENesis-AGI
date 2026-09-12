@@ -18,6 +18,7 @@ synthetic payloads, subprocess isolation, no network, no live DB.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -166,6 +167,27 @@ _ALLOWED_ENV_READERS = {"hook_input.py"}
 _DEAD_ENV_VARS = ("CLAUDE_TOOL_INPUT", "CLAUDE_TOOL_USE_RESULT", "CLAUDE_SESSION_ID")
 
 
+#: An actual READ of the environment. The bare substring ``environ`` is NOT
+#: enough: the word "environment" contains it, so a docstring explaining why the
+#: dead variable must not be read was itself reported as an offender — the guard
+#: flagging the very comment that documents it.
+#:
+#: A word BOUNDARY is the whole fix, and enumerating access forms instead is a
+#: trap: an earlier revision here matched ``environ.get``/``environ[`` and thereby
+#: LOST three spellings the crude substring had caught —
+#: ``if "X" in os.environ:`` (the natural presence check),
+#: ``dict(os.environ).get("X")`` and ``os.environ.copy().get("X")``. Narrowing a
+#: guard to the forms you happened to think of is how it stops guarding.
+#: ``\benviron\b`` rejects "environment" (the next character is a word char) while
+#: keeping every access form, including ones nobody has written yet.
+#:
+#: ``getenv`` is the second alternative because it is the MOST idiomatic spelling
+#: of the exact regression this guard exists to prevent — and neither the crude
+#: substring nor the enumerated version ever caught it, while the docstring below
+#: claimed they did.
+_ENV_READ = re.compile(r"\benviron\b|\bgetenv\s*\(")
+
+
 def test_no_hook_reads_dead_env_var_directly():
     """Static guard: no hook reads the dead payload env vars via os.environ.
 
@@ -178,7 +200,7 @@ def test_no_hook_reads_dead_env_var_directly():
         if path.name in _ALLOWED_ENV_READERS:
             continue
         for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if "environ" in line and any(v in line for v in _DEAD_ENV_VARS):
+            if _ENV_READ.search(line) and any(v in line for v in _DEAD_ENV_VARS):
                 offenders.append(f"{path.relative_to(_REPO).as_posix()}: {line.strip()}")
     assert not offenders, (
         "These hooks read a dead payload env var via os.environ instead of "

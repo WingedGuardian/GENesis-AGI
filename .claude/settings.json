@@ -369,6 +369,26 @@
                         "timeout": 10
                     }
                 ]
+            },
+            {
+                "matcher": "Bash|Read|Grep|Glob|Edit|Write|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/secrets_env_access_guard.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook behavioral_linter.py",
+                        "timeout": 10
+                    }
+                ]
             }
         ],
         "Stop": [
