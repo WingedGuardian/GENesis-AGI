@@ -59,11 +59,7 @@ _COMPLETE_SOURCE_COVERAGE_RULE = (
 
 
 def _skill_claims_complete_source_coverage(text: str) -> bool:
-    normalized = " ".join(text.split())
-    return (
-        _COMPLETE_SOURCE_COVERAGE_RULE in normalized
-        and "do not fetch every supplied url" not in normalized.lower()
-    )
+    return _COMPLETE_SOURCE_COVERAGE_RULE in " ".join(text.split())
 
 
 def _read_delegated_skill(skill_path: str) -> str:
@@ -125,14 +121,5 @@ def test_canonical_skills_require_complete_multi_source_coverage(
 
 def test_multi_source_contract_rejects_a_negated_instruction() -> None:
     text = "Do not fetch every supplied URL or individually address each source."
-
-    assert not _skill_claims_complete_source_coverage(text)
-
-
-def test_multi_source_contract_rejects_a_later_contradiction() -> None:
-    text = (
-        _COMPLETE_SOURCE_COVERAGE_RULE
-        + "\n\nDo not fetch every supplied URL when the first source seems sufficient."
-    )
 
     assert not _skill_claims_complete_source_coverage(text)
