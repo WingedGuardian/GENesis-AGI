@@ -1,1 +1,1 @@
-- genesis-development skill: rising review findings (round N+1 > round N) now name a mechanical divergence trigger — revert to the smallest correct diff or split the PR, rather than patching an enlarging diff.
+- genesis-development skill: rising review findings now prompt a provenance check; split correct separable additions or revert incorrect ones before adding more changes.
