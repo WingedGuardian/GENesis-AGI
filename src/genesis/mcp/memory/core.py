@@ -865,6 +865,44 @@ async def memory_store(
 
 
 @mcp.tool()
+async def memory_supersede(old_id: str, new_id: str) -> dict:
+    """Deprecate a memory, recording another memory as its correction.
+
+    The supersede on its own, when the correction is ALREADY stored. Use this
+    when ``memory_store(supersedes=...)`` reported that the deprecation did not
+    happen, when you are linking two memories that both already exist, or
+    whenever you know both ids up front — it is the direct way to say "this one
+    replaces that one".
+
+    Both arguments accept the same short ``id:<8-char>`` handles the proactive
+    hook prints and ``memory_expand`` accepts; an ambiguous handle is never
+    guessed.
+
+    Nothing is written unless every check passes, so a failure here costs
+    nothing and is safe to retry once you have corrected the ids. It raises
+    rather than returning a verdict, because there is no stored content whose
+    fate you would have to interpret alongside the error — that asymmetry is
+    exactly why this exists as its own tool.
+
+    Rejected, with nothing changed:
+      * either id naming no memory, or a prefix naming several
+      * ``old_id == new_id`` — a memory cannot replace itself
+      * a ``new_id`` that is itself deprecated, which normal recall filters out,
+        so the correction would be unreachable while the target went away
+
+    Args:
+        old_id: The memory being corrected. Marked deprecated.
+        new_id: The memory that replaces it. Must exist and be live.
+    """
+    memory_mod = _memory_mod()
+    memory_mod._require_init()
+    assert memory_mod._store is not None
+
+    await memory_mod._store.supersede(old_id, new_id)
+    return {"superseded": True, "old_id": old_id, "new_id": new_id}
+
+
+@mcp.tool()
 async def memory_extract(
     extractions: list[dict],
 ) -> list[str]:

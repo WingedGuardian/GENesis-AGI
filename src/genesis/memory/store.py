@@ -77,16 +77,16 @@ _COLLECTION_MAP = {
 
 
 class SupersedeUnresolved(Exception):
-    """``supersedes`` named no memory, or named several.
+    """A supersede could not be performed on the pair it was given.
 
-    Raised BEFORE ``_mark_superseded`` writes anything, and — on the ``store()``
-    path — AFTER the new memory is durably stored, so it describes a partial
-    outcome rather than a failed write: the content is safe, the deprecation did
-    not happen.
+    Either a handle named no memory or named several, or the pair cannot express
+    a correction (a memory replacing itself, or a successor that is itself
+    deprecated).
 
-    Never guess an ambiguous handle: two memories sharing a prefix are two
-    different corrections, and deprecating the wrong one is unrecoverable
-    without the transcript.
+    Raised BEFORE anything is written, so it always describes an operation that
+    did not start rather than one that half-finished. Never guess an ambiguous
+    handle: two memories sharing a prefix are two different corrections, and
+    deprecating the wrong one is unrecoverable without the transcript.
     """
 
     def __init__(
@@ -96,9 +96,14 @@ class SupersedeUnresolved(Exception):
         successor_id: str | None = None,
         candidates: list[str] | None = None,
         truncated: bool = False,
+        role: str = "supersedes",
     ):
         self.raw_id = raw_id
-        self.reason = reason  # "not_found" | "ambiguous"
+        # "not_found" | "ambiguous" | "self_supersede" | "successor_deprecated"
+        self.reason = reason
+        # Which parameter the bad handle came from. Without it a caller told
+        # "not_found" about its SUCCESSOR would go looking at its target.
+        self.role = role
         # The memory that WOULD have become the successor, when one is known.
         # Deliberately optional: validation now runs BEFORE any write, so on the
         # ``store()`` path there is usually no successor yet — and nothing
@@ -117,7 +122,7 @@ class SupersedeUnresolved(Exception):
         # "is still live in recall", which for `not_found` is exactly the thing
         # resolution just failed to establish.
         super().__init__(
-            f"supersedes={raw_id!r} is {reason}{detail}; "
+            f"{role}={raw_id!r} is {reason}{detail}; "
             "no deprecation was performed"
         )
 
@@ -558,8 +563,60 @@ class MemoryStore:
 
         return memory_id
 
-    async def _resolve_supersede_target(self, handle: str) -> str:
-        """Resolve a ``supersedes`` handle to exactly one EXISTING memory id.
+    async def supersede(
+        self,
+        old_handle: str,
+        new_handle: str,
+        *,
+        timestamp: str | None = None,
+    ) -> None:
+        """Deprecate *old_handle*, recording *new_handle* as its correction.
+
+        The supersede as its own operation, rather than a side effect of
+        storing. That distinction is what makes this simple: BOTH ids are named
+        by the caller, so both can be resolved and validated up front, and there
+        is no content being written whose fate has to be reported alongside the
+        outcome. Every failure is a precondition failure, nothing is mutated,
+        and the caller can retry for free — so this raises rather than
+        returning a verdict to interpret.
+
+        Contrast ``store(supersedes=...)``, where the successor is whatever that
+        call produces: the caller never names it, cannot see it, and a failure
+        after the content lands leaves a genuinely partial outcome.
+        """
+        old_id = await self._resolve_supersede_target(old_handle)
+        new_id = await self._resolve_supersede_target(new_handle, role="new_id")
+        await self._validate_supersede_pair(old_id, new_id)
+        await self._mark_superseded(
+            old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
+        )
+
+    async def _validate_supersede_pair(self, old_id: str, new_id: str) -> None:
+        """Reject a pair that cannot express a correction. Reads only.
+
+        Both checks are about the SUCCESSOR, and both are pre-write:
+
+        * A memory cannot replace itself. It would deprecate the only copy and
+          record it as its own correction — the content survives in the table
+          but is filtered out of recall, and nothing in the result says so.
+        * The successor cannot itself be deprecated. Normal recall filters
+          deprecated rows, so superseding onto one deprecates the target and
+          leaves the correction unreachable: both halves gone.
+        """
+        if old_id == new_id:
+            raise SupersedeUnresolved(old_id, "self_supersede", new_id)
+        meta = await memory_crud.get_metadata(self._db, new_id)
+        if meta is None or meta["deprecated"]:
+            raise SupersedeUnresolved(old_id, "successor_deprecated", new_id)
+
+    async def _resolve_supersede_target(
+        self, handle: str, *, role: str = "supersedes"
+    ) -> str:
+        """Resolve a memory handle to exactly one EXISTING memory id.
+
+        *role* names the parameter in the error, so a caller told
+        ``new_id=... is not_found`` is not left thinking its supersede target
+        was the problem.
 
         Reads only — it writes nothing and must be called BEFORE the store does,
         so an unresolvable target costs nothing and leaves nothing behind. That
@@ -583,10 +640,10 @@ class MemoryStore:
         if outcome == _AMBIGUOUS:
             raise SupersedeUnresolved(
                 handle, "ambiguous", candidates=matches,
-                truncated=len(matches) >= _RESOLVER_MATCH_LIMIT,
+                truncated=len(matches) >= _RESOLVER_MATCH_LIMIT, role=role,
             )
         if outcome == _NOT_FOUND:
-            raise SupersedeUnresolved(handle, "not_found")
+            raise SupersedeUnresolved(handle, "not_found", role=role)
         resolved = matches[0]
 
         # PASSTHROUGH ids (full length, or non-hex) are returned unverified by
@@ -597,7 +654,7 @@ class MemoryStore:
         if outcome == _PASSTHROUGH and await memory_crud.get_metadata(
             self._db, resolved
         ) is None:
-            raise SupersedeUnresolved(handle, "not_found")
+            raise SupersedeUnresolved(handle, "not_found", role=role)
         return resolved
 
     async def _mark_superseded(
