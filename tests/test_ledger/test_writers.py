@@ -25,7 +25,9 @@ async def _rows(db, action_class, subject):
 
 
 async def test_outreach_hook_writes_both_metrics_policy_prior(db):
-    await writers.on_outreach_delivered(db, outreach_id="o-1", category="insight")
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-1", category="insight", channel="discord"
+    )
     rows = await _rows(db, "outreach_send", "o-1")
     assert {r["metric"] for r in rows} == {"reply_received", "positive_engagement"}
     for r in rows:
@@ -36,9 +38,54 @@ async def test_outreach_hook_writes_both_metrics_policy_prior(db):
         assert r["status"] == "open"
 
 
+async def test_outreach_hook_skips_owner_facing_channel(db):
+    # Owner-facing sends (Telegram / voice — approvals, digests, blockers, GitHub-monitor
+    # pings, career nudges, marketing reply-pings, bite-relay) solicit no external reply →
+    # they must NOT create reply_received / positive_engagement predictions, which would
+    # always grade as silence and inject a systematic false negative into calibration.
+    for ch in ("telegram", "voice"):
+        oid = f"o-owner-{ch}"
+        await writers.on_outreach_delivered(
+            db, outreach_id=oid, category="notification", channel=ch
+        )
+        assert await _rows(db, "outreach_send", oid) == []  # no predictions on an owner channel
+
+
+async def test_outreach_hook_predicts_external_notification_on_email(db):
+    # THE discriminator lock: category is OVERLOADED — the cold-marketing PROSPECT email is
+    # category="notification" but channel="email" (external, reply-gradable). It MUST still
+    # get both predictions; gating on category (not channel) would wrongly suppress the
+    # flagship cold-email reply-rate calibration.
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-mktg", category="notification", channel="email"
+    )
+    rows = await _rows(db, "outreach_send", "o-mktg")
+    assert {r["metric"] for r in rows} == {"reply_received", "positive_engagement"}
+
+
+async def test_outreach_hook_predicts_external_discord(db):
+    # A genuine external channel still creates BOTH predictions (not a blanket disable).
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-content", category="content", channel="discord"
+    )
+    rows = await _rows(db, "outreach_send", "o-content")
+    assert {r["metric"] for r in rows} == {"reply_received", "positive_engagement"}
+
+
+async def test_outreach_hook_skips_owner_channel_for_external_category(db):
+    # CHANNEL is the discriminator, not category: a non-owner category ("content") delivered
+    # on an OWNER channel (telegram — e.g. a content-review draft) is still owner-facing and
+    # must be skipped. Locks that the skip is channel-driven — a category-based skip (which
+    # only catches "notification") would wrongly still predict here.
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-content-tg", category="content", channel="telegram"
+    )
+    assert await _rows(db, "outreach_send", "o-content-tg") == []
+
+
 async def test_outreach_hook_stated_confidence(db):
     await writers.on_outreach_delivered(
-        db, outreach_id="o-2", category="digest", stated_confidence=0.4
+        db, outreach_id="o-2", category="digest", channel="discord", stated_confidence=0.4
     )
     rows = await _rows(db, "outreach_send", "o-2")
     assert all(r["provenance"] == "stated" and r["confidence"] == 0.4 for r in rows)
@@ -46,14 +93,16 @@ async def test_outreach_hook_stated_confidence(db):
 
 async def test_outreach_hook_clamps_out_of_range_stated(db):
     await writers.on_outreach_delivered(
-        db, outreach_id="o-3", category="digest", stated_confidence=1.7
+        db, outreach_id="o-3", category="digest", channel="discord", stated_confidence=1.7
     )
     rows = await _rows(db, "outreach_send", "o-3")
     assert all(r["confidence"] == 0.99 and r["provenance"] == "stated" for r in rows)
 
 
 async def test_outreach_hook_default_72h_horizon(db):
-    await writers.on_outreach_delivered(db, outreach_id="o-4", category="insight")
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-4", category="insight", channel="discord"
+    )
     row = (await _rows(db, "outreach_send", "o-4"))[0]
     from datetime import datetime, timedelta
 
@@ -142,7 +191,9 @@ async def test_hook_failure_never_escapes_and_is_counted(db, monkeypatch):
 
     monkeypatch.setattr(lp, "create", _boom)
     # must NOT raise
-    await writers.on_outreach_delivered(db, outreach_id="o-f", category="insight")
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-f", category="insight", channel="discord"
+    )
     await writers.on_task_claimed(db, task_id="t-f", source="user")
     await writers.on_build_verdict(db, candidate_id="b-f", verdict="build")
     await writers.on_ego_proposal(db, proposal_id="p-f", action_type="x")
@@ -157,8 +208,12 @@ async def test_hook_failure_never_escapes_and_is_counted(db, monkeypatch):
 
 
 async def test_dedupe_reentry_is_silent_and_uncounted(db):
-    await writers.on_outreach_delivered(db, outreach_id="o-d", category="insight")
-    await writers.on_outreach_delivered(db, outreach_id="o-d", category="insight")  # resend
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-d", category="insight", channel="discord"
+    )
+    await writers.on_outreach_delivered(
+        db, outreach_id="o-d", category="insight", channel="discord"
+    )  # resend
     rows = await _rows(db, "outreach_send", "o-d")
     assert len(rows) == 2  # still exactly one row per metric
     assert writers.write_failure_counts() == {}
@@ -171,7 +226,9 @@ async def test_validation_failure_is_counted_not_raised(db):
     import unittest.mock as mock
 
     with mock.patch.dict(writers._PRIOR_SEEDS, {"reply_received": 5.0}):
-        await writers.on_outreach_delivered(db, outreach_id="o-v", category="insight")
+        await writers.on_outreach_delivered(
+            db, outreach_id="o-v", category="insight", channel="discord"
+        )
     # reply_received row rejected (confidence out of bounds) and counted;
     # positive_engagement row still landed (isolation is per-write)
     rows = await _rows(db, "outreach_send", "o-v")
