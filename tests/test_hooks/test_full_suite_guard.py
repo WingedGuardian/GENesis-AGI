@@ -271,6 +271,11 @@ class TestUvCarrierBypasses:
             "pdm add pytest",
             "rye add pytest",
             "uv run ruff check .",
+            # The carried executable is the first command after `run`; a later
+            # pytest token is an argument to that program, not an invocation.
+            "uv --color always run echo pytest",
+            "uv --color always run ruff check pytest",
+            "uvx echo pytest",
             # A mere textual MENTION is not an invocation.
             "echo pytest",
             "git commit -m 'run pytest later'",

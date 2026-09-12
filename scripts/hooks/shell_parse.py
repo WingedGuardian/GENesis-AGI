@@ -1229,6 +1229,32 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _hatch_revealed(
+    argv: list[str], start: int, via_tool: bool, is_hatch: bool
+) -> tuple[int, bool] | None:
+    """Return Hatch's carried command, removing its optional ``ENV:`` prefix.
+
+    Hatch's first ``run`` argument may select an environment as
+    ``ENV:COMMAND``.  That selector is not part of the executable.  The
+    documented matrix selectors (``+name=value``) similarly precede the first
+    command argument and must not become the resolved executable.
+    """
+    if start >= len(argv):
+        return None
+    if not is_hatch:
+        return start, via_tool
+    while start < len(argv) and argv[start].startswith("+"):
+        start += 1
+    if start >= len(argv):
+        return None
+    env, separator, command = argv[start].partition(":")
+    if separator:
+        # Hatch defines the *first* colon as the environment separator.  Keep
+        # the remainder intact: it belongs to the command token.
+        argv[start] = command
+    return start, via_tool
+
+
 def _run_carrier_command_start(argv: list[str], i: int) -> tuple[int, bool] | None:
     """``(index, via_tool_run)`` for a ``<front-end> run …`` invocation, else None.
 
@@ -1265,12 +1291,13 @@ def _run_carrier_command_start(argv: list[str], i: int) -> tuple[int, bool] | No
         j += 1
     else:
         return None
+    is_hatch = _basename(argv[i]) == "hatch"
     while j < len(argv):  # `run`'s own flags, ahead of the wrapped command
         t = argv[j]
         if t == "--":
-            return j + 1, via_tool
+            return _hatch_revealed(argv, j + 1, via_tool, is_hatch)
         if not t.startswith("-"):
-            return j, via_tool
+            return _hatch_revealed(argv, j, via_tool, is_hatch)
         j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
     return None  # `uv run --flag` with no command after it
 

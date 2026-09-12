@@ -53,6 +53,21 @@ class TestRunCarrierReveals:
         for fe in ("hatch", "pdm", "pipenv", "rye"):
             assert exes(f"{fe} run pytest tests/") == ["pytest"], fe
 
+    def test_hatch_env_qualified_command_reveals_command(self):
+        # `hatch run [ENV:]COMMAND` — the environment selector is NOT part of
+        # the command name. Hatch treats the FIRST colon as the selector, and
+        # the command may retain later colons.
+        assert exes("hatch run test:pytest tests/") == ["pytest"]
+        assert exes("hatch run py310,py311:pytest tests/") == ["pytest"]
+        assert exes("hatch run lint:all") == ["all"]
+        assert exes("hatch run +py=3.12 test:pytest tests/") == ["pytest"]
+        assert exes("hatch run test:command:with-colon") == ["command:with-colon"]
+
+    def test_colon_token_only_unwrapped_for_hatch(self):
+        # The ENV: split is Hatch's documented form, not a general rewrite:
+        # another carrier's `a:b` token is a command name verbatim.
+        assert exes("uv run a:b") == ["a:b"]
+
     def test_uv_run_with_value_flags_before_command(self):
         # value-flags on `run` are consumed; the wrapped command is still found
         assert exes("uv run --python 3.12 pytest tests/") == ["pytest"]
@@ -60,6 +75,9 @@ class TestRunCarrierReveals:
 
     def test_uv_run_double_dash_then_command(self):
         assert exes("uv run -- pytest tests/") == ["pytest"]
+
+    def test_hatch_run_double_dash_then_env_qualified_command(self):
+        assert exes("hatch run -- test:pytest tests/") == ["pytest"]
 
     def test_run_carrier_stacks_with_ordinary_wrappers(self):
         # timeout is an existing _WRAPPER_SPEC carrier; they compose
@@ -131,6 +149,9 @@ class TestGuardIntegration:
 
     def test_uv_run_selector_allowed(self):
         assert self._guard_rc("uv run pytest tests/ -k foo") == 0
+
+    def test_hatch_env_qualified_bare_directory_blocked(self):
+        assert self._guard_rc("hatch run test:pytest tests/") == 2
 
     def test_plain_forms_unchanged(self):
         assert self._guard_rc("pytest tests/") == 2

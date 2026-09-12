@@ -132,7 +132,7 @@ _CARRIER_EXES = frozenset({"uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye
 
 
 def _carried_pytest_args(seg: Segment) -> list[str] | None:
-    """Args after a literal `pytest` token inside an UNRESOLVED carrier, else None.
+    """Args after a carried pytest executable inside an UNRESOLVED carrier, else None.
 
     The resolver models uv's option grammar to find the carried command, and that
     grammar is an OPEN set: a value-taking flag before `run` swallows `run`
@@ -141,11 +141,11 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
     blocks. Four such gaps were reported on this PR alone, which is the signature
     of enumerating someone else's CLI rather than a list that was merely short.
 
-    So this does not extend the grammar. It asks a CLOSED question — does the
-    literal token `pytest` appear in a carrier's argv — and hands the tokens after
-    it to the SAME `_targets_specific_test` used on a resolved run. An unknown uv
-    flag can no longer decide the verdict; at worst it costs one extra token
-    before `pytest`, which this does not read.
+    So this does not extend the grammar. It identifies the first command token
+    after the literal ``run`` and hands its following tokens to the SAME
+    `_targets_specific_test` used on a resolved run. Scanning every later token
+    is incorrect: ``uv --color always run echo pytest`` runs ``echo``, while
+    ``pytest`` is only its argument.
 
     The scan starts AFTER the `run` literal, because a `pytest` token ahead of it
     is a package NAME, not an invocation. MEASURED on this PR's own tree: scanning
@@ -176,7 +176,8 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
     exists to avoid.
 
     Returns None when the segment is not a carrier, carries no `run` subcommand,
-    or carries no pytest token — `uv pip install requests` must stay allowed.
+    or carries a command other than pytest — `uv pip install requests` must stay
+    allowed.
     """
     if _basename(seg.exe) not in _CARRIER_EXES:
         return None  # resolved to a real command (or not a carrier at all)
@@ -201,9 +202,12 @@ def _carried_pytest_args(seg: Segment) -> list[str] | None:
         if tok in _RUN_CARRIER_VALUE_FLAGS and "=" not in tok:
             i += 2  # `--with pytest` names a DEPENDENCY, not the command being run
             continue
-        if _basename(tok).split("@", 1)[0] == "pytest":  # uv permits `pytest@8.3.5`
-            return argv[i + 1 :]
-        i += 1
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if _basename(tok).split("@", 1)[0] != "pytest":
+            return None
+        return argv[i + 1 :]  # uv permits `pytest@8.3.5`
     return None
 
 
