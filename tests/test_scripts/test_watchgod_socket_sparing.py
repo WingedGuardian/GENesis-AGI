@@ -167,3 +167,121 @@ def test_orange_never_touches_old_socket_pin(tmp_path):
         "yellow/orange sweep deleted a socket"
     )
     assert not (cctmp / "claude-skills").exists(), "orange should evict the cache"
+
+
+def test_red_preserves_a_session_that_has_not_written_a_file_yet(tmp_path):
+    """A session between creating its workspace and writing its first file.
+
+    Selecting on `-type f` alone found no candidate there, so nothing was
+    preserved and the depth-1 sweep reaped the live session's own directories out
+    from under it — its next write gets ENOENT. A brand-new session IS a fresh
+    directory and nothing else, so directories have to count as evidence of life.
+    (Codex P2 on #1856; the regression was introduced by the newest-FILE fix in
+    the commit before it, which is why both shapes are pinned here.)
+
+    The fixture is deliberately the ONLY session, with no file anywhere under a
+    `claude-*` tree: that is what leaves a `-type f` search with no candidate at
+    all, and an empty selection means the depth-1 skip protects NOTHING. With any
+    other file present the skip covers the whole `claude-<uid>` tree and the
+    hazard is masked — an earlier draft of this test made exactly that mistake
+    and passed against the unfixed code.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    starting = cctmp / "claude-1000" / "-home-dev-starting" / "session-new"
+    starting.mkdir(parents=True)  # dirs exist, no file written yet
+    canary = cctmp / "reclaimable-junk"  # outside claude-*, so it cannot be selected
+    canary.mkdir()
+    (canary / "blob").write_bytes(b"x" * 4096)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert starting.is_dir(), (
+        "RED reaped a session that had created its workspace but not yet written "
+        "a file — the live process's next write would fail with ENOENT"
+    )
+    assert not (canary / "blob").exists(), (
+        "the canary survived, so RED reclaimed nothing and the assertion above "
+        "proved nothing"
+    )
+
+
+
+
+def test_red_does_not_let_a_claude_named_decoy_outside_the_tree_win(tmp_path):
+    """RED's preserve-selector must never resolve to a directory outside the
+    ``claude-<uid>/`` tree, however new an entry inside it happens to be.
+
+    This is the anti-regression for the defect two attempts at "improve the
+    selector" shipped (PR #1856): ``find``'s ``-path`` matches the WHOLE path
+    and its ``*`` crosses ``/``, so widening the selector's depth turns
+    ``-path "*/claude-*"`` into "a component OR BASENAME beginning ``claude-``
+    anywhere". A file under an unrelated depth-1 directory then wins the mtime
+    sort, the winner is reduced to the wrong project root, and the depth-1 loop
+    reaps the real live workspace — while the log still says "preserving active
+    session".
+
+    The shape is not hypothetical: pytest basetemps live inside cc-tmp on this
+    install, so the watchgod suite itself plants ``claude-*`` fixtures in the
+    directory the daemon sweeps.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+
+    live = cctmp / "claude-1000" / "-home-dev-active" / "session-a"
+    live.mkdir(parents=True)
+    (live / "live.json").write_bytes(b"L" * 4096)
+
+    # The decoy: basename begins "claude-", depth 3, under a NON-claude depth-1
+    # dir, and strictly the newest thing in the tree.
+    decoy = cctmp / "tmpXYZ" / "sub"
+    decoy.mkdir(parents=True)
+    (decoy / "claude-notes.txt").write_bytes(b"D" * 4096)
+    old = time.time() - 600
+    os.utime(live / "live.json", (old, old))
+    os.utime(live, (old, old))
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (live / "live.json").exists(), (
+        "RED deleted the live session workspace: a claude-named decoy OUTSIDE "
+        "the claude-<uid> tree won the preserve-selector"
+    )
+    # Guard the guard: if the decoy survived too, RED preserved everything and
+    # the assertion above is vacuous.
+    assert not (decoy / "claude-notes.txt").exists(), (
+        "the decoy survived as well, so RED reclaimed nothing and this test "
+        "proves nothing"
+    )
+
+
+def test_red_spares_an_empty_socket_dir_but_still_reclaims_files_in_it(tmp_path):
+    """cc-socks must survive RED even with no socket inside it — it is the
+    directory the next session binds into — while non-socket files sitting in
+    it are still reclaimable.
+
+    Sparing socket INODES is not enough: an empty cc-socks has nothing to keep
+    it non-empty, so the depth-first pass removes the directory itself. Zone B's
+    empty-dir sweep already spares it; this pins the same rule in Zone A.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    socks = cctmp / "cc-socks"
+    socks.mkdir()
+    junk = socks / "stale.log"
+    junk.write_bytes(b"j" * 8192)
+    old = time.time() - 600
+    os.utime(junk, (old, old))
+
+    session = cctmp / "claude-1000" / "-home-dev-active" / "session-a"
+    session.mkdir(parents=True)
+    (session / "live.json").write_bytes(b"L" * 1024)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert socks.is_dir(), (
+        "RED removed an EMPTY cc-socks — the next session has nowhere to bind"
+    )
+    assert not junk.exists(), (
+        "the reclaimable file inside cc-socks survived, so the directory "
+        "exclusion widened to its contents"
+    )
