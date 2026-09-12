@@ -3220,12 +3220,19 @@ class TestRequiredCiWorkflowsConfig:
 
 class TestPrCiStatusCancelSibling:
     """Concurrency-cancel dedup (approach B): a CANCELLED CheckRun is dropped IFF a
-    check of the SAME identity (name + workflowName) concluded SUCCESS AT OR AFTER
+    check of the SAME identity (name + workflowName) concluded SUCCESS STRICTLY AFTER
     it — so a superseded `cancel-in-progress` duplicate (cancel older than its
     re-run's success) drops, but a SUCCESS-then-cancel re-run on an unchanged head
     still blocks. Both sides are terminal COMPLETED runs (always carry completedAt);
-    every unresolvable case (no identity, no completedAt, no later success) fails
-    closed to red."""
+    every unresolvable case (no identity, no completedAt, no strictly-later success)
+    fails closed to red.
+
+    The rule now lives in the SHARED `_drop_superseded_cancels`, which the leaks relief
+    path also calls. The boundary was tightened from at-or-after to strictly-after when
+    that second caller appeared (Codex P1): an EQUAL second-precision timestamp orders
+    nothing, and an unprovable ordering must fail closed on a gate that forces --admin.
+    Measured cost on the CI path before tightening: 0 of 30 real cancelled jobs turned
+    on a tie."""
 
     @staticmethod
     def _set(monkeypatch, checks):
