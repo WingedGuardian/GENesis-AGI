@@ -184,6 +184,13 @@ _GATED_MENTION = re.compile(
 _GH_MENTION = re.compile(r"\bgh\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
 
+#: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
+#: whether a segment that resolved to one of them left its operation unreadable —
+#: the one blind-spot shape `_mentions_gated_op` structurally cannot see, because
+#: the operation's name is the missing part. Every gated op in this file is a
+#: subcommand of one of these two.
+_GATED_EXES = frozenset({"git", "gh"})
+
 
 def _mentions_gated_op(command: str) -> bool:
     """Whether the RAW text names any gated operation, on the blind path only."""
@@ -7860,11 +7867,33 @@ def _run_merge_and_push_gates() -> int:
         # turns an allow into a prompt, or into a refusal when unattended.
         #
         # A mutation test proves nothing about an axis its cells do not vary.
+        # `_mentions_gated_op` is the conjunct that keeps this net narrow, and it
+        # rests on an assumption that holds for every blind-spot cause but one: that
+        # the operation is still SPELLED in the raw text, and only the structure
+        # around it is unreadable. A segment that resolves to git or gh with a verb
+        # the shell builds is the case where the unreadable part IS the operation's
+        # name — the text test is then asked about a word that is not there to find,
+        # and it answers "no gated op" with the same confidence for a command that
+        # has none. Requiring it there would make this net's trigger depend on
+        # whoever wrote the command choosing to spell the operation out.
+        #
+        # Read off the SEGMENT rather than off `blind`, deliberately: which programs
+        # are gated is this guard's question, and shell_parse keeps its BlindSpot to
+        # a single decision field for reasons its own class docstring measures. The
+        # exe test is what keeps the widening affordable — a segment whose PROGRAM
+        # is a variable is not established as git at all, and MEASURED over 129,179
+        # real commands those are 1,845 (interpreters and remote shells held in
+        # variables, plus prose) against 14 for the case this adds. Those 1,845 still
+        # reach this net through `_mentions_gated_op` whenever the operation is
+        # spelled, which is the honest split: an unreadable program naming a publish
+        # is worth one confirmation, an unreadable program naming nothing is a
+        # Tuesday.
+        hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
         blind_spot_reason: str | None = None
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
             and blind is not None
-            and _mentions_gated_op(cmd)
+            and (_mentions_gated_op(cmd) or hidden_gated_verb)
         ):
             if blind.bounds_induced:
                 # The DEPTH bound refuses outright, interactive or not, and the
