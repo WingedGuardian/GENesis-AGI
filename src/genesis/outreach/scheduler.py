@@ -18,19 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Discord sub-channel names used by campaign sessions in pending_outreach.
 # The outreach pipeline routes via adapter name ("discord"), not sub-channel.
-_DISCORD_CHANNELS = frozenset(
-    {
-        "announcements",
-        "dev-discussion",
-        "general",
-        "showcase",
-        "getting-started",
-        "design",
-        "bug-reports",
-        "feature-requests",
-        "troubleshooting",
-    }
-)
+# Moved to outreach.types so `outreach_send` shares ONE list with this module;
+# the alias is kept so existing references here keep reading.
+from genesis.outreach.types import DISCORD_CHANNELS as _DISCORD_CHANNELS  # noqa: E402
 
 
 class OutreachScheduler:
@@ -749,8 +739,18 @@ class OutreachScheduler:
                     # Map Discord sub-channel names to adapter name.
                     # Campaign sessions queue with channel="announcements" etc.,
                     # but the pipeline adapter is registered as "discord".
+                    #
+                    # AND CARRY THE SUB-CHANNEL. Mapping the name away without
+                    # keeping it is how a queued "announcements" post silently
+                    # became a dev-discussion post: _deliver then resolves the
+                    # recipient from OUTREACH_RECIPIENT_DISCORD (default
+                    # "dev-discussion"), and the webhook adapter falls back to
+                    # the default webhook rather than failing, so nothing
+                    # anywhere reports the redirect. MEASURED 2026-09-07 with a
+                    # real v3.0b18 announcement, caught before it drained.
                     raw_channel = row.get("channel", "telegram")
-                    channel = "discord" if raw_channel in _DISCORD_CHANNELS else raw_channel
+                    is_discord_subchannel = raw_channel in _DISCORD_CHANNELS
+                    channel = "discord" if is_discord_subchannel else raw_channel
 
                     req = OutreachRequest(
                         category=cat,
@@ -761,6 +761,10 @@ class OutreachScheduler:
                         channel=channel,
                         thread_id=row.get("thread_id"),
                         validated_recipient=row.get("validated_recipient"),
+                        # The sub-channel the row asked for. _deliver resolves
+                        # validated_recipient or target_chat_id or <default>, so
+                        # an explicit recipient on the row still wins.
+                        target_chat_id=raw_channel if is_discord_subchannel else None,
                         # Preserve the BULK/campaign flag through the queue so a
                         # QUEUED cold-marketing send classifies BULK at the
                         # autonomy gate (a legacy row lacking the column → False).
