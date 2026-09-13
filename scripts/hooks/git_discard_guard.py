@@ -779,7 +779,7 @@ def _rewind_verb_and_operands(argv: list[str]) -> tuple[str, list[str], list[str
     return verb, operands, options
 
 
-def _writes_the_worktree(argv: list[str], verb: str) -> bool:
+def _writes_the_worktree(argv: list[str], verb: str, options: list[str] | None = None) -> bool:
     """Does this verb, as spelled, write the WORKING TREE at all?
 
     An index-only command reverts no merged work, so claiming it rewrote the
@@ -800,15 +800,23 @@ def _writes_the_worktree(argv: list[str], verb: str) -> bool:
     Unrecognised spellings fall toward TRUE — an over-eager note costs a sentence,
     a missed one costs the silent reversion this guard was built for.
     """
+    # Read the flags from the VERB's OWN options, never the whole argv. A token after
+    # `--` is a FILENAME: MEASURED, `git checkout <old> -- -p .` rewinds the whole
+    # worktree while a file named `-p` sits in the pathspec list, and matching over
+    # argv read that as patch mode and suppressed the note. Same collision class as
+    # git's global `-C` sharing a spelling with switch's `-C`. `options` excludes the
+    # pathspec section by construction; argv is the fallback only when the caller did
+    # not resolve it.
+    opts = set(options) if options is not None else set(argv)
     if verb == "read-tree":
         # `-n/--dry-run` reports and changes nothing — MEASURED on git 2.43:
         # `git read-tree -n -u --reset <old>` exits 0 with worktree AND index
         # untouched, yet it warned and wrote `broad: true` recurrence evidence
-        # (Codex P2, round 2).
-        if {"-n", "--dry-run"} & set(argv):
+        # (Codex P2, round 2). read-tree takes no pathspec, so argv and options agree.
+        if {"-n", "--dry-run"} & opts:
             return False
-        return "-u" in argv
-    if verb in ("checkout", "restore") and {"-p", "--patch"} & set(argv):
+        return "-u" in opts
+    if verb in ("checkout", "restore") and {"-p", "--patch"} & opts:
         # Patch mode is an INTERACTIVE hunk picker: nothing is written until a
         # human selects hunks, and a session-driven Bash tool has no interactive
         # stdin to select them with. The silent-revert shape this note hunts is
@@ -816,8 +824,8 @@ def _writes_the_worktree(argv: list[str], verb: str) -> bool:
         # recurrence evidence (Codex P2, round 2).
         return False
     if verb == "restore":
-        staged = {"-S", "--staged"} & set(argv)
-        worktree = {"-W", "--worktree"} & set(argv)
+        staged = {"-S", "--staged"} & opts
+        worktree = {"-W", "--worktree"} & opts
         return bool(worktree) or not staged
     return True
 
@@ -900,9 +908,21 @@ def _rewind_source(argv: list[str], verb: str, cwd: str | None = None) -> str | 
         # HEAD and stayed silent (Codex P2, round 2).
         trees = [t for t in resolved[1] if t != "--"]
         return _as_commitish(trees[-1]) if trees else None
-    for tok in resolved[1]:
-        if tok == "--":
-            return None  # `git checkout -- .` — no source, a plain local discard
+    # A `--` separator REMOVES the ambiguity: git reads everything before it as a
+    # revision and everything after as a pathspec. So when one is present, the first
+    # operand is the source and no disambiguation is needed — and must not be
+    # attempted. MEASURED: with a branch AND a directory both named `src`,
+    # `git checkout src -- .` really does rewind the worktree from that branch
+    # (top.py v1 -> v2), and the directory stat classified `src` as a pathspec and
+    # went silent. A false NEGATIVE, introduced by the stat that fixed the slashless
+    # case, in the one direction that matters — found by cross-model review.
+    operands = resolved[1]
+    if "--" in operands:
+        before = operands[: operands.index("--")]
+        return _as_commitish(before[0]) if before else None
+    # No separator: the first bare operand is genuinely ambiguous, which is the case
+    # git itself has to resolve, so here the pathspec tests earn their place.
+    for tok in operands:
         if (
             tok in _TREE_REWIND_BROAD_PATHSPECS
             or tok.endswith("/")
@@ -944,7 +964,10 @@ def _rewrites_whole_tree(argv: list[str], verb: str, cwd: str | None = None) -> 
     """
     # An index-only spelling rewrites nothing in the worktree, so it is excluded
     # before any pathspec question — see `_writes_the_worktree` for the measurements.
-    if not _writes_the_worktree(argv, verb):
+    resolved_for_mode = _rewind_verb_and_operands(argv)
+    if not _writes_the_worktree(
+        argv, verb, resolved_for_mode[2] if resolved_for_mode else None
+    ):
         return False
     if verb == "read-tree":
         # `--prefix <dir>/` reads the tree UNDER that subdirectory — MEASURED on

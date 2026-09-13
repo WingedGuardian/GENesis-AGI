@@ -1819,6 +1819,80 @@ def test_the_count_is_documented_as_ATTEMPTS_not_completed_rewinds():
     )
 
 
+def test_a_revision_before_the_separator_is_never_mistaken_for_a_pathspec(repo):
+    """`--` removes the ambiguity, so the directory stat must not apply before it.
+
+    MEASURED: with a BRANCH and a DIRECTORY both named `src`, `git checkout src -- .`
+    really rewinds the worktree from that branch — and the stat that fixed the
+    slashless-directory miss classified `src` as a pathspec and went silent. A false
+    NEGATIVE introduced by a false-positive fix, in the direction that matters.
+
+    git reads everything before `--` as a revision and everything after as a
+    pathspec, so when a separator is present there is nothing to disambiguate and
+    nothing to stat. The stat earns its place only in the genuinely ambiguous case
+    git itself has to resolve.
+    """
+    (repo / "src").mkdir()
+    (repo / "src" / "f.py").write_text("v1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add src dir")
+    _git(repo, "branch", "src")  # a branch whose name collides with the directory
+    _git(repo, "checkout", "-q", "src")
+    (repo / "tracked.py").write_text("ON-BRANCH-src\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "work on branch src")
+    _git(repo, "checkout", "-q", "main")
+
+    cmd = "git checkout src -- ."
+    got = _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": str(repo)})
+    assert got and got[0][0] == "src", (
+        f"a rewind from branch `src` must be detected even though a src/ directory "
+        f"exists — the separator settles it. Got {got!r}"
+    )
+    assert got[0][3] is True, "the pathspec is `.`, so it is a whole-tree rewind"
+
+    # The control, and the reason the stat exists at all: with NO separator the same
+    # token is ambiguous, and an ordinary directory discard must stay silent.
+    discard = "git checkout src"
+    assert not _gd._tree_rewind_segments(
+        discard, {"tool_input": {"command": discard}, "cwd": str(repo)}
+    ), "without a separator `src` is a pathspec — an ordinary discard, not a rewind"
+
+
+def test_a_file_named_like_a_mode_flag_does_not_suppress_the_warning(repo):
+    """Mode flags are read from the VERB's options, never from the whole argv.
+
+    MEASURED: `git checkout <old> -- -p .` rewinds the whole worktree while a file
+    named `-p` sits in the pathspec list; matching `-p` over argv read that as
+    interactive patch mode and suppressed the note entirely. Same collision class as
+    git's global `-C` sharing a spelling with switch's force-create `-C`.
+    """
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "-p").write_text("awkward name\n")
+    (repo / "--staged").write_text("awkward name\n")
+    _git(repo, "add", "--", "-p", "--staged")
+    _git(repo, "commit", "-m", "files named like flags")
+
+    for cmd in (
+        f"git checkout {old} -- -p .",
+        f"git restore --source={old} -- --staged .",
+    ):
+        got = _gd._tree_rewind_segments(
+            cmd, {"tool_input": {"command": cmd}, "cwd": str(repo)}
+        )
+        assert got and got[0][0] == old, (
+            f"a pathspec that looks like a mode flag must not silence a real rewind: "
+            f"{cmd!r} gave {got!r}"
+        )
+
+    # Controls: the SAME spellings as real verb options must still suppress, or this
+    # test would pass against a build that simply stopped checking modes.
+    for cmd in (f"git checkout -p {old} -- .", f"git restore -S --source={old} ."):
+        assert not _gd._tree_rewind_segments(
+            cmd, {"tool_input": {"command": cmd}, "cwd": str(repo)}
+        ), f"{cmd!r} is interactive or index-only and must stay silent"
+
+
 # ── the tripwire: recurrence must be COUNTABLE, not argued ───────────────────
 # The owner's decision (2026-09-06) was "loud note now, block if it recurs". That
 # only means something if recurrence can be measured, so every match writes a
