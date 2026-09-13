@@ -38,12 +38,44 @@ class _QueueStub:
         self.marked = (task_id, reason)
 
 
+@pytest.fixture(autouse=True)
+def _no_runtime_leak():
+    """Preserve and restore the process-global GenesisRuntime singleton.
+
+    `_handle_failure`'s autonomy-correction block calls
+    `GenesisRuntime.instance()`, which CONSTRUCTS AND STORES a blank singleton
+    when none exists (`runtime/_core.py` `instance`) rather than raising. An
+    earlier version of this file's docstring asserted the opposite, so these
+    tests would have leaked a blank runtime into every test that ran after
+    them in the same process — making those collection-order dependent
+    (Codex P3, #1941). Restoring the exact prior value keeps the leak local
+    whether or not a real runtime already exists.
+    """
+    from genesis.runtime._core import GenesisRuntime
+
+    saved = GenesisRuntime._instance
+    # Cleared, not merely saved: `_sched`'s docstring below claims the
+    # autonomy-correction block does nothing, which is true only when no
+    # singleton pre-exists. A runtime left by an earlier test in the same
+    # process carries a real `_autonomy_manager`, and the block would then
+    # perform a real `record_correction` write — swallowed, so the test still
+    # passes, but it is a stray write and a collection-order dependency. This
+    # makes the claim unconditional.
+    GenesisRuntime._instance = None
+    try:
+        yield
+    finally:
+        GenesisRuntime._instance = saved
+
+
 def _sched(bus) -> types.SimpleNamespace:
     """Minimal DispatchContext stand-in with only what _handle_failure reads.
 
     `_db=None` makes maybe_observe_failure's guarded lookup raise and be
-    swallowed, and no GenesisRuntime exists so the autonomy-correction block
-    is likewise swallowed — both by their own try/except, not by this test.
+    swallowed by its own try/except. The autonomy-correction block does NOT
+    raise — `GenesisRuntime.instance()` lazily builds a blank singleton, whose
+    `_autonomy_manager` is None, so the block simply does nothing; the
+    `_no_runtime_leak` fixture above contains the singleton it leaves behind.
     """
     return types.SimpleNamespace(_queue=_QueueStub(), _event_bus=bus, _db=None)
 
