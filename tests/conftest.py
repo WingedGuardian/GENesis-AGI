@@ -251,6 +251,47 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from writing REAL merge-override audit rows ───────
+@pytest.fixture(autouse=True)
+def _isolate_override_log(tmp_path):
+    """Redirect the merge gate's override STORE to tmp for ALL tests.
+
+    Any test that drives ``git_push_guard`` with an override sigil in the command
+    now produces a durable audit row, and the default path is the live log the
+    operator reads. MEASURED before this existed: four rows describing a PR that
+    does not exist — one blocked command retried during development — reached the
+    real store and had to be removed by hand. A store nobody isolated records
+    fiction before it records anything true.
+
+    Repo-wide rather than under ``tests/test_hooks/``: ``tests/test_scripts/``
+    also drives these hooks (some as subprocesses), and a bare local
+    ``git merge x  # merge-to-main-override`` is enough to write a row — no PR,
+    no network. Set on the environment so subprocess-launched hooks inherit it.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real log — mirrors
+    ``_isolate_alert_queue``.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GENESIS_MERGE_OVERRIDE_DIR", str(tmp_path / "merge_overrides"))
+    # The discard guard's recovery store, for the SAME reason and by the same
+    # argument: tests/test_scripts/ drives that hook too, some as subprocesses, and
+    # its live default is ~/.genesis/git_discard_snapshots. Today only
+    # test_git_discard_guard.py sets it locally, so nothing leaks — this is here so
+    # the NEXT test that drives that guard cannot write to the operator's real
+    # recovery store. Isolating one of two sibling stores was the gap.
+    mp.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(tmp_path / "git_discard_snapshots"))
+    # And the SUPERSEDED knob, which is config the operator may still carry. It no
+    # longer steers the store, but setting it now makes the guard print a migration
+    # notice — so leaving it inherited means the suite's stderr depends on the
+    # developer's environment. Same gap as the sibling store above, one level up:
+    # isolating the store but not the config that talks about it.
+    mp.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
 @pytest.fixture(autouse=True)
 def _isolate_genesis_db_path(tmp_path):

@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0b17"
+version = "3.0.0b18"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite",
@@ -32,6 +32,26 @@ dependencies = [
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
+    "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
+                           # qdrant-client above: the graph engine is part of the memory
+                           # architecture, not an optional add-on. `config/graphstore.yaml`
+                           # defaulting to networkx is a STAGED CUTOVER, not optionality.
+                           # Its own pin is redis<9,>=8.0.0, so the line below is not an
+                           # independent choice — declaring falkordb mandates redis 8.
+    "redis>=8,<9",  # Was UNDECLARED and purely transitive (fastmcp -> pydocket -> redis>=5,
+                    # no upper bound). Pinned explicitly now that first-party code depends
+                    # on it: observability/health.py's engine probe is the first in-tree
+                    # importer (there were zero before this change).
+                    #
+                    # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
+                    # configures no redis URL and never uses docket, so the surface is the
+                    # IMPORT chain, not a connection. Under fastmcp 2.14.6 + pydocket
+                    # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
+                    # and registers tools, docket._redis loads, fakeredis async round-trips,
+                    # and redis.asyncio's unix-socket client behaves. The same probe passes
+                    # on 7.4.0/2.34.1 and FAILS when asked to assert 8.x against 7.4.0, so
+                    # it is measuring the version it names. The whole graph-engine path
+                    # (12.4s full projection, concurrent-reader swap) also ran on 8.1.0.
     # Transitive deps pinned to secure floors (audit #638) so a clean/cached install can't resolve a vulnerable version
     "urllib3>=2.7.0",  # via qdrant-client/requests — CVE-2026-44431/44432 (auth-header leak, decompression DoS)
     "idna>=3.15",  # via httpx/requests — CVE-2026-45409 (quadratic-processing DoS)

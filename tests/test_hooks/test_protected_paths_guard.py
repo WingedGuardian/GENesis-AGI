@@ -23,6 +23,19 @@ _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _WORKTREE / "scripts" / "hooks" / "protected_paths_guard.py"
 _PYTHON = sys.executable
 
+# The cap is READ from the parser, never restated here: a fixture built from a
+# literal length stops crossing the bound the moment the bound moves, and a test
+# that no longer reaches its subject goes on passing for another reason.
+#
+# Imported by PATH rather than by `spec_from_file_location` + `module_from_spec`,
+# which a sibling test uses and which does NOT register the module in `sys.modules`:
+# `shell_parse` defines a dataclass, and `@dataclass` looks its own module up there,
+# so that form raises AttributeError at COLLECTION unless something else happened to
+# import shell_parse first. The sibling gets away with it only because it loads a
+# guard that imports shell_parse normally one line earlier.
+sys.path.insert(0, str(_WORKTREE / "scripts" / "hooks"))
+import shell_parse  # noqa: E402
+
 
 @pytest.fixture
 def fake_home(tmp_path: Path) -> Path:
@@ -325,4 +338,88 @@ class TestQuotedParenRedirectTargetRegression:
         r = _run("echo ok 2>$(printf ')') && echo done", fake_home)
         assert r.returncode == 0, (
             f"benign command wrongly blocked: out={r.stdout!r} err={r.stderr!r}"
+        )
+
+
+class TestBoundedParseNeverDowngradesToTheWeakerCheck:
+    """A parse stopped by a shell_parse BOUND must not fall back to substring matching.
+
+    The substring fallback is STRICTLY WEAKER than the parse it replaces, and weakest
+    exactly where the command is most destructive. The parse catches an ANCESTOR of a
+    protected directory (`prot.startswith(expanded + "/")`) and a GLOB over its
+    contents (`fnmatch`); a substring test catches NEITHER, because a protected path
+    is not a substring of a command naming its PARENT.
+
+    MEASURED at depth 9 before this was fixed — the default branch refused all three,
+    this guard refused only the last:
+
+        rm -rf $HOME/genesis        (ancestor)  -> ALLOWED
+        rm -rf $HOME/genesis/*      (glob)      -> ALLOWED
+        rm -rf $HOME/genesis/data   (exact)     -> refused
+
+    The acceptance test that missed this used the exact path, the one shape the weak
+    check does catch, so it passed over a hole that swallowed the whole install.
+    """
+
+    # `genesis/data` is on _PROTECTED_RELATIVE; `genesis` is its parent and is NOT.
+    @pytest.mark.parametrize(
+        "shape,target",
+        [
+            ("ancestor", f"{H}/genesis"),
+            ("glob", f"{H}/genesis/*"),
+            ("exact", f"{H}/genesis/data"),
+        ],
+    )
+    def test_a_buried_rm_is_refused_whatever_the_path_shape(self, fake_home, shape, target):
+        buried = "$(" * 9 + f"rm -rf {target}" + ")" * 9
+        r = _run(buried, fake_home)
+        assert r.returncode == 2, (
+            f"{shape}: an rm the parser could not read was ALLOWED. The parse is "
+            f"bounded, so 'no protected operand found' may mean 'stopped looking' — "
+            f"and for this shape the substring fallback cannot see it either.\n"
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_an_over_length_rm_is_refused_too(self, fake_home):
+        """The other bound reaches the same weak fallback, so it gets the same test.
+
+        The length is DERIVED from the cap, never written out. This test shipped with
+        a literal 40,000 — correct against the 32,768 cap it was written for, and
+        silently below the cap once that moved to 49,152 in the same branch. It went
+        on passing, because `rm -rf $HOME/genesis` is refused by the ORDINARY parse
+        path as an ancestor of a protected directory: a test of the length bound that
+        never reached the length bound, green for a reason that had nothing to do with
+        its name.
+
+        So the exit code alone cannot attribute the refusal. The stderr assertion is
+        what does: only the bounds branch says the command is too long, and a guard
+        with no bounds handling at all would still return 2 here.
+        """
+        over = f'rm -rf {H}/genesis "' + "x" * shell_parse.MAX_COMMAND_CHARS + '"'
+        assert len(over) > shell_parse.MAX_COMMAND_CHARS, (
+            "the fixture must actually cross the cap, or this test is about the "
+            "ordinary parse path wearing the length bound's name"
+        )
+        r = _run(over, fake_home)
+        assert r.returncode == 2, (
+            f"an over-length rm naming a protected ancestor was ALLOWED.\n"
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+        assert "longer than" in r.stderr, (
+            "the refusal did not come from the LENGTH bound — this test can pass on "
+            f"the ordinary parse path, which is how it stayed green while vacuous.\n"
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_an_ordinary_unreadable_command_without_rm_is_untouched(self, fake_home):
+        """The control on the other side: this guard only ever refuses rm commands.
+
+        Without it, the tests above would pass equally well against a guard that
+        refused every unreadable command, which would be a different and much worse
+        change than the one being made.
+        """
+        buried = "$(" * 9 + "echo hello" + ")" * 9
+        r = _run(buried, fake_home)
+        assert r.returncode == 0, (
+            f"a buried non-rm command was blocked: out={r.stdout!r} err={r.stderr!r}"
         )

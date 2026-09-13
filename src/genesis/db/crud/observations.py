@@ -100,6 +100,10 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # marker. The owner nudge (Telegram) is the delivery path; these rows must
         # NOT surface via the generic observation surfacers (would double-notify).
         "career_outreach_nudged",
+        # Career bite-relay — per (company, stage) "already relayed this advance"
+        # dedup marker. A stage-advance is a POINT EVENT; the owner Telegram nudge is
+        # the delivery path, so these rows must NOT surface via the generic surfacers.
+        "career_bite",
         # Ego questions channel — the Telegram question itself + the reactive
         # signal are the delivery paths. Surfacing user_reply would echo the
         # user's own answer back at them (double-notify); no_reply/not_delivered
@@ -219,6 +223,17 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # abandoned marker cannot linger. The external engine's own staged-draft state is
     # the source of truth for draft counts; this row only records "owner already nudged".
     "career_outreach_nudged": timedelta(days=30),
+    # Career bite-relay — per (company, stage) advance-relayed dedup marker. 365d
+    # (vs 30d for the re-emittable "N staged" nudge marker): a stage advance is a
+    # POINT EVENT, so the marker must permanently suppress a re-nudge across a full
+    # search cycle — long enough that a company sitting in one stage for months never
+    # re-fires. Checked with unresolved_only=False (a point event never re-emits).
+    # This TTL bounds the MARKER, not the guarantee: past 365d the row ages out, but the
+    # relay then re-derives it from the UNWINDOWED `outreach_history` delivered-topic
+    # lookup (`outreach.delivered_topic_exists`), which has no retention prune. So the
+    # at-most-once contract outlives this window by design — the TTL only keeps the
+    # observations table from carrying a marker it no longer needs to answer from.
+    "career_bite": timedelta(days=365),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
     # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the
@@ -473,6 +488,37 @@ async def exists_by_hash(
     return len(rows) > 0
 
 
+async def unresolved_by_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_hash: str,
+    limit: int = 10,
+) -> list[dict]:
+    """Unresolved observations for ONE ``(source, content_hash)``, OLDEST first.
+
+    A hash-scoped read (covered by ``idx_observations_content_hash``) for
+    callers that need a specific hash's rows. ``query()`` cannot express this
+    — no ``content_hash`` parameter, no offset, a hard ``LIMIT`` bound — so
+    its callers had to over-fetch the whole unresolved set and filter in
+    Python, which silently starves any hash that falls outside the fetch
+    window once the TOTAL unresolved population exceeds the limit (the
+    starved caller reads "no rows", indistinguishable from "no outage").
+
+    ``limit`` bounds a pathological same-hash pile-up only
+    (``skip_if_duplicate`` holds same-hash rows to origin-class variants in
+    practice — a handful); oldest-first means even a truncated read keeps the
+    EARLIEST rows, which is the direction outage-clock callers need — a
+    truncated NEWEST-first read would silently reset the clock.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT * FROM observations WHERE source = ? AND content_hash = ? "
+        "AND resolved = 0 ORDER BY created_at ASC LIMIT ?",
+        (source, content_hash, limit),
+    )
+    return [dict(r) for r in rows]
+
+
 async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     rows = await db.execute_fetchall("SELECT * FROM observations WHERE id = ?", (id,))
     row = rows[0] if rows else None
@@ -494,9 +540,132 @@ async def query(
     origin_class_in: list[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
+    where, params = _query_filters(
+        person_id=person_id,
+        source=source,
+        source_in=source_in,
+        source_prefix=source_prefix,
+        type=type,
+        priority=priority,
+        category=category,
+        resolved=resolved,
+        exclude_types=exclude_types,
+        origin_class_in=origin_class_in,
+    )
+    rows = await db.execute_fetchall(
+        f"SELECT * FROM observations {where} ORDER BY created_at DESC LIMIT ?",
+        [*params, limit],
+    )
+    return [dict(r) for r in rows]
+
+
+async def query_with_total(
+    db: aiosqlite.Connection,
+    *,
+    person_id: str | None = None,
+    source: str | None = None,
+    source_in: list[str] | None = None,
+    source_prefix: str | None = None,
+    type: str | None = None,
+    priority: str | None = None,
+    category: str | None = None,
+    resolved: bool | None = None,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
+    limit: int = 50,
+) -> tuple[list[dict], int]:
+    """``query()``'s rows AND the unlimited match count, from ONE statement.
+
+    A caller that reads the page and then counts separately holds two SNAPSHOTS,
+    and this database runs in WAL with concurrent writers — so between the two
+    reads a row can be inserted or resolved, and any claim relating them is
+    then false in a way nothing detects. Two shapes, both real:
+
+    * an INSERT lands after the page read. The page is the 15 newest AS OF the
+      first snapshot; the count is bigger; the caller reports "N older ones
+      exist beyond this digest" while the omitted row is the NEWEST one.
+    * a row ON THE PAGE is resolved before the count. The count can then fall to
+      the page length and the truncation marker disappears — while unresolved
+      rows outside the page still exist.
+
+    `COUNT(*) OVER ()` is evaluated over the same result set the LIMIT is
+    applied to, in one statement, so the page and its denominator cannot
+    disagree. The filters come from the SAME builder `query()` uses: a second
+    hand-written WHERE clause here would be a copy free to drift, and the
+    drifted version would report a denominator for a different population than
+    the rows — which is the exact defect this function exists to remove, one
+    level up.
+
+    Returns ``(rows, total)``. ``total`` is the count BEFORE the limit, so
+    ``total > len(rows)`` is exactly "this page is truncated".
+    """
+    where, params = _query_filters(
+        person_id=person_id,
+        source=source,
+        source_in=source_in,
+        source_prefix=source_prefix,
+        type=type,
+        priority=priority,
+        category=category,
+        resolved=resolved,
+        exclude_types=exclude_types,
+        origin_class_in=origin_class_in,
+    )
+    if limit <= 0:
+        # A caller can request a denominator without a page. A window count
+        # attached to page rows disappears when LIMIT 0 returns none, so retain
+        # the same one-statement snapshot with a count-only shape.
+        rows = await db.execute_fetchall(
+            f"SELECT COUNT(*) AS _total FROM observations {where}", params,
+        )
+        return [], int(rows[0]["_total"])
+
+    # Materialise only matching ids before counting. ``COUNT(*) OVER ()`` on
+    # ``SELECT *`` makes SQLite carry every matching content payload through its
+    # window/sort coroutine before the page limit applies. This keeps one
+    # statement (and therefore one WAL snapshot) while limiting payload reads to
+    # the requested page.
+    rows = await db.execute_fetchall(
+        f"WITH matched AS MATERIALIZED (SELECT id FROM observations {where}), "
+        "total AS (SELECT COUNT(*) AS _total FROM matched) "
+        "SELECT observations.*, total._total FROM observations "
+        "JOIN matched ON matched.id = observations.id CROSS JOIN total "
+        "ORDER BY observations.created_at DESC LIMIT ?",
+        [*params, limit],
+    )
+    if not rows:
+        # No rows means no window to count over — and an empty page IS a
+        # complete answer, so zero is the honest total rather than "unknown".
+        return [], 0
+    dicts = [dict(r) for r in rows]
+    total = int(dicts[0]["_total"])
+    for d in dicts:
+        d.pop("_total", None)
+    return dicts, total
+
+
+def _query_filters(
+    *,
+    person_id: str | None = None,
+    source: str | None = None,
+    source_in: list[str] | None = None,
+    source_prefix: str | None = None,
+    type: str | None = None,
+    priority: str | None = None,
+    category: str | None = None,
+    resolved: bool | None = None,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
+) -> tuple[str, list]:
+    """The shared WHERE clause + params for the observation readers.
+
+    Extracted so `query` and `query_with_total` cannot describe different
+    populations. Ordering and LIMIT stay with the callers, because that is where
+    they differ.
+    """
     if sum(map(bool, (source, source_in, source_prefix))) > 1:
         raise ValueError("Specify at most one of 'source', 'source_in', 'source_prefix'")
-    sql = "SELECT * FROM observations WHERE 1=1"
+    sql = "WHERE 1=1"
     params: list = []
     if person_id is not None:
         sql += " AND person_id = ?"
@@ -538,10 +707,7 @@ async def query(
         oc_placeholders = ",".join("?" for _ in origin_class_in)
         sql += f" AND origin_class IN ({oc_placeholders})"
         params.extend(origin_class_in)
-    sql += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
-    return [dict(r) for r in rows]
+    return sql, params
 
 
 async def distinct_unresolved_types(db: aiosqlite.Connection) -> list[str]:

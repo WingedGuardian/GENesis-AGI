@@ -142,7 +142,7 @@ Tasks requiring genuine reasoning, honest assessment, or creative synthesis.
 | 11 | User model synthesis | Claude Sonnet 4.6 ($3/$15) | Opus | Weekly | ~16K | Update user preference/behavior model from observations |
 | 14 | Weekly self-assessment | Claude Opus 4.6 ($5/$25) | — | Weekly | ~32K | Honest evaluation of Genesis's own performance. Anti-sycophancy critical |
 | 16 | Quality calibration | Claude Opus 4.6 ($5/$25) | — | Weekly | ~16K | Audit recent outputs for quality regression. Anti-sycophancy critical |
-| 17 | Fresh-eyes review | GPT-5.2 or Kimi 2.5 (switchable) | Sonnet | Per major decision | ~16K | Cross-vendor review of Genesis's reasoning. Must differ from primary vendor |
+| 17 | Fresh-eyes review | GPT-5.2 or Kimi 3 (switchable) | Sonnet | Per major decision | ~16K | Cross-vendor review of Genesis's reasoning. Must differ from primary vendor |
 | 27 | Pre-execution assessment | Same model as task executor | — | Per task | ~4K | Sanity check before executing. Uses whatever model will run the task |
 | 28 | Observation sweep | Qwen 3.5 Plus ($0.40/$2.40) | Sonnet | Per awareness tick | ~8K | Scan environment for noteworthy changes |
 
@@ -153,7 +153,7 @@ The 5% of calls that shape the system's trajectory.
 | # | Call Site | Primary | Paid Fallback | Freq | Context | Notes |
 |---|----------|---------|---------------|------|---------|-------|
 | 6 | Strategic reflection | Claude Opus 4.6 ($5/$25) | — | ~4-8/month | ~32K | Quarterly-depth strategic analysis. Anti-sycophancy critical |
-| 20 | Adversarial counterargument | Grok 4 (initial pick) | Kimi 2.5, GPT-5.2 (rotatable) | Per major decision | ~16K | Devil's advocate review. MUST be different vendor than primary. User-configurable rotation |
+| 20 | Adversarial counterargument | Grok 4 (initial pick) | Kimi 3, GPT-5.2 (rotatable) | Per major decision | ~16K | Devil's advocate review. MUST be different vendor than primary. User-configurable rotation |
 
 ### Bucket 5: Code Work — Claude Code CLI / DeepSeek V4
 

@@ -302,7 +302,8 @@ def _make_runner():
     config_builder = MagicMock()
     surplus_cfg = {"system_prompt": "test"}
     config_builder.build_surplus_config.return_value = surplus_cfg
-    config_builder.build_mcp_config.return_value = None
+    config_builder.build_mcp_config.return_value = "/tmp/test-mcp.json"
+    config_builder.build_research_recon_disallowed.return_value = []
     return DirectSessionRunner(
         invoker=MagicMock(),
         session_manager=MagicMock(),
@@ -666,6 +667,76 @@ def test_non_steward_invocation_has_empty_bash_allowlist():
     assert inv.bash_allowlist == ()
 
 
+def test_research_profile_injects_shared_web_research_skill():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="compare available libraries", profile="research")
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert "Evidence standard" in (inv.system_prompt or "")
+
+
+def test_research_profile_keeps_required_skill_with_explicit_skills():
+    runner = _make_runner()
+    explicit_skills = ["voice-master"]
+    req = DirectSessionRequest(
+        prompt="compare available libraries", profile="research", skills=explicit_skills,
+    )
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "## Skill: web-research" in (inv.system_prompt or "")
+    assert explicit_skills == ["voice-master"]
+
+
+def test_research_profile_fails_when_required_skill_is_missing(monkeypatch):
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="research", profile="research")
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="requires the web-research skill"):
+        runner._build_invocation(req, "test-session")
+
+
+@pytest.mark.parametrize(
+    "load_error", [OSError("unreadable"), UnicodeError("invalid UTF-8")],
+)
+def test_research_profile_normalizes_required_skill_read_errors(monkeypatch, load_error):
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="research", profile="research")
+
+    def fail(_name):
+        raise load_error
+
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", fail)
+    with pytest.raises(RuntimeError, match="requires the web-research skill") as raised:
+        runner._build_invocation(req, "test-session")
+    assert raised.value.__cause__ is load_error
+
+
+def test_research_profile_fails_when_mcp_config_is_missing():
+    runner = _make_runner()
+    runner._config_builder.build_mcp_config.return_value = None
+    req = DirectSessionRequest(prompt="research", profile="research")
+
+    with pytest.raises(RuntimeError, match="requires its MCP configuration"):
+        runner._build_invocation(req, "test-session")
+
+
+def test_research_profile_uses_derived_recon_boundary():
+    runner = _make_runner()
+    runner._config_builder.build_research_recon_disallowed.return_value = [
+        "mcp__genesis-recon__recon_store_finding",
+    ]
+    req = DirectSessionRequest(
+        prompt="research",
+        profile="research",
+        tool_exceptions=["mcp__genesis-recon__recon_store_finding"],
+    )
+    inv = runner._build_invocation(req, "test-session")
+
+    assert "mcp__genesis-recon__recon_store_finding" in inv.disallowed_tools
+
+
 # --- Profile overlay mechanism (generic; install-local profiles) ---
 # Install-specific profiles live in an optional, gitignored
 # genesis.cc.profile_overlay module — these tests exercise the loader + the
@@ -959,3 +1030,75 @@ def test_interact_allows_follow_up_update():
 
 def test_research_maps_to_research_mcp_profile():
     assert _PROFILE_TO_MCP["research"] == "research"
+
+
+# --- perimeter outreach surface: ALLOWLIST polarity ---
+# PROFILES entries are DENY lists, so a tool nobody enumerates is ALLOWED. Every
+# test above is `in` / `not in` on a named tool, which by construction cannot fail
+# for a tool that was just added — the `mail` profile's own comment claims "only
+# outreach_send is available", but nothing enforced that claim.
+#
+# This test states it as an allowlist instead: enumerate what the genesis-outreach
+# server actually registers, and require the perimeter profile to deny everything
+# outside a small, explicitly-reasoned allowed set. A new outreach tool now fails
+# this test until someone decides which side of the boundary it belongs on.
+#
+# It caught a real regression on the change that added it: outreach_pending (up to
+# 50 queued messages with previews — an exfiltration surface for injected inbound
+# content) and outreach_cancel (silently retracts the owner's queued alerts) were
+# both reachable from `mail`.
+
+# Deliberately allowed on the untrusted-inbound perimeter, with the reason:
+#   outreach_send  — the profile exists to reply to email; this IS its actuator.
+_PERIMETER_ALLOWED_OUTREACH = {"outreach_send"}
+
+
+async def test_perimeter_profiles_deny_every_outreach_tool_but_the_reply_actuator():
+    from genesis.mcp.outreach_mcp import mcp as outreach_mcp
+
+    registered = set(await outreach_mcp.get_tools())
+    assert "outreach_send" in registered, "enumeration is stale — the server changed"
+
+    for profile in ("mail", "community-responder"):
+        denied = set(PROFILES[profile])
+        should_deny = registered - _PERIMETER_ALLOWED_OUTREACH
+        missing = sorted(
+            name for name in should_deny if f"mcp__genesis-outreach__{name}" not in denied
+        )
+        assert not missing, (
+            f"profile {profile!r} does not deny outreach tool(s) {missing}. PROFILES is a "
+            "DENY list, so an unlisted tool is ALLOWED to a session reading "
+            "attacker-controlled inbound content. Add each to a _NO_OUTREACH_* group, "
+            "or to _PERIMETER_ALLOWED_OUTREACH with a written reason."
+        )
+
+
+def test_no_background_profile_can_read_or_cancel_the_pending_queue():
+    """EVERY background profile must deny the queue controls — allowed set is empty.
+
+    PROFILES governs background sessions only; the owner's own interactive session
+    does not go through it. No background session has business reading what the
+    owner has scheduled or retracting it, so this is stated over ALL profiles
+    rather than over a hand-maintained perimeter list.
+
+    That distinction is the finding: enumerating the perimeter profile-by-profile
+    left `steward` reachable, and steward ingests external GitHub PR content and
+    can publish `gh` comments — so an injected PR body could read queued-message
+    previews out through a comment, or silently cancel the owner's alerts.
+    `interact` (arbitrary browser pages) and `campaign` (external platform
+    replies) have the same shape. Iterating PROFILES removes the judgement call,
+    and a NEW profile is covered the moment it is added.
+    """
+    queue_controls = {
+        "mcp__genesis-outreach__outreach_pending",
+        "mcp__genesis-outreach__outreach_cancel",
+    }
+    gaps = {
+        profile: sorted(queue_controls - set(denied))
+        for profile, denied in PROFILES.items()
+        if queue_controls - set(denied)
+    }
+    assert not gaps, (
+        "background profile(s) can reach the pending-queue controls: "
+        f"{gaps}. Add _NO_OUTREACH_QUEUE_CONTROL to each."
+    )
