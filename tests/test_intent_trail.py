@@ -15,8 +15,12 @@ _HOOK_PATH = _SCRIPTS_DIR / "proactive_memory_hook.py"
 # Load the module from file path, without leaving the name registered for the
 # rest of the session — see tests.conftest. No production code imports this one
 # by bare name at call time, so it is not the exploitable shape `review_state`
-# was; converting it anyway keeps the invariant simple: no test module leaves a
-# shared sys.modules name pointing at its own private copy.
+# was; converted anyway so the helper is the one way this repo loads a script
+# privately. NOT because the tree is clean: ~22 test modules still register a
+# shared name without restoring it. Every one is a FIRST bind — no other module
+# binds those names, which is why the census finds zero replacements — but that
+# is a property of today's tree, not an invariant. The two locked names are the
+# two production imports at call time.
 _mod = private_module("proactive_memory_hook", _HOOK_PATH)
 
 _jaccard_similarity = _mod._jaccard_similarity
