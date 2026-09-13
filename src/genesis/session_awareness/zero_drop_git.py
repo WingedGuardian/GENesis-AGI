@@ -300,32 +300,85 @@ async def is_ancestor(
     return None
 
 
-async def count_non_merge_commits(
+async def count_unique_work_commits(
     root: str, exclude: str, include: str, *, runner: Runner | None = None
 ) -> int | None:
-    """Commits in *include* but not *exclude*, ignoring merges. None if unknown.
+    """Commits in *include* but not *exclude* that hold work existing nowhere
+    else. ``None`` if unknown.
 
-    The merge commits are excluded because they carry no unique work: a branch
-    whose only local-only commits are merges of the base branch has diverged by
-    ancestry while holding nothing that exists nowhere else, and flagging it
-    would be noise sitting on top of a real signal. A count of 0 therefore
-    means "diverged, but every distinct commit is already on the remote".
+    Routine catch-up merges are excluded, because a branch whose only local-only
+    commits are merges of the base has diverged by ancestry while holding
+    nothing unique, and flagging it would be noise on top of a real signal. A
+    count of 0 means "diverged, but every distinct change is already on the
+    remote", and the caller turns that into ``PUSH_BEHIND`` — i.e. SUPPRESSES
+    the finding. That is why what counts as "unique" has to be exactly right.
+
+    **A CONFLICT-RESOLVED merge is unique work, and excluding it UNDERCOUNTS.**
+    An earlier version ran ``rev-list --count --no-merges`` and its docstring
+    asserted that "merge commits carry no unique work". That is true of an
+    auto-merge and FALSE of a resolution: the resolved tree exists in neither
+    parent, so the change is real and lives only here (Codex P1, PR #1794).
+
+    **Scoped honestly against the report's stronger claim.** Codex described the
+    consequence as a SUPPRESSION — a branch whose only local-only commit is such
+    a merge counts 0, is labelled ``PUSH_BEHIND``, and vanishes. That specific
+    outcome could not be constructed: for the range to hold only a merge, BOTH
+    its parents must already be on the remote, and merging an already-merged
+    branch produces no conflict to resolve. Every range reachable here that
+    contains a resolved merge also contains the merged-in commits, so the
+    classification stays ``PUSH_DIVERGED``.
+    What IS reachable, and what this fix is for, is the COUNT: ``local_only``
+    is reported to a human as "commits that exist nowhere else", and it silently
+    understated that number by one per resolved merge. A wrong number under a
+    true classification is still a wrong number, and this subsystem's whole
+    claim is that its counts can be checked.
+
+    MEASURED on this repository when that was fixed: of 23 recent merge commits,
+    **3 (13%) carry a non-empty combined diff** — content present in neither
+    parent. Not a hypothetical, and more likely here than elsewhere because this
+    repo cannot rebase (a history-rewriting publish is hard-blocked), so
+    branches catch up by merging and every conflict resolved that way lands in a
+    merge commit.
+
+    The discriminator is git's own combined diff (``--cc``), which by
+    construction shows only hunks differing from EVERY parent. Empty combined
+    diff = the merge contributed nothing of its own; non-empty = it did.
     """
     if not (_is_sha(exclude) and _is_sha(include)):
-        logger.warning("zero_drop count_non_merge_commits refused a non-SHA argument")
+        logger.warning("zero_drop count_unique_work_commits refused a non-SHA argument")
         return None
     run = runner or default_runner
+    rng = f"{exclude}..{include}"
+
     rc, out, err = await run(
-        _git(root, "rev-list", "--count", "--no-merges", f"{exclude}..{include}"),
+        _git(root, "rev-list", "--count", "--no-merges", rng),
         ANCESTRY_TIMEOUT_S,
     )
     if rc != 0:
         logger.debug("zero_drop rev-list failed (rc=%s): %s", rc, err.strip()[:200])
         return None
     try:
-        return int(out.strip())
+        total = int(out.strip())
     except ValueError:
         return None
+
+    # NUL-separated records so a commit subject can never be confused for a
+    # diff line, and `%x00%H` so each record starts with its 40-char SHA.
+    rc, out, err = await run(
+        _git(root, "log", "--merges", "--cc", "--format=%x00%H", rng),
+        ANCESTRY_TIMEOUT_S,
+    )
+    if rc != 0:
+        # The merge leg is the half that PREVENTS a suppression, so failing it
+        # must not silently fall back to the old, wrong number. Unknown, not 0.
+        logger.debug("zero_drop merge-diff scan failed (rc=%s): %s", rc, err.strip()[:200])
+        return None
+
+    for record in out.split("\0")[1:]:
+        body = record[40:]
+        if any(line[:1] in ("+", "-") for line in body.splitlines()):
+            total += 1
+    return total
 
 
 async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
@@ -344,13 +397,22 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
     holds no uncommitted work; the caller skips it and counts it.
     """
     run = runner or default_runner
-    rc, out, err = await run(_git(root, "worktree", "list", "--porcelain"), REF_SWEEP_TIMEOUT_S)
+    # `-z` for the same reason `status` uses it: a worktree path may legally
+    # contain a NEWLINE, and the line-oriented porcelain would then split one
+    # record into two — yielding a truncated path that resolves to nothing and a
+    # phantom remainder. VERIFIED against git 2.43: `-z` NUL-TERMINATES each
+    # attribute and separates records with an empty field, so the branch tests
+    # below are unchanged and an empty field falls through all of them without
+    # counting as unparsed (Codex P2, PR #1794).
+    rc, out, err = await run(
+        _git(root, "worktree", "list", "--porcelain", "-z"), REF_SWEEP_TIMEOUT_S
+    )
     if rc != 0:
         return {"error": f"worktree list failed (rc={rc}): {err.strip()[:300]}"}
     worktrees: list[dict] = []
     current: dict = {}
     unparsed = 0
-    for line in out.splitlines():
+    for line in out.split("\0"):
         if line.startswith("worktree "):
             if current.get("path"):
                 worktrees.append(current)
@@ -426,9 +488,29 @@ async def worktree_status(path: str, *, runner: Runner | None = None) -> dict:
     Untracked files count. An untracked source file IS stranded work — the
     exact shape of "I wrote it and never added it" — and this repo gitignores
     its build/temp output, so the noise floor is low.
+
+    **``--untracked-files=all`` is load-bearing, not a default made explicit.**
+    Under git's default (``normal``) an untracked DIRECTORY collapses to a
+    single ``?? dir/`` entry, so nothing about its contents reaches the caller.
+    The dirty-state key is derived from these entries, and an ack is keyed to
+    that state — so adding a whole new file inside an already-untracked
+    directory left the key BYTE-IDENTICAL and the acknowledgement went on
+    suppressing work it was never granted against (Codex P1, PR #1794).
+    DEMONSTRATED: with two files under an untracked `somedir/`, default mode
+    printed `?? somedir/` before and after editing a child AND adding a third
+    file; `-uall` listed each child and gained the new one.
+    It also makes the sentence above true — under the default, "an untracked
+    source file" inside a new directory was exactly what could NOT be seen.
+    Cost MEASURED across 14 real worktrees on this install: identical entry
+    counts either way (delta 0), because the build/temp output is gitignored. A
+    clone where it is not is bounded by ``STATUS_TIMEOUT_S``, and a timeout
+    degrades the class to HELD rather than clean.
     """
     run = runner or default_runner
-    rc, out, err = await run(_git(path, "status", "--porcelain", "-z"), STATUS_TIMEOUT_S)
+    rc, out, err = await run(
+        _git(path, "status", "--porcelain", "-z", "--untracked-files=all"),
+        STATUS_TIMEOUT_S,
+    )
     if rc != 0:
         return {"error": f"status failed (rc={rc}): {err.strip()[:200]}"}
     entries, unparsed = parse_status_z(out)

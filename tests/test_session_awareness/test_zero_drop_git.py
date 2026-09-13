@@ -329,7 +329,7 @@ async def test_base_ref_resolution_returns_None_when_there_is_no_origin_HEAD(rep
     assert await _resolve_base_ref(str(repo)) == "origin/trunk"
 
 
-# ── is_ancestor / count_non_merge_commits: the SHA-evidence atoms ────────────
+# ── is_ancestor / count_unique_work_commits: the SHA-evidence atoms ────────────
 #
 # These exist because "a PR with this name merged" is a heuristic while "this
 # commit is reachable from that one" is a fact. Both are THREE-valued: the
@@ -383,23 +383,27 @@ async def test_is_ancestor_REFUSES_anything_that_is_not_a_full_sha(repo, bad):
     repository — `headRefOid` from gh's JSON, remote tips from ls-remote. A
     refused argument returns the unanswerable None, never an answer, and never
     an exception."""
-    from genesis.session_awareness.zero_drop_git import count_non_merge_commits, is_ancestor
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits, is_ancestor
 
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     assert await is_ancestor(str(repo), bad, head) is None
     assert await is_ancestor(str(repo), head, bad) is None
-    assert await count_non_merge_commits(str(repo), bad, head) is None
-    assert await count_non_merge_commits(str(repo), head, bad) is None
+    assert await count_unique_work_commits(str(repo), bad, head) is None
+    assert await count_unique_work_commits(str(repo), head, bad) is None
 
 
-async def test_count_non_merge_commits_ignores_merges(repo):
-    """A branch whose only local-only commit is a MERGE holds no unique work.
+async def test_count_unique_work_commits_ignores_a_CLEAN_merge(repo):
+    """A branch whose only local-only commit is a CLEAN merge holds nothing.
 
     Counting it would flag a branch that has merged the base in but has nothing
     of its own — noise sitting on top of the real signal, in the one class
     where a false positive costs an acknowledgement.
+
+    The qualifier is load-bearing and was missing: this is true of an AUTO-merge
+    and false of a conflict-resolved one. See the sibling test below, which
+    pins the case whose absence made this one read as a general rule.
     """
-    from genesis.session_awareness.zero_drop_git import count_non_merge_commits
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits
 
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
     _git(repo, "checkout", "-q", "-b", "side")
@@ -416,12 +420,70 @@ async def test_count_non_merge_commits_ignores_merges(repo):
     merged = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     # One real commit on the side branch, not reachable from base.
-    assert await count_non_merge_commits(str(repo), base, side) == 1
+    assert await count_unique_work_commits(str(repo), base, side) == 1
     # From the merge commit's side: the merge itself carries no unique work.
-    assert await count_non_merge_commits(str(repo), side, merged) == 1  # trunk work only
-    assert await count_non_merge_commits(str(repo), merged, merged) == 0
-    assert await count_non_merge_commits(str(repo), "0" * 40, merged) is None
-    assert await count_non_merge_commits(str(repo), "not-a-sha", merged) is None
+    assert await count_unique_work_commits(str(repo), side, merged) == 1  # trunk work only
+    assert await count_unique_work_commits(str(repo), merged, merged) == 0
+    assert await count_unique_work_commits(str(repo), "0" * 40, merged) is None
+    assert await count_unique_work_commits(str(repo), "not-a-sha", merged) is None
+
+
+async def test_a_CONFLICT_RESOLVED_merge_counts_as_unique_work(repo):
+    """The false-clean this function was fixed for (Codex P1, PR #1794).
+
+    A merge whose conflicts were resolved by hand holds a tree that exists in
+    NEITHER parent — the resolution is real work living only on this branch.
+    The earlier implementation ran `rev-list --count --no-merges`, counted 0,
+    and the caller turned that into PUSH_BEHIND, which SUPPRESSES the finding.
+    A detector that suppresses stranded work is the exact failure this
+    subsystem exists to prevent.
+
+    MEASURED on this repository at the time of the fix: 3 of 23 recent merge
+    commits (13%) carry a non-empty combined diff. Not hypothetical — and more
+    likely here than elsewhere, because this repo cannot rebase, so branches
+    catch up by merging and every hand-resolved conflict lands in a merge.
+    """
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits
+
+    (repo / "shared.txt").write_text("base\n")
+    _git(repo, "add", "shared.txt")
+    _git(repo, "commit", "-q", "-m", "shared base")
+
+    # Two branches change the SAME line, so the merge cannot auto-resolve.
+    _git(repo, "checkout", "-q", "-b", "conflicting")
+    (repo / "shared.txt").write_text("theirs\n")
+    _git(repo, "commit", "-q", "-am", "their change")
+
+    _git(repo, "checkout", "-q", "-")
+    (repo / "shared.txt").write_text("ours\n")
+    _git(repo, "commit", "-q", "-am", "our change")
+    ours = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "merge", "--no-commit", "conflicting", check=False)
+    # The resolution: a value present on NEITHER side.
+    (repo / "shared.txt").write_text("resolved-to-something-neither-parent-has\n")
+    _git(repo, "add", "shared.txt")
+    _git(repo, "commit", "-q", "-m", "merge with hand resolution")
+    resolved = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Preconditions, asserted rather than assumed — this test is only meaningful
+    # if the range really does contain one merge and one ordinary commit.
+    total = _git(repo, "rev-list", "--count", f"{ours}..{resolved}").stdout.strip()
+    non_merge = _git(
+        repo, "rev-list", "--count", "--no-merges", f"{ours}..{resolved}"
+    ).stdout.strip()
+    assert (total, non_merge) == ("2", "1"), (
+        f"fixture drift: expected 2 commits of which 1 is a merge, got {total}/{non_merge}"
+    )
+    combined = _git(repo, "log", "--cc", "-1", "--format=", resolved).stdout
+    assert any(ln[:1] in "+-" for ln in combined.splitlines()), (
+        "fixture drift: the merge must carry a combined diff, or it is not a resolution"
+    )
+
+    # The old implementation answered 1 — it saw only the ordinary commit and
+    # discarded the resolution. The resolution is work that exists nowhere else,
+    # so the honest answer is 2.
+    assert await count_unique_work_commits(str(repo), ours, resolved) == 2
 
 
 # ── rc=0 with nothing parsed is a FAILURE, on every enumerator ───────────────
@@ -495,7 +557,7 @@ async def test_every_git_argv_declines_optional_locks(repo, monkeypatch, tmp_pat
     await g.list_worktrees(str(repo), runner=_spy)
     await g.worktree_status(str(repo), runner=_spy)
     await g.is_ancestor(str(repo), "a" * 40, "b" * 40, runner=_spy)
-    await g.count_non_merge_commits(str(repo), "a" * 40, "b" * 40, runner=_spy)
+    await g.count_unique_work_commits(str(repo), "a" * 40, "b" * 40, runner=_spy)
 
     assert len(seen) == 6, "every atom must have issued exactly one command"
     for argv in seen:
@@ -525,7 +587,7 @@ async def test_the_push_probe_is_BUDGETED_like_its_sibling(monkeypatch):
         return 5
 
     monkeypatch.setattr(w, "is_ancestor", _counting)
-    monkeypatch.setattr(w, "count_non_merge_commits", _count_zero)
+    monkeypatch.setattr(w, "count_unique_work_commits", _count_zero)
 
     branches = [{"branch": f"b{i}", "tip_sha": f"{i:040x}"} for i in range(50)]
     heads = {f"b{i}": "f" * 40 for i in range(50)}
@@ -536,3 +598,81 @@ async def test_the_push_probe_is_BUDGETED_like_its_sibling(monkeypatch):
     assert sum(1 for v in states.values() if v == "diverged") == 5
     assert sum(1 for v in states.values() if v == "unknown") == 45
     assert len(states) == 50, "every branch still gets a state — none is silently dropped"
+
+
+async def test_a_new_file_inside_an_untracked_DIRECTORY_is_visible(repo):
+    """The ack-key false-clean (Codex P1, PR #1794).
+
+    Under git's default untracked mode an untracked DIRECTORY collapses to one
+    `?? dir/` entry, so nothing about its contents reaches the caller. The
+    dirty-state key is derived from these entries and an acknowledgement is
+    keyed to that state — so a whole new file could appear inside an
+    already-untracked directory while the key stayed BYTE-IDENTICAL, and the
+    ack went on suppressing work it was never granted against.
+
+    DEMONSTRATED before the fix: `?? somedir/` was the entire output both
+    before and after adding a third file.
+    """
+    (repo / "scratch").mkdir()
+    (repo / "scratch" / "a.py").write_text("one\n")
+    before = await worktree_status(str(repo))
+    assert "error" not in before, before
+
+    (repo / "scratch" / "b.py").write_text("two\n")
+    after = await worktree_status(str(repo))
+    assert "error" not in after, after
+
+    paths_before = {p for _xy, p in before["entries"]}
+    paths_after = {p for _xy, p in after["entries"]}
+
+    assert "scratch/a.py" in paths_before, (
+        "a file inside an untracked directory must be visible at FILE granularity — "
+        "the default mode collapses it to 'scratch/' and hides the contents"
+    )
+    assert paths_after - paths_before == {"scratch/b.py"}, (
+        "adding a file inside an untracked directory MUST change the observed "
+        "state, or an acknowledgement keyed to it silently suppresses new work"
+    )
+
+
+async def test_the_default_untracked_mode_would_have_hidden_it(repo):
+    """The MEASUREMENT behind `--untracked-files=all`, not an assumption.
+
+    Pins the git behaviour the fix exists for, so if git ever stops collapsing
+    untracked directories this rationale is re-derived rather than cargo-culted.
+    """
+    (repo / "scratch").mkdir()
+    (repo / "scratch" / "a.py").write_text("one\n")
+    default_before = _git(repo, "status", "--porcelain").stdout
+    (repo / "scratch" / "b.py").write_text("two\n")
+    default_after = _git(repo, "status", "--porcelain").stdout
+
+    assert default_before == default_after == "?? scratch/\n", (
+        "git no longer collapses untracked directories — the -uall rationale "
+        f"needs re-deriving (before={default_before!r} after={default_after!r})"
+    )
+    allmode = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+    assert "scratch/a.py" in allmode and "scratch/b.py" in allmode
+
+
+async def test_a_worktree_path_containing_a_newline_is_parsed_whole(repo, tmp_path):
+    """`worktree list --porcelain` is newline-delimited; a path may contain one.
+
+    Without `-z` one record splits into two: a truncated path that resolves to
+    nothing, plus a phantom remainder counted as an unparsed record. Both halves
+    are wrong, and the truncated one is worse — it names a worktree that does
+    not exist (Codex P2, PR #1794).
+    """
+    weird = tmp_path / "line\nbreak"
+    try:
+        _git(repo, "worktree", "add", "-q", "-b", "newline-branch", str(weird))
+    except Exception as exc:  # pragma: no cover - filesystem refused the name
+        pytest.skip(f"filesystem will not hold a newline in a path: {exc}")
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    paths = {w["path"] for w in out["worktrees"]}
+    assert str(weird) in paths, (
+        f"the newline-containing path was split or mangled; got {sorted(paths)}"
+    )
+    assert out.get("unparsed", 0) == 0, "a split record also inflates the unparsed count"

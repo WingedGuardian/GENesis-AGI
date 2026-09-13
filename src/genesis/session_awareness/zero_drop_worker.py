@@ -74,7 +74,7 @@ from genesis.session_awareness.zero_drop_config import (
     load_config,
 )
 from genesis.session_awareness.zero_drop_git import (
-    count_non_merge_commits,
+    count_unique_work_commits,
     is_ancestor,
     list_local_branches,
     list_remote_heads,
@@ -418,7 +418,7 @@ async def _resolve_push_states(
             # exists only on this machine, even though the SHAs differ.
             push_states[branch] = PUSH_BEHIND
             continue
-        count = await count_non_merge_commits(repo_path, remote_tip, tip)
+        count = await count_unique_work_commits(repo_path, remote_tip, tip)
         if count is None:
             push_states[branch] = PUSH_UNKNOWN
         elif count == 0:
