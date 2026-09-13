@@ -43,9 +43,26 @@ _ROOT = Path(__file__).resolve().parents[2]
 #: listed so the omission reads as known rather than forgotten.
 _ALWAYS_LOADED = ("CLAUDE.md", "AGENTS.md")
 
-#: A `#` followed by 3-5 digits: the GitHub issue/PR shape in this repo, which is
-#: past #1000. Two digits would collide with ordinary prose ("#2 below").
-_TICKET_RE = re.compile(r"#\d{3,5}\b")
+#: Three spellings of the same thing, because only matching the first one let a
+#: real instance survive the gate that was written to catch it.
+#:
+#:   `#1718`        the bare GitHub shape, 3-5 digits. Two would collide with
+#:                  ordinary prose ("#2 below"), and this repo is past #1000.
+#:   `PR-3`         a NAMED reference. The digit bound is 1-5, not 3-5: this form
+#:                  is most often a plan-series label ("session-manager PR-3"),
+#:                  which is if anything LESS durable than a GitHub number — the
+#:                  series it indexes exists only in a plan file nobody reading
+#:                  CLAUDE.md can resolve.
+#:   `issue 1718`   the same reference spelled out, with the `#` dropped.
+#:
+#: MEASURED against `CLAUDE.md` + `AGENTS.md` at the time of writing: 1 hit
+#: (`CLAUDE.md:386`, `session-manager PR-3`, fixed in this change) and 0 false
+#: positives. `gh pr checks <PR-number>` in the commands block does NOT match —
+#: the placeholder carries no digits.
+_TICKET_RE = re.compile(
+    r"#\d{3,5}\b|\bPR[-‑ ]\d{1,5}\b|\b(?:issues?|PRs?|pull requests?)\s+\d{1,5}\b",
+    re.IGNORECASE,
+)
 
 
 @pytest.mark.parametrize("name", _ALWAYS_LOADED)
@@ -74,6 +91,14 @@ def test_the_detector_actually_matches_a_ticket_number() -> None:
     """
     assert _TICKET_RE.search("is NOT BUILT YET (issue #1718).")
     assert _TICKET_RE.search("the day #1556 moved it behind the writer")
+    # The NAMED form, which the first version of this pattern missed entirely —
+    # it shipped green while `CLAUDE.md:386` still read "(session-manager PR-3)".
+    # A reviewer found that, not this test, which is the reason the case is here.
+    assert _TICKET_RE.search("ambient extraction (session-manager PR-3) is the net")
+    assert _TICKET_RE.search("superseded by PR 1941")
+    assert _TICKET_RE.search("tracked in issue 1718")
     # …and does not fire on ordinary prose, or the rule would be unfollowable.
     assert not _TICKET_RE.search("see item #2 below")
     assert not _TICKET_RE.search("a 32-hex row id")
+    assert not _TICKET_RE.search("gh pr checks <PR-number>")
+    assert not _TICKET_RE.search("open a PR and request a review")

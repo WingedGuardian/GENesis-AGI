@@ -383,7 +383,7 @@ mission via `session_charter_update` when the session's purpose
 crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
 until you do, because an unset mission falls back to the raw origin prompt and
 reads as noise. You are the first line of defense; ambient
-extraction (session-manager PR-3) is only the safety net. Plan files stay
+extraction is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
 **PR-body convention — `E2E:` (encouraged, advisory):** a PR body may declare
