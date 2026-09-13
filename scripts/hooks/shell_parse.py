@@ -1340,56 +1340,81 @@ def _coproc_body(argv: list[str]) -> list[str]:
     return body
 
 
-def _embedded_commands(argv: list[str]) -> list[str]:
+def _embedded_commands(
+    argv: list[str],
+    raw_argv: list[str] | None = None,
+) -> list[str]:
     """Return command bodies embedded in shell constructs."""
     if not argv:
         return []
 
+    if raw_argv is None:
+        raw_argv = argv
+
     if argv[0] == "case":
         try:
-           start = argv.index("in") + 1
+            start = raw_argv.index("in") + 1
         except ValueError:
             return []
 
-        for i, token in enumerate(argv[start:], start):
-            if token.endswith(")") and i + 1 < len(argv):
-                return [shlex.join(argv[i + 1 :])]
+        for i, token in enumerate(raw_argv[start:], start):
+            if token.endswith(")") and i + 1 < len(raw_argv):
+                return [shlex.join(raw_argv[i + 1 :])]
 
         return []
+
+    # A parenthesized case pattern such as `(b) git push ...` is stripped
+    # by `_strip_wrappers()` before reaching `argv`. Use the raw token so
+    # the pattern itself is not mistaken for the executable.
+    if (
+        len(raw_argv) > 1
+        and raw_argv[0].startswith("(")
+        and raw_argv[0].endswith(")")
+    ):
+        return [shlex.join(raw_argv[1:])]
 
     if argv[0].endswith(")") and len(argv) > 1:
         return [shlex.join(argv[1:])]
 
     if argv[0] == "function" and len(argv) > 2:
-        if (
-           re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argv[1])
-           and argv[2] in {
-               "{",
-               "(",
-               "if",
-               "while",
-               "until",
-               "for",
-               "case",
-               "select",
-           }
-        ):
-           if argv[2] == "{":
-              return [shlex.join(argv[3:])]
-           return [shlex.join(argv[2:])]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argv[1]):
+            return []
+
+        body_index = 2
+
+        # `function NAME () { ... }` is also valid Bash syntax.
+        if argv[2] == "()":
+            body_index = 3
+            if len(argv) <= body_index:
+                return []
+
+        if argv[body_index] in {
+            "{",
+            "(",
+            "if",
+            "while",
+            "until",
+            "for",
+            "case",
+            "select",
+        }:
+            if argv[body_index] == "{":
+                return [shlex.join(argv[body_index + 1 :])]
+            return [shlex.join(argv[body_index:])]
+
         return []
 
     if (
         (
-         _FUNCTION_DEF.match(argv[0])
-         and len(argv) > 2
-         and argv[1] == "{"
+            _FUNCTION_DEF.match(argv[0])
+            and len(argv) > 2
+            and argv[1] == "{"
         )
-    or  (
-         len(argv) > 3
-         and argv[0].isidentifier()
-         and argv[1] == "()"
-         and argv[2] == "{"
+        or (
+            len(argv) > 3
+            and argv[0].isidentifier()
+            and argv[1] == "()"
+            and argv[2] == "{"
         )
     ):
         start = 2 if argv[1] == "{" else 3

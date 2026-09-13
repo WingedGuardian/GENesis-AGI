@@ -384,6 +384,13 @@ class TestCommandPositionStrip:
     def test_function_keyword_body_command(self):
         assert self._detects("function f { echo hello; }", "echo")
 
+    def test_function_keyword_with_optional_parens_body_command(self):
+        assert self._detects(
+            "function f () { git push origin main; }",
+            "git",
+            "push",
+        )
+
     def test_function_keyword_if_body_command(self):
         assert self._detects(
             "function f if git push origin main; then :; fi",
