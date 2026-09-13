@@ -510,23 +510,28 @@ def private_module(name: str, path):
     at a time.
 
     LIMIT, and it is real, because the instruction to prefer this helper routes
-    you into it. On return the name is UNBOUND, so a class defined in the loaded
-    module resolves its string annotations against a module that is no longer
-    registered. ``dataclasses.fields`` is unaffected; ``typing.get_type_hints``
-    — and anything built on it (pydantic, ``inspect.signature(eval_str=True)``)
-    — raises ``NameError`` whenever an annotation names a MODULE-LEVEL symbol
-    rather than a builtin or a generic. Today that is
-    ``disk_reclaim.CacheTarget`` (``path: Path``) and ``git_repair.Diagnosis``
-    (``checks: list[Check]``), whose test modules still hand-roll the sequence
-    and are the obvious next conversions — so this is the limit they will hit.
-    ``tests/test_private_module.py`` locks it: it enumerates the carriers and
-    fails if none of them raises.
+    you into it. A class defined in the loaded module resolves its string
+    annotations against whatever ``sys.modules`` holds AFTER the restore, and the
+    restore has TWO branches with different — and differently dangerous —
+    outcomes for an annotation naming a module-level symbol:
+
+    * name previously UNBOUND -> the entry is popped, and
+      ``typing.get_type_hints`` (plus anything built on it: pydantic,
+      ``inspect.signature(eval_str=True)``) raises ``NameError``. Loud.
+    * name previously BOUND -> the PREVIOUS object is put back, so resolution
+      SUCCEEDS against the canonical module and returns a same-named class from
+      a different module object. Silent, and worse for that reason.
+
+    ``dataclasses.fields`` is unaffected in both. Both branches are locked in
+    ``tests/test_private_module.py``; an earlier revision of this paragraph
+    asserted the first outcome unconditionally, which is wrong about the second.
 
     So if the script under test needs late annotation resolution, it is not a
-    private-module candidate. (An earlier revision claimed the opposite — "5/5,
-    no failures" — from four modules picked by hand for being easy to exec
-    rather than from the population. Recorded because the convenience sample IS
-    the failure mode, and it becomes invisible the moment it is a number.)
+    private-module candidate. (An earlier revision also claimed the opposite of
+    the limit entirely — "5/5, no failures" — from four modules picked by hand
+    for being easy to exec rather than from the population. Recorded because the
+    convenience sample IS the failure mode, and it becomes invisible the moment
+    it is written as a number.)
     """
     import importlib.util
 

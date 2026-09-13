@@ -150,46 +150,74 @@ def test_the_fixture_shape_is_not_a_strawman() -> None:
     )
 
 
-def test_the_documented_limit_is_real_not_hypothetical() -> None:
-    """The LIMIT in ``private_module``'s docstring, held open by a test.
+def test_the_limit_after_restore__previously_unbound(tmp_path: Path) -> None:
+    """The LIMIT in ``private_module``'s docstring, branch 1 of 2.
 
-    That paragraph has now been WRONG TWICE in prose, in both directions — once
-    asserting the failure was universal, once asserting it never happens here
-    (from a convenience sample of four hand-picked modules, stated as `5/5`).
-    A sentence that keeps flipping does not belong in a docstring unenforced.
+    That paragraph has been WRONG TWICE in prose, in both directions, so it is a
+    test now. An earlier revision of THIS test enumerated and EXEC'd every real
+    carrier under ``scripts/`` — which dragged ``migrate_reference_data``'s
+    module-level ``load_dotenv(..., override=True)`` into the test process and
+    permanently replaced environment variables for every test after it. A test
+    written to prevent cross-test contamination was causing it. Synthetic
+    fixtures prove the same mechanism and touch no process global.
 
-    This asserts only the part that is stable and load-bearing: at least one REAL
-    script in this repo genuinely cannot survive the restore, so the caveat
-    describes live code rather than a hypothetical. It deliberately does NOT pin
-    the split (7/2 today) — that number moves whenever a carrier is added, and a
-    brittle count is how a lock becomes noise someone deletes.
-
-    If this ever fails, every carrier resolves and the docstring's LIMIT should
-    be re-derived — not this test loosened.
+    Branch 1: the name was UNBOUND beforehand, so the restore POPS it and the
+    annotation resolves against nothing.
     """
-    scripts = _REPO_ROOT / "scripts"
-    raisers: list[str] = []
-    for path in sorted(scripts.rglob("*.py")):
-        src = path.read_text()
-        if "from __future__ import annotations" not in src:
-            continue
-        if not re.search(r"^@dataclass", src, re.M):
-            continue
-        name = f"limitprobe_{path.stem}"
-        try:
-            mod = private_module(name, path)
-        except Exception:  # pragma: no cover - a carrier that will not exec
-            continue
-        for obj in vars(mod).values():
-            if isinstance(obj, type) and dataclasses.is_dataclass(obj) and obj.__module__ == name:
-                try:
-                    typing.get_type_hints(obj)
-                except NameError:
-                    raisers.append(f"{path.name}::{obj.__name__}")
-
-    assert raisers, (
-        "no carrier raised NameError from get_type_hints after private_module "
-        "restored the name — the documented LIMIT no longer describes live "
-        "code. Re-derive the caveat in tests/conftest.py::private_module "
-        "against the real population before relaxing anything."
+    path = tmp_path / "unbound_mod.py"
+    path.write_text(
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "class Check: pass\n"
+        "@dataclass\n"
+        "class D:\n"
+        "    c: Check\n"
     )
+    sys.modules.pop("unbound_mod", None)
+
+    mod = private_module("unbound_mod", path)
+
+    assert "unbound_mod" not in sys.modules  # popped, per the restore contract
+    assert dataclasses.fields(mod.D)[0].name == "c"  # fields() is unaffected
+    with pytest.raises(NameError):
+        typing.get_type_hints(mod.D)
+
+
+def test_the_limit_after_restore__previously_bound(tmp_path: Path) -> None:
+    """Branch 2, and it is the DANGEROUS one — it does not raise.
+
+    When the name was already bound, the restore puts the PREVIOUS object back,
+    so the name is NOT unbound and ``get_type_hints`` resolves happily — against
+    the CANONICAL module's globals. It returns a same-named class from a
+    different module object, silently, which is worse than the NameError of
+    branch 1 because nothing signals it.
+
+    The docstring said "on return the name is UNBOUND" without qualification.
+    That is true only of branch 1.
+    """
+    body = (
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "class Check: pass\n"
+        "@dataclass\n"
+        "class D:\n"
+        "    c: Check\n"
+    )
+    canon_path = tmp_path / "canon_src.py"
+    priv_path = tmp_path / "priv_src.py"
+    canon_path.write_text(body)
+    priv_path.write_text(body)
+
+    sys.modules.pop("shared_name", None)
+    canonical = private_module("shared_name", canon_path)
+    sys.modules["shared_name"] = canonical  # now canonically bound
+    try:
+        private = private_module("shared_name", priv_path)
+
+        assert sys.modules["shared_name"] is canonical  # previous object restored
+        hints = typing.get_type_hints(private.D)
+        # Resolves — and to the WRONG object. This is the finding.
+        assert hints["c"] is canonical.Check
+        assert hints["c"] is not private.Check
+    finally:
+        sys.modules.pop("shared_name", None)
