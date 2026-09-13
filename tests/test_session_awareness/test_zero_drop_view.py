@@ -455,3 +455,78 @@ async def test_a_FUTURE_dated_pr_cache_WITHHOLDS_its_count(db, pulse_home):
 
     ok = (await V.build_view(db, now=now))["pr_pipeline"]
     assert ok["status"] == V.STATUS_OK, f"drift inside the tolerance is not a wedged writer: {ok}"
+
+
+async def test_the_stranded_counts_come_from_ONE_snapshot_not_two(db, pulse_home, monkeypatch):
+    """Two sections of one board must not disagree about the same number.
+
+    `items_by_store` used to issue its own `counts_by_status`, independent of
+    the identical query the gaps part had already run. A detector committing a
+    sweep between those two awaits would leave the SAME assembled board
+    reporting different open/tracked totals in its two sections — and the
+    morning report free to pair the later count with the earlier detector
+    metadata. SQLite WAL gives snapshot isolation per read TRANSACTION, not
+    across unrelated autocommit SELECTs, so proximity is not a defence.
+
+    Driven by making the second call answer DIFFERENTLY: if the assembled view
+    still shows one consistent number, the second call is not being used.
+    """
+    from genesis.db.crud import zero_drop as zd_crud
+
+    real = zd_crud.counts_by_status
+    calls = {"n": 0}
+
+    async def _shifting_counts(conn):
+        calls["n"] += 1
+        out = await real(conn)
+        if calls["n"] > 1:
+            # A concurrent sweep landing between the two reads.
+            return {**out, "open": out.get("open", 0) + 99}
+        return out
+
+    monkeypatch.setattr(zd_crud, "counts_by_status", _shifting_counts)
+
+    view = await V.build_view(db, now=datetime.now(UTC))
+
+    assert view["gaps"]["status"] == V.STATUS_OK
+    assert view["items_by_store"]["stranded_work"]["open"] == view["gaps"]["open"], (
+        "the two sections of one board must report the same number — "
+        f"gaps={view['gaps']['open']} "
+        f"items={view['items_by_store']['stranded_work']['open']}"
+    )
+
+
+async def test_DEFERRED_follow_ups_are_reported_not_silently_dropped(db, pulse_home):
+    """A store of nothing but deferred work rendered `0 unresolved of 0 total`.
+
+    `include_tabled=False` narrows the query to `WHERE kind = 'follow_up'`,
+    which excludes the cold `tabled` lane AND the `idea` lane. Those rows exist
+    and are tracked; they are simply in a lane nobody dispatches from. Counting
+    them as zero is a FALSE ZERO on the board whose whole purpose is that a
+    zero can be trusted.
+
+    Folding them into `unresolved` would be the opposite error — tabled work is
+    consciously NOT being done, and counting it as outstanding inflates every
+    surface. So the actionable lane keeps its own numerator and denominator and
+    the rest is reported BESIDE it.
+    """
+    from genesis.db.crud import follow_ups as fu_crud
+
+    await fu_crud.create(
+        db,
+        id="cold-1",
+        content="someday",
+        source="test",
+        strategy="ego_judgment",
+        kind="tabled",
+    )
+    await db.commit()
+
+    part = (await V.build_view(db, now=datetime.now(UTC)))["items_by_store"]["follow_ups"]
+
+    assert part["deferred"] == 1, (
+        f"a tracked row in a deferred lane must be COUNTED, not dropped: {part}"
+    )
+    assert part["unresolved"] == 0, (
+        f"and must NOT inflate the actionable numerator — it is consciously not being done: {part}"
+    )

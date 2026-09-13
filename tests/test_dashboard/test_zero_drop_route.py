@@ -136,8 +136,17 @@ def test_the_dashboard_renders_the_SAFE_identity_not_the_ack_key():
         / "src/genesis/dashboard/templates/partials/tabs/zero_drop.html"
     ).read_text()
 
-    assert 'x-text="f.branch_display || f.branch"' in tpl, (
-        "the finding row must render the NEUTRALISED identity"
+    # `??`, not `||`. The first version of this fix used `||`, which is falsy on
+    # the EMPTY STRING — and a branch name consisting only of bidi or zero-width
+    # characters neutralises to exactly that, so the fallback handed back the
+    # verbatim key in the one case the field exists for. A reviewer caught it.
+    # `??` separates "field missing" from "deliberately empty after sanitising".
+    assert "f.branch_display ?? '[unrenderable]'" in tpl, (
+        "an EMPTY neutralised name must fall back to a placeholder, never to "
+        "the raw ack key — `||` would do the latter"
+    )
+    assert "f.branch_display || f.branch" not in tpl, (
+        "`||` falls through on an empty sanitised name and renders the raw key"
     )
     assert "f.identity_unrenderable" in tpl, (
         "and must TELL the reader when what they see is not the ack key"
@@ -146,4 +155,75 @@ def test_the_dashboard_renders_the_SAFE_identity_not_the_ack_key():
     # legal as an x-for :key, which is never rendered.
     assert 'x-text="f.branch"' not in tpl, (
         "rendering the verbatim ack key is the defect this test exists for"
+    )
+
+
+def test_the_finding_row_guards_a_NULL_ahead_count_and_shows_the_worktree():
+    """Two renders that were unconditional over a nullable field.
+
+    `classify_worktrees` creates `dirty_worktree` findings with NO
+    `ahead_count` — by design, and the column is nullable — so an unguarded
+    `' +' + f.ahead_count` printed the literal `+null` on every row of the
+    third supported finding class.
+
+    The same row rendered only the identity, but a dirty-worktree identity is
+    `branch:<digest>` when one branch is checked out in several worktrees and
+    `@opaque:<digest>` when the natural identity is unsafe. In both cases the
+    operator cannot tell WHICH worktree holds the edits — which is precisely
+    why the API supplies a neutralised `worktree_path` beside it.
+    """
+    import pathlib
+
+    tpl = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "src/genesis/dashboard/templates/partials/tabs/zero_drop.html"
+    ).read_text()
+
+    assert "Number.isFinite(f.ahead_count)" in tpl, (
+        "the ahead-count suffix must render only when the value is numeric — "
+        "every dirty_worktree finding has none"
+    )
+    # Assert the GUARD, not just the field name. The first version of this
+    # checked `"f.worktree_path" in tpl`, which stays true when the element is
+    # hidden — the field name still appears in the `x-text`. That test passed
+    # against a permanently invisible row, which is the thing it exists to
+    # catch. The condition is what makes it render.
+    assert 'x-show="f.worktree_path"' in tpl, (
+        "a dirty finding whose identity is a digest needs its readable path "
+        "SHOWN — gating it on anything else hides the only way to tell which "
+        "worktree holds the edits"
+    )
+    assert "' @ ' + f.worktree_path" in tpl, "and the path itself must be rendered"
+
+
+def test_the_header_badge_carries_its_denominator_and_refuses_a_stale_count():
+    """The first thing read, and the one count with no qualifier.
+
+    A bare `N stranded` rendered identically whether the detector had just
+    swept cleanly or was stale and blind — presenting leftover findings as
+    current, above the qualified body. That is this panel's own accounting
+    invariant broken in its most prominent position.
+
+    The badge does not go blank in that state: it says WHICH fault it is
+    ("detector stale" / "detector blind") and that what follows is not a
+    measurement. Replacing a misleading number with the reason it is
+    misleading is the whole point — the same thing the PR cache does when it
+    reports `stale` and a verdict instead of a number it cannot stand behind.
+    """
+    import pathlib
+
+    tpl = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "src/genesis/dashboard/templates/partials/tabs/zero_drop.html"
+    ).read_text()
+
+    header = tpl.split("panel-body")[0]
+    assert "gaps.listed_of" in header, "the badge must carry its denominator"
+    assert "detector?.stale" in header and "detector?.blind" in header, (
+        "a stale or blind detector must change what the badge SAYS, not print "
+        "a number it cannot stand behind"
+    )
+    assert "not a count" in header and "detector" in header, (
+        "and must name the fault — the reader is told why, never left with a "
+        "blank where a figure used to be"
     )

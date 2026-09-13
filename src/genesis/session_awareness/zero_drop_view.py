@@ -198,7 +198,7 @@ def _pr_pipeline(*, now: datetime) -> dict:
     }
 
 
-async def _items_by_store(db) -> dict:
+async def _items_by_store(db, *, gaps: dict | None = None) -> dict:
     """Full COUNTs per store, each with its denominator.
 
     Counts only — never row CONTENT. Ledger rows on a live install have carried
@@ -213,7 +213,25 @@ async def _items_by_store(db) -> dict:
     out: dict[str, Any] = {"status": STATUS_OK}
 
     try:
-        counts = await zd_crud.counts_by_status(db)
+        # ONE snapshot, not two. This used to issue its own `counts_by_status`
+        # independently of the identical query the gaps part had already run,
+        # and a detached detector committing a sweep between the two awaits
+        # would leave the SAME assembled board showing different open/tracked
+        # totals in its two sections — with the morning report free to pair the
+        # later count with the earlier detector metadata. SQLite WAL gives
+        # snapshot isolation per read transaction, not across unrelated
+        # autocommit SELECTs, so "they run close together" is not a defence.
+        #
+        # Reusing the gaps counts makes the two agree BY CONSTRUCTION rather
+        # than by timing. The fallback query is kept for the case where the
+        # gaps part itself failed: there is then no second number to disagree
+        # with, and per-part independent degradation is the property that makes
+        # this view safe to assemble at all.
+        counts = None
+        if isinstance(gaps, dict) and gaps.get("status") == STATUS_OK:
+            counts = gaps.get("counts_by_status")
+        if not isinstance(counts, dict):
+            counts = await zd_crud.counts_by_status(db)
         tracked = counts.get("open", 0) + counts.get("acked", 0)
         out["stranded_work"] = {
             "open": counts.get("open", 0),
@@ -238,10 +256,30 @@ async def _items_by_store(db) -> dict:
         out["ledger"] = _unavailable(type(exc).__name__)
 
     try:
+        # `include_tabled=False` narrows to `WHERE kind = 'follow_up'`, which
+        # excludes BOTH the cold `tabled` lane and the `idea` lane. Reporting
+        # only that view produced "0 unresolved of 0 total" on a store holding
+        # nothing but deferred items — a FALSE ZERO, on the board whose entire
+        # purpose is that a zero can be trusted. The rows exist and are tracked;
+        # they are simply in a lane nobody dispatches from.
+        #
+        # Collapsing them into `unresolved` would be the opposite error: tabled
+        # work is CONSCIOUSLY not being done, and counting it as outstanding
+        # would inflate the number every surface reads. So the actionable lane
+        # keeps its own numerator and denominator, and the rest is reported
+        # BESIDE it rather than folded in or dropped.
+        #
+        # `deferred` is a REMAINDER (all kinds minus the actionable lane), not a
+        # per-kind enumeration, and deliberately so: a fourth kind added later
+        # is absorbed by a remainder and would be silently missed by a list of
+        # kinds — which is the same shape as the bug this comment is about.
         fu = await fu_crud.get_summary_counts(db, include_tabled=False)
+        fu_all = await fu_crud.get_summary_counts(db, include_tabled=True)
+        actionable_total = sum(fu.values())
         out["follow_ups"] = {
             "unresolved": sum(fu.get(s, 0) for s in FOLLOW_UP_OPEN_STATUSES),
-            "total": sum(fu.values()),
+            "total": actionable_total,
+            "deferred": sum(fu_all.values()) - actionable_total,
             "by_status": fu,
         }
     except Exception as exc:
@@ -354,11 +392,17 @@ async def build_view(db, *, now: datetime | None = None, findings_limit: int | N
             logger.warning("zero-drop view: %s part failed", name, exc_info=True)
             return _unavailable(f"{type(exc).__name__}: {exc}"[:200])
 
+    # `gaps` is bound before the dict is built so `items_by_store` can reuse the
+    # stranded-work counts it already read, rather than issuing an identical
+    # query that a concurrent sweep could answer differently. One board, one
+    # snapshot of that number.
+    gaps = await _guard("gaps", _gaps(db, now=now, findings_limit=findings_limit))
+
     return {
         "computed_at": now.isoformat(),
-        "gaps": await _guard("gaps", _gaps(db, now=now, findings_limit=findings_limit)),
+        "gaps": gaps,
         "pr_pipeline": _guard_sync("pr_pipeline", lambda: _pr_pipeline(now=now)),
-        "items_by_store": await _guard("items_by_store", _items_by_store(db)),
+        "items_by_store": await _guard("items_by_store", _items_by_store(db, gaps=gaps)),
         "owner_pending": await _guard("owner_pending", _owner_pending(db)),
         "roadmap": _roadmap(),
     }

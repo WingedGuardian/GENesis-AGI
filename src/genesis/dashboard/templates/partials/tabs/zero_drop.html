@@ -20,9 +20,33 @@
       <div class="panel-header">
         <span class="material-symbols-outlined">inventory</span>
         Zero-Drop
-        <span class="panel-status" x-show="$store.genesisDashboard.zeroDropView?.gaps?.status === 'ok' && $store.genesisDashboard.zeroDropView?.gaps?.open > 0">
+        <!-- The badge is the FIRST thing read, and it was the one count on this
+             panel carrying neither a denominator nor a freshness qualifier: a
+             bare "N stranded" rendered identically whether the detector had
+             just swept cleanly or was stale and blind, presenting leftover
+             findings as current before the reader reaches the qualified body
+             below. That is this panel's own accounting invariant, broken in its
+             most prominent position. It now carries the denominator, and a
+             stale or blind detector replaces it with a warning instead of a
+             number — the same rule the PR cache follows when it withholds a
+             stale count rather than printing it beside its age. -->
+        <span class="panel-status"
+              x-show="$store.genesisDashboard.zeroDropView?.gaps?.status === 'ok'
+                      && $store.genesisDashboard.zeroDropView?.gaps?.open > 0
+                      && !$store.genesisDashboard.zeroDropView?.gaps?.detector?.stale
+                      && !$store.genesisDashboard.zeroDropView?.gaps?.detector?.blind">
           <span class="status-dot" style="background:#ffa726;"></span>
-          <span x-text="$store.genesisDashboard.zeroDropView.gaps.open + ' stranded'"></span>
+          <span x-text="$store.genesisDashboard.zeroDropView.gaps.open + ' of '
+                        + $store.genesisDashboard.zeroDropView.gaps.listed_of + ' stranded'"></span>
+        </span>
+        <span class="panel-status"
+              x-show="$store.genesisDashboard.zeroDropView?.gaps?.status === 'ok'
+                      && ($store.genesisDashboard.zeroDropView?.gaps?.detector?.stale
+                          || $store.genesisDashboard.zeroDropView?.gaps?.detector?.blind)">
+          <span class="status-dot" style="background:#f0ad4e;"></span>
+          <span x-text="$store.genesisDashboard.zeroDropView.gaps.detector?.blind
+                        ? 'detector blind — not a count'
+                        : 'detector stale — not a count'"></span>
         </span>
       </div>
       <div class="panel-body">
@@ -121,12 +145,32 @@
                              other than the key an operator would be acknowledging. This is a
                              rendering problem, not an injection one, so `x-text` is not the
                              defence — choosing the right field is. -->
+                        <!-- `?? '[unrenderable]'`, NOT `|| f.branch`. An earlier
+                             version of this line used `||`, which is falsy on the
+                             EMPTY STRING — and a branch name made entirely of bidi
+                             or zero-width characters neutralises to exactly that,
+                             so the fallback reintroduced the verbatim key this
+                             field exists to suppress, in the one case where it
+                             matters most. `??` distinguishes "missing" from
+                             "deliberately empty after sanitising". -->
                         <span style="margin-left:0.4rem; font-family:monospace;"
-                              x-text="f.branch_display || f.branch"></span>
+                              x-text="f.branch_display ?? '[unrenderable]'"></span>
                         <span x-show="f.identity_unrenderable" style="color:#ff9800; font-size:0.6rem;"
                               title="This name contains characters that do not render as themselves — what you see is not the acknowledgement key.">
                           &#9888; name &ne; ack key</span>
-                        <span style="color:var(--color-text-secondary);" x-text="' +' + f.ahead_count"></span>
+                        <!-- A `dirty_worktree` finding has NO ahead_count by
+                             design (the column is nullable), so an unguarded
+                             render printed `+null` on every row of that class. -->
+                        <span x-show="Number.isFinite(f.ahead_count)" style="color:var(--color-text-secondary);"
+                              x-text="' +' + f.ahead_count"></span>
+                        <!-- A dirty-worktree identity is `branch:<digest>` when one
+                             branch is checked out in several worktrees, and
+                             `@opaque:<digest>` when the natural identity is unsafe.
+                             In both the operator cannot tell WHICH worktree holds
+                             the edits — which is why the API supplies a neutralised
+                             `worktree_path` alongside. -->
+                        <span x-show="f.worktree_path" style="color:var(--color-text-secondary); font-size:0.68rem;"
+                              x-text="' @ ' + f.worktree_path"></span>
                         <span x-show="f.escalated" style="color:#f44336; font-weight:700;"> ESCALATED</span>
                         <span x-show="f.status === 'acked'" style="color:var(--color-text-secondary);"
                               x-text="' — acked: ' + (f.ack_reason || '')"></span>
