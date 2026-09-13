@@ -508,7 +508,10 @@ async def _resolve_push_states(
 
 
 async def _resolve_merge_ancestry(
-    repo_path: str, branches: list[dict], index: PrIndex, budget: int,
+    repo_path: str,
+    branches: list[dict],
+    index: PrIndex,
+    budget: int,
     deadline: float | None = None,
 ) -> dict:
     """Test each local tip against the head SHA its merged/closed PRs recorded.
@@ -538,9 +541,7 @@ async def _resolve_merge_ancestry(
             key = f"{tip}..{head}"
             if key in ancestry:
                 continue
-            if len(ancestry) >= budget or (
-                deadline is not None and time.monotonic() > deadline
-            ):
+            if len(ancestry) >= budget or (deadline is not None and time.monotonic() > deadline):
                 # Same wall clock as its sibling above. Pairs past either cap
                 # are simply absent from the map, which the classifier reads as
                 # unanswerable and FLAGS — so the ceiling can add findings,
@@ -1217,6 +1218,23 @@ async def _run_locked(
             },
         }
         _assert_sums(stages["branches"], "refs_total", degraded, "branches")
+
+        # A branch this run could not MEASURE is the detector being partially
+        # blind, and blindness has exactly one channel: `degraded`. Without
+        # this, a sweep whose ancestry probes all hit the budget or the
+        # wall-clock deadline held every affected branch and still published
+        # `status: ok` / `coverage: all classes swept` / `blind: false`,
+        # because `frozen` is derived from which CLASSES applied and both of
+        # these did. The worktree leg has always announced its own budget
+        # overrun (`worktrees_budget` below); this is the branch half of that
+        # same statement, which was missing.
+        if unmeasured := classified.get("unmeasured"):
+            detail = ", ".join(f"{k}={v}" for k, v in sorted(unmeasured.items()))
+            degraded["branches_unmeasured"] = (
+                f"{sum(unmeasured.values())} of {classified['stages']['refs_total']} "
+                f"ref(s) could not be measured ({detail}); those are held, the "
+                f"rest reconciled"
+            )
 
     # ── Worktree leg: independent of the branch legs ─────────────────────────
     dirty_findings: list[dict] | None = None

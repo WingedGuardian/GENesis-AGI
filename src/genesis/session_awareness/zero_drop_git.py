@@ -138,7 +138,19 @@ def _refuse_empty(kind: str, records, *, raw: str) -> dict | None:
 
 # TAB-separated so a branch name containing a space survives the split; git ref
 # names cannot contain a TAB (check-ref-format forbids control characters).
-_REF_FORMAT = "%(refname:short)\t%(objectname)\t%(ahead-behind:{base})\t%(committerdate:iso-strict)"
+#
+# `lstrip=2`, not `:short`, and the difference is not cosmetic. `:short` emits
+# the shortest UNAMBIGUOUS name, so the moment a tag shares a branch's name it
+# emits `heads/foo` where the branch is `foo` (MEASURED on git 2.43). The remote
+# and the PR history both key on `foo`, so such a branch matches NEITHER the
+# ls-remote join nor the PR-name join and is reported as unpushed work with no
+# PR. Since this enumeration is scoped to `refs/heads`, the prefix is a known
+# constant: a fixed strip is exact where an abbreviation is context-sensitive.
+# The identity is also the ack key, so a name that changes shape when an
+# unrelated tag appears would expire a standing acknowledgement.
+_REF_FORMAT = (
+    "%(refname:lstrip=2)\t%(objectname)\t%(ahead-behind:{base})\t%(committerdate:iso-strict)"
+)
 
 # `base` is spliced into a git FORMAT STRING, where `%(...)` is a directive. It
 # arrives from `refs/remotes/origin/HEAD` — i.e. whatever the remote's default
@@ -446,9 +458,41 @@ async def count_unique_work_commits(
         return None
 
     # NUL-separated records so a commit subject can never be confused for a
-    # diff line, and `%x00%H` so each record starts with its 40-char SHA.
+    # diff line, and `%x00%H` so each record starts with its object name.
+    #
+    # `log.showSignature` is neutralised deliberately. The predicate below asks
+    # "is this record's body non-empty", so anything else git may print into
+    # that body is indistinguishable from merge content — and in a repository
+    # that signs its commits, this config makes git emit signature-verification
+    # lines for every commit shown. Left ambient, every signed merge would read
+    # as unique work. `-c` here rather than in `_git` because it is this one
+    # reader's requirement, not a property every git call in the module needs.
     rc, out, err = await run(
-        _git(root, "log", "--merges", "--cc", "--format=%x00%H", rng),
+        _git(
+            root,
+            "-c",
+            "log.showSignature=false",
+            # `diff.context` is PINNED because the predicate below reads hunk
+            # GROUPING, and the context width is what decides where one hunk
+            # ends and the next begins. MEASURED on git 2.43 over this
+            # repository's 36 merges: the same command counts 6 / 7 / 8 merges
+            # as carrying unique work at context 0 / 3 / 10. One constructed
+            # merge makes the mechanism plain — two parents each adding a
+            # different line a line apart, the merge keeping BOTH: at context 3
+            # that is ONE hunk matching neither parent (shown, counted); at
+            # context 0 it splits into two hunks that each match one parent,
+            # both suppressed as uninteresting, and the merge vanishes.
+            # Git's default is 3; the value only has to be STABLE, not special.
+            # What must not happen is a repo-level or user-level setting
+            # silently retuning a number this detector publishes.
+            "-c",
+            "diff.context=3",
+            "log",
+            "--merges",
+            "--cc",
+            "--format=%x00%H",
+            rng,
+        ),
         ANCESTRY_TIMEOUT_S,
     )
     if rc != 0:
@@ -458,8 +502,39 @@ async def count_unique_work_commits(
         return None
 
     for record in out.split("\0")[1:]:
-        body = record[40:]
-        if any(line[:1] in ("+", "-") for line in body.splitlines()):
+        # Split at the FIRST NEWLINE rather than a fixed object-name width. The
+        # width is the repository's hash format — 40 hex for SHA-1, 64 for
+        # SHA-256 — so a hardcoded slice leaves object-name digits in the body
+        # of a SHA-256 repository, where they read as content.
+        _, _, body = record.partition("\n")
+        # `--cc` suppresses a hunk whose "contents in the parents have only two
+        # variants and the merge result picks one of them without modification"
+        # (git-diff-tree(1), verbatim). For a two-parent merge that is exactly
+        # "the result matched NEITHER parent here", so a non-empty body IS the
+        # definition of "this merge contributed something of its own".
+        #
+        # The property is HUNK-level, not LINE-level, and the difference is a
+        # trap worth naming because a reviewer fell into it. A merge that keeps
+        # BOTH parents' additions has a hunk matching neither parent — real
+        # content living only on this branch — while EVERY LINE in it came from
+        # one parent or the other, so no line carries a mark in both combined-
+        # diff columns. MEASURED on this repository: 5 of the 7 merges counted
+        # here are that shape. Testing the columns instead would silently stop
+        # counting them, which is the SUPPRESSING direction.
+        #
+        # The one shape this over-counts is an OCTOPUS merge, where "only two
+        # variants" can fail with three or more parents, so a hunk may be shown
+        # that does match one parent. Over-count is the safe direction for a
+        # detector and octopus merges are vanishingly rare here (0 of 36).
+        #
+        # Ask the question directly rather than inspecting the
+        # body's shape: the previous form scanned for a line starting `+` or
+        # `-` and therefore missed a hand-resolved BINARY conflict, whose
+        # entire combined diff is the line `Binary files differ` (MEASURED on
+        # git 2.43). The branch was then counted at zero and suppressed as
+        # PUSH_BEHIND — the false-clean this function exists to prevent,
+        # arriving through the one door the text-conflict fix left open.
+        if body.strip():
             total += 1
     return total
 

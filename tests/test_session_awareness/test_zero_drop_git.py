@@ -854,3 +854,87 @@ async def test_ls_remote_lines_it_cannot_parse_are_COUNTED_not_dropped(repo):
     # freeze the class on the unparsed path...
     tagged = await g.list_remote_heads(str(repo), runner=_tags_only)
     assert "unparseable" not in tagged.get("error", ""), tagged
+
+
+async def test_a_BINARY_conflict_resolution_counts_as_unique_work(repo):
+    """The sibling of the text-conflict case, and the predicate missed it.
+
+    A hand-resolved BINARY conflict produces a valid combined diff whose body
+    is ``Binary files differ`` — no line begins with ``+`` or ``-``, because
+    there are no textual hunks to show. MEASURED on git 2.43:
+
+        diff --cc f.bin
+        index 62830a0,080ea7c..0de5691
+        Binary files differ
+
+    The old predicate scanned for a leading ``+``/``-``, so it read that as an
+    empty combined diff and omitted the merge. A branch whose only novel tree
+    is such a merge then counted 0 and was suppressed as PUSH_BEHIND — the
+    false-clean this whole function exists to prevent, reappearing through a
+    door the text-conflict fix did not cover.
+
+    The predicate is now "the combined diff is non-empty at all", which is
+    what ``--cc`` already means by construction and needs no knowledge of what
+    git's diff body looks like. That is deliberate: every finding in this file
+    of the form "a git default lost information" came from a parser encoding a
+    belief about git's output, so the fix removes an assumption rather than
+    adding a second one.
+    """
+    from genesis.session_awareness.zero_drop_git import count_unique_work_commits
+
+    (repo / "f.bin").write_bytes(b"A\x00\x01\x02")
+    _git(repo, "add", "f.bin")
+    _git(repo, "commit", "-qm", "binary base")
+
+    # Two branches rewrite the SAME binary file, so the merge cannot resolve.
+    _git(repo, "checkout", "-q", "-b", "binconflict")
+    (repo / "f.bin").write_bytes(b"X\x00\xff\xfe")
+    _git(repo, "commit", "-qam", "their binary")
+    theirs = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "checkout", "-q", "-")
+    (repo / "f.bin").write_bytes(b"B\x00\x40\x41")
+    _git(repo, "commit", "-qam", "our binary")
+
+    _git(repo, "merge", "binconflict", "-m", "merge binary", check=False)
+    # Resolve to a THIRD value: the tree exists in neither parent, so the
+    # resolution is real work living only here.
+    (repo / "f.bin").write_bytes(b"R\x00\x80\x81")
+    _git(repo, "add", "f.bin")
+    _git(repo, "commit", "-q", "--no-edit")
+    merged = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # From their tip: "our binary" (1 non-merge) + the resolving merge (1).
+    # The old predicate returned 1 and the caller read that as PUSH_BEHIND.
+    assert await count_unique_work_commits(str(repo), theirs, merged) == 2, (
+        "a hand-resolved binary conflict is unique work and must be counted"
+    )
+
+
+async def test_a_branch_SHARING_A_NAME_WITH_A_TAG_is_emitted_unambiguously(repo):
+    """``%(refname:short)`` is ambiguity-sensitive; the identity must not be.
+
+    MEASURED on git 2.43: with both ``refs/heads/foo`` and ``refs/tags/foo``
+    present, ``for-each-ref --format='%(refname:short)' refs/heads`` emits
+    ``heads/foo`` — short enough to be unambiguous, which is exactly the
+    problem. The remote and the PR history both key on ``foo``, so the branch
+    matches NEITHER the ls-remote join nor the PR-name join, and an ahead
+    branch in that state is falsely reported as unpushed work with no PR.
+
+    This enumeration is already scoped to ``refs/heads``, so the prefix is a
+    known constant and ``lstrip=2`` removes exactly it — a fixed strip rather
+    than a context-sensitive abbreviation. The identity is the ack key, so a
+    name that changes shape when an unrelated tag appears would also expire a
+    standing acknowledgement.
+    """
+    _git(repo, "branch", "foo")
+    _git(repo, "tag", "foo")
+
+    out = await list_local_branches(str(repo), base="main")
+
+    assert "error" not in out, out
+    names = {b["branch"] for b in out["branches"]}
+    assert "foo" in names, f"the branch must be named as the remote names it: {names}"
+    assert "heads/foo" not in names, (
+        "a disambiguated short ref misses both the ls-remote and PR joins"
+    )

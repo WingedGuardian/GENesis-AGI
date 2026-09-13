@@ -678,6 +678,35 @@ def classify_branches(
     )
     stages["refs_total"] = len(branches)
 
+    # Holding is TWO facts, and until now only the first was recorded.
+    #
+    # The first is "do not resolve this row" — every hold site had that right.
+    # The second is "this run did not MEASURE this branch", and that one is the
+    # detector's own blindness signal: the run record has exactly one field
+    # saying so (`degraded`, which drives `blind`, the alarm and `status`). A
+    # hold that never reaches it lets a sweep which measured NOTHING publish
+    # `status: ok`, `coverage: all classes swept`, `blind: false` — `frozen`
+    # derives from which CLASSES were applied, and a fully-held sweep still
+    # applies both. That is the stale confident zero this subsystem exists to
+    # prevent, reached with no leg reporting an error.
+    #
+    # So holding goes through here and the second fact is a REQUIRED argument.
+    # A future hold site cannot forget it the way three existing ones did,
+    # because there is no spelling of this call that omits it — the same
+    # argument `_git()` makes for `--no-optional-locks`.
+    #
+    # `measured=True` is not a formality: an age-gated branch was looked at and
+    # deliberately not reported, which is a JUDGEMENT, not a blind spot. Wiring
+    # it to `degraded` would make the alarm permanent furniture on any repo
+    # with recent work — the failure mode that ruins an alarm's meaning.
+    unmeasured: dict[str, int] = {}
+
+    def _hold(name: str, stage: str, *, measured: bool) -> None:
+        stages[stage] += 1
+        held.add(name)
+        if not measured:
+            unmeasured[stage] = unmeasured.get(stage, 0) + 1
+
     # Every `continue` below is one of two KINDS, and conflating them is the
     # bug this classifier keeps almost making:
     #   "the condition genuinely ended"  -> absent from `present`, so the
@@ -694,8 +723,7 @@ def classify_branches(
             # measure it — so it is held, not resolved. (Missed on the first
             # pass, which held age-gated branches and let this one through: the
             # identical mistake one branch over.)
-            stages["ahead_unknown"] += 1
-            held.add(branch)
+            _hold(branch, "ahead_unknown", measured=False)
             continue
         if ahead <= 0:
             # Genuinely no longer ahead of the base: the condition ended.
@@ -709,8 +737,7 @@ def classify_branches(
             # forever) is judged on its merits rather than excused.
             # HELD, not absent: a branch under the age gate is one we looked at
             # and chose not to report, so it must not resolve an existing row.
-            stages["too_young"] += 1
-            held.add(branch)
+            _hold(branch, "too_young", measured=True)
             continue
 
         push_state = push_states.get(branch, PUSH_UNKNOWN)
@@ -719,8 +746,7 @@ def classify_branches(
             # unanswerable, so we cannot tell "ahead" from "behind". HELD for
             # the same reason ahead_unknown is: a guess in either direction is
             # a claim we cannot support, and the wrong one is silent.
-            stages["push_unknown"] += 1
-            held.add(branch)
+            _hold(branch, "push_unknown", measured=False)
             continue
 
         verdict, evidence = pr_coverage(
@@ -783,6 +809,11 @@ def classify_branches(
         "stages": stages,
         "held": held,
         "ignored_forks": ignored_forks,
+        # META, outside the terminal sum: a stage -> count map of the branches
+        # this run FAILED TO MEASURE (never the ones it judged). The caller
+        # folds it into `degraded`, which is what makes the blindness alarm and
+        # the coverage line tell the truth about a partial sweep.
+        "unmeasured": unmeasured,
     }
 
 
@@ -912,9 +943,7 @@ def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours
     findings: list[dict] = []
     held: set[str] = set()
     opaque_identities = 0
-    stages = dict.fromkeys(
-        ("worktrees_total", "clean", "too_young", "flagged_dirty"), 0
-    )
+    stages = dict.fromkeys(("worktrees_total", "clean", "too_young", "flagged_dirty"), 0)
     stages["worktrees_total"] = len(observations)
 
     for obs in observations:

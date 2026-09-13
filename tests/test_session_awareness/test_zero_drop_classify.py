@@ -338,9 +338,7 @@ def test_dirty_worktrees_report_held_identities_that_MATCH_the_finding_key():
     nothing matches, silently restoring resolve-on-absence."""
     young = _wt(path="/w/young", branch="feat/young", mtime=NOW - timedelta(minutes=1))
     old = _wt(path="/w/old", branch="feat/old")
-    detached_young = _wt(
-        path="/w/dy", branch=None, detached=True, mtime=NOW - timedelta(minutes=1)
-    )
+    detached_young = _wt(path="/w/dy", branch=None, detached=True, mtime=NOW - timedelta(minutes=1))
 
     out = classify_worktrees([young, old, detached_young], now=NOW, min_age_hours=6)
 
@@ -606,10 +604,20 @@ def test_an_UNSAFE_identity_is_DERIVED_not_dropped():
     old = NOW - timedelta(days=2)
     out = classify_worktrees(
         [
-            {"path": "/tmp/evil\n[injected] · row", "branch": None, "detached": True,
-             "entries": [("??", "x")], "newest_mtime": old},
-            {"path": "/tmp/fine", "branch": "feat/ok", "detached": False,
-             "entries": [("??", "y")], "newest_mtime": old},
+            {
+                "path": "/tmp/evil\n[injected] · row",
+                "branch": None,
+                "detached": True,
+                "entries": [("??", "x")],
+                "newest_mtime": old,
+            },
+            {
+                "path": "/tmp/fine",
+                "branch": "feat/ok",
+                "detached": False,
+                "entries": [("??", "y")],
+                "newest_mtime": old,
+            },
         ],
         now=NOW,
     )
@@ -653,15 +661,21 @@ def test_a_closed_pr_is_settled_by_SHA_evidence_before_push_state():
 
     for state in (PUSH_ABSENT, PUSH_EXACT, PUSH_BEHIND, PUSH_DIVERGED):
         contained = pr_coverage(
-            [row], tip_date=NOW - timedelta(days=10), tip_sha="c" * 40,
-            push_state=state, ancestry={f"{'c' * 40}..{'d' * 40}": True},
+            [row],
+            tip_date=NOW - timedelta(days=10),
+            tip_sha="c" * 40,
+            push_state=state,
+            ancestry={f"{'c' * 40}..{'d' * 40}": True},
         )
         assert contained[0] == "closed", f"{state}: proof of containment must suppress"
         assert contained[1]["proof"] == "head_oid_or_ancestor"
 
         disproven = pr_coverage(
-            [row], tip_date=NOW - timedelta(days=10), tip_sha="c" * 40,
-            push_state=state, ancestry={f"{'c' * 40}..{'d' * 40}": False},
+            [row],
+            tip_date=NOW - timedelta(days=10),
+            tip_sha="c" * 40,
+            push_state=state,
+            ancestry={f"{'c' * 40}..{'d' * 40}": False},
         )
         assert disproven[0] == "closed_local_only", f"{state}: disproof must flag"
 
@@ -672,11 +686,15 @@ def test_an_ABSENT_branch_is_not_suppressed_by_a_clock_alone():
     push state does not reduce to one boolean and its negation."""
     recent = (NOW - timedelta(days=1)).isoformat()
     no_sha = _pr("MERGED", merged=recent, oid=None)
-    assert pr_coverage([no_sha], tip_date=NOW - timedelta(days=10),
-                       push_state=PUSH_ABSENT)[0] == "merged_predates_tip"
+    assert (
+        pr_coverage([no_sha], tip_date=NOW - timedelta(days=10), push_state=PUSH_ABSENT)[0]
+        == "merged_predates_tip"
+    )
     for state in (PUSH_EXACT, PUSH_BEHIND):
-        assert pr_coverage([no_sha], tip_date=NOW - timedelta(days=10),
-                           push_state=state)[0] == "merged"
+        assert (
+            pr_coverage([no_sha], tip_date=NOW - timedelta(days=10), push_state=state)[0]
+            == "merged"
+        )
 
 
 def test_every_value_in_the_EVIDENCE_blob_is_structurally_constrained():
@@ -718,8 +736,11 @@ def test_every_value_in_the_EVIDENCE_blob_is_structurally_constrained():
     seen = 0
     for prs, ancestry, push in cases:
         _, evidence = pr_coverage(
-            prs, tip_date=NOW - timedelta(days=10), tip_sha=sha,
-            push_state=push, ancestry=ancestry,
+            prs,
+            tip_date=NOW - timedelta(days=10),
+            tip_sha=sha,
+            push_state=push,
+            ancestry=ancestry,
         )
         for key, value in evidence.items():
             seen += 1
@@ -765,12 +786,27 @@ def test_an_identity_carrying_a_REORDERING_character_is_quarantined_too():
     old = NOW - timedelta(days=2)
     out = classify_worktrees(
         [
-            {"path": "/w/a‮b", "branch": None, "detached": True,
-             "entries": [("??", "x")], "newest_mtime": old},
-            {"path": "/w/z​z", "branch": None, "detached": True,
-             "entries": [("??", "y")], "newest_mtime": old},
-            {"path": "/w/fine", "branch": "feat/ok", "detached": False,
-             "entries": [("??", "z")], "newest_mtime": old},
+            {
+                "path": "/w/a‮b",
+                "branch": None,
+                "detached": True,
+                "entries": [("??", "x")],
+                "newest_mtime": old,
+            },
+            {
+                "path": "/w/z​z",
+                "branch": None,
+                "detached": True,
+                "entries": [("??", "y")],
+                "newest_mtime": old,
+            },
+            {
+                "path": "/w/fine",
+                "branch": "feat/ok",
+                "detached": False,
+                "entries": [("??", "z")],
+                "newest_mtime": old,
+            },
         ],
         now=NOW,
     )
@@ -1092,9 +1128,7 @@ def test_a_worktree_whose_mtime_is_in_the_FUTURE_is_still_judged():
     """The sibling gate. A restored snapshot or a backwards clock step yields a
     future mtime, and this gate HOLDS its worktree — so the uncommitted work
     stays off the board for as long as the wrong date stands."""
-    out = classify_worktrees(
-        [_wt(mtime=NOW + timedelta(days=400))], now=NOW, min_age_hours=6
-    )
+    out = classify_worktrees([_wt(mtime=NOW + timedelta(days=400))], now=NOW, min_age_hours=6)
     assert out["stages"]["too_young"] == 0
     assert out["stages"]["flagged_dirty"] == 1
     assert out["held"] == set()
@@ -1103,8 +1137,109 @@ def test_a_worktree_whose_mtime_is_in_the_FUTURE_is_still_judged():
 def test_a_worktree_edited_MOMENTS_ago_is_still_young():
     """Its control: ordinary drift must not turn somebody's live typing into a
     finding."""
-    out = classify_worktrees(
-        [_wt(mtime=NOW + timedelta(seconds=20))], now=NOW, min_age_hours=6
-    )
+    out = classify_worktrees([_wt(mtime=NOW + timedelta(seconds=20))], now=NOW, min_age_hours=6)
     assert out["stages"]["too_young"] == 1
     assert out["stages"]["flagged_dirty"] == 0
+
+
+def test_an_UNMEASURED_branch_is_reported_as_such_not_merely_held():
+    """The blocker a fresh-context audit found, and the worst kind: silent.
+
+    Holding is TWO facts. "Do not resolve this row" — every hold site had that
+    right. And "this run did not MEASURE this branch", which is the detector's
+    own blindness signal. Only the first was recorded.
+
+    The consequence is the stale confident zero this whole subsystem exists to
+    prevent. A sweep whose ancestry probes all hit the budget or the wall-clock
+    deadline holds every affected branch; `apply_sweep` correctly resolves
+    nothing; both classes still APPLY (with an empty present-set), so `frozen`
+    comes back empty, `coverage` reads "all classes swept", `degraded` stays
+    empty, `status` is "ok" and `blind` is False. The board announces a clean
+    full sweep of refs it never looked at.
+
+    `too_young` is deliberately NOT unmeasured: that branch was looked at and
+    judged too recent to report. Wiring a judgement into the blindness alarm
+    would make the alarm permanent furniture on any repo with recent work.
+    """
+    now = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
+    old = (now - timedelta(days=30)).isoformat()
+    fresh = now.isoformat()
+
+    out = classify_branches(
+        [
+            {"branch": "a", "tip_sha": "a" * 40, "ahead": None, "tip_date": old},
+            {"branch": "b", "tip_sha": "b" * 40, "ahead": 3, "tip_date": old},
+            {"branch": "c", "tip_sha": "c" * 40, "ahead": 3, "tip_date": fresh},
+        ],
+        push_states={"b": PUSH_UNKNOWN},
+        prs=[],
+        now=now,
+        min_age_hours=12,
+    )
+
+    assert out["held"] == {"a", "b", "c"}, "all three are held — that part was right"
+    assert out["unmeasured"] == {"ahead_unknown": 1, "push_unknown": 1}, (
+        "only the branches we FAILED to measure are blindness; the age-gated "
+        f"one is a judgement: {out['unmeasured']}"
+    )
+
+
+def test_every_branch_hold_site_declares_whether_it_MEASURED():
+    """The lock, not the instance.
+
+    Three hold sites existed and all three forgot to record the second fact.
+    Fixing them one by one leaves the next one free to forget again, which is
+    how this class has already recurred once in this file's history.
+
+    So holding routes through `_hold(name, stage, measured=...)`, where the
+    declaration is a REQUIRED keyword — there is no spelling of the call that
+    omits it. This walks the AST and fails on any direct `held.add(...)` inside
+    `classify_branches`, so a hold site written next year cannot reintroduce
+    the silent variant. The same argument the module already makes for routing
+    every git invocation through `_git()`.
+    """
+    import ast
+    import pathlib
+
+    from genesis.session_awareness import zero_drop as _zd
+
+    src = pathlib.Path(_zd.__file__).read_text()
+    tree = ast.parse(src, _zd.__file__)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "classify_branches"
+    )
+
+    # The chokepoint's OWN body is the one legitimate `held.add` — excluding it
+    # is not a carve-out that weakens the lock, it is the difference between
+    # "route through the helper" and "the helper may not exist". (Caught by
+    # running this test: its first version flagged `_hold` itself.)
+    helper = next(n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef) and n.name == "_hold")
+    inside_helper = {id(n) for n in ast.walk(helper)}
+
+    offenders = [
+        f"line {n.lineno}"
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "add"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "held"
+        and id(n) not in inside_helper
+    ]
+    assert not offenders, (
+        "a branch hold must go through `_hold(..., measured=...)` so it cannot "
+        f"forget to declare blindness; direct held.add at {offenders}"
+    )
+
+    holds = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_hold"
+    ]
+    assert len(holds) >= 3, f"expected every hold site routed through _hold, saw {len(holds)}"
+    for call in holds:
+        assert any(kw.arg == "measured" for kw in call.keywords), (
+            f"_hold at line {call.lineno} omits `measured=` — the whole point"
+        )

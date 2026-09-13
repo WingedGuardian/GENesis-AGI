@@ -534,9 +534,7 @@ async def test_a_prunable_worktree_is_counted_not_treated_as_an_error(env, db_pa
     out = await _run(db_path)
     assert out["status"] == "ok", "a gone worktree is absent, not unreadable"
     assert (
-        json.loads(w.last_run_path().read_text())["stages"]["worktrees"]["meta"][
-            "prunable_skipped"
-        ]
+        json.loads(w.last_run_path().read_text())["stages"]["worktrees"]["meta"]["prunable_skipped"]
         == 3
     )
 
@@ -710,6 +708,7 @@ async def test_a_failed_store_read_degrades_instead_of_losing_the_run(env, db_pa
     """These reads run AFTER the sweep committed. Raising would discard the run
     record, the heartbeat and the blindness alarm for a failure that changed
     nothing in the store."""
+
     async def _boom(*a, **kw):
         raise RuntimeError("store read exploded")
 
@@ -818,7 +817,7 @@ async def test_an_UNCHANGED_board_keeps_the_SAME_hash(captured_alert):
 
 
 async def test_the_blindness_denominator_counts_REGISTERED_worktrees(env, db_path):
-    """"N of M unreadable" must use the M the sweep set out to read.
+    """ "N of M unreadable" must use the M the sweep set out to read.
 
     Three cases skip a worktree BEFORE it becomes an observation — prunable,
     over-budget, unreadable — so a denominator derived from the observations
@@ -951,12 +950,27 @@ async def test_the_worker_HOLD_key_of_a_duplicated_branch_matches_the_classifier
         # Same branch, three worktrees: one readable, one unreadable, one
         # prunable — so all three subsets differ and a per-consumer computation
         # would produce three different answers.
-        {"path": "/w/a", "branch": "feat/dup", "detached": False, "prunable": None,
-         "branch_duplicated": True},
-        {"path": "/w/b", "branch": "feat/dup", "detached": False, "prunable": None,
-         "branch_duplicated": True},
-        {"path": "/w/c", "branch": "feat/dup", "detached": False, "prunable": "gitdir gone",
-         "branch_duplicated": True},
+        {
+            "path": "/w/a",
+            "branch": "feat/dup",
+            "detached": False,
+            "prunable": None,
+            "branch_duplicated": True,
+        },
+        {
+            "path": "/w/b",
+            "branch": "feat/dup",
+            "detached": False,
+            "prunable": None,
+            "branch_duplicated": True,
+        },
+        {
+            "path": "/w/c",
+            "branch": "feat/dup",
+            "detached": False,
+            "prunable": "gitdir gone",
+            "branch_duplicated": True,
+        },
     ]
 
     async def _listing(root, runner=None):
@@ -971,9 +985,7 @@ async def test_the_worker_HOLD_key_of_a_duplicated_branch_matches_the_classifier
     monkeypatch.setattr(w, "worktree_status", _status)
 
     out = await w._observe_worktrees("/repo", budget_s=60)
-    classified = classify_worktrees(
-        out["observations"], now=datetime.now(UTC), min_age_hours=0
-    )
+    classified = classify_worktrees(out["observations"], now=datetime.now(UTC), min_age_hours=0)
 
     held = out["held"]
     found = {f["branch"] for f in classified["findings"]}
@@ -1130,7 +1142,9 @@ def test_a_genuine_degradation_is_PRESERVED_beside_a_shape_violation(last_run_fi
     rebuilding it as EMPTY would discard the sweep's own report of what it
     could not see.
     """
-    last_run_file({"computed_at": _GOOD_TS, "degraded": {"branches": "gh auth failed"}, "stages": []})
+    last_run_file(
+        {"computed_at": _GOOD_TS, "degraded": {"branches": "gh auth failed"}, "stages": []}
+    )
     degraded = w.read_last_run()["degraded"]
 
     assert degraded["branches"] == "gh auth failed", "the real degradation survives"
@@ -1197,8 +1211,13 @@ async def test_a_FAILED_sweep_REPLACES_the_record_that_broke_it(tmp_path, monkey
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
     path = w.last_run_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    poison = {"version": 1, "computed_at": "2026-09-07T00:00:00", "status": "ok",
-              "open_findings": 7, "coverage": "branches+worktrees"}
+    poison = {
+        "version": 1,
+        "computed_at": "2026-09-07T00:00:00",
+        "status": "ok",
+        "open_findings": 7,
+        "coverage": "branches+worktrees",
+    }
     path.write_text(json.dumps(poison))
 
     async def _boom(**kwargs):
@@ -1263,9 +1282,7 @@ async def test_a_SUCCESSFUL_record_still_debounces(env, db_path):
 # it describes, so the two drift. These cover the three that are not :277.
 
 
-async def test_an_UNSAFE_resolved_base_falls_back_and_says_SO_distinctly(
-    env, db_path, monkeypatch
-):
+async def test_an_UNSAFE_resolved_base_falls_back_and_says_SO_distinctly(env, db_path, monkeypatch):
     """`%`, `(` and `)` are LEGAL in a git ref name (MEASURED against
     `git check-ref-format --branch`), and the base is spliced into a git FORMAT
     string where `%(...)` is a directive. `list_local_branches` already refuses
@@ -1278,6 +1295,7 @@ async def test_an_UNSAFE_resolved_base_falls_back_and_says_SO_distinctly(
     places, and the second used to produce no note at all — so the run record
     looked clean while the branch classes were frozen.
     """
+
     async def _unsafe(root, runner=None):
         return "origin/%(objectname)"
 
@@ -1409,9 +1427,7 @@ async def test_the_failed_floor_is_SHORTER_than_the_normal_interval(env, db_path
     path = w.last_run_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     aged = datetime.now(UTC) - timedelta(minutes=w.FAILED_RETRY_FLOOR_MINUTES + 1)
-    path.write_text(
-        json.dumps({"version": 1, "computed_at": aged.isoformat(), "status": "failed"})
-    )
+    path.write_text(json.dumps({"version": 1, "computed_at": aged.isoformat(), "status": "failed"}))
     out = await w.run_zero_drop_worker(
         trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
     )
@@ -1433,14 +1449,16 @@ async def test_the_blind_alert_does_NOT_remint_when_only_a_COUNT_moves(db_path):
     conn.row_factory = aiosqlite.Row
     try:
         first = await w._maintain_blind_alert(
-            conn, degraded={"worktrees": "1 of 161 worktrees unreadable: /w/a: denied"},
+            conn,
+            degraded={"worktrees": "1 of 161 worktrees unreadable: /w/a: denied"},
             frozen=[],
         )
         assert first == "created"
         # Same leg, same words, a denominator that moved because a worktree was
         # reaped. Nothing about the fault changed.
         second = await w._maintain_blind_alert(
-            conn, degraded={"worktrees": "1 of 165 worktrees unreadable: /w/a: denied"},
+            conn,
+            degraded={"worktrees": "1 of 165 worktrees unreadable: /w/a: denied"},
             frozen=[],
         )
         assert second == "unchanged", "a moving denominator re-minted the alert"
@@ -1485,9 +1503,7 @@ def test_the_freshness_surface_does_not_call_a_FUTURE_record_fresh():
     from genesis.mcp.health.zero_drop_tools import _freshness
 
     now = datetime.now(UTC)
-    out = _freshness(
-        {"computed_at": (now + timedelta(days=30)).isoformat()}, now=now
-    )
+    out = _freshness({"computed_at": (now + timedelta(days=30)).isoformat()}, now=now)
     assert out["stale"] is True
     assert "FUTURE" in out["verdict"]
 
@@ -1504,6 +1520,7 @@ async def test_a_failed_BLIND_alert_resolve_reaches_degraded(env, db_path, monke
     high-priority blindness alert stays open saying the board cannot be trusted.
     Two surfaces disagreeing, with nothing pointing at the contradiction.
     """
+
     async def _resolve_fails(db, *, degraded, frozen):
         return "resolve_failed"
 
@@ -1530,17 +1547,24 @@ async def test_changing_alert_PRIORITY_re_mints_the_findings_alert(db_path):
     conn = await aiosqlite.connect(db_path)
     conn.row_factory = aiosqlite.Row
     try:
-        findings = [{"class": "unpushed_branch", "branch": "feat/x",
-                     "ahead_count": 2, "escalated": False}]
+        findings = [
+            {"class": "unpushed_branch", "branch": "feat/x", "ahead_count": 2, "escalated": False}
+        ]
         base = {"max_listed": 10}
         first = await w._maintain_alert(
-            conn, cfg={**base, "alert_priority": "medium"},
-            findings=findings, total=1, coverage="all classes swept",
+            conn,
+            cfg={**base, "alert_priority": "medium"},
+            findings=findings,
+            total=1,
+            coverage="all classes swept",
         )
         assert first == "created"
         second = await w._maintain_alert(
-            conn, cfg={**base, "alert_priority": "high"},
-            findings=findings, total=1, coverage="all classes swept",
+            conn,
+            cfg={**base, "alert_priority": "high"},
+            findings=findings,
+            total=1,
+            coverage="all classes swept",
         )
         assert second == "created", "a priority change never reached the board"
 
@@ -1572,14 +1596,24 @@ async def test_a_PRUNABLE_worktree_is_held_not_resolved(monkeypatch):
     what settles it: a worktree whose `status` call FAILS is already held, and
     that is the same condition through a different door.
     """
+
     async def _listing(root, runner=None):
         return {
             "worktrees": [
-                {"path": "/w/live", "branch": "feat/live", "detached": False,
-                 "prunable": None, "branch_duplicated": False},
-                {"path": "/mnt/usb/wt", "branch": "feat/on-a-mount", "detached": False,
-                 "prunable": "gitdir file points to non-existent location",
-                 "branch_duplicated": False},
+                {
+                    "path": "/w/live",
+                    "branch": "feat/live",
+                    "detached": False,
+                    "prunable": None,
+                    "branch_duplicated": False,
+                },
+                {
+                    "path": "/mnt/usb/wt",
+                    "branch": "feat/on-a-mount",
+                    "detached": False,
+                    "prunable": "gitdir file points to non-existent location",
+                    "branch_duplicated": False,
+                },
             ]
         }
 
@@ -1653,8 +1687,17 @@ async def test_an_ABSURD_mtime_does_not_kill_the_whole_sweep(monkeypatch, tmp_pa
     (wt / "f.py").write_text("x\n")
 
     async def _listing(root, runner=None):
-        return {"worktrees": [{"path": str(wt), "branch": "feat/x", "detached": False,
-                               "prunable": None, "branch_duplicated": False}]}
+        return {
+            "worktrees": [
+                {
+                    "path": str(wt),
+                    "branch": "feat/x",
+                    "detached": False,
+                    "prunable": None,
+                    "branch_duplicated": False,
+                }
+            ]
+        }
 
     async def _status(path, runner=None):
         return {"entries": [("M ", "f.py")], "unparsed": 0}
@@ -1672,3 +1715,44 @@ async def test_an_ABSURD_mtime_does_not_kill_the_whole_sweep(monkeypatch, tmp_pa
     assert out["observations"][0]["newest_mtime"] is None, (
         "an unusable mtime reads as UNDATED, which the age gate judges on merits"
     )
+
+
+async def test_a_sweep_that_MEASURED_NOTHING_cannot_publish_a_CLEAN_BOARD(
+    env, db_path, monkeypatch
+):
+    """The blocker, driven through the REAL worker rather than a restatement.
+
+    An earlier draft of this test inlined the worker's own fold and asserted on
+    the result. That pins the arithmetic and nothing else: deleting the fold
+    from the worker would have left it green. So this goes through
+    `run_zero_drop_worker` and reads the PUBLISHED run record.
+
+    The wedge: every ancestry probe is skipped because the wall-clock deadline
+    has already passed, so every branch whose tip differs from its remote ref
+    is PUSH_UNKNOWN -> held. Before the fix the run published `status: ok`,
+    `coverage: all classes swept`, `degraded: {}` and `blind: false`, because
+    `frozen` derives from which CLASSES applied and a fully-held sweep still
+    applies both. A clean board over refs nobody looked at.
+    """
+    # The remote has this branch at a DIFFERENT sha, so the classifier needs an
+    # ancestry probe to tell "ahead" from "behind"...
+    env["remote"] = {"heads": {BRANCH["branch"]: "bbb222"}}
+    # ...and the probe budget's wall clock is already spent, so it never runs.
+    monkeypatch.setattr(w, "_worktree_budget_s", lambda cfg: 0.0)
+
+    out = await _run(db_path)
+
+    assert out["status"] == "degraded", "a sweep that could not measure its refs must not report ok"
+    note = out["degraded"].get("branches_unmeasured", "")
+    assert "push_unknown" in note, f"the reason must name WHICH measurement failed: {note}"
+    assert "1 of 1" in note, f"and how many of how many: {note}"
+
+    record = json.loads(w.last_run_path().read_text())
+    assert record["degraded"].get("branches_unmeasured"), (
+        "the PUBLISHED record is what the status tool and the blindness alert "
+        "read — an in-memory-only degradation is invisible where it matters"
+    )
+    # The terminal stages must still sum: holding is not an escape from the
+    # accounting that makes suppression auditable.
+    terminal = record["stages"]["branches"]["terminal"]
+    assert sum(v for k, v in terminal.items() if k != "refs_total") == terminal["refs_total"]
