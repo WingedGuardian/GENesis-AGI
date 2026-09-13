@@ -1270,11 +1270,34 @@ line-count double-counts.
 Frequency was never the real argument, though: the worst SUCCESSFUL connect was
 **25 395 ms**, i.e. 85 % of the 30 s ceiling. The margin was the problem.
 
-**Mitigation (shipped):** `MCP_TIMEOUT: "120000"` in the repo's
-`.claude/settings.json` `env` block. VERIFIED end-to-end — `MCP_TIMEOUT` occurs 6×
-in the CC binary, and a CC process started after the change logs
+**Mitigation (shipped), in TWO halves — one is not enough:**
+
+1. `MCP_TIMEOUT: "120000"` in the repo's `.claude/settings.json` `env` block, for
+   sessions that read repo settings.
+2. The same value in `CCInvoker._build_env`, because **most dispatched sessions
+   never read those settings** — they run with a cwd outside any git repo, so CC
+   does not load them. Without half 2 the entire background fleet (reflection,
+   research, sentinel, direct sessions) keeps the 30 s default, which is the worst
+   place to miss: an unattended session has nobody to notice its tools are gone.
+   (A worktree-cwd dispatch is the exception and DOES load repo settings; both
+   halves carry the same number, so those paths agree either way. A test compares
+   the two, since they cannot share a constant.)
+
+VERIFIED end-to-end — a CC process started after the change logs
 `Starting connection with timeout of 120000ms` where it previously logged
 `30000ms`.
+
+**`MCP_TIMEOUT` is NOT connect-only, despite where it shows up in the log.**
+MEASURED in the 2.1.246 binary, one getter reads it and is applied to the server
+connect, generic MCP requests, `tools/list`, resource reads, the `mcp_tool` hook
+cap and the subscriptions listen stream. So raising it also widens the ceiling on
+a server that wedges MID-session, not just at startup — 120 s per operation
+instead of 30 s, against a shortest MCP-carrying dispatch budget of 600 s.
+
+CC has a **separate** `MCP_CONNECT_TIMEOUT_MS` (default 5000 ms) sitting beside it
+in the same env registry, and a third `MCP_TOOL_TIMEOUT`. Do not conflate them —
+naming a local constant after the connect variable sends the next maintainer to
+the wrong one, which is a mistake this repo made and corrected.
 
 **This makes the drop rarer, not visible.** Detecting and announcing a missing
 server is separate work (see the issue tracking it). Until that lands, the way to
