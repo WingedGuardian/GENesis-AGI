@@ -600,7 +600,19 @@
               this._cockpitInterval = setInterval(() => this.fetchCockpit(), 30000);
               break;
             case "zero-drop":
-              if (first) { this.fetchZeroDrop(); }
+              // Fetches on EVERY entry, deliberately diverging from the
+              // `if (first)` its siblings use — do not "fix" this back to match
+              // them. `first` is false forever after the first visit, so on
+              // re-entry a sibling tab renders its retained payload until the
+              // next interval tick. For those tabs that is unremarkable. This
+              // one asserts that a number is current, and its stale banner is
+              // driven by FETCH state — so a re-entry that attempts no fetch
+              // leaves the state healthy and the banner silent while the board
+              // shows a figure up to a minute old. A board claiming a
+              // trustworthy zero cannot apply a weaker standard to itself than
+              // it applies to its sources. One extra request per tab click is
+              // the whole cost.
+              this.fetchZeroDrop();
               this._zeroDropInterval = setInterval(() => this.fetchZeroDrop(), 60000);
               break;
             case "traces":

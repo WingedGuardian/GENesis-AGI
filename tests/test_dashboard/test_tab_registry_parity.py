@@ -304,3 +304,44 @@ def test_every_panelState_call_in_a_tab_template_is_declared():
         f"tab templates call panelState() for keys absent from the `fetchState` "
         f"registry, so their loading/error gates are dead: {missing}"
     )
+
+
+def test_the_zero_drop_tab_refetches_on_EVERY_entry_not_just_the_first():
+    """A deliberate divergence from the sibling pattern, pinned so it survives.
+
+    Every other tab guards its initial fetch with `if (first)`, and `first` is
+    false forever after the first visit — so re-entering a tab renders the
+    retained payload until the next interval tick. For an operational panel
+    that is unremarkable.
+
+    This panel is different in kind: it asserts that a number is CURRENT, and
+    its stale banner is driven by FETCH state. A re-entry that attempts no
+    fetch therefore leaves the fetch state healthy and the banner silent while
+    the board displays a figure up to a minute old — the board applying a
+    weaker standard to its own transport than it applies to its sources, which
+    is the one thing it exists not to do.
+
+    The risk this test guards is a future reader noticing the inconsistency
+    with eight sibling cases and "correcting" it. The comment in the source
+    says why; this makes the reasoning enforceable.
+    """
+    import pathlib
+    import re
+
+    js = (
+        pathlib.Path(__file__).resolve().parents[2] / "src/genesis/dashboard/webui/js/dashboard.js"
+    ).read_text()
+
+    case = re.search(r'case "zero-drop":(.*?)break;', js, re.S)
+    assert case, "the zero-drop tab case disappeared from _startTabIntervals"
+    # Strip `//` comments before matching. The source comment EXPLAINS the
+    # divergence and necessarily quotes the pattern it diverges from, so a raw
+    # substring check fails on the very text that documents the behaviour —
+    # which is what the first version of this test did.
+    body = re.sub(r"//.*", "", case.group(1))
+
+    assert "this.fetchZeroDrop();" in body, "the tab must fetch on entry at all"
+    assert "if (first)" not in body, (
+        "the zero-drop tab must fetch on EVERY entry, not only the first — see "
+        "the comment in dashboard.js for why this diverges from its siblings"
+    )
