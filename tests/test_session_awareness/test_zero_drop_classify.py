@@ -26,6 +26,7 @@ from genesis.session_awareness.zero_drop import (
     PUSH_UNKNOWN,
     classify_branches,
     classify_worktrees,
+    index_prs_by_head,
     pr_coverage,
     worktree_identity,
 )
@@ -757,3 +758,273 @@ def test_an_identity_carrying_a_REORDERING_character_is_quarantined_too():
     )
     assert out["stages"]["quarantined_identity"] == 2
     assert [f["branch"] for f in out["findings"]] == ["feat/ok"]
+
+
+# ── Class B: a NAME is not an IDENTITY (Codex round 1, PR #1794) ─────────────
+
+
+def test_a_RENAMED_branch_is_still_covered_by_its_merged_pr_head_sha():
+    """The finding that says this PR's own thesis was unfinished.
+
+    Rename a branch after its PR merged and the historical `headRefName` no
+    longer matches anything local, so a name-only lookup hands `pr_coverage`
+    an EMPTY row list — and the SHA proof sitting in `headRefOid`, the
+    strongest evidence this module recognises, never gets to speak. The
+    detector then files a stranded finding for work that demonstrably shipped.
+    """
+    tip = "f" * 40
+    out = _run(
+        [_branch(name="feat/renamed", tip=tip)],
+        prs=[_pr("MERGED", merged=OLD, head="feat/ORIGINAL-name", oid=tip, number=7)],
+    )
+    assert out["stages"]["covered_merged_pr"] == 1
+    assert out["stages"]["flagged_no_pr"] == 0
+    assert out["findings"][CLASS_PUSHED_NO_PR] == []
+
+
+def test_an_exact_head_sha_covers_an_OPEN_pr_on_a_ref_that_no_longer_exists():
+    """Same rename, PR still open. Push state is ABSENT — there is no remote
+    ref of the NEW name to consult — but `headRefOid` IS the commit GitHub
+    holds as that PR's head, which proves the tip is on the server directly.
+    Push state is tier 3 evidence read off a name; the SHA is tier 1.
+    """
+    tip = "c" * 40
+    out = _run(
+        [_branch(name="feat/renamed", tip=tip)],
+        prs=[_pr("OPEN", head="feat/gone", oid=tip, number=9)],
+        push={"feat/renamed": PUSH_ABSENT},
+    )
+    assert out["stages"]["covered_open_pr"] == 1
+    assert out["stages"]["flagged_local_ahead_of_open_pr"] == 0
+
+
+def test_an_open_pr_at_a_DIFFERENT_sha_still_flags_an_absent_branch():
+    """The control for the test above, and the one that keeps the widening
+    honest: without an exact SHA match an ABSENT branch is still not covered
+    by an open PR, exactly as before.
+
+    The PR must MATCH BY NAME. An earlier version of this test used a head ref
+    the branch does not carry, so the lookup returned nothing, `pr_coverage`
+    answered "none", and the OPEN branch this test exists to constrain was
+    never entered at all — it would have passed with the SHA comparison
+    deleted. `flagged_no_pr` was the tell: a genuinely non-covering open PR
+    produces `flagged_local_ahead_of_open_pr`, which is what is asserted now.
+    """
+    out = _run(
+        [_branch(name="feat/renamed", tip="c" * 40)],
+        prs=[_pr("OPEN", head="feat/renamed", oid="d" * 40, number=9)],
+        push={"feat/renamed": PUSH_ABSENT},
+    )
+    assert out["stages"]["covered_open_pr"] == 0
+    assert out["stages"]["flagged_local_ahead_of_open_pr"] == 1
+    assert out["stages"]["flagged_no_pr"] == 0
+
+
+def test_a_fork_pr_cannot_cover_a_local_branch_through_the_SHA_index_either():
+    """The fork filter governs BOTH maps. It would be defensible to keep forks
+    in the SHA map — an exact head OID is the same commit, not a name
+    coincidence — but that opens a new SUPPRESSION path on third-party data,
+    and the wrong direction here is the silent one."""
+    tip = "b" * 40
+    out = _run(
+        [_branch(name="feat/x", tip=tip)],
+        prs=[_pr("MERGED", merged=OLD, head="their-branch", oid=tip, owner="contributor")],
+        owner="us",
+    )
+    assert out["stages"]["covered_merged_pr"] == 0
+    assert out["stages"]["flagged_no_pr"] == 1
+    assert out["ignored_forks"] == 1
+
+
+def test_a_pr_matching_by_BOTH_name_and_sha_is_passed_once():
+    """The ordinary case is both indexes returning the same row. Deduplicated
+    by object identity: `number` is untrusted input and may be missing, which
+    would collapse every unnumbered row onto a single None."""
+    tip = "a" * 40
+    index, _ = index_prs_by_head([_pr("MERGED", merged=OLD, head="feat/x", oid=tip)])
+    rows = index.for_branch("feat/x", tip)
+    assert len(rows) == 1
+
+
+def test_name_rows_LEAD_so_the_sha_index_can_only_add_evidence():
+    """A branch that was never renamed must see exactly the sequence it saw
+    before the SHA index existed — the union adds, it never reorders."""
+    tip = "a" * 40
+    named = _pr("MERGED", merged=OLD, head="feat/x", oid="e" * 40, number=1)
+    by_sha = _pr("MERGED", merged=OLD, head="feat/other", oid=tip, number=2)
+    index, _ = index_prs_by_head([by_sha, named])
+    assert [p["number"] for p in index.for_branch("feat/x", tip)] == [1, 2]
+
+
+def test_no_PRODUCTION_caller_looks_a_branch_up_in_ONE_index():
+    """The LOCK behind `for_branch`, because a docstring is a convention.
+
+    The whole Class B defect was a call site reaching for the name map
+    directly, and nothing stopped it. `for_branch` is only a chokepoint while
+    every caller is forced through it, so this walks the AST of the modules
+    that consume a `PrIndex` and fails on any attribute access to a raw index.
+    A new lookup written next year fails here until it goes through the union —
+    which is what a convention could not do.
+
+    Scoped to `src/`: a test may read `by_name` to assert what the index HOLDS,
+    which is a statement about the data structure, not a lookup.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "src/genesis/session_awareness"
+    offenders = []
+    for path in (root / "zero_drop.py", root / "zero_drop_worker.py"):
+        tree = ast.parse(path.read_text(), str(path))
+        inside = {
+            node
+            for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef) and cls.name == "PrIndex"
+            for node in ast.walk(cls)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in ("by_name", "by_head_sha")
+                and node not in inside
+            ):
+                offenders.append(f"{path.name}:{node.lineno} .{node.attr}")
+    assert not offenders, (
+        "a raw index lookup bypasses PrIndex.for_branch, which is what gated "
+        f"SHA proof behind a name join in the first place: {offenders}"
+    )
+
+
+def test_a_pr_with_no_head_ref_NAME_is_still_reachable_by_its_head_sha():
+    """A row is dropped from the name map when it carries no usable name — it
+    used to be dropped from the join entirely, discarding an immutable SHA."""
+    tip = "a" * 40
+    index, _ = index_prs_by_head([{"number": 3, "headRefOid": tip, "state": "MERGED"}])
+    assert index.by_name == {}
+    assert [p["number"] for p in index.for_branch(None, tip)] == [3]
+
+
+def test_ALL_closed_prs_are_scanned_before_a_negative_verdict_is_chosen():
+    """Head-ref names are REUSED — MEASURED 35 of 1586 names here, one carrying
+    7 PRs — so one branch can carry several unrelated closed PRs, and the
+    listing order is evidence about nothing. Returning on the first disproven
+    row let a stale PR override SHA proof sitting in a later one."""
+    tip = "a" * 40
+    verdict, evidence = pr_coverage(
+        [
+            _pr("CLOSED", closed=OLD, oid="9" * 40, number=1),
+            _pr("CLOSED", closed=OLD, oid=tip, number=2),
+        ],
+        tip_date=NOW - timedelta(days=10),
+        tip_sha=tip,
+        push_state=PUSH_DIVERGED,
+        ancestry={f"{tip}..{'9' * 40}": False},
+    )
+    assert verdict == "closed"
+    assert evidence["pr"] == 2
+
+
+def test_every_closed_pr_disproven_still_flags_and_names_the_FIRST():
+    """The control. Scanning further must not weaken the negative verdict when
+    nothing positive turns up, and the reported row is stable."""
+    tip = "a" * 40
+    verdict, evidence = pr_coverage(
+        [
+            _pr("CLOSED", closed=OLD, oid="9" * 40, number=1),
+            _pr("CLOSED", closed=OLD, oid="8" * 40, number=2),
+        ],
+        tip_date=NOW - timedelta(days=10),
+        tip_sha=tip,
+        push_state=PUSH_DIVERGED,
+        ancestry={f"{tip}..{'9' * 40}": False, f"{tip}..{'8' * 40}": False},
+    )
+    assert verdict == "closed_local_only"
+    assert evidence["pr"] == 1
+
+
+def test_one_branch_in_TWO_worktrees_gets_two_independently_ackable_rows():
+    """`git worktree add --force` checks out a branch that is already checked
+    out elsewhere. Keyed on the branch alone the two collapse onto one
+    identity, `apply_sweep` keeps the first sighting, and the second worktree's
+    uncommitted work can never be acknowledged or tracked (Codex P2, #1794)."""
+    rows = classify_worktrees(
+        [
+            _wt(path="/w/one", entries=[("M ", "a.py")]) | {"branch_duplicated": True},
+            _wt(path="/w/two", entries=[("M ", "b.py")]) | {"branch_duplicated": True},
+        ],
+        now=NOW,
+        min_age_hours=6,
+    )
+    identities = [f["branch"] for f in rows["findings"]]
+    assert len(set(identities)) == 2
+    assert all(i.startswith("feat/x:") for i in identities)
+    assert ":" in identities[0], "an identity must stay unrepresentable as a ref"
+    # The path is carried where it can be rendered safely; the KEY is a digest.
+    assert {f["worktree_path"] for f in rows["findings"]} == {"/w/one", "/w/two"}
+
+
+def test_discriminating_an_identity_never_widens_the_QUARANTINE():
+    """The false suppression this discriminator introduced before it was caught.
+
+    A worktree PATH may legally contain a newline — this subsystem's own parser
+    was redesigned around exactly that — and `classify_worktrees` quarantines an
+    identity carrying a control character. A quarantined worktree lands in
+    NEITHER `present` NOR `held`, and `apply_sweep` resolves anything absent
+    from both, so splicing a raw path into a branch-keyed identity could resolve
+    a live finding about uncommitted work.
+
+    The invariant, stated exactly: discriminating changes whether a worktree is
+    quarantined for nobody. A hex digest is safe by construction, so only the
+    BRANCH NAME can ever decide.
+    """
+    hostile = "/w/line\nbreak\x07"
+    dup = _wt(path=hostile) | {"branch_duplicated": True}
+    solo = _wt(path=hostile)
+
+    out_dup = classify_worktrees([dup], now=NOW, min_age_hours=6)
+    out_solo = classify_worktrees([solo], now=NOW, min_age_hours=6)
+
+    assert out_dup["stages"]["quarantined_identity"] == 0
+    assert out_solo["stages"]["quarantined_identity"] == 0
+    assert out_dup["stages"]["flagged_dirty"] == out_solo["stages"]["flagged_dirty"] == 1
+    ident = out_dup["findings"][0]["branch"]
+    assert "\n" not in ident and "\x07" not in ident, ident
+    # And the control: a hostile BRANCH is still quarantined either way, so the
+    # digest did not smuggle an unsafe identity through.
+    bad_branch = _wt(branch="feat/‮x") | {"branch_duplicated": True}
+    assert classify_worktrees([bad_branch], now=NOW)["stages"]["quarantined_identity"] == 1
+
+
+def test_the_duplicate_digest_is_FULL_never_shortened():
+    """Two paths colliding on a prefix would transfer one worktree's
+    acknowledgement to another worktree's work — the rule `dirty_state_key`
+    states, for the same reason."""
+    import hashlib
+
+    ident = worktree_identity({"path": "/w/one", "branch": "b", "branch_duplicated": True})
+    assert ident == "b:" + hashlib.sha256(b"/w/one").hexdigest()
+    assert len(ident.split(":", 1)[1]) == 64
+
+
+def test_a_branch_checked_out_ONCE_keeps_its_BARE_identity():
+    """The discriminator is CONDITIONAL and this is why: the identity is the
+    ACK KEY, so applying a path suffix unconditionally would change every
+    existing worktree identity at once and silently expire every
+    acknowledgement ever written. MEASURED 2026-09-12: 0 of 162 worktrees on
+    this install share a branch, so the conditional form is a no-op here."""
+    rows = classify_worktrees([_wt(path="/w/only")], now=NOW, min_age_hours=6)
+    assert [f["branch"] for f in rows["findings"]] == ["feat/x"]
+
+
+def test_the_HELD_key_of_a_duplicated_worktree_matches_its_finding_key():
+    """The invariant that makes the stamp live on the LISTING rather than being
+    derived per consumer: a hold computed one way and a finding the other holds
+    a key nothing matches, silently restoring resolve-on-absence."""
+    young = _wt(path="/w/y", mtime=NOW - timedelta(minutes=1)) | {"branch_duplicated": True}
+    old = _wt(path="/w/o") | {"branch_duplicated": True}
+
+    out = classify_worktrees([young, old], now=NOW, min_age_hours=6)
+
+    assert out["held"] == {worktree_identity(young)}
+    assert [f["branch"] for f in out["findings"]] == [worktree_identity(old)]
+    assert out["held"].isdisjoint({f["branch"] for f in out["findings"]})

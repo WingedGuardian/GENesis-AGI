@@ -25,6 +25,13 @@ exists to prevent, so verdicts are now ordered by EVIDENCE STRENGTH:
 
 1. **SHA proof.** ``headRefOid == tip`` means the PR contained exactly this
    commit. MEASURED: 119 of 123 merged-covered branches match exactly.
+   PR history is therefore indexed BOTH ways — by head-ref name and by head
+   SHA — because a name-only lookup gates tier 1 behind tier 5: a branch
+   renamed (or checked out locally under another name) matches no historical
+   ``headRefName``, so the exact-SHA evidence never reached the classifier at
+   all. MEASURED 2026-09-12 over 251 refs / 1775 PRs: 4 of 26 ``flagged_no_pr``
+   rows (15%) were that blind spot, each one a local branch sitting at the
+   exact head of a real PR — one open, two merged, one closed.
 2. **Ancestry.** The tip is reachable from the PR's head, so everything local
    was in the PR. Costs one local ``merge-base`` and needs no clocks.
 3. **Push state.** ``ls-remote`` gives the remote's tip SHA. If the local tip
@@ -52,7 +59,9 @@ the judgement instead of a rule nobody can see.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 # The alert's row grammar, defused. Git ref names may legally contain `|` and
@@ -112,6 +121,43 @@ CLASS_DIRTY = "dirty_worktree"
 # never collide with a real branch identity.
 DETACHED_KEY_PREFIX = "@detached:"
 
+# ...and the same ':' separates a branch from a DIGEST OF its path when ONE
+# branch is checked out in several worktrees at once (`git worktree add
+# --force`). A bare branch identity can therefore never be mistaken for a
+# discriminated one, and a discriminated one can never be mistaken for a
+# detached key: that would need a branch literally named "@detached" sharing a
+# path with a detached worktree, and a single path is either detached or on a
+# branch, never both.
+DUPLICATE_KEY_SEP = ":"
+
+
+def _path_digest(path: str) -> str:
+    """A worktree path rendered as something that is always safe to be a key.
+
+    The path itself is NOT used, and the reason is a false suppression this
+    very discriminator introduced before it was caught. A worktree path may
+    legally contain a newline — this subsystem's own worktree parser was
+    redesigned around exactly that — and `classify_worktrees` QUARANTINES an
+    identity carrying a control or invisible character. A quarantined worktree
+    is counted, but it lands in neither ``present`` nor ``held``, and
+    ``apply_sweep`` resolves anything absent from both. So splicing a raw path
+    into the identity of a branch-keyed worktree could RESOLVE a live finding
+    about uncommitted work — a false suppression, in the one subsystem that
+    cannot afford one.
+
+    A hex digest is safe by construction, which makes the invariant exact and
+    testable: discriminating an identity never changes whether it is safe, so
+    the duplicate case can never be quarantined when the ordinary case would
+    not have been. The readable value is not lost — the finding row carries
+    ``worktree_path``, and every surface renders THAT through ``neutralise``.
+
+    The digest is FULL, never shortened. A key is the one thing that must not
+    be truncated: two paths colliding on a prefix would silently transfer one
+    worktree's acknowledgement to another worktree's work, which is the same
+    rule ``dirty_state_key`` states for the same reason.
+    """
+    return hashlib.sha256(path.encode()).hexdigest()
+
 
 def _parse_iso(value: str | None) -> datetime | None:
     """Parse a timestamp to an AWARE datetime, or None.
@@ -144,35 +190,109 @@ PUSH_ABSENT = "absent"  # no remote branch of this name (never pushed, or delete
 PUSH_UNKNOWN = "unknown"  # differs, but ancestry was unanswerable
 
 
-def index_prs_by_head(prs: list[dict], *, owner: str | None = None) -> tuple[dict, int]:
-    """Group PR records by ``headRefName``. Returns ``(index, ignored_forks)``.
+@dataclass(frozen=True)
+class PrIndex:
+    """PR history addressed BOTH ways — by head-ref name and by head SHA.
 
-    Rows without a head-ref name are dropped. When *owner* is given, PRs whose
-    head branch lives in a DIFFERENT account are excluded from the join and
-    counted: a contributor's fork branch named ``patch-1`` says nothing about a
-    local ``patch-1``, and head-ref name reuse is already MEASURED at 35 of
-    1586 names here. Excluding them is cheap insurance — MEASURED 2026-09-06,
-    9 of 1665 PRs come from forks and none currently collides with a local
-    branch name, so this closes a real hole at zero present cost.
+    Two maps rather than one because they are different tiers of evidence and
+    the module's whole design is that the stronger one must not sit behind the
+    weaker. ``by_name`` is the indexing convenience (tier 5); ``by_head_sha``
+    is SHA proof (tier 1), and a branch RENAMED after its PR merged matches
+    only through it — the historical ``headRefName`` is gone, but
+    ``headRefOid`` is immutable and still equals the local tip.
+
+    ``for_branch`` is the only supported lookup, and that is deliberate. A
+    caller reaching into ``by_name`` directly is the mechanism this class
+    exists to retire: the SHA index would then be something every call site
+    had to REMEMBER to consult, which is a convention, and a convention is
+    what a reviewer finds one missing instance of at a time.
+    """
+
+    by_name: dict[str, list[dict]]
+    by_head_sha: dict[str, list[dict]]
+
+    def for_branch(self, branch: str | None, tip_sha: str | None = None) -> list[dict]:
+        """Every PR row that could speak to this branch, name rows first.
+
+        Name rows keep their listing order and lead, so a branch that was never
+        renamed sees exactly the sequence it saw before the SHA index existed —
+        the union can only ADD evidence, never reorder what was already there.
+
+        Deduplicated by object identity rather than by ``number``: both maps are
+        built in a single pass over one list and therefore hold the SAME dict
+        objects, and every one of them is kept alive by the maps themselves for
+        this index's whole lifetime, so ``id()`` cannot be recycled underneath
+        us. ``number`` would have been the obvious key and is the wrong one — it
+        is untrusted input and may be missing, in which case every unnumbered
+        row would collapse onto a single ``None``.
+        """
+        rows = list(self.by_name.get(branch, [])) if branch else []
+        if not tip_sha:
+            return rows
+        seen = {id(row) for row in rows}
+        rows.extend(row for row in self.by_head_sha.get(tip_sha, []) if id(row) not in seen)
+        return rows
+
+
+def index_prs_by_head(prs: list[dict], *, owner: str | None = None) -> tuple[PrIndex, int]:
+    """Index PR records by head-ref NAME and by head SHA. ``(index, ignored)``.
+
+    Rows without a head-ref name are dropped FROM THE NAME MAP but kept in the
+    SHA map — defence in depth rather than an observed case: the only
+    production producer (``repo_pulse_gh.list_all_prs``) already drops every row
+    lacking a non-empty string ``headRefName`` before the classifier sees it, so
+    no live sweep can currently reach that branch.
+
+    When *owner* is given, PRs whose head branch lives in a DIFFERENT account
+    are excluded from the join entirely and counted: a contributor's fork branch
+    named ``patch-1`` says nothing about a local ``patch-1``, and head-ref name
+    reuse is already
+    MEASURED at 35 of 1586 names here. Excluding them is cheap insurance —
+    MEASURED 2026-09-06, 9 of 1665 PRs come from forks and none currently
+    collides with a local branch name, so this closes a real hole at zero
+    present cost.
+
+    The fork filter governs BOTH maps, which is a choice worth stating because
+    the SHA map could defensibly keep forks: a fork PR whose ``headRefOid`` IS
+    our tip holds that exact commit, so it is genuine evidence rather than a
+    name coincidence. It is excluded anyway because including it would open a
+    new SUPPRESSION path on third-party data for a case nothing has yet
+    observed, and the wrong direction here is the silent one. Revisit with a
+    measurement, not with an argument.
+
+    "Governs both maps" describes the filter's REACH, not its strength: the
+    filter itself fails OPEN on an owner it cannot read. ``headRepositoryOwner``
+    is absent for a PR whose fork has been DELETED, which
+    ``repo_pulse_gh.list_all_prs`` records as ``None``, and a non-string owner
+    is kept rather than excluded — uniformly in both maps, and uncounted.
+    Pre-existing, unmeasured, and named here so the sentence above is not read
+    as a guarantee it does not make.
 
     ``owner=None`` keeps every PR, for a caller that could not resolve the
     repository owner. That is the safe direction: an over-broad join can only
     SUPPRESS, and a suppression here is visible in the stage counts, whereas
     dropping every PR would flag the entire branch list at once.
     """
-    index: dict[str, list[dict]] = {}
+    by_name: dict[str, list[dict]] = {}
+    by_head_sha: dict[str, list[dict]] = {}
     ignored = 0
     for pr in prs:
         head = pr.get("headRefName")
-        if not (isinstance(head, str) and head):
+        oid = pr.get("headRefOid")
+        named = isinstance(head, str) and bool(head)
+        shaed = isinstance(oid, str) and bool(oid)
+        if not (named or shaed):
             continue
         if owner is not None:
             pr_owner = pr.get("headRepositoryOwnerLogin")
             if isinstance(pr_owner, str) and pr_owner.lower() != owner.lower():
                 ignored += 1
                 continue
-        index.setdefault(head, []).append(pr)
-    return index, ignored
+        if named:
+            by_name.setdefault(head, []).append(pr)
+        if shaed:
+            by_head_sha.setdefault(oid, []).append(pr)
+    return PrIndex(by_name=by_name, by_head_sha=by_head_sha), ignored
 
 
 def pr_coverage(
@@ -261,7 +381,17 @@ def pr_coverage(
             # carry SHA proof, which outranks an open PR.
             # MEASURED 2026-09-06: 0 of 221 refs are ABSENT with an open PR, so
             # this tightening changes no current row.
-            if not proven_pushed:
+            #
+            # An exact head SHA settles the same question DIRECTLY and outranks
+            # push state, which is tier 3 evidence read off a ref of this NAME.
+            # `headRefOid` is the commit GitHub holds as this PR's head, so an
+            # exact match proves the tip is on the server whatever a same-named
+            # remote ref does or does not say — and under a RENAME there is no
+            # such ref to consult, which is exactly when this row arrived by SHA
+            # rather than by name. Not gated on HOW the row was found: the
+            # evidence is identical either way, and gating on provenance would
+            # be the name-as-identity mistake one level up.
+            if not (proven_pushed or (head and head == tip_sha)):
                 open_not_covering = {"pr": pr.get("number"), "url": pr.get("url")}
                 continue
             return "open", {"pr": pr.get("number"), "url": pr.get("url")}
@@ -382,17 +512,30 @@ def _closed_verdict(
     suppressed, and one that flags takes a single acknowledgement that never
     expires, because a dead branch never moves.
     """
+    # Positive containment is scanned for across EVERY row before any negative
+    # verdict is chosen. Head-ref names are reused — MEASURED 35 of 1586 names
+    # here, one carrying 7 PRs — so a branch can carry several unrelated closed
+    # PRs, and the listing order is not evidence about anything. Returning on
+    # the first disproven row let one stale PR override SHA proof sitting in
+    # another, which files a stranded finding for work a closed PR provably did
+    # contain (Codex P2, PR #1794). The first disproven row is still what gets
+    # REPORTED; it just no longer gets to decide.
     unanswerable = False
+    disproven: dict | None = None
     for pr in closed_rows:
         verdict = contains(pr.get("headRefOid"))
         if verdict is True:
             return "closed", {"pr": pr.get("number"), "proof": "head_oid_or_ancestor"}
         if verdict is False:
-            return "closed_local_only", {
-                "pr": pr.get("number"),
-                "proof": "not_an_ancestor_of_the_closed_head",
-            }
+            if disproven is None:
+                disproven = {
+                    "pr": pr.get("number"),
+                    "proof": "not_an_ancestor_of_the_closed_head",
+                }
+            continue
         unanswerable = True
+    if disproven is not None:
+        return "closed_local_only", disproven
 
     # Same verdict, DIFFERENT evidence, and the difference is the point: one of
     # these is proven and the other is merely unrefuted. `local_only` implies
@@ -533,7 +676,7 @@ def classify_branches(
             continue
 
         verdict, evidence = pr_coverage(
-            index.get(branch, []),
+            index.for_branch(branch, row.get("tip_sha")),
             tip_date=tip_date,
             tip_sha=row.get("tip_sha"),
             push_state=push_state,
@@ -612,8 +755,6 @@ def dirty_state_key(entries: list[tuple[str, str]], newest: datetime | None) -> 
     that must never be shortened, since two states colliding on a prefix would
     silently transfer one worktree's acknowledgement to another's work.
     """
-    import hashlib
-
     payload = "\n".join(sorted(f"{xy}\t{path}" for xy, path in entries))
     payload += f"\n@{newest.isoformat() if newest else 'undated'}"
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -646,18 +787,52 @@ def _safe_identity(value: str | None) -> bool:
 def worktree_identity(observation: dict) -> str:
     """The stable identity of a worktree finding.
 
-    The branch name when there is one — a worktree is one-to-one with its
-    branch, and the path can change while the work does not. A DETACHED
+    The branch name when there is one — a worktree is USUALLY one-to-one with
+    its branch, and the path can change while the work does not. A DETACHED
     worktree has no branch, so it keys on its path behind a prefix containing
     ':', which git forbids in a ref name, so the two spaces cannot collide.
 
-    Shared rather than inlined because the HOLD set and the finding row must
-    agree on it exactly: an identity computed one way in one place and another
-    way in the other would hold a key nothing matches, silently restoring the
-    resolve-on-absence behaviour the hold exists to prevent.
+    "Usually" is where this went wrong. ``git worktree add --force`` checks out
+    a branch that is ALREADY checked out elsewhere, so two worktrees can carry
+    the same branch and different uncommitted work — and they then collapse
+    onto one ``(class, branch)`` key, where ``apply_sweep`` keeps the first
+    sighting and the second can never be acknowledged or tracked separately
+    (Codex P2, PR #1794). Such a worktree therefore takes a discriminator,
+    behind the same ':' that makes the detached key collision-proof — a DIGEST
+    of the path rather than the path, for the reason ``_path_digest`` states.
+
+    The discriminator is CONDITIONAL, and that is load-bearing rather than
+    tidy: the identity IS the ack key, so applying it unconditionally would
+    change every existing worktree identity at once and silently expire every
+    acknowledgement ever written. MEASURED 2026-09-12: 0 of 165 worktrees on
+    this install share a branch, so the conditional form is a no-op here by
+    construction and only starts acting when the ambiguity it answers actually
+    exists.
+
+    Being conditional has its own cost, which is smaller than the unconditional
+    one but is not zero and is stated rather than left to be discovered: at the
+    TRANSITION — a branch becoming duplicated, or stopping — the identity
+    changes shape, so the old row is absent from ``present``, ``apply_sweep``
+    resolves it and its acknowledgement goes with it. The work stays visible (a
+    new row opens immediately), so the direction is safe, but that run publishes
+    a ``resolved`` for a condition that did not end.
+
+    ``branch_duplicated`` is stamped by ``list_worktrees`` over the FULL
+    listing, not derived here from whatever subset a caller holds. That matters
+    because the callers hold different subsets — the worker's HOLD path sees
+    every registration including prunable ones, while ``classify_worktrees``
+    sees only the ones it could read — and two populations would disagree about
+    which branches are duplicated, producing a hold key that matches no finding.
+    An identity computed one way in one place and another way in the other holds
+    a key nothing matches, silently restoring the resolve-on-absence behaviour
+    the hold exists to prevent.
     """
     branch = observation.get("branch")
-    return branch or f"{DETACHED_KEY_PREFIX}{observation['path']}"
+    if not branch:
+        return f"{DETACHED_KEY_PREFIX}{observation['path']}"
+    if observation.get("branch_duplicated"):
+        return f"{branch}{DUPLICATE_KEY_SEP}{_path_digest(observation['path'])}"
+    return branch
 
 
 def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours: int = 6) -> dict:

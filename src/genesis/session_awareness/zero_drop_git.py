@@ -442,6 +442,29 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
         return {"error": f"worktree list: {unparsed} unrecognised record line(s)"}
     if err := _refuse_empty("worktree list", worktrees):
         return err
+    # Stamped HERE, over the whole listing, because it is a fact about the
+    # listing rather than a judgement about any one worktree — and because the
+    # two consumers see different subsets of it. `git worktree add --force`
+    # checks out a branch already checked out elsewhere, and the classifier
+    # keys a finding on the branch, so two such worktrees would collapse onto
+    # one identity and one of them could never be acknowledged. Computing the
+    # duplicate set at each consumer instead would let the worker's HOLD path
+    # (which sees prunable and unreadable worktrees) and the classifier (which
+    # does not) disagree about which branches are duplicated — a hold key that
+    # matches no finding, which fails silently in the resolve direction.
+    #
+    # The cost of one population, stated rather than left to be found: a
+    # PRUNABLE registration still counts, so a live worktree can be
+    # discriminated because of a sibling whose directory no longer exists, and
+    # un-discriminated again once that registration is pruned. Both transitions
+    # are visible ones — the row re-opens immediately — and the alternative,
+    # two populations that must agree, fails silently instead.
+    seen: dict[str, int] = {}
+    for wt in worktrees:
+        if wt["branch"]:
+            seen[wt["branch"]] = seen.get(wt["branch"], 0) + 1
+    for wt in worktrees:
+        wt["branch_duplicated"] = bool(wt["branch"]) and seen[wt["branch"]] > 1
     return {"worktrees": worktrees}
 
 

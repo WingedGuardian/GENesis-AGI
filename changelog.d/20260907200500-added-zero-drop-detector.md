@@ -23,6 +23,19 @@
   server, including finished fixes with tests; four of them sat behind a closed
   pull request and one behind an open one that was reviewing something else.
 
+  The same mistake runs the other way too, and had to be closed from both ends.
+  Looking a branch up by its NAME alone means a branch you renamed — or one you
+  created locally to review somebody's pull request under a name of your own —
+  matches nothing in the history, so the exact commit that would have proved it
+  was already handled never gets consulted, and it is reported as stranded.
+  Names change; the commit a pull request points at does not. Branches are now
+  matched by both, which on this project's own history removed four such false
+  reports out of twenty-six — every one of them a branch sitting on the exact
+  commit of a real pull request. The same reasoning settles a smaller one: if
+  you have the same branch open in two working copies at once, they are now two
+  separate rows rather than one, so acknowledging the uncommitted work in one
+  of them no longer silently speaks for the other.
+
   Coverage that cannot be established is now reported rather than assumed. If
   the merged commit is one this machine has never fetched, the branch is
   flagged as unconfirmed and carries the single command that settles it, on the

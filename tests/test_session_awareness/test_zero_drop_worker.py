@@ -898,6 +898,93 @@ async def test_the_observer_reports_the_REGISTERED_total_not_the_observed_one(mo
     assert out["total"] == 3, "the denominator counts every REGISTERED worktree"
 
 
+async def test_a_branch_whose_TIP_is_on_the_server_under_another_NAME_is_not_unpushed():
+    """The third instance of "a NAME used as IDENTITY", one module over.
+
+    `heads` is `{name: sha}` and the lookup was `heads.get(branch)`, so a branch
+    renamed locally — or created to review somebody's PR under a name of your
+    own — read as ABSENT. `classify_branches` then assigns `unpushed_branch`,
+    whose documented meaning is "these commits exist only here". That is false
+    when the same commit is a remote head under a different name, and the class
+    is part of the finding's identity, so the row forks if the name realigns.
+
+    MEASURED 2026-09-12 on this install: 2 of 251 local branches, both verified
+    by name against the remote (`feat/...` checked out under a review alias, and
+    a `pr<N>` checkout of somebody's branch).
+    """
+    from genesis.session_awareness.zero_drop import PUSH_ABSENT, PUSH_EXACT
+
+    heads = {"feat/real-name": "a" * 40, "main": "b" * 40}
+    rows = [
+        {"branch": "feat/renamed", "tip_sha": "a" * 40},  # on the server, other name
+        {"branch": "feat/genuinely-local", "tip_sha": "c" * 40},  # nowhere but here
+        {"branch": "main", "tip_sha": "b" * 40},  # the ordinary exact match
+    ]
+
+    out = await w._resolve_push_states("/repo", rows, heads, budget=40)
+
+    assert out["push_states"]["feat/renamed"] == PUSH_EXACT
+    # The control, and the one that matters: a SHA the remote does not hold is
+    # still ABSENT, so this cannot quietly mark real stranded work as pushed.
+    assert out["push_states"]["feat/genuinely-local"] == PUSH_ABSENT
+    assert out["push_states"]["main"] == PUSH_EXACT
+    assert out["local_only"] == {}
+
+
+async def test_the_worker_HOLD_key_of_a_duplicated_branch_matches_the_classifier(monkeypatch):
+    """The cross-consumer invariant the design actually rests on.
+
+    The worker's HOLD path keys on the raw listing — which includes worktrees
+    the classifier never sees (prunable, over-budget, unreadable) — while the
+    classifier keys on the observations it could read. Two POPULATIONS would
+    disagree about which branches are duplicated, so the hold would name a key
+    no finding carries and `apply_sweep` would resolve a row nobody could see.
+    That is why `branch_duplicated` is stamped once, by `list_worktrees`, over
+    the whole listing; this asserts the two consumers agree END TO END rather
+    than asserting the classifier agrees with itself.
+    """
+    from datetime import UTC, datetime
+
+    from genesis.session_awareness.zero_drop import classify_worktrees, worktree_identity
+
+    rows = [
+        # Same branch, three worktrees: one readable, one unreadable, one
+        # prunable — so all three subsets differ and a per-consumer computation
+        # would produce three different answers.
+        {"path": "/w/a", "branch": "feat/dup", "detached": False, "prunable": None,
+         "branch_duplicated": True},
+        {"path": "/w/b", "branch": "feat/dup", "detached": False, "prunable": None,
+         "branch_duplicated": True},
+        {"path": "/w/c", "branch": "feat/dup", "detached": False, "prunable": "gitdir gone",
+         "branch_duplicated": True},
+    ]
+
+    async def _listing(root, runner=None):
+        return {"worktrees": [dict(r) for r in rows]}
+
+    async def _status(path, runner=None):
+        if path == "/w/b":
+            return {"error": "status failed"}
+        return {"entries": [("M ", "f.py")], "unparsed": 0}
+
+    monkeypatch.setattr(w, "list_worktrees", _listing)
+    monkeypatch.setattr(w, "worktree_status", _status)
+
+    out = await w._observe_worktrees("/repo", budget_s=60)
+    classified = classify_worktrees(
+        out["observations"], now=datetime.now(UTC), min_age_hours=0
+    )
+
+    held = out["held"]
+    found = {f["branch"] for f in classified["findings"]}
+    assert held == {worktree_identity(rows[1])}, "the unreadable worktree is held by its own key"
+    assert found == {worktree_identity(rows[0])}
+    # The load-bearing assertion: the held key is one the classifier COULD have
+    # produced, so it names a real row rather than a key nothing matches.
+    assert held.isdisjoint(found)
+    assert all(k.startswith("feat/dup:") for k in held | found)
+
+
 # ── read_last_run: the record's FIELD shapes, not just its container ────────
 #
 # read_last_run already treated the file as untrusted — it caught unreadable

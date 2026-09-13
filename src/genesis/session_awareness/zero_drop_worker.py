@@ -59,6 +59,7 @@ from genesis.session_awareness.zero_drop import (
     PUSH_DIVERGED,
     PUSH_EXACT,
     PUSH_UNKNOWN,
+    PrIndex,
     classify_branches,
     classify_worktrees,
     index_prs_by_head,
@@ -399,12 +400,22 @@ async def _resolve_push_states(
     """
     push_states: dict[str, str] = {}
     local_only: dict[str, int] = {}
+    remote_shas = set(heads.values())
     probes = 0
     for row in branches:
         branch, tip = row.get("branch"), row.get("tip_sha")
         remote_tip = heads.get(branch)
         if remote_tip is None:
-            push_states[branch] = PUSH_ABSENT
+            # The name misses — but a NAME is not an identity here either, and
+            # `heads` carries the SHAs already. A branch renamed locally, or one
+            # created to review somebody's PR under a name of your own, has its
+            # tip on the server under a DIFFERENT ref name; reading that as
+            # ABSENT assigns `unpushed_branch`, whose documented meaning is
+            # "these commits exist only here". That statement is false, and the
+            # class is part of the finding's identity, so the row forks if the
+            # name ever realigns. An exact SHA match settles it with no name and
+            # no probe.
+            push_states[branch] = PUSH_EXACT if tip in remote_shas else PUSH_ABSENT
             continue
         if remote_tip == tip:
             push_states[branch] = PUSH_EXACT
@@ -430,7 +441,7 @@ async def _resolve_push_states(
 
 
 async def _resolve_merge_ancestry(
-    repo_path: str, branches: list[dict], index: dict, budget: int
+    repo_path: str, branches: list[dict], index: PrIndex, budget: int
 ) -> dict:
     """Test each local tip against the head SHA its merged/closed PRs recorded.
 
@@ -450,7 +461,7 @@ async def _resolve_merge_ancestry(
         tip = row.get("tip_sha")
         if not tip:
             continue
-        for pr in index.get(row.get("branch"), []):
+        for pr in index.for_branch(row.get("branch"), tip):
             if (pr.get("state") or "").upper() not in ("MERGED", "CLOSED"):
                 continue
             head = pr.get("headRefOid")

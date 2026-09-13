@@ -195,6 +195,56 @@ async def test_worktree_list_reports_path_and_branch(repo, tmp_path):
     assert by_path[str(wt)]["branch"] == "feat/linked"
 
 
+async def test_one_branch_checked_out_TWICE_is_stamped_on_both_worktrees(repo, tmp_path):
+    """`git worktree add --force` puts one branch in two worktrees at once.
+
+    The classifier keys a dirty-worktree finding on the branch, so without a
+    stamp the two collapse onto one identity and only the first sighting
+    survives (Codex P2, PR #1794). The flag is computed HERE, over the whole
+    listing, because the worker's hold path and the classifier see different
+    SUBSETS of it and would otherwise disagree about which branches are
+    duplicated — a hold key matching no finding, which fails silently.
+
+    The premise is asserted rather than assumed: if a future git refuses the
+    forced duplicate, this test says so instead of quietly passing.
+    """
+    first, second, solo = tmp_path / "d1", tmp_path / "d2", tmp_path / "solo"
+    _git(repo, "worktree", "add", "-q", "-b", "feat/twice", str(first))
+    forced = _git(repo, "worktree", "add", "-q", "--force", str(second), "feat/twice", check=False)
+    assert forced.returncode == 0, (
+        f"git no longer allows a forced duplicate checkout — the discriminator's "
+        f"rationale needs re-deriving: {forced.stderr}"
+    )
+    _git(repo, "worktree", "add", "-q", "-b", "feat/once", str(solo))
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    by_path = {w["path"]: w for w in out["worktrees"]}
+
+    assert by_path[str(first)]["branch_duplicated"] is True
+    assert by_path[str(second)]["branch_duplicated"] is True
+    # The control, and it is the load-bearing half: the identity IS the ack
+    # key, so a branch checked out ONCE must keep its bare name or every
+    # acknowledgement ever written expires at once.
+    assert by_path[str(solo)]["branch_duplicated"] is False
+    assert by_path[str(repo)]["branch_duplicated"] is False
+
+
+async def test_a_detached_worktree_is_never_stamped_as_a_duplicate(repo, tmp_path):
+    """`branch` is None for a detached worktree and several may be detached at
+    once. Counting None as a branch would mark them all duplicated and rewrite
+    every detached identity — which already keys on its path and needs no
+    discriminator."""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    for name in ("det1", "det2"):
+        _git(repo, "worktree", "add", "-q", "--detach", str(tmp_path / name), head)
+
+    out = await list_worktrees(str(repo))
+    detached = [w for w in out["worktrees"] if w["detached"]]
+    assert len(detached) == 2, out
+    assert [w["branch_duplicated"] for w in detached] == [False, False]
+
+
 async def test_detached_worktree_has_no_branch(repo, tmp_path):
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     wt = tmp_path / "detached"

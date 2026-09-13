@@ -1785,12 +1785,27 @@ verified: 788dd9a9 2026-09-06
   2026-09-06 for 119 of 123 merged-covered branches. (2) ancestry — the tip is
   reachable from the merged head (`is_ancestor`, local, three-valued: a missing
   object is UNANSWERABLE, never False). (3) push state from `ls-remote`'s SHA —
+  matched by NAME first and, when that misses, against the set of remote head
+  SHAs, because a branch renamed locally (or a `pr<N>` review checkout) has its
+  tip on the server under another ref name and reading it as ABSENT assigned
+  `unpushed_branch`, i.e. "these commits exist only here", which was false —
+  MEASURED 2026-09-12: 2 of 251 local branches, both verified against the
+  remote by name;
   tip == remote tip means nothing here is local-only, whatever the PRs say;
   tip diverged (and not merely behind, merges excluded) means local-only
   commits are PROVEN and NO PR on that ref can cover them. (4) the `mergedAt` /
   `closedAt` time guards, demoted to confirming a tip already known pushed.
   (5) the name join itself — indexing only, scoped to head refs in THIS repo so
-  a fork PR cannot cover a same-named local branch. Unresolvable coverage is
+  a fork PR cannot cover a same-named local branch. PR history is indexed BOTH
+  ways (`PrIndex.by_name` + `.by_head_sha`, union via `for_branch`, name rows
+  leading): a name-ONLY lookup gated tier 1 behind tier 5, so a branch renamed
+  or checked out locally under another name matched no historical `headRefName`
+  and its exact-SHA evidence never reached the classifier. MEASURED 2026-09-12
+  over 251 refs / 1775 PRs: 4 of 26 `flagged_no_pr` rows (15%) were that blind
+  spot, each a local branch at the exact head of a real PR (1 open, 2 merged, 1
+  closed). An exact head SHA also stands in for push state on an OPEN PR — the
+  commit is demonstrably on the server — which is the only form of coverage a
+  renamed branch can have. Unresolvable coverage is
   FLAGGED with the resolving command (`refs/pull/<n>/head`), never suppressed;
   an unresolvable PUSH state is HELD (neither flagged nor resolved). MEASURED
   2026-09-06 on 217 refs: the older name-join-as-proof suppressed 5 branches
@@ -1801,9 +1816,19 @@ verified: 788dd9a9 2026-09-06
   with a fresh edit is somebody typing). Classes follow the COMMITS, not the
   name: `unpushed_branch` (commits on no remote) | `pushed_no_pr` (safe, but in
   no pipeline) | `dirty_worktree` (a detached worktree keys on
-  `@detached:<path>`, which no ref name can collide with; an identity carrying
-  a control character is quarantined and counted, never stored, because the
-  identity is the ack key and a key must round-trip unsanitised).
+  `@detached:<path>`, which no ref name can collide with; one branch checked
+  out in SEVERAL worktrees at once — `git worktree add --force` — takes a
+  `<branch>:<sha256(path)>` discriminator behind the same forbidden ':' (a
+  DIGEST, not the path: a path may hold a newline, and a raw one would route the
+  identity into the control-character quarantine, which lands in neither
+  `present` nor `held` and so RESOLVES a live finding — the readable path is
+  carried separately as `worktree_path`), stamped as
+  `branch_duplicated` by `list_worktrees` over the WHOLE listing so the worker's
+  hold path and the classifier cannot disagree about a key; CONDITIONAL because
+  the identity is the ack key and an unconditional suffix would expire every ack
+  ever written, MEASURED 2026-09-12: 0 of 165 worktrees duplicated here; an identity
+  carrying a control character is quarantined and counted, never stored, because
+  the identity is the ack key and a key must round-trip unsanitised).
   Store: `zero_drop_findings` (migration 20260905215957, mirrored in
   `_tables.py`; CRUD `db/crud/zero_drop.py`). Identity is `UNIQUE(class,
   branch)` — never the SHA, which would fork the row on every commit and
