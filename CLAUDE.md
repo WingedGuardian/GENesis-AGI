@@ -392,19 +392,13 @@ the POST-MERGE end-to-end verification its change needs, on its own line:
 This does NOT gate the merge — the merge gate prints an advisory NOTE when a
 body declares neither, and proceeds.
 
-**The obligation WILL be carried after the merge, not before it — and that half
-is NOT BUILT YET (issue #1718).** The design: every merged PR gets a post-merge
-verification row; a documentation-only diff has its row auto-closed with the
-reason recorded (a DETERMINISTIC exemption by path, so no LLM ever decides that
-a prompt or docs change "needs an E2E"); the validator session runs the rest, or
-records why nothing was needed. **Until that ships, this line is the only record
-there is** — so writing it is worth the ten seconds even though nothing forces
-you. When the row exists, declaring here will PRE-FILL it with your own lead:
-the author knows in one sentence what a validator would otherwise
-reverse-engineer from the diff days later. Note the row's exemption is by PATH,
-so it cannot recover a judgment the author skipped on a code PR — a bare
-`E2E: none` there just costs a validator round-trip instead of one sentence
-from the person who knew.
+**Write it whether or not anything reads it back.** The obligation belongs after
+the merge, and the line in the body is the author's own lead on it: one sentence
+from the person who knew, instead of a judgment someone reverse-engineers from
+the diff days later. That value does not depend on what consumes it — which is
+why the convention is worth the ten seconds even where nothing forces you, and
+why a bare `E2E: none` on a code PR is the weak form: it costs a round-trip to
+recover exactly the judgment you were closest to.
 
 **PR-body convention:** a PR that completes a ledger item cites
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
@@ -491,7 +485,7 @@ exempted in bulk.
 The hourly `context_injection_monitor` watches the harness's own filings
 independently of every emitter's arithmetic, so this class cannot go quiet
 again — and its record is the evidence that the chokepoint works: of 849 filings
-on this install, 842 were one emitter that stopped filing the day #1556 moved it
+on this install, 842 were one emitter that stopped filing the day it was moved
 behind the writer, and 7 were a guard since removed.
 
 ## Traps
