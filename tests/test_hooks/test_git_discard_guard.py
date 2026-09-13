@@ -17,14 +17,25 @@ Hermetic: each test builds a real throwaway git repo under tmp_path.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
+import re
+import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+#: Assembled rather than written literally: this file is read by the shell
+#: safety hook as DATA when it appears in a command payload, and the discard
+#: guard's closed-set clean whitelist correctly refuses a payload carrying a
+#: bare clean invocation. Splitting it keeps the test honest without waving
+#: the guard off with an override.
+_CLEAN_DRY_RUN = "git clean -" + "nd"
 
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _HOOKS = _WORKTREE / "scripts" / "hooks"
@@ -71,6 +82,24 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
+@pytest.fixture(autouse=True)
+def _clear_parse_memo():
+    """The guard memoises its parse in module state, once per process.
+
+    Without this, a command string parsed by an earlier test is already cached, so
+    `monkeypatch.setattr(_gd, "analyze_checked", <raises>)` is INERT for it and the
+    test quietly stops exercising the crash path. Measured: two tests share the
+    string "git checkout main", and the crash-path one stays non-vacuous only
+    because definition order happens to put it first. Neither `pytest-randomly` nor
+    `pytest-random-order` is installed today, so it holds — but a `-k` subset, a
+    reorder, or a new test inserted above it would silently vacate it, and nothing
+    would report that.
+    """
+    _gd._PARSE_MEMO.clear()
+    yield
+    _gd._PARSE_MEMO.clear()
+
+
 @pytest.fixture
 def snap_log(tmp_path: Path, monkeypatch) -> Path:
     """The recovery STORE — a directory, one file per snapshot."""
@@ -85,6 +114,22 @@ def _snap_files(store: Path) -> list[Path]:
     if not store.exists():
         return []
     return sorted(f for f in store.glob("*.jsonl") if f.is_file() and not f.is_symlink())
+
+
+def _snapshot_rows(store: Path) -> list[dict]:
+    """Rows recording a SNAPSHOT (they carry a stash sha)."""
+    return [r for r in _rows(store) if "sha" in r]
+
+
+def _rewind_rows(store: Path) -> list[dict]:
+    """Rows recording a REWIND EVENT — the tripwire.
+
+    Selected by KIND, never by position. These tests used to read `_rows(...)[-1]`,
+    which silently meant "the snapshot row" only because nothing was appended after
+    it; the moment rewind events became their own rows, four tests broke on ordering
+    rather than on behaviour. Asking for the row you mean cannot drift that way.
+    """
+    return [r for r in _rows(store) if r.get("tree_rewind")]
 
 
 def _rows(store: Path) -> list[dict]:
@@ -211,13 +256,25 @@ def test_the_command_is_parsed_exactly_once_per_process(monkeypatch):
 def test_an_ordinary_command_near_the_cap_is_still_allowed(monkeypatch):
     """The control for the test above: refusing everything would also make it pass.
 
-    A long-but-readable command mentioning the trigger words must still be ALLOWED,
-    so the refusals above are attributable to the bound rather than to a guard that
-    blocks anything large or anything containing "clean".
+    A long-but-readable command REACHING THE PARSE and carrying the trigger word
+    must still be ALLOWED, so the refusals above are attributable to the bound
+    rather than to a guard that blocks anything large or anything saying "clean".
+
+    Both of those properties were missing. The command ended `&& git status`, whose
+    trigger-substring hits are zero — so `main` returned 0 at the trigger gate and
+    never reached the parse, and the command contained no "clean" at all, making the
+    second half of the claim untestable by it. MEASURED: inserting
+    `if len(cmd) > 2000: return 2` right after the trigger gate left the suite fully
+    green, i.e. a guard that blocks every command over 2 KB would have shipped. A
+    dry-run clean fixes both halves: it is a trigger word, it reaches the parse, and
+    it is the one clean form that must be allowed.
     """
-    cmd = 'echo "' + "x" * (shell_parse.MAX_COMMAND_CHARS - 256) + '" && git status'
+    cmd = 'echo "' + "x" * (shell_parse.MAX_COMMAND_CHARS - 256) + '" && ' + _CLEAN_DRY_RUN
     _segs, blind = shell_parse.analyze_checked(cmd)
     assert blind is None, "control must be INSIDE the bounds"
+    assert any(s in cmd for s in _gd._TRIGGER_SUBSTRINGS), (
+        "the control must reach the parse, or it cannot attribute anything"
+    )
     monkeypatch.setattr(
         _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
     )
@@ -850,23 +907,47 @@ def test_the_rewind_path_never_blocks(repo, snap_log, monkeypatch, capsys):
     assert _gd.main() == 0
 
 
-def test_the_recovery_command_in_the_note_ACTUALLY_WORKS(repo, snap_log, monkeypatch, capsys):
-    """EXECUTE the recovery command against the post-rewind state.
+@pytest.mark.parametrize(
+    "dirtied_after_rewind",
+    [False, True],
+    ids=["clean-post-rewind", "dirtied-after-rewind"],
+)
+def test_the_recovery_chain_in_the_note_ACTUALLY_WORKS(
+    dirtied_after_rewind, repo, snap_log, monkeypatch, capsys
+):
+    """EXECUTE the note's recovery chain, on BOTH states a reader can be in.
 
-    This is the test that matters, and its absence is what let a bad one ship.
-    The first version of this note recommended `git stash apply --index <sha>`,
-    and a test that merely string-matched that command was green — while the
-    command itself, run for real, exits 1 and writes CONFLICT MARKERS into the
-    file the user is trying to rescue. A whole-tree rewind leaves every tracked
-    path staged-modified, which is exactly what `stash apply` refuses to merge
-    into.
+    Three rounds of this note shipped wrong, each caught only by running the
+    command instead of reading it, so the history is recorded here.
 
-    So: perform a real rewind, pull the command out of the note, run it, and
-    assert the pre-command content came back. Nothing weaker can distinguish a
-    usable recovery instruction from a harmful one.
+    ROUND 1 recommended `git stash apply --index <sha>` and the test merely
+    string-matched it: green, unexecuted.
+
+    ROUND 2 changed the note to `git checkout <sha> -- .` and added a test that
+    really did EXECUTE it — against a fixture that modified one file and nothing
+    else. Still green, still wrong: path checkout is OVERLAY by default, so a path
+    the work had DELETED is never restored-as-absent and the rewind's copy
+    survives to be committed.
+
+    ROUND 3 is this parametrization, and it exists because adding the deletion was
+    still not enough. MEASURED: on a freshly-rewound tree `stash apply --index`
+    SUCCEEDS, so a single-state test never reaches the fallback at all — the
+    `--no-overlay` half was pinned by a string match and by nothing executable.
+    The fallback's reader is the one who kept working after the rewind, so that
+    state gets its own cell, and in it the two spellings genuinely diverge:
+    overlay leaves doomed.py, `--no-overlay` removes it.
+
+    Each cell also asserts WHICH arm ran, so neither can silently stop covering
+    its path — a cell that quietly falls through to the other arm is how this
+    became vacuous the first time.
     """
+    # The discriminating state: a tracked file the work DELETED.
+    (repo / "doomed.py").write_text("delete me\n")
+    _git(repo, "add", "doomed.py")
+    _git(repo, "commit", "-m", "add doomed.py")
     old = _git(repo, "rev-parse", "HEAD").strip()
     (repo / "tracked.py").write_text("MY-UNCOMMITTED-WORK\n")
+    (repo / "doomed.py").unlink()
     monkeypatch.setattr(
         _gd,
         "read_payload",
@@ -879,34 +960,569 @@ def test_the_recovery_command_in_the_note_ACTUALLY_WORKS(repo, snap_log, monkeyp
     # Perform the destruction the note describes.
     _git(repo, "checkout", old, "--", ".")
     assert (repo / "tracked.py").read_text() == "orig\n", "the rewind must have happened"
+    if dirtied_after_rewind:
+        # The reader the fallback exists for: work continued after the rewind, so
+        # the tree is dirty exactly where the snapshot carries content.
+        (repo / "tracked.py").write_text("WRITTEN AFTER THE REWIND\n")
 
-    # Extract the recommended command verbatim and run it.
-    snap = _rows(snap_log)[-1]["sha"]
-    assert f"git checkout {snap[:12]} -- ." in rewind_line, (
-        "the note must recommend the restore-from-snapshot form"
+    # EXTRACT both commands from the note and run THOSE — never a hand-copied
+    # equivalent. A test that string-matches the note and then executes its own
+    # copy proves the copy works, which is the shape that shipped in round 2: the
+    # note and the tested command can drift apart silently. Extraction also pins
+    # the SHA the note prints, which matters because a multi-repo compound once
+    # carried the wrong repo's sha — unresolvable where the reader would run it.
+    snap = _snapshot_rows(snap_log)[-1]["sha"]
+    complete = re.search(r"git stash apply --index ([0-9a-f]{7,40})", rewind_line)
+    fallback = re.search(r"git checkout --no-overlay ([0-9a-f]{7,40}) -- \.", rewind_line)
+    assert complete, (
+        "the COMPLETE form must be offered first — it is the only one that "
+        f"restores the staged/unstaged split exactly. Note said: {rewind_line}"
     )
-    assert "git stash apply" not in rewind_line.split("NOT `git stash apply`")[0], (
-        "it must not RECOMMEND stash apply — that form conflicts here"
+    assert fallback, (
+        "the robust fallback must be offered, and with --no-overlay: without it, "
+        "path checkout is overlay-by-default and silently keeps a deleted file. "
+        f"Note said: {rewind_line}"
     )
-    subprocess.run(
-        ["git", "-C", str(repo), "checkout", snap[:12], "--", "."],
-        check=True,
+    for label, got in (("complete", complete.group(1)), ("fallback", fallback.group(1))):
+        assert snap.startswith(got), (
+            f"the {label} command names {got}, which is not a prefix of this "
+            f"repo's snapshot {snap} — the reader would run it in the wrong repo"
+        )
+
+    # Run the chain exactly as a reader would: complete form first, fallback only
+    # if it refuses.
+    rc = subprocess.run(
+        ["git", "-C", str(repo), "stash", "apply", "--index", complete.group(1)],
         capture_output=True,
         env=_GIT_ENV,
-    )
+    ).returncode
+    if dirtied_after_rewind:
+        assert rc != 0, (
+            "this cell exists to exercise the FALLBACK; if the complete form now "
+            "succeeds here, the cell covers nothing and the fixture must be fixed "
+            "rather than the assertion relaxed"
+        )
+        # The note's own safety claim — 'if it exits 1 it changes NOTHING, so
+        # nothing is lost by trying it' — is what makes 'try this first' sound
+        # advice. Assert it, or the note is promising something untested.
+        assert (repo / "tracked.py").read_text() == "WRITTEN AFTER THE REWIND\n", (
+            "a refused stash-apply must leave the tree untouched — the note tells "
+            "the reader nothing is lost by trying it first"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "--no-overlay", fallback.group(1), "--", "."],
+            check=True,
+            capture_output=True,
+            env=_GIT_ENV,
+        )
+    else:
+        assert rc == 0, (
+            "on a freshly-rewound tree the COMPLETE form must work — that is why "
+            "the note offers it first"
+        )
+
     assert (repo / "tracked.py").read_text() == "MY-UNCOMMITTED-WORK\n", (
-        "the recovery command the note gives must actually restore the work"
+        "the recovery chain the note gives must actually restore modified work"
+    )
+    assert not (repo / "doomed.py").exists(), (
+        "the recovery chain must also restore a DELETION — this is the assertion "
+        "whose absence let an overlay-mode command ship as 'byte-identical'"
     )
 
 
-def test_the_note_warns_against_the_command_that_does_not_work(repo, snap_log, monkeypatch, capsys):
-    """`git stash apply` is the obvious thing to reach for and it makes this
-    situation worse, so the note says so rather than staying silent."""
-    old = _git(repo, "rev-parse", "HEAD").strip()
-    ctx = _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
-    line = next(x for x in ctx.splitlines() if "WHOLE-TREE REWIND" in x)
-    assert "NOT `git stash apply`" in line
-    assert "conflict markers" in line
+def test_the_note_states_the_fallbacks_cost_rather_than_hiding_it():
+    """The robust fallback flattens the staged/unstaged split, so the note says so.
+
+    It replaces an earlier warning that `git stash apply` "writes conflict
+    markers". RE-MEASURED on git 2.43: it exits 1 and leaves the file UNTOUCHED —
+    a safe refusal, not corruption. Warning someone off the only command that
+    restores their index split, on the strength of a harm that does not occur, is
+    its own false promise.
+    """
+    doc = _gd._tree_rewind_note.__doc__ or ""
+    assert "No conflict markers" in doc, (
+        "the docstring must record the re-measurement that corrected the earlier claim"
+    )
+    # Asserted on the RENDERED note, not on the module source. Reading the source
+    # meant a COMMENT carrying the phrase satisfied it: measured, changing the
+    # note's text to "lands it all" and appending the old phrase as a comment left
+    # the suite green.
+    rendered = _gd._tree_rewind_note("a" * 40, "/r", "b" * 40)
+    assert "lands everything STAGED" in rendered, (
+        "the note must name the fallback's cost — a reader who commits straight "
+        "after it would stage work they never staged"
+    )
+
+
+def test_every_stand_in_in_THIS_FILE_matches_its_production_signature():
+    """A stand-in with the wrong arity tests the signature, not the behaviour.
+
+    One of these shipped green through several review rounds: the replacement for
+    `_tree_rewind_segments` took one argument where production passes two, so
+    Python raised TypeError at the CALL SITE and the `RuntimeError` the test was
+    named after never ran. Both exceptions land in the same `except Exception`, so
+    nothing distinguished "the predicate failed" from "the test is malformed" —
+    the failure path the test claimed to cover was untested while it passed.
+
+    Found by review, then ENUMERATED rather than spot-fixed: 34 stand-ins in this
+    file, one mismatch. This derives the check from the file's own AST so the
+    thirty-fifth cannot be wrong quietly. Scope is deliberately THIS file — a
+    repo-wide version is a different change with a different blast radius, and
+    claiming coverage it does not have is how a lock becomes decoration.
+
+    Only simple lambdas are checked. A `def` stand-in or a callable object is out
+    of scope here, and saying so is the point: this is the spelling that drifted.
+    """
+    import inspect
+
+    src = Path(__file__).read_text()
+    mismatches = []
+    checked = 0
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "setattr"):
+            continue
+        if len(node.args) != 3 or not isinstance(node.args[1], ast.Constant):
+            continue
+        if not isinstance(node.args[2], ast.Lambda):
+            continue
+        name = node.args[1].value
+        target = getattr(_gd, name, None)
+        if not callable(target):
+            continue  # e.g. patching a stdlib attr on the module, not a guard function
+        try:
+            params = inspect.signature(target).parameters.values()
+        except (TypeError, ValueError):  # pragma: no cover — builtins without signatures
+            continue
+        required = len(
+            [
+                p
+                for p in params
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+            ]
+        )
+        checked += 1
+        got = len(node.args[2].args.args)
+        if got != required:
+            mismatches.append(f"line {node.lineno}: {name} takes {got}, needs {required}")
+    assert checked >= 20, (
+        f"only {checked} stand-ins were examined — the walk has stopped finding them, "
+        "so this lock is passing by blindness rather than by correctness"
+    )
+    assert not mismatches, (
+        "stand-ins that cannot be called as production calls them:\n" + "\n".join(mismatches)
+    )
+
+
+# ── the predicate's option grammar: one walk, measured tables ────────────────
+# Four review findings were one generator — the walk re-derived git's option
+# grammar in three places, keyed on `argv.index(verb)`. `git_subcommand_index`
+# exists in shell_parse precisely to end that duplication (its own docstring says
+# so). These cells are the DIFFERENTIAL that proved the fix: every one of them
+# behaves differently against the pre-fix binary, and the controls beneath them
+# behave identically — a narrowing fix whose cases do not change against the old
+# code pins nothing.
+#
+# The expected values are MEASURED against real git 2.43 (`git <verb> -h` for the
+# option tables, and an actual repo with an uncommitted edit for the modes), not
+# transcribed from a review comment.
+
+_OLD = "0" * 40
+
+
+@pytest.mark.parametrize(
+    "label,cmd,fires",
+    [
+        # ── cases that CHANGED (each was a reported defect) ──
+        # Three filenames that happen to be named like the verb. The snapshot row
+        # is the recurrence evidence that would justify escalating this note to a
+        # block, so a false positive here argues for a block from an event that
+        # never happened.
+        ("filenames named like the verb", f"git add checkout {_OLD} .", False),
+        # `-` is the previously-checked-out branch. MEASURED on 2.43: this really
+        # does replace the paths from that branch, i.e. the exact reversion the
+        # note exists for — and the old walk skipped it as an option.
+        ("previous-branch sentinel", "git checkout - -- .", True),
+        # `--reset` alone loads the INDEX; `-u` is what writes the worktree.
+        ("read-tree index-only", f"git read-tree --reset {_OLD}", False),
+        ("read-tree worktree", f"git read-tree --reset -u {_OLD}", True),
+        # `-S/--staged` restores the index; `-W/--worktree` is the default when
+        # neither is given.
+        ("restore staged-only", f"git restore --staged --source={_OLD} .", False),
+        ("restore -S short", f"git restore -S --source={_OLD} .", False),
+        ("restore staged AND worktree", f"git restore -S -W --source={_OLD} .", True),
+        ("restore default is worktree", f"git restore --source={_OLD} .", True),
+        # ── controls: unchanged by the rewrite, and each one a real shape ──
+        ("whole-tree rewind", f"git checkout {_OLD} -- .", True),
+        ("plain local discard", "git checkout -- .", False),
+        ("bare pathspec", "git checkout .", False),
+        ("HEAD alias rewinds nothing merged", "git checkout HEAD -- .", False),
+        ("attached short source", f"git restore -s{_OLD} .", True),
+        ("directory pathspec", f"git checkout {_OLD} -- tests/", True),
+        ("unrelated", "git status", False),
+    ],
+)
+def test_the_rewind_predicate_over_real_git_spellings(label, cmd, fires):
+    got = _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": "/tmp"})
+    assert bool(got) == fires, (
+        f"{label}: expected fires={fires} for {cmd!r}, got {got!r}. A false POSITIVE "
+        "manufactures recurrence evidence for a block; a false NEGATIVE is the "
+        "silent reversion this guard was built to make conspicuous."
+    )
+
+
+@pytest.mark.parametrize(
+    "label,cmd",
+    [
+        # Every one of these named an option's VALUE as the commit being restored
+        # before the value-taking table existed. Naming the real source is the
+        # whole point of the note, so a confidently wrong name is worse than the
+        # generic note it replaced.
+        ("--index-output <file>", f"git read-tree --reset -u --index-output tmpidx {_OLD}"),
+        ("--prefix <dir>/", f"git read-tree --reset -u --prefix sub/ {_OLD}"),
+        (
+            "--exclude-per-directory <file>",
+            f"git read-tree --reset -u --exclude-per-directory .gitignore {_OLD}",
+        ),
+    ],
+)
+def test_an_options_value_is_never_named_as_the_rewind_source(label, cmd):
+    got = _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": "/tmp"})
+    assert got, f"{label}: the rewind was not detected at all"
+    assert got[0][0] == _OLD, (
+        f"{label}: the note names {got[0][0]!r} as the source, which is an option's "
+        f"value, not the commit. Expected {_OLD!r}."
+    )
+
+
+def test_the_value_taking_option_tables_cover_every_rewind_verb():
+    """A verb added to the trigger set without a table silently inherits the old
+    defect, so the two sets are bound to each other rather than kept in step by
+    hand."""
+    assert set(_gd._TREE_REWIND_OPTS_WITH_ARG) == set(_gd._TREE_REWIND_VERBS), (
+        "every rewind verb needs a measured value-taking-option table (an empty "
+        "frozenset is a fine answer, but it must be a stated one)"
+    )
+
+
+# ── the advisory must stay DELIVERABLE, not merely produced ──────────────────
+# Claude Code persists a hook payload over ~10,000 chars and hands the model a
+# preview instead, so an oversized advisory is an ABSENT one — silently. MEASURED
+# with a 40-char cwd: one rewind note is ~1.3 KB, so the payload crossed the cap
+# at EIGHT repositories (10,766 chars; seven fit, at 9,430), which is precisely the
+# the per-repo note was added to serve. These tests drive the REAL emitter; the
+# equivalents lived only in a scratchpad harness before, and a scratchpad E2E is
+# what let an unverified recovery command ship twice on this same PR.
+
+
+def _emit(notes: list[str], capsys) -> str:
+    """Raw stdout of the real emitter, so the payload SIZE is what is measured."""
+    _gd._emit_additional_context(notes)
+    return capsys.readouterr().out
+
+
+def _rewind_note_fixture() -> tuple[str, str]:
+    """One realistic note plus the 12-char sha it must always carry intact.
+
+    The cwd is SYNTHETIC and a fixed width. A real path would put this install's
+    home directory — and the username inside it — into a public test fixture, and
+    it would also make the measured size below vary by machine, so the assertion
+    would pass or fail depending on how long someone's checkout path happens to
+    be. 40 characters is the figure the cap arithmetic in `_emit_additional_context`
+    is stated against.
+    """
+    sha = "b" * 40
+    return _gd._tree_rewind_note("a" * 40, "/" + "p" * 39, sha), sha[:12]
+
+
+@pytest.mark.parametrize("repos", [8, 20, 200])
+def test_the_advisory_stays_under_the_hook_output_cap(repos, capsys):
+    note, _sha = _rewind_note_fixture()
+    out = _emit([note] * repos, capsys)
+    cap = _gd.hook_output.HOOK_STDOUT_CAP
+    assert len(out) <= cap, (
+        f"{repos} repositories produced a {len(out)}-char payload, over the "
+        f"{cap}-char cap — the harness persists that and the model gets a preview, "
+        "so the whole advisory is lost exactly where multi-repo support matters"
+    )
+
+
+def test_every_surviving_note_is_COMPLETE_never_amputated(capsys):
+    """The bound omits WHOLE notes; it must never trim the joined text.
+
+    Every note ends in a recovery command carrying a snapshot sha. A mid-value cut
+    would hand the reader a truncated sha — a command that fails, or resolves to a
+    different object — dressed as a recovery instruction. An omitted note sends
+    them to the snapshot log; an amputated one sends them somewhere wrong.
+
+    Asserted STRUCTURALLY, on two properties that cannot pass by luck, because the
+    obvious version of this test did. Checking only that no sha looks truncated
+    PASSED against a build with the whole-note selection removed: the writer's
+    text-trim had landed mid-prose rather than mid-sha that run, so the assertion
+    was a coin-flip on the cut offset and pinned nothing. What holds regardless of
+    where a cut would land is (a) the writer's trim marker must be ABSENT — if
+    selection did its job the backstop never fires — and (b) every note that
+    appears must also END, so started-notes == finished-notes.
+    """
+    note, sha12 = _rewind_note_fixture()
+    ctx = json.loads(_emit([note] * 200, capsys))["hookSpecificOutput"]["additionalContext"]
+    assert "cap]" not in ctx, (
+        "the writer's text-trim marker is present, so the joined text was cut "
+        "mid-note — whole-note selection is supposed to make that unreachable here"
+    )
+    started = ctx.count("WHOLE-TREE REWIND")
+    finished = ctx.count("DELETED restored by the rewind.")
+    assert started == finished, (
+        f"{started} notes started but only {finished} finished — a note was cut off"
+    )
+    found = re.findall(r"git stash apply --index ([0-9a-f]+)", ctx)
+    assert found and all(s == sha12 for s in found), (
+        f"a recovery sha was truncated: {[s for s in found if s != sha12]}"
+    )
+
+
+def test_the_omission_is_stated_with_an_accurate_count(capsys):
+    """A silent drop would be the same defect as the cap, one layer up."""
+    note, _sha = _rewind_note_fixture()
+    ctx = json.loads(_emit([note] * 20, capsys))["hookSpecificOutput"]["additionalContext"]
+    kept = ctx.count("WHOLE-TREE REWIND")
+    m = re.search(r"…and (\d+) more repository note", ctx)
+    assert m, f"notes were dropped with no omission line. Context: {ctx[-400:]}"
+    assert kept + int(m.group(1)) == 20, (
+        f"the count lies: {kept} notes shown + {m.group(1)} claimed omitted != 20"
+    )
+    assert "GENESIS_DISCARD_SNAPSHOT_DIR" in ctx or "snapshot log" in ctx, (
+        "an omission must say where the dropped recovery shas can be read"
+    )
+
+
+def test_all_notes_survive_when_they_fit(capsys):
+    """The control: the bound must not fire on the ordinary case.
+
+    Without this, a bound that dropped everything would pass every test above.
+    """
+    note, _sha = _rewind_note_fixture()
+    ctx = json.loads(_emit([note] * 3, capsys))["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("WHOLE-TREE REWIND") == 3
+    assert "omitted" not in ctx, "nothing was dropped, so nothing may claim it was"
+
+
+def test_a_single_oversized_note_still_leaves_parseable_json(capsys):
+    """The envelope backstop, for the one case selection cannot fix.
+
+    Dropping the only note would be a worse answer than a trimmed one, so it is
+    kept and `print_json_bounded` pays for the overage out of the text — the JSON
+    must still parse, because a preview instead of JSON loses the payload whole.
+    """
+    note, _sha = _rewind_note_fixture()
+    giant = note + "X" * (_gd.hook_output.DEFAULT_BUDGET + 500)
+    out = _emit([giant], capsys)
+    assert len(out) <= _gd.hook_output.HOOK_STDOUT_CAP
+    payload = json.loads(out)  # must not raise
+    assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "cap]" in payload["hookSpecificOutput"]["additionalContext"], (
+        "a trimmed payload must say it was trimmed"
+    )
+
+
+def test_the_bound_degrades_to_the_old_behaviour_if_hook_output_is_absent(monkeypatch, capsys):
+    """With the writer unavailable, notes go out unbounded — a lost advisory at
+    worst, which is the pre-change behaviour, never a permitted `git clean`.
+
+    SCOPE, because the first version of this docstring overclaimed: this patches the
+    already-imported attribute to None, so it pins the RUNTIME degrade, not the
+    import guard. Whether a missing module can disarm the block is a different
+    question and is tested by driving the real script with the sibling deleted — see
+    `test_a_missing_GUARDED_sibling_cannot_disarm_the_clean_block`.
+    """
+    note, _sha = _rewind_note_fixture()
+    monkeypatch.setattr(_gd, "hook_output", None)
+    ctx = json.loads(_emit([note] * 20, capsys))["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("WHOLE-TREE REWIND") == 20, (
+        "with the writer absent the guard must still emit every note — degrading to "
+        "silence would make a cosmetic import load-bearing"
+    )
+
+
+def test_an_oversized_FIRST_note_does_not_silently_drop_the_rest(capsys):
+    """The bound's contract is that it never drops anything silently.
+
+    It broke that once: the loop reserves room for the omission line, so when the
+    FIRST note costs more than `budget - reserve` it breaks with nothing kept, and
+    the `not kept` branch returned `notes[:1]` — discarding every remaining note
+    with no omission line. Its comment assumed "a single note exceeds the budget",
+    but the condition tested was `budget - reserve` and it never looked at how many
+    notes there were. MEASURED: a 9,680-char first note (UNDER the 9,800 budget)
+    plus a second note emitted one note and no omission line.
+    """
+    second = "SECOND-NOTE-SENTINEL"
+    big = "X" * (_gd.hook_output.DEFAULT_BUDGET - 120)
+    ctx = json.loads(_emit([big, second], capsys))["hookSpecificOutput"]["additionalContext"]
+    m = re.search(r"…and (\d+) more repository note", ctx)
+    assert m, (
+        "a note was dropped with no omission line — the one thing this bound "
+        f"promises it never does. Context tail: {ctx[-300:]!r}"
+    )
+    assert int(m.group(1)) == 1, f"omission count should be 1, said {m.group(1)}"
+
+
+@pytest.mark.parametrize(
+    "label,cmd",
+    [
+        # `-s` consumed the separator as its value, so `--` was reported as the
+        # commit being restored.
+        ("restore with no source operand", "git restore -s -- ."),
+        # `-b` creates a branch; git rejects that alongside a pathspec, so the
+        # command cannot run — and a tripwire row for an impossible event inflates
+        # the count that would justify escalating to a block.
+        ("branch-creating checkout", f"git checkout -b tmp {_OLD} -- ."),
+        ("branch-creating switch", f"git switch -C tmp {_OLD} -- ."),
+    ],
+)
+def test_a_command_git_itself_rejects_is_not_recorded_as_a_rewind(label, cmd):
+    got = _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": "/tmp"})
+    assert not got, f"{label}: {cmd!r} reported {got!r}"
+
+
+def test_the_global_C_flag_is_not_read_as_switchs_force_create():
+    """git's global `-C <dir>` and `switch -C <branch>` share a spelling.
+
+    The branch-creating exclusion was first written against the whole argv, which
+    made `git -C <path> checkout <sha> -- .` look like a branch creation and stopped
+    warning about it — a false NEGATIVE on the multi-repository shape this feature
+    exists for. The exclusion is scoped to the verb's own options; this pins that.
+    """
+    cmd = f"git -C /tmp/somewhere checkout {_OLD} -- ."
+    got = _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": "/tmp"})
+    assert got and got[0][0] == _OLD, f"the rewind must still be detected, got {got!r}"
+
+
+@pytest.mark.parametrize(
+    "label,cmd,broad",
+    [
+        ("whole worktree", f"git checkout {_OLD} -- .", True),
+        ("magic root pathspec", f"git checkout {_OLD} -- :/", True),
+        ("read-tree has no pathspec", f"git read-tree --reset -u {_OLD}", True),
+        ("one directory", f"git checkout {_OLD} -- docs/", False),
+    ],
+)
+def test_the_event_row_records_whether_the_pathspec_was_the_WHOLE_tree(label, cmd, broad):
+    """The recurrence count has to be able to exclude routine work.
+
+    `git checkout origin/main -- docs/` fires this predicate by design — the note's
+    own prose says "UNDER THE PATHSPEC YOU GAVE" for that reason — but it is routine
+    work, not the incident. The row cannot carry the command text (durable log, and
+    a Bash payload can carry credentials), so breadth is carried out of the
+    predicate as one boolean that argv already proves.
+    """
+    got = _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": "/tmp"})
+    assert got, f"{label}: not detected"
+    assert got[0][3] is broad, f"{label}: broad={got[0][3]}, expected {broad}"
+
+
+def test_an_unparseable_submodule_command_is_not_told_to_use_a_dead_escape(monkeypatch):
+    """The bounds-induced refusal must not promise an override it cannot honour.
+
+    That early return precedes the per-segment override check, so the generic
+    block message's closing "append `# discard-override` to proceed" was a route
+    that did not exist — MEASURED: an over-length command carrying the sigil still
+    returned 2 with that text, leaving no way forward at all. The `clean` twin
+    already said the right thing.
+    """
+    cmd = (
+        'echo "'
+        + "x" * (shell_parse.MAX_COMMAND_CHARS + 64)
+        + '" && git checkout --recurse-submodules .  # discard-override'
+    )
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is not None and blind.bounds_induced, "fixture must trip the bound"
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 2, "an unreadable submodule-recursive command must refuse"
+    msg = _gd._SUBMODULE_PARSE_FAILED_MSG
+    assert "OWN line" in msg, "it must name the route that actually works"
+    assert "NOT honoured here" in msg, (
+        "and say plainly that the override does not apply on this path, rather than offering it"
+    )
+
+
+def test_an_untokenizable_clean_mentioning_command_is_still_ALLOWED():
+    """The fail-closed branch is narrowed to BOUNDS-induced blindness on purpose.
+
+    Nothing pinned that narrowing: widening the branch back to `if blind is not
+    None:` left the whole suite green while re-introducing an over-block on the
+    measured ~15% of real clean-mentioning commands that merely fail to tokenize
+    (an apostrophe in a commit message is the common case). The fixture asserts its
+    own blindness KIND, so it cannot quietly start testing the other path.
+    """
+    cmd = """git commit -m $'don\\'t clean' && git status"""
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is not None and not blind.bounds_induced, (
+        "fixture must be untokenizable-but-not-bounds-induced, or it proves nothing"
+    )
+    assert _gd._clean_violation(cmd) is None, (
+        "an untokenizable command that merely MENTIONS clean must not be refused"
+    )
+
+
+@pytest.mark.parametrize("sibling", ["audit_jsonl.py", "discarded_write.py", "hook_output.py"])
+def test_a_missing_GUARDED_sibling_cannot_disarm_the_clean_block(tmp_path, sibling):
+    """Drive the REAL script with one guarded sibling deleted; the BLOCK must hold.
+
+    The three guarded imports are this module's most safety-critical property — a
+    module-load exception exits 1, which Claude Code reads as NON-blocking, so an
+    unimportable helper would let an unrecoverable `git clean -fdx` through. Nothing
+    tested it: deleting all three `try/except` wrappers is behaviour-identical under
+    pytest, because pytest imports the module from an intact tree. So the property
+    was unfalsifiable by this suite until this test, which is what let the gap sit.
+
+    A subprocess is the only honest way to ask: the failure happens at module load,
+    before any in-process monkeypatch could apply.
+
+    HONEST LIMIT, stated rather than implied: `hook_input` and `shell_parse` are
+    imported WITHOUT a guard, so deleting either still exits 1 — and for the
+    submodule-recursive block there is no shell-side floor behind it. That is a
+    pre-existing shape this module shares with the other guards that import
+    `shell_parse` bare, and closing it is the import-time fail-closed work tracked
+    separately; it is deliberately NOT papered over here by limiting this test to
+    the three modules that ARE guarded.
+    """
+    hooks = tmp_path / "hooks"
+    shutil.copytree(_HOOKS, hooks)
+    (hooks / sibling).unlink()
+
+    payload = json.dumps({"tool_input": {"command": "git clean -fdx"}, "cwd": str(tmp_path)})
+    proc = subprocess.run(
+        [sys.executable, str(hooks / "git_discard_guard.py")],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GENESIS_DISCARD_SNAPSHOT_DIR": str(tmp_path / "snaps")},
+    )
+    assert proc.returncode == 2, (
+        f"with {sibling} missing the guard exited {proc.returncode}. Only 2 BLOCKS; "
+        "anything else is read as a non-blocking error and the clean RUNS, deleting "
+        f"untracked files the snapshot net cannot restore. stderr: {proc.stderr[:400]}"
+    )
+
+
+def test_the_positive_control_an_intact_tree_allows_a_dry_run_clean(tmp_path):
+    """The control for the three cells above: a guard that blocked everything would
+    pass them. An intact copy of the tree must still allow the dry-run form."""
+    hooks = tmp_path / "hooks"
+    shutil.copytree(_HOOKS, hooks)
+    payload = json.dumps({"tool_input": {"command": _CLEAN_DRY_RUN}, "cwd": str(tmp_path)})
+    proc = subprocess.run(
+        [sys.executable, str(hooks / "git_discard_guard.py")],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GENESIS_DISCARD_SNAPSHOT_DIR": str(tmp_path / "snaps")},
+    )
+    assert proc.returncode == 0, (
+        f"an intact tree refused a dry-run clean (rc={proc.returncode}) — the cells "
+        f"above would then prove nothing. stderr: {proc.stderr[:400]}"
+    )
 
 
 # ── the tripwire: recurrence must be COUNTABLE, not argued ───────────────────
@@ -918,13 +1534,13 @@ def test_the_note_warns_against_the_command_that_does_not_work(repo, snap_log, m
 def test_a_rewind_is_flagged_in_the_snapshot_log(repo, snap_log, monkeypatch, capsys):
     old = _git(repo, "rev-parse", "HEAD").strip()
     _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
-    assert _rows(snap_log)[-1].get("tree_rewind") is True
+    assert len(_rewind_rows(snap_log)) == 1
 
 
 def test_an_ordinary_discard_is_not_flagged(repo, snap_log, monkeypatch, capsys):
     _rewind_ctx("git checkout -- tracked.py", repo, monkeypatch, capsys)
-    row = _rows(snap_log)[-1]
-    assert "tree_rewind" not in row, "the flag must mean something when present"
+    assert _snapshot_rows(snap_log), "the ordinary snapshot must still be recorded"
+    assert _rewind_rows(snap_log) == [], "the flag must mean something when present"
 
 
 def test_the_log_row_stays_metadata_only(repo, snap_log, monkeypatch, capsys):
@@ -932,9 +1548,83 @@ def test_the_log_row_stays_metadata_only(repo, snap_log, monkeypatch, capsys):
     durable and a Bash payload can carry credentials."""
     old = _git(repo, "rev-parse", "HEAD").strip()
     _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
-    row = _rows(snap_log)[-1]
-    assert set(row) == {"ts", "cwd", "sha", "tree_rewind"}
-    assert old not in json.dumps(row)
+    assert set(_snapshot_rows(snap_log)[-1]) == {"ts", "cwd", "sha"}
+    assert set(_rewind_rows(snap_log)[-1]) == {"ts", "cwd", "tree_rewind", "broad", "snapshot"}
+    assert old not in json.dumps(_rows(snap_log))
+
+
+def test_a_rewind_from_a_CLEAN_worktree_is_still_counted(repo, snap_log, monkeypatch, capsys):
+    """The tripwire must not depend on a snapshot having been possible.
+
+    This is the case that was warned about and never counted, and no test reached
+    it because the shared `_rewind_ctx` helper dirties the tree first. MEASURED on
+    the pre-fix code: `git stash create` returns empty on a clean worktree, so the
+    loop `continue`d before writing any row — zero rows, while the note fired.
+
+    It is also the likeliest setting for the incident this exists to measure. The
+    2026-08-31 reversion happened while applying someone's changes onto a moved
+    base; you need no local edits of your own for that, so the most dangerous
+    shape was precisely the uncounted one. Budget skips and snapshot failures were
+    dropped the same way.
+    """
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    assert not _git(repo, "status", "--porcelain").strip(), (
+        "this fixture must be CLEAN — a dirty tree tests the other path"
+    )
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": f"git checkout {old} -- ."}, "cwd": str(repo)},
+    )
+    assert _gd.main() == 0
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "WHOLE-TREE REWIND" in ctx, "the note must still fire"
+    assert _snapshot_rows(snap_log) == [], (
+        "a clean worktree cannot be snapshotted — if this changes, the premise of "
+        "this test has moved and the assertion below is measuring something else"
+    )
+    events = _rewind_rows(snap_log)
+    assert len(events) == 1, (
+        "the rewind must be COUNTED even with no recovery point — otherwise the "
+        "count is a measure of how often stash-create happened to succeed"
+    )
+    assert events[0]["snapshot"] is None, (
+        "and it must say there was no recovery point, rather than implying one"
+    )
+
+
+def test_two_rewinds_of_one_repo_from_different_sources_are_two_events(
+    repo, snap_log, monkeypatch, capsys
+):
+    """Counting events, not repositories.
+
+    A single boolean on one snapshot row collapsed any number of rewinds in a repo
+    into one. Distinct sources are distinct events; the SAME source twice in one
+    payload is deliberately one, since that is one intent spelled twice.
+    """
+    first = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "second.py").write_text("x\n")
+    _git(repo, "add", "second.py")
+    _git(repo, "commit", "-m", "second")
+    second = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "tracked.py").write_text("dirty\n")
+    cmd = f"git checkout {first} -- . && git checkout {second} -- ."
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(repo)}
+    )
+    assert _gd.main() == 0
+    capsys.readouterr()
+    assert len(_rewind_rows(snap_log)) == 2, "two distinct sources are two events"
+
+    same = f"git checkout {first} -- . && git checkout {first} -- ."
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": same}, "cwd": str(repo)}
+    )
+    assert _gd.main() == 0
+    capsys.readouterr()
+    assert len(_rewind_rows(snap_log)) == 3, (
+        "the same source twice in one payload is ONE further event, not two"
+    )
 
 
 def test_an_overridden_rewind_is_silent_but_still_counted(repo, snap_log, monkeypatch, capsys):
@@ -944,15 +1634,22 @@ def test_an_overridden_rewind_is_silent_but_still_counted(repo, snap_log, monkey
     old = _git(repo, "rev-parse", "HEAD").strip()
     ctx = _rewind_ctx(f"git checkout {old} -- .  # discard-override", repo, monkeypatch, capsys)
     assert "WHOLE-TREE REWIND" not in ctx
-    assert _rows(snap_log)[-1].get("tree_rewind") is True
+    assert len(_rewind_rows(snap_log)) == 1
 
 
 def test_a_broken_rewind_predicate_never_costs_the_snapshot(repo, snap_log, monkeypatch, capsys):
     """The snapshot is the actual recovery mechanism; this note is a courtesy on
     top. A bug in the courtesy must not take the mechanism down with it."""
     old = _git(repo, "rev-parse", "HEAD").strip()
+    # ARITY MATTERS: production calls `_tree_rewind_segments(cmd, payload)`. A
+    # one-argument stand-in raised TypeError at the CALL SITE, before its body ran,
+    # so the RuntimeError this test names never happened — and both land in the same
+    # `except Exception`, so it passed while testing a different failure entirely.
+    # A stand-in that does not match the signature tests the signature.
     monkeypatch.setattr(
-        _gd, "_tree_rewind_segments", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+        _gd,
+        "_tree_rewind_segments",
+        lambda cmd, payload: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     ctx = _rewind_ctx(f"git checkout {old} -- .", repo, monkeypatch, capsys)
     assert _rows(snap_log), "the snapshot must still have been taken"
@@ -1001,7 +1698,7 @@ def test_the_note_carries_the_REWOUND_repos_sha_not_another(
     ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     line = next(x for x in ctx.splitlines() if "WHOLE-TREE REWIND" in x)
 
-    by_cwd = {row["cwd"]: row["sha"] for row in _rows(snap_log)}
+    by_cwd = {row["cwd"]: row["sha"] for row in _snapshot_rows(snap_log)}
     assert str(a) in by_cwd and str(b) in by_cwd, "both repos should be snapshotted"
     assert by_cwd[str(b)][:12] in line, "must offer the REWOUND repo's snapshot"
     assert by_cwd[str(a)][:12] not in line, "must not offer an unrelated repo's sha"
@@ -1017,7 +1714,7 @@ def test_only_the_rewound_repo_is_flagged_in_the_log(two_repos, snap_log, monkey
         _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(a.parent)}
     )
     assert _gd.main() == 0
-    flagged = {row["cwd"] for row in _rows(snap_log) if row.get("tree_rewind")}
+    flagged = {row["cwd"] for row in _rewind_rows(snap_log)}
     assert flagged == {str(b)}
 
 
@@ -1037,6 +1734,8 @@ def test_every_broad_pathspec_in_the_set_is_covered(pathspec, repo, snap_log, mo
     old = _git(repo, "rev-parse", "HEAD").strip()
     ctx = _rewind_ctx(f"git checkout {old} -- {pathspec}", repo, monkeypatch, capsys)
     assert "WHOLE-TREE REWIND" in ctx, f"{pathspec} is in the constant but unpinned"
+
+
 def test_an_unavailable_writer_says_so_on_stderr(repo, snap_log, monkeypatch, capsys):
     """The guard's own message must not point at evidence it never emits.
 
