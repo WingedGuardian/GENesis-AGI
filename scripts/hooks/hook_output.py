@@ -43,6 +43,20 @@ from typing import Any
 #: The measured harness threshold. Output STRICTLY ABOVE this is persisted.
 HOOK_STDOUT_CAP = 10_000
 
+#: The events whose BARE STDOUT the model reads, per the module docstring above.
+#: Lives here, next to the cap, because this module is the single home of the
+#: contract and the gate that enforces it must DERIVE the set rather than restate
+#: it -- an allowlist whose whole guarantee is "a newly wired model-facing hook
+#: fails by construction" cannot be built on a hand-maintained copy of the list.
+#:
+#: ``PostModelSwitch`` is deliberately ABSENT. The published hooks reference names
+#: it alongside these three; the bundle read that produced this list does not, and
+#: nothing in .claude/settings.json is wired to it. It is excluded on the weaker
+#: evidence rather than included on the stronger, because a wrong entry here makes
+#: the gate demand exemptions for hooks that cannot reach the model. If a hook is
+#: ever wired to it, add it here and the gate picks it up with no other change.
+BARE_STDOUT_EVENTS = ("SessionStart", "UserPromptSubmit", "UserPromptExpansion")
+
 #: What a section divider costs: the emitters write "\n\n---\n\n" (7) and
 #: ``print`` adds its newline. Under-counting here makes ``fits()`` slightly
 #: optimistic, which the chokepoint then has to correct with a cut.
@@ -358,18 +372,32 @@ class BoundedStdout:
             return
         self._cut_here(text, block=block, room=room)
 
-    def emit_final(self, text: str) -> None:
+    def emit_final(self, text: str, fallback: str | None = None) -> None:
         """Write a closing line using the reserved headroom.
 
         Bypasses ``reserve`` (that is what it was reserved for) but never the
         budget, and is emitted even after a cut — the audit line reporting the
         cut is the one thing that must always land.
+
+        ``fallback`` is a SHORTER form of the same line to emit WHOLE when the
+        full text will not fit the remaining room. The writer chooses (the
+        caller supplies candidates, never arithmetic): full if it fits, else a
+        fitting fallback, else a raw clip as the genuine last resort. The clip
+        cuts from the RIGHT, so a line whose tail is load-bearing — the audit
+        line's ``— full text: <mirror>]_`` pointer — loses exactly the part the
+        reader needs; the fallback exists so that outcome requires BOTH the full
+        line AND its own shorter form to overflow, not merely the full line.
         """
         self._intended.append(text)
         room = self._budget - self._emitted
         if room <= 0:
             return
-        self._write(text if emit_cost(text) <= room else clip_to_cost(text, max(0, room - 1)))
+        if emit_cost(text) <= room:
+            self._write(text)
+        elif fallback is not None and emit_cost(fallback) <= room:
+            self._write(fallback)
+        else:
+            self._write(clip_to_cost(text, max(0, room - 1)))
 
     # ── internals ──────────────────────────────────────────────────────
     def _write(self, text: str) -> None:

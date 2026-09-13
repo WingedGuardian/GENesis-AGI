@@ -73,7 +73,20 @@ async def pending_approvals():
     if not rt.is_bootstrapped or rt._db is None:
         return jsonify([])
 
+    from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
+
     pending = await approval_requests.list_pending(rt._db)
+    # Desktop-takeover rows are withheld from this queue on purpose. The cards
+    # it renders are CLI-fallback cards: the template fills Fallback / Reason /
+    # API Route from context keys a desktop row does not have, so the helpers
+    # fall through to their hardcoded defaults and the row is presented as
+    # "claude -p" / "CLI fallback requires manual approval". An owner tapping
+    # Approve on that would believe they cleared a stuck dispatch while
+    # actually handing over their keyboard and mouse. Desktop consent belongs
+    # to the purpose-built surface that names the target window back to them.
+    pending = [
+        r for r in pending if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE
+    ]
     return jsonify(_parse_approval_rows(pending))
 
 

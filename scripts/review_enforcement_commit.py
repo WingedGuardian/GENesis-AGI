@@ -14,7 +14,6 @@ Exit codes:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -26,12 +25,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
 from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
-    analyze,
+    analyze_checked,
     commit_skips_hooks,
     git_subcommand,
     has_trailing_override,
     split_segments,
-    untokenizable,
 )
 
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
@@ -648,76 +646,29 @@ def main() -> None:
     # Parse the command into the segments it actually executes (through
     # wrappers, bash -c, command substitutions). Reused for Rule 0, the
     # add-chain detection, and the override binding.
-    segs = analyze(command)
+    #
+    # `blind` is the same parse telling us whether it could read ALL of the command
+    # — an empty result means "found no commit" only when it is not also "stopped
+    # looking". One call answers both, so the two can never disagree.
+    segs, blind = analyze_checked(command)
 
     # The cheap _COMMIT_PATTERN early-out can match "git commit" mentioned in a
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
-        # ── Blind-spot net: unverifiable → ASK the human ────────────────────
-        # "No commit segment" is a trustworthy verdict only when the command was
-        # PARSEABLE. The parser can mis-segment a command and DROP the real
-        # commit segment, so this very early-out is what lets a commit-to-main
-        # / --no-verify / unreviewed commit through. Reproduced against a
-        # shimmed binary, so the proof was execution rather than a parse
-        # reading. When the word "commit" appears (guaranteed past the
-        # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
-        # empty parse is not evidence of absence.
-        #
-        # The outcome is an approval PROMPT, not a refusal. A hard block here has
-        # to be surgically precise about which un-parseable commands are real
-        # commits — and precision is exactly what an unreliable parse cannot
-        # deliver: every narrowing conjunct became a new way to starve the trigger,
-        # while over-blocking broke benign shapes (`git status # don't commit yet`).
-        # Asking inverts those costs: a false positive is one confirmation, a miss
-        # is the pre-existing status quo.
-        #
-        # The probe reads the command RAW — the normalizer that used to
-        # pre-process it is deleted, so an ordinary contraction inside quoted
-        # multi-line input DOES reach this branch. It still does not prompt, but
-        # for a different reason than this comment used to give: analyze()
-        # resolves the segment, and the net only fires where it found none.
-        try:
-            if untokenizable(command):
-                # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
-                # "1" and every other consumer compares to it exactly
-                # (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
-                # outcome_verification_hook). A truthiness test also treats
-                # GENESIS_CC_SESSION=0 — an operator explicitly turning it OFF — as
-                # dispatched, and would then HARD-BLOCK a benign unparseable
-                # mention such as `echo $'don\\'t commit this'` that the interactive
-                # path is meant to merely ask about. Over-blocking is the failure
-                # direction this whole design was chosen to avoid.
-                if os.environ.get("GENESIS_CC_SESSION") == "1":
-                    # No human present to answer a prompt in a dispatched session.
-                    _deny(
-                        "BLOCKED: this command cannot be parsed safely (e.g. "
-                        "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
-                        "sessions cannot proceed on an unverifiable command.\n"
-                        "To proceed: if you are WRITING TEXT (a commit message, "
-                        "a plan, review notes) whose content merely mentions a "
-                        "commit, use the Write tool instead of a here-doc — an "
-                        "apostrophe in ordinary prose is what makes this "
-                        "unparseable, and re-quoting the here-doc cannot fix "
-                        "that. If you are RUNNING a git command, rewrite it in "
-                        "a directly-parseable form (plain quotes, or "
-                        "`git commit -F <file>`)."
-                        # The way OUT belongs here more than on the ask below:
-                        # an interactive session can ask a human what it did
-                        # wrong, an unattended one cannot. A refusal it cannot
-                        # act on is a wall; with the rewrite named it is a cost.
-                    )
-                _ask(
-                    "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                    "quoting) and mentions a commit, so review enforcement cannot "
-                    "verify what it would actually run. Approve only if you are "
-                    "sure. To avoid the prompt, rewrite it in a directly-parseable "
-                    "form (plain quotes, or `git commit -F <file>`)."
-                )
-        except Exception:  # noqa: BLE001 — never crash into a silent allow
-            _ask(
-                "The commit-guard parseability probe failed, so this command could "
-                "not be verified. Approve only if you are sure."
+        # A missing segment is not proof of absence when the same checked
+        # parse reports blindness. Refuse in every session type: user ruling
+        # 2026-09-08 prices a false positive in an agent rewrite, not a human
+        # approval. Keep main's bounds refusal and its cause-specific remedy.
+        if blind is not None:
+            _deny(
+                f"BLOCKED: this command {blind.cause} and mentions a commit, so "
+                "review enforcement cannot verify what it would actually run.\n"
+                f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                "message, a plan, review notes) whose content merely mentions "
+                "a commit, use the Write tool instead of a here-doc. If you are "
+                "RUNNING a git command, rewrite it in a directly-parseable "
+                "form (plain quotes, or `git commit -F <file>`)."
             )
         sys.exit(0)
 
@@ -1267,29 +1218,6 @@ def _deny(message: str) -> None:
     """Output denial message and block the tool via exit code 2."""
     print(message, file=sys.stderr)
     sys.exit(2)
-
-
-def _ask(reason: str) -> None:
-    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
-
-    For the UNVERIFIABLE path only: a command the parser cannot resolve is not
-    evidence of wrongdoing, so it earns a human decision rather than a refusal.
-    Claude Code runs the tool only on explicit approval, which the agent cannot
-    self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
-    stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
-    """
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
-    sys.exit(0)
 
 
 if __name__ == "__main__":

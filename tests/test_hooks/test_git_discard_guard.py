@@ -32,6 +32,11 @@ _spec = importlib.util.spec_from_file_location("git_discard_guard", _HOOKS / "gi
 _gd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_gd)
 
+# The guard's own parser, so a fixture can PROVE it trips the bound it claims to.
+_sp_spec = importlib.util.spec_from_file_location("shell_parse", _HOOKS / "shell_parse.py")
+shell_parse = importlib.util.module_from_spec(_sp_spec)
+_sp_spec.loader.exec_module(shell_parse)
+
 _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "t",
@@ -68,15 +73,27 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def snap_log(tmp_path: Path, monkeypatch) -> Path:
-    log = tmp_path / "snapshots.jsonl"
-    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", str(log))
-    return log
+    """The recovery STORE — a directory, one file per snapshot."""
+    store = tmp_path / "snapshots"
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(store))
+    return store
 
 
-def _rows(log: Path) -> list[dict]:
-    if not log.exists():
+def _snap_files(store: Path) -> list[Path]:
+    """Record files, oldest first. REGULAR files only, without following links —
+    a reader must skip anything else, exactly as ``trim_dir_by_size`` does."""
+    if not store.exists():
         return []
-    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    return sorted(f for f in store.glob("*.jsonl") if f.is_file() and not f.is_symlink())
+
+
+def _rows(store: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for f in _snap_files(store)
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
 
 
 # ── the guard never blocks the RECOVERABLE verbs ─────────────────────────────
@@ -108,6 +125,105 @@ def test_main_fails_open_on_garbage(monkeypatch):
 #    `"clean" in cmd`, so a crash on a clean-MENTIONING command fails CLOSED
 #    unconditionally and asks the user to simplify. The direct settings.json wiring
 #    has no shell floor behind it, so the guard must self-block here.
+@pytest.mark.parametrize(
+    "label,verb",
+    [
+        ("clean", "git clean -fd"),
+        ("submodule-recursive checkout", "git checkout --recurse-submodules ."),
+    ],
+)
+@pytest.mark.parametrize("axis", ["length", "depth"])
+def test_an_unreadable_command_never_reaches_a_silent_allow(label, verb, axis, monkeypatch):
+    """A guard whose only verdicts are BLOCK and ALLOW must refuse on EITHER bound.
+
+    This is the coverage that did not exist, and its absence is why a real fail-open
+    shipped green. No test drove any guard with an OVER-LENGTH command, so when the
+    length axis was softened to "ask" — for a guard that cannot ask, where not
+    refusing means permitting — MEASURED `echo "<49,200 chars>" && git clean -fd`
+    returned rc=0 from this guard AND rc=0 from bash_safety_hook.sh, with nothing
+    anywhere blocking a real, executing `git clean -fd`. The whole suite stayed green.
+
+    The justification at the time was that bash_safety_hook.sh's raw-text `git clean`
+    grep still covered it. It does not: that fallback runs only when this guard is
+    ABSENT or CRASHES (bash_safety_hook.sh:220 gates it on `_handled == 0`), and
+    exiting 0 sets `_handled=1`. For the submodule verb there is no fallback at all.
+
+    Parametrised over BOTH axes deliberately — a bound softened on one axis is
+    invisible to a test that only exercises the other.
+    """
+    if axis == "length":
+        cmd = 'echo "' + "x" * (shell_parse.MAX_COMMAND_CHARS + 64) + '" && ' + verb
+    else:
+        cmd = 'bash -c "$(' * 9 + verb + ')"' * 9
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is not None and blind.bounds_induced, (
+        f"fixture must actually trip the {axis} bound, or it proves nothing"
+    )
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 2, (
+        f"an over-{axis} `{label}` was not refused. This guard cannot ask, so any "
+        "verdict other than 2 is a silent permit of an unrecoverable operation"
+    )
+
+
+def test_the_command_is_parsed_exactly_once_per_process(monkeypatch):
+    """Parsing once is a SECURITY property here, not a tidiness one.
+
+    `bash_safety_hook.sh` is registered at 5s and delegates to THREE guards over the
+    same command, this one included — and this guard reaches three consumers that each
+    analyse it. That put FIVE full parses on one 5s clock. MEASURED end to end with
+    the worst payload inside both bounds: 6.12s BEFORE memoisation, i.e. the hook is
+    KILLED, and a killed hook does not refuse — it PERMITS. Comfortably inside the
+    budget after; the after-figure is the depth-5 row in `shell_parse.MAX_COMMAND_CHARS`
+    and is not repeated here, because three files restating it from memory is how it
+    came to have three different values.
+
+    So bounding the input was not sufficient on its own; the same work had to stop
+    being done three times. This test exists because a mutation removing the memo
+    SURVIVED the whole suite: every verdict stayed correct and only the clock moved,
+    which is invisible to an assertion about verdicts and fatal in production.
+    Counting the calls pins the property directly rather than timing it, since a
+    wall-clock assertion would be flaky on a shared box.
+    """
+    cmd = "git clean -nd && git checkout -- x.py && git submodule update --recurse-submodules"
+    calls = []
+    real = _gd.analyze_checked
+
+    def counting(c):
+        calls.append(c)
+        return real(c)
+
+    _gd._PARSE_MEMO.clear()
+    monkeypatch.setattr(_gd, "analyze_checked", counting)
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    _gd.main()
+    assert len(calls) == 1, (
+        f"the command was parsed {len(calls)} times in one process. Three of the five "
+        "parses on the shell hook's 5s clock are this guard's; duplicating them "
+        "measured 6.12s against that 5s registration, which permits the command"
+    )
+
+
+def test_an_ordinary_command_near_the_cap_is_still_allowed(monkeypatch):
+    """The control for the test above: refusing everything would also make it pass.
+
+    A long-but-readable command mentioning the trigger words must still be ALLOWED,
+    so the refusals above are attributable to the bound rather than to a guard that
+    blocks anything large or anything containing "clean".
+    """
+    cmd = 'echo "' + "x" * (shell_parse.MAX_COMMAND_CHARS - 256) + '" && git status'
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is None, "control must be INSIDE the bounds"
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 0
+
+
 def test_clean_parse_crash_blocks(monkeypatch):
     monkeypatch.setattr(
         _gd, "read_payload", lambda: {"tool_input": {"command": "git clean -f"}, "cwd": "/tmp"}
@@ -141,8 +257,12 @@ def test_clean_parse_crash_no_clean_substring_fails_open(monkeypatch):
         "read_payload",
         lambda: {"tool_input": {"command": "git checkout main"}, "cwd": "/tmp"},
     )
-    # analyze() would be called by the snapshot path; force it to raise there too.
-    monkeypatch.setattr(_gd, "analyze", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom")))
+    # The snapshot path parses too; force that to raise as well. It asks
+    # `analyze_checked` now (one call for "what runs" AND "could I read it all"), so
+    # that is the name to poison — patching the old one silently patched nothing.
+    monkeypatch.setattr(
+        _gd, "analyze_checked", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
     assert _gd.main() == 0
 
 
@@ -516,35 +636,77 @@ def test_log_row_has_no_command(repo, snap_log):
     row = _rows(snap_log)[0]
     assert set(row) == {"ts", "cwd", "sha"}
     assert "SECRET-TOKEN-XYZ" not in json.dumps(row)
-    assert "SECRET-TOKEN-XYZ" not in snap_log.read_text()
+    assert not any("SECRET-TOKEN-XYZ" in f.read_text() for f in _snap_files(snap_log))
 
 
-def test_log_and_lock_are_own_user_only(repo, snap_log):
+def test_store_and_records_are_own_user_only(repo, snap_log):
+    """The store sits in ~/.genesis beside secrets, so both levels matter.
+
+    There is no sidecar lock any more: one file per snapshot means nothing is
+    shared, so nothing needs serialising and there is no second file to protect.
+    """
     (repo / "tracked.py").write_text("dirty\n")
     _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    assert stat.S_IMODE(snap_log.stat().st_mode) == 0o600
-    lock = Path(str(snap_log) + ".lock")
-    assert lock.exists() and stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert stat.S_IMODE(snap_log.stat().st_mode) == 0o700
+    files = _snap_files(snap_log)
+    assert files, "no record file was written"
+    for f in files:
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600, f
+    assert not list(snap_log.glob("*.lock")), "the sidecar lock should be gone"
 
 
-def test_relative_log_override(repo, tmp_path, monkeypatch):
+def test_a_relative_store_override_is_REFUSED(repo, tmp_path, monkeypatch, capsys):
+    """A relative override would put durable recovery records inside the repo.
+
+    It resolves against the hook's cwd, so `rel_store` lands in whatever tree the
+    guarded command ran in — where it can be committed, and where a worktree removal
+    destroys it. The store's own docstring already claimed it "lives outside any
+    repo"; this is what makes that true.
+
+    An earlier version of this test asserted the OPPOSITE, pinning the permissive
+    behaviour, while the sibling merge-override store refused the same input. The
+    asymmetry was the defect, not the refusal.
+
+    Tests the RESOLVER rather than driving a write, deliberately: the refusal falls
+    back to the live default, so a test that wrote here would put a record in the
+    operator's real recovery store.
+    """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", "rel.jsonl")
-    (repo / "tracked.py").write_text("dirty\n")
-    _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    assert len(_rows(tmp_path / "rel.jsonl")) == 1
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", "rel_store")
+    resolved = _gd._snapshot_dir()
+    assert os.path.isabs(resolved), resolved
+    assert not resolved.endswith("rel_store"), "the relative override was honoured"
+    assert "must be an absolute path" in capsys.readouterr().err
+    assert not (tmp_path / "rel_store").exists()
 
 
-def test_log_trim_keeps_newest_half(repo, tmp_path, monkeypatch):
-    log = tmp_path / "snap.jsonl"
-    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", str(log))
-    monkeypatch.setattr(_gd, "_SNAPSHOT_LOG_MAX_BYTES", 2000)
-    log.write_text("\n".join(f'{{"ts":"old","sha":"{i:040d}"}}' for i in range(50)) + "\n")
+def test_the_hook_writes_but_never_maintains_the_store(repo, tmp_path, monkeypatch):
+    """Retention moved OFF the hook path, and this is what keeps it off.
+
+    The previous design self-trimmed on every write: a guard about to refuse a
+    destructive command was also rewriting a file, and that retention engine was
+    the source of most of this writer's defects. The hook now only ever ADDS.
+    Pre-existing records must survive a new snapshot untouched — asserted by
+    content, not by count, so a trim that rewrote them would fail here.
+    """
+    store = tmp_path / "store"
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(store))
+    store.mkdir()
+    seeded = {}
+    for i in range(50):
+        f = store / f"20200101T000000_{i:06d}Z-1-0.jsonl"
+        f.write_text(f'{{"ts":"old","sha":"{i:040d}"}}\n')
+        seeded[f] = f.read_text()
+
     (repo / "tracked.py").write_text("dirty\n")
     _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    rows = _rows(log)
-    assert rows and rows[-1]["cwd"] == str(repo)
-    assert len(rows) < 50  # the trim actually fired
+
+    for f, body in seeded.items():
+        assert f.exists(), f"the hook deleted a pre-existing record: {f.name}"
+        assert f.read_text() == body, f"the hook rewrote a pre-existing record: {f.name}"
+    rows = _rows(store)
+    assert len(rows) == 51, "the new snapshot must be ADDED, not merged into a rewrite"
+    assert rows[-1]["cwd"] == str(repo)
 
 
 def test_recovery_note_returned(repo, snap_log):
@@ -582,3 +744,49 @@ def test_no_additional_context_when_nothing_snapshotted(repo, snap_log, monkeypa
     )
     assert _gd.main() == 0
     assert capsys.readouterr().out == ""
+
+
+def test_an_unavailable_writer_says_so_on_stderr(repo, snap_log, monkeypatch, capsys):
+    """The guard's own message must not point at evidence it never emits.
+
+    `_record_snapshots` tells the operator "NOT logged — see the [audit-log] line
+    on stderr for why". When `audit_jsonl` failed to import, no such line existed:
+    the durable recovery pointer was dropped and the only explanation offered was
+    a reference to a line that was never printed (Codex P2, PR #1609). The sibling
+    condition in `git_push_guard._flush_overrides` already reports itself; this is
+    the other half of that rule.
+    """
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(_gd, "audit_jsonl", None)
+    notes = _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
+    captured = capsys.readouterr()
+    assert notes and "NOT logged" in notes[0], notes
+    assert "[audit-log]" in captured.err, (
+        "the note sends the operator to an [audit-log] line that was never printed"
+    )
+    assert _snap_files(snap_log) == []
+
+
+def test_the_superseded_file_knob_is_reported_not_silently_ignored(snap_log, monkeypatch, capsys):
+    """`GENESIS_DISCARD_SNAPSHOT_LOG` named a FILE and this store is a DIRECTORY.
+
+    An install that set the old knob would otherwise keep writing to the new
+    default while its tooling read the old path — snapshots appearing to have
+    stopped, with nothing said (Codex P2, PR #1609). Deliberately NOT translated:
+    a file path does not carry a correct directory, and inventing one would put
+    recovery records somewhere nobody chose. The resolved directory must therefore
+    still be the one the NEW knob names.
+    """
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", "/tmp/legacy-snapshots.jsonl")
+    resolved = _gd._snapshot_dir()
+    err = capsys.readouterr().err
+    assert "GENESIS_DISCARD_SNAPSHOT_LOG" in err, "the superseded knob was dropped in silence"
+    assert "GENESIS_DISCARD_SNAPSHOT_DIR" in err, "the notice does not name the replacement"
+    assert resolved == str(snap_log), "the legacy value must not steer the store"
+
+
+def test_no_notice_when_the_superseded_knob_is_unset(snap_log, monkeypatch, capsys):
+    """The control. A notice on every ordinary run is a notice nobody reads."""
+    monkeypatch.delenv("GENESIS_DISCARD_SNAPSHOT_LOG", raising=False)
+    assert _gd._snapshot_dir() == str(snap_log)
+    assert "GENESIS_DISCARD_SNAPSHOT_LOG" not in capsys.readouterr().err

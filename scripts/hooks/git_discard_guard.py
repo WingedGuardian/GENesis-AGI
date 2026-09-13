@@ -103,7 +103,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import fcntl
 import json
 import os
 import subprocess
@@ -112,8 +111,50 @@ import time
 
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# SOFT dependency: this guard BLOCKS `git clean` (exit 2), and a module-load
+# exception exits 1, which the harness treats as non-blocking — so an unimportable
+# brand-new logging module would let an unrecoverable `git clean -fdx` through.
+# Snapshot logging degrades to a no-op instead. Mirrors git_push_guard's guard on
+# the same import, for the same reason.
+try:
+    import audit_jsonl  # noqa: E402
+except Exception:  # noqa: BLE001 — logging must never disarm the clean block.
+    audit_jsonl = None
+
 from hook_input import field, read_payload  # noqa: E402
-from shell_parse import analyze, has_trailing_override  # noqa: E402
+from shell_parse import analyze_checked, has_trailing_override  # noqa: E402
+
+#: The chokepoint, parsed ONCE per process. `main` reaches three consumers that each
+#: analyse the SAME command string (_clean_violation, _submodule_recurse_violation,
+#: _record_snapshots), and the parse is a pure function of that string — so three
+#: identical parses were pure cost on a clock this guard SHARES.
+#:
+#: That clock is the reason this exists rather than being a tidiness nicety.
+#: `bash_safety_hook.sh` is registered at 5s and delegates to THREE guards over the
+#: same command, this one included, so those duplicates were 3 of the 5 full parses on
+#: one budget. MEASURED end to end, worst payload inside both bounds: 6.12s BEFORE —
+#: over the registration, i.e. the hook is killed and the command is PERMITTED — and
+#: comfortably inside the budget after. The after-figure is the depth-5 row of the cost
+#: table in `shell_parse.MAX_COMMAND_CHARS` and is deliberately NOT repeated here: this
+#: line carried 2.92s while that table said 2.67s and a test docstring said 3.19s, and
+#: the figure is load-dependent, so a copy is a copy that drifts. A copy that points at
+#: its source is still a copy.
+#:
+#: Do not re-pair those two numbers into a speedup ratio, either. 6.12s is this guard's
+#: own before/after-memoisation measurement; the depth-5 row comes from a sweep taken
+#: to CHOOSE the bound. Nothing on record establishes they are the same run, and an
+#: earlier revision of this comment asserted they were. Bounding the input was not
+#: enough on its own; the work per command had to stop being done three times, and that
+#: claim rests on the 6.12s pair alone.
+_PARSE_MEMO: dict[str, tuple] = {}
+
+
+def _parse_once(cmd: str) -> tuple:
+    """`analyze_checked`, memoised for the lifetime of this hook process."""
+    if cmd not in _PARSE_MEMO:
+        _PARSE_MEMO[cmd] = analyze_checked(cmd)
+    return _PARSE_MEMO[cmd]
+
 
 # Substrings that gate the parse path; absent all of them the command cannot be
 # a worktree-overwriting git op, so we return instantly. `clean` is included
@@ -186,21 +227,62 @@ _GIT_TIMEOUT_S = 3
 # SURFACED in a recovery note (never a silent cap). < the 10s hook cap, with
 # margin for launcher/parse.
 _TOTAL_SNAPSHOT_BUDGET_S = 8.0
-# Self-trim the snapshot JSONL when it grows past this (no external consumer /
-# rotation exists); keep the most recent half.
-_SNAPSHOT_LOG_MAX_BYTES = 1_000_000
-# Recovery logs may sit in ~/.genesis alongside secrets — own-user only.
-_LOG_DIR_MODE = 0o700
-_LOG_FILE_MODE = 0o600
+# Retention is a size bound over the whole store, applied by
+# scripts/prune_hook_audit_logs.py on the daily disk_hygiene.sh timer. It is NOT
+# done here: self-trimming on the hook path meant a guard about to refuse a
+# destructive command was also rewriting a file, and that retention engine was the
+# source of most of the shared writer's defects.
+# Own-user-only modes for stores that sit in ~/.genesis beside secrets live in
+# audit_jsonl (LOG_DIR_MODE / LOG_FILE_MODE), shared with the merge-gate override
+# store so the two cannot diverge.
 
 
-def _snapshot_log_path() -> str:
-    """JSONL recovery log. ``GENESIS_DISCARD_SNAPSHOT_LOG`` overrides (test seam
-    + config knob); default lives outside any repo so it survives worktree
-    removal and is never committed."""
-    return os.environ.get("GENESIS_DISCARD_SNAPSHOT_LOG") or os.path.expanduser(
-        "~/.genesis/git_discard_snapshots.jsonl"
-    )
+def _snapshot_dir() -> str:
+    """Directory of recovery records, one file per snapshot.
+    ``GENESIS_DISCARD_SNAPSHOT_DIR`` overrides (test seam + config knob); default
+    lives outside any repo so it survives worktree removal and is never committed.
+
+    NOT BACKED UP, deliberately — recorded here because the omission looks like an
+    oversight and is not. Each row's recovery payload is a ``git stash create``
+    sha, and that object lives ONLY in the local repo's object store: unreachable
+    objects are never pushed, git prunes them on its own schedule (default two
+    weeks), and ``scripts/backup.sh`` captures no object store. Copying the JSONL
+    to a backup would therefore restore a list of pointers to nothing — a log that
+    LOOKS recoverable while every recovery fails, which is worse than none.
+    At a live install, of 76 recorded shas one was already unresolvable in the repo
+    that wrote it. Making this store genuinely restorable means backing up the
+    referenced objects, not the files; the merge-gate override store, whose rows are
+    self-contained, IS backed up (``backup.sh`` §6d).
+
+    The pre-existing single file ``~/.genesis/git_discard_snapshots.jsonl`` is left
+    where it is rather than migrated. Its rows point at unreachable stash objects git
+    prunes on its own schedule, so it self-obsoletes within weeks; moving it would
+    carry pointers that are about to stop resolving anyway."""
+    # The knob this REPLACES is not silently ignored. `GENESIS_DISCARD_SNAPSHOT_LOG`
+    # named a FILE and is documented in the code it superseded as a config knob, so
+    # an install that set it would otherwise keep writing to the new default while
+    # its operator tooling read the old path — snapshots appearing to have stopped,
+    # with nothing said (Codex P2, PR #1609). It is NOT auto-translated: a file path
+    # does not carry a correct directory, and inventing one would put recovery
+    # records somewhere the operator did not choose. Say it, and let them decide.
+    _legacy = os.environ.get("GENESIS_DISCARD_SNAPSHOT_LOG")
+    if _legacy:
+        with contextlib.suppress(Exception):
+            print(
+                "[audit-log] GENESIS_DISCARD_SNAPSHOT_LOG is no longer read (the store "
+                "is now a DIRECTORY of one file per snapshot) — set "
+                "GENESIS_DISCARD_SNAPSHOT_DIR to an absolute directory instead; "
+                "records are being written to the default until you do",
+                file=sys.stderr,
+            )
+    # ONE resolver, shared with the other guard and the pruner. This rule
+    # was written out three times and the pruner's copy omitted the
+    # absolute-path refusal, so it trimmed an unrelated directory while the
+    # real store grew unbounded (Codex P2, PR #1609). See
+    # audit_jsonl.resolve_store_dir.
+    from audit_jsonl import resolve_store_dir
+
+    return resolve_store_dir("GENESIS_DISCARD_SNAPSHOT_DIR")
 
 
 def _segment_cwd(seg, payload: dict) -> str | None:
@@ -238,48 +320,34 @@ def _snapshot_worktree(cwd: str, timeout: float = _GIT_TIMEOUT_S) -> str | None:
     return sha or None
 
 
-def _open_own(path: str, *, append: bool):
-    """Open ``path`` for writing, creating it own-user-only (0600) with NO
-    umask window — ``os.open`` applies the mode AT create time, unlike
-    ``open()`` then ``chmod`` (which is briefly world/group-readable per the
-    process umask). A pre-existing looser file is separately tightened by
-    ``_restrict``; the 0700 log dir already gates access regardless."""
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
-    fd = os.open(path, flags, _LOG_FILE_MODE)
-    return os.fdopen(fd, "a" if append else "w", encoding="utf-8")
-
-
 def _write_log_row(row: dict) -> str | None:
-    """Append ``row`` to the recovery JSONL under an exclusive flock on a SIDECAR
-    lock file (locking the log fh itself is defeated by the trim's os.replace —
-    the lock rides the OLD inode and a waiter appends to the orphan). The
-    sidecar is never replaced, so every writer serializes on one inode. Returns
-    the log path on success, None on any OS error. Files are created own-user
-    only (the log can carry local repo paths and sits beside secrets)."""
-    log_path = _snapshot_log_path()
-    # A relative override has an empty dirname — makedirs("") raises.
-    os.makedirs(os.path.dirname(log_path) or ".", mode=_LOG_DIR_MODE, exist_ok=True)
-    lock_path = log_path + ".lock"
-    with _open_own(lock_path, append=True) as lk:
-        _restrict(lock_path)  # tighten a pre-existing loose sidecar
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        with _open_own(log_path, append=True) as fh:
-            _restrict(log_path)
-            fh.write(json.dumps(row) + "\n")
-        if os.path.getsize(log_path) > _SNAPSHOT_LOG_MAX_BYTES:
-            with open(log_path, encoding="utf-8") as rd:
-                lines = rd.readlines()
-            tmp = log_path + ".tmp"
-            with _open_own(tmp, append=False) as wr:
-                wr.writelines(lines[len(lines) // 2 :])
-            os.replace(tmp, log_path)
-    return log_path
+    """Write ``row`` as one new file in the recovery store.
 
+    The own-user create modes and the create-or-fail naming live in ``audit_jsonl``
+    — extracted from HERE when the merge gate's override store needed the same
+    properties, so the two cannot drift apart. Returns the file path, or None if the
+    write failed (reported on stderr, never raised: a logging failure must not break
+    the user's command) or the writer is unavailable (see the guarded import).
 
-def _restrict(path: str) -> None:
-    """Best-effort chmod to own-user-only; a chmod failure never aborts logging."""
-    with contextlib.suppress(OSError):
-        os.chmod(path, _LOG_FILE_MODE)
+    Size retention belongs to the daily timer, not to this call. A guard about to
+    refuse a destructive command has no business also rewriting a file.
+    """
+    if audit_jsonl is None:
+        # SAY SO. `_record_snapshots` tells the operator the snapshot was "NOT
+        # logged — see the [audit-log] line on stderr for why", and on this path no
+        # such line existed: the message pointed at evidence that was never emitted
+        # (Codex P2, PR #1609). The sibling in git_push_guard._flush_overrides
+        # already reports the same condition; this is the second half of that rule.
+        # Cannot use audit_jsonl.warn — that is the module we do not have. Suppressed
+        # for the same reason it is there: an unwritable stderr must not raise out of
+        # a best-effort logging call on a guard's verdict path.
+        with contextlib.suppress(Exception):
+            print(
+                "[audit-log] audit_jsonl unavailable — snapshot record NOT written",
+                file=sys.stderr,
+            )
+        return None
+    return audit_jsonl.write_batch(_snapshot_dir(), [row])
 
 
 def _tokens_after_subcommand(argv: list[str], sub: str) -> list[str]:
@@ -332,8 +400,43 @@ def _clean_violation(cmd: str) -> str | None:
     detection (``"clean" in argv``) NOT positional resolution: resolution
     depends on skipping git's OPEN set of value-taking global flags, so a
     pathological ``git checkout clean`` merely over-blocks (override escape) —
-    the direction this boundary wants."""
-    for seg in analyze(cmd):
+    the direction this boundary wants.
+
+    A parse cut short by one of shell_parse's BOUNDS lands on the same fail-closed
+    message as a parser crash, because it is the same situation: this guard cannot
+    prove a clean-mentioning command safe. It matters that the parser says so rather
+    than raising — a bound does not crash, it silently returns fewer segments, and
+    reading that as "no clean here" is a silent allow of the one unrecoverable
+    operation this guard blocks. MEASURED before this call was switched: a
+    `git clean -fd` nested 9 deep went from refused to allowed.
+
+    `untokenizable` is deliberately EXCLUDED. It predates the bounds and this guard
+    already allowed those commands, so failing closed on it would be a new
+    over-block rather than a restoration — MEASURED at 209 of 1,367 real
+    clean-mentioning commands, against 0 for the bounds. Widening to it is a
+    separate decision with its own evidence, not a rider on this one.
+
+    BOTH bounds refuse here. An earlier revision honoured it and softened the length axis, on the
+    written grounds that "`bash_safety_hook.sh` keeps the real coverage there: its
+    `git clean` check greps RAW text per shell segment". THAT WAS FALSE, and measured
+    so: the coarse fallback at bash_safety_hook.sh:220 runs only when `_handled == 0`,
+    i.e. when python3 or this guard is ABSENT or this guard CRASHED. Exiting 0 — which
+    is exactly what softening produced — sets `_handled=1` and SKIPS the fallback.
+    MEASURED on `echo "<49,200 chars>" && git clean -fd`: guard rc=0, hook rc=0, so
+    nothing anywhere blocked a real, executing `git clean -fd`.
+
+    That is the sibling-layer trap in its purest form: a fail-open justified by a
+    second layer that does not actually cover the case, asserted in a comment rather
+    than checked. The rule this leaves behind: a guard whose only verdicts are BLOCK
+    and ALLOW must fail closed on ANY blindness, because "ask" is not available to it
+    and the alternative to blocking is permitting. The per-axis severity flag that
+    made this mistake possible has since been DELETED outright — see BlindSpot.
+
+    Cost of refusing both: 0 of 45,956 real commands reach either bound."""
+    segs, blind = _parse_once(cmd)
+    if blind is not None and blind.bounds_induced:
+        return _CLEAN_PARSE_FAILED_MSG
+    for seg in segs:
         if seg.exe != "git":
             continue
         if "clean" not in set(seg.argv[1:]):
@@ -401,8 +504,24 @@ def _submodule_recurse_violation(cmd: str) -> str | None:
     worktrees, so recursing into them is unrecoverable (like clean) and a
     superproject snapshot is a false recovery promise. Closed-set: literal
     snapshot-verb membership AND a recursing token; honors ``# discard-override``
-    per segment. Returns a block message or None. Pure argv (no subprocess)."""
-    for seg in analyze(cmd):
+    per segment. Returns a block message or None. Pure argv (no subprocess).
+
+    Fails CLOSED when a shell_parse BOUND cut the parse short, for the reason given
+    in _clean_violation: a bound returns fewer segments without raising, so treating
+    that as "no recursing verb" silently allows the unrecoverable case this blocks.
+    MEASURED: `git checkout --recurse-submodules .` nested 9 deep went from refused
+    to allowed. The guard's documented fail-OPEN is for a parser CRASH, which is a
+    different event; `untokenizable` stays on that fail-open path unchanged.
+
+    BOTH bounds refuse, for the reason given in _clean_violation — and here there was
+    never even a sibling to appeal to: `bash_safety_hook.sh` has no submodule check at
+    all, so softening the length axis left this operation with NO coverage whatsoever.
+    MEASURED on `echo "<49,200 chars>" && git checkout --recurse-submodules .`: guard
+    rc=0, hook rc=0."""
+    segs, blind = _parse_once(cmd)
+    if blind is not None and blind.bounds_induced:
+        return _SUBMODULE_BLOCK_MSG
+    for seg in segs:
         if seg.exe != "git":
             continue
         if not (set(seg.argv[1:]) & _SUBMODULE_RECURSE_VERBS):
@@ -430,7 +549,24 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     seen_cwds: set[str] = set()
     deadline = time.monotonic() + _TOTAL_SNAPSHOT_BUDGET_S
     budget_hit = False
-    for seg in analyze(cmd):
+    segs, blind = _parse_once(cmd)
+    # The same "never silent" rule the time budget already obeys, applied to the other
+    # reason this can come up short: a parse stopped by a bound yields no segment for
+    # a nested snapshot verb, so the recovery point is simply missing — and a missing
+    # recovery point that says nothing is indistinguishable from "nothing needed one"
+    # exactly when someone is about to discard work. (`untokenizable` excluded for the
+    # reason given in _clean_violation: pre-existing here, and noting it would fire on
+    # ordinary work.)
+    #
+    # DEFERRED until after the loop, never appended ahead of it. This note asserts
+    # that NO snapshot was recorded, and the loop below can still record one for a
+    # repository the parse did reach. Emitting first produced additional context that
+    # said "no recovery snapshot was recorded" AND supplied a recovery SHA — leaving
+    # the recovery status unreadable at the one moment it is load-bearing. The note is
+    # about what the guard could NOT see, so it can only be written once the loop has
+    # finished establishing what it could.
+    blind_unrecorded = blind is not None and blind.bounds_induced
+    for seg in segs:
         if seg.exe != "git":
             continue
         # Literal VERB membership — never positional subcommand resolution
@@ -457,9 +593,26 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             "cwd": cwd,
             "sha": sha,
         }
-        log_path = _snapshot_log_path()
-        with contextlib.suppress(OSError):
-            log_path = _write_log_row(row) or log_path
+        # _write_log_row no longer raises — audit_jsonl converts an OS error to
+        # None and reports it — so the old `contextlib.suppress(OSError)` here is
+        # gone rather than left reading as live protection.
+        # Say where the row LANDED, or say it did not land — never name a path as
+        # though a row is in it when the write returned None. The recovery note is
+        # what an operator reads while trying to get work back; pointing them at
+        # an empty file is the same false promise this store was built to end.
+        #
+        # And do not name the CAUSE: None means the writer was unimportable, OR
+        # the lock was still busy at its deadline, OR an OS/serialisation error —
+        # two different things. Naming one would be a fresh false statement in
+        # the message this was rewritten to make truthful. The writer reports the
+        # real reason on stderr.
+        written = _write_log_row(row)
+        log_note = (
+            f"(log: {written})"
+            if written
+            else "(NOT logged — see the [audit-log] line on stderr for why; the "
+            "snapshot sha above is the only record, so keep it)"
+        )
         notes.append(
             f"[git-discard-guard] snapshotted the worktree at {cwd} as "
             f"{sha[:12]} (tracked changes only — `git stash create` does NOT "
@@ -469,7 +622,7 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             f"discarded work in, recover with: git stash apply --index {sha}  "
             f"(--index restores the staged/unstaged split; drop it if the apply "
             f"conflicts). For a DELETED/overwritten file (rm/mv), pull it straight "
-            f"from the snapshot: git checkout {sha[:12]} -- <path>. (log: {log_path})"
+            f"from the snapshot: git checkout {sha[:12]} -- <path>. {log_note}"
         )
     if budget_hit:
         notes.append(
@@ -477,6 +630,21 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             f"{_TOTAL_SNAPSHOT_BUDGET_S:.0f}s snapshot budget — one or more later "
             "repos in this compound were NOT snapshotted. Run a single git "
             "command per repo if you need its recovery point."
+        )
+    if blind_unrecorded:
+        # `seen_cwds` is provably EMPTY here, so this says so plainly rather than
+        # hedging. A bounds-induced blind spot means `analyze_checked` returned no
+        # segments at all, and `seen_cwds` is filled only from inside the segment
+        # loop — so "cut short but still snapshotted something" is not a state this
+        # function can be in. An earlier revision branched on `sorted(seen_cwds)` and
+        # spoke of the repositories it "did snapshot"; that branch was unreachable,
+        # and the wording it left on the live path implied repositories that cannot
+        # exist. Defensive phrasing against an impossible state is not caution, it is
+        # a false claim with a conditional in front of it.
+        notes.append(
+            f"[git-discard-guard] no recovery snapshot was recorded at all: this "
+            f"command {blind.cause}, so the guard could not tell which "
+            f"repositories it touches. To get the missing snapshots: {blind.hint}."
         )
     return notes
 
