@@ -1585,8 +1585,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   caller does differently because of its output, and say whether a better shape
   exists (an existing chokepoint it re-implements, a simpler mechanism, a place
   the problem disappears). Emit the `Design-premise:` block. Also informational,
-  and its BROKEN verdict has a HIGH bar: it routes to a builder session rather
-  than to another round, so everything short of "the change cannot do what it
+  and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
+  premise-wrong disposition (architecture conversation, or
+  `needs-architecture-session` + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
@@ -1869,7 +1870,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      Continuing a round-4+ loop on an earlier instruction is a violation, not
      obedience — STOP, post the round ledger (round → what it found → what it
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
-     and get a FRESH decision: HAND IT BACK to a builder session (three rounds
+     and get a FRESH decision: HAND IT BACK through the established disposition
+     — architecture conversation, or `needs-architecture-session` + a `ready` row
+     (three rounds
      each finding something new, after a class-level audit, is the strongest
      evidence available that the PREMISE and not the code is what is wrong —
      and no further round can fix that), switch to a robust-by-construction
@@ -1916,7 +1919,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   | Round | Gate | Demands | Sigil | Resets counter? |
   |---|---|---|---|---|
-  | 2 (`cap-1`) | **MODE-SWITCH block** | Decide PREMISE-vs-POLISH first (`.claude/docs/premise-check.md`). If the premise is wrong: hand it back to a builder, and do NOT ack past this block. If it holds: stop patching the named instance — dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` (attests the AUDIT happened — it is not an exit for the hand-back branch) | **No** |
+  | 2 (`cap-1`) | **MODE-SWITCH block** | Decide PREMISE-vs-POLISH first (`.claude/docs/premise-check.md`). If the premise is wrong: hand it back via `needs-architecture-session`, and do NOT ack past this block. If it holds: stop patching the named instance — dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` (attests the AUDIT happened — it is not an exit for the hand-back branch) | **No** |
   | 3 (`cap`) | **HARD STOP** | The full round-ledger stop above. | `# escalation-ack` | **Yes** — which is what makes the cycle repeat |
   | **7 (`FINAL_ROUND_CAP`, lifetime)** | **TERMINAL** | Two full cycles have already run. Decide: ACCEPT the outstanding findings and merge (document each in the PR body), or ABANDON and restart from a design that does not need seven rounds. | `# final-round-accept` | **No, and it is ONE-SHOT** |
 

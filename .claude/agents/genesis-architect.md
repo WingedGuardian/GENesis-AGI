@@ -78,7 +78,11 @@ block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
 
 Emit the `Design-premise:` block from the reference doc before the main review.
 
-**BROKEN has a HIGH bar and routes to a builder session, not to another round —
+**BROKEN has a HIGH bar and routes to the repo's EXISTING disposition for a
+premise-wrong PR — a foreground architecture conversation with the user, or the
+`needs-architecture-session` label plus a `ready` follow-up when none is present
+(genesis-development skill, "Some PRs are not a review problem"). Never a new
+path around it, and never another round —
 everything short of "the change cannot do what it says it was built to do" is
 SOUND-BUT-INFERIOR with the better shape named.** The reference doc owns the
 calibration: the two failure modes, the UNPROVEN and no-stated-premise cases,

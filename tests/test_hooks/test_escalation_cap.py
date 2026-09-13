@@ -1225,9 +1225,15 @@ def test_mode_switch_states_the_evidence_bar_for_handing_back(repo, home):
     # The wrong-shape signals — which is what "evidence" means at this tier.
     assert "CONCENTRATING" in err
     assert "GROWING" in err
-    # And the explicit default when they are absent. Matched loosely on
-    # punctuation so an ordinary prose edit does not break a structural claim.
-    assert re.search(r"Absent those[,\s]+it is \(B\)", err), err
+    # TWO OR MORE signals, not one. The review mandate sets that bar and this
+    # message must not undercut it: one signal alone is an ordinary local defect
+    # wearing an architectural shape — findings concentrate in any large parser.
+    # An earlier version of this message listed the signals with `or` and a bare
+    # "absent those" default, which classified a single signal as (A).
+    assert re.search(r"TWO OR MORE", err), err
+    # …and the explicit default short of that bar. Matched loosely on punctuation
+    # so an ordinary prose edit does not break a structural claim.
+    assert re.search(r"Short of two[,\s]+it is \(B\)", err), err
 
 
 def test_escalation_cap_names_handing_back_FIRST(repo, home):
@@ -1250,6 +1256,27 @@ def test_escalation_cap_names_handing_back_FIRST(repo, home):
         f"menu in the order the gate prints it (got {hand_back}, {redesign}, "
         f"{shelve})"
     )
+
+
+def test_the_cap_gives_hand_back_no_sigil_exit(repo, home):
+    """Option (a) must NOT be told to rerun the commit with `# escalation-ack`.
+
+    At the cap the index still holds the design just judged premise-broken and
+    its review marker is current, so that sigil would permit exactly that commit
+    AND reset the streak — landing the work and erasing the evidence that
+    stopped it. The same conditional-exit defect was fixed at the round-2 tier
+    and left here, which is why this is pinned separately rather than trusted to
+    the neighbouring test.
+    """
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    err = _stderr_at_round(repo, home, review_state.ESCALATION_ROUND_CAP)
+    assert "THE EXIT DEPENDS ON WHICH OPTION" in err, err
+    assert "do NOT run that command" in err, err
+    # The sigil must still be offered to the options that legitimately continue.
+    assert "escalation-ack" in err
+    # Guard the guard: the hand-back warning must sit AFTER the sigil it warns
+    # about, or a reader takes the command and never reaches the caveat.
+    assert err.index("escalation-ack") < err.index("do NOT run that command")
 
 
 def test_both_tiers_route_the_fork_to_evidence_not_feel(repo, home):

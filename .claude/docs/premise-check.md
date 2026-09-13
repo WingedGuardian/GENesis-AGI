@@ -91,10 +91,17 @@ rather than left to judgement:
   Emit `SOUND — UNPROVEN(n)`, naming which premises and what would settle them.
   UNPROVEN never supports BROKEN: you cannot hand a change back on evidence you
   do not have.
-- **`Effect: nothing`** is a finding on the CHANGE, not automatically a broken
-  premise. Raise it on the severity ladder (normally BLOCKER — a change that
-  alters nothing downstream does not do what it claims), then judge the premises
-  separately. Only conclude BROKEN if a premise is itself false.
+- **`Effect: nothing` IS broken**, and this is the case worth being precise
+  about, because an earlier draft of this file said the opposite two paragraphs
+  apart. BROKEN means "cannot do what it says it was built to do" — and a change
+  whose consumer does nothing differently is the purest instance of that, so it
+  routes like any other BROKEN verdict. What it does NOT mean is that a premise
+  was false: every stated premise can be true and the change still land on
+  nothing. Say exactly that in the writeup — `Design-premise: BROKEN — premises
+  hold, effect is nil` — because "your reasoning was right and the change still
+  does nothing" is a different conversation from "your reasoning was wrong", and
+  the builder needs to know which one they are having. Raise it on the severity
+  ladder too (normally BLOCKER).
 - **No stated premises anywhere** — no PR body, no plan file, uninformative
   commit messages — is common on a fresh branch. Reconstruct the premises from
   the diff and SAY that you did. A reconstructed premise can never carry a
@@ -112,12 +119,22 @@ is not permission to rewrite it, not a substitute for the code review (run this
 first, then review the code if the premises hold), and not a reason to close
 anything — a reviewer session retires nothing.
 
-**BROKEN routes to a builder session, and the bar is HIGH.** Recommend handing a
-change back only when the premise is genuinely wrong or the change cannot do what it
-says it was built to do — a major rework, or a material finding that moves the whole
-premise. Everything short of that stays in the gate and gets iterated on: a premise
-slightly off, needing modest rework a review session can carry in a round or two, is
-the ordinary case and is NOT a kick-back.
+**BROKEN routes through the ESTABLISHED disposition, not a new one — and the bar
+is HIGH.** The repo already has a route for a change that is wrong at the premise
+or structurally superseded, and it is NOT "hand it to a builder": it is a
+foreground ARCHITECTURE conversation with the user, and where no user is present,
+the `needs-architecture-session` label plus a `ready` follow-up naming the PR and
+the decision it awaits. See the genesis-development skill, "Some PRs are not a
+review problem". This check produces the EVIDENCE for that conversation; it does
+not invent a parallel path around it, and a session that reads "hand back" as
+"dispatch a builder and move on" has skipped the decision the label exists to
+force.
+
+Recommend it only when the premise is genuinely wrong, or the change cannot do
+what it says it was built to do — a major rework, or a material finding that moves
+the whole premise. Everything short of that stays in the gate and gets iterated
+on: a premise slightly off, needing modest rework a review session can carry in a
+round or two, is the ordinary case and is NOT a kick-back.
 
 Two failure modes, and the second is worse than the first:
 
