@@ -965,83 +965,122 @@ def test_the_recovery_chain_in_the_note_ACTUALLY_WORKS(
         # the tree is dirty exactly where the snapshot carries content.
         (repo / "tracked.py").write_text("WRITTEN AFTER THE REWIND\n")
 
-    # EXTRACT both commands from the note and run THOSE — never a hand-copied
-    # equivalent. A test that string-matches the note and then executes its own
-    # copy proves the copy works, which is the shape that shipped in round 2: the
-    # note and the tested command can drift apart silently. Extraction also pins
-    # the SHA the note prints, which matters because a multi-repo compound once
-    # carried the wrong repo's sha — unresolvable where the reader would run it.
+    # EXTRACT the commands from the note and run THOSE — never a hand-copied
+    # equivalent. This test kept PASSING across a note rewrite because its regexes
+    # still matched text that had moved to a different role, which is exactly the
+    # drift extraction exists to prevent: a test that string-matches the note and
+    # then executes its own copy proves the copy works. Extraction also pins the SHA
+    # the note prints, because a multi-repo compound once carried the wrong repo's.
+    #
+    # The procedure is THREE steps, and it was chosen by MEASUREMENT rather than
+    # judgement after four hand-picked chains each failed in a state nobody had
+    # constructed (see `_tree_rewind_note`): 320 enumerated states, six candidates,
+    # an oracle and a no-op as instrument controls. Capture, restore the merged work
+    # from the branch, replay your own edits from the snapshot: 240/240 where HEAD
+    # has not moved, against 56/240 for the single command this replaced.
     snap = _snapshot_rows(snap_log)[-1]["sha"]
-    complete = re.search(r"git stash apply --index ([0-9a-f]{7,40})", rewind_line)
-    fallback = re.search(r"git checkout --no-overlay ([0-9a-f]{7,40}) -- \.", rewind_line)
-    assert complete, (
-        "the COMPLETE form must be offered first — it is the only one that "
-        f"restores the staged/unstaged split exactly. Note said: {rewind_line}"
+    assert "git stash create" in rewind_line, (
+        "step 1 must capture the current tree first, or step 2 is destructive"
     )
-    assert fallback, (
-        "the robust fallback must be offered, and with --no-overlay: without it, "
-        "path checkout is overlay-by-default and silently keeps a deleted file. "
+    assert "git checkout HEAD -- ." in rewind_line, (
+        "step 2 must restore the merged work from the BRANCH — that is where it "
+        f"lives, and no snapshot command brings it back. Note said: {rewind_line}"
+    )
+    replay = re.search(r"git stash apply --index ([0-9a-f]{7,40})", rewind_line)
+    committed = re.search(r"git checkout --no-overlay ([0-9a-f]{7,40}) -- \.", rewind_line)
+    assert replay, f"step 3 must replay your own edits. Note said: {rewind_line}"
+    assert committed, (
+        "the already-committed case must carry its own command, because the three "
+        "steps REINSTATE the reversion once HEAD holds it — measured 0/80. "
         f"Note said: {rewind_line}"
     )
-    for label, got in (("complete", complete.group(1)), ("fallback", fallback.group(1))):
+    for label, got in (("replay", replay.group(1)), ("committed-case", committed.group(1))):
         assert snap.startswith(got), (
             f"the {label} command names {got}, which is not a prefix of this "
             f"repo's snapshot {snap} — the reader would run it in the wrong repo"
         )
 
-    # Run the chain exactly as a reader would: complete form first, fallback only
-    # if it refuses.
+    # Run the three steps in order, exactly as a reader would.
+    capture = subprocess.run(
+        ["git", "-C", str(repo), "stash", "create"],
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    ).stdout.strip()
+    if dirtied_after_rewind:
+        assert capture, (
+            "step 1 must produce a capture when the tree is dirty — that capture is "
+            "the only thing making step 2 non-destructive, and this cell exists to "
+            "exercise exactly that"
+        )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "HEAD", "--", "."],
+        check=True,
+        capture_output=True,
+        env=_GIT_ENV,
+    )
     rc = subprocess.run(
-        ["git", "-C", str(repo), "stash", "apply", "--index", complete.group(1)],
+        ["git", "-C", str(repo), "stash", "apply", "--index", replay.group(1)],
         capture_output=True,
         env=_GIT_ENV,
     ).returncode
+    assert rc == 0, (
+        "step 3 must apply cleanly onto a pristine HEAD — the stash's parent IS "
+        "HEAD-at-create, which is the whole reason this ordering works"
+    )
     if dirtied_after_rewind:
-        assert rc != 0, (
-            "this cell exists to exercise the FALLBACK; if the complete form now "
-            "succeeds here, the cell covers nothing and the fixture must be fixed "
-            "rather than the assertion relaxed"
-        )
-        # The note's own safety claim — 'if it exits 1 it changes NOTHING, so
-        # nothing is lost by trying it' — is what makes 'try this first' sound
-        # advice. Assert it, or the note is promising something untested.
-        assert (repo / "tracked.py").read_text() == "WRITTEN AFTER THE REWIND\n", (
-            "a refused stash-apply must leave the tree untouched — the note tells "
-            "the reader nothing is lost by trying it first"
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "checkout", "--no-overlay", fallback.group(1), "--", "."],
-            check=True,
+        # The post-rewind edit is overwritten by design; what matters is that it is
+        # RECOVERABLE from the step-1 capture rather than gone.
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{capture}:tracked.py"],
             capture_output=True,
+            text=True,
             env=_GIT_ENV,
         )
-    else:
-        assert rc == 0, (
-            "on a freshly-rewound tree the COMPLETE form must work — that is why "
-            "the note offers it first"
+        assert blob.returncode == 0 and "WRITTEN AFTER THE REWIND" in blob.stdout, (
+            "work done after the rewind must survive inside the step-1 capture; "
+            "without it, step 2 silently destroys it"
         )
 
     assert (repo / "tracked.py").read_text() == "MY-UNCOMMITTED-WORK\n", (
-        "the recovery chain the note gives must actually restore modified work"
+        "the recovery procedure the note gives must actually restore modified work"
     )
     assert not (repo / "doomed.py").exists(), (
-        "the recovery chain must also restore a DELETION — this is the assertion "
-        "whose absence let an overlay-mode command ship as 'byte-identical'"
+        "it must also restore a DELETION — this is the assertion whose absence let "
+        "an overlay-mode command ship as 'byte-identical'"
     )
 
 
-def test_the_note_states_the_fallbacks_cost_rather_than_hiding_it():
-    """The robust fallback flattens the staged/unstaged split, so the note says so.
 
-    It replaces an earlier warning that `git stash apply` "writes conflict
-    markers". RE-MEASURED on git 2.43: it exits 1 and leaves the file UNTOUCHED —
-    a safe refusal, not corruption. Warning someone off the only command that
-    restores their index split, on the strength of a harm that does not occur, is
-    its own false promise.
+
+def test_the_note_states_WHERE_its_procedure_does_not_apply():
+    """The three steps are correct before you commit and WRONG after — say both.
+
+    This is the load-bearing scope claim, and it is measured: the procedure scores
+    240/240 while HEAD has not moved since the snapshot, and 0/80 once the reader has
+    committed, because step 2 restores HEAD and HEAD then *contains* the reversion.
+    A note that gave the steps without that boundary would hand someone the exact
+    reversion they were trying to undo, which is the false-recovery-promise class
+    this module treats as severe enough to justify a hard block.
+
+    The test also keeps the earlier retraction on the record: an intermediate version
+    warned that `git stash apply` "writes conflict markers", and re-measurement
+    showed it exits 1 leaving the file untouched — a safe refusal, not corruption.
+    Warning someone off a command on the strength of a harm that does not occur was
+    its own false promise, and the docstring has to keep saying so or the next
+    rewrite reintroduces it.
     """
     doc = _gd._tree_rewind_note.__doc__ or ""
     assert "No conflict markers" in doc, (
         "the docstring must record the re-measurement that corrected the earlier claim"
+    )
+    rendered_scope = _gd._tree_rewind_note("a" * 40, "/r", "b" * 40)
+    assert "NOT COMMITTED" in rendered_scope, (
+        "the note must state the precondition for its three steps, not just the steps"
+    )
+    assert "ALREADY COMMITTED" in rendered_scope, (
+        "and it must name the case where they are WRONG — measured 0/80, where step "
+        "2 reinstates the reversion from a HEAD that now contains it"
     )
     # Asserted on the RENDERED note, not on the module source. Reading the source
     # meant a COMMENT carrying the phrase satisfied it: measured, changing the
@@ -1101,9 +1140,23 @@ def test_every_stand_in_in_THIS_FILE_matches_its_production_signature():
             ]
         )
         checked += 1
-        got = len(node.args[2].args.args)
-        if got != required:
-            mismatches.append(f"line {node.lineno}: {name} takes {got}, needs {required}")
+        # CALLABILITY, not parameter count. A stand-in written as
+        # `lambda cid=value: ...` is the late-binding idiom for capturing a loop
+        # variable and is perfectly callable with zero arguments — an earlier version
+        # of this lock counted it as arity 1 and flagged it, which would have taught
+        # the next author to work around the lock rather than fix a real mismatch.
+        # What matters is whether production's call would land: the stand-in must
+        # accept the required count, i.e. its REQUIRED arity is at most that count and
+        # its capacity at least that count (a `*args` lambda has no upper bound).
+        lam = node.args[2].args
+        lo = len(lam.args) - len(lam.defaults)
+        hi = None if lam.vararg is not None else len(lam.args)
+        if lo > required or (hi is not None and hi < required):
+            span = f"{lo}" if hi == lo else f"{lo}-{'*' if hi is None else hi}"
+            mismatches.append(
+                f"line {node.lineno}: {name} accepts {span} positional, production calls "
+                f"it with {required}"
+            )
     assert checked >= 20, (
         f"only {checked} stand-ins were examined — the walk has stopped finding them, "
         "so this lock is passing by blindness rather than by correctness"
@@ -1229,10 +1282,30 @@ def test_the_value_taking_option_tables_cover_every_rewind_verb():
 # what let an unverified recovery command ship twice on this same PR.
 
 
-def _emit(notes: list[str], capsys) -> str:
-    """Raw stdout of the real emitter, so the payload SIZE is what is measured."""
+def _emit(notes: list[str], capsys, monkeypatch=None) -> str:
+    """Raw stdout of the real emitter, so the payload SIZE is what is measured.
+
+    Callers that measure the BOUND pin the store path, because the omission line
+    names it and its length therefore changes how many notes fit. Left free, these
+    tests inherit conftest's tmp_path store — far longer than the real default —
+    which enlarged the reserve, kept one note fewer, and masked an off-by-envelope
+    overflow that the live end-to-end run caught at once. A size assertion whose
+    answer depends on the test directory's name is not a size assertion.
+    """
+    if monkeypatch is not None:
+        monkeypatch.setattr(_gd, "_snapshot_dir", lambda: "/var/genesis/snapshots")
     _gd._emit_additional_context(notes)
     return capsys.readouterr().out
+
+
+def _note_terminal() -> str:
+    """The tail of a rendered note, used to count notes that FINISHED.
+
+    Derived rather than hardcoded: two tests pinned the literal phrase
+    "DELETED restored by the rewind." and broke the moment the note was reworded —
+    a test coupled to prose instead of to the property it names.
+    """
+    return _gd._tree_rewind_note("a" * 40, "/r", "b" * 40)[-45:]
 
 
 def _rewind_note_fixture() -> tuple[str, str]:
@@ -1261,7 +1334,7 @@ def test_the_advisory_stays_under_the_hook_output_cap(repos, capsys):
     )
 
 
-def test_every_surviving_note_is_COMPLETE_never_amputated(capsys):
+def test_every_surviving_note_is_COMPLETE_never_amputated(capsys, monkeypatch):
     """The bound omits WHOLE notes; it must never trim the joined text.
 
     Every note ends in a recovery command carrying a snapshot sha. A mid-value cut
@@ -1279,13 +1352,18 @@ def test_every_surviving_note_is_COMPLETE_never_amputated(capsys):
     appears must also END, so started-notes == finished-notes.
     """
     note, sha12 = _rewind_note_fixture()
-    ctx = json.loads(_emit([note] * 200, capsys))["hookSpecificOutput"]["additionalContext"]
+    out = _emit([note] * 200, capsys, monkeypatch)
+    assert len(out) <= _gd.hook_output.HOOK_STDOUT_CAP, (
+        f"the emitted payload is {len(out)} chars, over the cap — selection must "
+        "budget the ENVELOPE too, not just the joined notes"
+    )
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
     assert "cap]" not in ctx, (
         "the writer's text-trim marker is present, so the joined text was cut "
         "mid-note — whole-note selection is supposed to make that unreachable here"
     )
     started = ctx.count("WHOLE-TREE REWIND")
-    finished = ctx.count("DELETED restored by the rewind.")
+    finished = ctx.count(_note_terminal())
     assert started == finished, (
         f"{started} notes started but only {finished} finished — a note was cut off"
     )
@@ -1574,7 +1652,7 @@ def test_rewind_warnings_come_BEFORE_routine_snapshot_notes(
     )
 
 
-def test_notes_are_sized_by_their_SERIALIZED_cost(capsys):
+def test_notes_are_sized_by_their_SERIALIZED_cost(capsys, monkeypatch):
     """The payload ships through json.dumps, so raw length under-counts.
 
     A quote or backslash becomes two characters and a control character six —
@@ -1585,7 +1663,7 @@ def test_notes_are_sized_by_their_SERIALIZED_cost(capsys):
     """
     evil_cwd = "/" + '"\\\\' * 60 + "路径" * 30
     note = _gd._tree_rewind_note("a" * 40, evil_cwd, "b" * 40)
-    out = _emit([note] * 12, capsys)
+    out = _emit([note] * 12, capsys, monkeypatch)
     assert len(out) <= _gd.hook_output.HOOK_STDOUT_CAP
     ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
     assert "cap]" not in ctx, (
@@ -1593,9 +1671,151 @@ def test_notes_are_sized_by_their_SERIALIZED_cost(capsys):
         "serialised cost did not fit — a mid-note cut one layer down"
     )
     started = ctx.count("WHOLE-TREE REWIND")
-    finished = ctx.count("DELETED restored by the rewind.")
+    finished = ctx.count(_note_terminal())
     assert started == finished and started > 0, (
         f"{started} notes started, {finished} finished — a metachar-heavy note was amputated"
+    )
+
+
+def test_a_directory_pathspec_without_a_trailing_slash_is_detected(repo, monkeypatch):
+    """`-- src` rewinds src/ recursively, and that spelling is the natural one.
+
+    MEASURED on git 2.43: `git checkout <old> -- src` put every tracked file under
+    src/ back to the old content while a file outside src/ stayed untouched — a real,
+    scoped rewind. The predicate recognised a directory only by a trailing slash, so
+    `src` and `./src` — the two ways anyone would actually type it — were silent.
+
+    Resolved with one `os.path.isdir` against the segment's repository. That is a
+    deliberate departure from this module's argv-only-no-filesystem rule, and the
+    distinction is that the rule exists to stop it MODELLING git's semantics: a stat
+    is a fact, not a model, and not a subprocess.
+    """
+    (repo / "src").mkdir()
+    (repo / "src" / "f.py").write_text("v1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add src")
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "src" / "f.py").write_text("v2\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "upstream")
+
+    for spelling in ("src", "./src", "src/"):
+        cmd = f"git checkout {old} -- {spelling}"
+        got = _gd._tree_rewind_segments(
+            cmd, {"tool_input": {"command": cmd}, "cwd": str(repo)}
+        )
+        assert got, f"{spelling!r} is a directory rewind and must be detected"
+        assert got[0][3] is False, (
+            f"{spelling!r} is SCOPED to one directory, so it must not be recorded broad"
+        )
+
+    # THE SIBLING, and it is the half that bit: teaching the breadth predicate to
+    # recognise a slashless directory while the SOURCE predicate still asked only
+    # about a trailing slash made them disagree, and the disagreement was immediately
+    # a false positive — MEASURED, `git checkout src` (rc=0, an ordinary discard
+    # restoring from the index, reverting nothing merged) fired with source `src`.
+    # Both ends of one rule move together or neither does.
+    for discard in ("git checkout src", "git checkout src/", "git checkout -- src"):
+        assert not _gd._tree_rewind_segments(
+            discard, {"tool_input": {"command": discard}, "cwd": str(repo)}
+        ), f"{discard!r} is an ordinary local discard and must stay silent"
+
+    plain = f"git checkout {old} -- src/f.py"
+    assert not _gd._tree_rewind_segments(
+        plain, {"tool_input": {"command": plain}, "cwd": str(repo)}
+    ), "a single FILE is not a directory rewind — the stat must discriminate, not blanket"
+
+
+def test_a_missing_path_falls_back_to_the_trailing_slash_rule(repo):
+    """The stat fails toward FALSE: a miss is the status quo, never a false note."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    cmd = f"git checkout {old} -- no_such_dir"
+    assert not _gd._tree_rewind_segments(
+        cmd, {"tool_input": {"command": cmd}, "cwd": str(repo)}
+    ), "a path that is not there must not produce a note"
+    assert _gd._operand_is_directory("src", None) is False, (
+        "no cwd means no answer, and the answer must be the safe one"
+    )
+
+
+def test_the_event_identity_distinguishes_SEPARATE_INVOCATIONS(repo, snap_log, monkeypatch, capsys):
+    """Two runs of the same command are two attempts; the count must see both.
+
+    The digest was source+cwd+command, which made an identical rewind run again next
+    week collapse into the one event forever — so the tripwire could not measure the
+    recurrence it exists for. `tool_use_id` is MEASURED present in the PreToolUse
+    payload (58 captured firings on this install) and is shared by the two hook
+    wirings, because `bash_safety_hook.sh` pipes the verbatim payload through. So it
+    separates invocations while preserving cross-wiring dedup.
+    """
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    cmd = f"git checkout {old} -- ."
+    seen = []
+    for call_id in ("toolu_FIRST", "toolu_SECOND", "toolu_SECOND"):
+        (repo / "tracked.py").write_text(f"dirty-{call_id}\n")
+        monkeypatch.setattr(
+            _gd,
+            "read_payload",
+            lambda cid=call_id: {
+                "tool_input": {"command": cmd},
+                "cwd": str(repo),
+                "tool_use_id": cid,
+            },
+        )
+        assert _gd.main() == 0
+        capsys.readouterr()
+        seen.append({r["event"] for r in _rewind_rows(snap_log)})
+
+    ids = {r["event"] for r in _rewind_rows(snap_log)}
+    assert len(ids) == 2, (
+        f"two distinct invocations of the same command must be two events, and the "
+        f"SAME tool_use_id seen twice (the two hook wirings) must be one; got {ids}"
+    )
+
+
+def test_the_identity_degrades_when_the_payload_carries_no_invocation_id(
+    repo, snap_log, monkeypatch, capsys
+):
+    """One captured payload shape lacks `tool_use_id`, so absence must still work.
+
+    It degrades to the old source+cwd+command digest: coarse for counting, but still
+    correct for the property that must not break — the two hook wirings of one
+    command agreeing on one row.
+    """
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    cmd = f"git checkout {old} -- ."
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(repo)}
+    )
+    assert _gd.main() == 0
+    capsys.readouterr()
+    rows = _rewind_rows(snap_log)
+    assert len(rows) == 1 and re.fullmatch(r"[0-9a-f]{16}", rows[0]["event"]), (
+        "a payload without an invocation id must still produce one digested event row"
+    )
+
+
+def test_the_count_is_documented_as_ATTEMPTS_not_completed_rewinds():
+    """PreToolUse runs BEFORE bash, so a row can precede a rewind that never happens.
+
+    MEASURED: `false && git checkout <old> -- .` changes nothing (shell short-circuit)
+    and an invalid ref exits 128 having changed nothing — both still write a row.
+    Narrowing the predicate cannot close that, because the gap is WHEN the hook runs.
+    The honest fix is to say so wherever the count is described, since the count's
+    only purpose is justifying an escalation to a hard block.
+    """
+    src_text = Path(_gd.__file__).read_text()
+    assert "COUNT ATTEMPTS, NOT ROWS" in src_text, (
+        "the counting recipe must name what it counts"
+    )
+    assert "UPPER BOUND" in src_text, (
+        "and must say the count is an upper bound on rewinds that happened"
+    )
+    cmd = "false && git checkout abc -- ."
+    assert _gd._tree_rewind_segments(cmd, {"tool_input": {"command": cmd}, "cwd": "/tmp"}), (
+        "the predicate still fires on a short-circuited command — that is the "
+        "behaviour the documentation now describes rather than pretends away"
     )
 
 
