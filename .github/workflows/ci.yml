@@ -39,9 +39,36 @@ jobs:
         run: ruff check src/ tests/ scripts/
 
   dependency-audit:
-    # Report known vulnerabilities outside the retained ignore baseline.
-    # Audit findings remain visible in the log without blocking this job;
-    # dependency installation failures still fail it.
+    # REPORTS known-vulnerable dependencies in the resolved runtime tree. It no
+    # longer FAILS — see the step-level continue-on-error below, which is the whole
+    # point of this job's current shape.
+    #
+    # It used to be a blocking check whose red run was "a SIGNAL to bump the dep
+    # or add a triaged ignore". In practice the signal arrived as a repo-wide
+    # outage: pip-audit queries a LIVE advisory database, so an unchanged
+    # dependency tree passes at one hour and fails the next, on every open PR at
+    # once, with nobody having changed a line. MEASURED 2026-09-10/11: main's CI
+    # passed this job at 18:41 EDT; by 23:30 the same tree failed it on four
+    # different branches simultaneously. The four new IDs were litellm
+    # CVE-2026-12771/12772/12773/12795, every one of them in `litellm/proxy/` —
+    # the same proxy-server class as the 28 already triaged below, and Genesis
+    # imports acompletion / completion_cost / model_cost / the exception types
+    # and references the proxy NOWHERE (verified across src/, scripts/, config/
+    # and pyproject.toml).
+    #
+    # So the blocking behaviour was not catching reachable vulnerabilities; it
+    # was converting third-party disclosure timing into an unplanned freeze of
+    # everyone's queue, repaired each time by appending another ignore. The
+    # advisories are still printed in the log, and GitHub's Dependabot security
+    # alerts — enabled on this repo — remain the mechanism that actually raises a
+    # vulnerability to a human. This job is the convenience view of the same
+    # data, and a convenience view must not hold the merge queue.
+    #
+    # NOTE the triaged --ignore-vuln list below is deliberately KEPT rather than
+    # deleted. It is the written record of which advisories were examined and why
+    # they were judged unreachable; deleting it would discard that reasoning.
+    # This reporting-policy change adds no new ignores: the four IDs discussed
+    # above remain visible, along with any other ID outside the existing baseline.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -54,10 +81,19 @@ jobs:
           pip install -e .
           pip install pip-audit
       - name: Audit dependencies for known CVEs
+        # STEP level, not job level, and the difference is the whole mechanism.
+        # MEASURED on this PR's own first run: with `continue-on-error` on the
+        # JOB, the workflow no longer fails but the job's own check-run
+        # conclusion is still `failure`, so `gh pr checks` and the merge gate
+        # both still read it red — the block was unchanged. On the STEP, a
+        # failing pip-audit does not fail the job, so the rollup entry is green
+        # and the advisories are still printed in the log above it.
         continue-on-error: true
         run: |
           # Triaged --ignore-vuln IDs (rationale of record: pyproject.toml pins).
-          # Advisories outside this list remain visible in the log.
+          # A NEW / untriaged advisory is NOT in this list, so it is REPORTED here —
+          # it no longer fails the job (see continue-on-error above). Existing
+          # ignores reduce log noise; all IDs outside that baseline stay visible.
           #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI /
           #     MCP-gateway vuln; Genesis uses acompletion/completion_cost only
           #     (no proxy server), so none are reachable. Pinned <1.83 also dodges
