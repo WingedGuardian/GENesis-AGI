@@ -125,6 +125,11 @@ class TestNesting:
     def test_bash_cl_bundle(self):
         assert any(s.exe == "echo" for s in sp.analyze("bash -cl 'echo hello'"))
 
+    def test_bash_co_value_taking_option_bundle(self):
+        assert any(s.exe == "echo" for s in sp.analyze("bash -co pipefail 'echo hello'"))
+
+    def test_bash_Oc_value_taking_option_bundle(self):assert any(s.exe == "echo" for s in sp.analyze("bash -Oc extglob 'echo hello'"))
+
     def test_bash_ec_bundle_still_works(self):
         assert any(s.exe == "echo" for s in sp.analyze("bash -ec 'echo hello'"))
 
@@ -322,6 +327,13 @@ class TestCommandPositionStrip:
     def test_subshell_spaced(self):
         assert self._detects("( git clean -f )", "git", "clean")
 
+    def test_case_selector_ending_in_paren(self):
+        assert self._detects(
+            'case "$(printf b)" in b) git push origin main ;; esac',
+            "git",
+            "push",
+        )
+
     def test_subshell_glued(self):
         assert self._detects("(git clean -f)", "git", "clean")
 
@@ -350,6 +362,12 @@ class TestCommandPositionStrip:
     def test_function_body_command(self):
         assert self._detects("f() { echo hello; }", "echo")
 
+    def test_function_body_command_with_spaced_parens(self):
+        assert self._detects("f () { echo hello; }", "echo")
+
+    def test_function_body_git_push_with_spaced_parens(self):
+        assert self._detects("f () { git push origin main; }", "git", "push")
+
     def test_function_keyword_body_command(self):
         assert self._detects("function f { echo hello; }", "echo")
 
@@ -359,10 +377,23 @@ class TestCommandPositionStrip:
     def test_named_coproc_compound_body_command(self):
         assert self._detects("coproc worker { rm -rf /tmp/scratch; }", "rm")
 
-    @pytest.mark.parametrize("opener, closer", [("(", ")"), ("if true; then", "fi"), ("while false; do", "done")])
-    def test_named_coproc_other_compound_body_command(self, opener, closer):
-        assert self._detects(f"coproc worker {opener} rm -rf /tmp/scratch; {closer}", "rm")
+    @pytest.mark.parametrize(
+       "opener, closer",
+       [("(", ")"), ("if true; then", "fi"), ("while false; do", "done")],
+    )
 
+    def test_named_coproc_other_compound_body_command(self, opener, closer):
+       assert self._detects(
+          f"coproc worker {opener} rm -rf /tmp/scratch; {closer}",
+          "rm",
+       )
+
+    def test_coproc_named_subshell_command(self):
+       assert self._detects(
+          "coproc worker (git push origin main)",
+          "git",
+          "push",
+       )
     def test_glued_rm(self):
         assert self._detects("(rm -rf ~)", "rm")
 

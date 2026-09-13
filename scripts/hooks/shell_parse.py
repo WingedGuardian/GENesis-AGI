@@ -1313,15 +1313,30 @@ _C_BUNDLE_OPTIONS = {
 def _coproc_body(argv: list[str]) -> list[str]:
     """The command run by ``coproc``, dropping its optional compound name."""
     body = argv[1:]
-    # ``coproc NAME COMPOUND-COMMAND`` gives NAME to the coprocess.  For
+
+    # ``coproc NAME COMPOUND-COMMAND`` gives NAME to the coprocess. For
     # ``coproc NAME command`` NAME is the command itself, so only strip it when
     # the following token can open Bash's compound-command grammar.
     if (
         len(body) > 1
-        and body[1] in {"{", "(", "if", "while", "until", "for", "case", "select", "function"}
+        and (
+            body[1] in {
+                "{",
+                "(",
+                "if",
+                "while",
+                "until",
+                "for",
+                "case",
+                "select",
+                "function",
+            }
+            or body[1].startswith("(")
+        )
         and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", body[0])
     ):
         body = body[1:]
+
     return body
 
 
@@ -1331,9 +1346,15 @@ def _embedded_commands(argv: list[str]) -> list[str]:
         return []
 
     if argv[0] == "case":
-        for i, token in enumerate(argv[1:], 1):
+        try:
+           start = argv.index("in") + 1
+        except ValueError:
+            return []
+
+        for i, token in enumerate(argv[start:], start):
             if token.endswith(")") and i + 1 < len(argv):
-               return [shlex.join(argv[i + 1 :])]
+                return [shlex.join(argv[i + 1 :])]
+
         return []
 
     if argv[0].endswith(")") and len(argv) > 1:
@@ -1346,8 +1367,21 @@ def _embedded_commands(argv: list[str]) -> list[str]:
             return []
         return [shlex.join(argv[start:])]
 
-    if _FUNCTION_DEF.match(argv[0]) and len(argv) > 2 and argv[1] == "{":
-        return [shlex.join(argv[2:])]
+    if (
+        (
+         _FUNCTION_DEF.match(argv[0])
+         and len(argv) > 2
+         and argv[1] == "{"
+        )
+    or  (
+         len(argv) > 3
+         and argv[0].isidentifier()
+         and argv[1] == "()"
+         and argv[2] == "{"
+        )
+    ):
+        start = 2 if argv[1] == "{" else 3
+        return [shlex.join(argv[start:])]
 
     if argv[0] == "coproc" and len(argv) > 1:
         return [shlex.join(_coproc_body(argv))]
@@ -1546,19 +1580,42 @@ def _substitutions(text: str) -> list[str]:
 def _nested_script(argv: list[str], interpreter: str) -> str:
     """The script string passed to an interpreter's ``-c``, else ''.
 
-    Stops at ``--`` and a lone ``-``, which end option processing.  A combined
+    Stops at ``--`` and a lone ``-``, which end option processing. A combined
     option is accepted only when every letter is valid for this interpreter;
     ``bash -cz`` is rejected by Bash and does not run a script.
     """
     allowed = _C_BUNDLE_OPTIONS[interpreter]
+
     for i, tok in enumerate(argv[1:], 1):
         if tok in {"-", "--"}:
             break
         if not tok.startswith("-"):
             continue
+
         options = tok[1:]
-        if "c" not in options or not set(options) <= allowed:
+        if "c" not in options:
             continue
+
+        pos = tok.find("c")
+
+        # `-co` / `-Oc`: `o` / `O` consumes the next token as its value,
+        # so the script is the token after that value.
+        value_taking = (
+            (pos + 1 < len(tok) and tok[pos + 1] in {"o", "O"})
+            or (pos > 0 and tok[pos - 1] in {"o", "O"})
+        )
+
+        if value_taking:
+            option_letters = set(options) - {"o", "O"}
+            if not option_letters <= allowed:
+                continue
+            if i + 2 < len(argv):
+                return argv[i + 2]
+            continue
+
+        if not set(options) <= allowed:
+            continue
+
         if i + 1 < len(argv):
             return argv[i + 1]
 
