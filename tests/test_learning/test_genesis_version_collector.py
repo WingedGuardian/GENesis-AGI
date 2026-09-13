@@ -610,3 +610,50 @@ async def test_the_untagged_fallback_measures_the_same_thing(tagged_repo, db):
         behind, _ = await collector._check_upstream()
     fallback.assert_awaited_once()
     assert behind == 2
+
+
+def _count_returns(collector, value):
+    """Stub only the `rev-list --count` call; everything else stays real."""
+    original = collector._git_output
+
+    async def _stub(*args):
+        if args[:2] == ("rev-list", "--count"):
+            return value
+        return await original(*args)
+
+    return patch.object(collector, "_git_output", side_effect=_stub)
+
+
+@pytest.mark.asyncio
+async def test_an_unmeasurable_distance_raises_instead_of_reporting_one(tagged_repo, db):
+    """A failed count must not become a number.
+
+    The docstring on `_check_upstream` promises RuntimeError on git failure, and
+    it used to substitute 1 instead — which reached the reader as "New Genesis
+    version available (1 commit(s) behind)" beside an EMPTY change list. That is
+    the same defect the release-span fix was about: a statement about the reader
+    that nobody measured, wearing the grammar of one that was. The caller logs
+    and skips the cycle, so refusing costs one quiet cycle.
+    """
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo), _count_returns(
+        collector, None
+    ), pytest.raises(RuntimeError, match="distance unknown"):
+        await collector._check_upstream()
+
+
+@pytest.mark.asyncio
+async def test_a_measured_zero_stays_zero_when_the_tags_differ(tagged_repo, db):
+    """`max(behind, 1)` announced an update that did not exist for this reader.
+
+    Differing tags with a deployed commit that is NOT behind the ref is a real
+    state — a local tag, or a tree at the tip whose tag has not moved. The
+    reader's distance there is 0, and the caller's `if behind > 0` is what keeps
+    it quiet. Clamping to 1 defeated that from inside.
+    """
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo), _count_returns(
+        collector, "0"
+    ):
+        behind, _ = await collector._check_upstream()
+    assert behind == 0, "a measured zero must survive; max(behind, 1) fabricated an update"

@@ -158,11 +158,16 @@ from shell_parse import (  # noqa: E402
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
 # analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
-# destructive flags — because the outcome there is an approval PROMPT, not a
-# block: an over-match costs one confirmation, while an under-match silently
-# runs an unverified publish. (An earlier flag-only, hard-block version had to be
-# surgically precise, and precision is exactly what an unreliable parse cannot
-# deliver — every narrowing conjunct became a new way to starve the trigger.)
+# destructive flags.
+#
+# The breadth SURVIVES the 2026-09-08 ruling that made the outcome a DENY rather
+# than a prompt, and the reason has changed with it: an over-match now costs the
+# AGENT one rewrite that the deny message spells out, where it used to cost a
+# human one confirmation. An under-match still silently runs an unverified
+# publish. The asymmetry is intact, so do NOT narrow this — an earlier
+# flag-only, hard-block version had to be surgically precise, and precision is
+# exactly what an unreliable parse cannot deliver: every narrowing conjunct
+# became a new way to starve the trigger (measured).
 _GATED_MENTION = re.compile(
     r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
 )
@@ -204,6 +209,12 @@ try:
     import push_allowlist  # noqa: E402 — scripts/hooks is on sys.path[0]
 except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
     push_allowlist = None
+
+try:
+    import discarded_write  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — same rationale: an unguarded import failure would
+    # abort module load → exit 1 → CC reads non-2 as NON-blocking → the push RUNS.
+    discarded_write = None
 
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
@@ -7640,6 +7651,13 @@ def _ask(reason: str) -> int:
     """
     global _ASK_EMITTED
     _ASK_EMITTED = True
+    # Nothing is discarded YET here — the decision is still open — so this warns
+    # about what DECLINING costs, which is the thing a "block the push?" dialog
+    # otherwise hides.
+    if discarded_write is not None:
+        extra = discarded_write.prompt_note()
+        if extra:
+            reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {
@@ -7773,6 +7791,46 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
         return True  # fail-safe → gate
 
 
+def _main_with_note() -> int:
+    """``main`` plus the discarded-command note on every refusal.
+
+    ``main`` delegates to ``_run_merge_and_push_gates``, which holds 28 separate
+    ``return 2`` sites (AST count) and has no ``_deny`` chokepoint, so wrapping the
+    entry point is the only way to cover them all without editing 28 places — and
+    without a 29th being added noteless tomorrow, which is the failure this shape
+    exists to make impossible. ``main`` returns that code unchanged, so the wrapper
+    sees every one of them.
+
+    That delegation is NEW: when this wrapper was written, the 28 sites were inside
+    ``main`` itself and this docstring counted them there. The gates were extracted
+    in the interval, which moved every site out of the function named here while
+    leaving the wrapper correct — so the sentence explaining WHY the wrapper exists
+    described a function with none of them. Pinned now by
+    ``test_live_a_refusal_from_the_extracted_gates_carries_the_note``, because the
+    invariant that extraction could have broken silently — ``main`` returning the
+    gate's own rc — was locked by nothing but this prose.
+
+    The note is emitted ONLY on a refusal; every other verdict is passed through
+    untouched, and the return value is never altered.
+    """
+    try:
+        rc = main()
+    except BaseException:
+        # An EXCEPTION is also a refusal here: `run_guard` converts it to exit 2,
+        # so the whole command is discarded just as deliberately as on a `return
+        # 2` — but the reader only sees "GUARD ERROR ... failing CLOSED" and is
+        # told nothing about the write two steps earlier. MEASURED: a crash
+        # injected after the command is remembered gave rc=2 with the note
+        # ABSENT. `finally` would run on the allow path too, so the note is
+        # emitted here, on the raising path only.
+        if discarded_write is not None:
+            discarded_write.warn()
+        raise
+    if rc == 2 and discarded_write is not None:
+        discarded_write.warn()
+    return rc
+
+
 def main() -> int:
     """Run the guard, then record any override sigils with the verdict they got.
 
@@ -7804,9 +7862,13 @@ def main() -> int:
 
 
 def _run_merge_and_push_gates() -> int:
+    # An armed refusal must survive the malformed-payload exception tail.
+    blind_spot_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd:
             return 0
 
@@ -7824,101 +7886,32 @@ def _run_merge_and_push_gates() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
-        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
-        # list is NOT evidence that no gated command is present: an ANSI-C
-        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
-        # a real, executing `git push --force` from the parse (reproduced on both
-        # guards). When the raw text names a gated op, the command will not
-        # tokenize, and the parse surfaced NO matching segment, the verdict is
-        # "unknown" — which earns a human decision, not a silent allow.
-        #
-        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
-        # precise about which unparseable commands are real, and precision is
-        # exactly what an unreliable parse cannot deliver — every narrowing
-        # conjunct became a new way to starve the trigger, while over-blocking
-        # broke benign shapes. Asking inverts the costs: a false positive is one
-        # confirmation, a miss is the pre-existing status quo. That is what lets
-        # the predicate stay broad.
-        #
-        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
-        # above) so every hard block below — sqlite writes, --no-verify, the
-        # dispatched publish denies, the escalation cap — still takes precedence.
-        # Returning here would DOWNGRADE those to a prompt (measured).
-        # The segment check names ALL FOUR gated ops, not the three the first cut
-        # listed. `create_segs` is LOAD-BEARING — do not remove it.
-        #
-        # An earlier version of this comment claimed the opposite: that it was
-        # symmetry only, and mutation-tested to change no verdict. That claim was
-        # WRONG, and wrong in the direction that invites deleting the conjunct.
-        # Its four cells varied parse state (interactive/dispatched x
-        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
-        # all assumed a create that was already gated. The axis that matters is
-        # whether the create is gated at all: for one the real gate ALLOWS (a
-        # branch already on the remote, so no publish risk), dropping this
-        # conjunct lets the net fire on an untokenizable-but-benign create and
-        # turns an allow into a prompt, or into a refusal when unattended.
-        #
-        # A mutation test proves nothing about an axis its cells do not vary.
-        blind_spot_reason: str | None = None
+        # ── Blind-spot net: unverifiable near a gated op → DENY ────────────
+        # Keep the broad raw-mention predicate: a failed parse cannot prove an
+        # operation absent. User ruling 2026-09-08: an ambiguous command costs
+        # the agent a rewrite, not the human an approval click. The only asks
+        # remain deliberate publishing. Current parser bounds still refuse.
+        # All FOUR parsed-operation exclusions matter: an already-published
+        # gh pr create must retain its normal allow path.
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
             and blind is not None
             and _mentions_gated_op(cmd)
         ):
-            if blind.bounds_induced:
-                # The DEPTH bound refuses outright, interactive or not, and the
-                # asymmetry between the two bounds is measured rather than felt.
-                # Across this install's history the deepest real nesting is 4
-                # against a bound of 5 — see the distribution recorded with
-                # `shell_parse.MAX_SUBSTITUTION_DEPTH`, which is the one place it
-                # is derived. Nothing legitimate reaches the bound, and a command
-                # that does is not a shape ordinary work produces. It is also the
-                # axis the decoy attacks use: a visible benign `git push` with a
-                # force push buried past the bound, which reaches an approval
-                # prompt describing the decoy. A human approving what looks like an
-                # ordinary push is not a gate on the operation actually hidden
-                # there. Length still asks — a long here-doc IS ordinary work.
-                print(
-                    f"BLOCKED: this command {blind.cause} and names a gated "
-                    "operation, so the guard cannot see every publish it would "
-                    "run. A command can carry a second, hidden one past the point "
-                    "the parser stops — approving the visible one would approve "
-                    f"that too.\nTo proceed: {blind.hint}.",
-                    file=sys.stderr,
-                )
-                return 2
-            if _is_dispatched():
-                # No human is present to answer a prompt, and an unverifiable
-                # gated command must not proceed unattended. Mirrors the
-                # dispatched deny legs on the push / pr-create asks below.
-                print(
-                    f"BLOCKED: this command {blind.cause} and names a gated "
-                    "operation. Autonomous sessions cannot proceed on an "
-                    "unverifiable command.\n"
-                    f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
-                    "message, a plan, review notes) whose content merely mentions "
-                    "push or merge, use the Write tool instead of a here-doc. If "
-                    "you are RUNNING a git command, rewrite it in a "
-                    "directly-parseable form (plain quotes, or -F <file>).",
-                    file=sys.stderr,
-                )
-                # The advice above is load-bearing, not decoration. An
-                # unattended session cannot ask what it did wrong, so a refusal
-                # it cannot act on is a wall rather than a cost — which is the
-                # whole basis for refusing here at all. MEASURED: the dominant
-                # real shape that reaches this leg is prose-to-a-file, and the
-                # previous message's only suggestion ("rewrite it in a
-                # directly-parseable form") does not apply to it.
-                return 2
-            blind_spot_reason = (
-                f"This command {blind.cause} and mentions a gated operation "
-                "(push / merge / gh pr create / --force / --no-verify / --admin), "
-                "so the guard cannot verify what it would actually run. Approve "
-                f"only if you are sure. To avoid the prompt: {blind.hint}, or "
-                "rewrite it in a directly-parseable form (plain quotes, or "
-                "-F <file>)."
+            # Defer the syntax refusal so specific sqlite/no-verify blocks keep
+            # their sharper diagnostics. Bounds keep main's immediate refusal.
+            blind_spot_deny = (
+                f"BLOCKED: this command {blind.cause} and mentions a gated "
+                "operation, so the guard cannot verify what it would actually run.\n"
+                f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                "message, a plan, review notes) whose content merely mentions "
+                "push or merge, use the Write tool instead of a here-doc. If "
+                "you are RUNNING a git command, rewrite it in a "
+                "directly-parseable form (plain quotes, or -F <file>)."
             )
+            if blind.bounds_induced:
+                print(blind_spot_deny, file=sys.stderr)
+                return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -8717,8 +8710,9 @@ def _run_merge_and_push_gates() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
-        if ask_reason is None and blind_spot_reason is not None:
-            ask_reason = blind_spot_reason
+        if blind_spot_deny is not None:
+            print(blind_spot_deny, file=sys.stderr)
+            return 2
         if ask_reason is not None:
             return _ask(ask_reason)
 
@@ -8741,6 +8735,9 @@ def _run_merge_and_push_gates() -> int:
             )
 
     except (json.JSONDecodeError, KeyError):
+        if blind_spot_deny is not None:
+            print(blind_spot_deny, file=sys.stderr)
+            return 2
         # A malformed/partial payload is a parse-ambiguity fail-open (matches the
         # sibling guards). Any OTHER exception is an orchestration BUG and must
         # NOT silently allow a push/merge — it propagates to run_guard(), which
@@ -8968,4 +8965,4 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
-    run_guard(main, "git_push_guard")
+    run_guard(_main_with_note, "git_push_guard")

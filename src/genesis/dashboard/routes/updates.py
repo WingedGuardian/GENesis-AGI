@@ -209,10 +209,18 @@ def update_check():
     # shape is observability/snapshots/deploy_health.py's
     # `commits_behind_upstream`.
     behind_str = _git("rev-list", "--count", "HEAD..origin/main")
-    # Preserve the existing differing-release fallback when git cannot count.
-    # A failed measurement must not clear a known update from the dashboard.
-    fallback = 1 if local_tag and origin_tag else 0
-    commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else fallback
+    if behind_str is None or not behind_str.isdigit():
+        # A failed measurement is not a distance, and every number we could
+        # invent here is a lie in one direction or the other: 0 renders as "up
+        # to date" and CLEARS a known update, while 1 fabricates a distance
+        # nobody counted. Both wear the grammar of a measurement — the exact
+        # defect this endpoint was changed to stop telling. Report the failure
+        # through the same 502 the fetch failure above already uses, which the
+        # dashboard surfaces as "Check failed" and which cannot overwrite a
+        # previously detected update.
+        logger.error("git rev-list HEAD..origin/main failed; distance unknown")
+        return jsonify({"error": "could not measure distance from origin/main"}), 502
+    commits_behind = int(behind_str)
     summary = (
         _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
         if commits_behind > 0

@@ -294,7 +294,17 @@ class GenesisVersionCollector:
             # and its field name says so: `commits_behind_upstream`, counted
             # `HEAD..@{upstream}`. This is the same measurement.
             count_str = await self._git_output("rev-list", "--count", f"HEAD..{ref}")
-            behind = int(count_str) if count_str and count_str.isdigit() else 1
+            if count_str is None or not count_str.isdigit():
+                # Honour the docstring above rather than substituting a 1. A
+                # fabricated distance is the same defect as the tag-span one
+                # this method was rewritten to fix: it is false about the
+                # reader while wearing verified grammar. The caller logs and
+                # skips the cycle, so the cost of raising is one quiet cycle,
+                # against a notification that names a number nobody counted.
+                raise RuntimeError(
+                    f"git rev-list --count HEAD..{ref} failed; distance unknown"
+                )
+            behind = int(count_str)
 
             # The summary must describe the SAME range as the count, or the two
             # halves of one alert disagree: the tag-range version ended "... and
@@ -309,7 +319,12 @@ class GenesisVersionCollector:
             if len(lines) > 10:
                 summary = "\n".join(lines[:10]) + f"\n... and {len(lines) - 10} more"
 
-            return max(behind, 1), summary
+            # No max(behind, 1): when the tags differ but the deployed commit is
+            # not behind the ref, the reader's distance genuinely is 0 and the
+            # caller correctly stays silent. Clamping it to 1 announced an update
+            # that did not exist for this reader, which is the same class of
+            # falsehood as counting the release span.
+            return behind, summary
 
         # Same tag — up to date
         return 0, ""

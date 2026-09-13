@@ -31,6 +31,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, field, read_payload, run_guard  # noqa: E402
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would abort
+    # module load → exit 1 → CC reads non-2 as NON-blocking → the rm RUNS.
+    discarded_write = None  # type: ignore[assignment]
+
 # Legacy single-token pattern — kept as the fallback when shlex cannot
 # tokenize the command (unmatched quotes etc.).
 _RM_RF_PATTERN = re.compile(
@@ -217,6 +223,8 @@ def _rm_violations(cmd: str) -> list[str] | None:
 def main() -> int:
     try:
         cmd = field(read_payload(), "command")
+        if discarded_write is not None:
+            discarded_write.remember(cmd)
         if not cmd or "rm" not in cmd:
             return 0
 
@@ -238,6 +246,8 @@ def main() -> int:
                 "If intentional, ask the user to confirm.",
                 file=sys.stderr,
             )
+            if discarded_write is not None:
+                discarded_write.warn()
             return 2
 
     except (json.JSONDecodeError, KeyError):

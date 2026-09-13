@@ -62,6 +62,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
 from shell_parse import analyze_checked  # noqa: E402
 
+try:  # noqa: E402
+    import discarded_write
+except Exception:  # noqa: BLE001 — GUARDED ON PURPOSE: an unguarded import that
+    # failed would abort module load → exit 1 → CC reads non-2 as NON-blocking →
+    # the rm RUNS. A cosmetic note must never fail this guard open.
+    discarded_write = None  # type: ignore[assignment]
+
 # Directories that must never be deleted.  Relative to $HOME.
 _PROTECTED_RELATIVE = [
     ".claude/projects",  # CC session transcripts (JSONL)
@@ -198,6 +205,8 @@ def _block(reason: str) -> int:
         "them exactly (no globs).",
         file=sys.stderr,
     )
+    if discarded_write is not None:
+        discarded_write.warn()
     return 2
 
 
@@ -206,6 +215,10 @@ def main() -> int:
     cmd = tool_input(payload).get("command", "")
     if not cmd or not isinstance(cmd, str):
         return 0
+    # Hand it over once, here: stdin is already consumed, and _block takes only a
+    # reason so it cannot reach the command itself.
+    if discarded_write is not None:
+        discarded_write.remember(cmd)
 
     # Fast path: no rm/rmdir word anywhere in the command.
     if not _RM_PATTERN.search(cmd):

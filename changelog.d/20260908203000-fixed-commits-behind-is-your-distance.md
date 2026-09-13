@@ -13,3 +13,11 @@
   next to a figure the reader takes as their own. A third place in the codebase
   already measured this correctly and its field name said so; the two that were
   wrong shared a name that did not.
+
+  The same rule is now applied to the cases where the count cannot be taken at
+  all. When the distance could not be measured, one of these reported "1 commit
+  behind" beside an empty list of changes, and the other reported zero — which
+  renders as "up to date" and cleared a real pending update from the dashboard.
+  Neither number had been counted. A measurement that failed now says it failed,
+  and a measured zero is left alone instead of being rounded up to an update that
+  does not exist for this reader.

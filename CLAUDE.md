@@ -533,6 +533,16 @@ behind the writer, and 7 were a guard since removed.
   whether one was requested. It reads published reviews only, so "never triggered"
   and "triggered, still running" are the SAME output; if you have not just requested
   one, request one rather than reading that line as proof nobody did.
+  **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
+  own schedule. An unresolved **Critical or Major** inline finding on a file in
+  the PR diff scores 1.0 — enough to block a merge by itself, the same weight as
+  a Codex P1 — unless the configured documentation-path exclusion applies.
+  Maintainer-replied findings and findings on files outside the PR diff do not
+  score; under the shipped `doc_findings: skip`, documentation findings do not
+  score either. Until 2026-09-10 it was
+  named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
+  "review is clear" and were surprised by the score. Read the `inline-findings` row,
+  not just the Codex row.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
@@ -556,6 +566,11 @@ behind the writer, and 7 were a guard since removed.
   3 silently discards steps 1 and 2 while the error text mentions only step 3.
   Never chain a state-changing step (`cd`, heredoc, file write,
   restore-from-backup) with one a guard can block (test run, commit, push).
+  Most guards now append a note saying the whole command went whenever the
+  command had more than one step — a REMINDER, never a report: it names nothing
+  and cannot tell you which step mattered, so it does not replace the check. The
+  shell blockers (`bash_safety_hook.sh` and the inline `settings.json` one) do
+  NOT carry it yet, so its ABSENCE never means the command was single-step.
   After any block, run `pwd` and re-check the file you believed you wrote —
   never assume the earlier half ran. Prefer `git -C <literal path>` and
   `$ROOT/scripts/…` over a persistent `cd`, so a lost `cd` cannot silently
