@@ -269,6 +269,15 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # marker) BEFORE our asyncio watchdog kills the process group. One source of truth
 # for the "graceful truncation beats hard kill" invariant.
 _BG_WAIT_HARD_MARGIN_MS = 60_000
+# MCP server CONNECT timeout for dispatched sessions, as a string because it goes
+# straight into the child's environment. MUST stay in step with the MCP_TIMEOUT in
+# the repo's .claude/settings.json, which covers foreground sessions only — the two
+# cannot share a constant (one is JSON read by CC, one is Python read by us), so
+# they are kept honest by tests/test_cc/test_invoker_mcp_timeout.py instead.
+#
+# 120s is ~11x the measured typical connect and ~4.7x the worst SUCCESSFUL one
+# (25,395ms against CC's 30,000ms default, which is what made a drop possible).
+_MCP_CONNECT_TIMEOUT_MS = "120000"
 # Grace granted to surviving DESCENDANTS after the leader exits post-terminate,
 # before the group-kill escalation (reap_bounded waits only on the leader, so
 # without this a still-flushing MCP child gets zero grace of its own).
@@ -590,6 +599,22 @@ class CCInvoker:
             env.pop("GENESIS_PARENT_SPAN_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
+        # MCP server CONNECT timeout. The repo's .claude/settings.json carries the
+        # same value for foreground sessions, but a DISPATCHED session cannot read
+        # it: it runs with a cwd outside any git repo, so CC never loads the repo
+        # settings at all (see the --settings comment in _build_args, which exists
+        # for exactly that reason). Without this line the whole background fleet —
+        # reflection, research, sentinel, direct sessions — keeps CC's 30s default.
+        #
+        # That is the half that matters most. A server dropped on connect is gone
+        # for the life of the process and nothing announces it, so a foreground
+        # session at least has someone present to notice the tools are missing. An
+        # unattended one does not: it runs to completion believing it had memory.
+        #
+        # setdefault, matching the ceiling below: an operator's own MCP_TIMEOUT
+        # inherited from os.environ wins, and an explicit env_overrides entry
+        # (applied last) wins over both.
+        env.setdefault("MCP_TIMEOUT", _MCP_CONNECT_TIMEOUT_MS)
         # Own the headless background-task wait ceiling for lanes that run long
         # dispatched work. Clamp strictly below the hard timeout_s so the CLI's
         # graceful truncation + partial flush always precedes our SIGKILL. An
