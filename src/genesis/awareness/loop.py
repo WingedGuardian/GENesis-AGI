@@ -1490,6 +1490,145 @@ async def _check_context_injection_health(db) -> None:
         logger.warning("Failed context-injection health check", exc_info=True)
 
 
+_CODE_INTEL_SUPERSEDED_NOTE = "superseded by current code-intel index state"
+
+
+def _code_intel_headline(health) -> str:
+    """The headline must describe the state that was actually found.
+
+    `derive_findings` can return a list whose only member is the DEGRADED
+    finding — one unreadable marker file beside a perfectly healthy index. A
+    fixed "ANSWERING FROM NOTHING" prefix asserts an outage that did not happen,
+    which is the same class of false confidence as a silent failure, pointed the
+    other way.
+    """
+    if health.index_state != "ok" or health.euthanized:
+        return "CODE INTELLIGENCE IS ANSWERING FROM NOTHING — "
+    return "code-intel health check could not complete — "
+
+
+def _code_intel_recovery(health) -> str:
+    """Recovery text for the state actually found, never a fixed script.
+
+    The euthanized remedy ("clear the marker so the runner retries") is ACTIVELY
+    DESTRUCTIVE for a starved PENDING request: there is no euthanized marker to
+    clear, and deleting the pending one removes the only thing that would ever
+    cause the index to be built — turning a self-healing state into a permanent
+    one, on the instruction of the alert meant to repair it.
+    """
+    if health.euthanized:
+        return (
+            " Recovery: clear the euthanized marker in ~/.genesis/index-requests "
+            "so the runner retries (it is a terminal state — nothing retries it "
+            "on its own), then watch ~/.genesis/code-intelligence-runner.log. "
+        )
+    if health.index_state == "absent":
+        return (
+            " Recovery: the request is still PENDING and has waited past the "
+            "runner's own relax window, so the runner never found a window it "
+            "would act in — check that genesis-code-intel.timer is enabled and "
+            "that genesis-code-intel-freeze is not armed, then watch "
+            "~/.genesis/code-intelligence-runner.log. Do NOT delete the pending "
+            "marker: it is the only thing that will build the index. "
+        )
+    return " Watch ~/.genesis/code-intelligence-runner.log. "
+
+
+async def _check_code_intel_health(db) -> None:
+    """Alert when the code index is dead, corrupt, or permanently abandoned.
+
+    Same generator as the context-injection watcher one subsystem over: the
+    indexer DOES detect its own failures — it logged ``index failed`` 35 times
+    and euthanized the main repo's request after 5 attempts — but it records
+    them in a log file and a marker nothing reads. MEASURED 2026-09-05: the main
+    repo's index sat as a 164 MB ``.db.corrupt`` for two weeks while
+    ``list_projects`` reported only a worktree whose root no longer exists.
+
+    Reads the indexer's own on-disk artifacts, never the tool's self-report: a
+    crashed indexer cannot report its own health, and its daemon may be gone.
+
+    Priority defaults to ``high`` (morning report), not ``critical``: a dead
+    index degrades tool quality, it does not lose the user's data or context.
+
+    Best-effort — the whole body is guarded and never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.awareness import code_intel_health_config as _cfg_mod
+        from genesis.observability.snapshots.code_intel_health import (
+            alert_identity,
+            collect,
+            derive_findings,
+        )
+
+        if not _cfg_mod.is_enabled():
+            # Resolve on the way out: disabling a check must not leave its last
+            # alert standing forever on the health and outreach surfaces.
+            await observations.resolve_by_source_and_type(
+                db,
+                source="code_intel_health_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="code-intel health check disabled",
+            )
+            return
+
+        cfg = _cfg_mod.load_config()
+        health = await asyncio.to_thread(
+            collect, indexed_path=_cfg_mod.indexed_path(cfg)
+        )
+        findings = derive_findings(health)
+        if not findings:
+            await observations.resolve_by_source_and_type(
+                db,
+                source="code_intel_health_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="code index present and no abandoned index requests",
+            )
+            return
+
+        alert_key = alert_identity(health)
+        content_hash = hashlib.sha256(f"code_intel:{alert_key}".encode()).hexdigest()
+        await observations.supersede_except_hash(
+            db,
+            source="code_intel_health_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_CODE_INTEL_SUPERSEDED_NOTE,
+        )
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="code_intel_health_monitor",
+            type="infrastructure_alert",
+            content=(
+                _code_intel_headline(health)
+                + " | ".join(findings)
+                + _code_intel_recovery(health)
+                + "If it dies again with "
+                "rc=143 it is being killed under the memory cap: the indexed "
+                "path is decided by whoever WRITES the marker (post-commit hook, "
+                "disk_reclaim, the gitnexus surplus job — all repo-root), so "
+                "narrowing it means re-pointing those writers AND setting "
+                "config/code_intel_health.yaml:indexed_path to match. Setting "
+                "indexed_path alone only moves what this check looks for, and "
+                "would report ABSENT forever."
+            ),
+            priority=_cfg_mod.alert_priority(cfg),
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        # WARNING, not debug: a crash here is indistinguishable from "nothing to
+        # report" on every operator-visible surface — the exact failure mode
+        # this check exists to catch, applied to itself.
+        logger.warning("Failed code-intel health check", exc_info=True)
+
+
 def _created_before(row: dict, cutoff: datetime) -> bool:
     """True if the row's created_at is older than cutoff (grace boundary).
 
@@ -3296,6 +3435,11 @@ class AwarenessLoop:
                     # rows gain a trigger or close.
                     await _check_follow_up_watchdog(self._db)
                     await _check_context_injection_health(self._db)
+                    # Code-intel index health: a permanently-abandoned index
+                    # request or a corrupt/absent index for the configured
+                    # target. Same silent-failure class one subsystem over —
+                    # the indexer logs its failures where nothing reads them.
+                    await _check_code_intel_health(self._db)
                     # Ego liveness: an ego completing NO real cycle well past its
                     # cadence (job_health.last_success gap), NOT the is_running /
                     # heartbeat proxies that stay green while deadlocked.
