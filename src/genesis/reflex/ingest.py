@@ -100,8 +100,21 @@ class ReflexIngestor:
             # payload in fact never carried error_type at all — every task.failed
             # was silently dropped HERE, and the false invariant is why nobody
             # looked. A claim about another file's emit belongs in a test, not a
-            # comment: `tests/test_reflex/test_severity_seam.py` now pins both
-            # admission axes for every reflex-owned emit site.
+            # comment. What pins the two emitters is a FUNNEL test each, driving
+            # the real producer into the real consumer:
+            # `tests/test_reflex/test_task_failed_funnel.py` and
+            # `tests/test_runtime/test_job_failure_funnel.py`.
+            #
+            # A THIRD emitter is NOT covered by either, and one admission form
+            # is therefore still a convention rather than a guarantee:
+            # `util/tasks.py` builds this payload by hand (and issue #1970 shows
+            # it can raise and emit nothing at all). Issue #1969's
+            # `emit_failure()` chokepoint is what makes the contract
+            # unconstructible instead of remembered — until it lands, a new
+            # emitter of an existing type is the gap. A scanner over every emit
+            # site was tried here and deleted: it graded that broken emitter as
+            # passing, because it checked the SHAPE of a call rather than
+            # whether an event arrives.
             error_type = details.get("error_type")
             # behavioral-lint: ignore no-hide-problems — lane-routing, not hiding
             # (see the contract note above; reason-only failures stay visible via

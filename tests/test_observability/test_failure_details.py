@@ -133,8 +133,13 @@ class TestRenderingNeverEscapes:
     dispatch-loop failure and losing the reflex signal for the original
     exception (Codex P2, #1941).
 
-    VERIFY-RED: reverting `_safe_text` to a bare `str(exc)[:500]` makes every
-    test in this class fail with RuntimeError("__str__ exploded").
+    VERIFY-RED: reverting `_safe_text` to a bare `str(exc)[:500]` makes the
+    four RENDERING tests in this class fail with RuntimeError("__str__
+    exploded"). The str-typed-lane test below does not depend on `_safe_text`
+    and is unaffected — stated precisely because the earlier "every test in
+    this class" wording was measurably false once tests were added to the
+    class, which is exactly the docstring-outlives-its-claim shape this file
+    exists to warn about.
     """
 
     def test_failure_details_survives_an_unrenderable_exception(self):
@@ -167,3 +172,25 @@ class TestRenderingNeverEscapes:
                 raise RuntimeError("nope")
 
         assert failure_details(reason=_HostileReason()) == {"error_reason": "<unrenderable>"}
+
+    def test_the_reason_lane_is_str_typed_so_its_dispatch_cannot_run_user_code(self):
+        """Why the `reason` lane needs no containment, recorded so it is not
+        "hardened" again.
+
+        `if reason:` is `str.__bool__` — a C slot, unoverridable on the exact
+        type. Both call sites declare `error: str | None` and pass
+        `reason=None if exc is not None else error`, and both already evaluate
+        `bool(error)` themselves before calling. A round of this PR widened the
+        annotation to `object`, which invented a hazard that then cost two more
+        rounds; the widening was reverted rather than contained further.
+
+        If a caller is ever widened, this test fails to parse the intent — that
+        is the point: change the CALLERS' signatures and this docstring
+        together, not the leaf.
+        """
+        import inspect
+
+        sig = inspect.signature(failure_details)
+        assert str(sig.parameters["reason"].annotation) in ("str | None", "'str | None'"), (
+            "the reason lane's safety rests on it being str-typed — see this docstring"
+        )

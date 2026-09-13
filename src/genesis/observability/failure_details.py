@@ -44,7 +44,7 @@ _MAX_ERROR_CHARS = 500
 def failure_details(
     *,
     exc: BaseException | None = None,
-    reason: object | None = None,
+    reason: str | None = None,
 ) -> dict[str, object]:
     """Build the ``details`` payload for a failure event.
 
@@ -55,9 +55,7 @@ def failure_details(
         precedence over *reason* — an exception is always the stronger signal.
     reason:
         A semantic failure reason with no exception behind it (e.g. a job
-        result's ``reason`` field). Emitted as ``error_reason``. Typed
-        ``object`` rather than ``str``: job results carry arbitrary values
-        here, and rendering them is the callee's job (see ``_safe_text``).
+        result's ``reason`` field). Emitted as ``error_reason``.
 
     Returns
     -------
@@ -73,6 +71,14 @@ def failure_details(
             "error": _safe_text(exc),
             "error_frames": _safe_frames(exc),
         }
+    # `reason` is a str by contract at every call site, so its truthiness is
+    # str.__bool__ — a C slot that cannot be overridden and cannot raise. A
+    # round of this PR widened the annotation to `object` and then spent two
+    # more rounds containing the hazard that widening invented; both call sites
+    # pass `str | None` and already evaluate `bool(error)` themselves one line
+    # earlier, so the containment guarded a gate the caller had walked through.
+    # Reverted rather than hardened further. Widening belongs at the CALLERS'
+    # signatures if it is ever wanted, not at this leaf.
     if reason:
         return {"error_reason": _safe_text(reason)}
     return {}
