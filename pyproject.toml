@@ -33,6 +33,23 @@ dependencies = [
                                   # BUMP BOTH TOGETHER or not at all — locked by
                                   # tests/test_scripts/test_dependency_pins.py, which re-derives the
                                   # coupling from this line AND install.sh rather than trusting it.
+                                  #
+                                  # KNOWN LIMIT, stated rather than hidden: this bound tracks the
+                                  # SHIPPED DEFAULT server, and install.sh does not force that server
+                                  # on anyone — QDRANT_VERSION is overridable, QDRANT_URL may point at
+                                  # a remote of any version, and an already-running server is left
+                                  # alone. An install deliberately on a NEWER server gets a client
+                                  # that is now too old, and a later `pip install -e .` will pull it
+                                  # back down. That is a real cost and it is the reason this comment
+                                  # exists: if you run a non-default server, move BOTH this specifier
+                                  # and QDRANT_VERSION to match it (the test above will tell you when
+                                  # the pair is wrong). Such an install is not made WORSE by the pin —
+                                  # unpinned it would resolve to the newest release (1.19.0 today),
+                                  # which is further from a 1.17 server than 1.15 is — but it does
+                                  # lose the ability to just install a matching client by hand.
+                                  # The deeper problem is that the right client depends on the server
+                                  # version, which is unknown at dependency-resolution time; a static
+                                  # bound is the best instrument available here, not a complete one.
     "pyyaml",
     "httpx",
     "diskcache>=5.6",
