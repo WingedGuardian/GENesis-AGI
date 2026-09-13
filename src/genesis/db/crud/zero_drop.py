@@ -400,13 +400,44 @@ async def ack(
     row = await get(db, class_=class_, branch=branch)
     if row is None or row["status"] == "resolved":
         return None
-    await db.execute(
+    # CONDITIONAL on the state that was read, not just on the id. This runs from
+    # an MCP tool while a DETACHED sweep may be reconciling the same row on
+    # another connection: between the read above and this write the sweep can
+    # resolve the finding, or advance its tip. An unconditional `WHERE id = ?`
+    # would then acknowledge a stale row — resurrecting a resolved condition, or
+    # suppressing work that has CHANGED since the operator looked at it, against
+    # a tip that is no longer current (Codex P2, PR #1794). Both directions end
+    # with the board hiding something, which is the one thing it may not do.
+    #
+    # `tip_sha` is compared with `IS NOT DISTINCT FROM` semantics spelled out
+    # longhand, because it is nullable for a dirty worktree and `= NULL` is
+    # never true in SQL — the bug this guard would otherwise introduce.
+    cursor = await db.execute(
         """UPDATE zero_drop_findings
               SET status = 'acked', ack_reason = ?, acked_at = ?, acked_tip_sha = ?,
                   updated_at = ?
-            WHERE id = ?""",
-        (reason, ts, row["tip_sha"], ts, row["id"]),
+            WHERE id = ?
+              AND status = ?
+              AND (tip_sha IS ? OR tip_sha = ?)""",
+        (reason, ts, row["tip_sha"], ts, row["id"], row["status"], row["tip_sha"], row["tip_sha"]),
     )
+    if cursor.rowcount == 0:
+        # The row moved under us. Treated as NOT FOUND rather than retried: the
+        # operator acknowledged a condition as they saw it, and what is there now
+        # is a different condition that deserves its own look.
+        #
+        # COMMIT, not rollback — and this was a defect in the fix that added
+        # this branch (cross-model review). Unlike the worker, which owns a
+        # short-lived connection, `ack` is reached from an MCP tool running on
+        # the SERVER'S shared `SerializedConnection`. That proxy serializes per
+        # METHOD and its own docstring blesses interleaving at method boundaries
+        # on the grounds that "commit() flushes all pending work" — which makes
+        # `rollback()` the unsafe mirror, because it would discard all pending
+        # work too, including another subsystem's. A zero-row UPDATE has nothing
+        # of its own worth discarding, so committing ends the implicit
+        # transaction just as well and takes nobody else's writes with it.
+        await db.commit()
+        return None
     await db.commit()
     return await get(db, class_=class_, branch=branch)
 

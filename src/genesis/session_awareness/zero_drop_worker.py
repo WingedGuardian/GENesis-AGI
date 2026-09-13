@@ -55,6 +55,7 @@ from genesis.session_awareness.zero_drop import (
     CLASS_DIRTY,
     CLASS_PUSHED_NO_PR,
     CLASS_UNPUSHED,
+    FUTURE_SKEW_TOLERANCE,
     PUSH_ABSENT,
     PUSH_BEHIND,
     PUSH_DIVERGED,
@@ -314,7 +315,17 @@ def _within_minutes(ts: str | None, minutes: int) -> bool:
         return False
     if then.tzinfo is None:
         then = then.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - then).total_seconds() < minutes * 60
+    age = (datetime.now(UTC) - then).total_seconds()
+    # A NEGATIVE age is not "very recent", it is a broken record — a backwards
+    # clock step, a restored snapshot, a hand repair. Read as recent it would
+    # satisfy this test on every trigger until wall time caught up, which for a
+    # year-ahead stamp means the detector never runs again (Codex P2, PR #1794).
+    # Treated as not-recent, the sweep runs and REPLACES the record, so the
+    # condition clears itself on the next boundary.
+    if age < -FUTURE_SKEW_TOLERANCE.total_seconds():
+        logger.warning("zero_drop last_run.json is dated %.0fs in the FUTURE", -age)
+        return False
+    return age < minutes * 60
 
 
 DEFAULT_BASE_REF = "origin/main"
@@ -419,7 +430,7 @@ def _assert_sums(leg: dict, denominator: str, degraded: dict, leg_name: str) -> 
 
 
 async def _resolve_push_states(
-    repo_path: str, branches: list[dict], heads: dict, budget: int
+    repo_path: str, branches: list[dict], heads: dict, budget: int, deadline: float | None = None
 ) -> dict:
     """Classify each local branch against the remote ref of the same name.
 
@@ -465,7 +476,18 @@ async def _resolve_push_states(
         if remote_tip == tip:
             push_states[branch] = PUSH_EXACT
             continue
-        if probes >= budget:
+        if probes >= budget or (deadline is not None and time.monotonic() > deadline):
+            # A probe COUNT is not a wall clock, and the difference is the whole
+            # of this guard. Each unit here can run `is_ancestor` plus the two
+            # subprocesses inside `count_unique_work_commits`, every one with a
+            # 30s timeout — so the count cap alone permits ~40 minutes under the
+            # exclusive detector.lock, against a 60-minute debounce. The
+            # WORKTREE leg was given a derived wall-clock budget for exactly
+            # this reason and the branch legs were not (cross-model review).
+            # While the lock is held every session-boundary spawn exits
+            # `lock_busy` silently — no record, no heartbeat — so a sick sweep
+            # starves its successors invisibly, which is the failure the
+            # worktree budget's own docstring describes.
             push_states[branch] = PUSH_UNKNOWN
             continue
         probes += 1
@@ -486,7 +508,8 @@ async def _resolve_push_states(
 
 
 async def _resolve_merge_ancestry(
-    repo_path: str, branches: list[dict], index: PrIndex, budget: int
+    repo_path: str, branches: list[dict], index: PrIndex, budget: int,
+    deadline: float | None = None,
 ) -> dict:
     """Test each local tip against the head SHA its merged/closed PRs recorded.
 
@@ -515,7 +538,13 @@ async def _resolve_merge_ancestry(
             key = f"{tip}..{head}"
             if key in ancestry:
                 continue
-            if len(ancestry) >= budget:
+            if len(ancestry) >= budget or (
+                deadline is not None and time.monotonic() > deadline
+            ):
+                # Same wall clock as its sibling above. Pairs past either cap
+                # are simply absent from the map, which the classifier reads as
+                # unanswerable and FLAGS — so the ceiling can add findings,
+                # never remove them.
                 return ancestry
             ancestry[key] = await is_ancestor(repo_path, tip, head)
     return ancestry
@@ -594,7 +623,26 @@ async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None =
     deadline = time.monotonic() + budget_s if budget_s else None
     for wt in listing["worktrees"]:
         if wt.get("prunable"):
+            # HELD, not resolved. The old reasoning was "a directory that does
+            # not exist holds no uncommitted work", which is true of DELETION
+            # and false of UNREACHABILITY — an unmounted network or removable
+            # volume, or a directory renamed aside, produces the byte-identical
+            # `prunable gitdir file points to non-existent location`.
+            # DEMONSTRATED on git 2.43 by the cross-model reviewer: add a
+            # worktree, move its directory away, and `worktree list` marks it
+            # prunable; move it back and it is normal again with the
+            # uncommitted file intact.
+            #
+            # The asymmetry is what settles it: this module ALREADY holds a
+            # worktree whose `status` call fails (rc=128 below), which is the
+            # same underlying condition reached through a different door — the
+            # prunable shortcut just fires before status is ever attempted. So
+            # one unreachable path was held and the other resolved, destroying
+            # the ack and the recurrence count of work that still exists.
+            # Holding costs a stale row until the path really goes; resolving
+            # costs the acknowledgement, permanently.
             prunable += 1
+            held.add(worktree_identity(wt))
             continue
         if deadline is not None and time.monotonic() > deadline:
             # Out of budget. Everything not yet visited is HELD, exactly like an
@@ -617,8 +665,16 @@ async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None =
                 mtime = datetime.fromtimestamp(
                     os.lstat(os.path.join(wt["path"], rel)).st_mtime, UTC
                 )
-            except OSError:
-                continue  # a deleted path has no mtime; other entries still date it
+            except (OSError, ValueError, OverflowError):
+                # OSError is the deleted path. ValueError/OverflowError are
+                # `datetime.fromtimestamp` on an absurd st_mtime — a corrupted
+                # or remote filesystem can report a year past 9999 — and that
+                # one escapes the leg, kills the whole sweep through the outer
+                # handler, and recurs on every trigger until somebody finds the
+                # file (cross-model review). Loud rather than silent, since the
+                # failure record makes the run read blind, but a single bad
+                # inode should not stop the detector.
+                continue  # no usable mtime; other entries still date this worktree
             if newest is None or mtime > newest:
                 newest = mtime
         observations.append({**wt, "entries": entries, "newest_mtime": newest})
@@ -737,7 +793,16 @@ async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, co
         # drift, because there is nothing left to keep in sync. The offender
         # key is folded in as well because `max_listed` bounds what the text
         # names, and a change confined to the unlisted tail must still refresh.
-        content_hash = hashlib.sha256(f"zero_drop:{content}\n{offender_key}".encode()).hexdigest()
+        # PRIORITY is part of the identity, because it is part of what the row
+        # publishes. Without it an operator who raises or lowers
+        # `alert_priority` changes nothing: the text and hash are unchanged, so
+        # `skip_if_duplicate` keeps the existing row at the old priority and the
+        # supersede call deliberately preserves that same hash — the new setting
+        # takes effect only when some finding text happens to change, or when
+        # the 3-day TTL expires (Codex P2, PR #1794).
+        content_hash = hashlib.sha256(
+            f"zero_drop:{alert_priority(cfg)}\n{content}\n{offender_key}".encode()
+        ).hexdigest()
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
@@ -1100,8 +1165,16 @@ async def _run_locked(
         # queried, so the fork filter and the PR history can never disagree
         # about which repository is "ours".
         owner = (prs.get("repo") or "").split("/")[0] or None
+        # ONE wall clock shared by both probe loops, derived the same way the
+        # worktree leg's is. The branch legs previously had only a probe COUNT
+        # cap, which bounds calls and not time.
+        branch_deadline = time.monotonic() + _worktree_budget_s(cfg)
         pushed = await _resolve_push_states(
-            repo_path, local["branches"], remote["heads"], knob_int(cfg, "max_ancestry_probes")
+            repo_path,
+            local["branches"],
+            remote["heads"],
+            knob_int(cfg, "max_ancestry_probes"),
+            deadline=branch_deadline,
         )
         for row in local["branches"]:
             count = pushed["local_only"].get(row["branch"])
@@ -1109,7 +1182,11 @@ async def _run_locked(
                 row["local_only"] = count
         index, _ = index_prs_by_head(prs["prs"], owner=owner)
         ancestry = await _resolve_merge_ancestry(
-            repo_path, local["branches"], index, knob_int(cfg, "max_ancestry_probes")
+            repo_path,
+            local["branches"],
+            index,
+            knob_int(cfg, "max_ancestry_probes"),
+            deadline=branch_deadline,
         )
         classified = classify_branches(
             local["branches"],
@@ -1273,6 +1350,15 @@ async def _run_locked(
         # Blindness is reported in EVERY running mode: the lever governs egress
         # about findings, and a broken instrument is not a finding.
         blind_state = await _maintain_blind_alert(db, degraded=degraded, frozen=frozen)
+        if blind_state in ("alert_failed", "resolve_failed"):
+            # The other half of the pair above, and it was missing. A failed
+            # RESOLVE is the worse direction: the detector has recovered, the
+            # run would publish `ok` with `degraded=none` on the heartbeat, and
+            # a stale high-priority blindness alert stays open saying the board
+            # cannot be trusted. Reported here, the run reads `degraded` and the
+            # contradiction is visible instead of being split across two
+            # surfaces that disagree (Codex P2, PR #1794).
+            degraded["blind_alert"] = blind_state
         await _emit_heartbeat(
             db,
             detail=(

@@ -1829,7 +1829,16 @@ verified: 788dd9a9 2026-09-06
   OPEN one. No prefix denylists by design — a backup branch is ACKED with a
   reason instead, leaving a record rather than an invisible rule. Age gates:
   12h on the branch tip, 6h on the newest DIRTY FILE (not the tip — an old tip
-  with a fresh edit is somebody typing). Classes follow the COMMITS, not the
+  with a fresh edit is somebody typing). Every gate that HOLDS or DEBOUNCES
+  rejects an implausibly FUTURE timestamp first (`not_future`,
+  `FUTURE_SKEW_TOLERANCE` 5m): git accepts a future commit date and a restored
+  snapshot yields future mtimes, and a gate asking "is this newer than the
+  cutoff" then answers yes forever, holding the item off the board until wall
+  time catches up. A future value is read exactly like an UNPARSEABLE one, so it
+  is judged on its merits (which FLAGS) rather than excused; `_within_minutes`
+  and `_freshness` take the same guard, the latter because a negative age is
+  never `> STALE_AFTER_S` and so announced a wedged board as FRESH. The three
+  comparisons that fail toward flagging are deliberately untouched. Classes follow the COMMITS, not the
   name: `unpushed_branch` (commits on no remote) | `pushed_no_pr` (safe, but in
   no pipeline) | `dirty_worktree` (a detached worktree keys on
   `@detached:<path>`, which no ref name can collide with; one branch checked
@@ -1842,9 +1851,23 @@ verified: 788dd9a9 2026-09-06
   `branch_duplicated` by `list_worktrees` over the WHOLE listing so the worker's
   hold path and the classifier cannot disagree about a key; CONDITIONAL because
   the identity is the ack key and an unconditional suffix would expire every ack
-  ever written, MEASURED 2026-09-12: 0 of 165 worktrees duplicated here; an identity
-  carrying a control character is quarantined and counted, never stored, because
-  the identity is the ack key and a key must round-trip unsanitised).
+  ever written, MEASURED 2026-09-12: 0 of 165 worktrees duplicated here; an identity that
+  cannot round-trip safely — a path with a control character, or a BRANCH name
+  carrying a bidi/zero-width character, which check-ref-format PERMITS — is
+  DERIVED as `@opaque:<sha256>` rather than refused, and counted as the META
+  `opaque_identities`. Refusing it put the worktree in neither `present` nor
+  `held`, so `apply_sweep` resolved the uncommitted work it named; refusal is
+  only right when the alternative is a key that lies, and a digest is neither.)
+  A PRUNABLE worktree is HELD, not resolved: `prunable` means git could not
+  find the directory, which is UNREACHABLE and not necessarily gone — an
+  unmounted volume gives the byte-identical `gitdir file points to non-existent
+  location`, and the code already HELD the sibling condition (a failing `status`
+  call), so one unreachable path was held and the other resolved. Cost named
+  rather than hidden: a genuinely deleted worktree's row now needs an ack to
+  clear (a confirm-by-repetition refinement is filed, not built). Both branch
+  probe loops share the worktree leg's derived WALL-CLOCK deadline — a probe
+  COUNT cap bounds calls, not time, and the flock is held throughout while every
+  loser exits `lock_busy` silently.
   Store: `zero_drop_findings` (migration 20260905215957, mirrored in
   `_tables.py`; CRUD `db/crud/zero_drop.py`). Identity is `UNIQUE(class,
   branch)` — never the SHA, which would fork the row on every commit and

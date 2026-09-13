@@ -35,6 +35,8 @@ STALE_AFTER_S = 26 * 3600
 
 
 def _freshness(last_run: dict, *, now: datetime) -> dict:
+    from genesis.session_awareness.zero_drop import FUTURE_SKEW_TOLERANCE
+
     computed_at = last_run.get("computed_at")
     if not computed_at:
         return {
@@ -59,6 +61,17 @@ def _freshness(last_run: dict, *, now: datetime) -> dict:
             "age_seconds": None,
             "stale": True,
             "verdict": "last-run timestamp unreadable — treat counts as unverified",
+        }
+    if age < -FUTURE_SKEW_TOLERANCE.total_seconds():
+        # The other half of the same defect, and the half that made it silent:
+        # a future-dated record reads as a NEGATIVE age, which is never greater
+        # than STALE_AFTER_S — so the board announced itself FRESH while the
+        # worker was wedged on that very record.
+        return {
+            "computed_at": computed_at,
+            "age_seconds": int(age),
+            "stale": True,
+            "verdict": "last-run timestamp is in the FUTURE — treat counts as unverified",
         }
     stale = age > STALE_AFTER_S
     return {
@@ -132,6 +145,10 @@ async def _impl_zero_drop_status(db, *, now: datetime, limit: int | None = None)
             "frozen_classes": last_run.get("frozen_classes") or [],
             "degraded": {k: _neutralise(str(v)) for k, v in degraded.items()},
             "blind": bool(degraded),
+            # The record has carried this from the start and no surface showed
+            # it, so a failed blindness-alert write was invisible to the one
+            # tool a reader actually calls.
+            "blind_alert": last_run.get("blind_alert"),
             "mode": last_run.get("mode"),
             "duration_s": last_run.get("duration_s"),
         },

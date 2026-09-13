@@ -405,3 +405,133 @@ async def test_a_FAILED_unwind_falls_back_to_a_full_rollback(tmp_path):
         )
     finally:
         await conn.close()
+
+
+async def test_an_ack_is_REFUSED_when_the_row_moves_between_read_and_write(db, monkeypatch):
+    """The ack runs from an MCP tool while a DETACHED sweep may be reconciling
+    the same row on another connection. Between the read and the write the sweep
+    can advance the tip, and an unconditional `WHERE id = ?` would acknowledge
+    that stale row anyway — suppressing work that has CHANGED since the operator
+    looked at it, against a tip that is no longer current (Codex P2, PR #1794).
+
+    The window has to be opened deliberately: `ack` resolves `get` at call time,
+    so patching it lets the sweep land in exactly the gap the guard covers. An
+    earlier version of this test simply acked after the move, which the re-read
+    absorbed — it passed with the conditional deleted.
+    """
+    await _sweep(db, [_f(tip="aaa111")])
+
+    real_get = zd.get
+    calls = {"n": 0}
+
+    async def _racing_get(conn, *, class_, branch):
+        row = await real_get(conn, class_=class_, branch=branch)
+        calls["n"] += 1
+        if calls["n"] == 1 and row is not None:
+            # The sweep advances the tip after the operator read the board.
+            await conn.execute(
+                "UPDATE zero_drop_findings SET tip_sha = ? WHERE id = ?",
+                ("ccc333", row["id"]),
+            )
+            await conn.commit()
+        return row
+
+    monkeypatch.setattr(zd, "get", _racing_get)
+    refused = await zd.ack(db, class_=CLS, branch="feat/x", reason="stale", now=None)
+    monkeypatch.undo()
+
+    assert calls["n"] >= 1, "the fixture never opened the window it exists to test"
+    assert refused is None, "an ack landed on a row that had moved underneath it"
+    # And the row is untouched: not acknowledged, still carrying the NEW tip.
+    row = await zd.get(db, class_=CLS, branch="feat/x")
+    assert row["status"] == "open"
+    assert row["tip_sha"] == "ccc333"
+    assert row["ack_reason"] is None
+
+
+async def test_an_UNRACED_ack_still_lands(db):
+    """The control, and the one that keeps the guard from being a wall: the
+    ordinary path must still acknowledge, binding the tip it actually read."""
+    await _sweep(db, [_f(tip="aaa111")])
+    acked = await zd.ack(db, class_=CLS, branch="feat/x", reason="deliberate", now=None)
+    assert acked is not None
+    assert acked["status"] == "acked"
+    assert acked["acked_tip_sha"] == "aaa111"
+
+
+async def test_an_ack_on_a_row_resolved_underneath_it_is_refused(db):
+    """The other direction of the same race, caught one step earlier: resolving
+    between read and write would let the ack RESURRECT a resolved condition."""
+    await _sweep(db, [_f()])
+    await _sweep(db, [], run="r2")  # the condition ended
+    assert (await zd.get(db, class_=CLS, branch="feat/x"))["status"] == "resolved"
+
+    assert await zd.ack(db, class_=CLS, branch="feat/x", reason="late", now=None) is None
+
+
+async def test_a_refused_ack_does_not_DISCARD_another_writers_pending_work(tmp_path):
+    """Kimi K3, and it is a defect the ack fix itself introduced an hour earlier.
+
+    Unlike the worker, which owns a short-lived connection, `ack` is reached
+    from an MCP tool running on the SERVER'S shared `SerializedConnection`. That
+    proxy serializes per METHOD and its own docstring blesses interleaving at
+    method boundaries, justified by "commit() flushes all pending work". The
+    mirror is not safe: `rollback()` discards all pending work too — including
+    another subsystem's uncommitted write.
+
+    A zero-row UPDATE has nothing of its own worth discarding, so committing
+    ends the implicit transaction just as well and takes nobody else's writes
+    with it.
+    """
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    conn = await aiosqlite.connect(str(tmp_path / "zd.db"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await create_all_tables(conn)
+        await conn.commit()
+        await zd.apply_sweep(
+            conn, class_=CLS, present=[_f(tip="aaa111")], run_id="r1"
+        )
+
+        # Another subsystem has an uncommitted write in flight on the SHARED
+        # connection — exactly the interleaving SerializedConnection permits.
+        await conn.execute("CREATE TABLE IF NOT EXISTS _other (x INTEGER)")
+        await conn.commit()
+        await conn.execute("INSERT INTO _other VALUES (42)")  # deliberately uncommitted
+
+        real_get = zd.get
+        calls = {"n": 0}
+
+        async def _racing_get(db, *, class_, branch):
+            row = await real_get(db, class_=class_, branch=branch)
+            calls["n"] += 1
+            if calls["n"] == 1 and row is not None:
+                # Deliberately NOT committed. On one connection an uncommitted
+                # UPDATE is still visible to later statements, so ack's
+                # conditional sees the moved tip — and the other writer's row
+                # stays PENDING, which is the state the rollback would destroy.
+                # Committing here would flush that row first and the test would
+                # pass either way, which is exactly how the first version of it
+                # failed to pin anything.
+                await db.execute(
+                    "UPDATE zero_drop_findings SET tip_sha = ? WHERE id = ?",
+                    ("ccc333", row["id"]),
+                )
+            return row
+
+        zd.get = _racing_get
+        try:
+            refused = await zd.ack(conn, class_=CLS, branch="feat/x", reason="x", now=None)
+        finally:
+            zd.get = real_get
+        assert refused is None, "the fixture must exercise the zero-row path"
+
+        cursor = await conn.execute("SELECT COUNT(*) AS n FROM _other")
+        assert (await cursor.fetchone())["n"] == 1, (
+            "the refused ack discarded another writer's pending work"
+        )
+    finally:
+        await conn.close()

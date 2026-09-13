@@ -977,10 +977,13 @@ async def test_the_worker_HOLD_key_of_a_duplicated_branch_matches_the_classifier
 
     held = out["held"]
     found = {f["branch"] for f in classified["findings"]}
-    assert held == {worktree_identity(rows[1])}, "the unreadable worktree is held by its own key"
+    # BOTH unreachable worktrees are held: the unreadable one by its status
+    # failure, the PRUNABLE one because "the directory is not there" does not
+    # distinguish deleted from unmounted.
+    assert held == {worktree_identity(rows[1]), worktree_identity(rows[2])}
     assert found == {worktree_identity(rows[0])}
-    # The load-bearing assertion: the held key is one the classifier COULD have
-    # produced, so it names a real row rather than a key nothing matches.
+    # The load-bearing assertion: every held key is one the classifier COULD
+    # have produced, so it names a real row rather than a key nothing matches.
     assert held.isdisjoint(found)
     assert all(k.startswith("feat/dup:") for k in held | found)
 
@@ -1448,3 +1451,224 @@ async def test_the_blind_alert_does_NOT_remint_when_only_a_COUNT_moves(db_path):
         assert (await cursor.fetchone())["n"] == 1
     finally:
         await conn.close()
+
+
+async def test_a_FUTURE_dated_record_does_not_debounce_forever(env, db_path):
+    """The third member of family F, and the one that wedges hardest.
+
+    A negative age satisfies `< minutes` on every trigger until wall time
+    catches up, so a record dated a year ahead stops the detector for a year.
+    Read as not-recent, the sweep runs and REPLACES the record — the condition
+    clears itself on the next boundary instead of needing a human with `rm`.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    path = w.last_run_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    future = (datetime.now(UTC) + timedelta(days=365)).isoformat()
+    path.write_text(json.dumps({"version": 1, "computed_at": future, "status": "ok"}))
+
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced", "a future-dated record wedged the sweep"
+    record = json.loads(path.read_text())
+    assert record["computed_at"] != future, "the wedging record was not replaced"
+
+
+def test_the_freshness_surface_does_not_call_a_FUTURE_record_fresh():
+    """The fourth member, and the one that made the wedge SILENT: a negative
+    age is never greater than STALE_AFTER_S, so the board announced itself
+    fresh while the worker was stuck on that very record."""
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.mcp.health.zero_drop_tools import _freshness
+
+    now = datetime.now(UTC)
+    out = _freshness(
+        {"computed_at": (now + timedelta(days=30)).isoformat()}, now=now
+    )
+    assert out["stale"] is True
+    assert "FUTURE" in out["verdict"]
+
+    # Control: an ordinary recent record is still fresh.
+    fine = _freshness({"computed_at": (now - timedelta(minutes=1)).isoformat()}, now=now)
+    assert fine["stale"] is False
+
+
+async def test_a_failed_BLIND_alert_resolve_reaches_degraded(env, db_path, monkeypatch):
+    """Family G: the worker produced two alert outcomes and propagated one.
+
+    A failed RESOLVE is the worse direction — the detector has recovered, so the
+    run would publish `ok` with `degraded=none` on the heartbeat while a stale
+    high-priority blindness alert stays open saying the board cannot be trusted.
+    Two surfaces disagreeing, with nothing pointing at the contradiction.
+    """
+    async def _resolve_fails(db, *, degraded, frozen):
+        return "resolve_failed"
+
+    monkeypatch.setattr(w, "_maintain_blind_alert", _resolve_fails)
+    out = await _run(db_path)
+
+    assert out["status"] == "degraded", "a failed blindness resolve published as ok"
+    assert out["degraded"].get("blind_alert") == "resolve_failed"
+    record = json.loads(w.last_run_path().read_text())
+    assert "blind_alert" in record["degraded"]
+
+
+async def test_changing_alert_PRIORITY_re_mints_the_findings_alert(db_path):
+    """The alert's dedup identity must include what the alert PUBLISHES.
+
+    Without priority in the hash, an operator raising or lowering
+    `alert_priority` changes nothing: the text and hash are unchanged, so the
+    existing row is kept at the old priority and the supersede call preserves
+    that same hash. The new setting would take effect only when some finding
+    text happened to change, or after the 3-day TTL.
+    """
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        findings = [{"class": "unpushed_branch", "branch": "feat/x",
+                     "ahead_count": 2, "escalated": False}]
+        base = {"max_listed": 10}
+        first = await w._maintain_alert(
+            conn, cfg={**base, "alert_priority": "medium"},
+            findings=findings, total=1, coverage="all classes swept",
+        )
+        assert first == "created"
+        second = await w._maintain_alert(
+            conn, cfg={**base, "alert_priority": "high"},
+            findings=findings, total=1, coverage="all classes swept",
+        )
+        assert second == "created", "a priority change never reached the board"
+
+        cursor = await conn.execute(
+            "SELECT priority, resolved FROM observations WHERE source = ? ORDER BY created_at",
+            (w.ALERT_SOURCE,),
+        )
+        rows = await cursor.fetchall()
+        live = [r for r in rows if not r["resolved"]]
+        assert len(live) == 1 and live[0]["priority"] == "high"
+    finally:
+        await conn.close()
+
+
+async def test_a_PRUNABLE_worktree_is_held_not_resolved(monkeypatch):
+    """Kimi K3 (cross-model second reviewer), and it is the exact shape this PR
+    exists to kill, reached through the one door that bypassed the held path.
+
+    `prunable` means git could not find the worktree's directory. The code read
+    that as "the directory is gone, so it holds no uncommitted work" — true of
+    DELETION, false of UNREACHABILITY. An unmounted network or removable volume,
+    or a directory renamed aside, produces the byte-identical
+    `prunable gitdir file points to non-existent location`; DEMONSTRATED on git
+    2.43 by moving a worktree directory away and back, with its uncommitted file
+    intact throughout.
+
+    Resolved, the finding's acknowledgement and recurrence count are destroyed
+    permanently even though the work returns with the mount. The asymmetry is
+    what settles it: a worktree whose `status` call FAILS is already held, and
+    that is the same condition through a different door.
+    """
+    async def _listing(root, runner=None):
+        return {
+            "worktrees": [
+                {"path": "/w/live", "branch": "feat/live", "detached": False,
+                 "prunable": None, "branch_duplicated": False},
+                {"path": "/mnt/usb/wt", "branch": "feat/on-a-mount", "detached": False,
+                 "prunable": "gitdir file points to non-existent location",
+                 "branch_duplicated": False},
+            ]
+        }
+
+    async def _status(path, runner=None):
+        return {"entries": [], "unparsed": 0}
+
+    monkeypatch.setattr(w, "list_worktrees", _listing)
+    monkeypatch.setattr(w, "worktree_status", _status)
+
+    out = await w._observe_worktrees("/repo", budget_s=60)
+
+    assert out["prunable"] == 1, "it must still be COUNTED"
+    assert "feat/on-a-mount" in out["held"], (
+        "a worktree that is merely unreachable must be HELD — resolving it "
+        "destroys the ack of work that still exists"
+    )
+    # And the live one is untouched: holding the unreachable must not freeze
+    # the class, which is the whole point of per-item quarantine.
+    assert [o["path"] for o in out["observations"]] == ["/w/live"]
+
+
+async def test_the_branch_probe_loops_respect_a_WALL_CLOCK_deadline():
+    """Kimi K3: the branch legs had a probe COUNT cap where the worktree leg got
+    a wall clock, and a count is not a clock.
+
+    Each probe unit can run `is_ancestor` plus the two subprocesses inside
+    `count_unique_work_commits`, every one with a 30s timeout — so the count cap
+    alone permits tens of minutes under the exclusive detector.lock, against a
+    60-minute debounce. While the lock is held every session-boundary spawn
+    exits `lock_busy` silently, so a sick sweep starves its successors with no
+    record and no heartbeat.
+    """
+    import time
+
+    from genesis.session_awareness.zero_drop import PUSH_UNKNOWN
+
+    rows = [{"branch": f"feat/{i}", "tip_sha": f"{i:040x}"} for i in range(5)]
+    heads = {r["branch"]: "f" * 40 for r in rows}  # every tip DIFFERS -> would probe
+
+    calls = {"n": 0}
+
+    async def _never_called(*a, **kw):
+        calls["n"] += 1
+        return True
+
+    import genesis.session_awareness.zero_drop_worker as mod
+
+    original = mod.is_ancestor
+    mod.is_ancestor = _never_called
+    try:
+        out = await w._resolve_push_states(
+            "/repo", rows, heads, budget=40, deadline=time.monotonic() - 1
+        )
+    finally:
+        mod.is_ancestor = original
+
+    assert calls["n"] == 0, "an expired deadline must stop the probing entirely"
+    assert all(v == PUSH_UNKNOWN for v in out["push_states"].values()), (
+        "branches past the ceiling are UNKNOWN, which the classifier HOLDS — "
+        "the cap may add findings, never remove them"
+    )
+
+
+async def test_an_ABSURD_mtime_does_not_kill_the_whole_sweep(monkeypatch, tmp_path):
+    """Kimi K3: only OSError was caught, but `datetime.fromtimestamp` raises
+    ValueError/OverflowError on an st_mtime a corrupted or remote filesystem can
+    report (a year past 9999). That escapes the leg, kills the sweep through the
+    outer handler, and recurs on every trigger until somebody finds the file."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "f.py").write_text("x\n")
+
+    async def _listing(root, runner=None):
+        return {"worktrees": [{"path": str(wt), "branch": "feat/x", "detached": False,
+                               "prunable": None, "branch_duplicated": False}]}
+
+    async def _status(path, runner=None):
+        return {"entries": [("M ", "f.py")], "unparsed": 0}
+
+    class _AbsurdStat:
+        st_mtime = 1e300  # beyond year 9999
+
+    monkeypatch.setattr(w, "list_worktrees", _listing)
+    monkeypatch.setattr(w, "worktree_status", _status)
+    monkeypatch.setattr(w.os, "lstat", lambda p: _AbsurdStat())
+
+    out = await w._observe_worktrees("/repo", budget_s=60)
+
+    assert len(out["observations"]) == 1, "one bad inode must not stop the leg"
+    assert out["observations"][0]["newest_mtime"] is None, (
+        "an unusable mtime reads as UNDATED, which the age gate judges on merits"
+    )

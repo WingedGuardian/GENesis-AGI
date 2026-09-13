@@ -19,6 +19,7 @@ from genesis.session_awareness.zero_drop import (
     CLASS_PUSHED_NO_PR,
     CLASS_UNPUSHED,
     DETACHED_KEY_PREFIX,
+    OPAQUE_KEY_PREFIX,
     PUSH_ABSENT,
     PUSH_BEHIND,
     PUSH_DIVERGED,
@@ -588,12 +589,20 @@ def test_stage_counts_still_sum_with_every_new_verdict_present():
     assert stages["flagged_no_pr"] == 1
 
 
-def test_a_worktree_identity_carrying_a_control_character_is_QUARANTINED():
+def test_an_UNSAFE_identity_is_DERIVED_not_dropped():
     """The identity is the ack KEY: it round-trips verbatim to a model and back
-    through `zero_drop_ack`, so it is the one field a sanitiser must not touch
-    (mangling a key merges identities). Refusal is what keeps it safe to emit
-    whole — and a detached worktree keys on its PATH, which unlike a git ref
-    name may contain newlines and escapes."""
+    through `zero_drop_ack`, so it is the one field a sanitiser must not touch —
+    mangling a key merges identities. A detached worktree keys on its PATH,
+    which unlike a git ref name may contain newlines and escapes.
+
+    The earlier resolution was to REFUSE such a value, and this test pinned
+    that. It was wrong: a refused identity entered neither `present` nor
+    `held`, so `apply_sweep` resolved the row and the uncommitted work it named
+    left the board silently (Codex P2, PR #1794). Refusal is only right when
+    the alternative is a key that LIES, and an opaque digest is neither. So the
+    row survives, keyed on something safe, and the readable form travels as
+    `worktree_path` — which every surface renders through `neutralise`.
+    """
     old = NOW - timedelta(days=2)
     out = classify_worktrees(
         [
@@ -604,8 +613,17 @@ def test_a_worktree_identity_carrying_a_control_character_is_QUARANTINED():
         ],
         now=NOW,
     )
-    assert out["stages"]["quarantined_identity"] == 1
-    assert [f["branch"] for f in out["findings"]] == ["feat/ok"]
+    assert out["opaque_identities"] == 1
+    identities = [f["branch"] for f in out["findings"]]
+    assert len(identities) == 2, "the unsafe worktree must still produce a finding"
+    opaque = [i for i in identities if i.startswith(OPAQUE_KEY_PREFIX)]
+    assert len(opaque) == 1
+    # The KEY carries nothing that could deceive a reader...
+    assert "\n" not in opaque[0] and "[" not in opaque[0]
+    # ...and the readable path is still on the row as evidence.
+    paths = {f["worktree_path"] for f in out["findings"]}
+    assert "/tmp/evil\n[injected] · row" in paths
+    # The terminal stages still sum: the opaque count is META, not a stage.
     assert sum(v for k, v in out["stages"].items() if k != "worktrees_total") == 2
 
 
@@ -756,8 +774,12 @@ def test_an_identity_carrying_a_REORDERING_character_is_quarantined_too():
         ],
         now=NOW,
     )
-    assert out["stages"]["quarantined_identity"] == 2
-    assert [f["branch"] for f in out["findings"]] == ["feat/ok"]
+    assert out["opaque_identities"] == 2
+    keys = [f["branch"] for f in out["findings"]]
+    assert len(keys) == 3, "both reordering identities must still produce findings"
+    assert sum(1 for k in keys if k.startswith(OPAQUE_KEY_PREFIX)) == 2
+    assert len(set(keys)) == 3, "two unsafe identities must not collapse onto one key"
+    assert "feat/ok" in keys
 
 
 # ── Class B: a NAME is not an IDENTITY (Codex round 1, PR #1794) ─────────────
@@ -984,15 +1006,17 @@ def test_discriminating_an_identity_never_widens_the_QUARANTINE():
     out_dup = classify_worktrees([dup], now=NOW, min_age_hours=6)
     out_solo = classify_worktrees([solo], now=NOW, min_age_hours=6)
 
-    assert out_dup["stages"]["quarantined_identity"] == 0
-    assert out_solo["stages"]["quarantined_identity"] == 0
+    assert out_dup["opaque_identities"] == 0
+    assert out_solo["opaque_identities"] == 0
     assert out_dup["stages"]["flagged_dirty"] == out_solo["stages"]["flagged_dirty"] == 1
     ident = out_dup["findings"][0]["branch"]
     assert "\n" not in ident and "\x07" not in ident, ident
     # And the control: a hostile BRANCH is still quarantined either way, so the
     # digest did not smuggle an unsafe identity through.
     bad_branch = _wt(branch="feat/‮x") | {"branch_duplicated": True}
-    assert classify_worktrees([bad_branch], now=NOW)["stages"]["quarantined_identity"] == 1
+    bad_out = classify_worktrees([bad_branch], now=NOW)
+    assert bad_out["opaque_identities"] == 1
+    assert bad_out["findings"], "an unsafe BRANCH name must still produce a finding"
 
 
 def test_the_duplicate_digest_is_FULL_never_shortened():
@@ -1028,3 +1052,59 @@ def test_the_HELD_key_of_a_duplicated_worktree_matches_its_finding_key():
     assert out["held"] == {worktree_identity(young)}
     assert [f["branch"] for f in out["findings"]] == [worktree_identity(old)]
     assert out["held"].isdisjoint({f["branch"] for f in out["findings"]})
+
+
+# ── Family F: a timestamp the code assumed could not be in the FUTURE ───────
+#
+# Seven time comparisons exist in this subsystem; four HOLD or DEBOUNCE, and
+# only those can wedge — a future timestamp answers "too new" forever. The
+# other three fail toward FLAGGING, which is the direction a detector is
+# allowed to be wrong in, so they are deliberately left alone.
+
+
+def test_a_branch_dated_in_the_FUTURE_is_judged_not_held_forever():
+    """Git accepts a future commit date. Held, the branch is neither reported
+    nor resolved until wall time catches up — which for a year-ahead stamp
+    means never, so stranded work nobody is told about (Codex P2, PR #1794).
+
+    Resolved to an EXISTING state rather than a new one: a future tip is read
+    exactly like an unparseable one, which this classifier already documents as
+    "judged on its merits rather than excused".
+    """
+    future = (NOW + timedelta(days=365)).isoformat()
+    out = _run([_branch(date=future)])
+    assert out["stages"]["too_young"] == 0, "a future tip must not be held forever"
+    assert out["stages"]["flagged_no_pr"] == 1
+
+
+def test_a_branch_dated_MOMENTS_ahead_is_still_young():
+    """The control, and the reason there is a tolerance at all: a commit made
+    seconds ago can carry a timestamp a hair ahead of `now` through ordinary
+    clock drift, and flagging THAT would be a false positive on the freshest
+    work in the tree."""
+    just_ahead = (NOW + timedelta(seconds=30)).isoformat()
+    out = _run([_branch(date=just_ahead)])
+    assert out["stages"]["too_young"] == 1
+    assert out["stages"]["flagged_no_pr"] == 0
+
+
+def test_a_worktree_whose_mtime_is_in_the_FUTURE_is_still_judged():
+    """The sibling gate. A restored snapshot or a backwards clock step yields a
+    future mtime, and this gate HOLDS its worktree — so the uncommitted work
+    stays off the board for as long as the wrong date stands."""
+    out = classify_worktrees(
+        [_wt(mtime=NOW + timedelta(days=400))], now=NOW, min_age_hours=6
+    )
+    assert out["stages"]["too_young"] == 0
+    assert out["stages"]["flagged_dirty"] == 1
+    assert out["held"] == set()
+
+
+def test_a_worktree_edited_MOMENTS_ago_is_still_young():
+    """Its control: ordinary drift must not turn somebody's live typing into a
+    finding."""
+    out = classify_worktrees(
+        [_wt(mtime=NOW + timedelta(seconds=20))], now=NOW, min_age_hours=6
+    )
+    assert out["stages"]["too_young"] == 1
+    assert out["stages"]["flagged_dirty"] == 0

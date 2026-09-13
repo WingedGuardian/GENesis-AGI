@@ -130,6 +130,14 @@ DETACHED_KEY_PREFIX = "@detached:"
 # branch, never both.
 DUPLICATE_KEY_SEP = ":"
 
+# ...and once more for an identity that cannot be emitted as itself at all. A
+# worktree PATH may contain anything, and a BRANCH name may legally contain a
+# bidi override or a zero-width space (MEASURED on git 2.43 — check-ref-format
+# bans control characters and says nothing about the Cf category), so the
+# natural identity is sometimes a value that cannot safely be a key OR be shown
+# to a reader. It becomes an opaque digest rather than being thrown away.
+OPAQUE_KEY_PREFIX = "@opaque:"
+
 
 def _path_digest(path: str) -> str:
     """A worktree path rendered as something that is always safe to be a key.
@@ -137,19 +145,24 @@ def _path_digest(path: str) -> str:
     The path itself is NOT used, and the reason is a false suppression this
     very discriminator introduced before it was caught. A worktree path may
     legally contain a newline — this subsystem's own worktree parser was
-    redesigned around exactly that — and `classify_worktrees` QUARANTINES an
-    identity carrying a control or invisible character. A quarantined worktree
-    is counted, but it lands in neither ``present`` nor ``held``, and
-    ``apply_sweep`` resolves anything absent from both. So splicing a raw path
-    into the identity of a branch-keyed worktree could RESOLVE a live finding
-    about uncommitted work — a false suppression, in the one subsystem that
-    cannot afford one.
+    redesigned around exactly that — and an identity carrying a control or
+    invisible character cannot be stored as a key and emitted verbatim to a
+    model. Splicing a raw path into a branch-keyed identity therefore produced a
+    value the classifier had to refuse, and a refused worktree landed in neither
+    ``present`` nor ``held``, so ``apply_sweep`` resolved a live finding about
+    uncommitted work.
 
-    A hex digest is safe by construction, which makes the invariant exact and
-    testable: discriminating an identity never changes whether it is safe, so
-    the duplicate case can never be quarantined when the ordinary case would
-    not have been. The readable value is not lost — the finding row carries
-    ``worktree_path``, and every surface renders THAT through ``neutralise``.
+    That refusal is GONE — ``worktree_identity`` now derives an opaque key for
+    any unsafe identity rather than dropping it (see ``OPAQUE_KEY_PREFIX``), so
+    this digest is no longer what stands between a duplicated worktree and a
+    resolved row. It is kept because it is still the right key: stable, opaque
+    and collision-resistant, so the duplicate case never DEPENDS on the safety
+    net. Stated in the past tense on purpose — describing a quarantine that no
+    longer exists is how the next reader trusts a guarantee nothing provides
+    (cross-model review).
+
+    The readable value is not lost — the finding row carries ``worktree_path``,
+    and every surface renders THAT through ``neutralise``.
 
     The digest is FULL, never shortened. A key is the one thing that must not
     be truncated: two paths colliding on a prefix would silently transfer one
@@ -183,6 +196,39 @@ def _parse_iso(value: str | None) -> datetime | None:
 # A local branch's relationship to the remote ref of the same name. This is
 # evidence tier 3 and it is computed from SHAs, so it does not depend on PR
 # names or on any clock.
+# How far ahead of the clock a timestamp may legitimately sit. Not a guess at
+# how wrong a clock can be — it is the skew between the clock that WROTE the
+# value and the one reading it. Git commit dates come from this machine, mtimes
+# come from this filesystem, and `mergedAt` comes from GitHub, so seconds of NTP
+# and network drift are normal and minutes are not. Generous enough that a
+# commit made moments ago is never mistaken for a corrupt one, tight enough that
+# nothing hides behind it for long.
+FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
+
+
+def not_future(parsed: datetime | None, now: datetime) -> datetime | None:
+    """*parsed*, or None when it sits implausibly far ahead of *now*.
+
+    Git accepts a future commit date, a restored snapshot or a backwards clock
+    step produces future mtimes, and a hand-repaired run record can carry
+    anything. Every age gate in this subsystem asks "is this NEWER than the
+    cutoff", so a future timestamp answers YES forever — and the two gates that
+    ask it HOLD their subject, which means neither reported nor resolved, for as
+    long as the wrong timestamp stands. A tip dated 2031 is not stranded work
+    that resolves itself in five years; it is stranded work nobody is told about
+    (Codex P2, PR #1794).
+
+    Returning None rather than a clamped value is what keeps this from inventing
+    a state: None is already what an UNPARSEABLE timestamp yields, and every
+    caller already handles it — `classify_branches` judges such a branch "on its
+    merits rather than excused", which FLAGS, and flagging is the direction a
+    detector is allowed to be wrong in.
+    """
+    if parsed is None:
+        return None
+    return None if parsed - now > FUTURE_SKEW_TOLERANCE else parsed
+
+
 PUSH_EXACT = "exact"  # local tip IS the remote tip: nothing is local-only
 PUSH_BEHIND = "behind"  # remote has moved on; every local commit is pushed
 PUSH_DIVERGED = "diverged"  # PROVEN local-only commits (non-merge, so real work)
@@ -655,10 +701,12 @@ def classify_branches(
             # Genuinely no longer ahead of the base: the condition ended.
             stages["not_ahead"] += 1
             continue
-        tip_date = _parse_iso(row.get("tip_date"))
+        tip_date = not_future(_parse_iso(row.get("tip_date")), now)
         if tip_date is not None and tip_date > cutoff:
             # Work in flight right now is not stranded work. An UNDATED tip
-            # (unparseable) is judged on its merits rather than excused.
+            # (unparseable, or dated implausibly far AHEAD — git accepts a
+            # future commit date, and this gate would then read "too new"
+            # forever) is judged on its merits rather than excused.
             # HELD, not absent: a branch under the age gate is one we looked at
             # and chose not to report, so it must not resolve an existing row.
             stages["too_young"] += 1
@@ -829,10 +877,25 @@ def worktree_identity(observation: dict) -> str:
     """
     branch = observation.get("branch")
     if not branch:
-        return f"{DETACHED_KEY_PREFIX}{observation['path']}"
-    if observation.get("branch_duplicated"):
-        return f"{branch}{DUPLICATE_KEY_SEP}{_path_digest(observation['path'])}"
-    return branch
+        natural = f"{DETACHED_KEY_PREFIX}{observation['path']}"
+    elif observation.get("branch_duplicated"):
+        natural = f"{branch}{DUPLICATE_KEY_SEP}{_path_digest(observation['path'])}"
+    else:
+        natural = branch
+    if _safe_identity(natural):
+        return natural
+    # DERIVED, not refused. An identity that cannot round-trip safely used to be
+    # QUARANTINED — counted, then dropped into neither `present` nor `held`, so
+    # `apply_sweep` resolved it and the uncommitted work it named left the board
+    # silently (Codex P2, PR #1794). Refusing to make a key is only correct when
+    # the alternative is a key that lies; a digest is neither.
+    #
+    # Collision-resistant and stable, so an acknowledgement granted against it
+    # holds, and prefixed with the same forbidden ':' that keeps every other
+    # derived identity unrepresentable as a ref name. The human-readable form is
+    # not lost: the finding carries `worktree_path`, which every surface renders
+    # through `neutralise`.
+    return f"{OPAQUE_KEY_PREFIX}{_path_digest(natural)}"
 
 
 def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours: int = 6) -> dict:
@@ -848,28 +911,35 @@ def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours
     cutoff = now - timedelta(hours=min_age_hours)
     findings: list[dict] = []
     held: set[str] = set()
+    opaque_identities = 0
     stages = dict.fromkeys(
-        ("worktrees_total", "clean", "too_young", "quarantined_identity", "flagged_dirty"), 0
+        ("worktrees_total", "clean", "too_young", "flagged_dirty"), 0
     )
     stages["worktrees_total"] = len(observations)
 
     for obs in observations:
-        if not _safe_identity(worktree_identity(obs)):
-            # The identity is the ACK KEY and it round-trips verbatim through
-            # the MCP surface, so it is the one field that cannot be sanitised
-            # without merging two identities onto one key. A detached worktree
-            # keys on its PATH, and a path — unlike a git ref name — may
-            # contain newlines and escape sequences. Refusing such a value is
-            # the resolution: it never becomes a key, so the key stays safe to
-            # emit whole, and the refusal is COUNTED rather than silent.
-            # MEASURED 2026-09-06: 0 of 161 worktrees here.
-            stages["quarantined_identity"] += 1
-            continue
+        identity = worktree_identity(obs)
+        if identity.startswith(OPAQUE_KEY_PREFIX):
+            # COUNTED, not dropped — and that is the correction. The identity is
+            # the ACK KEY and round-trips verbatim through the MCP surface, so
+            # it cannot be sanitised without merging two identities onto one
+            # key; the previous resolution was to refuse it, which meant the
+            # worktree entered neither `present` nor `held` and `apply_sweep`
+            # RESOLVED it. `worktree_identity` now derives an opaque key
+            # instead, so the row survives and this is a META count of how many
+            # identities had to be made opaque. It is deliberately NOT one of
+            # the terminal stages any more: the worktree still lands in exactly
+            # one of clean/too_young/flagged_dirty, so those still sum to the
+            # denominator. MEASURED 2026-09-06: 0 of 161 worktrees here.
+            opaque_identities += 1
         entries = obs.get("entries") or []
         if not entries:
             stages["clean"] += 1
             continue
-        newest = obs.get("newest_mtime")
+        # Same future-proofing as the branch gate: a restored snapshot or a
+        # backwards clock step yields a future mtime, which would hold this
+        # worktree out of the board for as long as the date stands.
+        newest = not_future(obs.get("newest_mtime"), now)
         if newest is not None and newest > cutoff:
             # HELD, not absent — and this is the case that made the distinction
             # matter. One edit inside a worktree moves newest_mtime, so an
@@ -896,4 +966,12 @@ def classify_worktrees(observations: list[dict], *, now: datetime, min_age_hours
             }
         )
 
-    return {"findings": findings, "stages": stages, "held": held}
+    return {
+        "findings": findings,
+        "stages": stages,
+        "held": held,
+        # META, outside the terminal sum — like `ignored_forks` on the branch
+        # side. Putting it in `stages` would break the invariant that the
+        # terminal counts add up to `worktrees_total`.
+        "opaque_identities": opaque_identities,
+    }

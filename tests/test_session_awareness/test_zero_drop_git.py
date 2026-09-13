@@ -346,10 +346,30 @@ async def test_a_dirty_symlink_is_dated_by_ITSELF_not_by_its_target(repo, tmp_pa
     )
 
 
-async def test_observe_worktrees_SKIPS_a_real_prunable_worktree(repo, tmp_path):
-    """The worker-level assertion, against real git rather than a fake listing:
-    a worktree whose directory is gone is ABSENT, not unreadable. Treating it as
-    unreadable would freeze the whole dirty class on every sweep from then on."""
+async def test_a_real_prunable_worktree_is_HELD_per_item_not_frozen_wholesale(repo, tmp_path):
+    """The worker-level assertion, against real git rather than a fake listing.
+
+    This test previously asserted that a prunable worktree is neither reported
+    nor HELD — that it is simply ABSENT, so its finding resolves. A cross-model
+    reviewer disproved the premise: `prunable` means git could not find the
+    directory, which is UNREACHABLE, not necessarily gone. An unmounted volume
+    or a directory renamed aside gives the byte-identical
+    `gitdir file points to non-existent location`, and DEMONSTRATED on git 2.43
+    the work comes back intact when the path does. Resolving destroys the ack
+    and the recurrence count permanently; holding costs a stale row.
+
+    The subsystem's own doctrine settles which error to prefer: "an extra
+    acknowledged row costs less than a clean board that lied." So a prunable
+    worktree is now HELD — and the cost is named rather than hidden: for a
+    genuinely DELETED worktree the row will not resolve on its own and takes an
+    acknowledgement to clear. A confirm-by-repetition refinement (resolve only
+    after N consecutive prunable sightings, which an unmounted volume survives
+    and a deleted directory does not) would recover that, and is filed rather
+    than built here.
+
+    What must NOT change is the per-ITEM granularity: one unreachable worktree
+    holds only itself, never the whole dirty class.
+    """
     import shutil
 
     from genesis.session_awareness.zero_drop_worker import _observe_worktrees
@@ -362,7 +382,8 @@ async def test_observe_worktrees_SKIPS_a_real_prunable_worktree(repo, tmp_path):
 
     assert out["prunable"] == 1
     assert out["errors"] == [], "a gone worktree must not be reported as unreadable"
-    assert out["held"] == set(), "and it must not be quarantined either — it is absent"
+    assert out["held"] == {"doomed"}, "an unreachable worktree is held, never resolved"
+    # Per-item, not wholesale: the live worktree is still observed.
     assert [o["path"] for o in out["observations"]] == [str(repo)]
 
 
