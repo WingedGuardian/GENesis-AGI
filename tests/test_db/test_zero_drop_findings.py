@@ -278,3 +278,130 @@ async def test_a_duplicate_identity_does_not_abort_the_sweep(db):
     assert counts["new"] == 2
     assert counts["duplicate_identities"] == 1
     assert (await zd.get(db, class_=CLS, branch="feat/x"))["tip_sha"] == "aaa111"
+
+
+async def test_a_class_that_FAILS_midway_leaves_no_partial_writes(db, monkeypatch):
+    """The docstring promises "no half-applied middle state — one commit at the
+    end", and that was true only when nothing raised (Codex P2, PR #1794).
+
+    These are many statements with ONE commit. A failure partway left them
+    PENDING on a connection the worker keeps using, so the next class's
+    reconcile, the alert write, or the always-runs heartbeat commit would flush
+    the failed class's partial updates — while the run record reported that
+    class as NOT applied. A frozen class that silently half-applied is the exact
+    failure this subsystem exists to prevent, arriving through the caller's own
+    error handling.
+
+    The later unrelated write is the load-bearing part of this test: without it
+    an open transaction is merely open, and the defect is invisible.
+    """
+    await _sweep(db, [_f("feat/one"), _f("feat/two")])
+    before = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(db)}
+    assert before == {"feat/one": 1, "feat/two": 1}
+
+    # Fail partway through the SECOND sweep, after the first row's write landed.
+    #
+    # The seam is `_details_json`, a module-level function called per row inside
+    # the loop and BEFORE that row's DML — so raising on the second call leaves
+    # row one written and pending, which is the state under test.
+    #
+    # NOT `db.execute`: the `db` fixture yields a SerializedConnection whose
+    # __setattr__ forwards unknown names to the wrapped connection, so patching
+    # it puts the wrapper UNDER the proxy while the captured original is the
+    # proxy's own method — the proxy takes its lock, calls the wrapper, the
+    # wrapper calls the proxy, and it waits forever on a lock it already holds.
+    real_details = zd._details_json
+    seen = {"n": 0}
+
+    def _flaky(details):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise RuntimeError("the store failed midway through a class")
+        return real_details(details)
+
+    monkeypatch.setattr(zd, "_details_json", _flaky)
+    with pytest.raises(RuntimeError):
+        await _sweep(db, [_f("feat/one"), _f("feat/two")], run="r2")
+    monkeypatch.undo()
+    assert seen["n"] >= 2, "the fixture never reached the failure it was built to inject"
+
+    # The worker goes on to write its heartbeat on this same connection. That
+    # commit must not carry the failed class's half-finished work.
+    await db.execute("CREATE TABLE IF NOT EXISTS _probe (x INTEGER)")
+    await db.execute("INSERT INTO _probe VALUES (1)")
+    await db.commit()
+
+    after = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(db)}
+    assert after == before, f"a failed class half-applied: {before} -> {after}"
+
+
+async def test_a_FAILED_unwind_falls_back_to_a_full_rollback(tmp_path):
+    """The fix's own recovery path could reproduce the defect it was written for.
+
+    If `ROLLBACK TO` raises, `RELEASE` never runs (one exception exits the whole
+    block), so the savepoint stays on the stack and the transaction stays open
+    carrying this class's half-finished rows. The caller then reconciles the
+    NEXT class on the same connection, whose savepoint is now NESTED — its
+    RELEASE commits nothing, and its `db.commit()` issues a real COMMIT that
+    flushes BOTH classes while the run record reports this one as not applied.
+
+    Uses a RAW aiosqlite connection deliberately. The shared `db` fixture yields
+    a SerializedConnection whose `__setattr__` forwards to the wrapped
+    connection while the captured original is the proxy's own method, so
+    patching `execute` there re-enters a non-reentrant lock and hangs forever.
+    """
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    conn = await aiosqlite.connect(str(tmp_path / "zd.db"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await create_all_tables(conn)
+        await conn.commit()
+        await zd.apply_sweep(
+            conn, class_=CLS, present=[_f("feat/one"), _f("feat/two")], run_id="r1"
+        )
+        before = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(conn)}
+
+        real_execute = conn.execute
+        real_details = zd._details_json
+        calls = {"details": 0, "rollback_to": 0}
+
+        async def _no_unwind(sql, *a, **kw):
+            if sql.strip().upper().startswith("ROLLBACK TO"):
+                calls["rollback_to"] += 1
+                raise aiosqlite.OperationalError("no such savepoint (simulated)")
+            return await real_execute(sql, *a, **kw)
+
+        def _flaky_details(details):
+            calls["details"] += 1
+            if calls["details"] == 2:
+                raise RuntimeError("the store failed midway through a class")
+            return real_details(details)
+
+        conn.execute = _no_unwind
+        zd._details_json = _flaky_details
+        try:
+            with pytest.raises(RuntimeError):
+                await zd.apply_sweep(
+                    conn, class_=CLS, present=[_f("feat/one"), _f("feat/two")], run_id="r2"
+                )
+        finally:
+            conn.execute = real_execute
+            zd._details_json = real_details
+
+        assert calls["rollback_to"] == 1, "the fixture never reached the unwind it breaks"
+
+        # The worker continues on this connection and eventually commits.
+        await conn.execute("CREATE TABLE _probe (x INTEGER)")
+        await conn.execute("INSERT INTO _probe VALUES (1)")
+        await conn.commit()
+
+        after = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(conn)}
+        assert after == before, (
+            f"a failed unwind left partial writes for a later commit to flush: "
+            f"{before} -> {after}"
+        )
+    finally:
+        await conn.close()

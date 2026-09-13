@@ -41,6 +41,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -77,9 +78,11 @@ from genesis.session_awareness.zero_drop_config import (
 from genesis.session_awareness.zero_drop_git import (
     count_unique_work_commits,
     is_ancestor,
+    is_safe_base_ref,
     list_local_branches,
     list_remote_heads,
     list_worktrees,
+    scrubbed_git_env,
     worktree_status,
 )
 
@@ -89,6 +92,15 @@ ALERT_SOURCE = "zero_drop_detector"
 BLIND_SOURCE = "zero_drop_detector_blind"
 ALERT_TYPE = "infrastructure_alert"
 HEARTBEAT_SUBSYSTEM = "zero_drop"
+
+# How long a FAILED run record suppresses the next sweep. Not the configurable
+# interval: a failure must retry sooner than an hour, but not on every session
+# boundary. Derived from the sweep's own MEASURED cost (~14-20s, including a
+# live ls-remote and a ~1700-PR gh listing) — at this floor a persistently
+# failing detector spends under 7% of wall-clock sweeping. Deliberately NOT a
+# settings knob: it is a floor protecting shared resources, and the lever an
+# operator actually wants is `zero_drop.enabled`.
+FAILED_RETRY_FLOOR_MINUTES = 5
 
 BRANCH_CLASSES = (CLASS_UNPUSHED, CLASS_PUSHED_NO_PR)
 ALL_CLASSES = (*BRANCH_CLASSES, CLASS_DIRTY)
@@ -269,12 +281,39 @@ def read_last_run() -> dict:
 
 
 def _within_minutes(ts: str | None, minutes: int) -> bool:
+    """Is *ts* less than *minutes* old? Anything unreadable answers False.
+
+    Two failure shapes, and the second is the one that mattered. A non-string
+    makes ``fromisoformat`` raise **TypeError**, not ValueError. And a
+    syntactically valid but timezone-NAIVE timestamp parses cleanly, then
+    raises TypeError on the aware-minus-naive subtraction — past the guard, in
+    the arithmetic.
+
+    That second shape was a permanent wedge. This is the SECOND statement of
+    ``_run_locked`` and the run record is written at exactly ONE place, right
+    at the end, so a raise here meant the offending record was never replaced:
+    every later sweep read it, died at the same line, and wrote nothing. The
+    board froze at whatever it last said and stayed there (Codex P2, PR #1794).
+
+    A naive value is READ AS UTC rather than rejected, which is what every
+    producer here means and what ``zero_drop_tools._freshness`` already does —
+    a timestamp missing its offset is a legitimate reading, so a branch two
+    minutes old should still debounce. Rejection is reserved for values that
+    are not timestamps at all.
+
+    The catch is necessary and NOT sufficient, and reading it as sufficient is
+    the trap: returning False merely lets THIS sweep proceed to the write. Any
+    other raise between here and that single write leaves the bad record in
+    place, which is why ``_run`` also replaces the record on failure.
+    """
     if not ts:
         return False
     try:
         then = datetime.fromisoformat(ts)
-    except ValueError:
+    except (TypeError, ValueError):
         return False
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
     return (datetime.now(UTC) - then).total_seconds() < minutes * 60
 
 
@@ -304,6 +343,12 @@ def _gh_runner(repo_path: str):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=repo_path,
+                # Same reason as the git runner: `cwd` is how this runner binds
+                # gh to the repository being swept, and an inherited GIT_DIR
+                # overrides it — so the PR history could come from a different
+                # repository than the branches, which reads as "no PR" on every
+                # branch and turns the whole board into false positives.
+                env=scrubbed_git_env(),
             )
         except Exception as exc:
             return 127, "", f"gh spawn failed: {exc}"
@@ -718,7 +763,7 @@ async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, co
     return "created" if created else "unchanged"
 
 
-async def _maintain_blind_alert(db, *, degraded: dict) -> str:
+async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str:
     """Announce a BLIND detector — separately from what it found.
 
     This is the failure the rest of the design guards against arriving through
@@ -755,22 +800,63 @@ async def _maintain_blind_alert(db, *, degraded: dict) -> str:
         return "resolved"
 
     legs = ",".join(sorted(degraded))
-    content_hash = hashlib.sha256(f"zero_drop_blind:{legs}".encode()).hexdigest()
-    try:
-        content = (
-            f"The zero-drop detector is BLIND on: {legs}. Findings in those classes are "
-            f"FROZEN — nothing new is detected there and nothing already found is "
-            f"resolved, so the board is not a measurement until this clears. "
-            # The cause text embeds WORKTREE PATHS (a failed status call names
-            # The cause text embeds WORKTREE PATHS (a failed status call names
-            # the path it failed on), which this process did not author — the
-            # same untrusted content the findings alert neutralises. Sanitising
-            # one renderer and not its sibling is how that class survives: the
-            # findings alert got this treatment and this one, written in the
-            # same change, did not. 400 is the diagnostic budget, not the
-            # 160-char identity budget — a cause blob is worth more room.
-            f"Cause: {_bounded(_neutralise(json.dumps(degraded, default=str)), 400)}"
+    # The cause text embeds WORKTREE PATHS (a failed status call names the path
+    # it failed on), which this process did not author — the same untrusted
+    # content the findings alert neutralises. Sanitising one renderer and not
+    # its sibling is how that class survives: the findings alert got this
+    # treatment and this one, written in the same change, did not. 400 is the
+    # diagnostic budget, not the 160-char identity budget — a cause blob is
+    # worth more room.
+    causes = _bounded(_neutralise(json.dumps(degraded, default=str)), 400)
+    # DERIVED from the frozen set the caller already computed, never asserted
+    # alongside it. The old text said the affected classes were FROZEN in every
+    # case, which is false for PARTIAL degradation: one unreadable worktree
+    # holds that identity and reconciles the other 164, so the board DID move
+    # and the alert said it could not have (Codex P2, PR #1794). A checkable
+    # runtime claim that contradicts the code is worse than a vaguer one — it
+    # tells an operator not to trust a board that is in fact current.
+    if frozen:
+        effect = (
+            f"Classes FROZEN: {','.join(sorted(frozen))} — nothing new is detected there "
+            f"and nothing already found is resolved, so those counts are not a "
+            f"measurement until this clears."
         )
+    else:
+        effect = (
+            "No class was frozen: the affected items are HELD individually and every "
+            "other item reconciled normally, so the counts are current but incomplete."
+        )
+    content = f"The zero-drop detector is BLIND on: {legs}. {effect} Cause: {causes}"
+    # Hash the RENDERED content, plus the UNBOUNDED causes. The hash covered
+    # only the degradation KEYS while the text carried the CAUSES, so a leg that
+    # stayed broken for a NEW reason deduped against the standing alert and the
+    # obsolete cause persisted until the 3-day TTL happened to re-mint it
+    # (Codex P2, PR #1794). Hashing the text closes that by construction —
+    # there is nothing left to keep in sync — and the full causes are folded in
+    # because the rendered ones are bounded at 400 chars, so a change confined
+    # to the truncated tail must still supersede. This is the shape the sibling
+    # findings alert already used, one function away.
+    #
+    # DIGITS ARE QUANTISED FOR THE IDENTITY ONLY, and the rendered text keeps
+    # the real numbers. Hashing them raw traded a stale alert for an alert
+    # storm: the worktree cause reads "N of M worktrees unreadable" where M is
+    # the REGISTERED WORKTREE COUNT — a property of the repository, not of the
+    # fault, and one that moves constantly here (MEASURED 161 -> 165 inside a
+    # single session, plus a daily reap). One permanently unreadable worktree
+    # would therefore mint a fresh high-priority row every sweep for a fault
+    # that had not changed, which forfeits the dedup this hash exists to
+    # provide. What it costs: a fault whose SCALE changes but whose words do
+    # not (1 unreadable -> 47) no longer supersedes, so the open row keeps the
+    # older count. That is the acceptable half — this row is the ALARM ("the
+    # detector is blind on X"), while the live counts are in the run record and
+    # are re-rendered by `zero_drop_status` on every sweep.
+    _identity = re.sub(
+        r"\d+",
+        "#",
+        f"{content}\n{json.dumps(degraded, default=str, sort_keys=True)}",
+    )
+    content_hash = hashlib.sha256(f"zero_drop_blind:{_identity}".encode()).hexdigest()
+    try:
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
@@ -846,15 +932,78 @@ async def _run(*, trigger: str, force: bool, db_path: Path | str, repo_path: str
             fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return {"status": "lock_busy"}
-        return await _run_locked(
-            trigger=trigger,
-            force=force,
-            db_path=db_path,
-            repo_path=repo_path,
-            mode=mode,
-        )
+        try:
+            return await _run_locked(
+                trigger=trigger,
+                force=force,
+                db_path=db_path,
+                repo_path=repo_path,
+                mode=mode,
+            )
+        except Exception as exc:  # noqa: BLE001 — re-raised; the caller reports
+            # A FAILED sweep must still replace the run record, or a record
+            # that CAUSES the failure survives it. `_run_locked` writes the
+            # record at exactly one place, its last statement, so before this
+            # every raise left the previous record untouched — and when the
+            # cause was IN that record (a naive `computed_at`), each sweep read
+            # it, died at the same line and wrote nothing, forever. Catching
+            # the one known crash is not enough on its own: what makes the
+            # failure PERMANENT is the record outliving the run, and only
+            # replacing it closes that for causes nobody has thought of yet.
+            #
+            # Written under the SAME flock as the sweep, deliberately. The
+            # obvious home is `run_zero_drop_worker`'s handler, but the lock is
+            # released before the exception reaches it, so a concurrent sweep's
+            # good record could be clobbered by this failure record.
+            _write_failure_record(trigger=trigger, mode=mode, exc=exc)
+            raise
     finally:
         lock_fh.close()
+
+
+def _write_failure_record(*, trigger: str, mode: str, exc: BaseException) -> None:
+    """Replace the run record with one that says the sweep FAILED.
+
+    Deliberately minimal on the MEASUREMENT keys: no ``stages``, no
+    ``counts_by_status``, no ``open_findings``. Nothing was measured, and a
+    failure record carrying those would read as a sweep that looked and found
+    nothing — the exact "confident stale zero" this subsystem exists to stop.
+    ``degraded`` is populated so every surface asking "is this blind?" gets
+    True, and ``computed_at`` is stamped because a run DID happen: without it
+    ``_freshness`` reports "never run", which is a different and false claim.
+
+    But ``coverage`` and ``frozen_classes`` are SCOPE claims, not measurements,
+    and omitting them is not neutral — which is this function's own generator
+    biting it one review later. ``zero_drop_tools`` reads
+    ``last_run.get("frozen_classes") or []``, so an omission renders as ``[]``:
+    a positive, checkable assertion that NOTHING is frozen, published at the
+    precise moment everything is. That is the mirror of the claim
+    ``_maintain_blind_alert`` was just fixed to stop making, and the same
+    sentence applies — a checkable runtime claim that contradicts the code is
+    worse than a vaguer one. After a failed sweep the true value is known
+    exactly and for free: every class is frozen, so say so.
+
+    Never raises. A failure inside the failure path would replace the original
+    exception with a less informative one, and the sweep's own report is what
+    the caller is about to return.
+    """
+    try:
+        _atomic_write_json(
+            last_run_path(),
+            {
+                "version": 1,
+                "computed_at": datetime.now(UTC).isoformat(),
+                "trigger": trigger,
+                "mode": mode,
+                "status": "failed",
+                "degraded": {"sweep_failed": f"{type(exc).__name__}: {exc}"[:300]},
+                "coverage": f"FROZEN: {','.join(ALL_CLASSES)}",
+                "frozen_classes": list(ALL_CLASSES),
+                "notes": ["record replaced by a FAILED sweep — nothing was measured"],
+            },
+        )
+    except Exception:
+        logger.warning("zero_drop could not record its own failure", exc_info=True)
 
 
 async def _run_locked(
@@ -862,9 +1011,29 @@ async def _run_locked(
 ) -> dict:
     cfg = load_config()
     prior = read_last_run()
-    if not force and _within_minutes(
-        prior.get("computed_at"), knob_int(cfg, "min_interval_minutes")
-    ):
+    # A FAILED prior debounces on a SHORT floor rather than the full interval.
+    #
+    # Two mistakes are available here and the first draft made the second. A
+    # failure must not buy a full hour of silence — that would turn the record
+    # that fixes a wedge into a slower wedge. But exempting it ENTIRELY is worse
+    # than the behaviour it replaced: before the failure record existed a crash
+    # wrote nothing, so the previous (usually `ok`) record still debounced and a
+    # crash loop was capped at one sweep per interval. Removing the debounce
+    # removed that cap, and the raise that is caught nowhere — `get_raw_db` on a
+    # corrupt or unreadable database — happens AFTER both expensive legs have
+    # run. A persistent DB fault would therefore replay the whole sweep on every
+    # session boundary: MEASURED at ~14-20s including a live `ls-remote` and a
+    # ~1700-PR `gh` listing, where it used to replay hourly.
+    #
+    # So the floor is derived from that cost rather than picked: at 5 minutes a
+    # persistently failing detector spends under 7% of wall-clock sweeping,
+    # while a transient fault still recovers in minutes instead of an hour.
+    debounce_minutes = (
+        FAILED_RETRY_FLOOR_MINUTES
+        if prior.get("status") == "failed"
+        else knob_int(cfg, "min_interval_minutes")
+    )
+    if not force and _within_minutes(prior.get("computed_at"), debounce_minutes):
         return {"status": "debounced"}
 
     run_id = uuid.uuid4().hex
@@ -885,9 +1054,26 @@ async def _run_locked(
 
     # ── Branch legs: for-each-ref + ls-remote + full PR history ──────────────
     resolved_base = await _resolve_base_ref(repo_path)
-    base_ref = resolved_base or DEFAULT_BASE_REF
     if resolved_base is None:
+        base_ref = DEFAULT_BASE_REF
         notes.append(f"base_ref_unresolved_using={DEFAULT_BASE_REF}")
+    elif not is_safe_base_ref(resolved_base):
+        # `%`, `(` and `)` are LEGAL in a git ref name (MEASURED against
+        # `git check-ref-format --branch`), and `base` is spliced into a git
+        # FORMAT string where `%(...)` is a directive. `list_local_branches`
+        # already refuses such a base — so passing it through meant the branch
+        # detector failed on EVERY sweep, permanently, on a default branch
+        # nobody was going to rename back (Codex P2, PR #1794). Falling back is
+        # what the formatter's own contract says the caller should do.
+        #
+        # A DISTINCT note, not the one above: "could not resolve a base" and
+        # "resolved one we cannot safely format" send a reader to different
+        # places, and today the second produced no note at all — the run looked
+        # clean while the branch classes were frozen.
+        base_ref = DEFAULT_BASE_REF
+        notes.append(f"base_ref_unsafe_using={DEFAULT_BASE_REF}")
+    else:
+        base_ref = resolved_base
     branch_findings: dict[str, list[dict]] | None = None
     branch_held: set[str] = set()
     local = await list_local_branches(repo_path, base=base_ref)
@@ -1086,7 +1272,7 @@ async def _run_locked(
                 degraded["alert"] = alert_state
         # Blindness is reported in EVERY running mode: the lever governs egress
         # about findings, and a broken instrument is not a finding.
-        blind_state = await _maintain_blind_alert(db, degraded=degraded)
+        blind_state = await _maintain_blind_alert(db, degraded=degraded, frozen=frozen)
         await _emit_heartbeat(
             db,
             detail=(

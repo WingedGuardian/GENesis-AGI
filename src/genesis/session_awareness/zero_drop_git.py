@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 
@@ -77,8 +78,8 @@ def _is_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_FULL_SHA.match(value))
 
 
-def _refuse_empty(kind: str, records) -> dict | None:
-    """Refuse an rc=0 result that parsed to NOTHING. Shared by all enumerators.
+def _refuse_empty(kind: str, records, *, raw: str) -> dict | None:
+    """Refuse output that PARSED to nothing. An empty OUTPUT is not that.
 
     An empty set does NOT fail neutrally, which is what makes this a
     correctness guard rather than tidiness. Each enumerator feeds a class that
@@ -88,19 +89,51 @@ def _refuse_empty(kind: str, records) -> dict | None:
     subsystem exists to prevent, arriving through the one door that looks like
     success.
 
-    And empty cannot be a true observation for any of them: a repository always
-    has at least one local branch, at least one branch on its remote, and at
-    least one worktree. "rc=0 and nothing parsed" therefore means the output was
-    not what we think it is — a format change, a wrong path, a truncated read —
-    and the honest response is to freeze the class.
+    But the first version of this guard could not tell the two rc=0 empties
+    apart, and they mean opposite things (Codex P2, PR #1794):
 
-    MEASURED 2026-09-06 before this existed: the guard was on ls-remote ONLY.
-    ``for-each-ref`` and ``worktree list`` both returned a clean empty set from
-    rc=0, and ``worktree list`` did so even for unparseable garbage.
+    * **rc=0, and git printed NOTHING.** A true observation of an empty set. An
+      unborn repository has no local refs; a newly created or fully cleared
+      remote answers ``ls-remote`` with no heads at all. MEASURED 2026-09-13 on
+      git 2.43: an empty bare repo gives ``ls-remote --heads`` rc=0 and stdout
+      of EXACTLY zero bytes, and an unborn repo gives ``for-each-ref
+      refs/heads`` the same — and ``--exit-code``, the OPTIONAL flag that turns
+      no-match into rc=2, is what this code would have to pass for emptiness to
+      be an error at all. Refusing these froze both branch classes forever on a
+      condition that never changes, and in the cleared-remote case every local
+      branch is precisely the unpushed work the detector exists to report.
+    * **rc=0, git printed SOMETHING, and none of it parsed.** The format changed
+      under us, or the read was truncated. Nothing here can be trusted and the
+      class freezes.
+
+    So the discriminator is the RAW output, not the record count. Passing the
+    parsed list alone is what made the two indistinguishable.
+
+    Tested on the raw string rather than ``raw.strip()``, and the measurement
+    above is why: an empty set is zero bytes, so WHITESPACE is not one — it is
+    output that parsed to nothing, and it belongs on the freezing side. Using
+    ``strip()`` would have quietly moved a whole class of unreadable output into
+    the permissive branch, which is the direction that resolves findings.
+
+    MEASURED 2026-09-06 before this existed at all: the guard was on ls-remote
+    ONLY. ``for-each-ref`` and ``worktree list`` both returned a clean empty set
+    from rc=0, and ``worktree list`` did so even for unparseable garbage.
+
+    Where it actually fires, stated because the obvious reading is wrong: each
+    enumerator counts unreadable lines itself and returns before reaching here,
+    so for a non-empty output that parsed to nothing it is the caller's
+    ``unparsed`` counter that freezes the class, not this. That makes this a
+    BACKSTOP for a parser that ever stops counting — worth keeping, worth not
+    mistaking for the primary guard.
     """
-    if not records:
-        return {"error": f"{kind} returned no records (rc=0) — refusing an empty set"}
-    return None
+    if records or not raw:
+        return None
+    return {
+        "error": (
+            f"{kind}: rc=0 with {len(raw)} bytes of output, none of which parsed "
+            "as a record — refusing a set we cannot read"
+        )
+    }
 
 
 # TAB-separated so a branch name containing a space survives the split; git ref
@@ -144,6 +177,39 @@ def _git(root: str, *args: str) -> list[str]:
     return ["git", "--no-optional-locks", "-C", root, *args]
 
 
+# Git's repository-discovery environment OVERRIDES `-C`. `-C` is equivalent to
+# `cd`, and `GIT_DIR` takes precedence over discovery from the working
+# directory — so with one of these inherited, every argv `_git()` builds reads a
+# repository the caller never named, and the module docstring's claim that
+# addressing by `-C` cannot point the sweep at the wrong worktree is simply
+# false.
+#
+# That used to fail CLOSED: a mismatched GIT_DIR yielding zero refs hit
+# `_refuse_empty` and froze the branch classes, loudly. Since an rc=0 empty set
+# became a legitimate observation it fails OPEN instead — `{"branches": []}`
+# reconciles both branch classes against nothing and RESOLVES every open and
+# acked finding in them. Stripped in the runner rather than at each call site,
+# for the same reason `--no-optional-locks` lives in `_git()`: a guarantee every
+# caller must remember is a convention.
+_GIT_ENV_OVERRIDES = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    }
+)
+
+
+def scrubbed_git_env() -> dict[str, str]:
+    """The ambient environment with git's repo-discovery overrides removed."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_OVERRIDES}
+
+
 async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
     """Run a git command, returning (rc, stdout, stderr). Never raises."""
     try:
@@ -151,6 +217,7 @@ async def default_runner(argv: list[str], timeout: float) -> tuple[int, str, str
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrubbed_git_env(),
         )
     except Exception as exc:  # git missing / not executable
         return 127, "", f"git spawn failed: {exc}"
@@ -221,7 +288,7 @@ async def list_local_branches(
         # COMPLETE candidate set, and a quietly-short one resolves findings for
         # branches that were simply never listed.
         return {"error": f"for-each-ref: {unparsed} unparseable ref line(s)"}
-    if err := _refuse_empty("for-each-ref", branches):
+    if err := _refuse_empty("for-each-ref", branches, raw=out):
         return err
     return {"branches": branches}
 
@@ -252,15 +319,31 @@ async def list_remote_heads(
     if rc != 0:
         return {"error": f"ls-remote failed (rc={rc}): {err.strip()[:300]}"}
     heads: dict[str, str] = {}
+    unparsed = 0
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
         if ref.startswith("refs/heads/") and _FULL_SHA.match(sha):
             heads[ref[len("refs/heads/") :]] = sha
+        elif line.strip() and not ref.startswith(("refs/tags/", "refs/pull/")):
+            # The third sibling, and the last one to get this. Its two peers
+            # have counted unreadable lines from the start; this one dropped
+            # them silently, so a PARTIAL parse — most lines unreadable, a few
+            # readable — left `heads` truthy, passed `_refuse_empty`, and was
+            # accepted as a COMPLETE remote listing. The dropped branches then
+            # read as absent from the remote, which forks their identity into
+            # the wrong class and RESOLVES their `pushed_no_pr` rows.
+            #
+            # Tags and pull refs are named rather than swept into the counter:
+            # `--heads` should exclude them, but a server that sends them anyway
+            # is not a format change and must not freeze the class.
+            unparsed += 1
+    if unparsed:
+        return {"error": f"ls-remote: {unparsed} unparseable ref line(s)"}
     # On top of the class-wide resolve that `_refuse_empty` describes, an empty
     # set fails a second way here: it reclassifies EVERY branch as never-pushed,
     # and class is part of a finding's identity, so it forks rows instead of
     # correcting them.
-    if err := _refuse_empty("ls-remote", heads):
+    if err := _refuse_empty("ls-remote", heads, raw=out):
         return err
     return {"heads": heads}
 
@@ -440,8 +523,21 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
         worktrees.append(current)
     if unparsed:
         return {"error": f"worktree list: {unparsed} unrecognised record line(s)"}
-    if err := _refuse_empty("worktree list", worktrees):
-        return err
+    if not worktrees:
+        # NOT `_refuse_empty`, and the difference is the whole point of that
+        # helper's split. For the two ref enumerators an empty OUTPUT is a true
+        # observation — an unborn repo, a cleared remote — so they accept it.
+        # Here it cannot be: `git worktree list` always names the main worktree
+        # of any repository it can read at all, so nothing parsed means the
+        # output is not what we think it is, whether it was empty or garbage.
+        # Stated locally rather than borrowed, because the reason is this
+        # command's, not the shared guard's.
+        return {
+            "error": (
+                "worktree list returned no records (rc=0) — the main worktree is "
+                "always listed, so an empty parse means the output is unreadable"
+            )
+        }
     # Stamped HERE, over the whole listing, because it is a fact about the
     # listing rather than a judgement about any one worktree — and because the
     # two consumers see different subsets of it. `git worktree add --force`

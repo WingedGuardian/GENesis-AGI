@@ -1143,3 +1143,308 @@ def test_a_null_field_is_not_a_shape_violation(last_run_file):
 
     assert bool(out.get("degraded") or {}) is False, "a null field does not read blind"
     assert out["coverage"] is None
+
+
+# ── The run record must never outlive the sweep it broke ────────────────────
+#
+# The ACCEPTANCE case for Codex :277, and the property is PERMANENCE, not the
+# exception. `_run_locked` writes the record at exactly one place — its last
+# statement — so any raise before that left the previous record untouched. When
+# the cause was IN that record, every later sweep read it, died at the same
+# line and wrote nothing: a board frozen at whatever it last said, forever.
+#
+# So a test that only asserts "the naive timestamp no longer raises" would go
+# green while the class stayed open. These assert the record MOVES.
+
+
+def test_a_NAIVE_computed_at_is_read_as_utc_rather_than_crashing():
+    """The reported instance. A timezone-naive timestamp parses cleanly and
+    then raises TypeError on the aware-minus-naive subtraction — past the
+    guard, in the arithmetic — so catching ValueError alone never saw it."""
+    from datetime import UTC, datetime, timedelta
+
+    naive_recent = (datetime.now(UTC) - timedelta(minutes=1)).replace(tzinfo=None)
+    naive_old = (datetime.now(UTC) - timedelta(days=3)).replace(tzinfo=None)
+
+    # Read as UTC, not rejected: a timestamp missing its offset is still a
+    # reading, so a one-minute-old record must still debounce.
+    assert w._within_minutes(naive_recent.isoformat(), 60) is True
+    assert w._within_minutes(naive_old.isoformat(), 60) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [123, ["a"], {"x": 1}, 12.5, "not-a-timestamp", ""],
+    ids=["int", "list", "dict", "float", "garbage", "empty"],
+)
+def test_no_value_of_computed_at_can_raise_out_of_the_debounce(value):
+    """The guard is the DEBOUNCE, and it is the second statement of the sweep.
+    Anything that escapes here kills the run before it does any work."""
+    assert w._within_minutes(value, 60) is False
+
+
+async def test_a_FAILED_sweep_REPLACES_the_record_that_broke_it(tmp_path, monkeypatch):
+    """The permanence half, and the one Codex's remedy did not cover.
+
+    Catching the known TypeError only lets THIS sweep reach the write. The
+    record is what makes a failure permanent, so the property has to hold for
+    causes nobody has enumerated: a sweep that dies ANYWHERE must still leave a
+    record saying so, or the next sweep reads the same poison.
+    """
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "home"))
+    path = w.last_run_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    poison = {"version": 1, "computed_at": "2026-09-07T00:00:00", "status": "ok",
+              "open_findings": 7, "coverage": "branches+worktrees"}
+    path.write_text(json.dumps(poison))
+
+    async def _boom(**kwargs):
+        raise RuntimeError("the sweep died somewhere nobody predicted")
+
+    monkeypatch.setattr(w, "_run_locked", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+
+    out = await w.run_zero_drop_worker(trigger="manual", db_path=":memory:", repo_path="/repo")
+    assert out["status"] == "failed"
+
+    record = json.loads(path.read_text())
+    assert record["status"] == "failed", "the record that caused the failure survived it"
+    assert record["computed_at"] != poison["computed_at"]
+    # Blind, not clean: every surface asking "can this thing see?" must get True.
+    assert record["degraded"], "a failed sweep must read BLIND"
+    assert "RuntimeError" in record["degraded"]["sweep_failed"]
+    # Nothing MEASUREMENT-shaped, or the failure reads as a sweep that looked
+    # and found nothing — the confident stale zero, restated.
+    for key in ("stages", "counts_by_status", "open_findings"):
+        assert key not in record, f"a failed sweep must not publish {key}"
+    # But SCOPE is not a measurement, and omitting it is not neutral: the status
+    # tool reads `last_run.get("frozen_classes") or []`, so an omission renders
+    # as a positive claim that NOTHING is frozen at the moment everything is.
+    # An earlier version of this test asserted `coverage` was ABSENT and so
+    # pinned that defect as if it were the design.
+    assert record["frozen_classes"] == list(w.ALL_CLASSES), "a failed sweep froze everything"
+    assert record["coverage"].startswith("FROZEN:")
+
+
+def _seed_run_record(status: str) -> None:
+    """A run record stamped SECONDS ago, so only `status` can decide."""
+    from datetime import UTC, datetime
+
+    path = w.last_run_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "computed_at": datetime.now(UTC).isoformat(),
+                "status": status,
+                "degraded": {"sweep_failed": "RuntimeError: boom"} if status == "failed" else {},
+            }
+        )
+    )
+
+
+async def test_a_SUCCESSFUL_record_still_debounces(env, db_path):
+    """The control, and the assertion that keeps the exemption narrow: it is
+    scoped to failures and must not have disarmed the debounce for everyone."""
+    _seed_run_record("ok")
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "debounced"
+
+
+# ── Class C: the degradation report must be DERIVED from the event ──────────
+#
+# Six findings, one generator: a report computed somewhere other than the event
+# it describes, so the two drift. These cover the three that are not :277.
+
+
+async def test_an_UNSAFE_resolved_base_falls_back_and_says_SO_distinctly(
+    env, db_path, monkeypatch
+):
+    """`%`, `(` and `)` are LEGAL in a git ref name (MEASURED against
+    `git check-ref-format --branch`), and the base is spliced into a git FORMAT
+    string where `%(...)` is a directive. `list_local_branches` already refuses
+    such a base — so passing it straight through meant the branch detector
+    failed on EVERY sweep, permanently, on a default branch nobody was going to
+    rename back (Codex P2, PR #1794).
+
+    The note has to be DISTINCT from the unresolved one: "could not resolve a
+    base" and "resolved one we cannot safely format" send a reader to different
+    places, and the second used to produce no note at all — so the run record
+    looked clean while the branch classes were frozen.
+    """
+    async def _unsafe(root, runner=None):
+        return "origin/%(objectname)"
+
+    monkeypatch.setattr(w, "_resolve_base_ref", _unsafe)
+    out = await _run(db_path)
+
+    assert out["status"] in ("ok", "degraded")
+    record = json.loads(w.last_run_path().read_text())
+    assert record["base_ref"] == w.DEFAULT_BASE_REF, "an unsafe base must not be used"
+    assert "base_ref_unsafe_using=origin/main" in record["notes"]
+    # Distinct from the unresolved note, or a reader cannot tell the two apart.
+    assert "base_ref_unresolved_using=origin/main" not in record["notes"]
+    # And the branch leg must actually have RUN rather than frozen.
+    assert "branches" in record["stages"]
+
+
+async def test_a_SAFE_resolved_base_files_no_note_at_all(env, db_path):
+    """The control. A healthy run must not file a fallback note it did not make
+    — the first version of this code returned the fallback itself, so every
+    healthy run on a main-branch repo claimed a fallback that never happened."""
+    out = await _run(db_path)
+    record = json.loads(w.last_run_path().read_text())
+    assert out["status"] in ("ok", "degraded")
+    assert not [n for n in record["notes"] if n.startswith("base_ref_")]
+
+
+async def test_the_blind_alert_REFRESHES_when_only_the_CAUSE_changes(db_path):
+    """The hash covered the degradation KEYS while the text carried the CAUSES.
+
+    So a leg that stayed broken for a NEW reason deduped against the standing
+    alert, and an operator went on reading an obsolete cause until the 3-day TTL
+    happened to re-mint it (Codex P2, PR #1794). The sibling findings alert
+    already hashed its rendered content — the fix was one function away.
+    """
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        first = await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "/w/a: permission denied"}, frozen=[]
+        )
+        assert first == "created"
+        # SAME key, DIFFERENT cause. This used to dedupe.
+        second = await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "/w/b: stale nfs handle"}, frozen=[]
+        )
+        assert second == "created", "a changed cause deduped against the obsolete alert"
+
+        cursor = await conn.execute(
+            "SELECT content, resolved FROM observations WHERE source = ? ORDER BY created_at",
+            (w.BLIND_SOURCE,),
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 2
+        live = [r for r in rows if not r["resolved"]]
+        assert len(live) == 1, "the obsolete alert must be superseded, not left open"
+        assert "stale nfs handle" in live[0]["content"]
+    finally:
+        await conn.close()
+
+
+async def test_the_blind_alert_does_not_claim_FROZEN_when_nothing_is(db_path):
+    """A checkable runtime claim that contradicts the code is worse than a
+    vaguer one: it tells an operator not to trust a board that is current.
+
+    Partial degradation holds only the affected identities and reconciles
+    everything else — one unreadable worktree out of 165 does not freeze the
+    class — but the text asserted FROZEN in every case (Codex P2, PR #1794).
+    """
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "/w/a: permission denied"}, frozen=[]
+        )
+        cursor = await conn.execute(
+            "SELECT content FROM observations WHERE source = ? AND resolved = 0",
+            (w.BLIND_SOURCE,),
+        )
+        partial = (await cursor.fetchone())["content"]
+        assert "FROZEN" not in partial, partial
+        assert "HELD individually" in partial
+
+        # And the control: when a class really IS frozen, say so by name.
+        await w._maintain_blind_alert(
+            conn,
+            degraded={"prs": "gh listing capped"},
+            frozen=["unpushed_branch", "pushed_no_pr"],
+        )
+        cursor = await conn.execute(
+            "SELECT content FROM observations WHERE source = ? AND resolved = 0",
+            (w.BLIND_SOURCE,),
+        )
+        frozen_text = (await cursor.fetchone())["content"]
+        assert "Classes FROZEN: pushed_no_pr,unpushed_branch" in frozen_text
+    finally:
+        await conn.close()
+
+
+async def test_a_failed_record_still_debounces_on_a_SHORT_floor(env, db_path):
+    """The exemption needs a floor, and leaving it out was worse than the
+    behaviour it replaced.
+
+    Before the failure record existed a crash wrote nothing, so the previous
+    `ok` record still debounced and a crash loop was capped at one sweep per
+    interval. Exempting `failed` entirely removed that cap — and the raise that
+    is caught nowhere (an unreadable database) happens AFTER both expensive legs
+    have run, so a persistent fault would replay a ~14-20s network-touching
+    sweep on every session boundary.
+    """
+    _seed_run_record("failed")  # stamped seconds ago
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "debounced", "a failed record must still have a retry floor"
+
+
+async def test_the_failed_floor_is_SHORTER_than_the_normal_interval(env, db_path):
+    """And the floor must not become the interval: past it, the retry runs.
+
+    Uses a `computed_at` older than the floor but far younger than the 60-minute
+    configured interval, so only the failure exemption can let this through.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    path = w.last_run_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    aged = datetime.now(UTC) - timedelta(minutes=w.FAILED_RETRY_FLOOR_MINUTES + 1)
+    path.write_text(
+        json.dumps({"version": 1, "computed_at": aged.isoformat(), "status": "failed"})
+    )
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced"
+    assert w.FAILED_RETRY_FLOOR_MINUTES < 60, "the floor must be shorter than the interval"
+
+
+async def test_the_blind_alert_does_NOT_remint_when_only_a_COUNT_moves(db_path):
+    """The complement of the cause-change test, and the churn it prevents.
+
+    The worktree cause embeds the REGISTERED worktree count — a property of the
+    repository, not of the fault, and one that moves constantly here. Hashing it
+    raw minted a fresh high-priority row every sweep for a fault that had not
+    changed, forfeiting the dedup the hash exists to provide.
+    """
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        first = await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "1 of 161 worktrees unreadable: /w/a: denied"},
+            frozen=[],
+        )
+        assert first == "created"
+        # Same leg, same words, a denominator that moved because a worktree was
+        # reaped. Nothing about the fault changed.
+        second = await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "1 of 165 worktrees unreadable: /w/a: denied"},
+            frozen=[],
+        )
+        assert second == "unchanged", "a moving denominator re-minted the alert"
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE source = ?", (w.BLIND_SOURCE,)
+        )
+        assert (await cursor.fetchone())["n"] == 1
+    finally:
+        await conn.close()

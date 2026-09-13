@@ -277,18 +277,18 @@ async def test_ls_remote_reads_the_live_remote(repo, tmp_path):
     assert out["heads"]["main"] == head
 
 
-async def test_a_successful_ls_remote_that_parses_to_NOTHING_is_an_error(repo):
-    """rc=0 with no branch refs. The rc check above cannot see this (that test
-    uses a repo with no remote, which fails rc≠0 and never reaches the guard),
-    and an empty set does not fail neutrally: it reclassifies EVERY branch as
-    never-pushed, and class is part of a finding's identity — so it forks rows
-    instead of correcting them."""
+async def test_ls_remote_OUTPUT_that_parses_to_nothing_is_an_error(repo):
+    """rc=0 with output carrying no branch refs. The rc check above cannot see
+    this (that test uses a repo with no remote, which fails rc≠0 and never
+    reaches the guard), and accepting it does not fail neutrally: it
+    reclassifies EVERY branch as never-pushed, and class is part of a finding's
+    identity — so it forks rows instead of correcting them.
+
+    Scoped to OUTPUT. This test used to assert the same of a zero-byte result,
+    which was wrong and is corrected next door: a cleared remote legitimately
+    answers with nothing, and refusing that froze both branch classes forever.
+    """
     from genesis.session_awareness import zero_drop_git as g
-
-    async def _empty(argv, timeout):
-        return 0, "", ""
-
-    assert "error" in await g.list_remote_heads(str(repo), runner=_empty)
 
     async def _unexpected_shape(argv, timeout):
         return 0, "deadbeef\trefs/tags/v1\n", ""
@@ -547,18 +547,21 @@ async def test_a_CONFLICT_RESOLVED_merge_counts_as_unique_work(repo):
         ("list_worktrees", "worktree list"),
     ],
 )
-@pytest.mark.parametrize("payload", ["", "not a record at all\n", "   \n\n"])
-async def test_rc0_with_nothing_parsed_freezes_the_class(repo, fn_name, kind, payload):
-    """An empty result does not fail neutrally — it RESOLVES the whole class.
+@pytest.mark.parametrize("payload", ["not a record at all\n", "   \n\n"])
+async def test_rc0_with_OUTPUT_that_parsed_to_nothing_freezes_the_class(
+    repo, fn_name, kind, payload
+):
+    """Output we cannot read does not fail neutrally — it RESOLVES the class.
 
     Each of these feeds a class that reconciles, so whatever is not returned is
-    treated as gone. rc=0-and-empty therefore clears every open and acknowledged
-    finding in that class at once: silent, confident, complete. And empty cannot
-    be a true observation — a repository always has at least one local branch,
-    at least one branch on its remote, and at least one worktree.
+    treated as gone: silent, confident, complete. The guard used to exist on
+    ls-remote ONLY, and `worktree list` accepted unparseable garbage as a clean
+    empty set.
 
-    The guard used to exist on ls-remote ONLY. `worktree list` accepted
-    unparseable garbage as a clean empty set.
+    Whitespace-only counts as OUTPUT here, and that is a measurement rather than
+    a preference: an empty set is exactly ZERO bytes (below), so whitespace is
+    something git did not print for an empty set — it belongs on the freezing
+    side, which is the direction that does not resolve findings.
     """
     from genesis.session_awareness import zero_drop_git as g
 
@@ -566,11 +569,66 @@ async def test_rc0_with_nothing_parsed_freezes_the_class(repo, fn_name, kind, pa
         return 0, payload, ""
 
     out = await getattr(g, fn_name)(str(repo), runner=_runner)
-    assert "error" in out, f"{kind} accepted an empty parse as success"
-    # Either refusal is correct — an unreadable line and a result that parsed
-    # to nothing both mean "the output was not what we think it is", and both
-    # freeze the class. What must never happen is a clean empty success.
-    assert any(m in out["error"] for m in ("empty set", "unrecognised", "unparseable"))
+    assert "error" in out, f"{kind} accepted an unreadable parse as success"
+    # Either refusal is correct — an unreadable line and output that parsed to
+    # nothing both mean "this is not what we think it is", and both freeze the
+    # class. What must never happen is a clean empty success.
+    assert any(
+        m in out["error"]
+        for m in (
+            "none of which parsed",
+            "unrecognised",
+            "unparseable",
+            # `worktree list` refuses on its own reasoning rather than the
+            # shared guard's, so it has its own wording.
+            "main worktree is always listed",
+        )
+    ), out["error"]
+
+
+@pytest.mark.parametrize(
+    "fn_name",
+    ["list_local_branches", "list_remote_heads"],
+)
+async def test_an_rc0_empty_OUTPUT_is_a_true_observation_not_corruption(repo, fn_name):
+    """The correction, and my own test was what encoded the wrong predicate.
+
+    The first version of this guard refused EVERY rc=0 empty, on the reasoning
+    that a repository always has at least one local branch and one remote
+    branch. Both halves are false: an unborn repository has no local refs, and a
+    newly created or fully cleared remote answers with no heads (Codex P2, PR
+    #1794). Refusing them froze BOTH branch classes on every sweep, forever,
+    because nothing about the condition changes — and in the cleared-remote case
+    every local branch is precisely the unpushed work the detector exists to
+    report.
+
+    MEASURED 2026-09-13 on git 2.43: both spellings return rc=0 with stdout of
+    EXACTLY zero bytes; `--exit-code` is the optional flag that would have made
+    emptiness an error, and this code does not pass it.
+    """
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _runner(argv, timeout):
+        return 0, "", ""
+
+    out = await getattr(g, fn_name)(str(repo), runner=_runner)
+    assert "error" not in out, f"a legitimately empty set was refused: {out}"
+    assert out in ({"branches": []}, {"heads": {}})
+
+
+async def test_an_empty_WORKTREE_listing_is_still_refused(repo):
+    """The exception, and it is not an inconsistency: `git worktree list` always
+    names the main worktree of any repository it can read, so nothing parsed
+    means the output is unreadable whether or not it was empty. Its reason is
+    stated on the call site rather than borrowed from the shared guard."""
+    from genesis.session_awareness.zero_drop_git import list_worktrees
+
+    async def _runner(argv, timeout):
+        return 0, "", ""
+
+    out = await list_worktrees(str(repo), runner=_runner)
+    assert "error" in out
+    assert "main worktree is always listed" in out["error"]
 
 
 async def test_a_real_worktree_listing_still_parses(repo, tmp_path):
@@ -726,3 +784,52 @@ async def test_a_worktree_path_containing_a_newline_is_parsed_whole(repo, tmp_pa
         f"the newline-containing path was split or mangled; got {sorted(paths)}"
     )
     assert out.get("unparsed", 0) == 0, "a split record also inflates the unparsed count"
+
+
+async def test_an_inherited_GIT_DIR_cannot_redirect_the_sweep(repo, tmp_path, monkeypatch):
+    """git's repo-discovery environment OVERRIDES `-C`, and since an rc=0 empty
+    set became a legitimate observation, that stopped failing closed.
+
+    `-C` is equivalent to `cd`; `GIT_DIR` takes precedence over discovery from
+    the working directory. So with one inherited, every argv reads a repository
+    the caller never named — and an empty result there now reads as "this repo
+    has no branches", which RESOLVES every open and acked branch finding.
+    """
+    import subprocess
+
+    other = tmp_path / "elsewhere.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(other)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(other))
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    assert any(w["path"] == str(repo) for w in out["worktrees"]), (
+        f"GIT_DIR redirected the sweep to another repository: {out}"
+    )
+
+    branches = await list_local_branches(str(repo), base="main")
+    assert "error" not in branches, branches
+    assert [b["branch"] for b in branches["branches"]] == ["main"], branches
+
+
+async def test_ls_remote_lines_it_cannot_parse_are_COUNTED_not_dropped(repo):
+    """The third sibling. Its two peers have counted unreadable lines from the
+    start; this one dropped them silently, so a PARTIAL parse was accepted as a
+    complete remote listing and the dropped branches forked into the wrong
+    class."""
+    from genesis.session_awareness import zero_drop_git as g
+
+    async def _partial(argv, timeout):
+        return 0, ("a" * 40) + "\trefs/heads/real\nnot-a-ref-line-at-all\n", ""
+
+    out = await g.list_remote_heads(str(repo), runner=_partial)
+    assert "error" in out, f"a partial parse was accepted as complete: {out}"
+    assert "unparseable" in out["error"]
+
+    async def _tags_only(argv, timeout):
+        return 0, ("b" * 40) + "\trefs/tags/v1\n", ""
+
+    # A server sending tags despite --heads is not a format change: it must not
+    # freeze the class on the unparsed path...
+    tagged = await g.list_remote_heads(str(repo), runner=_tags_only)
+    assert "unparseable" not in tagged.get("error", ""), tagged

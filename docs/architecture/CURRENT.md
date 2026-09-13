@@ -1770,12 +1770,28 @@ verified: 788dd9a9 2026-09-06
   branch delete, unclaim, or write to ledger/follow-ups/tasks.
   Sweep (`zero_drop_git.py`, read-only, injectable runner): ONE `for-each-ref`
   with `%(ahead-behind:<base>)` (base read locally from
-  `refs/remotes/origin/HEAD`, fallback recorded not silent), live `ls-remote`
+  `refs/remotes/origin/HEAD`, validated with `is_safe_base_ref` and falling
+  back with a DISTINCT note — `%` and parens are LEGAL in a ref name, and an
+  unsafe base that reached the formatter froze the branch leg on every sweep
+  with no note at all), live `ls-remote`
   for remote presence (never the fetch-stale remote mirror — class is part of
   identity), the full `--state all` PR history (`repo_pulse_gh.list_all_prs`),
   and `git status --porcelain -z` per worktree (`-z` because the default
   porcelain C-quotes exactly the paths most likely to be somebody's untracked
   work). MEASURED 2026-09-05: 209 refs + 1651 PRs + 161 worktrees in ~14s.
+  `_refuse_empty` distinguishes the two rc=0 empties, which mean opposite
+  things: NO BYTES is a true empty set (an unborn repo, a cleared remote —
+  MEASURED 2026-09-13 on git 2.43 as exactly 0 bytes, since `--exit-code` is
+  the optional flag that would make it an error), while output that PARSED to
+  nothing is a format change and freezes the class. Refusing both froze the
+  branch classes forever on a condition that never changes. `list_worktrees`
+  refuses either way, on its own reasoning: the main worktree is always
+  listed, so nothing parsed is always unreadable. All three enumerators now
+  COUNT lines they cannot read (ls-remote was the last to silently drop them,
+  so a partial parse read as a complete listing), and both subprocess runners
+  scrub git's repo-discovery environment — `GIT_DIR` and friends OVERRIDE
+  `-C`, so an inherited one would point the sweep at another repository, which
+  since the empty-set change reads as "no branches" and resolves the lot.
   Classification (`zero_drop.py`, pure): this repo squash-merges, so every
   merged branch reads permanently ahead — a naive ahead-count query was ~12%
   precise (145 candidates, ~18 real). A head-ref-NAME PR join is what recovers
@@ -1850,6 +1866,23 @@ verified: 788dd9a9 2026-09-06
   counts (namespaced — the legs share key names) go to `last_run.json` so
   every suppression adds up to its denominator, and every published count
   carries the coverage line naming which classes that run actually swept.
+  A FAILED sweep replaces the run record too (`_write_failure_record`, under
+  the same flock): the record is written at ONE place, the last statement, so
+  a raise used to leave the previous record intact — and when the cause was
+  IN that record (a timezone-naive `computed_at`, which parses and then raises
+  TypeError on the aware subtraction) every later sweep died at the same line
+  and wrote nothing, freezing the board until someone deleted the file by
+  hand. The failure record carries `degraded` (so `blind` reads True) and no
+  MEASUREMENT-shaped keys — but it DOES carry `coverage`/`frozen_classes`,
+  because omitting them is not neutral: the status tool reads
+  `frozen_classes or []`, so an omission renders as a positive claim that
+  nothing is frozen at the moment everything is. A `failed` prior debounces on
+  a short floor (`FAILED_RETRY_FLOOR_MINUTES`) rather than the full interval —
+  exempting it entirely was worse than the behaviour it replaced, since the
+  uncaught raise (an unreadable DB) happens AFTER both expensive legs run.
+  Each class reconciles inside its own SAVEPOINT, so a class that raises
+  mid-DML cannot leave partial writes for the next commit on the shared
+  connection to flush while the record reports that class as not applied.
   Surfaces: `zero_drop_status` (read-only, in the reflection allowlist —
   findings + counts + the detector's own freshness, because a stale board's
   zero is unverified rather than clean) and `zero_drop_ack(class_, branch,
